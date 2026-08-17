@@ -1069,6 +1069,250 @@ pub fn record_native_dispatch(
     }
 }
 
+// ───────────────────── the general resolver's census arm (G47-1) ───────────
+//
+// `invoke_or_native` is the VM's *general* native resolver: the arm every
+// dispatch falls to that an inline cache did not serve. `G42-1` §3 measured
+// what that means for the census and named it the fourth bypass family, the
+// largest one: a compiled `invokevirtual` emits `jit_invoke_virtual_mic`, the
+// leaf/native site cache **refuses** any site whose method name is on
+// `site_name_is_special_cased` (`"invoke"` is), no MIC/PIC entry can be
+// published for a registered native, and the site falls to bare
+// `invoke_or_native` — which resolves with `find_with_kind`, holds no
+// `NativeMethodId`, and calls `safe_native_call`. Nothing counts.
+//
+// It is **not** a JIT-only family and not a reflection one. `invoke_or_native`
+// is also called from `dispatch_static.rs`, `lambda.rs`, `agent_loader.rs` and
+// `debug/mod.rs`, so the `--nojit` arm loses these calls too — it simply loses
+// far fewer of them, because the interpreter's cached-native target carries an
+// id and counts. Any native can land here; the set is not a fixed table whose
+// contents can be inspected the way `G33-1` §4 inspected the intrinsic table
+// and the direct-helper list.
+//
+// # Why this is not "mark at bind time", and why that decision was not open
+//
+// `G37-1` and `G42-1` both chose bind-time marking over a per-call counter,
+// on `G33-1` §5's +9.2 ns/call measurement. Both had a **bind point**: a call
+// site being wired to a pre-resolved callback (a JIT direct helper, an
+// intrinsic inline-cache fill), where one cold store buys silence forever.
+//
+// This site has none. `invoke_or_native` re-resolves the triple on every call
+// and wires nothing, so "mark once at bind" does not exist here; the cheapest
+// honest thing available is "mark on dispatch". And a mark needs a
+// `NativeMethodId`, which means `resolve_id` — the *same* lookup a count needs.
+// So the two options cost the same lookup and differ only by a relaxed
+// `fetch_add` versus a relaxed `store`, and the mark tells you strictly less.
+// Marking is not the free option here; it is the same-price, less-informative
+// one. That reframes the choice, and it is the one thing about this site that
+// could be settled from source without a build.
+//
+// # What is actually done, and why it is affordable unmeasured
+//
+// Default: **declare, at most once per (thread, VM, registry generation,
+// callback)**. A one-entry-deep pair of memo slots turns the steady state — a
+// loop calling the same native, which is exactly the shape `G42-1` §2 measured
+// — into a thread-local load and two compares, with `resolve_id` paid only on
+// the first dispatch of a callback. The census then says the row is a floor,
+// which is what schema 5 exists to print.
+//
+// On request (`CRATONVM_CENSUS_EXACT_INVOCATIONS`): **count exactly**, one
+// `resolve_id` plus one relaxed `fetch_add` per dispatch. That is the arm
+// `G42-1` §6 N2 wanted and could not cost; it is off by default precisely
+// because nobody has run the interleaved A/B the brief requires — and the one
+// run that *needs* it, a census run, is the one run where a few ns on the
+// native boundary buys the entire point of the file.
+//
+// This is the shape the capability gate ~16,300 lines above already argues for
+// on this same path and for this same reason ("re-deriving it with `resolve_id`
+// would pay a *second* full 128-bit hash per dispatch … the id is resolved only
+// after step 2 has said this native is capability-relevant, in the `#[cold]`
+// half"). It also inherits that gate's stated trade: under the default arm the
+// dump **under-reports `invocations` and says so**, rather than reporting a
+// number it cannot stand behind.
+//
+// # What would make this exact for free
+//
+// The in-source comment at the `find_with_kind` hit already prescribes it: "a
+// `find_with_kind`-shaped lookup that also returns the slot id". That is a
+// `native-api` edit and it is nominated, not done here.
+//
+// NOTE for whoever writes it: `G42-1` §6 N2 glosses the fix as `resolve_id` +
+// `callback_of` + **`kind_of_id`**, and that gloss is wrong. `find_with_kind`'s
+// own doc records that its cold descriptor-quirk arm looks the kind up with the
+// ORIGINAL descriptor, misses, and **deliberately** falls back to `Bridge`;
+// `kind_of_id` would return the slot's true kind instead. On a quirky
+// descriptor that flips `synthetic_stub_native`, which is the input to the
+// real-JDK `SyntheticStub` drop and to `resolve_native_dispatch_wave1` — a
+// dispatch-semantics change, in `--jdk-only`, which is the mode all 99
+// regression vectors run in. `find_with_kind` is left untouched here for
+// exactly that reason.
+
+/// Whether this run was asked for an **exact** `invocations` column on the
+/// general-resolver arm (`CRATONVM_CENSUS_EXACT_INVOCATIONS`), at the price of
+/// one `resolve_id` per native dispatch that reaches `invoke_or_native`.
+///
+/// Off by default. `OnceLock` and one relaxed load after the first call, the
+/// same shape `registry::lookup_census::enabled` uses on this very path — the
+/// disabled case is a load and a not-taken branch.
+#[inline]
+fn census_exact_general_dispatch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(v) = ENABLED.get() {
+        return *v;
+    }
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_CENSUS_EXACT_INVOCATIONS").is_some()
+    })
+}
+
+std::thread_local! {
+    /// `(vm_identity, registry generation, two callback addresses already
+    /// declared)` for this thread.
+    ///
+    /// A `Cell` of a `Copy` payload, mirroring `PERMISSIVE_DISPATCH_MEMO`
+    /// directly above: no `RefCell` borrow flag, no `Arc` clone, no allocation.
+    ///
+    /// Two slots rather than one because the measured shape is a loop over a
+    /// small set of natives, and rather than four because every extra slot is a
+    /// compare on the VM's general native path. A miss costs one `resolve_id`
+    /// and a relaxed store, never a wrong answer:
+    /// `mark_invocations_incomplete` is idempotent and sticky by contract, so
+    /// thrash re-declares an already-declared slot and changes nothing.
+    ///
+    /// Keyed on the **registry generation** as well as the VM, so a
+    /// `RegisterNatives` that introduces new slots invalidates the memo instead
+    /// of letting a stale callback address vouch for a slot it no longer names.
+    /// A callback address is never 0, so the all-zero initial value cannot
+    /// collide with a real entry — the same reasoning `PERMISSIVE_DISPATCH_MEMO`
+    /// records for `vm_identity`.
+    static GENERAL_DISPATCH_CENSUS_MEMO: std::cell::Cell<(usize, u32, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+/// Whether this thread has already declared the slot behind `callback`
+/// incomplete for this VM and registry generation — and record it if not.
+///
+/// Insert-at-front, evict-the-older: a two-entry direct-mapped cache with no
+/// hashing.
+#[inline]
+fn general_dispatch_census_already_declared(
+    vm_identity: usize,
+    generation: u32,
+    callback: usize,
+) -> bool {
+    GENERAL_DISPATCH_CENSUS_MEMO.with(|memo| {
+        let (memo_vm, memo_gen, first, second) = memo.get();
+        if memo_vm == vm_identity && memo_gen == generation {
+            if first == callback || second == callback {
+                return true;
+            }
+            memo.set((memo_vm, memo_gen, callback, first));
+        } else {
+            // Different VM, or the registry grew: start over rather than
+            // inherit an answer that was about other slots.
+            memo.set((vm_identity, generation, callback, 0));
+        }
+        false
+    })
+}
+
+/// Drop this thread's [`GENERAL_DISPATCH_CENSUS_MEMO`], so the next dispatch of
+/// every callback is declared again. For the tests that pin the memo's shape.
+#[cfg(test)]
+fn reset_general_dispatch_census_memo() {
+    GENERAL_DISPATCH_CENSUS_MEMO.with(|memo| memo.set((0, 0, 0, 0)));
+}
+
+/// Resolve the slot this dispatch is about to run and either **count** it or
+/// **declare it uncounted**, per [`census_exact_general_dispatch_enabled`].
+///
+/// `#[cold]` and out of line: on the default arm it runs once per callback per
+/// thread, and on the exact arm the caller is about to pay the ~141 ns
+/// `safe_native_call` funnel anyway.
+///
+/// # The verification, and why it is not paranoia
+///
+/// `resolve_id` and `find_with_kind` agree on the fast exact-hash path by
+/// construction, and both fall back to a descriptor-quirk rewrite — but through
+/// *different* functions (`resolve_id_with_descriptor_quirks` versus
+/// `find_with_descriptor_quirks`). Rather than assume the two rewrites always
+/// land on the same slot, this checks that the resolved slot's callback **is
+/// the one about to run**, by address, and does nothing otherwise. Marking or
+/// counting a neighbouring slot would put a wrong number on a row that looks
+/// authoritative, which is worse than the silence it replaced.
+///
+/// Compared as `usize` rather than as function pointers: `==` on `fn` pointers
+/// draws `unpredictable_function_pointer_comparisons`, and the address is the
+/// identity this memo already keys on.
+#[cold]
+#[inline(never)]
+fn census_general_dispatch_cold(
+    registry: &crate::native::registry::NativeMethodRegistry,
+    callback: cratonvm_native_api::NativeCallback,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    exact: bool,
+) {
+    let Some(id) = registry.resolve_id(class_name, method_name, descriptor) else {
+        return;
+    };
+    if registry.callback_of(id).map(|cb| cb as usize) != Some(callback as usize) {
+        return;
+    }
+    if exact {
+        registry.record_invocation(id);
+    } else {
+        registry.mark_invocations_incomplete(id);
+    }
+}
+
+/// The census hook every native-dispatching arm of [`invoke_or_native`] calls
+/// immediately before `safe_native_call`.
+///
+/// Purely additive: it reads the registry, writes only census state, returns
+/// nothing and cannot change which callback runs. Deliberately placed at the
+/// dispatch — not at the `find_with_kind` hit — for the reason the capability
+/// gate states one line away: the arms between the lookup and here can still
+/// route the call to real bytecode, and a slot that did not run must not be
+/// declared to have bypassed anything.
+#[inline]
+fn census_general_native_dispatch(
+    shared: &SharedVm,
+    callback: cratonvm_native_api::NativeCallback,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) {
+    let registry = &shared.natives.native_methods;
+    if census_exact_general_dispatch_enabled() {
+        census_general_dispatch_cold(
+            registry,
+            callback,
+            class_name,
+            method_name,
+            descriptor,
+            true,
+        );
+        return;
+    }
+    if general_dispatch_census_already_declared(
+        shared.vm_identity,
+        registry.generation(),
+        callback as usize,
+    ) {
+        return;
+    }
+    census_general_dispatch_cold(
+        registry,
+        callback,
+        class_name,
+        method_name,
+        descriptor,
+        false,
+    );
+}
+
 #[cfg(target_os = "windows")]
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const i8) -> *mut std::ffi::c_void;
@@ -17369,6 +17613,13 @@ pub fn invoke_or_native(
                     "type",
                     "()Ljava/lang/invoke/MethodType;",
                 ) {
+                    census_general_native_dispatch(
+                        shared,
+                        callback,
+                        "java/lang/foreign/DowncallHandle",
+                        "type",
+                        "()Ljava/lang/invoke/MethodType;",
+                    );
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
                 }
@@ -17391,6 +17642,13 @@ pub fn invoke_or_native(
                     method_name,
                     "([Ljava/lang/Object;)Ljava/lang/Object;",
                 ) {
+                    census_general_native_dispatch(
+                        shared,
+                        callback,
+                        "java/lang/foreign/DowncallHandle",
+                        method_name,
+                        "([Ljava/lang/Object;)Ljava/lang/Object;",
+                    );
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
                 }
@@ -17483,6 +17741,13 @@ pub fn invoke_or_native(
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "java/lang/ClassLoader",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17514,6 +17779,13 @@ pub fn invoke_or_native(
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "java/lang/ClassLoader",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17538,6 +17810,13 @@ pub fn invoke_or_native(
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "java/lang/ClassLoader",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17559,6 +17838,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/jar/ManifestInfo",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17573,6 +17859,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/jar/NestedJarFile",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17591,6 +17884,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17605,6 +17905,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/net/protocol/jar/UrlJarFile",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17621,6 +17928,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/zip/ZipContent$SignatureFiles",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17836,6 +18150,13 @@ pub fn invoke_or_native(
                         method_name,
                         descriptor,
                     )?;
+                    census_general_native_dispatch(
+                        shared,
+                        callback,
+                        effective_class,
+                        method_name,
+                        descriptor,
+                    );
                     return safe_native_call(shared, thread, callback, args)
                         .map(|v| coerce_native_return(v, descriptor));
                 }
@@ -17858,6 +18179,7 @@ pub fn invoke_or_native(
                 .native_methods
                 .find(class_name, method_name, descriptor)
         {
+            census_general_native_dispatch(shared, callback, class_name, method_name, descriptor);
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17903,6 +18225,13 @@ pub fn invoke_or_native(
                                 method_name,
                                 descriptor,
                             ) {
+                                census_general_native_dispatch(
+                                    shared,
+                                    callback,
+                                    &parent.name,
+                                    method_name,
+                                    descriptor,
+                                );
                                 drop(cm);
                                 return safe_native_call(shared, thread, callback, args)
                                     .map(|v| coerce_native_return(v, descriptor));
@@ -17920,6 +18249,13 @@ pub fn invoke_or_native(
                                     parent.name
                                 );
                             }
+                            census_general_native_dispatch(
+                                shared,
+                                callback,
+                                &parent.name,
+                                method_name,
+                                descriptor,
+                            );
                             drop(cm);
                             return safe_native_call(shared, thread, callback, args)
                                 .map(|v| coerce_native_return(v, descriptor));
@@ -30752,5 +31088,211 @@ mod tests {
         assert!(proxy_reference_return_refusal(&shared, obj, "Ljava/lang/Object;").is_none());
         assert!(proxy_reference_return_refusal(&shared, obj, "[Ljava/lang/String;").is_none());
         assert!(proxy_reference_return_refusal(&shared, obj, "[I").is_none());
+    }
+
+    // ─────────── the general resolver's census arm (G47-1, assignment B) ────
+    //
+    // `G42-1` §3 measured `invoke_or_native` as the fourth and largest bypass
+    // family and prescribed the fix in an in-source comment. These pin what
+    // landed: the declaration, the exact arm, the guard that keeps either from
+    // touching a neighbouring slot, and the memo that keeps the default arm
+    // off the triple-hash path.
+
+    fn census_probe_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(None)
+    }
+
+    fn census_probe_native_2(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(Some(Value::Int(7)))
+    }
+
+    fn census_probe_registry() -> cratonvm_native_api::NativeMethodRegistry {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+            r.register(
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+                census_probe_native,
+            );
+            r.register(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+                census_probe_native_2,
+            );
+        });
+        registry
+    }
+
+    const METHOD_INVOKE: (&str, &str, &str) = (
+        "java/lang/reflect/Method",
+        "invoke",
+        "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+
+    /// **The default arm turns the row into an admitted floor and moves no
+    /// number.**
+    ///
+    /// `Method.invoke` is the measured subject: `G42-1` §2 read 1,999 in the
+    /// JIT arm against 99,999 under `--nojit`, from this exact dispatch. The
+    /// mark does not repair the count — nothing here can — it makes the row say
+    /// the count is a floor, which is the difference between an instrument that
+    /// says "at least N" and one that says "N" and means "at least N".
+    #[test]
+    fn a_general_resolver_dispatch_declares_its_row_a_floor_without_moving_the_tally() {
+        let registry = census_probe_registry();
+        let (c, m, d) = METHOD_INVOKE;
+        let id = registry.resolve_id(c, m, d).expect("registered");
+        let control = registry
+            .resolve_id(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+            )
+            .expect("registered");
+
+        // A few calls did reach the counted path before the site went compiled.
+        registry.record_invocation(id);
+        registry.record_invocation(id);
+        assert_eq!(registry.invocations_complete(id), Some(true));
+
+        census_general_dispatch_cold(&registry, census_probe_native, c, m, d, false);
+
+        assert_eq!(
+            registry.invocations_of_id(id),
+            Some(2),
+            "declaring must not disturb the tally: the floor is the number a \
+             reader falls back on"
+        );
+        assert_eq!(registry.invocations_complete(id), Some(false));
+        assert_eq!(
+            registry.invocations_complete(control),
+            Some(true),
+            "the bit is per slot — a bypass on one native must not cast doubt \
+             on one still dispatched through the counted path"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+
+        // Sticky and idempotent: this fires once per callback per thread, but
+        // a memo miss re-enters it and every re-entry must be a no-op.
+        census_general_dispatch_cold(&registry, census_probe_native, c, m, d, false);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+        assert_eq!(registry.invocations_of_id(id), Some(2));
+
+        // And the doubt has to survive into `census()`, which is the only place
+        // a reader ever sees it — and, since schema 5, the only place it is
+        // written down.
+        let census = registry.census();
+        let row = census
+            .iter()
+            .find(|r| r.class == c && r.owns_slot)
+            .expect("slot owner");
+        assert!(!row.invocations_complete);
+        assert_eq!(row.invocations, 2);
+    }
+
+    /// **The exact arm counts and leaves the completeness claim alone.**
+    ///
+    /// `CRATONVM_CENSUS_EXACT_INVOCATIONS` buys a real count on this arm at the
+    /// price of one `resolve_id` per dispatch. When it is on, the row is a
+    /// total *for this family* and must not be labelled a floor by it — the
+    /// label would then be describing a bypass that is not happening.
+    #[test]
+    fn the_exact_arm_counts_the_dispatch_instead_of_declaring_it_uncounted() {
+        let registry = census_probe_registry();
+        let (c, m, d) = METHOD_INVOKE;
+        let id = registry.resolve_id(c, m, d).expect("registered");
+
+        for _ in 0..3 {
+            census_general_dispatch_cold(&registry, census_probe_native, c, m, d, true);
+        }
+
+        assert_eq!(registry.invocations_of_id(id), Some(3));
+        assert_eq!(
+            registry.invocations_complete(id),
+            Some(true),
+            "the exact arm is not a bypass; labelling it one would report a \
+             floor where there is a total"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+    }
+
+    /// **Nothing is ever recorded against a slot whose callback is not the one
+    /// about to run.**
+    ///
+    /// `resolve_id` and `find_with_kind` agree on the exact-hash path but reach
+    /// their descriptor-quirk fallbacks through different functions. A wrong
+    /// number on a row that looks authoritative is worse than the silence this
+    /// replaced, so the resolved slot's callback is checked by address first.
+    #[test]
+    fn a_callback_that_is_not_the_resolved_slots_touches_no_census_state() {
+        let registry = census_probe_registry();
+        let (c, m, d) = METHOD_INVOKE;
+        let id = registry.resolve_id(c, m, d).expect("registered");
+
+        // Right triple, wrong callback — the shape a quirk-rewritten resolution
+        // would produce.
+        census_general_dispatch_cold(&registry, census_probe_native_2, c, m, d, false);
+        census_general_dispatch_cold(&registry, census_probe_native_2, c, m, d, true);
+        assert_eq!(registry.invocations_complete(id), Some(true));
+        assert_eq!(registry.invocations_of_id(id), Some(0));
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+
+        // A triple with no row at all is a silent no-op, not a panic. This runs
+        // on the VM's general native path, so "does not panic" is an assertion.
+        census_general_dispatch_cold(
+            &registry,
+            census_probe_native,
+            "java/lang/String",
+            "charAt",
+            "(I)C",
+            false,
+        );
+        let empty = cratonvm_native_api::NativeMethodRegistry::new();
+        census_general_dispatch_cold(&empty, census_probe_native, c, m, d, false);
+        census_general_dispatch_cold(&empty, census_probe_native, c, m, d, true);
+        assert_eq!(empty.slots_with_incomplete_invocations(), 0);
+    }
+
+    /// **The memo keeps the default arm off the triple-hash path**, holds two
+    /// callbacks, and cannot let a stale entry vouch across a registry change.
+    ///
+    /// The memo is what makes "declare on dispatch" affordable without a build:
+    /// it turns the measured shape — a loop calling the same native — into a
+    /// thread-local load and two compares. Correctness never depends on it,
+    /// because the mark is sticky and idempotent; only the cost does.
+    #[test]
+    fn the_dispatch_memo_declares_once_per_callback_and_resets_with_the_registry() {
+        reset_general_dispatch_census_memo();
+        let (a, b, c) = (0x1000usize, 0x2000usize, 0x3000usize);
+
+        assert!(!general_dispatch_census_already_declared(1, 7, a));
+        assert!(general_dispatch_census_already_declared(1, 7, a));
+
+        // Two slots, so an alternating pair of natives does not thrash.
+        assert!(!general_dispatch_census_already_declared(1, 7, b));
+        assert!(general_dispatch_census_already_declared(1, 7, a));
+        assert!(general_dispatch_census_already_declared(1, 7, b));
+
+        // A third evicts the older of the two.
+        assert!(!general_dispatch_census_already_declared(1, 7, c));
+        assert!(general_dispatch_census_already_declared(1, 7, c));
+        assert!(general_dispatch_census_already_declared(1, 7, b));
+
+        // A `RegisterNatives` that grows the registry invalidates the memo
+        // rather than letting a callback address vouch for a slot it may no
+        // longer name.
+        assert!(!general_dispatch_census_already_declared(1, 8, c));
+        // So does a different VM in the same process.
+        assert!(!general_dispatch_census_already_declared(2, 8, c));
+        reset_general_dispatch_census_memo();
+        assert!(!general_dispatch_census_already_declared(2, 8, c));
     }
 }

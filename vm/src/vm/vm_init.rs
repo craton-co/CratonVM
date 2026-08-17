@@ -1078,7 +1078,10 @@ impl BootstrapPhase<RuntimeReady> {
 
 #[cfg(test)]
 mod typed_bootstrap_phase_tests {
-    use super::{BootstrapInvariantError, BootstrapPhase};
+    use super::{
+        native_census_incomplete_header_json, native_census_invocations_json,
+        BootstrapInvariantError, BootstrapPhase, NATIVE_CENSUS_SCHEMA_VERSION,
+    };
 
     #[test]
     fn phase_invariants_fail_at_the_boundary_that_owns_them() {
@@ -1119,6 +1122,113 @@ mod typed_bootstrap_phase_tests {
             .expect("runtime")
             .finish();
         assert!(elapsed <= std::time::Duration::from_secs(1));
+    }
+
+    // ───────────────────────── native census, schema 5 ─────────────────────
+    //
+    // `G47-1`. The registry has carried a per-slot "this count is a floor" bit
+    // since 2026-08-17 and 25 slots set it; until schema 5 the census writer
+    // emitted neither the bit nor its header total, so no reader could see any
+    // of them. These pin the shape that fixed it.
+
+    /// **The tally can never be emitted without its qualifier.**
+    ///
+    /// This is the whole defect in one assertion: `invocations` alone is
+    /// unreadable — `0` means "never called" and "called through a path that
+    /// does not count" equally well — and the fix is that one function emits
+    /// both or neither. A future edit that deletes the second line has to do it
+    /// on purpose.
+    #[test]
+    fn a_census_rows_invocation_tally_always_carries_its_completeness_bit() {
+        let floor = native_census_invocations_json(1_999, false);
+        assert!(floor.contains("\"invocations\": 1999,"), "{floor}");
+        assert!(
+            floor.contains("\"invocations_complete\": false,"),
+            "{floor}"
+        );
+        // JSON booleans, not the strings "false"/"true": a quoted value would
+        // parse as truthy in every consumer that does a bare truthiness test,
+        // which is the one direction this instrument must not err in.
+        assert!(!floor.contains("\"false\""), "{floor}");
+
+        let total = native_census_invocations_json(0, true);
+        assert!(total.contains("\"invocations\": 0,"), "{total}");
+        assert!(total.contains("\"invocations_complete\": true,"), "{total}");
+
+        // Order matters for a human reading the file top to bottom: the
+        // qualifier must follow the number it qualifies, not precede it.
+        let i = floor.find("\"invocations\":").expect("tally key");
+        let c = floor.find("\"invocations_complete\":").expect("bit key");
+        assert!(i < c, "the bit must follow the tally:\n{floor}");
+    }
+
+    /// The header total is a **slot** count and says so; `0` is a real answer
+    /// (nothing declared itself) and must still be emitted, because an absent
+    /// key is exactly what schema 4 had and what nobody could read.
+    #[test]
+    fn the_header_states_the_incomplete_slot_total_even_when_it_is_zero() {
+        let none = native_census_incomplete_header_json(0);
+        assert!(
+            none.contains("\"slots_with_incomplete_invocations\": 0,"),
+            "{none}"
+        );
+        let some = native_census_incomplete_header_json(25);
+        assert!(
+            some.contains("\"slots_with_incomplete_invocations\": 25,"),
+            "{some}"
+        );
+        // Header indentation (two spaces), not row indentation (six): it sits
+        // beside `counts` and `invocations`, not inside `natives`.
+        assert!(some.starts_with("  \""), "{some}");
+    }
+
+    /// **The writer, the doc example and the schema constant cannot drift.**
+    ///
+    /// `G37-1` §6 N2 measured a binary emitting `schema_version: 3`, `G42-1`
+    /// §6 N1 measured `4` on a later one, and `--help` documented a third
+    /// shape — three records disagreeing about one integer, all of them right
+    /// about the binary they ran. The constant is the single source; this
+    /// witness is what makes editing the writer's literal impossible.
+    ///
+    /// Reads this file from the **working tree** rather than `include_str!`,
+    /// matching `registrar_call_graph_witness`: a compile-time snapshot would
+    /// keep passing against source that is no longer there.
+    #[test]
+    fn the_census_writer_emits_the_schema_constant_and_both_new_keys() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vm/vm_init.rs"))
+                .expect("witness must read vm_init.rs from the working tree");
+
+        assert_eq!(
+            NATIVE_CENSUS_SCHEMA_VERSION, 5,
+            "schema 5 is what adds invocations_complete; bumping this constant \
+             without moving scripts/jdk-only-bridge-ratchet.py's \
+             REQUIRED_CENSUS_SCHEMA (an equality test) turns the bridge ratchet \
+             red — see G47-1 NOMINATION 1"
+        );
+
+        assert!(
+            src.contains("NATIVE_CENSUS_SCHEMA_VERSION"),
+            "the writer must stamp the constant, not a literal"
+        );
+        assert!(
+            src.contains("native_census_invocations_json("),
+            "the row loop must go through the function that emits both halves"
+        );
+        assert!(
+            src.contains("native_census_incomplete_header_json("),
+            "the header must carry slots_with_incomplete_invocations"
+        );
+        // The published example a reader copies from must show the new keys,
+        // or the schema is documented as its predecessor.
+        assert!(
+            src.contains("\"invocations_complete\": false,"),
+            "the doc example must show the bit"
+        );
+        assert!(
+            src.contains("\"slots_with_incomplete_invocations\": 25,"),
+            "the doc example must show the header total"
+        );
     }
 }
 
@@ -4897,10 +5007,12 @@ impl SharedVm {
     ///
     /// ```json
     /// {
-    ///   "schema_version": 4,
+    ///   "schema_version": 5,
     ///   "mode": "compatible",
     ///   "image_adjudication": true,
     ///   "counts": { "intrinsic": 2, "bridge": 1, "synthetic-stub": 1, "total": 4 },
+    ///   "invocations": { "intrinsic": 267, "bridge": 2818, "synthetic-stub": 0 },
+    ///   "slots_with_incomplete_invocations": 25,
     ///   "natives": [
     ///     { "class": "java/lang/System", "name": "arraycopy",
     ///       "descriptor": "([Ljava/lang/Object;I[Ljava/lang/Object;II)V",
@@ -4908,6 +5020,7 @@ impl SharedVm {
     ///       "registered_by": "native-builtins/src/lib.rs:1234",
     ///       "overwrote": "synthetic-stub",
     ///       "invocations": 10,
+    ///       "invocations_complete": false,
     ///       "kind_stated": true, "kind_chosen": true,
     ///       "owns_slot": true,
     ///       "real_declaring_method": { "loaded": true, "declared": true,
@@ -4943,6 +5056,32 @@ impl SharedVm {
     ///
     /// Reading the two together is the point: `real` says whether this run
     /// exercised the slot, `image` says whether the JDK declares it at all.
+    ///
+    /// ## Schema 5 — `invocations_complete` and `slots_with_incomplete_invocations`
+    ///
+    /// `invocations` was always documented as a **lower bound**
+    /// (`NativeMethodRegistry::record_invocation`), and the registry has
+    /// carried a per-slot "this is a floor" bit
+    /// (`NativeMethodRegistry::mark_invocations_incomplete`) since
+    /// 2026-08-17. Until schema 5 **this writer emitted neither** — measured
+    /// against real dumps by `G37-1` §6 N2 and `G42-1` §6 N1 — so 25 slots
+    /// declared themselves uncounted and every reader of the file was told
+    /// `invocations: 0` with nothing to distinguish "never called" from "called
+    /// through a path that does not count".
+    ///
+    /// Schema 5 emits the bit per row and the slot total in the header. It
+    /// changes **no number**: not a count, not an invocation tally, not
+    /// `owns_slot`. What it changes is what a number licenses, and only ever in
+    /// the direction of less confidence.
+    ///
+    /// What the bit does and does not claim, spelled out because it is easy to
+    /// over-read: `false` means a dispatch path is *wired* for this slot that
+    /// will not count, not that such a dispatch has happened. `true` means no
+    /// path has declared itself — which is **not** "exact", because a bypass
+    /// nobody has audited is indistinguishable from no bypass. There is no
+    /// configuration of this VM in which the whole column is exact
+    /// (`G37-1` §2, `G42-1` §5); `--nojit` with `CRATONVM_DISABLE_INTRINSICS=1`
+    /// is the least inexact one.
     ///
     /// Notes on the fields that are easy to misread:
     ///
@@ -5075,7 +5214,15 @@ impl SharedVm {
         // row as unadjudicated, which is the exact miscount the keys exist to
         // end, so `jdk-only-bridge-ratchet.py` refuses the older shape rather
         // than degrading.
-        out.push_str("{\n  \"schema_version\": 4,\n");
+        // Schema 5 (2026-08-17): rows carry `invocations_complete` and the
+        // header carries `slots_with_incomplete_invocations`. See
+        // [`NATIVE_CENSUS_SCHEMA_VERSION`] for why this is a bump and not an
+        // additive-at-the-same-version change, and for the two consumers that
+        // pin it by equality.
+        out.push_str(&format!(
+            "{{\n  \"schema_version\": {},\n",
+            NATIVE_CENSUS_SCHEMA_VERSION
+        ));
         out.push_str(&format!(
             "  \"image_adjudication\": {},\n",
             image_verdicts.is_some()
@@ -5119,7 +5266,18 @@ impl SharedVm {
                 .native_methods
                 .invocations_of_kind(NativeKind::SyntheticStub)
         ));
-        out.push_str("  },\n  \"natives\": [");
+        out.push_str("  },\n");
+        // How many slots have a dispatch path that has declared itself
+        // uncounted. Emitted between `invocations` and `natives` so it reads as
+        // the qualifier on the block immediately above it. Cold: one relaxed
+        // load per slot, once, at report time — the same shape and the same
+        // justification as the three `invocations_of_kind` calls above.
+        out.push_str(&native_census_incomplete_header_json(
+            self.natives
+                .native_methods
+                .slots_with_incomplete_invocations(),
+        ));
+        out.push_str("  \"natives\": [");
 
         // One read lock for the whole loop: `real_declaring_method` asks the
         // class manager a question per row, and re-acquiring L10 tens of
@@ -5159,7 +5317,16 @@ impl SharedVm {
                 )),
                 None => out.push_str("      \"overwrote\": null,\n"),
             }
-            out.push_str(&format!("      \"invocations\": {},\n", row.invocations));
+            // "How many dispatches resolved this slot by name or id" — and,
+            // inseparably, whether that is a total or a floor. Before schema 5
+            // only the first half was emitted, while the registry had already
+            // been told about 25 bypassing slots; a reader could not tell a
+            // counted zero from an uncounted one. See
+            // [`native_census_invocations_json`].
+            out.push_str(&native_census_invocations_json(
+                row.invocations,
+                row.invocations_complete,
+            ));
             // "Did anyone adjudicate this kind, or did it inherit an ambient
             // `set_category`?" — the discriminator the 157-entry
             // reclassification needs. See `NativeCensusEntry::kind_stated`.
@@ -6089,6 +6256,76 @@ pub fn init_service_loader_bootstrap(registry: &mut NativeMethodRegistry) {
     tracing::info!(
         "WP1.8: ServiceLoader bootstrap wired — META-INF/services classpath scan enabled"
     );
+}
+
+/// The `schema_version` [`SharedVm::dump_native_census_json`] stamps on every
+/// native census it writes.
+///
+/// **5** since 2026-08-17 (`G47-1`): rows gained `invocations_complete` and the
+/// header gained `slots_with_incomplete_invocations`. The bump is not cosmetic
+/// and the reason is the same one schema 4 was bumped for. A schema-4 reader
+/// scoring a schema-5 file is harmless (it ignores two keys); a reader that
+/// believes it is looking at schema 5 and is handed a schema-4 file concludes
+/// **every row is a total**, because the absent key reads as "nothing declared
+/// itself a bypass" — which is the exact direction
+/// `NativeMethodRegistry::mark_invocations_incomplete` says this instrument
+/// must never err in. One `schema_version` with two shapes is the hazard
+/// `dump_native_census_json`'s "only native-census writer" note is about.
+///
+/// A named constant rather than a literal because the writer, this file's doc
+/// example and the witness test below must not be able to drift apart — the
+/// state `G37-1` §6 N2 and `G42-1` §6 N1 measured, where two records disagreed
+/// about whether the shipping binary said 3 or 4 and `--help` said a third
+/// thing.
+///
+/// **Consumers that pin this exactly** (equality, not `>=`), and therefore move
+/// with it: `scripts/jdk-only-bridge-ratchet.py`'s `REQUIRED_CENSUS_SCHEMA` and
+/// the `census_schema_version` recorded in
+/// `scripts/baselines/jdk-only-bridge-ratchet.json`. Neither is in this crate;
+/// see `docs/known-issues/jdk-only/G47-1-*.md` NOMINATION 1.
+/// `scripts/jdk-only-kind-map.py` asks for `>= 2` and needs nothing.
+pub(crate) const NATIVE_CENSUS_SCHEMA_VERSION: u32 = 5;
+
+/// The `invocations` pair of a census row: the tally, and whether it is a
+/// **total** or a **floor**.
+///
+/// The two are emitted together, in this order, by one function on purpose.
+/// The whole defect `G33-1`/`G37-1`/`G42-1` chased is that `invocations` was
+/// readable without its qualifier: 25 slots carried
+/// `NativeCensusEntry::invocations_complete` `false` and **no reader could
+/// see it**, so every consumer of the column read a floor as a count. Emitting
+/// the number from a function that cannot emit it without the bit is the cheap
+/// structural way to keep that from recurring; a future editor who wants one
+/// has to delete the other deliberately.
+///
+/// `false` here means "a dispatch path has *declared* that it serves this slot
+/// without counting" — a claim carried by code, not a proof. `true` means no
+/// path has declared itself, which is weaker than "exact": see
+/// `NativeMethodRegistry::record_invocation`'s bypass list.
+fn native_census_invocations_json(invocations: u64, complete: bool) -> String {
+    format!(
+        "      \"invocations\": {},\n      \"invocations_complete\": {},\n",
+        invocations, complete
+    )
+}
+
+/// The census header's one-line summary of how much of the `invocations`
+/// column is a floor:
+/// `NativeMethodRegistry::slots_with_incomplete_invocations`.
+///
+/// In the header rather than only per row so a reader is told the column is
+/// partly a floor **before** quoting a number out of it, which is the order the
+/// mistake actually happens in — `G33-1` §4 records a lane concluding a body
+/// was dead from `invocations: 0`, and `G42-1` §4 shows zero is the *expected*
+/// reading for a hot native whose loop began after its caller was compiled.
+///
+/// Counted over **slots**, while `natives` is one row per **registration**, so
+/// this number is not the count of rows carrying `invocations_complete: false`
+/// — a superseded row shares its successor's slot and shows the same bit. That
+/// asymmetry is inherited from `counts` (registrations) versus `invocations`
+/// (slots) and is deliberate in both.
+fn native_census_incomplete_header_json(slots: usize) -> String {
+    format!("  \"slots_with_incomplete_invocations\": {},\n", slots)
 }
 
 /// Escape an arbitrary UTF-8 string as a JSON string literal, including
