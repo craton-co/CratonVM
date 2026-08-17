@@ -226,6 +226,33 @@ mod tests {
         assert_eq!(float_compare(-0.0, 0.0), -1);
     }
 
+    /// The three ways this rule gets written wrong, side by side.
+    ///
+    /// `f64::total_cmp` and `partial_cmp(..).unwrap_or(Equal)` are the two
+    /// substitutions that have actually shipped in this tree, and each is wrong
+    /// in its own direction. Naming both here means a reader who reaches for
+    /// one finds the counter-example before the census does.
+    #[test]
+    fn neither_total_cmp_nor_partial_cmp_is_double_compare() {
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+
+        // total_cmp: orders a negatively-signed NaN BELOW -infinity.
+        assert_eq!(double_compare(neg_nan, f64::NEG_INFINITY), 1);
+        assert_eq!(neg_nan.total_cmp(&f64::NEG_INFINITY), std::cmp::Ordering::Less);
+
+        // partial_cmp: `None` for any NaN, so the usual `unwrap_or(Equal)`
+        // makes NaN equal to everything — not merely the wrong order, but a
+        // NON-TRANSITIVE comparator: NaN == 1.0 and NaN == 2.0 while 1.0 != 2.0.
+        assert_eq!(neg_nan.partial_cmp(&1.0), None);
+        assert_eq!(double_compare(neg_nan, 1.0), 1);
+        assert_eq!(double_compare(1.0, neg_nan), -1);
+
+        // ...and it is wrong with no NaN in sight, which is the reachable half:
+        // `partial_cmp` calls the two zeros equal because `-0.0 == 0.0`.
+        assert_eq!((-0.0f64).partial_cmp(&0.0), Some(std::cmp::Ordering::Equal));
+        assert_eq!(double_compare(-0.0, 0.0), -1);
+    }
+
     /// A sort is the shape that actually reached users, so assert on one.
     #[test]
     fn sorting_puts_every_nan_at_the_top_whatever_its_payload() {
