@@ -596,6 +596,7 @@ export inherited from a parent shell.
 | `ir-isel-emit` | `CRATONVM_JIT_IR_ISEL_EMIT` |
 | `ir-isel-verify` | `CRATONVM_JIT_IR_ISEL_VERIFY` |
 | `precise-field-ops` | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` |
+| `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |

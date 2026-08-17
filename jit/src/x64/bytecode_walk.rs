@@ -3962,9 +3962,53 @@ impl Compiler {
                     let throw_bci = self.orig_bci(pc);
                     self.emit_mov_imm32_sx(ARG_REGS[1], throw_bci as i32); // Cast: bci fits i32
                     self.emit_call_absolute(self.helpers.throw_exception);
-                    // Helper returned the i64::MIN sentinel in RAX —
+                    // Helper returned the i64::MIN sentinel in RAX -
                     // propagate it as the method's return value.
-                    self.emit_epilogue();
+                    //
+                    // RBC.6 `athrow` admission: inside a protected range the
+                    // sentinel alone is not enough. `jit_throw_exception` has
+                    // stashed the exception and this bci, but nothing has
+                    // recorded where this frame's non-parameter locals live, so
+                    // a handler that reads one would resume it as 0/null. Route
+                    // through the reason-9 stub instead of returning directly:
+                    // it spills the trapping registers, materializes the precise
+                    // exceptional frame from the snapshot recorded here, and
+                    // then runs exactly the epilogue this arm would have run.
+                    // The unconditional `JMP rel32` is patched by
+                    // `emit_deopt_stubs` the same way a `Jcc rel32` guard is -
+                    // both end in the same four displacement bytes.
+                    //
+                    // `flush_scratch_registers` above ran before the call, so
+                    // any local the snapshot places in a caller-saved register
+                    // has already been spilled to its frame slot; this is the
+                    // same ordering `emit_post_invoke_exception_check` relies on.
+                    //
+                    // Keyed on the EMITTER pc, never on `throw_bci`: every
+                    // `*_box_ptr_by_bci` map, `build_and_record_deopt_point`'s
+                    // analysis lookups and `emit_deopt_stubs`' stub sharing are
+                    // all in emitter coordinates, and each applies `orig_bci`
+                    // itself for the value it hands the runtime. Handing an
+                    // already-translated bci in would double-apply it under a
+                    // bytecode loop rewrite (identity, and byte-identical, on an
+                    // ordinary compile).
+                    let precise_athrow_stub =
+                        self.precise_exception_frames && self.pc_is_protected(pc);
+                    if precise_athrow_stub {
+                        if !self.exc_frame_box_ptr_by_bci.contains_key(&pc) {
+                            let box_ptr = self.build_and_record_deopt_point(
+                                pc,
+                                crate::deopt::DeoptReason::PendingException,
+                            );
+                            self.exc_frame_box_ptr_by_bci.insert(pc, box_ptr);
+                        }
+                        // JMP rel32 (E9) - patched to the reason-9 stub.
+                        self.buf.emit_byte(0xE9);
+                        let patch_offset = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((patch_offset, pc, 9));
+                    } else {
+                        self.emit_epilogue();
+                    }
                     self.reset_spills();
                     self.emitted_athrow = true;
                     dead = true;

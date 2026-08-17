@@ -1092,15 +1092,48 @@ impl Compiler {
     /// `i64::MIN` deopt sentinel and runs the epilogue; the interpreter's
     /// post-JIT drain then throws the stashed OOME through the method's
     /// exception table (catchable, matching the interpreter's allocation paths).
+    ///
+    /// **Inside a protected range this guard publishes a precise exceptional
+    /// frame**, exactly as `emit_post_invoke_exception_check` does, instead of
+    /// branching to the shared sentinel-only stub. That is what makes `new`
+    /// (0xbb) admissible to RBC.6 - see `precise_alloc_ops_enabled` in
+    /// `jit/src/lib.rs` for the argument that this is the whole obligation, and
+    /// the netty adaptive-allocator throughput page for the method it was
+    /// refusing (`AdaptivePoolingAllocator$Magazine.allocate`,
+    /// `reason=rbc6-handler-reads-unsafe-local(pc=338,op=0xbb)`).
+    ///
+    /// The bci keyed here is the ALLOCATING instruction's own, not its
+    /// successor: a reason-9 frame is consumed by `route_jit_signal_exception`,
+    /// which range-tests the bci as the THROW pc against `[start_pc, end_pc)`.
+    /// `emit_post_invoke_exception_check` carries the full argument for that
+    /// choice, and javac ends a protected range at the successor of its last
+    /// instruction often enough that keying on the successor puts the throw
+    /// outside its own handler.
     pub(super) fn emit_post_alloc_oom_check(&mut self) {
+        // Same shape as `emit_post_invoke_exception_check`: a frame is only
+        // useful where this method's own exception table can catch, so outside
+        // every protected range the cheaper shared sentinel exit stays.
+        let throw_bci = self.dbg_last_pc;
+        let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
+            let box_ptr = self.build_and_record_deopt_point(
+                throw_bci,
+                crate::deopt::DeoptReason::PendingException,
+            );
+            self.exc_frame_box_ptr_by_bci.insert(throw_bci, box_ptr);
+        }
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
         // JZ rel32 → shared exception-check stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.exception_check_stubs
-            .push((patch_offset, self.dbg_last_pc));
+        if precise_exc_stub {
+            self.deopt_stubs.push((patch_offset, throw_bci, 9));
+        } else {
+            self.exception_check_stubs
+                .push((patch_offset, self.dbg_last_pc));
+        }
         // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
         // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
         // allocation-failure GC and to construct the OOME — which only the
