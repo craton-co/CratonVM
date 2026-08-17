@@ -1815,30 +1815,33 @@ pub(crate) fn native_math_pow(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // HotSpot-style fast path: integer-valued exponent with finite base.
-    // - Gated on a.is_finite() && b.is_finite() so NaN/±infinity edge cases fall through to powf,
-    //   preserving Java/JLS special-value semantics (e.g. pow(NaN, 0) == 1, pow(±0, neg) == ±inf,
-    //   pow(1, ±inf) == NaN per JLS, etc.).
-    // - b.fract() == 0.0 ensures b is an exact integer (also false for NaN, but we already gated that).
-    // - |b| < 64 keeps powi cheap and avoids producing values that overflow to ±inf when powf
-    //   would have given a finite (but huge) result via continuous exponentiation.
-    // - Negative bases with integer exponents are fine: powi does repeated multiplication, which
-    //   matches Java's result for integer-valued b. Only fractional b on negative a yields NaN in
-    //   Java, and we route those through powf.
-    // The comment above used to claim that falling through to `powf` preserved
-    // `pow(1, ±inf) == NaN`. It does not: C99 defines `pow(±1, anything)` as
-    // 1.0, NaN exponent included, and Java deliberately overrides that — the
-    // javadoc's second rule is "if the absolute value of the first argument
-    // equals 1 and the second argument is infinite, then the result is NaN",
-    // and a NaN exponent is NaN for every base. So the case has to be taken
-    // BEFORE libm sees it. (`StrictMath.pow`, being fdlibm, already agreed.)
-    if a.abs() == 1.0 && (b.is_infinite() || b.is_nan()) {
+    // Three places where Java's `Math.pow` is NOT C99's `pow`, all verified
+    // against a HotSpot JDK 25 oracle (probes/MathSurfaceSweep):
+    //
+    //   * `|x| == 1` with an infinite exponent is NaN. C99 says 1.0.
+    //   * `pow(1.0, NaN)` is NaN. C99 says 1.0. Note the asymmetry — HotSpot
+    //     answers `pow(-1.0, NaN)` with the NaN OPERAND, payload intact, so
+    //     only the `+1.0` base takes the freshly-made canonical NaN.
+    //   * a NaN base propagates with its sign bit; the libm we call clears it.
+    //     `pow(NaN, 0.0)` is still 1.0, so this cannot swallow a zero exponent.
+    if a.abs() == 1.0 && b.is_infinite() {
         return Ok(Some(Value::Double(f64::NAN)));
     }
-    if a.is_finite() && b.is_finite() && b.fract() == 0.0 && b.abs() < 64.0 {
-        let bi = b as i32;
-        return Ok(Some(Value::Double(a.powi(bi))));
+    if a == 1.0 && b.is_nan() {
+        return Ok(Some(Value::Double(f64::NAN)));
     }
+    if a.is_nan() && b != 0.0 {
+        return Ok(Some(Value::Double(a)));
+    }
+    // There used to be an integer-exponent fast path here that routed
+    // `b.fract() == 0 && |b| < 64` to `powi`, i.e. to repeated multiplication.
+    // It was not free: `probes/PowIntExpProbe` puts 400 bases against every
+    // exponent in [-70, 70] and that shortcut disagreed with HotSpot on 36,947
+    // of the 55,600 rows it owned — 66% — against 17 of ~800 on this `powf`
+    // line. Repeated multiplication compounds one rounding per multiply, and
+    // for a negative exponent a reciprocal on top. The census that chose libm
+    // for this function (see the table above `let strict`) drew continuous
+    // exponents, so it never priced the shortcut it was sitting behind.
     Ok(Some(Value::Double(a.powf(b))))
 }
 
@@ -6079,6 +6082,38 @@ mod tests {
         // A unit base with an ordinary exponent is untouched.
         let r = native_math_pow(&mut ctx, &[Value::Double(1.0), Value::Double(3.0)]);
         assert_eq!(d(&r), 1.0f64.to_bits());
+    }
+
+    #[test]
+    fn math_pow_propagates_a_nan_base_with_its_sign() {
+        let mut ctx = mock_ctx();
+        let nan = f64::from_bits(NAN_NEG_PAYLOAD);
+        for exp in [1.0, -1.0, 3.0, -3.0] {
+            let r = native_math_pow(&mut ctx, &[Value::Double(nan), Value::Double(exp)]);
+            assert_eq!(d(&r), NAN_NEG_PAYLOAD, "pow(NaN, {exp})");
+        }
+        // ...but a zero exponent still wins, NaN base or not.
+        let r = native_math_pow(&mut ctx, &[Value::Double(nan), Value::Double(0.0)]);
+        assert_eq!(d(&r), 1.0f64.to_bits());
+        // A NaN exponent under a non-unit base keeps ITS payload.
+        let r = native_math_pow(&mut ctx, &[Value::Double(-1.0), Value::Double(nan)]);
+        assert_eq!(d(&r), NAN_NEG_PAYLOAD);
+    }
+
+    #[test]
+    fn math_pow_integer_exponents_go_through_powf_not_repeated_multiplication() {
+        let mut ctx = mock_ctx();
+        // 0.1^-3: repeated multiplication plus a reciprocal lands one ulp below
+        // the oracle. These two bit patterns are HotSpot JDK 25's answers.
+        let r = native_math_pow(&mut ctx, &[Value::Double(0.1), Value::Double(-3.0)]);
+        assert_eq!(d(&r), 0x408F_3FFF_FFFF_FFFF);
+        let r = native_math_pow(&mut ctx, &[Value::Double(-0.1), Value::Double(-3.0)]);
+        assert_eq!(d(&r), 0xC08F_3FFF_FFFF_FFFF);
+        let r = native_math_pow(
+            &mut ctx,
+            &[Value::Double(4503599627370495.5), Value::Double(-1.0)],
+        );
+        assert_eq!(d(&r), 0x3CB0_0000_0000_0000);
     }
 
     #[test]
