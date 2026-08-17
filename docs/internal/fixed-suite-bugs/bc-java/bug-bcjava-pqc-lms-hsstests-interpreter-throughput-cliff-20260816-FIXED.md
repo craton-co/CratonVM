@@ -215,7 +215,18 @@ and no budget cap it passes on **both** binaries — including the unmodified on
 
 29 is exactly the five constituent classes' counts summed (13 + 7 + 1 + 7 + 1),
 and it is the same count HotSpot reports for the same suite — so this is a real
-green, not a `started=0` one. The fix is **2.14x** on this suite.
+green, not a `started=0` one.
+
+**It reproduces.** A second, independent base/fix pair run hours later from a
+different script:
+
+| run | base | +fix | gain |
+|---|---|---|---|
+| first | 1460 s | 681 s | 2.14x |
+| second | 1008 s | **315 s** | **3.20x** |
+
+Four runs, two binaries, two harnesses, all `OK (29 tests)`. The pass is not a
+one-off, and the fix is worth 2–3x on this suite depending on host load.
 
 The class that owns 15.9 of those 16 HotSpot seconds behaves the same way:
 
