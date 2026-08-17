@@ -1211,6 +1211,16 @@ pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
 }
 
+/// `zgc_concurrent_mark_cycle` for the JIT allocation helpers.
+///
+/// Same reason `maybe_gc_forced_pub` exists: `vm/src/jit/helpers.rs` is a
+/// sibling module and the cycle opener is `pub(super)`. See
+/// `jit_maybe_start_zgc_concurrent_mark` for why the JIT needs its own call
+/// site at all -- a fully compiled allocation loop reaches `maybe_gc` never.
+pub fn zgc_concurrent_mark_cycle_pub(shared: &SharedVm, thread: &mut JvmThread) {
+    zgc_concurrent_mark_cycle(shared, thread);
+}
+
 /// Allocate a dynamically-produced `java.lang.String` under the SAME
 /// heap-exhaustion contract as `new`: collect, retry, and finally raise a
 /// catchable `OutOfMemoryError` -- never abort the process.

@@ -2525,6 +2525,10 @@ pub struct ZgcRealHeap {
     /// [`Self::conc_phase_nanos`] can be closed out at mark end. `0` when no
     /// cycle is open.
     conc_mark_started_at: AtomicU64,
+    /// `allocated` at which a concurrent cycle opens, precomputed from
+    /// [`Self::conc_start_percent`] and [`Self::gc_threshold`]. `0` means
+    /// concurrent marking is off for this heap.
+    conc_start_bytes: usize,
     /// Phase 4: the barrier's good mask, and the phase machine behind it.
     ///
     /// `Z_REMAPPED` — "no mark parity is good; addresses are plain" — until a
@@ -2917,6 +2921,14 @@ impl ZgcRealHeap {
             conc_ingress_replayed: AtomicUsize::new(0),
             conc_phase_nanos: AtomicU64::new(0),
             conc_mark_started_at: AtomicU64::new(0),
+            conc_start_bytes: {
+                let pct = conc_start_percent_setting();
+                if pct == 0 {
+                    0
+                } else {
+                    (cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100) / 100 * pct
+                }
+            },
             mark_ingress_pushes: AtomicUsize::new(0),
             barrier_good_mask: AtomicU64::new(vaddr::Z_REMAPPED),
             relocate_active: AtomicBool::new(false),
@@ -3047,15 +3059,7 @@ impl ZgcRealHeap {
     /// overrides it; `0` disables concurrent marking outright and is the kill
     /// switch this feature is required to ship with.
     fn conc_start_percent(&self) -> usize {
-        static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CACHED.get_or_init(|| {
-            match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_CONC_START")
-                .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
-            {
-                Some(p) => p.min(100),
-                None => Z_CONC_START_PERCENT_DEFAULT,
-            }
-        })
+        conc_start_percent_setting()
     }
 
     /// How many mark workers a CONCURRENT cycle should use.
@@ -3086,24 +3090,28 @@ impl ZgcRealHeap {
 
     /// Should a concurrent mark cycle open now?
     ///
-    /// Called from the VM's allocation path on every allocation that reaches
-    /// `maybe_gc`, so it is two relaxed loads and a comparison and nothing
-    /// else. Everything expensive is behind [`Self::start_concurrent_mark`].
+    /// On the allocation path of both the interpreter (`maybe_gc`) and the JIT
+    /// (`jit_new_object` / `jit_newarray`), so it is two relaxed loads and
+    /// three comparisons against precomputed fields. The percentage is turned
+    /// into [`Self::conc_start_bytes`] once, at construction: it used to be a
+    /// division here, which is a strange thing to put on an allocation path
+    /// for a number that cannot change.
+    ///
+    /// Everything expensive is behind [`Self::start_concurrent_mark`].
     #[inline]
     pub fn should_start_concurrent_mark(&self) -> bool {
-        if self.conc_cycle_active.load(Ordering::Relaxed) {
+        // `0` is the kill switch (`CRATONVM_ZGC_CONC_START=0`) AND the
+        // disabled-by-default state, so this is the first and cheapest test.
+        if self.conc_start_bytes == 0 {
             return false;
         }
-        let start_percent = self.conc_start_percent();
-        if start_percent == 0 {
-            return false;
-        }
-        let trigger = self.gc_threshold / 100 * start_percent;
         let a = self.allocated.load(Ordering::Relaxed);
         // The `< gc_threshold` clause is not redundant. Above the collection
         // threshold a collection is already due, and opening a cycle there
         // would pay a mark-start pause for a concurrent phase of zero length.
-        a >= trigger && a < self.gc_threshold
+        a >= self.conc_start_bytes
+            && a < self.gc_threshold
+            && !self.conc_cycle_active.load(Ordering::Relaxed)
     }
 
     /// Is a concurrent mark cycle in flight?
@@ -7426,6 +7434,24 @@ const Z_CONC_MARK_END_RESTART_BUDGET: usize = 8;
 /// small enough that the ingress cannot grow past ~64 KiB per handoff window
 /// however hard the workload stores.
 const Z_SATB_HANDOFF_INTERVAL: usize = 8192;
+
+/// `CRATONVM_ZGC_CONC_START`, read once per process.
+///
+/// A free function rather than a method because the constructor needs it
+/// before there is a `self` to call it on -- the answer is turned into
+/// `ZgcRealHeap::conc_start_bytes` there, so nothing on the allocation path
+/// ever divides.
+fn conc_start_percent_setting() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_CONC_START")
+            .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
+        {
+            Some(p) => p.min(100),
+            None => Z_CONC_START_PERCENT_DEFAULT,
+        }
+    })
+}
 
 /// A fragmentation reading, taken post-sweep — the "steady state" of Phase 2.2.
 ///
