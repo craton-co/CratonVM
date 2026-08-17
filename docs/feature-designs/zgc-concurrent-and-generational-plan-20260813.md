@@ -734,7 +734,30 @@ i.e. G2 below.
 
 A slide drops the floor and arms `gen_force_major_next`: after a relocation an
 address no longer says which generation an object is in, and re-deriving the
-boundary would be guesswork.
+boundary would be guesswork. A floor left *above* the cursor by a tail retraction
+recovers the same way, and there is a test for it — otherwise it stalls collection
+until an allocation fails, which presents as a slow leak rather than as a bug.
+
+#### It is NOT yet measured against §3b, and here is why not
+
+The re-run was attempted on 2026-08-17 and the host was at **load 25–35 on 8
+cores** for its whole duration (other sessions building and running suites).
+§3b's table was taken on an idle box, so the two are not comparable and no pause
+figure from that run is quoted here. This tree has a standing rule about exactly
+this: a shared host's load invalidates a timing comparison, and one
+un-interleaved run in §2b already said "free" and was noise.
+
+**What IS load-independent, and what to check first on the re-run:** the
+engagement counters. `swept=A/B` on each `[GC] zgc-real:` line and
+`sweep_skipped` on `[GC] zgc-nursery:` are counts, not timings. `A == B`, or
+`sweep_skipped=0` with `young_cycles>0`, means the floor never moved and the whole
+change is inert — and that is the state §3b was in for the split itself, so it is
+the first thing to read, before any pause number.
+
+The comparison to make, once the box is quiet: the same probe and arguments as
+§3b (800k retained, 600 rounds of 30k churn, `-Xmx1200m`, arms interleaved), and
+the number to watch is `sweep` in `[GC] zgc-pause:` — 182 ms of a 309 ms mean
+before, and O(young) is only worth having if that falls.
 
 ### G2 — promotion, and a real young space — **NOT BUILT, and re-scoped**
 
