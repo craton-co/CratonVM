@@ -13,6 +13,11 @@ inferred from a single arm.
 | `CRATONVM_ARGS="--jdk-only"` | 97 of 99 | **99 of 99** |
 | `SUITE=all` (Compatible mode) | 92 of 99 | **94 of 99** |
 
+The third arm, `SUITE=core` — **the DEFAULT, which is what anyone who types
+`bash regression-suite/run.sh` with no environment gets** — is **60 of 61** at
+`89e2c56f1`, failing `RImmutableFactoryTypes`. That is one of the five below,
+and it is the one a newcomer meets first.
+
 Both arms improved by exactly the vectors that were fixed, and **no vector
 regressed in either arm**. The Compatible-mode failure lists are nested:
 
@@ -88,9 +93,11 @@ the tree, because each one already has an oracle-differential vector proving
 the real bytecode is right. That is a far stronger starting position than the
 24 pure-Java triples in `G60-1` §2, which have no failing row behind them.
 
-**N2 — run both arms in CI, not just one.** This gap was invisible for the
-whole session because only the `--jdk-only` arm was being measured. Two arms
-cost two commands and would have surfaced it on day one.
+**N2 — run all three arms in CI, not one.** This gap was invisible for the
+whole session because only the `--jdk-only` arm was being measured. Three arms
+cost three commands and would have surfaced it on day one — and the DEFAULT
+arm is red, which means the failure is not even hidden behind an unusual
+invocation.
 
 **N3 — `G60-1` N3 re-raised and now sharper.** Run `--jdk-only-report` against
 a real application. `APP-READINESS-20260812.md` has the Spring and Tomcat
