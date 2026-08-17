@@ -3793,9 +3793,11 @@ pub(super) fn try_jit_upgrade_with_gate(
                         callee_desc,
                         store,
                     ) {
+                        // Sibling of the same gate in `direct_callee_lookup`.
                         if method
                             .code()
                             .map_or(false, |code| !code.exception_table.is_empty())
+                            && !cratonvm_jit::direct_call_exc_table_publish_enabled()
                         {
                             cratonvm_jit::note_direct_callee_bind_refusal(
                                 cratonvm_jit::DirectBindRefusal::CalleeExceptionTable,
@@ -5634,10 +5636,20 @@ pub(super) fn try_jit_compile_callee_slow(
             if method.is_synchronized() {
                 dc_no!("synchronized", cratonvm_jit::DirectBindRefusal::Synchronized);
             }
-            if method
-                .code()
-                .map_or(true, |c| !c.exception_table.is_empty())
-            {
+            // A callee with no `Code` attribute at all (`map_or(true, ..)`)
+            // is always refused — there is no body to bake a CALL to. A callee
+            // that merely DECLARES a table is refused only while
+            // `direct_call_exc_table_publish_enabled` is off; see that function
+            // for why the stated reason has expired and what it is interlocked
+            // against.
+            let callee_code_bars_direct_call = match method.code() {
+                None => true,
+                Some(c) => {
+                    !c.exception_table.is_empty()
+                        && !cratonvm_jit::direct_call_exc_table_publish_enabled()
+                }
+            };
+            if callee_code_bars_direct_call {
                 dc_no!("callee-exception-table", cratonvm_jit::DirectBindRefusal::CalleeExceptionTable);
             }
             if method.is_static()

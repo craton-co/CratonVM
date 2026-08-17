@@ -950,6 +950,12 @@ pub const INVENTORY: &[E] = &[
     // INTERLOCKED with `sp-ic-deopt-check`: publishing is refused outright when
     // that check is not being emitted, so `=0` on either one is safe.
     E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
+    // The statically-bound door's sibling of `mic-exc-table-publish`: may a
+    // baked direct CALL target a callee that declares its own exception table?
+    // Default-OFF pending its own measurement (16 refused binds on netty's
+    // BigEndianHeapByteBufTest against 736 for the native shadow), and
+    // interlocked with `sp-ic-deopt-check` the same way.
+    E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by

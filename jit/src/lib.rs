@@ -14059,6 +14059,45 @@ pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
     })
 }
 
+/// May a STATICALLY BOUND site bake a direct `CALL` to a callee that declares
+/// its own exception table?
+///
+/// The sibling of `mic_publish_exception_table_callees` (`vm/src/jit/helpers.rs`)
+/// for the other door. Both `callee_compiler` ladders refuse such a callee for
+/// the same stated reason — a raw `CALL` has no Rust frame to notice the
+/// `i64::MIN` sentinel and run the callee's own handler — and that reason has
+/// the same answer: `emit_inline_callee_deopt_check` is emitted after the baked
+/// `CALL` too (`x64/bytecode_walk.rs`, the `invokestatic` and `invokespecial`
+/// direct-call arms), and `jit_service_callee_deopt` resolves a statically bound
+/// callee by name.
+///
+/// Two interlocks, because a direct `CALL` has one precondition the inline
+/// cascade does not:
+///
+///  * `sp_ic_deopt_check_mode() == On`, exactly as the MIC gate requires; and
+///  * the emitter must have been able to reserve the contiguous service-argument
+///    slots that check needs. A site that could not is now a compile failure
+///    (`direct-call-service-slots`) rather than an unserviced raw edge, so
+///    "bound" implies "serviced" for every Java callee.
+///
+/// Default-OFF pending its own measurement: on netty's
+/// `BigEndianHeapByteBufTest` this gate accounts for 16 of 892 refused binds,
+/// against 736 for the native shadow, so it is a much smaller population than
+/// the virtual-site ban and is not worth defaulting on unmeasured.
+/// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1` opts in.
+pub fn direct_call_exc_table_publish_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        if sp_ic_deopt_check_mode() != SpIcDeoptCheck::On {
+            return false;
+        }
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 pub fn direct_jit_callee_calls_enabled() -> bool {
     // A raw JIT-to-JIT call produces a callee frame with no `JitEntryGuard`, so
     // it is not reachable from the entry chain: the active-RBP mirror points at

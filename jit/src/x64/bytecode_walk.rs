@@ -6783,6 +6783,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws
@@ -8953,6 +8954,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws (or

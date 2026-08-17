@@ -690,6 +690,33 @@ impl Compiler {
         );
     }
 
+    /// A raw JIT-to-JIT call whose callee CAN stash a deopt frame, but for which
+    /// the emitter could not reserve the contiguous service-argument slots the
+    /// sentinel check needs, is the unserviced edge `dbg_unserviced_direct_call`
+    /// exists to name: the callee traps, stashes a frame keyed to ITSELF, returns
+    /// `i64::MIN`, and nothing at this site can attribute it.
+    ///
+    /// Until now that site was emitted anyway and the hazard was only printed
+    /// under `CRATONVM_DBG_DEOPT`. Fail the compile instead, so "the ladder bound
+    /// this callee directly" implies "the trap is serviced here" with no
+    /// remaining case — which is the precondition
+    /// `direct_call_exc_table_publish_enabled` needs before a callee that
+    /// declares its own exception table may be bound this way at all.
+    ///
+    /// Measured cost of the stricter rule: on netty's `BigEndianHeapByteBufTest`
+    /// all 49 unserviced direct calls carry `info=false`, i.e. they are inline
+    /// intrinsics and thin native helpers with no `JitInvokeInfo` and no way to
+    /// stash. None is a Java callee, so this fails nothing there.
+    pub(super) fn fail_unserviced_java_direct_call(
+        &mut self,
+        info_ptr: Option<&crate::JitInvokeInfo>,
+        service_args_base: Option<i32>,
+    ) {
+        if info_ptr.is_some() && service_args_base.is_none() {
+            self.fail("direct-call-service-slots");
+        }
+    }
+
     pub(super) fn emit_inline_callee_deopt_check(
         &mut self,
         info: *const crate::JitInvokeInfo,
