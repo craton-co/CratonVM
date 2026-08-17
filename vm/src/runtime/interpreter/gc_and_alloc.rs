@@ -817,6 +817,20 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 
+    // ZGC: open a CONCURRENT mark cycle once allocation crosses the start
+    // threshold, so the transitive closure is traced with the mutators
+    // running instead of inside the collection pause. Checked before
+    // `needs_gc` because the two are mutually exclusive by construction:
+    // `should_start_concurrent_mark` refuses at or above the collection
+    // threshold, where a cycle would get no concurrent phase at all.
+    //
+    // Costs one `match` and two relaxed loads per allocation that reaches
+    // here, and exactly that on the other two backends (their arm is a
+    // compile-time `false`).
+    if shared.mem.heap.zgc_should_start_concurrent_mark() {
+        zgc_concurrent_mark_cycle(shared, thread);
+    }
+
     if shared.mem.heap.needs_gc()
         || shared
             .mem
@@ -1195,6 +1209,16 @@ pub(super) fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) ->
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
+}
+
+/// `zgc_concurrent_mark_cycle` for the JIT allocation helpers.
+///
+/// Same reason `maybe_gc_forced_pub` exists: `vm/src/jit/helpers.rs` is a
+/// sibling module and the cycle opener is `pub(super)`. See
+/// `jit_maybe_start_zgc_concurrent_mark` for why the JIT needs its own call
+/// site at all -- a fully compiled allocation loop reaches `maybe_gc` never.
+pub fn zgc_concurrent_mark_cycle_pub(shared: &SharedVm, thread: &mut JvmThread) {
+    zgc_concurrent_mark_cycle(shared, thread);
 }
 
 /// Allocate a dynamically-produced `java.lang.String` under the SAME
@@ -5141,6 +5165,100 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 // ---------------------------------------------------------------------------
 // G1 concurrent marking cycle
 // ---------------------------------------------------------------------------
+
+/// Phase 1 of a ZGC concurrent cycle: **mark start**, at a brief STW pause.
+///
+/// Opens the cycle and returns. The transitive closure is then traced by
+/// `ZMarkCoordinator`'s worker threads while every mutator in this VM runs;
+/// the cycle is closed inside the next `collect_garbage`, which replays the
+/// SATB ingress, re-scans the roots, and only then sweeps.
+///
+/// # Why this is shaped exactly like `g1_concurrent_mark_cycle`
+///
+/// Because the constraint is the VM's, not the collector's: a stop-the-world
+/// pause in this VM can only be initiated by a thread that is in the thread
+/// registry, holds a `JvmThread`, and can drive `stw_take_over_and_wait` for
+/// in-JIT peers. A GC background thread is none of those. So the two phase
+/// boundaries a concurrent collector needs — mark start and mark end — are
+/// both taken by mutators, and the collector's own threads do only the part
+/// that needs no safepoint: the tracing.
+///
+/// The open-coded `request → takeover-wait → work → complete` (rather than
+/// `brief_stw_counted_with_live_blocked`) is INT-3's residual fix, copied
+/// deliberately: that helper's internal plain `wait_for_all()` stalls forever
+/// on a peer spinning in compiled code, and its root set covers such a peer
+/// only through a STALE deposit snapshot. A missed root here is an object the
+/// concurrent phase never traces.
+///
+/// Mark-only pause: nothing moves, so there is no pointer map, no pin set and
+/// no root rewrite — the frozen peers' conservative roots are simply extra
+/// mark roots.
+pub(super) fn zgc_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let stw_taken = shared
+        .mem
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            let (n, blocked, tids, blocked_tids) = shared
+                .threads
+                .thread_registry
+                .alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
+    if !stw_taken {
+        // Another STW is in progress. Nothing has been done, so there is
+        // nothing to unwind: the next allocation re-tests the threshold and
+        // re-opens the cycle. If that other STW is a collection, the threshold
+        // will have dropped and the cycle correctly does not open.
+        return;
+    }
+    {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+
+        // SAFETY: `stw_take_over_and_wait` above has parked every other mutator
+        // at a safepoint (or forcibly stopped and conservatively scanned it),
+        // and `taken` is still held, so this thread is the only mutator for the
+        // whole block below.
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+
+        let roots =
+            cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
+        let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
+        let all_roots: Vec<ObjectRef> = roots
+            .into_iter()
+            .chain(snapshot_roots.into_iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.into_iter())
+            .collect();
+
+        let opened = shared
+            .mem
+            .heap
+            .zgc_start_concurrent_mark(&stw, &all_roots);
+
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening the
+        // world — same race rationale as `maybe_gc`'s epilogue.
+        shared.mem.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared
+            .mem
+            .gc_barrier
+            .complete_gc(cratonvm_types::PointerMap::default());
+
+        if opened {
+            tracing::debug!(
+                "[ZGC] concurrent mark started: {} roots seeded",
+                all_roots.len()
+            );
+        }
+    }
+}
 
 /// Execute a full G1 concurrent marking cycle:
 /// 1. Initial Mark (brief STW) — mark roots, activate SATB

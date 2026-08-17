@@ -3527,6 +3527,42 @@ unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
 // passed through from the interpreter. atype encodes a JVM array element type (T_BOOLEAN..T_LONG).
 // length is the requested array size. The returned i64 is a raw heap pointer to the new array.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+
+/// Open a ZGC concurrent mark cycle from a JIT allocation helper, if the
+/// occupancy threshold has been crossed.
+///
+/// # Why the JIT needs its own call to this
+///
+/// `maybe_gc` is the interpreter's allocation hook, and it is where the
+/// concurrent-start check naturally lives. **A JIT-compiled allocation loop
+/// never reaches it.** `jit_newarray` calls `heap.try_alloc_array_full`, which
+/// succeeds until the heap is genuinely full, so on this backend a fully
+/// compiled `new byte[128]` loop consults no occupancy predicate at all: its
+/// collections arrive by allocation FAILURE. Measured 2026-08-16 --
+/// `ZgcConcMarkProbe` single-threaded reported `cycles_started=0` with six
+/// collections, i.e. the feature could not engage on the workload it was
+/// written for, while the multi-threaded probe (whose peers do run
+/// interpreted code) engaged on every cycle.
+///
+/// The JIT safepoint poll is not an alternative: `emit_safepoint_poll` fires
+/// only when `stw_requested` is already set, which is a consequence of a
+/// collection rather than a cause of one.
+///
+/// Cost on the other two backends and on a ZGC run with the feature off: one
+/// `match` and one load of a plain `usize` field that is `0`.
+#[inline]
+unsafe fn jit_maybe_start_zgc_concurrent_mark(vm: &SharedVm) {
+    if !vm.mem.heap.zgc_should_start_concurrent_mark() {
+        return;
+    }
+    // Needs a `JvmThread`: the mark-start pause is a real STW and only a
+    // registered thread can request one.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        thread.tlab.retire();
+        crate::runtime::interpreter::zgc_concurrent_mark_cycle_pub(vm, thread);
+    }
+}
+
 pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -3535,6 +3571,12 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // buffer before any path that may park at the GC barrier or trigger
     // collection. Mirrors interpreter::safepoint_check (line 899).
     jit_safepoint_flush_satb(vm_ptr);
+    // ZGC: the concurrent-start check the interpreter does in `maybe_gc`.
+    // See `jit_maybe_start_zgc_concurrent_mark` for why this call site exists.
+    if vm_ptr != 0 {
+        // SAFETY: same provenance as the `&*(vm_ptr as *const SharedVm)` below.
+        jit_maybe_start_zgc_concurrent_mark(&*(vm_ptr as *const SharedVm));
+    }
     let elem_type = match atype as u8 {
         4 => ArrayElementType::Boolean,
         5 => ArrayElementType::Char,
@@ -4090,6 +4132,8 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     let vm = &*(vm_ptr as *const SharedVm);
     let heap = &vm.mem.heap;
     let class_id = ClassId::new(class_id_raw as u32);
+    // ZGC: the concurrent-start check the interpreter does in `maybe_gc`.
+    jit_maybe_start_zgc_concurrent_mark(vm);
 
     // JVMS §5.5 / §new: `new` must initialize its class before the object
     // is allocated -- same missing check, same shape of bug as the

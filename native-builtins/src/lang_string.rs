@@ -7857,7 +7857,40 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let char_values: Vec<Value> = s.encode_utf16().map(|c| Value::Int(c as i32)).collect();
+    string_int_stream(ctx, &char_values)
+}
 
+/// `String.codePoints()` -- an `IntStream` of Unicode CODE POINTS, not UTF-16
+/// code units.
+///
+/// This used to be registered as an alias of `native_string_chars` with the
+/// comment "Same as chars() for BMP characters". True for the BMP, wrong for
+/// everything above it: a supplementary character came back as its two
+/// surrogate halves, so a caller that built a set of code points from
+/// `codePoints()` and then tested membership with `String.codePointAt` (which
+/// is correct here) never matched. H2's `StringUtils.trim(String, ..., String
+/// characters)` does exactly that for a trim set of three or more code points,
+/// which is why `BTRIM(U&'...', U&'\+01F600\+01F603\+01F604')` left the
+/// astral trim characters in place (`functions/string/btrim.sql:22`).
+///
+/// `ctx.read_string` hands back a Rust `String`, whose `chars()` iterator is
+/// already code-point-wise, so the fix is to stop widening through UTF-16.
+pub(crate) fn native_string_code_points(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let s = ctx.read_string(this).unwrap_or_default();
+    let cp_values: Vec<Value> = s.chars().map(|c| Value::Int(c as i32)).collect();
+    string_int_stream(ctx, &cp_values)
+}
+
+/// Shared tail of `chars()`/`codePoints()`: wrap already-computed `int`
+/// elements in the standard synthetic `IntStream`.
+fn string_int_stream(ctx: &mut dyn NativeContext, char_values: &[Value]) -> MethodCallResult {
     // 2-field synthetic stream layout: field 0 = elements array, field 1 =
     // close handlers (None -- chars()/codePoints() never register any).
     // Must be 2 fields (not 1) to match STREAM_NUM_FIELDS in
