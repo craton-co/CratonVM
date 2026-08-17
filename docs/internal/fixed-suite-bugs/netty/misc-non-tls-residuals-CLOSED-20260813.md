@@ -154,7 +154,7 @@ retired the page. See
 which already reports this class at **15/15**, and its two residual pages:
 [collection-view carrier residuals](collection-view-carrier-residuals-FIXED-20260813.md)
 (closed the same day) and
-[the VM-wide per-call cost](../../../known-issues/perf/vm-per-call-dispatch-cost-20260813.md).
+the VM-wide per-call cost.
 
 Re-measured here on the merged tree (that fix plus this branch's three):
 

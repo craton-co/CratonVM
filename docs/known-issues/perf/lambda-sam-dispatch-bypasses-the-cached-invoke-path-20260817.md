@@ -92,7 +92,7 @@ memo that must be invalidated if class unloading is ever wired up (today
 exchange for nothing.
 
 This is the third time this VM's flat profile has offered a structural lead
-that did not convert; see `vm-per-call-dispatch-cost-20260813.md`
+that did not convert; see `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md`
 §3 for the other two.
 
 ## 4. What the evidence actually points at

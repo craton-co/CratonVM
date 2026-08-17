@@ -1581,7 +1581,7 @@ unsafe fn try_call_compiled_entry_reentrant(
     vm_ptr: i64,
     args_slice: &[i64],
 ) -> Option<i64> {
-    CACHED_ENTRY_REGISTRY_PINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    note_cached_entry_arm(&CACHED_ENTRY_REGISTRY_PINS);
     // This helper is itself called from compiled dispatch code.  Its raw ABI
     // call used to enter the nested compiled method without registering a
     // `JitEntryGuard`, so a GC triggered by that callee found a JIT return
@@ -1644,7 +1644,7 @@ unsafe fn try_call_compiled_entry_reentrant_owned(
     if !cached_entry_owner_reuse_enabled() {
         return try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice);
     }
-    CACHED_ENTRY_OWNER_REUSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    note_cached_entry_arm(&CACHED_ENTRY_OWNER_REUSE_HITS);
     call_compiled_entry_under_owner(Some(&**owner), entry, needs_ctx, vm_ptr, args_slice)
 }
 
@@ -1680,6 +1680,21 @@ pub static CACHED_ENTRY_OWNER_REUSE_HITS: std::sync::atomic::AtomicU64 =
 /// Cached dispatches that resolved the owner through the code-range registry.
 pub static CACHED_ENTRY_REGISTRY_PINS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Count one arm of the cached-dispatch split, **behind the same gate as every
+/// other counter in this file**.
+///
+/// The gate is not tidiness. The reuse arm runs 111 564 628 times in a 55 s
+/// netty run, and an ungated `fetch_add` there is one contended cache line
+/// shared by every thread in the VM — an instrument that would have been a
+/// variable of the very comparison it exists to settle, present on one arm of
+/// the A/B and absent from the other.
+#[inline]
+fn note_cached_entry_arm(counter: &'static std::sync::atomic::AtomicU64) {
+    if mic_prof::enabled() {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The body both forms share: register the precise frame for the nested call,
 /// correct a lying ABI flag against the artifact's own, and make the raw call.
@@ -13969,7 +13984,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             None => false,
         });
         if skip_probe {
-            MIC_COMPILE_PROBE_MEMO_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_cached_entry_arm(&MIC_COMPILE_PROBE_MEMO_SKIPS);
         }
         let compile_res = if skip_probe
             || !direct_virtual_compiled_callee_entry_enabled()

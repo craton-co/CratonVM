@@ -708,6 +708,123 @@ pub fn record_transition(to: ThreadExecState, site: &'static str) {
     }
 }
 
+/// A borrowed handle on this thread's shadow cell, so a caller that must record
+/// TWO transitions around one operation pays ONE thread-local access instead of
+/// three.
+///
+/// ## Why this exists
+///
+/// `vm_exec::safe_native_call_impl` is the funnel every native dispatch in the
+/// VM passes through, and it used to reach `SELF_CELL` three times per call:
+/// [`current_state`] to learn what to restore, [`record_transition`] to record
+/// `NativeRunning`, and [`record_transition`] again from its guard's `Drop`.
+/// `native_funnel_profile::funnel_cost_breakdown` prices that trio at
+/// **10.8-14.4 ns of a 29-36 ns funnel** — the single largest component,
+/// against `catch_unwind` at 1.5 ns, the pin push at 0.7 and the STW probe at
+/// 0.3. `current_state` ALONE measures 0.9 ns, which is what says the cost is
+/// the repetition and not the read.
+///
+/// The `Arc` the cell lives in is owned by this thread's `SELF_CELL` handle and
+/// by the census registry, and neither can release it while the thread is
+/// inside a native call — the TLS handle is dropped at OS-thread teardown, and
+/// a native call cannot outlive the thread running it. So a raw pointer taken
+/// under `with_cell` stays valid for the call, and the restore is a relaxed
+/// store with no thread-local access at all.
+///
+/// Nothing about the census changes: the cell is the same cell, the store is
+/// the same store, and an illegal edge is still detected when the tripwire is
+/// armed — [`NativeStateSpan::restore`] runs the same legality check
+/// [`try_record_transition`] does.
+pub struct NativeStateSpan {
+    cell: *const ThreadStateCell,
+    /// The state to put back, already corrected for the `Starting` case.
+    prior: ThreadExecState,
+}
+
+impl NativeStateSpan {
+    /// The state this span will restore.
+    pub fn prior(&self) -> ThreadExecState {
+        self.prior
+    }
+
+    /// Put the caller's state back. Consumes the span so it cannot run twice.
+    pub fn restore(self, site: &'static str) {
+        // SAFETY: see the type doc — the cell's `Arc` is held by this thread's
+        // TLS handle and by the registry for at least as long as this thread is
+        // inside the native call that opened the span.
+        let cell = unsafe { &*self.cell };
+        if stress_checks_enabled() {
+            let from = ThreadExecState::from_u8(cell.state.load(Ordering::Relaxed))
+                .unwrap_or(ThreadExecState::Starting);
+            if !is_legal(from, self.prior) {
+                ILLEGAL_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
+                let violation = IllegalTransition {
+                    from,
+                    to: self.prior,
+                    thread_id: cell.thread_id.load(Ordering::Relaxed),
+                    site,
+                };
+                if violations_are_fatal() {
+                    panic!("CRATONVM_STRESS_THREAD_STATES: {violation}");
+                }
+                tracing::error!(
+                    from = violation.from.name(),
+                    to = violation.to.name(),
+                    tid = violation.thread_id,
+                    site = violation.site,
+                    "{violation}"
+                );
+            }
+        }
+        cell.state.store(self.prior.as_u8(), Ordering::Relaxed);
+    }
+}
+
+/// Record `to` and hand back a span that restores what it replaced — one
+/// thread-local access for the pair. See [`NativeStateSpan`].
+///
+/// `Starting` is folded into `JavaRunning` here rather than at the call site
+/// because it is the same correction every caller of this function needs and
+/// getting it wrong is silent: `Starting` is also the recorder's answer for a
+/// thread it has never observed, and `Starting -> NativeRunning` is
+/// deliberately absent from the table, so restoring it would assert the one
+/// thing that cannot be true of a thread that just ran a native — and would
+/// then repeat on that thread's every later native call.
+pub fn enter_native_state(site: &'static str) -> NativeStateSpan {
+    with_cell(ThreadExecState::NativeRunning, |cell| {
+        let raw = cell.state.load(Ordering::Relaxed);
+        let from = ThreadExecState::from_u8(raw).unwrap_or(ThreadExecState::Starting);
+        if stress_checks_enabled() && !is_legal(from, ThreadExecState::NativeRunning) {
+            ILLEGAL_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
+            let violation = IllegalTransition {
+                from,
+                to: ThreadExecState::NativeRunning,
+                thread_id: cell.thread_id.load(Ordering::Relaxed),
+                site,
+            };
+            if violations_are_fatal() {
+                panic!("CRATONVM_STRESS_THREAD_STATES: {violation}");
+            }
+            tracing::error!(
+                from = violation.from.name(),
+                to = violation.to.name(),
+                tid = violation.thread_id,
+                site = violation.site,
+                "{violation}"
+            );
+        }
+        cell.state
+            .store(ThreadExecState::NativeRunning.as_u8(), Ordering::Relaxed);
+        NativeStateSpan {
+            cell: cell as *const ThreadStateCell,
+            prior: match from {
+                ThreadExecState::Starting => ThreadExecState::JavaRunning,
+                other => other,
+            },
+        }
+    })
+}
+
 /// Non-panicking [`record_transition`]: the store always lands, and an illegal
 /// edge is returned rather than reported. Used by the tests and available to
 /// callers that want to decide for themselves.

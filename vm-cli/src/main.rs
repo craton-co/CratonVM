@@ -115,7 +115,7 @@ fn maybe_dump_shutdown_reports() {
 
     // How many native-registry probes one invoke cost, self-gated on
     // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
-    // `docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` §2 asks for
+    // `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` §2 asks for
     // before anyone restructures the dispatch entry points: a profile share can
     // say `slot_for_exact` is 8.5%, but only this says whether a "one lookup
     // per invoke" rewrite would divide it by 1 or by 10.
@@ -4584,7 +4584,7 @@ fn run() -> Result<()> {
         // compiled yet at that instant leaves the site on the helper forever.
         let (bind_hits, bind_misses) = cratonvm_jit::direct_callee_bind_counts();
         eprintln!(
-            "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the              dispatch helper (statically bound sites where a ladder asked for a direct target)"
+            "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the dispatch helper (statically bound sites where a ladder asked for a direct target)"
         );
     }
 
