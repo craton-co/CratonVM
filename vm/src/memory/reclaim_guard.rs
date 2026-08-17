@@ -260,6 +260,35 @@ fn report_reclaimed_receiver_inner(
             );
         }
     }
+    // ZGC's relocation ledger, when `CRATONVM_DBG_ZGC_CORPSE` armed the run.
+    // Unlike everything above it names the address's PREDECESSOR rather than
+    // its span: which object the slide moved away from here, where that object
+    // went, and whether it is still alive there. A live target means the holder
+    // of this stale address was simply never rewritten when its referent moved;
+    // a dead one means the object died afterwards and the defect is a lifetime
+    // bug instead. `None` unless the flag was set, which is the one thing this
+    // module's header complains about -- but the surrounding verdicts are
+    // flag-free, so an armed re-run now adds identity to a report that already
+    // says "reclaimed" on its own.
+    if let Some((from, to, cid, size, still_live)) = shared.mem.heap.zgc_corpse_lookup(addr) {
+        static Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if Z.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                obj = format!("{addr:#x}"),
+                site = site,
+                vacated_from = format!("{from:#x}"),
+                interior_off = addr - from,
+                moved_to = format!("{to:#x}"),
+                original_class = %class_name_of(shared, cid),
+                original_size = size,
+                target_still_live = still_live,
+                "receiver names an address the ZGC slide VACATED. `original_class` is what \
+                 lived here; `moved_to` is where it went. `target_still_live=true` means the \
+                 object is alive at its new address and this holder was never rewritten.",
+            );
+        }
+    }
     // The per-object young-sweep ring only records under
     // `CRATONVM_DBG_SWEEP_ZERO`, which also switches the young collector to the
     // sequential walk — so a hit here means the run was instrumented, and a
@@ -522,6 +551,44 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
             // and the header read below is a raw dereference.
             if heap.is_heap_addr(a).is_none() {
                 return;
+            }
+            // `CRATONVM_DBG_VACATED_FRAMES` — the RE-OCCUPIED face, which the
+            // `ClassId(0)` test below cannot see. A compacting collector slides
+            // a survivor onto the address it vacated, so a slot left naming the
+            // old address reads back a perfectly valid object of an unrelated
+            // class, and every test in this function stays silent. Asked FIRST,
+            // and only when armed.
+            if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(a) {
+                static V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{a:#x}"),
+                        site = site,
+                        tid = thread.thread_id.0,
+                        frame = fi,
+                        class = %fr.class_name(),
+                        method = %fr.method_name(),
+                        pc = fr.pc,
+                        slot = format!("{what}[{idx}]"),
+                        slot_class = %class_name_of(shared, heap.class_id_of(o).as_u32()),
+                        moved_to = format!("{moved_to:#x}"),
+                        heap_collection = heap.collection_count(),
+                        thread_last_heal = thread.last_heal_collection,
+                        class_at_target = %class_name_of(
+                            shared,
+                            // SAFETY: `moved_to` is a post-move object base the
+                            // collector just wrote; its header is mapped.
+                            heap.class_id_of(unsafe {
+                                cratonvm_types::ObjectRef::from_raw(moved_to as *mut u8)
+                            })
+                            .as_u32(),
+                        ),
+                        "a LIVE frame slot still names an address the LAST collection moved an \
+                         object away from — the frame remap did not reach this slot. \
+                         `slot_class` is whatever the slide has since put at that address.",
+                    );
+                }
             }
             if heap.class_id_of(o).as_u32() != 0 || heap.kind_of(o) != ObjectKind::Object {
                 return;

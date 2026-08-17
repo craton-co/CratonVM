@@ -230,7 +230,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     let soft_free_mb = shared.mem.heap.soft_ref_policy_free_mb();
     let (pairs, soft_pairs) = {
         let mut rp = shared.mem.ref_processor.lock();
-        let weak_phantom = rp.weak_phantom_active_pairs();
+        let weak_phantom = rp.weak_phantom_active_triples();
         // SOFT-CLEAR GAP (2026-08-15). This is the measured answer to the
         // residual left by the retired `zgc-resourceleakdetector-corpse-read`
         // write-up: "the marker traces referents as strong edges; whether the
@@ -267,6 +267,12 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         } else {
             rp.condemn_idle_soft_refs(soft_free_mb, now_ms())
         };
+        // Same stamp column the weak/phantom half carries -- the write loop
+        // below screens both the same way.
+        let soft: Vec<(usize, usize, i32)> = soft
+            .into_iter()
+            .map(|(r, t)| (r, t, rp.identity_stamp(r).unwrap_or(0)))
+            .collect();
         (weak_phantom, soft)
     };
     // RandomizedContext WeakHashMap<Thread,...> fix: publish this cycle's
@@ -329,7 +335,34 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
             soft_pairs.len()
         );
     }
-    for (ref_obj_addr, _referent) in pairs.into_iter().chain(soft_pairs) {
+    // THE PRE-GC PASS WAS THE UNSCREENED WRITE SITE.
+    //
+    // `process_references_after_gc`'s cleared / enqueue / restore loops were
+    // given a class-shape guard on 2026-08-16 (`is_reference_shaped`) after two
+    // measured corruptions -- a `java.lang.String` published as a
+    // `ReferenceQueue` head, and field 0 of a `String` nulled. THIS loop, which
+    // performs the same kind of write through the same kind of address, kept
+    // only the `num_fields >= 2` test, which almost every class passes: an
+    // `org.h2.engine.SessionLocal` passes it, and so does every `org.h2.value.Value`.
+    // So a processor entry whose `Reference` had been reclaimed and its address
+    // re-issued nulled slot 0 of whatever now lived there -- the
+    // `NullPointerException: Cannot invoke "org.h2.value.Value.getValueType()"
+    // because "v" is null` half of the H2 `TestMultiThread` MVStore-writer
+    // report, whose own analysis records that the failure "survives the shape
+    // guard that now screens every reference-processor write". It did, because
+    // this write was not one of the screened ones.
+    //
+    // Screened here with BOTH tests:
+    //
+    //  * the same class-shape guard as the post-GC loops, and
+    //  * the identity stamp, which is the exact version of it: a reclaimed
+    //    `Reference`'s address re-issued to ANOTHER `Reference` is shape-clean
+    //    and identity-wrong, and H2 allocates a `CloseWatcher` (a
+    //    `PhantomReference`) per connection, so same-class reuse is the common
+    //    case rather than the exotic one.
+    let class_manager = shared.classes.class_manager.read();
+    let reference_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/Reference");
+    for (ref_obj_addr, _referent, stamp) in pairs.into_iter().chain(soft_pairs) {
         // The Reference object is live (or dead-but-not-yet-collected) at this
         // point, so its memory is valid; writing its referent slot is safe.
         // SAFETY: `ref_obj_addr` is a current Reference-object address held by
@@ -352,6 +385,26 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         // in SIGSEGV); when it has exactly 1 the write lands SILENTLY on a
         // real field. Requiring >= 2 declines both, and can never skip a
         // genuine Reference.
+        // Not a `Reference` any more ⇒ the address no longer names what this
+        // processor recorded. `None` (class not loaded) admits: no Reference
+        // object can exist yet, so the guard has nothing to judge.
+        if let Some(cid) = reference_cid {
+            if !class_manager.is_subclass_of(shared.mem.heap.class_id_of(ref_obj), cid) {
+                continue;
+            }
+        }
+        // Still a `Reference`, but is it THE Reference? `identity_hash_code`
+        // mints for an object that has none, so a re-issued address answers
+        // with a fresh counter value rather than the recorded one. A `0` answer
+        // is "cannot tell" (the object is thin-locked, so its hash is not in
+        // the mark word) and falls back to the shape guard above rather than
+        // declining a legitimate entry.
+        if stamp != 0 {
+            let now = shared.mem.heap.identity_hash_code(ref_obj);
+            if now != 0 && now != stamp {
+                continue;
+            }
+        }
         if shared.mem.heap.num_fields(ref_obj) >= 2 {
             // Slot 0 = REF_FIELD_REFERENT (matches the real JDK Reference layout
             // and the synthetic constant in native-builtins).

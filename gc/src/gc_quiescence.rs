@@ -1846,3 +1846,80 @@ mod tests {
         assert!(d <= usize::MAX / 2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// VACATED-ADDRESS LEDGER (`CRATONVM_DBG_VACATED_FRAMES`)
+// ---------------------------------------------------------------------------
+//
+// "A live object was relocated and one holder was never rewritten" is a verdict
+// the ZGC corpse ledger can produce (see `ZgcRealHeap::corpse_lookup`) — but it
+// produces it at the READER, an unbounded number of collections after the fact,
+// and by then the holder is whatever frame happens to be executing. What is
+// missing is the other end: WHICH frame slot still named a vacated address at
+// the first safepoint after the collection that vacated it.
+//
+// This is that ledger. It stores the KEY set of one collection's pointer map —
+// every address the collector moved an object away from — and
+// `reclaim_guard::audit_thread_frames` tests each live frame slot against it at
+// the next safepoint. A hit names the thread, the method, the pc and the slot,
+// which is what separates "the frame remap missed this slot" from "something
+// re-introduced the address afterwards" (they report on different collections).
+//
+// Flag-gated because the set is one entry per relocated object — a compacting
+// cycle under GC stress moves hundreds of thousands — and because it answers a
+// question only a run that is already suspected of this defect needs asked.
+
+/// `(vacated -> where the object went, every destination the slide wrote to)`.
+///
+/// The destination set is what keeps this instrument honest. An address can be
+/// BOTH a source and a destination in one compacting cycle: survivors slide
+/// DOWN into the space dead objects vacated, so `ThreadPoolExecutor.runWorker`
+/// holding a perfectly valid `Thread` that happens to live at an address this
+/// cycle also moved something away from is not a defect — and reporting it as
+/// one is how an over-approximate instrument manufactures its own finding.
+type VacatedLedger = (
+    rustc_hash::FxHashMap<usize, usize>,
+    rustc_hash::FxHashSet<usize>,
+);
+
+static VACATED_ADDRS: parking_lot::Mutex<Option<VacatedLedger>> = parking_lot::Mutex::new(None);
+
+/// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
+pub fn vacated_frames_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VACATED_FRAMES").is_some()
+    })
+}
+
+/// Replace the ledger with THIS collection's vacated addresses (the pointer
+/// map's keys). One collection at a time, deliberately: the question is "did a
+/// slot survive the collection that moved its object", and carrying older
+/// cycles would answer a different, much noisier one.
+pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    let from: rustc_hash::FxHashMap<usize, usize> =
+        pointer_map.iter().map(|(k, v)| (*k, *v)).collect();
+    let to: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
+    *VACATED_ADDRS.lock() = Some((from, to));
+}
+
+/// Did the last recorded collection move an object away from `addr`, and if so
+/// where to?
+///
+/// `None` when the address was not a source, and — deliberately — also when it
+/// was a source but is ALSO a destination this cycle wrote a survivor to: a
+/// slot naming that address may legitimately hold the survivor.
+pub fn was_vacated(addr: usize) -> Option<usize> {
+    if !vacated_frames_enabled() {
+        return None;
+    }
+    let g = VACATED_ADDRS.lock();
+    let (from, to) = g.as_ref()?;
+    if to.contains(&addr) {
+        return None;
+    }
+    from.get(&addr).copied()
+}

@@ -6153,6 +6153,8 @@ impl<'a> NativeContextImpl<'a> {
             crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
+        // See `JvmThread::last_heal_collection`.
+        self.thread.last_heal_collection = self.shared.mem.heap.collection_count();
         // cceres3 FIX: exact per-slot write-back for the blocked window.
         // Runs after the chain application above — any slot the chain already
         // healed reads back != orig and is skipped; any slot the chain MISSED
@@ -12893,12 +12895,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
         // rather than a referent, so it must never reach the pre-GC
         // referent-nulling pass. See `ReferenceEntry::runs_cleaner`.
+        // THE IDENTITY STAMP (see `ReferenceProcessor::identity_stamps`).
+        // Minted here because it needs the heap: `identity_hash_code` installs
+        // a value from a monotonic counter into the object's own mark word when
+        // it has none and returns the existing one otherwise. It travels with
+        // the object across a relocation, so it identifies the OBJECT rather
+        // than its address -- which is what every guard downstream of this
+        // registry has been approximating with a class-shape test.
+        let stamp = self.shared.mem.heap.identity_hash_code(reference_obj);
         if ref_type == 4 {
-            self.shared
-                .mem
-                .ref_processor
-                .lock()
-                .discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            let mut rp = self.shared.mem.ref_processor.lock();
+            rp.discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            rp.stamp_reference(ref_addr, stamp);
             return;
         }
         let rt = match ref_type {
@@ -12908,12 +12916,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             3 => ReferenceType::Cleaner,
             _ => return,
         };
-        self.shared.mem.ref_processor.lock().discover_reference(
-            rt,
-            ref_addr,
-            referent_addr,
-            queue_addr,
-        );
+        let mut rp = self.shared.mem.ref_processor.lock();
+        rp.discover_reference(rt, ref_addr, referent_addr, queue_addr);
+        rp.stamp_reference(ref_addr, stamp);
     }
 
     /// PGJDBC-PHANTOM-GHOST (2026-08-07): see the trait doc and
