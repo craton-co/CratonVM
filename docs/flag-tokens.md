@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-448 tokens.
+450 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -311,6 +311,8 @@ export inherited from a parent shell.
 | `root-source` | `CRATONVM_DBG_ROOT_SOURCE` |
 | `zgc-verify-slide` | `CRATONVM_DBG_ZGC_VERIFY_SLIDE` |
 | `zgc-corpse` | `CRATONVM_DBG_ZGC_CORPSE` |
+| `mapgen` | `CRATONVM_DBG_MAPGEN` |
+| `vacated-frames` | `CRATONVM_DBG_VACATED_FRAMES` |
 | `atomic-intrinsic` | `CRATONVM_DBG_ATOMIC_INTRINSIC` |
 | `define-filter` | `CRATONVM_DBG_DEFINE_FILTER` |
 | `define-stack-filter` | `CRATONVM_DBG_DEFINE_STACK_FILTER` |
@@ -514,7 +516,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-175 tokens.
+178 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -542,6 +544,8 @@ export inherited from a parent shell.
 | `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
 | `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
 | `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
+| `osr-ctor-bind` | `CRATONVM_NO_OSR_CTOR_BIND` |
+| `real-new-site-flags` | `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` |
 | `deny` | `CRATONVM_JIT_DENY` |
 | `deopt-real` | `CRATONVM_DEOPT_REAL` |
 | `direct-callee-calls` | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` |
@@ -577,6 +581,7 @@ export inherited from a parent shell.
 | `ir-call` | `CRATONVM_JIT_IR_CALL` |
 | `ir-call-special` | `CRATONVM_JIT_IR_CALL_SPECIAL` |
 | `ir-call-virtual` | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
+| `ir-over-intrinsic` | `CRATONVM_JIT_IR_OVER_INTRINSIC` |
 | `ir-deopt-resume` | `CRATONVM_IR_DEOPT_RESUME` |
 | `ir-direct-call` | `CRATONVM_JIT_IR_DIRECT_CALL` |
 | `ir-buffer-estimate` | `CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE` |
@@ -696,11 +701,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-48 tokens.
+53 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
+| `dbg-mapgen` | `CRATONVM_DBG_MAPGEN` |
+| `dbg-vacated-frames` | `CRATONVM_DBG_VACATED_FRAMES` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
@@ -745,6 +752,9 @@ export inherited from a parent shell.
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
+| `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |
+| `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
+| `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |

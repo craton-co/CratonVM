@@ -1226,68 +1226,59 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         locale_get_extension,
     );
 
-    // Display-name overrides — the JDK's real implementations consult
-    // `sun.util.resources.cldr.LocaleNames` resource bundles that we cannot
-    // load (no CLDR data, no ServiceLoader for the resource-bundle
-    // providers). Return language/country codes directly — good enough
-    // for any caller that just wants a non-null human-readable string.
-    registry.register(
-        "java/util/Locale",
-        "getDisplayName",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let lang: String =
-                match ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[])? {
+    // Display-name overrides.
+    //
+    // These used to return the language/country CODE, on the reasoning that
+    // any caller "just wants a non-null human-readable string". That is true
+    // of callers who print one and false of callers who use one as a KEY.
+    // H2's `org.h2.value.CompareMode.getName` asks every locale `Collator`
+    // offers for its ENGLISH display name and matches the answer against the
+    // requested collation — so with codes in the table, `SET COLLATION TURKISH`
+    // resolved to nothing and every `SET COLLATION <language>` was rejected.
+    //
+    // The real names are in the JDK image all along, in
+    // `sun/util/resources/cldr/ext/LocaleNames_*` (324 bundles). Read them,
+    // and keep the code as the last resort — which is also what the real JDK
+    // does for a subtag CLDR does not name.
+    fn display_lookup(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        want_country: bool,
+        display_locale: Option<ObjectRef>,
+    ) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+        let accessor = if want_country {
+            "getCountry"
+        } else {
+            "getLanguage"
+        };
+        let code: String = match ctx.invoke_virtual(this, accessor, "()Ljava/lang/String;", &[])? {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if code.is_empty() {
+            return Ok(Some(Value::Object(Some(ctx.create_string("")))));
+        }
+        // Which locale to name it IN. No argument means the default locale,
+        // and the JDK's own default here is English.
+        let (dl, dc) = match display_locale {
+            Some(loc) => {
+                let l = match ctx.invoke_virtual(loc, "getLanguage", "()Ljava/lang/String;", &[])? {
                     Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),
                 };
-            let country: String =
-                match ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])? {
+                let c = match ctx.invoke_virtual(loc, "getCountry", "()Ljava/lang/String;", &[])? {
                     Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),
                 };
-            let display = if country.is_empty() {
-                lang
-            } else {
-                format!("{} ({})", lang, country)
-            };
-            Ok(Some(Value::Object(Some(ctx.create_string(&display)))))
-        },
-    );
-    registry.register(
-        "java/util/Locale",
-        "getDisplayName",
-        "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let lang: String =
-                match ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[])? {
-                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-            let country: String =
-                match ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])? {
-                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-            let display = if country.is_empty() {
-                lang
-            } else {
-                format!("{} ({})", lang, country)
-            };
-            Ok(Some(Value::Object(Some(ctx.create_string(&display)))))
-        },
-    );
-    // getDisplayLanguage()/getDisplayCountry() — the "final" variants
-    // delegate to the (Locale) overloads which hit the resource bundles.
-    // Short-circuit with the code itself.
+                (l, c)
+            }
+            None => ("en".to_string(), String::new()),
+        };
+        let named = crate::locale_resources::cldr_locale_display_name(ctx, &code, &dl, &dc)
+            .unwrap_or(code);
+        Ok(Some(Value::Object(Some(ctx.create_string(&named)))))
+    }
+
     registry.register(
         "java/util/Locale",
         "getDisplayLanguage",
@@ -1297,7 +1288,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[])
+            display_lookup(ctx, this, false, None)
         },
     );
     registry.register(
@@ -1309,7 +1300,11 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[])
+            let disp = match args.get(1) {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            display_lookup(ctx, this, false, disp)
         },
     );
     registry.register(
@@ -1321,7 +1316,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])
+            display_lookup(ctx, this, true, None)
         },
     );
     registry.register(
@@ -1333,7 +1328,65 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])
+            let disp = match args.get(1) {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            display_lookup(ctx, this, true, disp)
+        },
+    );
+
+    /// `getDisplayName` is the two halves joined the way the JDK joins them:
+    /// `Language (Country)`, or just whichever half exists.
+    fn display_name(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        display_locale: Option<ObjectRef>,
+    ) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+        let lang = match display_lookup(ctx, this, false, display_locale)? {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let country = match display_lookup(ctx, this, true, display_locale)? {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let display = if country.is_empty() {
+            lang
+        } else if lang.is_empty() {
+            country
+        } else {
+            format!("{lang} ({country})")
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&display)))))
+    }
+
+    registry.register(
+        "java/util/Locale",
+        "getDisplayName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            display_name(ctx, this, None)
+        },
+    );
+    registry.register(
+        "java/util/Locale",
+        "getDisplayName",
+        "(Ljava/util/Locale;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let disp = match args.get(1) {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            display_name(ctx, this, disp)
         },
     );
 

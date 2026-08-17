@@ -507,6 +507,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "root-source", on_key: Some("CRATONVM_DBG_ROOT_SOURCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-verify-slide", on_key: Some("CRATONVM_DBG_ZGC_VERIFY_SLIDE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-corpse", on_key: Some("CRATONVM_DBG_ZGC_CORPSE"), off_key: None, off_word: None },
+    // Declared 2026-08-17: both were read by `runtime_var_os` and named nowhere,
+    // so `CRATONVM_DBG=mapgen` could not reach them and a test could not arrange
+    // one with `flags::with_thread_overrides` -- and while the guard was red it
+    // could not catch the NEXT undeclared flag, which is what it is for.
+    // `mapgen` reports a safepoint waiter that resumed on a pointer map from a
+    // different pause generation than the one it arrived for; `vacated-frames`
+    // arms the vacated-address ledger that catches a frame slot still holding an
+    // address the collector moved away from.
+    E { group: Group::DBG, token: "mapgen", on_key: Some("CRATONVM_DBG_MAPGEN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "vacated-frames", on_key: Some("CRATONVM_DBG_VACATED_FRAMES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "atomic-intrinsic", on_key: Some("CRATONVM_DBG_ATOMIC_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "define-filter", on_key: Some("CRATONVM_DBG_DEFINE_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "define-stack-filter", on_key: Some("CRATONVM_DBG_DEFINE_STACK_FILTER"), off_key: None, off_word: None },
@@ -800,6 +810,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "code-cache-max-mb", on_key: Some("CRATONVM_JIT_CODE_CACHE_MAX_MB"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "conservative-locals", on_key: None, off_key: Some("CRATONVM_NO_CONSERVATIVE_LOCALS"), off_word: None },
     E { group: Group::JIT, token: "ctor-direct-call", on_key: None, off_key: Some("CRATONVM_NO_CTOR_DIRECT_CALL"), off_word: None },
+    E { group: Group::JIT, token: "osr-ctor-bind", on_key: None, off_key: Some("CRATONVM_NO_OSR_CTOR_BIND"), off_word: None },
+    E { group: Group::JIT, token: "real-new-site-flags", on_key: Some("CRATONVM_JIT_REAL_NEW_SITE_FLAGS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "deny", on_key: Some("CRATONVM_JIT_DENY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "deopt-real", on_key: Some("CRATONVM_DEOPT_REAL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "direct-callee-calls", on_key: Some("CRATONVM_JIT_DIRECT_CALLEE_CALLS"), off_key: None, off_word: None },
@@ -851,6 +863,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-call", on_key: Some("CRATONVM_JIT_IR_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-call-special", on_key: Some("CRATONVM_JIT_IR_CALL_SPECIAL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-call-virtual", on_key: Some("CRATONVM_JIT_IR_CALL_VIRTUAL"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "ir-over-intrinsic", on_key: Some("CRATONVM_JIT_IR_OVER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-deopt-resume", on_key: Some("CRATONVM_IR_DEOPT_RESUME"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-direct-call", on_key: Some("CRATONVM_JIT_IR_DIRECT_CALL"), off_key: None, off_word: None },
     // A/B opt-out: `-ir-buffer-estimate` restores the legacy code-buffer sizing
@@ -1076,6 +1089,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-peer-total-ms", on_key: Some("CRATONVM_XT_PEER_TOTAL_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "dbg-mapgen", on_key: Some("CRATONVM_DBG_MAPGEN"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "dbg-vacated-frames", on_key: Some("CRATONVM_DBG_VACATED_FRAMES"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None },
@@ -1173,6 +1188,11 @@ pub const INVENTORY: &[E] = &[
     // carries no `off_word`.
     E { group: Group::GC, token: "zgc-conc-start", on_key: Some("CRATONVM_ZGC_CONC_START"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-conc-workers", on_key: Some("CRATONVM_ZGC_CONC_WORKERS"), off_key: None, off_word: None },
+    // Phase G. `zgc-generational` is a boolean with a real `off` word; the other
+    // two are numeric tunables with no negative spelling, like `zgc-parmark`.
+    E { group: Group::GC, token: "zgc-generational", on_key: Some("CRATONVM_ZGC_GENERATIONAL"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-gen-promotion-age", on_key: Some("CRATONVM_ZGC_GEN_PROMOTION_AGE"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
@@ -1899,6 +1919,42 @@ mod tests {
             on.overrides().count(),
             1,
             "the ON form clears the opt-out key and touches nothing else",
+        );
+    }
+
+    /// Same for the two GC diagnostics declared on 2026-08-17.
+    ///
+    /// `CRATONVM_DBG_MAPGEN` (`vm/src/threading/gc_barrier.rs`) and
+    /// `CRATONVM_DBG_VACATED_FRAMES` (`gc/src/gc_quiescence.rs`) shipped as
+    /// `runtime_var_os` reads with no row, so each was served by a live
+    /// `getenv`. Both are plain opt-in diagnostics, so the assertion is just
+    /// that the grouped spelling reaches the legacy key — which is the fact a
+    /// consumer depends on and the row's existence alone does not establish.
+    ///
+    /// The wider cost of leaving them undeclared was not the two flags: while
+    /// `flag_declaration_guard` was red it could not catch the NEXT one.
+    #[test]
+    fn the_20260817_gc_diagnostics_expand_from_their_group_spelling() {
+        let c = case(&[("CRATONVM_DBG", "mapgen")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_DBG_MAPGEN"),
+            Some(OsString::from("1")),
+        );
+
+        let c = case(&[("CRATONVM_DBG", "vacated-frames")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_DBG_VACATED_FRAMES"),
+            Some(OsString::from("1")),
+        );
+
+        // And together, comma-separated, since that is how two diagnostics for
+        // one investigation actually get set.
+        let c = case(&[("CRATONVM_DBG", "mapgen,vacated-frames")]);
+        let both = c.resolve();
+        assert_eq!(both.get("CRATONVM_DBG_MAPGEN"), Some(OsString::from("1")));
+        assert_eq!(
+            both.get("CRATONVM_DBG_VACATED_FRAMES"),
+            Some(OsString::from("1")),
         );
     }
 

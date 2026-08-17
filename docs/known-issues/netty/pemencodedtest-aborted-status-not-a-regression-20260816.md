@@ -4,7 +4,7 @@
 Written 2026-08-16/17, commit `3ef3eb744`, Windows host, `cratonvm.exe`
 release build, to head off future sessions re-investigating this as a
 reopening of
-`docs/internal/fixed-suite-bugs/netty/ssl-cert-validation-residuals-FIXED-20260813.md`.
+`fixed-suite-bugs/netty/ssl-cert-validation-residuals-FIXED-20260813.md`.
 
 ## Why this looked like a regression
 
@@ -52,7 +52,7 @@ reads alarmingly at a glance. Nothing here contradicts or reopens the
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/netty/ssl-cert-validation-residuals-FIXED-20260813.md`
+- `fixed-suite-bugs/netty/ssl-cert-validation-residuals-FIXED-20260813.md`
   — the fix this doc confirms is still holding.
 - `defaultthreadfactorytest-zgc-timeout-20260816.md` — the other class
   investigated in the same session pass; unlike this one, that one *does*

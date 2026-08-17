@@ -21601,9 +21601,13 @@ fn native_dc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // DUAL-STACK, matching `sun.nio.ch.Net.socket(family, stream=false)`: with
+    // no `ProtocolFamily` argument the JDK opens AF_INET6 with `IPV6_V6ONLY`
+    // off whenever IPv6 is available. An AF_INET channel here refused every
+    // IPv6 destination with `EAFNOSUPPORT` — see `open_udp_dual_stack_socket`.
     let fd_id = ctx
         .fd_table()
-        .open_udp(None)
+        .open_udp_dual_stack()
         .map_err(|e| RuntimeError::IOException {
             message: format!("DatagramChannel.open: {e}"),
         })?;
@@ -21616,6 +21620,37 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
     dc_set_blocking(ctx, dc, true);
     set_dc_fd(ctx, dc, fd_id);
     Ok(Some(Value::Object(Some(dc))))
+}
+
+/// Turn a UDP bind failure into the exception HotSpot raises for it.
+///
+/// `java.nio.channels.DatagramChannel.bind` surfaces an unavailable address as
+/// `java.net.BindException`, and callers test for it by type — netty's
+/// `DnsNameResolverTest.testAddressAlreadyInUse` asserts
+/// `assertInstanceOf(BindException.class, cause.getCause())`. A plain
+/// `IOException` carrying the OS text satisfies nothing that looks at the
+/// type, and on Windows the text is localised on top of that.
+///
+/// Windows reports a clash two different ways depending on whether the caller
+/// asked for `SO_REUSEADDR`: `WSAEADDRINUSE` without it, `WSAEACCES` (mapped
+/// by Rust to `PermissionDenied`) with it, because the holder owns the port
+/// exclusively. Both are `BindException` on HotSpot, so both are here.
+fn dc_bind_error(addr: &str, e: std::io::Error) -> RuntimeError {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::AddrInUse => RuntimeError::BindException {
+            message: format!("Address already in use: bind to {addr}"),
+        },
+        ErrorKind::AddrNotAvailable => RuntimeError::BindException {
+            message: format!("Cannot assign requested address: bind to {addr}"),
+        },
+        ErrorKind::PermissionDenied => RuntimeError::BindException {
+            message: format!("Permission denied: bind to {addr}"),
+        },
+        _ => RuntimeError::IOException {
+            message: format!("DatagramChannel.bind: {e}"),
+        },
+    }
 }
 
 fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21657,29 +21692,101 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // bind succeeded, the send worked, and inbound traffic simply never
     // reached the event loop. `PcapWriteHandlerTest`'s `udpV4*` cases and
     // `io.netty.resolver.dns`'s transport are the visible half of that.
+    // A WILDCARD bind must keep the channel dual-stack. `open()` gave this
+    // channel an AF_INET6 socket with `IPV6_V6ONLY` off; rebinding it to the
+    // literal v4 wildcard would replace that with AF_INET and silently drop
+    // the second family — see `FileDescriptorTable::udp_rebind_dual_stack`.
+    // HotSpot reports `/[0:0:0:0:0:0:0:0]:port` for both `bind(null)` and
+    // `bind(new InetSocketAddress("0.0.0.0", 0))`, which is what this matches.
+    let wildcard_port = cratonvm_native_api::fd_table::wildcard_bind_port(&addr_str);
     if let Some(existing) = dc_fd(ctx, this) {
-        ctx.fd_table()
-            .udp_rebind(existing, Some(&addr_str), reuse)
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("DatagramChannel.bind: {e}"),
-            })?;
+        let rebound = match wildcard_port {
+            Some(port) => ctx.fd_table().udp_rebind_dual_stack(existing, port, reuse),
+            None => ctx.fd_table().udp_rebind(existing, Some(&addr_str), reuse),
+        };
+        rebound.map_err(|e| dc_bind_error(&addr_str, e))?;
         if let Ok(fresh) = ctx.fd_table().udp_try_clone(existing) {
             crate::nio_selector::selector_refresh_udp(existing as i32, &fresh);
         }
         return Ok(Some(Value::Object(Some(this))));
     }
 
-    let fd_id = if reuse {
-        ctx.fd_table().open_udp_reuse(Some(&addr_str))
-    } else {
-        ctx.fd_table().open_udp(Some(&addr_str))
+    // No socket yet (a legacy channel layout). Same wildcard rule as above.
+    let fd_id = match (wildcard_port, reuse) {
+        (Some(_), false) => ctx.fd_table().open_udp_dual_stack(),
+        _ if reuse => ctx.fd_table().open_udp_reuse(Some(&addr_str)),
+        _ => ctx.fd_table().open_udp(Some(&addr_str)),
     }
-    .map_err(|e| RuntimeError::IOException {
-        message: format!("DatagramChannel.bind: {e}"),
-    })?;
+    .map_err(|e| dc_bind_error(&addr_str, e))?;
 
     set_dc_fd(ctx, this, fd_id);
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// Render a real-JDK `java.net.InetAddress`'s NUMERIC address as a literal
+/// that `std::net::ToSocketAddrs` parses without consulting a resolver —
+/// dotted-quad for v4, bracketed for v6 so `format!("{host}:{port}")` stays
+/// unambiguous.
+///
+/// Returns `None` for anything that is not a real-JDK holder layout, and for
+/// an `InetSocketAddress` whose `addr` is null (an unresolved one); the caller
+/// falls back to the hostname there.
+///
+/// # Why the caller must prefer this over the hostname
+///
+/// `dc_socket_addr` used to answer `InetSocketAddressHolder.hostname` first,
+/// and `InetAddressHolder.hostName` after it, reaching the numeric `address`
+/// int only when both were absent. That handed a NAME to
+/// `UdpSocket::bind`/`send_to`, which resolves it again through the platform
+/// resolver — a second, independent answer to a question Java had already
+/// answered.
+///
+/// The two resolvers disagree on `localhost`. Windows `getaddrinfo` orders
+/// `::1` first; glibc, with the stock `127.0.0.1 localhost` line ahead of
+/// `::1 localhost` in `/etc/hosts`, orders `127.0.0.1` first. So
+/// `DatagramChannel.bind(new InetSocketAddress("localhost", 0))` — whose
+/// `InetSocketAddress` already holds a resolved `127.0.0.1` — bound `::1` on
+/// Windows and `127.0.0.1` on Linux, from identical bytes. HotSpot never has
+/// this divergence: `sun.nio.ch.Net.bind` takes `isa.getAddress()` and never
+/// looks at the name.
+///
+/// Downstream that produced a destination address no test constructs.
+/// Apache MINA's `NioDatagramAcceptor.localAddress()` rewrites any bound
+/// `Inet6Address` for which `isIPv4CompatibleAddress()` holds into the v4
+/// address in its last four bytes ("Ugly hack to workaround a problem on
+/// linux", per its own comment). `::1` satisfies that predicate, and its last
+/// four bytes are `[0, 0, 0, 1]` — so netty's `TestDnsServer.localAddress()`
+/// answered `0.0.0.1`, every `DnsNameResolver` query went to `0.0.0.1`, and
+/// Windows failed each one with `WSAENETUNREACH`.
+fn inet_addr_literal(ctx: &dyn NativeContext, inet_addr: ObjectRef) -> Option<String> {
+    // IPv6 FIRST. `Inet6Address` keeps its sixteen bytes in a separate
+    // `holder6` (`Inet6Address$Inet6AddressHolder.ipaddress`), and the base
+    // holder's `address` int stays 0 for it — reading that would render every
+    // v6 address as `0.0.0.0`, which binds the v4 wildcard.
+    if let Value::Object(Some(h6)) = ctx.get_field_by_name(inet_addr, "holder6") {
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(h6, "ipaddress") {
+            if ctx.array_length(arr) == 16 {
+                let mut octets = [0u8; 16];
+                for (i, slot) in octets.iter_mut().enumerate() {
+                    match ctx.get_array_element(arr, i) {
+                        Value::Int(b) => *slot = b as u8,
+                        _ => return None,
+                    }
+                }
+                // Bracketed: the caller appends `:{port}`, and a bare v6
+                // literal there is ambiguous to every parser that sees it.
+                return Some(format!("[{}]", std::net::Ipv6Addr::from(octets)));
+            }
+        }
+    }
+    let inet_holder = match ctx.get_field_by_name(inet_addr, "holder") {
+        Value::Object(Some(h)) => h,
+        _ => return None,
+    };
+    match ctx.get_field_by_name(inet_holder, "address") {
+        Value::Int(address) => Some(std::net::Ipv4Addr::from((address as u32).to_be_bytes()).to_string()),
+        _ => None,
+    }
 }
 
 /// Extract a printable host:port from both the real JDK 25 holder layout and
@@ -21690,30 +21797,25 @@ fn dc_socket_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<String> {
             Value::Int(port) if (0..=65_535).contains(&port) => port,
             _ => return None,
         };
+        // The RESOLVED address wins over the hostname, and this ordering is
+        // load-bearing — see [`inet_addr_literal`]. Java has already resolved
+        // the name; handing the name back to the OS asks a SECOND resolver the
+        // same question and takes whichever answer it happens to order first.
+        if let Value::Object(Some(inet_addr)) = ctx.get_field_by_name(holder, "addr") {
+            if let Some(host) = inet_addr_literal(ctx, inet_addr) {
+                return Some(format!("{host}:{port}"));
+            }
+        }
+        // Only an UNRESOLVED `InetSocketAddress` (`createUnresolved`, or a
+        // constructor whose lookup failed) reaches here with a name and no
+        // address; the name is then all there is, and the OS resolver is the
+        // right place to send it.
         let hostname = match ctx.get_field_by_name(holder, "hostname") {
             Value::Object(Some(hostname)) => ctx.read_string(hostname).unwrap_or_default(),
             _ => String::new(),
         };
         if !hostname.is_empty() {
             return Some(format!("{hostname}:{port}"));
-        }
-        if let Value::Object(Some(inet_addr)) = ctx.get_field_by_name(holder, "addr") {
-            if let Value::Object(Some(inet_holder)) = ctx.get_field_by_name(inet_addr, "holder") {
-                if let Value::Object(Some(host_name)) =
-                    ctx.get_field_by_name(inet_holder, "hostName")
-                {
-                    if let Some(host_name) = ctx.read_string(host_name) {
-                        if !host_name.is_empty() {
-                            return Some(format!("{host_name}:{port}"));
-                        }
-                    }
-                }
-                if let Value::Int(address) = ctx.get_field_by_name(inet_holder, "address") {
-                    let octets = (address as u32).to_be_bytes();
-                    let host = std::net::Ipv4Addr::from(octets);
-                    return Some(format!("{host}:{port}"));
-                }
-            }
         }
         return None;
     }
