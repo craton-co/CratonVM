@@ -12,6 +12,67 @@ out-of-file.
 > longer real-JDK-only. §7.1 (`onExit` on a minted handle) and §7.2 (the
 > synthetic-JDK empty stream) are untouched and remain the record's open work.
 
+> **RE-VERIFIED AGAINST THE TREE 2026-08-12 (later pass, A9 record triage).**
+> Read only — nothing was built or run in that pass either. Line numbers are
+> against the **committed** tree at `768ac2de0`; `classloading/src/class_manager.rs`
+> carries a concurrent lane's uncommitted edits, but §7.3's two rows are in the
+> commit and at the lines cited.
+>
+> * **The fix is present and is what §3–§5 describe.** `register_phase57_process`
+>   opens its three shared triples with an explicit
+>   `r.set_category(NativeKind::SyntheticStub)` and restores the ambient
+>   category after (`native-builtins/src/phases_late.rs`, the
+>   `let __ph_cat = r.current_category();` block), and
+>   `register_p60_process_handle` carries §5's whole argument in its doc comment
+>   and its own `set_category`. Both sites, as §5 requires.
+> * **§4's row is live.**
+>   `r.register(phi, "commandLine", "()Ljava/util/Optional;", p60_empty_optional)`
+>   is the last registration in `register_p60_process_handle`, and §7.3's
+>   `mk("commandLine", "()Ljava/util/Optional;")` is at
+>   `classloading/src/class_manager.rs:15464` with the mirror exact-set assertion
+>   at `:19294`.
+> * **§2's "no other file registers either class name" reproduces.** The only
+>   other `ProcessHandle` mentions in Rust are comments
+>   (`native-io/src/lib.rs`, `native-builtins/src/lib.rs`, `vm/src/vm/vm_init.rs`,
+>   `native-builtins/src/phases_late/reflect_invoke.rs` — the last is a stale
+>   section header above `p60_empty_optional`, not a registrar), the
+>   `ProcessHandleImpl` natives in `native-io/src/process.rs` (a *different* class
+>   name), the carrier in `class_manager.rs`, and the two tests. No competing
+>   registration exists, so last-write-wins has nothing to decide here.
+> * **§6's "second finding" HAS BEEN FIXED by another lane, and §6's numbers are
+>   dead.** `native-builtins/tests/common/vm_init_boot_path.rs` now names
+>   `register_p60_process_handle` and `register_classvalue_natives` in
+>   `VM_INIT_SEQUENCE` (`:114`/`:115`) and calls them in the replay
+>   (`:233`/`:234`), and it grew a **source witness** —
+>   `vm_init_real_jdk_boot_path` reads `vm_init.rs`'s real-JDK arm and fails on
+>   an unmodelled registrar or an order inversion. Its failure message cites this
+>   exact defect: *"18 registrations, `register_p60_process_handle` and
+>   `register_classvalue_natives`"*. `BASELINE_SYNTHETIC_STUBS` is no longer
+>   1038; it is now a pair, `BASELINE_SYNTHETIC_STUBS_MANAGEMENT = 1263` /
+>   `_NO_MANAGEMENT = 1253`, selected by `cfg`. **Do not quote §6's
+>   1038 -> 1041, nor its bridge-ratchet deltas**: they were computed against a
+>   census scope that has since changed and a baseline that has since been
+>   re-frozen. §6's *reasoning* (a stub census cannot tell a new fake from a
+>   correctly re-tagged old one) is what survives. That fix has its own record:
+>   `docs/known-issues/jdk-only/W7-30-stub-ratchet-boot-path-scope.md`, which is
+>   where a reader should go for the current scope and baselines rather than to
+>   §6.
+> * **Which census category this record is, since the two are counted
+>   separately.** Seventeen of the eighteen instance rows are *natives
+>   intercepting an **abstract** declaration on a real image class* — the 2865
+>   category, not the 335 "fabricated method on a real class" one. No method
+>   registered here is absent from the image: `javap` declares all thirteen
+>   `ProcessHandle` abstracts and all six `$Info` abstracts, `commandLine`
+>   included. The one row in a different category is `current()`, which is
+>   `ACC_STATIC` **with `Code`** — a §1.4 shadow of real bytecode. "No `Code`
+>   attribute" on the other rows means *abstract*, which is exactly why the
+>   registrations are load-bearing against `AbstractMethodError`, and does not
+>   mean a broken dispatch.
+> * **§7.1 and §7.2 are still open, unchanged.** `onExit` still answers a
+>   `p58_new_cf(ctx, Value::Object(None), true)` — an already-completed future —
+>   with no `p60_delegate_to_real_handle` attempt, so unlike `info`/`parent`/
+>   `children`/`descendants` it does not delegate even on a real image.
+
 **Nothing here has been built or run.** Every claim is either `javap` output
 from the JDK 25 image on this host (Eclipse Adoptium jdk-25.0.3.9-hotspot,
 `javap -version` = `25.0.3`), the JDK's own `lib/src.zip`, or a read of the
@@ -289,6 +350,14 @@ strict it decides it, and it decides it in the direction of whichever site is
 correct for the callback and wrong for the kind.
 
 ## 6. Ratchets this moves
+
+> **STALE AS OF 2026-08-12 (later pass) — read the banner at the top.** The
+> `BASELINE_SYNTHETIC_STUBS = 1038` this section is arithmetic over no longer
+> exists, and the scope gap it names as a "second finding" has been closed:
+> `register_boot_path` now replays `register_p60_process_handle` and
+> `register_classvalue_natives`, and a source witness asserts the scope against
+> `vm_init.rs`. The deltas below cannot be re-derived from today's tree; the
+> reasoning about *why* a stub census cannot see a re-tag still holds.
 
 Neither can be re-frozen from this lane — both live in files it does not own —
 and neither has been run. The numbers below are counted from the source, not

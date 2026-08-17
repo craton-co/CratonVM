@@ -877,6 +877,112 @@ pub(crate) fn cb_read_hb(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<Obje
     }
 }
 
+/// Is this buffer READ-ONLY, by the field the JDK's own bodies read?
+///
+/// Byte-identical in shape to `servlet.rs::s2_bb_is_read_only`, which is the
+/// ByteBuffer twin of this whole family — the two must not drift, so this is
+/// transcribed from it rather than written afresh.
+///
+/// The FIELD, not the `isReadOnly()` method, because that is what
+/// `CharBuffer.hasArray`/`array`/`arrayOffset` read:
+///
+/// ```java
+/// public final boolean hasArray() { return (hb != null) && !isReadOnly; }
+/// ```
+///
+/// The two can legitimately disagree. `ByteBufferAsCharBufferRB` overrides the
+/// METHOD to return `true` and never writes the field (JDK 25
+/// `java.base/java/nio/ByteBufferAsCharBufferRB.java:214` — the only
+/// `isReadOnly` in the file is the method). That is not a hazard here: those
+/// view classes carry no `hb` either, so the "no backing array" arm of
+/// [`buffer_array_access`] answers first and the field is never consulted.
+/// MEASURED on jdk-25.0.3+9 (`probes/BufferAccessibleArrayProbe`):
+/// `ByteBuffer.allocate(8).asReadOnlyBuffer().asIntBuffer()` answers
+/// `isReadOnly() == true` and `array()` throws **UnsupportedOperationException**,
+/// not `ReadOnlyBufferException`.
+///
+/// A synthetic carrier with no such field answers a non-`Int`, or `Int(0)`, and
+/// lands on `false` — which is right: every CharBuffer this VM mints goes
+/// through [`cb_write_hb`], which writes `isReadOnly = 0` by name.
+/// CONVERGED (F14-1 N1): a delegation to `cratonvm_native_io`'s copy, which is
+/// the only one of the three this crate can import (the dependency edge runs
+/// `cratonvm-native-builtins` → `cratonvm-native-io`). `servlet.rs`'s
+/// `s2_bb_is_read_only` is the same delegation.
+fn cb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    cratonvm_native_io::buffer_is_read_only(ctx, buf)
+}
+
+/// The ONE three-way decision that `hasArray()`, `array()` and `arrayOffset()`
+/// share — and the reason none of them can be written as a single
+/// "is the array accessible?" branch.
+///
+/// JDK 25, `java.base/java/nio/CharBuffer.java` L1490/L1513/L1541 (and the
+/// byte-for-byte identical bodies in `ByteBuffer.java` at the same line
+/// numbers — one contract, generated twice from `X-Buffer.java.template`):
+///
+/// ```java
+/// public final boolean hasArray() { return (hb != null) && !isReadOnly; }
+///
+/// public final char[] array() {
+///     if (hb == null)  throw new UnsupportedOperationException();
+///     if (isReadOnly)  throw new ReadOnlyBufferException();
+///     return hb;
+/// }
+///
+/// public final int arrayOffset() {          // identical split
+///     if (hb == null)  throw new UnsupportedOperationException();
+///     if (isReadOnly)  throw new ReadOnlyBufferException();
+///     return offset;
+/// }
+/// ```
+///
+/// So `hasArray() == false` covers **two** states that raise **different**
+/// classes, and the classes are not interchangeable to a `catch`. MEASURED on
+/// jdk-25.0.3+9 (`probes/BufferAccessibleArrayProbe`):
+///
+/// | receiver | `hasArray()` | `array()` / `arrayOffset()` |
+/// |---|---|---|
+/// | `HeapCharBuffer` (`CharBuffer.allocate(4)`) | `true` | the array / `0` |
+/// | `HeapCharBufferR` (`.asReadOnlyBuffer()`) | `false` | `ReadOnlyBufferException` |
+/// | `StringCharBuffer` (`CharBuffer.wrap("abcd")`) | `false` | `UnsupportedOperationException` |
+/// | `ByteBufferAsCharBufferB` (a view) | `false` | `UnsupportedOperationException` |
+///
+/// The **order** is load-bearing and is why this is a function rather than two
+/// booleans at each site: a `StringCharBuffer` is read-only AND array-less, and
+/// the JDK checks array-less FIRST, so it answers `UnsupportedOperation`. A
+/// read-only-first implementation gets that one cell wrong and every other cell
+/// right, which is exactly the shape a single-branch "not accessible" fix
+/// produces.
+/// CONVERGED (F14-1 N1). The `CbArrayAccess` enum and its `cb_array_access`
+/// constructor used to live here, byte-identical to
+/// `cratonvm_native_io::BufferArrayAccess` / `buffer_array_access` and to the
+/// conjunction open-coded in `servlet.rs`. Three copies of a rule whose whole
+/// point is an ORDER that is wrong in exactly one cell is three chances to
+/// drift, and this family had already drifted once — the ByteBuffer half
+/// carried `&& !isReadOnly` while this half did not.
+///
+/// They are DELETED rather than aliased: an enum alias would leave two type
+/// names for one set of states, and the three natives below now name the
+/// imported type directly. `cratonvm-native-builtins` depends on
+/// `cratonvm-native-io` and not the reverse, so the `native-io` copy is the
+/// only one this file could have converged onto.
+use cratonvm_native_io::{buffer_array_access, BufferArrayAccess};
+
+/// `throw new UnsupportedOperationException()` — the NO-ARGUMENT constructor,
+/// so `getMessage()` is null exactly as HotSpot's is. The empty string is the
+/// documented spelling for that in `types/src/error.rs`
+/// (`RuntimeError::UnsupportedOperationException` maps `""` to `None` so the
+/// `()V` ctor is used); `Some("")` would set a non-null empty detail message.
+///
+/// CONVERGED (F14-1 N1): a delegation to the one remaining body. The local name
+/// stays because the two call sites below read better with it and because the
+/// empty-string spelling — the detail a fourth transcription would get wrong —
+/// now exists once.
+#[inline]
+fn cb_no_backing_array() -> MethodCallFailed {
+    cratonvm_native_io::buffer_no_backing_array()
+}
+
 /// Plain CharBuffer/HeapCharBuffer/StringCharBuffer instances have no
 /// independent byte-order concept of their own (real `HeapCharBuffer.order()`
 /// just returns the platform's native order); this mirrors the same
@@ -1182,13 +1288,23 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     // report true. Without this, icu4j's `b16BitUnits.subSequence(
     // start, end).toString()` reads a null `hb` and throws
     // `IllegalStateException("CharBuffer has no backing array")`.
+    //
+    // The `&& !isReadOnly` half was MISSING: this answered purely "is there an
+    // hb?", so `CharBuffer.allocate(4).asReadOnlyBuffer()` — a real
+    // `HeapCharBufferR`, which does have an `hb` — reported `hasArray() == true`
+    // where HotSpot 25.0.3+9 reports `false`
+    // (`probes/BufferAccessibleArrayProbe`, row `rcb.hasArray`). A caller that
+    // trusts `hasArray()` then reaches for `array()` and mutates the backing
+    // store of a buffer the JDK says is read-only. The ByteBuffer twin
+    // (`servlet.rs::register_s2_bytebuffer`, `hasArray()Z`) has carried the
+    // second half all along; this is the drifted copy.
     r.register(cb, "hasArray", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if cb_read_hb(ctx, this).is_some() {
-            1
-        } else {
-            0
-        })))
+        let access =
+            buffer_array_access(cb_read_hb(ctx, this).is_some(), cb_is_read_only(ctx, this));
+        Ok(Some(Value::Int(i32::from(
+            access == BufferArrayAccess::Accessible,
+        ))))
     });
     // CharBuffer.isReadOnly()/isDirect() are abstract in the real JDK (each
     // concrete Heap/Direct/View subclass overrides them) — every OTHER typed
@@ -1203,14 +1319,16 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     // native registered) — killing any caller whose real-JDK bytecode reads
     // `hasArray()`/`isReadOnly()` on a CharBuffer (e.g. Lucene's vector codec
     // tests decoding index metadata strings).
+    //
+    // The body used to open-code the field read a FOURTH time, and not
+    // identically: `match … { Value::Int(v) => v, _ => 0 }` returns the raw
+    // field value where [`cb_is_read_only`] — which `hasArray`/`array`/
+    // `arrayOffset` on this same receiver consult — normalises it to 0/1. Any
+    // `isReadOnly` other than 0 or 1 made `isReadOnly()` and `hasArray()`
+    // disagree about one receiver. It is the same read now.
     r.register(cb, "isReadOnly", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(
-            match ctx.get_field_by_name(this, "isReadOnly") {
-                Value::Int(v) => v,
-                _ => 0,
-            },
-        )))
+        Ok(Some(Value::Int(i32::from(cb_is_read_only(ctx, this)))))
     });
     // isDirect()Z — STUB-REMOVAL (wave 3): was a flat `false`. Derive it, the
     // same way `hasArray` above derives from the backing array, so a genuinely
@@ -1274,11 +1392,25 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     ] {
         r.register(subclass, "order", "()Ljava/nio/ByteOrder;", cb_order_little);
     }
+    // `arrayOffset()` has the SAME three-way split as `array()` below and had
+    // NEITHER refusal — a `StringCharBuffer` and a read-only heap buffer both
+    // answered a number, and `0` is a perfectly ordinary offset, so
+    // `hasArray()`-less code that reached for the offset got a plausible answer
+    // instead of the exception that tells it to take the other path.
+    //
+    // Transcribed from the `array()` arm below through the shared
+    // [`buffer_array_access`] rather than written afresh, so the two cannot drift.
+    // This is the same repair `servlet.rs`'s `arrayOffset()I` already carries on
+    // the ByteBuffer side (record: W7-83 §7.1).
     r.register(cb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match ctx.get_field_by_name(this, "offset") {
-            Value::Int(v) => Ok(Some(Value::Int(v))),
-            _ => Ok(Some(Value::Int(0))),
+        match buffer_array_access(cb_read_hb(ctx, this).is_some(), cb_is_read_only(ctx, this)) {
+            BufferArrayAccess::Absent => Err(cb_no_backing_array()),
+            BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+            BufferArrayAccess::Accessible => match ctx.get_field_by_name(this, "offset") {
+                Value::Int(v) => Ok(Some(Value::Int(v))),
+                _ => Ok(Some(Value::Int(0))),
+            },
         }
     });
     // toString(II) / toString() — abstract on CharBuffer; subSequence and
@@ -1397,11 +1529,43 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         // toString() is documented as toString(position(), limit()). For
         // synthetic/heap buffers our `cb_to_string_range` historically treats
         // the range as relative, so keep the old 0..remaining call here.
-        let args2 = [
-            Value::Object(Some(this)),
-            Value::Int(0),
-            Value::Int(lim - pos),
-        ];
+        //
+        // BUT the range convention differs by receiver, and this registration
+        // is reached by BOTH routes while the `StringCharBuffer` one below is
+        // reached by only one. `StringCharBuffer` does not declare
+        // `toString()` — the JDK inherits it from `CharBuffer` — so
+        // `Class.getMethod("toString")` resolves to the DECLARING class and
+        // reflection / `Method.invoke` / `ctx.invoke_virtual` land HERE, while
+        // a bytecode `invokevirtual` dispatches on the receiver and lands
+        // there. Measured 2026-08-13 on `CharBuffer.wrap("x00ff0a80y", 1, 9)`:
+        // bytecode gave `00ff0a80` (correct) and the reflective route gave
+        // `x00ff0a8` — the right LENGTH from the wrong ORIGIN, because this
+        // arm passed a relative `0` for a receiver whose window lives in
+        // `position`. `HexFormat.parseHex(CharSequence)` is specified as
+        // `parseHex(CharBuffer.wrap(...))`, so it read the unsliced text and
+        // threw `NumberFormatException: not a hexadecimal digit: "x"`.
+        //
+        // Dispatch on the receiver's real class so ONE implementation serves
+        // both routes; the twin below stays as the direct-dispatch entry.
+        let is_string_cb = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .map(|n| n == "java/nio/StringCharBuffer")
+            .unwrap_or(false);
+        let args2 = if is_string_cb {
+            // Absolute: JDK `StringCharBuffer.toString(start, end)` is
+            // `str.subSequence(start + offset, end + offset)`.
+            [
+                Value::Object(Some(this)),
+                Value::Int(pos),
+                Value::Int(lim),
+            ]
+        } else {
+            [
+                Value::Object(Some(this)),
+                Value::Int(0),
+                Value::Int(lim - pos),
+            ]
+        };
         cb_to_string_range(ctx, &args2)
     });
     r.register(
@@ -1468,6 +1632,10 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 Value::Int(v) => v,
                 _ => 0,
             };
+            // Read BEFORE the allocation below: `this` is what the flag comes
+            // from, and it must be captured while `ctx` is only borrowed
+            // immutably.
+            let src_read_only = cb_is_read_only(ctx, this);
             let new_pos = cur_pos + start;
             let new_lim = cur_pos + end;
             // Allocate a fresh HeapCharBuffer pointing at the same char[]
@@ -1480,7 +1648,14 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             ctx.unpin_native_roots(arr_pin);
             ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
             ctx.set_field_by_name(buf, "offset", Value::Int(cur_off));
-            ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
+            // A view of a read-only buffer is READ-ONLY. This wrote a flat 0,
+            // so `subSequence` was a documented laundering route out of the
+            // read-only state — the result was array-backed and writable.
+            // MEASURED, jdk-25.0.3+9: `CharBuffer.allocate(4).asReadOnlyBuffer()
+            // .subSequence(0, 2).isReadOnly()` is `true`, as are `.slice()` and
+            // `.duplicate()` of the same receiver, and
+            // `CharBuffer.wrap("abcd").slice().isReadOnly()`.
+            ctx.set_field_by_name(buf, "isReadOnly", Value::Int(i32::from(src_read_only)));
             ctx.set_field_by_name(buf, "position", Value::Int(new_pos));
             ctx.set_field_by_name(buf, "limit", Value::Int(new_lim));
             // The slice keeps the PARENT's capacity, not its own limit — the
@@ -1561,6 +1736,24 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     });
     r.register(cb, "put", "(C)Ljava/nio/CharBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // READ-ONLY FIRST, before the overflow check. Every read-only
+        // `CharBuffer` subclass overrides the mutators with a bare
+        // `throw new ReadOnlyBufferException()` and never consults
+        // position/limit, so the refusal outranks both of the bounds classes.
+        // MEASURED, jdk-25.0.3+9: a buffer that is read-only AND full answers
+        // `ReadOnlyBufferException`, where the same buffer writable answers
+        // `BufferOverflowException`; an absolute `put(9, 'z')` past the end of a
+        // read-only buffer answers `ReadOnlyBufferException`, not
+        // `IndexOutOfBoundsException`.
+        //
+        // Without this a read-only receiver reaching this native (any receiver
+        // whose resolved `put` has no `Code` — the synthetic-JDK build, and
+        // CratonVM-minted abstract-stamped `java/nio/CharBuffer` instances)
+        // silently WROTE, which is worse than a wrong exception class: it
+        // mutates storage the JDK guarantees is immutable through this handle.
+        if cb_is_read_only(ctx, this) {
+            return Err(RuntimeError::ReadOnlyBufferException.into());
+        }
         let ch = args.get(1).copied().unwrap_or(Value::Int(0));
         let pos = match ctx.get_field(this, CB_FIELD_POS) {
             Value::Int(v) => v,
@@ -1709,14 +1902,30 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, CB_FIELD_CAPACITY)))
     });
+    // The three-way split, in the JDK's order — see [`buffer_array_access`].
+    //
+    // This used to be ONE branch: no `hb` raised
+    // `IllegalStateException("CharBuffer.array: no backing array")`, a class
+    // that is in neither of the two hierarchies the JDK uses here, so neither a
+    // `catch (UnsupportedOperationException)` nor a
+    // `catch (ReadOnlyBufferException)` around a buffer access saw it. And the
+    // read-only cell was missing entirely: an array-backed READ-ONLY buffer
+    // handed its backing `char[]` straight out, which is a mutable alias to
+    // storage the JDK refuses to expose — a wrong ANSWER on the two throwing
+    // cells and a wrong CAPABILITY on the third.
+    //
+    // MEASURED, jdk-25.0.3+9, `probes/BufferAccessibleArrayProbe`:
+    //   scb.array  java.lang.UnsupportedOperationException   (StringCharBuffer)
+    //   rcb.array  java.nio.ReadOnlyBufferException          (HeapCharBufferR)
+    //   hcb.array  OK 4                                      (HeapCharBuffer)
     r.register(cb, "array", "()[C", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match cb_read_hb(ctx, this) {
-            Some(a) => Ok(Some(Value::Object(Some(a)))),
-            None => Err(RuntimeError::IllegalStateException {
-                message: "CharBuffer.array: no backing array".into(),
-            }
-            .into()),
+        let hb = cb_read_hb(ctx, this);
+        match buffer_array_access(hb.is_some(), cb_is_read_only(ctx, this)) {
+            BufferArrayAccess::Absent => Err(cb_no_backing_array()),
+            BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+            // `hb` is `Some` on this arm by construction of `buffer_array_access`.
+            BufferArrayAccess::Accessible => Ok(Some(Value::Object(hb))),
         }
     });
     // `java/nio/CharBuffer.toString()` is registered ONCE, above, delegating to
@@ -1812,6 +2021,69 @@ mod cb_layout_tests {
             ctx.get_field(buf, CB_FIELD_MARK),
             Value::Int(-1),
             "slot 4 is the real Buffer.address — the indexed fallback must be suppressed here"
+        );
+    }
+
+    /// The full `hasArray`/`array`/`arrayOffset` truth table, as measured on
+    /// HotSpot 25.0.3+9 (`probes/BufferAccessibleArrayProbe`).
+    ///
+    /// Asserted on the pure decision function rather than through a
+    /// `MockNativeContext`: the mock resolves field NAMES through a slot
+    /// fallback, so a receiver-shaped test here would be measuring the mock's
+    /// name-to-slot table and not the ordering this function exists to fix.
+    /// The two inputs are exactly the two fields the JDK bodies read.
+    ///
+    /// The function is now `cratonvm_native_io::buffer_array_access` and the
+    /// local `cb_array_access` is gone (F14-1 N1). These three tests are KEPT
+    /// rather than deleted as duplicates of `native-io`'s own: they assert
+    /// from the CONSUMER side, so a future lane that re-introduces a local
+    /// copy has to delete an assertion to do it, and the CharBuffer-specific
+    /// receivers each cell names (`StringCharBuffer`, `ByteBufferAsCharBufferB`)
+    /// are witnesses `native-io`'s ByteBuffer-side rows do not carry.
+    #[test]
+    fn charbuffer_natives_use_the_shared_jdk_three_way_table() {
+        // HeapCharBuffer — `CharBuffer.allocate(4)`.
+        assert_eq!(buffer_array_access(true, false), BufferArrayAccess::Accessible);
+        // HeapCharBufferR — `.asReadOnlyBuffer()`. HotSpot: hasArray() == false,
+        // array() throws ReadOnlyBufferException.
+        assert_eq!(buffer_array_access(true, true), BufferArrayAccess::ReadOnly);
+        // ByteBufferAsCharBufferB — a writable VIEW with no `hb`. HotSpot:
+        // array() throws UnsupportedOperationException even though it is not
+        // read-only, which is why "not accessible" cannot be one branch.
+        assert_eq!(buffer_array_access(false, false), BufferArrayAccess::Absent);
+    }
+
+    /// The ORDER, pinned on its own because it is the single cell a
+    /// read-only-first implementation gets wrong.
+    ///
+    /// `CharBuffer.wrap("abcd")` is a `StringCharBuffer`: read-only AND
+    /// array-less at the same time. The JDK checks `hb == null` FIRST, so it
+    /// answers `UnsupportedOperationException`, not `ReadOnlyBufferException` —
+    /// and the two are unrelated classes, so a `catch` cannot absorb the
+    /// difference. This is the row `RJdkIntrinsics2 --only=bounds` asserts.
+    #[test]
+    fn shared_table_checks_absent_before_read_only_for_stringcharbuffer() {
+        assert_eq!(buffer_array_access(false, true), BufferArrayAccess::Absent);
+    }
+
+    /// Only ONE of the three states admits the array, and it is the one where
+    /// `hasArray()` is true. A mutation that made `hasArray()` derive from
+    /// anything but this function would let a read-only buffer hand out a
+    /// mutable alias to its backing store.
+    #[test]
+    fn exactly_one_state_hands_the_array_over() {
+        let states = [
+            buffer_array_access(false, false),
+            buffer_array_access(false, true),
+            buffer_array_access(true, false),
+            buffer_array_access(true, true),
+        ];
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| **s == BufferArrayAccess::Accessible)
+                .count(),
+            1
         );
     }
 

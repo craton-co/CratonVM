@@ -49,7 +49,8 @@
 #
 # Exit codes:
 #   0  every arm completed and the divergent set is within the baseline
-#   2  a prerequisite is missing, or there is no baseline for this
+#   2  a prerequisite is missing; or a FIXTURE did not build and the resulting
+#      degradation was not declared; or there is no baseline for this
 #      <feature>-<os> and the gate refuses to adjudicate (never a pass)
 #   3  a probe failed to compile
 #   4  an arm did not complete (non-zero exit, timeout, or crash)
@@ -62,6 +63,58 @@
 # 4 and 5 are separate on purpose: a truncated run and a wrong answer need
 # different triage, and collapsing them into "failed" is how a hang gets filed
 # as a diff.
+#
+# A FIXTURE THAT DID NOT BUILD IS NOT AN AGREEMENT (2026-08-12).
+# ------------------------------------------------------------
+# Until this date the two fixture builders below -- the agent jar and the JNI
+# shared object -- printed a WARNING when they failed and let the run continue,
+# and the comments here asserted that this was safe because "the arms still
+# agree and the gate stays honest". THAT ARGUMENT IS WRONG, and it is wrong in
+# the exact way this repo has already named twice.
+#
+# This gate measures AGREEMENT between three arms. When a fixture is missing,
+# JdkOnlyPlatformProbe prints `agent=absent` / `jni ... lib=absent` in ALL
+# THREE arms, because none of them was given the fixture. The three arms then
+# agree -- not because they behaved the same, but because none of them
+# executed the code under test. Agreement between three instruments that all
+# measured nothing is the ABSENCE OF EVIDENCE, not evidence of sameness. The
+# whole agent section and the whole JNI section switch themselves off, the
+# ratchet has nothing left to fire on, and the script prints PASS.
+#
+# That is G4 of regression-suite/harness-guard.sh -- "the run that supplies
+# ground truth did not itself succeed, so the 'expected' side of the diff is an
+# artefact of its failure" -- arriving one level up, and it is the shape
+# docs/known-issues/jdk-only/W7-60-harness-extract-blindness.md §6.6 rejects in
+# so many words: a warning inside a green build is how the previous version of
+# this defect survived long enough to be measured. It is worse than an ordinary
+# vacuous check because it is SELF-DISABLING: the harness silently reduces its
+# own coverage and still reports success.
+#
+# So: a fixture that did not build makes the run REFUSE (exit 2), reusing the
+# refusal the self-test and the missing-baseline paths already use. Degradation
+# is still allowed -- some hosts genuinely have no C compiler -- but it must be
+# DECLARED, exactly as regression-suite/harness-uncounted.txt makes an uncounted
+# vector declared rather than merely tolerated:
+#
+#   ALLOW_DEGRADED_FIXTURES=1                     allow every degradation
+#   ALLOW_DEGRADED_FIXTURES="jni-lib-no-cc"       allow exactly that one
+#
+# Prefer the second spelling. `=1` also silences a fixture that used to build
+# and has just started failing, which is the regression you wanted to hear
+# about. An UNDECLARED degradation refuses; a declared one runs and says out
+# loud, in the verdict, which sections it did not cover. A permanently-red job
+# is a job nobody reads, so if a matrix leg genuinely cannot build a fixture,
+# name that fixture in the leg's ALLOW_DEGRADED_FIXTURES with a reason in the
+# workflow comment -- do not leave the leg red.
+#
+# WHY THIS SCRIPT IN PARTICULAR. `probes/` is scheduled by nothing else:
+# `grep -c 'probes/' regression-suite/run.sh` is 0 (re-verified 2026-08-12), so
+# no SUITE= value of the regression suite runs a single probe. This script and
+# scripts/jdk-only-census.sh are the only scheduled consumers of the 449-file
+# probe corpus, and this script is the only one that runs a HotSpot control.
+# When its JNI and agent sections switch themselves off, the JNI boundary and
+# instrumentation under --jdk-only are covered by NOTHING, anywhere, and no
+# suite run at any SUITE= value would notice.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -136,6 +189,27 @@ divergent_keys() {
     | sort -u
 }
 
+# Which of the fixtures that failed to build were NOT declared by the operator.
+# Exactly one copy of this decision exists, and both the self-test below and the
+# verdict at the bottom call it, so the rule that is tested and the rule that is
+# enforced cannot drift apart -- the same reason harness-guard.sh defines
+# extract() exactly once.
+#
+# $1 = degraded tokens (space-separated), $2 = ALLOW_DEGRADED_FIXTURES.
+# stdout: the undeclared tokens, space-prefixed. Empty output means "declared".
+undeclared_degradations() {
+  ud_allowed=" $(printf '%s' "$2" | tr ',' ' ') "
+  ud_out=""
+  for ud_f in $1; do
+    case "$ud_allowed" in
+      *" 1 "*|*" all "*) continue ;;
+      *" $ud_f "*) continue ;;
+    esac
+    ud_out="$ud_out $ud_f"
+  done
+  printf '%s' "$ud_out"
+}
+
 # Detect the JDK feature version the same way scripts/jdk-only-census.sh does,
 # because the baselines are keyed by it and two different keys must never be
 # derived two different ways.
@@ -200,6 +274,35 @@ selftest() {
     *"p/strict/gamma"*) : ;;
     *) echo "ERROR: self-test failed -- a NEW key was not flagged. The ratchet cannot fire."; return 1 ;;
   esac
+
+  # The degradation guard, both directions, on the same principle: a guard that
+  # has never been shown to fire is indistinguishable from one that cannot --
+  # and this guard exists precisely because the previous version of it silently
+  # could not.
+  #   1. an undeclared fixture is reported (the guard fires)
+  #   2. a declared one is not (the escape hatch works, so nobody deletes it)
+  #   3. a blanket `1` covers everything
+  #   4. a PARTIAL declaration still reports the rest -- the case that makes
+  #      the list spelling worth having over `=1`
+  if [ -z "$(undeclared_degradations 'jni-lib' '0')" ]; then
+    echo "ERROR: self-test failed -- an UNDECLARED degraded fixture was not"
+    echo "       reported. The degradation guard cannot fire."
+    return 1
+  fi
+  if [ -n "$(undeclared_degradations 'jni-lib' 'jni-lib')" ]; then
+    echo "ERROR: self-test failed -- a DECLARED degraded fixture was still"
+    echo "       reported. ALLOW_DEGRADED_FIXTURES does not work."
+    return 1
+  fi
+  if [ -n "$(undeclared_degradations 'jni-lib agent-jar' '1')" ]; then
+    echo "ERROR: self-test failed -- ALLOW_DEGRADED_FIXTURES=1 did not allow all."
+    return 1
+  fi
+  if [ "$(undeclared_degradations 'jni-lib agent-jar' 'jni-lib')" != " agent-jar" ]; then
+    echo "ERROR: self-test failed -- a PARTIAL declaration did not leave the"
+    echo "       undeclared fixture reported."
+    return 1
+  fi
   return 0
 }
 if ! selftest; then
@@ -207,6 +310,7 @@ if ! selftest; then
   exit 2
 fi
 echo "self-test: the ratchet fires on a new section and not on a baselined one"
+echo "self-test: an undeclared degraded fixture refuses; a declared one does not"
 
 # ------------------------------------------------------------------ the corpus
 
@@ -236,6 +340,18 @@ if ! "$JAVAC" -d "$OUT/classes" $SRCS 2>&1; then
   exit 3
 fi
 
+# Set by any fixture that failed to build. A missing fixture makes its section
+# report `absent` in EVERY arm, so the arms AGREE and the agreement ratchet sees
+# no divergence -- the section is switched off and the gate would still say
+# PASS. That is the G4 defect of W7-60-harness-extract-blindness.md: a control
+# that produced no evidence being scored as ground truth. Declared degradation
+# is fine; silent degradation is not. Adjudicated once, at the verdict.
+#
+# Each token names a fixture, not a section, because a token is what an operator
+# has to type into ALLOW_DEGRADED_FIXTURES, and it must be obvious from the
+# token which build step to go and fix.
+DEGRADED_FIXTURES=""
+
 # ------------------------------------------------------- fixture: the agent jar
 
 AGENT_ARG=""
@@ -248,8 +364,17 @@ if [ -f "$OUT/classes/JdkOnlyProbeAgent.class" ]; then
     echo "agent jar: $OUT/jdkonly-probe-agent.jar"
   else
     echo "WARNING: the agent jar did not build; the agent section will report absent"
-    echo "         in EVERY arm, so the arms still agree and the gate stays honest."
+    echo "         in EVERY arm. The arms then agree because NEITHER measured"
+    echo "         anything, which is not honesty -- see the DEGRADED_FIXTURES note."
+    DEGRADED_FIXTURES="$DEGRADED_FIXTURES agent-jar"
   fi
+else
+  # Reached when probes/JdkOnlyProbeAgent.java is absent or did not produce a
+  # class. This path used to print NOTHING at all -- quieter even than the
+  # WARNING above, and with the identical effect on coverage.
+  echo "WARNING: no JdkOnlyProbeAgent.class under $OUT/classes; no agent jar was"
+  echo "         built and the agent section reports absent in EVERY arm."
+  DEGRADED_FIXTURES="$DEGRADED_FIXTURES agent-class"
 fi
 
 # --------------------------------------------------------- fixture: the JNI lib
@@ -275,10 +400,18 @@ if [ -f "$JNI_SRC" ]; then
     else
       echo "WARNING: the JNI fixture did not build (see $OUT/logs/jni-build.log)."
       echo "         The jni section will report lib=absent in EVERY arm."
+      DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib"
     fi
   else
     echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
+    DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib-no-cc"
   fi
+else
+  # Same silent path as the agent's: no C source, no warning, no JNI section,
+  # and three arms agreeing about a boundary none of them crossed.
+  echo "WARNING: $JNI_SRC does not exist; the jni section reports lib=absent in"
+  echo "         EVERY arm."
+  DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-source"
 fi
 
 # ------------------------------------------------------------------ the run
@@ -409,6 +542,9 @@ fi
 if [ -n "$BOTH_MODES" ]; then
   echo "  (both modes, so pre-existing:$BOTH_MODES)"
 fi
+if [ -n "$DEGRADED_FIXTURES" ]; then
+  echo "DEGRADED:   $DEGRADED_FIXTURES"
+fi
 
 # An incomplete arm is never baselined and always fails, before the ratchet
 # gets a say: a truncated transcript's divergent set is meaningless.
@@ -416,6 +552,48 @@ if [ -n "$BAD_EXIT" ]; then
   echo "RESULT: FAIL -- an arm did not complete. Never baselined: a hang or a"
   echo "        crash is not a known-acceptable transcript."
   exit 4
+fi
+
+# ------------------------------------- undeclared degradation refuses to score
+#
+# BEFORE the baseline is read or written, because both readings are wrong under
+# a degraded run: gating against a baseline frozen with the fixtures present
+# would compare a full baseline to a hollowed-out run, and --update-baseline
+# would freeze the hollowed-out set as the new normal, quietly deleting the
+# agent and JNI rows from the ratchet.
+#
+# ALLOW_DEGRADED_FIXTURES is `1`/`all` for a blanket allowance, or a
+# space/comma-separated list of the tokens printed above. The list spelling is
+# the one to use: a blanket `1` also swallows a fixture that used to build.
+if [ -n "$DEGRADED_FIXTURES" ]; then
+  UNDECLARED="$(undeclared_degradations "$DEGRADED_FIXTURES" "${ALLOW_DEGRADED_FIXTURES:-0}")"
+
+  if [ -n "$UNDECLARED" ]; then
+    echo ""
+    echo "UNDECLARED DEGRADED FIXTURES:$UNDECLARED"
+    echo "  Each of these switches a whole SECTION off in EVERY arm at once:"
+    echo "    agent-jar / agent-class   -> JdkOnlyPlatformProbe's 'agent' section"
+    echo "    jni-lib / jni-lib-no-cc / jni-source"
+    echo "                              -> JdkOnlyPlatformProbe's 'jni' section"
+    echo "  The arms then agree, no section diverges, and the ratchet cannot"
+    echo "  fire -- so a PASS here would mean 'nothing was measured', not"
+    echo "  'nothing broke'. Three arms that all failed to build agree with each"
+    echo "  other; that is the absence of evidence, not evidence."
+    echo "  Nothing else in the tree covers those sections: no SUITE= value of"
+    echo "  regression-suite/run.sh schedules a single probe."
+    echo "  Fix the fixture, or DECLARE the gap so the run says out loud what it"
+    echo "  did not cover:"
+    echo "    ALLOW_DEGRADED_FIXTURES=\"$(echo $UNDECLARED)\" bash $0"
+    echo "RESULT: REFUSED -- a fixture did not build, so its section is absent in"
+    echo "        every arm and the agreement between them is vacuous."
+    exit 2
+  fi
+
+  echo ""
+  echo "DECLARED FIXTURE GAP:$DEGRADED_FIXTURES"
+  echo "  ALLOW_DEGRADED_FIXTURES=${ALLOW_DEGRADED_FIXTURES:-0} was set, so this run"
+  echo "  continues. It did NOT cover the sections those fixtures feed; whatever"
+  echo "  it reports below is a verdict on the REST of the corpus only."
 fi
 
 sort -u "$OBSERVED" -o "$OBSERVED"
@@ -431,6 +609,13 @@ if [ "$UPDATE" -eq 1 ]; then
     echo "# three-arm run measured as diverging from the HotSpot control."
     echo "#"
     echo "# note: $NOTE"
+    if [ -n "$DEGRADED_FIXTURES" ]; then
+      echo "#"
+      echo "# WARNING: frozen from a DEGRADED run. These fixtures did not build, so"
+      echo "# the sections they feed were absent in every arm and contributed no"
+      echo "# rows to the set below:$DEGRADED_FIXTURES"
+      echo "# Re-freeze on a host where they build before trusting this key."
+    fi
     echo "#"
     echo "# The gate fails when this set GROWS. A line that stops diverging is"
     echo "# reported and passes, so a fix is never blocked by the gate that"
@@ -476,6 +661,13 @@ if [ -n "$NEW" ]; then
   echo "    bash scripts/jdk-only-strict-probes.sh --update-baseline --note \"...\""
   echo "RESULT: FAIL -- the strict corpus regressed against its baseline."
   exit 5
+fi
+
+if [ -n "$DEGRADED_FIXTURES" ]; then
+  echo "RESULT: PASS (DEGRADED:$DEGRADED_FIXTURES) -- every arm completed and no"
+  echo "        section diverged that the baseline does not already carry, but the"
+  echo "        sections fed by those fixtures were not measured at all."
+  exit 0
 fi
 
 echo "RESULT: PASS -- every arm completed and no section diverged that the"

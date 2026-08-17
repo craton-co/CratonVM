@@ -22,7 +22,7 @@
           "stated_shadows_bytecode": 24,
           "without_acc_native": 8912
         },
-        "census_schema_version": 4,
+        "census_schema_version": 5,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,

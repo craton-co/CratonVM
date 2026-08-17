@@ -548,3 +548,51 @@ The differential should report `divergent observables: 0`. If it does not, read
 `SELFCHECK.verdict` in the new probe first: a `FAIL` with
 `ordinaryFailures > 0` is an over-set and is the serious outcome, whatever the
 differential says.
+
+---
+
+## 10. Re-verified 2026-08-12 — every claim holds, and this record's coverage story is the counter-example to the rest of the campaign
+
+Source read only; **no build, no binary, no `cargo`**. Checked because this
+record's residual set is unusually specific and specific claims go stale fastest.
+Every one of them reproduces:
+
+| claim | where it says | status |
+|---|---|---|
+| slot 4 + the three helpers | §4, §8 | `STREAM_LINKED_MSG` (`native-collections/src/lib.rs:17646`), `stream_is_linked` (`:17655`), `stream_mark_linked` (`:17663`), `stream_link_or_consume` (`:17689`) |
+| `STREAM_NUM_FIELDS` 2 → 5 | §4.1 | `const STREAM_NUM_FIELDS: usize = 5;` (`:17626`) |
+| `STREAM_NUM_FIELDS_LAZY` 4 → 5 | §4.1 | `= STREAM_NUM_FIELDS` (`:18056`) — derived rather than duplicated, which is stronger than the record claims and is why the two cannot drift |
+| the §5.1.1 extension hook | §5.1.1 | `is_synthetic_stream` (`:19562`) exists, so the one-line widening is available whenever the 25 pin sites are settled |
+| **§5.6.1's four `service_loader.rs` mints, and its correction of §4.1's two** | §5.6.1 | **exact.** `java/util/stream/Stream` is minted at `:3051` (`.max(1)`), `:3303` (`.max(3)`), `:3371` (`.max(1)`), `:3415` (`.max(1)`); the two `.max(3)` `java/util/Spliterator` sites §5.6.1 warns not to touch are at `:3197` and `:3230`, exactly as written. Four line numbers and two decoys, all still correct a day later |
+
+**§5.3 and §5.4 are covered by a fixture that actually runs, and that is the
+finding worth carrying out of this record.** `RJdkCollections` is in
+`JDKONLY_CLASSES` (`regression-suite/run.sh:119`), `streamReuse()` is declared
+at `RJdkCollections.java:221`, called from `main` at `:320`, and prints its
+`CK RJdkCollections streamReuse=` line at `:278`. So the two residuals this
+record closed are **scheduled**, not probe-only.
+
+That is worth stating plainly against the rest of the sweep, because it is the
+exception. The campaign's standing note is that `regression-suite/run.sh` names
+no path under `probes/` at any `SUITE=` value, so a probe is evidence a human
+can run and not evidence the tree defends. Of the four records this lane holds:
+
+| record | its evidence | scheduled? |
+|---|---|:-:|
+| **W7-65** (this one) | `RJdkCollections.streamReuse()` + two Rust unit tests | **yes** |
+| W7-72 | `probes/SscSocketKeysProbe.java`, `probes/FileChannelIsOpenProbe.java` | no — and §7.1 says why: no fixture calls `ServerSocketChannel.socket()` and none can reach a literal `java/nio/channels/FileChannel` |
+| W7-88 | `probes/SscSocketOwnerProbe.java`, NO-CHANGE by construction, plus a source ratchet | no — §9 says a Java-visible predicate cannot move for a row that was never in the registry |
+| W7-8 | none for the shipping-path rows; §8.6 states the gap | no |
+
+The difference is not diligence. It is that §5.3/§5.4 changed a *Java-visible
+predicate on a class an ordinary program touches* — `stream.close()` then
+`stream.count()` — while the other three moved behaviour reachable only through
+an object the VM has to mint for itself. A record whose fix has no scheduled
+witness should say which of those two it is, and this record is the one that can
+say "the first".
+
+**Nothing here upgrades §5.1 or §5.6.** Both remain declined for the reasons
+given, and §5.6.1's declining argument is the one to re-read before anyone
+raises those four `.max()` calls: two lines of edit, an arm run's worth of risk,
+on the most pervasive stream path in the Spring Boot / Tomcat / Hibernate arms.
+Do not take it from a lane that cannot run those arms.

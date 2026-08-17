@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **ALL THREE PARTS ARE IN THE TREE, verified against the source on 2026-08-12 (§Landed state) — still unbuilt.** Part 1 (accessors) was merged and MEASURED to have taken effect; parts 2 (the constructor retag) and 3 (`stamp_inferred_caller`) are present and unmeasured. |
+| **Status** | **CLOSED BY MEASUREMENT 2026-08-12 (A34). Built, run, green in all three arms.** The "still unbuilt" status this row used to carry is retired: `scratchpad/bin/cratonvm-merged-dev.exe` (15:27) carries all three parts, and every row of §"What to rebuild, and what the probes must become" now reads its **must become** value. See §8. |
 | **Vector** | `regression-suite/src/RJdkLogging.java`, `formattedOutputIsRealBytes` — the last red in the `--jdk-only` strict corpus (69 passed / 1 failed). |
 | **Predecessor** | retired/jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md (the handoff; both of its candidate causes are refuted below). It is no longer in this directory — it was retired to the internal tree on 2026-08-12 and carries a SUPERSEDED marker pointing here. |
 | **Oracle** | HotSpot 25.0.3.9 renders `RJdkLogging formattedOutputIsRealBytes`. |
@@ -276,3 +276,53 @@ which reaches the same flag through the shadow. That fallback is strictly worse
   not; see the correction above. Both spellings were re-measured on this binary
   and on the pre-merge control, for all four `--add-*` flags, and a regression
   test now pins it.
+
+## 8. 2026-08-12 (A34) — the rebuild happened. Every predicted row is green.
+
+The binary this record asks for exists: `scratchpad/bin/cratonvm-merged-dev.exe`,
+built 15:27 on 2026-08-12, carrying all three parts. Run against Microsoft JDK
+25.0.3.9 with `--add-opens=java.logging/java.util.logging=ALL-UNNAMED`, one
+binary per arm with only the mode flag differing, HotSpot beside them.
+
+**The row this record says to read first is `true`.**
+
+| row | HotSpot | `--real-jdk` | `--jdk-only` | record's prediction |
+|---|---|---|---|---|
+| fresh `LogRecord` `needToInferCaller` | `true` | `false` | **`true`** | *"must become `true`"* — met |
+| fresh `getSourceClassName()` | `null` | `null` | `null` | unchanged, correct (lazy) |
+| fresh `getSequenceNumber() >= 0` | `true` | `true` | `true` | — |
+| `SimpleFormatter` during-publish | `SrcProbe6 main` | `SrcProbe6 main` | **`SrcProbe6 main`** | *"must become `<Class> / main`"* — met |
+
+The formatted line renders the **inferred source pair** and not the logger name,
+which is the whole symptom: `rjdklogging.stream` was `SimpleFormatter`'s
+documented fallback for a record carrying no source pair, and it is gone.
+
+**The vector is green, and it is scheduled.** `RJdkLogging` — *"the last red in
+the `--jdk-only` strict corpus (69 passed / 1 failed)"* — now reports
+`PASS RJdkLogging (79 checks)` on HotSpot, `--real-jdk` and `--jdk-only` alike.
+Unlike most evidence in this directory this record's instrument is a
+`regression-suite/src` vector rather than a `probes/` file, so `run.sh` re-runs
+it at every `SUITE=` and the closure cannot silently rot.
+
+**The Compatible non-regression check passes, and it passes in the specific
+shape §"Correction to fix item 2's Compatible sentence" predicted.**
+`--real-jdk` reads `needToInferCaller = false` on a fresh record while
+`--jdk-only` reads `true`. That is not a defect and it is not asymmetry for its
+own sake: in Compatible the `lib.rs` inline registration is made later in the
+same function body and `register()` is last-write-wins, so the surviving body is
+the one writing `Int(0)`; all four source accessors are still natives there and
+none reads the flag, so `0` and `1` are indistinguishable, and
+`stamp_inferred_caller` has already filled the pair in. **The correction
+predicted a value that a naive reading would have called a bug, and the run
+produced exactly it** — which is the strongest form of confirmation available
+here, and worth more than the green.
+
+**What is NOT closed by this run**, and it is the item §"Left open,
+deliberately" already names: `getLevel`, `getMessage` and `getSequenceNumber`
+remain in `RETIRED_SHADOW_TRIPLES` while live `Intrinsic` registrations in
+`phases_early.rs` still shadow them, exactly as the constructor did. They answer
+correctly today and this vector does not implicate them, so nothing here is
+red — but the table still says something about them that is not true, and the
+mechanism that made the `<init>` entry inert for a day is unchanged for these
+three. That is a table-accuracy defect, not a behavioural one, and it is the
+residual this record should be retired against.

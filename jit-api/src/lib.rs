@@ -1124,14 +1124,28 @@ pub struct JitRuntimeHelpers {
     /// offsets stay stable.
     pub ldc_class_cp: usize,
 
-    /// `aastore` element-type check — JVMS §aastore covariance.
+    /// `aastore` element-type check — the JVMS §6.5 *aastore* covariance rule
+    /// and NOTHING else: no null check, no bounds check, no barrier, no store.
     ///
-    /// Returns 0 when the store is legal and the `i64::MIN` deopt sentinel
-    /// when it is not, having stashed a real `ArrayStoreException` through the
-    /// JIT_THREAD TLS. The x64 emitter lowers `aastore` inline (null check,
-    /// bounds check, SATB barrier, store, card mark) and so never reaches
+    /// `extern "C" fn(vm_ptr: i64, array_ptr: i64, val: i64) -> i64`. Returns
+    /// `0` when the store is legal and the `i64::MIN` deopt sentinel when it is
+    /// not, having stashed a real `ArrayStoreException` through the JIT_THREAD
+    /// TLS. The sentinel is a *defined* return value on purpose: a `-> ()`
+    /// helper leaves RAX undefined, so an `emit_post_invoke_exception_check`
+    /// after it would be testing garbage.
+    ///
+    /// The x64 emitter lowers `aastore` inline (null check, bounds check, SATB
+    /// pre-write barrier, store, card mark) and so never reaches
     /// [`Self::aastore`]; this is the one piece of that helper the inline path
-    /// cannot do for itself, because the answer needs the class manager.
+    /// cannot do for itself, because the answer needs the class manager. On a
+    /// refusal the caller must skip the store, the SATB pre-write barrier and
+    /// the card mark.
+    ///
+    /// Required, not optional: a `0` slot would leave the inline lowering
+    /// storing with no check, which is the heap-type-confusion defect
+    /// (`Object[] a = new String[1]; a[0] = anInteger;` leaving an `Integer`
+    /// inside a `String[]`) this slot exists to close. Appended at the END of
+    /// the struct so all prior golden offsets stay stable.
     pub aastore_type_check: usize,
 }
 
@@ -1306,6 +1320,8 @@ helper_fields! {
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site
     // and bail the compile — the pre-fix behaviour.
     (ldc_class_cp,                   FieldKind::OptionalPtr),
+    // Required: the `0x53` lowering is inline and calls this for the JVMS §6.5
+    // covariance check; 0 would mean a reference store with no check at all.
     (aastore_type_check,             FieldKind::RequiredPtr),
 }
 

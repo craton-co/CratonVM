@@ -7,6 +7,49 @@ mode only — the whole of `native-builtins/src/service_loader.rs` registers as
 already ran real `java.util.ServiceLoader` bytecode and already enforced both
 paths.
 
+> **RE-AUDITED 2026-08-12 (A13, VM-internal doors + strict fallbacks). The
+> record's central strict-mode claim holds, and the checking is recorded because
+> the campaign's other two records in this lane did not survive the same test.**
+>
+> The claim under test is the status line's: *"`--jdk-only` drops it at
+> registration, so strict already ran real `java.util.ServiceLoader` bytecode
+> and already enforced both paths."* Three independent confirmations, none of
+> them a re-read of this record:
+>
+> * **The frozen kind map.** `scripts/baselines/jdk-only-kind-map-25-linux.tsv`
+>   is a per-registration census whose unit is one `(class, name, descriptor,
+>   ordinal)` triple. `java/util/ServiceLoader$Itr`'s registrations read
+>   `synthetic-stub`, and `NativeKind::allowed_in` drops exactly that kind under
+>   `JdkOnly`. The kind is **stated**, not ambient — §"Registration" below says
+>   so and the map agrees — so it cannot move by a `set_category` block boundary
+>   drifting.
+> * **The independent screen.** The campaign's 33-probe `--jdk-only`
+>   reachability screen (2026-08-12, HotSpot 25 as oracle at 33/33) finds
+>   `ServiceLoader` **iteration passes** under `--jdk-only`, and neither
+>   `ServiceLoader$Itr` nor any `service_loader.rs` receiver is in the
+>   five-family blocking set. A record claiming a live strict break in plain
+>   iteration would have been contradicted by that screen; this one is not.
+> * **The door test, applied.** `java/util/ServiceLoader$Itr` is on
+>   `NO_IMAGE_JDK_RECEIVERS`, so gate 1 and gate 2 are both shut for it — but
+>   the minting native (`ServiceLoader.iterator`/`stream`) is `synthetic-stub`
+>   and is therefore **dropped before the mint**. That is the structurally-dead
+>   arm of `W7-17` §5.0's two-term predicate: unreachable by construction, not
+>   merely unreached by a corpus. It is the strongest of the three verdicts and
+>   the only one that survives somebody re-tagging the receiver.
+>
+> **Scheduling — the question this record was right to make easy.** Unlike this
+> lane's other two records, W7-85's evidence is not a `probes/` run.
+> `probes/` is executed by no `SUITE=` value of `regression-suite/run.sh`, so a
+> record resting on one cannot be discharged by a suite run however green. This
+> record's vector is `regression-suite/src/RJdkModule.java` in
+> `JDKONLY_CLASSES`, with its `--module-path` / `--add-modules` supplied by
+> `run.sh`'s `class_args`, and its overlay is ground-truthed by
+> `compile_modules` with a guard the record confirms it made fail on purpose.
+> **That is scheduled evidence.** Nothing here needs re-running by hand.
+>
+> **Not verified by this lane:** the fix compiles or works. Source read only;
+> no build, no run.
+
 This record also carries the **population sweep** the fix was asked for: every
 other `ServiceLoader` validation, and which of the two provider paths enforces
 it. That table is the deliverable as much as the fix, because the defect was not

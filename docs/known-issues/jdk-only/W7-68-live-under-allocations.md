@@ -29,6 +29,83 @@ value quoted as "HotSpot says" is a transcript of
 > other verdict in this record was re-read on the later pass and holds, including
 > §1's structural finding, which three later records depend on.
 
+> **SOURCE-VERIFICATION BANNER — 2026-08-12, triage pass (A28). §3.5's premise
+> about the fabricated widths is wrong, in the direction that makes the overlay
+> look narrower than it is.**
+>
+> §3.5 files the collections overlay as *"an architecture, not a defect"* on the
+> ground that *"the narrow map IS the model's layout"*. The map is narrow; the
+> model is not. `ClassManager::synthetic_stub_fields`:
+>
+> | class | this record's model | the comment in `class_manager.rs` | what the arm FABRICATES | real |
+> |---|---:|---:|---:|---:|
+> | `java/util/ArrayList` | 2 (`AL_FIELD_DATA`=0, `AL_FIELD_SIZE`=1) | `:12300` says **2** | `:12304` **4** | 3 |
+> | `java/util/HashMap` | 3 | `:12305` says **3** | `:12310` **16** | 8 |
+> | `java/util/HashSet` | 3 | `:12305` says **3** | `:12310` **16** | 1 |
+>
+> In each row the comment sitting directly above the arm states the map's width
+> and the arm fabricates something wider. This does **not** turn §3.5 into a
+> defect — the overlay's writes are at 0 and 1, which are inside every one of
+> these widths, and `alloc_object` clamps up, so the extra fabricated slots are
+> simply never touched. What it costs is the argument's load-bearing sentence:
+> the model's layout and the fabricated layout are not the same object, so
+> *"the narrow map IS the model's layout"* cannot be the reason the row is safe.
+> The reason it is safe is narrower and checkable — **every index the overlay
+> writes is < 2, and 2 is at or below both the fabricated and the real width for
+> all five classes.** Whoever takes §6 item 4 should carry that sentence instead,
+> because it is the one that survives someone editing `class_manager.rs`.
+>
+> **This is the third instance of one shape, all in one function.** With
+> `java/nio/channels/{Server,}SocketChannel` — commented `= 1 (provider)` at
+> `:13472`–`:13473`, fabricated at **5** (`:13479`–`:13480`; W7-66 §6 found it,
+> W7-66's own triage banner nominates the fix) — `synthetic_stub_fields` now
+> carries three width comments that disagree with the arm beneath them, every one
+> understating. Four separate records in this family read their fabricated widths
+> out of these comments. Nomination N-4.
+>
+> **Verified true and not to be re-derived:** §3.2's dead-row banner holds —
+> `native-api/src/synthetic_file_channel.rs::alloc_slots` exists (`:80`) and is
+> the single width owner it describes. §5's crate move holds:
+> `cratonvm_native_api::appended_slots::base_for_class` exists (`:83`) with
+> `appended_slot_base_for_class` kept as a forwarder
+> (`util_concurrent_ext.rs:1037`). §6 item 6's hazard is **still un-gated and
+> still un-drifted**: `AL_FIELD_DATA = 0` / `AL_FIELD_SIZE = 1` are declared
+> twice and agree (`native-io/src/lib.rs:762`–`:763`,
+> `native-collections/src/lib.rs:3724`–`:3725`).
+>
+> **Nomination N-4 — `classloading/src/class_manager.rs`, comments only, two
+> sites.** Exact old text at `:12300`:
+>
+> ```text
+>         // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields (data, size)
+> ```
+>
+> exact new text:
+>
+> ```text
+>         // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 4 slots.
+>         // The comment read "= 2 fields (data, size)" until 2026-08-12: 2 is the
+>         // OVERLAY's map (`AL_FIELD_DATA`=0, `AL_FIELD_SIZE`=1), not this arm's
+>         // width. Real `java.util.ArrayList` declares 3 transitively
+>         // (`modCount` from `AbstractList`, `elementData`, `size`).
+> ```
+>
+> Exact old text at `:12305`:
+>
+> ```text
+>         // HashMap/HashSet/ConcurrentHashMap = 3 fields (buckets, size, capacity)
+> ```
+>
+> exact new text:
+>
+> ```text
+>         // HashMap/HashSet/ConcurrentHashMap = 16 slots. The comment read
+>         // "= 3 fields (buckets, size, capacity)" until 2026-08-12: 3 is the
+>         // overlay's map, not this arm's width. Real transitive widths are
+>         // HashMap 8, HashSet 1, ConcurrentHashMap 12 — so no single number
+>         // here can be "the layout", and the arm is a floor for all of them.
+> ```
+
 ---
 
 ## 1. An `under` row cannot describe a short object, and the proof is two lines apart

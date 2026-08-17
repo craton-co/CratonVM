@@ -1,5 +1,58 @@
 # W7-25 — the JUL `getLogger` regression: the cause was not the one we recorded
 
+> **MEASURED CLOSED 2026-08-12 (second pass, same day). §8 says "Nothing was
+> rebuilt" and that is no longer true of the prediction this record ends on.**
+>
+> §5 predicted that after §6.1 landed, `RJdkLogging` "should go green" under
+> `--jdk-only`, and §8 recorded that the prediction had not been run. It has now
+> been run, on a default-feature release binary dated 2026-08-12 15:27, with
+> HotSpot 25.0.3+9 as the oracle on the same host:
+>
+> | arm | result |
+> |---|---|
+> | HotSpot 25.0.3+9 | `PASS RJdkLogging (79 checks)` |
+> | CratonVM `--jdk-only` | `PASS RJdkLogging (79 checks)` |
+> | CratonVM `--real-jdk` | `PASS RJdkLogging (79 checks)` |
+>
+> All twelve `CK` lines are **byte-identical across all three arms**, including
+> `sourcePair=A_CLASS/a_method`, `publishedSource=RJdkLogging/publishedRecordCarriesItsCaller`,
+> `recordPayloads formatted='one=A two=B' recordGate=ok` and `streamBytes=177`.
+> The vector has grown from 63 checks to 79 since §5. §0's three-arm table, §5's
+> 9/10-failure census and §7's open table are therefore all historical: the
+> `getSystemContext` NPE, the `Formatter.formatMessage` raw-`{0}`, the
+> `useParentHandlers` walk, the missing inferred source pair and the
+> `log(LogRecord)` gate are **all closed in both modes and now verified by a
+> run**, not by a reading.
+>
+> **One live divergence remains, and this vector does not assert it.**
+> `--real-jdk` emits two console lines that HotSpot emits nowhere:
+>
+> ```text
+> INFO [rjdklogging.handlers] after-removal
+> INFO [rjdklogging.inherit.child] not-up-to-parent
+> ```
+>
+> Counted: HotSpot 0, CratonVM `--jdk-only` **0**, CratonVM `--real-jdk` **2**.
+> Both are records HotSpot delivers to no handler at all; `jul_log_parameterized`'s
+> console fallback publishes them anyway. §4's own `Compatible` effect table
+> predicted exactly this — "handler-less logger, admitted level → console line …
+> identical" — and treated it as harmless because it preserved existing output.
+> Against HotSpot it is a divergence, it is `Compatible`-only, and it survives
+> precisely because every check in `RJdkLogging` asserts on captured records and
+> byte counts rather than on stdout. **Open residual (NOMINATION 5): the
+> `Compatible` console fallback publishes a record that reached no handler and
+> that HotSpot drops.** The fallback exists so a handler-less logger still shows
+> output, which is the common boot-time shape — so the fix is a discrimination
+> between "no handler was configured" and "handlers were configured and none of
+> them took it", not a deletion, and the vector needs a stdout assertion to gate
+> it either way.
+>
+> **`LogManager.getLogger` demand-creation: verdict unchanged, and now also
+> unmeasurable from the vector** — the triple is in `RETIRED_SHADOW_TRIPLES`
+> (`native-api/src/retired_shadow.rs:353`, confirmed today), so strict gets the
+> real bytecode's `null` and the divergence is `Compatible`-only. Still will-not-
+> fix as a patch, for §5's reason.
+>
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — BOTH "not applied"
 > OUT-OF-FILE PATCHES ARE APPLIED, AND MOST OF SECTION 7's OPEN TABLE IS NOW
 > CLOSED.**

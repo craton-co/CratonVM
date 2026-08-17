@@ -4767,18 +4767,24 @@ mod tests {
         selector_close(id);
     }
 
+    /// The `i64::MAX` (indefinite) arm of the LOW-LEVEL `selector_select` is
+    /// short-circuited by a pre-existing wakeup.
+    ///
+    /// Scope note: this test does NOT cover the `0 -> i64::MAX` translation in
+    /// `selector_select_native`, which is the actual BUGFIX [nio-selector]
+    /// change — it starts one level below it, at `selector_select(id,
+    /// i64::MAX)`, so deleting the translation leaves it green.
+    /// `select_zero_maps_to_the_indefinite_wait_not_a_poll` below is the test
+    /// for the translation itself.
+    ///
+    /// (The historical comment here claimed an un-woken
+    /// `selector_select(id, i64::MAX)` "would block the test forever". That has
+    /// not been true since the self-healing `select_infinite_cap_ms()` cap
+    /// landed: an indefinite wait now returns 0 after `DEFAULT_SELECT_CAP_MS`.
+    /// The pre-armed wakeup is still the point of THIS test, which is that the
+    /// short-circuit fires before the syscall.)
     #[test]
     fn nio_selector_indefinite_block_path_honors_wakeup() {
-        // BUGFIX [nio-selector] regression: the public `Selector.select(0)`
-        // overload maps argument 0 to *block indefinitely* (i64::MAX) in
-        // `selector_select_native`. The low-level `selector_select` proves
-        // that the indefinite-block path (timeout == i64::MAX → timeout_c -1)
-        // is reachable and is correctly short-circuited by a pre-existing
-        // wakeup — i.e. it blocks until wakeup rather than busy-spinning, the
-        // exact property `select(0)` event loops rely on. (We can't call
-        // `selector_select(id, i64::MAX)` without a prior wakeup here because
-        // it would block the test forever — which is the whole point of the
-        // fix.)
         let id = selector_open();
         selector_wakeup(id).unwrap();
         let start = Instant::now();
@@ -4790,6 +4796,85 @@ mod tests {
             "indefinite block must short-circuit on a pending wakeup, got {elapsed:?}"
         );
         selector_close(id);
+    }
+
+    /// BUGFIX [nio-selector]: `Selector.select(0)` must BLOCK, not poll.
+    ///
+    /// The JDK contract is that only `selectNow()` polls; `select(0)` blocks
+    /// until a channel is ready or `wakeup()` fires. `selector_select_native`
+    /// implements that with one line — `if timeout == 0 { i64::MAX }` — and
+    /// without it an idiomatic `while (running) selector.select(0);` event loop
+    /// spins at 100% CPU.
+    ///
+    /// This test drives `selector_select_native` itself, so the translation is
+    /// on the call path. The only observable difference between the two
+    /// timeouts is TIME (both return 0 ready keys), so the signal is amplified
+    /// over `ITERS` calls and checked against a floor derived from the
+    /// production cap itself (`select_infinite_cap_ms()`), so retuning the cap
+    /// retunes the test.
+    ///
+    /// The assertion is deliberately a LOWER bound and nothing else: a loaded
+    /// host can only push a blocking measurement further into the passing
+    /// region, never out of it. The genuine poll is timed too, but only to
+    /// print alongside the failure — a ratio between the two would be an upper
+    /// bound in disguise and would flake when the poll loop hits a scheduler
+    /// stall.
+    ///
+    /// Mutation this catches: delete `let timeout = if timeout == 0 { i64::MAX
+    /// } else { timeout };` from `selector_select_native`. Each call then costs
+    /// a non-blocking poll (microseconds) instead of one capped block, and the
+    /// floors below are missed by more than an order of magnitude.
+    #[test]
+    fn select_zero_maps_to_the_indefinite_wait_not_a_poll() {
+        const ITERS: u32 = 8;
+
+        let id = selector_open();
+        let mut ctx = crate::test_support::MockNativeContext::new();
+        // Legacy synthetic-layout selector object: `selector_id_from_obj` falls
+        // back to the indexed slots when the object is not in `sel_obj_ids`.
+        let obj = ctx.alloc_object(SI_OPEN_FLAG + 1);
+        ctx.set_field(obj, SI_ID, Value::Int(id));
+        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(1));
+
+        // Baseline: the genuine non-blocking probe. This is the path
+        // `selectNow0` takes, and it is what `select(0)` WRONGLY took before
+        // the fix.
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            assert_eq!(
+                selector_select(id, 0).unwrap(),
+                0,
+                "a poll of an empty selector reports no ready keys"
+            );
+        }
+        let poll_total = t0.elapsed();
+
+        // The public `select(0)` overload, through the native that owns the
+        // translation.
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            match selector_select_native(&mut ctx, &[Value::Object(Some(obj)), Value::Long(0)]) {
+                Ok(Some(Value::Int(0))) => {}
+                other => panic!("select(0) on an empty selector must return 0, got {other:?}"),
+            }
+        }
+        let blocking_total = t1.elapsed();
+
+        selector_close(id);
+
+        // Half the nominal blocked time, so scheduler jitter and an early
+        // return on the last iteration cannot trip it.
+        let cap_ms = select_infinite_cap_ms().max(0) as u64;
+        let floor = Duration::from_millis(cap_ms * u64::from(ITERS) / 2);
+        assert!(
+            blocking_total >= floor,
+            "select(0) must map to the indefinite wait (capped at {cap_ms} ms per \
+             call), so {ITERS} calls must take at least {floor:?}; took \
+             {blocking_total:?} against {poll_total:?} for the same number of \
+             genuine polls. A poll-sized figure here means the `0 -> i64::MAX` \
+             translation in selector_select_native is gone and every \
+             `while (running) selector.select(0);` loop is spinning at 100% CPU."
+        );
     }
 
     #[test]

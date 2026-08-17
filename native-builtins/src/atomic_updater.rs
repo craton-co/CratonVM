@@ -67,6 +67,91 @@
 //!   HotSpot.
 //! * No part of the impl object's heap slots is exposed to Java code via
 //!   reflection — the synthetic class is internal-use-only.
+//!
+//! ## `--jdk-only`: this whole module is NOT registered (2026-08-12)
+//!
+//! Everything above describes **Compatible** mode and is unchanged there.
+//! Under [`CompatibilityMode::JdkOnly`] `register_atomic_updater_natives`
+//! registers nothing at all — see the guard at the top of it.
+//!
+//! The reason is measured, not argued.
+//! `docs/known-issues/jdk-only/APP-READINESS-20260812.md` §3.3 records that
+//! `java.sql.SQLException` holds
+//! `private static final AtomicReferenceFieldUpdater<SQLException,SQLException> nextUpdater`,
+//! so its `<clinit>` runs `newUpdater`, so `alloc_impl` asks for
+//! `…FieldUpdater$RustJvmImpl` — a class **no JDK image declares** — and strict
+//! mode correctly refuses to fabricate it. The refusal surfaces at the
+//! application as `NoClassDefFoundError` and takes the **entire `java.sql`
+//! package** with it: all JDBC, every ORM, every pool, plus H2's MVStore
+//! (`AtomicIntegerFieldUpdater`, reached with no JDBC at all) and — because
+//! `org.h2.message.DbException extends SQLException` — H2's *exception
+//! identity*, which is how `TestStringUtils` reports "expected `DbException`,
+//! got `NoClassDefFoundError`".
+//!
+//! **The refusal is correct; the survival of its caller is the defect.** The
+//! three `…$RustJvmImpl` accessor blocks were already dropped in strict mode by
+//! [`cratonvm_native_api::no_image_receiver::NO_IMAGE_JDK_RECEIVERS`], which
+//! lists all three impl names and re-tags a `Bridge` on them to
+//! `SyntheticStub`. That central rule cannot reach the `newUpdater` factories
+//! or the base-class accessors, because those are registered on
+//! `java/util/concurrent/atomic/Atomic*FieldUpdater` — names every image DOES
+//! declare. So strict mode kept exactly the half that mints the class and
+//! dropped exactly the half that would have used it.
+//!
+//! Dropping the base-class accessors matters independently of `newUpdater`.
+//! `getAndIncrement` / `getAndDecrement` / `addAndGet` / `incrementAndGet` /
+//! `decrementAndGet` / `getAndAdd` are **concrete on the abstract base** in the
+//! JDK and are *not* overridden by `Atomic*FieldUpdaterImpl`. CratonVM's
+//! virtual dispatch walks the superclass chain and lets a native on a parent
+//! shadow inherited bytecode when the receiver declares no override of its own
+//! (`vm/src/runtime/interpreter/dispatch_virtual.rs`, the `receiver_has_own_bytecode`
+//! guard). A real JDK `AtomicIntegerFieldUpdaterImpl` receiver reaching
+//! `native_aifu_get_and_increment` would have its `offset`/`cclass` fields read
+//! as `FU_SLOT_FIELD_INDEX`, `impl_slot` would answer `None`, and
+//! `.unwrap_or(0)` would fetch-add slot **0** of the target. That is a silent
+//! wrong-slot write, not an error — so leaving the base-class rows registered
+//! while removing `newUpdater` would have been strictly worse than either.
+//!
+//! Why *not* keep the native and return a real object (the other candidate
+//! shape §6 of the readiness record names): building a real
+//! `Atomic*FieldUpdaterImpl` means calling the JDK's own private constructor
+//! with the offset the JDK's own `Unsafe.objectFieldOffset` computes — i.e.
+//! re-implementing the bytecode strict mode exists to run, with a second copy
+//! to keep in step. And the reason this native exists in the first place does
+//! not apply in strict mode; see below.
+//!
+//! ### Why the native exists, and why removing it is safe *here* and only here
+//!
+//! `git log --follow` puts the file's whole history in the tree's first commit
+//! (`a6dc911ed`, "Open-source initial commit"), so the only statement of the
+//! original motivation is the module header above, and it names the workaround
+//! precisely: the JDK's reflective `newUpdater` "reaches into
+//! `java.lang.reflect.Field` … CratonVM's **synthetic** Field mirror does not
+//! preserve the exact JDK private layout, so the reflective cast trips a
+//! `ClassCastException` in `<clinit>`". Every later commit on this file
+//! (`fe52db3a5`, `686183560`, `636b58278`, `b291ffc3d`, `dc55e8057`) extends or
+//! repairs the *accessors*; none revisits that premise.
+//!
+//! The premise is about a **synthetic** `Field`. Under `--jdk-only` there is no
+//! synthetic `Field`: `java.lang.reflect.Field` is loaded from the image and
+//! `declared_fields` reports its real classfile `access_flags`. So the
+//! `ClassCastException` this native was written to dodge cannot be resurrected
+//! by a change that only stops registering under `JdkOnly` — Compatible mode,
+//! where the premise may still hold, is byte-for-byte untouched. That is why
+//! this is a **mode-conditional registration and not a deletion**.
+//!
+//! What is NOT established here, and is the thing to measure: whether the JDK's
+//! own `Atomic*FieldUpdaterImpl` bytecode then works on this VM end to end. It
+//! needs `Reflection.getCallerClass()` (registered on the real
+//! `jdk/internal/reflect/Reflection`, a genuine `ACC_NATIVE` bridge that
+//! survives strict mode) and `Unsafe.objectFieldOffset(Field)` +
+//! `compareAndSetReference`. The last of those has a documented failure mode:
+//! when `objectFieldOffset1` cannot resolve a (class, field) pair it **mints a
+//! synthetic offset** and routes loads/stores through a side table
+//! (`SYNTHETIC_OFFSET_BASE`, `lib.rs`), which is invisible to a plain
+//! `getfield` of the same field. `regression-suite/src/RJdkSqlPackage.java`
+//! exists to catch exactly that: it asserts that the updater and a direct field
+//! read/write address **one** storage location, in both directions.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -966,7 +1051,41 @@ fn native_alfu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// T19.H5: register every `*FieldUpdater.newUpdater` factory + the
 /// per-impl accessor surface.  Called from `register_essential_natives`
 /// in `lib.rs`.
+///
+/// **Registers nothing under [`CompatibilityMode::JdkOnly`].** The full
+/// argument is in the module header; the short form is that `newUpdater`
+/// returns a `…FieldUpdater$RustJvmImpl` receiver no JDK image declares, strict
+/// mode refuses to fabricate it, and the refusal lands as `NoClassDefFoundError`
+/// in `java.sql.SQLException.<clinit>` — i.e. on the whole `java.sql` package.
+///
+/// The guard is here, at the single registrar, rather than at the two `lib.rs`
+/// call sites (`register_essential_natives_with_shims`, which runs in **both**
+/// modes, and `register_synthetic_overrides`, which is synthetic-only and
+/// therefore never strict) so that a third call site cannot reintroduce the
+/// rows. `NativeMethodRegistry::set_compatibility_mode` is called once in
+/// `vm/src/vm/vm_init.rs` *above* the mode fork and before any `register_*`
+/// pass, so `compatibility_mode()` is already correct when we are called.
+///
+/// It is a `return`, not a `set_category(SyntheticStub)`, deliberately. Both
+/// would drop the rows in strict mode, but re-tagging changes the kind in
+/// **Compatible** mode too, where these ~46 rows are `Bridge` today: it would
+/// push `native-builtins/tests/stub_ratchet.rs::synthetic_stub_count_does_not_regress`
+/// (baseline 1263, `SLACK = 0`) over its frozen ceiling and move ~31 rows in
+/// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`. That ratchet's own
+/// failure text says not to raise the baseline. Compatible mode must come out
+/// of this change bit-identical, and with the `return` it does: same rows, same
+/// kinds, same counts.
 pub fn register_atomic_updater_natives(registry: &mut NativeMethodRegistry) {
+    if registry.compatibility_mode() == cratonvm_types::compat::CompatibilityMode::JdkOnly {
+        tracing::info!(
+            "T19.H5: --jdk-only — NOT registering the Atomic{{Reference,Integer,Long}}FieldUpdater \
+             natives; the real java.util.concurrent.atomic *FieldUpdaterImpl bytecode runs \
+             instead (newUpdater would mint …FieldUpdater$RustJvmImpl, which no JDK image \
+             declares and strict mode refuses — taking java.sql.SQLException.<clinit>, and \
+             therefore the whole java.sql package, with it)"
+        );
+        return;
+    }
     register_arfu(registry);
     register_aifu(registry);
     register_alfu(registry);
@@ -1988,6 +2107,75 @@ mod tests {
                 "(Ljava/lang/Object;I)I"
             )
             .is_some());
+    }
+
+    /// `--jdk-only` must register **nothing** from this module.
+    ///
+    /// Not just `newUpdater`. The base-class accessor rows are the half that
+    /// fails silently: `getAndIncrement`/`addAndGet`/… are CONCRETE on the
+    /// abstract `Atomic*FieldUpdater` in the JDK and are not overridden by
+    /// `Atomic*FieldUpdaterImpl`, so with a real impl receiver CratonVM's
+    /// superclass-walking virtual dispatch would hand the call to the native,
+    /// `impl_slot` would read the impl's `cclass` reference out of
+    /// `FU_SLOT_FIELD_INDEX`, get `None`, and `.unwrap_or(0)` would fetch-add
+    /// **slot 0** of the target object. A test that only checked `newUpdater`
+    /// would be green on precisely the tree that does that.
+    ///
+    /// Asserted as "the whole registry is empty" as well as per triple, so a
+    /// future registration added inside `register_arfu`/`register_aifu`/
+    /// `register_alfu` is covered without anyone remembering to extend the
+    /// list. The compatible arm below is the mutation control: it proves the
+    /// emptiness is the mode's doing and not a broken registrar.
+    #[test]
+    fn t19_h5_jdk_only_registers_nothing_from_this_module() {
+        let mut strict = NativeMethodRegistry::new();
+        strict.set_compatibility_mode(cratonvm_types::compat::CompatibilityMode::JdkOnly);
+        register_atomic_updater_natives(&mut strict);
+        assert!(
+            strict.is_empty(),
+            "--jdk-only must register no *FieldUpdater native at all ({} rows present); \
+             the JDK's own Atomic*FieldUpdaterImpl bytecode is what strict mode exists \
+             to run",
+            strict.len()
+        );
+
+        for (cls, name, desc) in [
+            (
+                CLS_REF_FIELD_UPDATER,
+                "newUpdater",
+                "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;)Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;",
+            ),
+            (
+                CLS_INT_FIELD_UPDATER,
+                "newUpdater",
+                "(Ljava/lang/Class;Ljava/lang/String;)Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;",
+            ),
+            (
+                CLS_LONG_FIELD_UPDATER,
+                "newUpdater",
+                "(Ljava/lang/Class;Ljava/lang/String;)Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;",
+            ),
+            // The silent half — base-class accessors on real JDK class names.
+            (CLS_REF_FIELD_UPDATER, "get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            (CLS_INT_FIELD_UPDATER, "getAndIncrement", "(Ljava/lang/Object;)I"),
+            (CLS_INT_FIELD_UPDATER, "addAndGet", "(Ljava/lang/Object;I)I"),
+            (CLS_LONG_FIELD_UPDATER, "incrementAndGet", "(Ljava/lang/Object;)J"),
+            (CLS_LONG_FIELD_UPDATER, "getAndAdd", "(Ljava/lang/Object;J)J"),
+        ] {
+            assert!(
+                strict.find(cls, name, desc).is_none(),
+                "--jdk-only still serves {cls}.{name}{desc}"
+            );
+            // The control: the same triple IS served in Compatible mode, so a
+            // green assertion above cannot come from a typo in the triple.
+            let mut compatible = NativeMethodRegistry::new();
+            register_atomic_updater_natives(&mut compatible);
+            assert!(
+                compatible.find(cls, name, desc).is_some(),
+                "{cls}.{name}{desc} is not registered in Compatible mode either — the \
+                 strict assertion above is vacuous"
+            );
+        }
     }
 
     #[test]

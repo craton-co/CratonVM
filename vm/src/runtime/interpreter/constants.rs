@@ -6,6 +6,41 @@
 //! Moved verbatim out of `interpreter.rs`'s `Helper: LDC / LDC_W (load constant from pool)`
 //! section. Lint levels declared at the parent module level (including
 //! its no-panic `deny` gate, where it has one) are inherited here.
+//!
+//! # The seven `ldc` operand kinds, and the twins that shadow them
+//!
+//! JVMS §6.5 lets `ldc`/`ldc_w` load `CONSTANT_Integer`, `CONSTANT_Float`,
+//! `CONSTANT_String`, `CONSTANT_Class`, `CONSTANT_MethodType`,
+//! `CONSTANT_MethodHandle` and (Java 11+) a category-1 `CONSTANT_Dynamic`;
+//! `ldc2_w` loads `CONSTANT_Long`, `CONSTANT_Double` and a category-2
+//! `CONSTANT_Dynamic`. `classloading::verify_insn`'s `verify_ldc` /
+//! `verify_ldc2w` have accepted all of those for some time. Until 2026-08-12
+//! this module refused `CONSTANT_MethodType`, `CONSTANT_MethodHandle` and the
+//! category-2 `CONSTANT_Dynamic` — a verifier/interpreter split where a class
+//! file passed verification and then died at execution with
+//! `ClassFormatError: ldc: unsupported constant pool entry type`. The real
+//! `java.lang.invoke.MethodHandleProxies.asInterfaceInstance` proxy template
+//! is the reachable case: the class it spins does
+//! `callerBoundTarget.asType(<MethodType>)` off an `ldc`.
+//!
+//! Three other implementations of the *same* JVMS rules already existed, and
+//! the arms below deliberately call into them instead of restating them:
+//!
+//! * `runtime::invokedynamic::resolve_method_handle_full` — the
+//!   `CONSTANT_MethodHandle` decode (JVMS Table 5.4.3.5-A: which reference
+//!   kinds read a `Fieldref` and which read a `Methodref`).
+//! * `native_builtins::lang_invoke::build_method_type_from_descriptor` — the
+//!   descriptor → `MethodType` construction, used by `invokedynamic`'s
+//!   bootstrap-argument path.
+//! * `native_builtins::phases_late::reflect_invoke` — the
+//!   "prefer `MethodType.fromMethodDescriptorString`, fall back to the VM
+//!   builder" ordering, reproduced here rather than reinvented.
+//!
+//! Materialising a `MethodHandle` goes through `MethodHandles.Lookup.find*`
+//! for the same reason: the VM has a second, native-only handle representation
+//! (`lang_invoke`'s `MH_KIND_*` shim objects) that is refused under
+//! `--jdk-only`, and hardwiring either representation into the opcode would
+//! create a fourth twin.
 
 use super::*;
 
@@ -61,11 +96,26 @@ pub(super) fn execute_ldc(
         /// as exact UTF-16 units (a Rust `String` cannot hold them).
         WideStr(Vec<u16>),
         ClassRef(String),
-        Dynamic {
-            bsm_index: u16,
-            name: String,
+        /// `CONSTANT_MethodType` (tag 16). Carried as the raw method
+        /// descriptor: materialising the `java.lang.invoke.MethodType` loads
+        /// classes and runs Java, so it must happen after the class-manager
+        /// read lock is dropped.
+        MethodTypeDesc(String),
+        /// `CONSTANT_MethodHandle` (tag 15), decoded by the SAME helper
+        /// `invokedynamic` uses
+        /// ([`crate::runtime::invokedynamic::resolve_method_handle_full`]) so
+        /// the two readings of JVMS §5.4.3.5 cannot drift. Owned strings, so
+        /// the value outlives the class-manager read lock.
+        MethodHandleRef {
+            kind: MethodHandleKind,
+            class_name: String,
+            member_name: String,
             descriptor: String,
         },
+        /// `CONSTANT_Dynamic` (tag 17). No payload: the bootstrap decode and
+        /// invocation live in [`resolve_condy_constant`], which `ldc2_w`'s
+        /// category-2 condy form calls as well.
+        Dynamic,
     }
 
     let ldc_val = {
@@ -135,27 +185,45 @@ pub(super) fn execute_ldc(
                 }
                 LdcValue::ClassRef(name)
             }
-            ConstantPoolEntry::Dynamic {
-                bootstrap_method_attr_index,
-                name_and_type_index,
-            } => {
-                let (name, descriptor) = class
+            // JVMS §6.5 `ldc`: `CONSTANT_MethodType` is one of the seven legal
+            // operand kinds, and it is the one the real
+            // `MethodHandleProxies.asInterfaceInstance` proxy template needs —
+            // its generated `<init>` does `callerBoundTarget.asType(<MT>)` off
+            // an `ldc` of the SAM's method type. `classloading::verify_insn`'s
+            // `verify_ldc` has always accepted the tag (it pushes
+            // `java/lang/invoke/MethodType`); only the interpreter refused it,
+            // so a verified class file was rejected at execution.
+            ConstantPoolEntry::MethodType { descriptor_index } => {
+                let desc = class
                     .constant_pool
-                    .get_name_and_type(*name_and_type_index)
+                    .get_utf8(*descriptor_index)
                     .ok_or_else(|| {
                         VmError::Linkage(LinkageError::ClassFormatError {
                             class_name: class.name.to_string(),
                             message: format!(
-                                "ldc: invalid condy name_and_type at #{name_and_type_index}"
+                                "ldc: invalid MethodType descriptor_index {descriptor_index}"
                             ),
                         })
-                    })?;
-                LdcValue::Dynamic {
-                    bsm_index: *bootstrap_method_attr_index,
-                    name: name.to_string(),
-                    descriptor: descriptor.to_string(),
+                    })?
+                    .to_string();
+                LdcValue::MethodTypeDesc(desc)
+            }
+            // JVMS §6.5 `ldc`: `CONSTANT_MethodHandle`. Decoded through
+            // `invokedynamic`'s existing reader rather than a second private
+            // copy of Table 5.4.3.5-A — see the module header.
+            ConstantPoolEntry::MethodHandle { .. } => {
+                let mh = crate::runtime::invokedynamic::resolve_method_handle_full(
+                    &class.constant_pool,
+                    index,
+                )?;
+                LdcValue::MethodHandleRef {
+                    kind: mh.kind,
+                    class_name: mh.class_name.to_string(),
+                    member_name: mh.member_name.to_string(),
+                    descriptor: mh.descriptor.to_string(),
                 }
             }
+            ConstantPoolEntry::Dynamic { .. } => LdcValue::Dynamic,
             _ => {
                 return Err(VmError::Linkage(LinkageError::ClassFormatError {
                     class_name: class.name.to_string(),
@@ -208,94 +276,545 @@ pub(super) fn execute_ldc(
                 .stack
                 .push(Value::Object(Some(mirror)))?;
         }
-        LdcValue::Dynamic {
-            bsm_index,
-            name,
+        LdcValue::MethodTypeDesc(desc) => {
+            // JVMS §5.4.3: a symbolic reference is resolved ONCE per
+            // constant-pool entry and the result recorded. The condy map is
+            // that record — keyed by (class, cp index), scanned and remapped
+            // by the collector (`for_each_condy_root` / `update_condy_refs`),
+            // bounded, and evicted on redefinition — so `CONSTANT_MethodType`
+            // and `CONSTANT_MethodHandle` share it rather than re-entering the
+            // JDK factory on every execution of the instruction. A CP index
+            // has exactly one tag, so the keys cannot collide with a condy's.
+            if let Some(cached) = cached_cp_constant(shared, frame_class_id, index) {
+                thread.frames[frame_idx].stack.push(cached)?;
+                return Ok(());
+            }
+            let mt = resolve_method_type_constant(shared, thread, frame_class_id, &desc)?;
+            if remap_trace_on() {
+                push_prov_record(mt.as_ptr() as usize, "ldc-methodtype");
+            }
+            shared.classes.resolution_cache.write().put_condy(
+                frame_class_id,
+                index,
+                Value::Object(Some(mt)),
+            );
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(mt)))?;
+        }
+        LdcValue::MethodHandleRef {
+            kind,
+            class_name,
+            member_name,
             descriptor,
         } => {
-            // Check condy cache first
-            {
-                let cache = shared.classes.resolution_cache.read();
-                if let Some(val) = cache.get_condy(frame_class_id, index) {
-                    if remap_trace_on() {
-                        if let Value::Object(Some(o)) = val {
-                            push_prov_record(o.as_ptr() as usize, "ldc-condy-cached");
-                        }
-                    }
-                    thread.frames[frame_idx].stack.push(*val)?;
-                    return Ok(());
-                }
+            if let Some(cached) = cached_cp_constant(shared, frame_class_id, index) {
+                thread.frames[frame_idx].stack.push(cached)?;
+                return Ok(());
             }
-
-            // Resolve the dynamic constant by invoking its bootstrap method.
-            // The bootstrap method receives (Lookup, String name, Class type, extra_args...).
-            // We resolve the bootstrap method handle, then dispatch based on known BSMs.
-            let (bsm_class, bsm_method, bsm_extra_args) = {
-                let cm = shared.classes.class_manager.read();
-                let class = cm
-                    .get_class(frame_class_id)
-                    .ok_or_else(|| VmError::Internal {
-                        message: "condy: current class not found".to_string(),
-                    })?;
-                let bsm = class
-                    .bootstrap_methods
-                    .get(bsm_index as usize) // Widening: index conversion
-                    .ok_or_else(|| VmError::Internal {
-                        message: format!("condy: bootstrap method index {bsm_index} out of bounds"),
-                    })?;
-                let handle = crate::runtime::invokedynamic::resolve_method_handle_full(
-                    &class.constant_pool,
-                    bsm.bootstrap_method_ref,
-                )?;
-                // Resolve bootstrap argument class names for getStaticFinal etc.
-                let extra: Vec<String> = bsm
-                    .bootstrap_arguments
-                    .iter()
-                    .filter_map(|&idx| {
-                        crate::runtime::invokedynamic::resolve_string_constant(
-                            &class.constant_pool,
-                            idx,
-                        )
-                        .or_else(|| {
-                            // Try resolving as ClassReference
-                            match class.constant_pool.get(idx) {
-                                Some(ConstantPoolEntry::ClassReference { name_index }) => class
-                                    .constant_pool
-                                    .get_utf8(*name_index)
-                                    .map(|s| s.to_string()),
-                                _ => None,
-                            }
-                        })
-                    })
-                    .collect();
-                (handle.class_name.clone(), handle.member_name.clone(), extra)
-            };
-
-            // Compute the result based on common bootstrap methods.
-            let result = resolve_condy_value(
+            let mh = resolve_method_handle_constant(
                 shared,
-                &bsm_class,
-                &bsm_method,
-                &name,
+                thread,
+                frame_class_id,
+                kind,
+                &class_name,
+                &member_name,
                 &descriptor,
-                &bsm_extra_args,
             )?;
-
-            // Cache the result
-            shared
-                .classes
-                .resolution_cache
-                .write()
-                .put_condy(frame_class_id, index, result);
             if remap_trace_on() {
-                if let Value::Object(Some(o)) = &result {
-                    push_prov_record(o.as_ptr() as usize, "ldc-condy");
-                }
+                push_prov_record(mh.as_ptr() as usize, "ldc-methodhandle");
             }
+            shared.classes.resolution_cache.write().put_condy(
+                frame_class_id,
+                index,
+                Value::Object(Some(mh)),
+            );
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(mh)))?;
+        }
+        LdcValue::Dynamic => {
+            let result = resolve_condy_constant(shared, thread, frame_class_id, index)?;
             thread.frames[frame_idx].stack.push(result)?;
         }
     }
     Ok(())
+}
+
+/// The recorded result of a previous resolution of this constant-pool entry,
+/// if any. See the `LdcValue::MethodTypeDesc` arm for why the condy map is the
+/// right store for `CONSTANT_MethodType` / `CONSTANT_MethodHandle` too.
+fn cached_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Option<Value> {
+    shared
+        .classes
+        .resolution_cache
+        .read()
+        .get_condy(class_id, cp_index)
+        .copied()
+}
+
+/// JVMS §5.4.3.5 resolution of a `CONSTANT_MethodType`, shared by `ldc` and
+/// `ldc_w`.
+///
+/// **Twin discipline.** There are two other places in the tree that turn a
+/// method descriptor into a `java.lang.invoke.MethodType`:
+/// `invokedynamic`'s bootstrap-argument path
+/// (`runtime/invokedynamic.rs`, `StaticArg::MType`) and
+/// `phases_late::reflect_invoke`'s `StackFrame.getMethodType()`. The latter
+/// already established the correct order — **prefer the real JDK factory**
+/// (`MethodType.fromMethodDescriptorString`), because it interns, so the
+/// result compares `==` against a `MethodType` obtained any other way; fall
+/// back to `lang_invoke::build_method_type_from_descriptor` only when the
+/// class library does not carry the factory (synthetic-JDK builds). This
+/// function follows that order rather than inventing a third one, and the
+/// fallback it uses is the *same function* the `invokedynamic` path uses, so
+/// the two agree by construction.
+///
+/// The class loader passed to the factory is the one that defined the class
+/// whose constant pool holds the entry — JVMS §5.4.3.5 resolves the
+/// descriptor's field types with that loader as the initiating loader. Passing
+/// `null` (the bootstrap loader) instead would silently fail for any
+/// descriptor naming an application class.
+pub(super) fn resolve_method_type_constant(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_class_id: ClassId,
+    descriptor: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    const FMDS: &str = "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/invoke/MethodType;";
+    // `method_exists` only inspects LOADED classes, so make sure the factory's
+    // own class is present before asking whether it declares the factory.
+    let _ = shared.load_class_concurrent("java/lang/invoke/MethodType");
+    // `NativeClassAccess` (which carries `method_exists`) is in scope from the
+    // parent module's imports.
+    let have_factory = {
+        let ctx = crate::vm::NativeContextImpl { shared, thread };
+        ctx.method_exists(
+            "java/lang/invoke/MethodType",
+            "fromMethodDescriptorString",
+            FMDS,
+        )
+    };
+    if have_factory {
+        let loader = defining_loader_object(shared, thread, frame_class_id);
+        // GC-safety: `create_java_string` below can move the heap, and the
+        // loader is a bare `ObjectRef` held in a Rust local. Pin it across the
+        // allocation and re-read the (possibly forwarded) reference.
+        // `invoke_shared` pins its own argument slice, so the pin can be
+        // released before the call.
+        let pin_base = thread.native_pin_roots.len();
+        if let Some(l) = loader {
+            thread.native_pin_roots.push(l);
+        }
+        let desc_str = create_java_string(shared, descriptor);
+        let loader = match loader {
+            Some(_) => thread.native_pin_roots.get(pin_base).copied(),
+            None => None,
+        };
+        thread.native_pin_roots.truncate(pin_base);
+        match invoke_shared(
+            shared,
+            thread,
+            "java/lang/invoke/MethodType",
+            "fromMethodDescriptorString",
+            FMDS,
+            &[Value::Object(Some(desc_str)), Value::Object(loader)],
+        ) {
+            Ok(Some(Value::Object(Some(mt)))) => return Ok(mt),
+            // A Java-visible failure IS the answer here: JVMS §5.4.3.5 says a
+            // method-type resolution that cannot resolve one of its field
+            // types fails with that error. Swallowing it and fabricating a
+            // MethodType would turn a linkage error into a wrong value.
+            Err(e @ MethodCallFailed::ExceptionThrown(_)) => return Err(e),
+            other => {
+                tracing::debug!(
+                    "ldc MethodType: fromMethodDescriptorString({descriptor}) did not \
+                     produce a MethodType ({other:?}); falling back to the VM builder"
+                );
+            }
+        }
+    }
+    let owner = shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(frame_class_id)
+        .map(|c| c.name.to_string())
+        .unwrap_or_default();
+    let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+    match cratonvm_native_builtins::lang_invoke::build_method_type_from_descriptor(
+        &mut ctx, descriptor,
+    )? {
+        Some(mt) => Ok(mt),
+        None => Err(VmError::Linkage(LinkageError::ClassFormatError {
+            class_name: owner,
+            message: format!("ldc: malformed CONSTANT_MethodType descriptor `{descriptor}`"),
+        })
+        .into()),
+    }
+}
+
+/// The `java.lang.ClassLoader` object that defined `class_id`, or `None` for a
+/// bootstrap-defined class (which is what the JDK's own descriptor factories
+/// take `null` to mean).
+///
+/// Asked through `Class.getClassLoader()` rather than the `ClassLoaderId`
+/// enum, because the callers here need the loader **object** to hand to Java,
+/// and `getClassLoader` is the one place that already reconciles the mirror's
+/// field, the defining-loader side table and the built-in loader singletons.
+fn defining_loader_object(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    class_id: ClassId,
+) -> Option<ObjectRef> {
+    let mirror = get_or_create_class_mirror(shared, class_id);
+    match invoke_shared(
+        shared,
+        thread,
+        "java/lang/Class",
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        &[Value::Object(Some(mirror))],
+    ) {
+        Ok(Some(Value::Object(loader))) => loader,
+        _ => None,
+    }
+}
+
+/// The `Class` mirror named by a **field** descriptor (`I`, `Ljava/lang/X;`,
+/// `[I`), resolved loader-faithfully from `frame_class_id` — the reference
+/// types go through the same [`resolve_class_loader_aware`] every
+/// `new`/`checkcast`/`ldc X.class` uses, so a `CONSTANT_MethodHandle` field
+/// accessor cannot resolve to a different copy of a class than the rest of the
+/// same class file does.
+fn class_mirror_for_field_descriptor(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_class_id: ClassId,
+    descriptor: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(inner) = descriptor.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        let class_id = resolve_class_loader_aware(shared, thread, frame_class_id, inner)
+            .map_err(|e| convert_class_not_found(shared, thread, inner, e))?;
+        return Ok(get_or_create_class_mirror(shared, class_id));
+    }
+    if descriptor.starts_with('[') {
+        let class_id = resolve_class_loader_aware(shared, thread, frame_class_id, descriptor)
+            .map_err(|e| convert_class_not_found(shared, thread, descriptor, e))?;
+        return Ok(get_or_create_class_mirror(shared, class_id));
+    }
+    Ok(crate::vm::get_or_create_primitive_mirror(shared, descriptor))
+}
+
+/// JVMS §5.4.3.5 resolution of a `CONSTANT_MethodHandle` reached from `ldc` /
+/// `ldc_w`.
+///
+/// **Twin discipline.** The constant-pool *decode* (Table 5.4.3.5-A: which
+/// reference kinds read a `Fieldref` and which read a
+/// `Methodref`/`InterfaceMethodref`) is not reimplemented here — it is
+/// `invokedynamic`'s `resolve_method_handle_full`, called by the caller. What
+/// is added here is the second half JVMS gives this opcode and gives
+/// `invokedynamic` no reason to have: turning the resolved member into a real
+/// `java.lang.invoke.MethodHandle`.
+///
+/// That half is deliberately expressed as `MethodHandles.Lookup.find*` calls
+/// rather than as a Rust construction of a handle object. The VM has a second
+/// method-handle representation (`native-builtins`' `MH_KIND_*` shim objects,
+/// minted by `alloc_method_handle`) which exists only in the compatible-mode
+/// native surface and is refused under `--jdk-only`. Routing through `Lookup`
+/// means this opcode yields whichever representation the running mode's
+/// `Lookup` yields — the shim in compatible mode, a genuine JDK handle in
+/// strict mode — instead of hardwiring one of them into the opcode and
+/// creating a third twin.
+///
+/// `MethodHandles.lookup()` is caller-sensitive; invoked from here the
+/// innermost Java frame is the method executing the `ldc`, so the lookup class
+/// is the class whose constant pool holds the entry, which is exactly the
+/// access context JVMS §5.4.3.5 specifies. (Same property `invokedynamic`'s
+/// `bootstrap_generic` relies on for the bootstrap `Lookup`.)
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_method_handle_constant(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_class_id: ClassId,
+    kind: MethodHandleKind,
+    class_name: &str,
+    member_name: &str,
+    descriptor: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    const LOOKUP: &str = "java/lang/invoke/MethodHandles$Lookup";
+    const FIND_MEMBER: &str = "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;";
+    const FIND_SPECIAL: &str = "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;";
+    const FIND_CTOR: &str =
+        "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;";
+    const FIND_ACCESSOR: &str =
+        "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;";
+
+    let lookup = match invoke_shared(
+        shared,
+        thread,
+        "java/lang/invoke/MethodHandles",
+        "lookup",
+        "()Ljava/lang/invoke/MethodHandles$Lookup;",
+        &[],
+    )? {
+        Some(Value::Object(Some(l))) => l,
+        _ => {
+            return Err(VmError::Internal {
+                message: "ldc: MethodHandles.lookup() produced no Lookup".to_string(),
+            }
+            .into())
+        }
+    };
+    // Every reference below has to survive the allocations that follow it, so
+    // each is pinned as it is produced and re-read from its slot afterwards.
+    // `invoke_shared` pins its own argument slice, so the pins are released
+    // immediately before the dispatch.
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(lookup); // + 0
+
+    // Immediately-invoked so an early `?` cannot leave the pins behind: an
+    // abandoned pin slot is never popped by anyone else (every other user
+    // truncates to its OWN base), so it would keep its object alive for the
+    // lifetime of the thread.
+    let prepared = (|| -> Result<(), MethodCallFailed> {
+        // Spelled out rather than chained through `map_err`: `thread` is a
+        // captured upvar here, and a nested closure that re-borrows it inside
+        // the same expression is not worth the ambiguity.
+        let refc_id = match resolve_class_loader_aware(shared, thread, frame_class_id, class_name) {
+            Ok(id) => id,
+            Err(e) => return Err(convert_class_not_found(shared, thread, class_name, e)),
+        };
+        let refc = get_or_create_class_mirror(shared, refc_id);
+        thread.native_pin_roots.push(refc); // + 1
+
+        let name_obj = create_java_string(shared, member_name);
+        thread.native_pin_roots.push(name_obj); // + 2
+
+        // Reference kinds 1..4 name a FIELD, so their "type" argument is the
+        // field's `Class`; 5..9 name a method, so it is a `MethodType`.
+        let type_obj = match kind {
+            MethodHandleKind::GetField
+            | MethodHandleKind::GetStatic
+            | MethodHandleKind::PutField
+            | MethodHandleKind::PutStatic => {
+                class_mirror_for_field_descriptor(shared, thread, frame_class_id, descriptor)?
+            }
+            _ => resolve_method_type_constant(shared, thread, frame_class_id, descriptor)?,
+        };
+        thread.native_pin_roots.push(type_obj); // + 3
+
+        // `findSpecial`'s trailing `specialCaller` is the class that holds the
+        // constant-pool entry.
+        let caller = get_or_create_class_mirror(shared, frame_class_id);
+        thread.native_pin_roots.push(caller); // + 4
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        thread.native_pin_roots.truncate(pin_base);
+        return Err(e);
+    }
+
+    let a_lookup = Value::Object(thread.native_pin_roots.get(pin_base).copied());
+    let a_refc = Value::Object(thread.native_pin_roots.get(pin_base + 1).copied());
+    let a_name = Value::Object(thread.native_pin_roots.get(pin_base + 2).copied());
+    let a_type = Value::Object(thread.native_pin_roots.get(pin_base + 3).copied());
+    let a_caller = Value::Object(thread.native_pin_roots.get(pin_base + 4).copied());
+    thread.native_pin_roots.truncate(pin_base);
+
+    let (method, method_desc, args): (&str, &str, Vec<Value>) = match kind {
+        MethodHandleKind::GetField => (
+            "findGetter",
+            FIND_ACCESSOR,
+            vec![a_lookup, a_refc, a_name, a_type],
+        ),
+        MethodHandleKind::GetStatic => (
+            "findStaticGetter",
+            FIND_ACCESSOR,
+            vec![a_lookup, a_refc, a_name, a_type],
+        ),
+        MethodHandleKind::PutField => (
+            "findSetter",
+            FIND_ACCESSOR,
+            vec![a_lookup, a_refc, a_name, a_type],
+        ),
+        MethodHandleKind::PutStatic => (
+            "findStaticSetter",
+            FIND_ACCESSOR,
+            vec![a_lookup, a_refc, a_name, a_type],
+        ),
+        MethodHandleKind::InvokeStatic => (
+            "findStatic",
+            FIND_MEMBER,
+            vec![a_lookup, a_refc, a_name, a_type],
+        ),
+        // `findVirtual` is specified to handle the interface case too, so
+        // REF_invokeInterface shares it (this is what the JDK's own
+        // `MethodHandleNatives.linkMethodHandleConstant` does).
+        MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => (
+            "findVirtual",
+            FIND_MEMBER,
+            vec![a_lookup, a_refc, a_name, a_type],
+        ),
+        MethodHandleKind::InvokeSpecial => (
+            "findSpecial",
+            FIND_SPECIAL,
+            vec![a_lookup, a_refc, a_name, a_type, a_caller],
+        ),
+        // REF_newInvokeSpecial's descriptor is already `(params)V`, which is
+        // the shape `findConstructor` wants; the member name is `<init>` and
+        // is not passed.
+        MethodHandleKind::NewInvokeSpecial => {
+            ("findConstructor", FIND_CTOR, vec![a_lookup, a_refc, a_type])
+        }
+    };
+
+    match invoke_shared(shared, thread, LOOKUP, method, method_desc, &args)? {
+        Some(Value::Object(Some(mh))) => Ok(mh),
+        _ => Err(VmError::Internal {
+            message: format!(
+                "ldc: Lookup.{method} produced no MethodHandle for \
+                 {kind} {class_name}.{member_name}{descriptor}"
+            ),
+        }
+        .into()),
+    }
+}
+
+/// Resolve the `CONSTANT_Dynamic` at `cp_index` in `frame_class_id`, memoised
+/// per (class, constant-pool index).
+///
+/// A condy `ldc` is a **bootstrap call**, not a constant read: JVMS §5.4.3.6
+/// says the bootstrap method runs once per constant-pool entry and its result
+/// is remembered, which is what the `resolution_cache` condy map is.
+///
+/// Split out of `execute_ldc` so `ldc2_w` can call it: JVMS §6.5 `ldc2_w`
+/// accepts a `CONSTANT_Dynamic` whose field type is `long`/`double` (Java 11+),
+/// and `classloading::verify_insn`'s `verify_ldc2w` already verifies exactly
+/// that shape. The interpreter used to refuse it.
+///
+/// **Pre-existing residual, now reachable from one more opcode.**
+/// [`resolve_condy_value`] does NOT run arbitrary bootstrap methods — it
+/// pattern-matches a list of known `ConstantBootstraps` / `ObjectMethods` /
+/// `SwitchBootstraps` entry points and answers `default_for_descriptor` for
+/// everything else, i.e. a fabricated zero/null for a user-defined condy
+/// bootstrap. Wiring `ldc2_w` to the same resolver makes that fabrication
+/// reachable as `0L`/`0.0` where the opcode previously raised
+/// `ClassFormatError`. That is deliberate: giving `ldc2_w` a *different* condy
+/// policy from `ldc` would be a fourth implementation of one JVMS rule, which
+/// is the failure mode this module's header is about. The fabrication itself is
+/// the thing to fix, in one place, for both opcodes.
+pub(super) fn resolve_condy_constant(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_class_id: ClassId,
+    cp_index: u16,
+) -> Result<Value, MethodCallFailed> {
+    {
+        let cache = shared.classes.resolution_cache.read();
+        if let Some(val) = cache.get_condy(frame_class_id, cp_index) {
+            if remap_trace_on() {
+                if let Value::Object(Some(o)) = val {
+                    push_prov_record(o.as_ptr() as usize, "ldc-condy-cached");
+                }
+            }
+            return Ok(*val);
+        }
+    }
+
+    // Resolve the dynamic constant by invoking its bootstrap method.
+    // The bootstrap method receives (Lookup, String name, Class type, extra_args...).
+    // We resolve the bootstrap method handle, then dispatch based on known BSMs.
+    let (name, descriptor, bsm_class, bsm_method, bsm_extra_args) = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm
+            .get_class(frame_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: "condy: current class not found".to_string(),
+            })?;
+        let (bsm_index, nat_index) = match class.constant_pool.get(cp_index) {
+            Some(ConstantPoolEntry::Dynamic {
+                bootstrap_method_attr_index,
+                name_and_type_index,
+            }) => (*bootstrap_method_attr_index, *name_and_type_index),
+            _ => {
+                return Err(VmError::Linkage(LinkageError::ClassFormatError {
+                    class_name: class.name.to_string(),
+                    message: format!("condy: cp#{cp_index} is not a CONSTANT_Dynamic"),
+                })
+                .into())
+            }
+        };
+        let (name, descriptor) =
+            class
+                .constant_pool
+                .get_name_and_type(nat_index)
+                .ok_or_else(|| {
+                    VmError::Linkage(LinkageError::ClassFormatError {
+                        class_name: class.name.to_string(),
+                        message: format!("ldc: invalid condy name_and_type at #{nat_index}"),
+                    })
+                })?;
+        let bsm = class
+            .bootstrap_methods
+            .get(bsm_index as usize) // Widening: index conversion
+            .ok_or_else(|| VmError::Internal {
+                message: format!("condy: bootstrap method index {bsm_index} out of bounds"),
+            })?;
+        let handle = crate::runtime::invokedynamic::resolve_method_handle_full(
+            &class.constant_pool,
+            bsm.bootstrap_method_ref,
+        )?;
+        // Resolve bootstrap argument class names for getStaticFinal etc.
+        let extra: Vec<String> = bsm
+            .bootstrap_arguments
+            .iter()
+            .filter_map(|&idx| {
+                crate::runtime::invokedynamic::resolve_string_constant(&class.constant_pool, idx)
+                    .or_else(|| {
+                        // Try resolving as ClassReference
+                        match class.constant_pool.get(idx) {
+                            Some(ConstantPoolEntry::ClassReference { name_index }) => class
+                                .constant_pool
+                                .get_utf8(*name_index)
+                                .map(|s| s.to_string()),
+                            _ => None,
+                        }
+                    })
+            })
+            .collect();
+        (
+            name.to_string(),
+            descriptor.to_string(),
+            handle.class_name.clone(),
+            handle.member_name.clone(),
+            extra,
+        )
+        // cm dropped here
+    };
+
+    // Compute the result based on common bootstrap methods.
+    let result = resolve_condy_value(
+        shared,
+        &bsm_class,
+        &bsm_method,
+        &name,
+        &descriptor,
+        &bsm_extra_args,
+    )?;
+
+    // Cache the result
+    shared
+        .classes
+        .resolution_cache
+        .write()
+        .put_condy(frame_class_id, cp_index, result);
+    if remap_trace_on() {
+        if let Value::Object(Some(o)) = &result {
+            push_prov_record(o.as_ptr() as usize, "ldc-condy");
+        }
+    }
+    Ok(result)
 }
 
 /// Resolve a CONSTANT_Dynamic value based on the bootstrap method.
@@ -427,37 +946,93 @@ pub fn default_for_descriptor(descriptor: &str) -> Value {
     }
 }
 
-pub(super) fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(), MethodCallFailed> {
-    let cm = shared.classes.class_manager.read();
-    let class = cm
-        .get_class(frame.class_id)
-        .ok_or_else(|| VmError::Internal {
-            message: "current class not found".to_string(),
+/// The three shapes `ldc2_w` accepts, decoded under the class-manager read
+/// lock so the lock can be dropped before a condy bootstrap runs Java.
+enum Ldc2wValue {
+    Long(i64),
+    Double(f64),
+    /// A `CONSTANT_Dynamic` whose field type is `long`/`double` — legal under
+    /// `ldc2_w` since Java 11 (JVMS §6.5) and already accepted by
+    /// `classloading::verify_insn`'s `verify_ldc2w`.
+    Dynamic,
+}
+
+pub(super) fn execute_ldc2w(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    index: u16,
+) -> Result<(), MethodCallFailed> {
+    let frame_class_id = thread.frames[frame_idx].class_id;
+    let decoded = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm
+            .get_class(frame_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: "current class not found".to_string(),
+            })?;
+
+        // Bounds-check the constant-pool index.  `ConstantPool::get` already
+        // returns `None` for out-of-range entries, so mapping the miss to
+        // `ClassFormatError` (rather than a panic) satisfies JVMS §4.4.5 for
+        // ldc2_w which accepts CONSTANT_Long_info / CONSTANT_Double_info and
+        // (Java 11+) a category-2 CONSTANT_Dynamic_info.
+        let entry = class.constant_pool.get(index).ok_or_else(|| {
+            VmError::Linkage(LinkageError::ClassFormatError {
+                class_name: class.name.to_string(),
+                message: format!("ldc2_w: constant-pool index {index} out of range"),
+            })
         })?;
 
-    // Bounds-check the constant-pool index.  `ConstantPool::get` already
-    // returns `None` for out-of-range entries, so mapping the miss to
-    // `ClassFormatError` (rather than a panic) satisfies JVMS §4.4.5 for
-    // ldc2_w which only accepts CONSTANT_Long_info / CONSTANT_Double_info.
-    let entry = class.constant_pool.get(index).ok_or_else(|| {
-        VmError::Linkage(LinkageError::ClassFormatError {
-            class_name: class.name.to_string(),
-            message: format!("ldc2_w: constant-pool index {index} out of range"),
-        })
-    })?;
+        match entry {
+            ConstantPoolEntry::Long(v) => Ldc2wValue::Long(*v),
+            ConstantPoolEntry::Double(v) => Ldc2wValue::Double(*v),
+            ConstantPoolEntry::Dynamic { .. } => Ldc2wValue::Dynamic,
+            _ => {
+                return Err(VmError::Linkage(LinkageError::ClassFormatError {
+                    class_name: class.name.to_string(),
+                    message: format!("ldc2_w: expected Long, Double or Dynamic at cp#{index}"),
+                })
+                .into());
+            }
+        }
+        // cm dropped here
+    };
 
     // The constant pool already carries the Long/Double tag — use it to push
     // directly as a tagged CompactValue slot, avoiding any Value-enum
     // boundary that would collapse Long into the untagged Double bucket.
-    match entry {
-        ConstantPoolEntry::Long(v) => frame.stack.push_long(*v)?,
-        ConstantPoolEntry::Double(v) => frame.stack.push_double(*v)?,
-        _ => {
-            return Err(VmError::Linkage(LinkageError::ClassFormatError {
-                class_name: class.name.to_string(),
-                message: format!("ldc2_w: expected Long or Double at cp#{index}"),
-            })
-            .into());
+    match decoded {
+        Ldc2wValue::Long(v) => thread.frames[frame_idx].stack.push_long(v)?,
+        Ldc2wValue::Double(v) => thread.frames[frame_idx].stack.push_double(v)?,
+        Ldc2wValue::Dynamic => {
+            // Same bootstrap-once-per-entry path `ldc` uses; only the push
+            // differs, because the two slots have to stay tagged.
+            match resolve_condy_constant(shared, thread, frame_class_id, index)? {
+                Value::Long(v) => thread.frames[frame_idx].stack.push_long(v)?,
+                Value::Double(v) => thread.frames[frame_idx].stack.push_double(v)?,
+                // A category-1 result under `ldc2_w` is ill-formed. The
+                // verifier rejects it outright; under `skip_verification`
+                // refuse it here rather than pushing one slot where the rest
+                // of the frame's stack map expects two.
+                other => {
+                    let class_name = shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(frame_class_id)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    return Err(VmError::Linkage(LinkageError::ClassFormatError {
+                        class_name,
+                        message: format!(
+                            "ldc2_w: CONSTANT_Dynamic at cp#{index} resolved to a \
+                             category-1 value ({other:?}); ldc2_w loads long/double only"
+                        ),
+                    })
+                    .into());
+                }
+            }
         }
     }
     Ok(())

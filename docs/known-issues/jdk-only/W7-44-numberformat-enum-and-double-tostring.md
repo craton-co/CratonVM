@@ -1,5 +1,40 @@
 # W7-44 — the accounting currency pattern, the anonymous enum refusal, and the ULP that was not `Double.toString`
 
+> ## 2026-08-12 (P3-E) — re-verified against the tree; all three sections stand, and P3-E discharges NONE of them
+>
+> Checked because W7-34/W7-80/W7-44 are one neighbourhood and a record's stated
+> hypothesis can be wrong rather than merely stale. Every claim below was
+> re-derived from today's source, not inherited:
+>
+> * **§1, currency pattern.** The `;(¤#,##0.00)` negative subpattern is gone from
+>   both copies; `locale_resources.rs:314` carries the standing comment that slot
+>   1 must not reacquire one. §1's own inline STALE banner is **correct** —
+>   `getNumberPatterns` now reads `cldr_number_strings(&t, "NumberPatterns")` per
+>   locale, exactly the staged step it declined. Nothing further to change.
+> * **§2, `Enum.valueOf`.** `no_enum_constant_message` and
+>   `no_enum_constant_message_for_mirror` are in
+>   `native-builtins/src/lang_class.rs` with three unit tests, including the
+>   nested-canonical-name and the literal-`null` cases. Stands.
+> * **§3, `StrictMath.log`.** The CORRECTION note's claim is the one worth
+>   re-testing, because it is the one that says the fix had landed in a body the
+>   VM does not run. Re-grepped: **all five** polar sites now read
+>   `cratonvm_types::fdlibm::log` — `native-builtins/src/lib.rs:36220`,
+>   `securerandom.rs:603/996/1356`, `native-collections/src/lib.rs:31186` — so
+>   the last-write-wins winner is covered. `types/src/fdlibm.rs` exists. Stands,
+>   correction included.
+>
+> **What P3-E does NOT discharge here, stated because the two look adjacent.**
+> P3-E fixed which `Locale` `java.util.Formatter` picks when the overload has
+> none. `java.text.NumberFormat` / `DecimalFormat` — this record's whole §1 — is
+> a **different surface** that never had that defect: its no-arg factories are
+> real JDK bytecode that already call
+> `getInstance(Locale.getDefault(Locale.Category.FORMAT))`, and the patterns and
+> symbols they read were made locale-aware by W7-80, not by P3-E. §2 and §3 are
+> unrelated to formatting locale entirely. Every residual in this record's
+> "What is still open" — the rest of the `StrictMath` transcendental surface, and
+> synthetic mode's pattern-ignoring `DecimalFormat.format(D)` (§1's last
+> subsection) — is untouched by P3-E and remains open.
+
 **Status: SOURCE LANDED, NOT RE-MEASURED.** No CratonVM binary was built from this branch —
 this lane does not run `cargo build`. Every HotSpot column below is a run on
 jdk-25.0.3.9-hotspot; every CratonVM column is the state recorded by

@@ -69,7 +69,7 @@ pub(super) fn execute_instruction(
         Instruction::LdcW(index) => execute_ldc(shared, thread, frame_idx, *index)
             .map_err(|e| convert_ldc_class_format_error(shared, thread, e))?,
         Instruction::Ldc2W(index) => {
-            execute_ldc2w(shared, &mut thread.frames[frame_idx], *index)
+            execute_ldc2w(shared, thread, frame_idx, *index)
                 .map_err(|e| convert_ldc_class_format_error(shared, thread, e))?
         }
 
@@ -257,6 +257,22 @@ pub(super) fn execute_instruction(
                     }
                 },
             )?;
+            // JVMS §6.5 aastore fixes the order of the three checks:
+            // NullPointerException (done above, by `pop_object_ref_ctx_with`),
+            // THEN ArrayIndexOutOfBoundsException, THEN ArrayStoreException.
+            // The bounds test used to be nothing but `set_array_element`'s error
+            // return, which runs AFTER the covariance block below — so an
+            // out-of-range index with an incompatible value reported
+            // `ArrayStoreException` where HotSpot reports
+            // `ArrayIndexOutOfBoundsException` (measured: `RArrayStoreTiers` s15).
+            // `jit_aastore` already had this order; the interpreter did not.
+            // See docs/known-issues/jdk-only/W8-C10-1-typecheck-hatch-audit-and-aastore-precedence.md
+            {
+                let alen = shared.mem.heap.array_length(array_ref) as i32;
+                if index < 0 || index >= alen {
+                    return Err(RuntimeError::aioobe(index, alen).into());
+                }
+            }
             // JVMS §aastore covariance check: a reference store into an
             // Object[]-family array whose element's runtime type is NOT
             // assignment-compatible with the array's component type throws
@@ -270,13 +286,44 @@ pub(super) fn execute_instruction(
                     && shared.mem.heap.element_type_of(array_ref) == ArrayElementType::Reference
                     && !aastore_element_assignable(shared, array_ref, elem_ref)
                 {
-                    let elem_cls = shared
+                    // HotSpot's message is `Klass::external_name()` of the
+                    // VALUE'S OWN class. For an array value that is the JVMS
+                    // descriptor — `[Ljava.lang.Integer;`, never the component
+                    // `java.lang.Integer` (measured on JDK 25.0.3:
+                    // `Object[] o = new String[1][]; o[0] = new Integer[1];`).
+                    //
+                    // The raw lookup below cannot produce that, because on a
+                    // reference array the header class id holds the COMPONENT
+                    // class (`typecheck::array_descriptor_of`, and the same
+                    // trap is written out at length on `cce_display_class_name`
+                    // — it cost a session as a class-identity split). So this
+                    // arm was off by exactly one array dimension for every
+                    // array-valued element, and only for those: the plain-class
+                    // shapes (`RArrayStoreTiers` s01/s02/s03/s05) were always
+                    // right, which is why only s04 diverged.
+                    //
+                    // Reuse `cce_display_class_name` rather than re-deriving the
+                    // descriptor here: it is the same "Java-visible class name
+                    // for a VM-minted type error" question `checkcast` asks a
+                    // few hundred lines below, and it also carries the
+                    // `UnmodifiableMap` stamp translation that keeps a
+                    // VM-internal storage class out of an app-visible message.
+                    // It returns the INTERNAL (slashed) name; `throw_runtime_
+                    // error`'s funnel dots it (`exceptions::hotspot_external_
+                    // name`) and correctly leaves a primitive descriptor such as
+                    // `[I` alone, since that contains no `/`.
+                    //
+                    // Two statements, not one: `cce_display_class_name` takes
+                    // the class-manager read lock itself, so the guard from the
+                    // name lookup must be dropped before the call.
+                    let raw_elem_name = shared
                         .classes
                         .class_manager
                         .read()
                         .get_class(shared.mem.heap.class_id_of(elem_ref))
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| "?".to_string());
+                    let elem_cls = cce_display_class_name(shared, elem_ref, &raw_elem_name);
                     return Err(RuntimeError::ArrayStoreException { message: elem_cls }.into());
                 }
             }

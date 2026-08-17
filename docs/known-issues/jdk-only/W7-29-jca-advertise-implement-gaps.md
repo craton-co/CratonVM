@@ -1,5 +1,88 @@
 # The JCA engines that answer names they never advertised
 
+> ## RETIRED as work, 2026-08-12 (lane A3) — re-verified in source, and the one item this record left open is now closed
+>
+> **Method: source verification, not a run.** This lane could not build. Every
+> claim below is a grep/read of the tree at this branch, and is labelled as such.
+> No CratonVM binary was produced and no probe was executed on this pass; the
+> HotSpot columns in the body remain the only measurements in this file.
+>
+> ### The advertise-vs-serve enumeration, re-taken
+>
+> The shape this record is about — *"the provider advertises an algorithm it
+> cannot actually serve"* — is now held by **ratchets that derive one side from
+> the registry**, not by a list, which is what makes re-enumerating it a matter
+> of checking the ratchets exist rather than re-counting names. All present:
+>
+> | engine | direction | ratchet, verified present |
+> |---|---|---|
+> | `CertificateFactory` | both | `certificate_factory_serves_exactly_the_advertised_types` + `certificate_factory_stub_only_stands_in_for_x509` (`native-builtins/src/phases_late/ssl_security.rs`) |
+> | `Cipher` | both | `provider_chain::every_advertised_sunjce_cipher_is_serviceable` |
+> | `Mac` | both | `provider_chain::every_advertised_sunjce_mac_is_computable` |
+> | `KeyGenerator` | implemented → advertised | `provider_chain::every_keygenerator_the_engine_implements_is_advertised` |
+> | `Signature` | accepted ⊆ offered | `jca::signature`/`provider_chain::signature_name_is_offered` |
+>
+> ### The five residuals — all five FIXED in source, checked by symbol
+>
+> 1. **`MD2`** — `real_md2` exists in `native-builtins/src/jca/message_digest.rs`.
+>    Implemented, per this record's own "strictly better" alternative, rather
+>    than de-advertised.
+> 2. **SHAKE** — `canonical_algorithm` in `message_digest.rs`, which is the
+>    alias half this record's own measurement said was the part that had not
+>    landed.
+> 3. **Mutable set** — `wrap_unmodifiable` in `jca/provider_chain.rs`.
+> 4. **`ML-DSA` umbrella** — gone from the `SUN` `KeyFactory` seed; the seed loop
+>    at `provider_chain.rs:1131` carries `DSA, ML-DSA-44/65/87` only, and the
+>    `Signature` loop 6 lines later still carries the umbrella, which is the
+>    asymmetry the record prescribed. The `SunJCE` `KeyFactory` `ML-KEM` twin
+>    that "neither record names" is also absent and is now reasoned in place
+>    (`provider_chain.rs:1265`). Both are held by a test that names the pair
+>    `[("SUN", "ML-DSA"), ("SunJCE", "ML-KEM")]`.
+> 5. **`Signature.getInstance` accepts every name** — `signature_name_is_offered`
+>    exists and is the disjunction gate W7-63 §3 #5 describes, not the
+>    `find_service_provider`-only gate prescribed here.
+>
+> **Required companion edit: APPLIED.** `vm/src/vm/tests.rs:51239` carries the
+> comment *"in-tree Java callers ask for \"X.509\". W7-29."* beside the real
+> string.
+>
+> **Coverage: `regression-suite/src/RJdkSecurity.java::advertisedVersusServed`
+> exists**, which is the scheduled vector the second pass said the five had
+> gained.
+>
+> ### The one item this record left open, now CLOSED
+>
+> "What was deliberately not done" — `getType()` on the synthetic
+> `CertificateFactory` fallback answering `null` where HotSpot echoes the
+> caller's spelling. The record's reasoning for leaving it was exactly right and
+> is worth keeping: the fallback wrote `Value::Object(None)` into **raw slot 0**,
+> and in real-JDK mode the allocation funnel widens the object to
+> `java.security.cert.CertificateFactory`'s real three-field layout
+> (`provider`, `certFacSpi`, `type`), so slot 0 is `provider`, not `type`.
+>
+> Fixed 2026-08-12 in `register_p68_security_cert`: the raw slot-0 write is
+> **removed** (nothing reads slot 0 of this receiver — grepped) and replaced
+> with `ctx.set_field_by_name(obj, "type", <the caller's spelling>)`, which
+> lands on `type` whatever the layout is and is a no-op when the field is
+> absent (synthetic-stub mode), so it is safe on both. That is the
+> `set_field_by_name` pair the record named and could not verify.
+>
+> **Not verified by running it.** The acceptance vector is this record's own:
+> `CertificateFactory.getInstance("x509").getType()` must answer `x509`, and
+> `getInstance("X.509").getType()` must answer `X.509` — the caller's spelling,
+> not a canonical one. Note this arm is reached only when the real SPI declines
+> to build AND the type folds to X.509, so a run must force that path (or read
+> the value in `--synthetic-jdk`, where `set_field_by_name` is the no-op and the
+> answer legitimately stays `null`).
+>
+> **Why this belongs to a TLS-stream lane at all:** it is the same defect
+> species as the one that lane fixed — a native writing its own idea of a field
+> over whichever real field happens to sit at index 0. See
+> `W7-61-sslengine-layout-and-tls-blocking.md`'s third-pass section.
+>
+> **Nothing else in this file is work.** The line citations throughout the body
+> have rotted and are a picture of the pre-fix tree.
+
 > **SUPERSEDED for its residuals, 2026-08-12 — W7-63-jca-advertise-vs-serve.md.**
 > All five residuals below are **FIXED in source** there, together with W4-3's
 > five live patches. Read W7-63 §3 rather than working from the residual

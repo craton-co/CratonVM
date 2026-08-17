@@ -1,10 +1,82 @@
 # Four families the widened differential found: TreeMap views, `Iterator.remove`, `String.format` floats, and a stream that kills the run
 
+> **CLOSED 2026-08-12 — ALL FOUR FAMILIES VERIFIED GREEN. The differential was
+> re-taken, which is the thing every earlier pass of this record said it needed
+> and could not do.**
+>
+> `probes/ShadowDifferentialProbe.java`, HotSpot 25.0.3+9 as oracle against
+> CratonVM `--real-jdk`, same class files, same image, on this Windows host:
+> **864 lines each, 863 identical.** Every row of both acceptance tables at the
+> top of this record now matches, including the two families this record left
+> untouched and handed to other lanes:
+>
+> | acceptance row | HotSpot 25 | CratonVM `--real-jdk` |
+> |---|---|---|
+> | `TreeMap.descendingMap()` | `{d=4, c=3, b=2, a=1}` | **same** |
+> | `TreeMap.descendingKeySet()` | `[d, c, b, a]` | **same** |
+> | `headMap("c").remove("a")` writes through | `{b=2, c=3, d=4}` | **same** |
+> | `TreeMap.pollFirstEntry()` | `b=2` | **same** |
+> | `iterator().remove()` before `next()` | `IllegalStateException` | **same** |
+> | `Iterator.removeTwice` | `IllegalStateException` | **same** |
+> | `ListIterator.set`+`add` | `[B, B2, c, d]` | **same** |
+> | `for (x : list) list.add(x)` | `ConcurrentModificationException` | **same** |
+> | `String.format("%.3f\|%e\|%g", …)` | `0.333\|1.234500e+03\|0.000100000` | **same** |
+> | `new StringBuilder("ab").delete(5, 6)` | `StringIndexOutOfBoundsException` | **same** |
+> | `IntStream.rangeClosed(1,5).summaryStatistics()` | prints the stats | **prints the stats** |
+>
+> `SECTION-DIED.streamsSurface` is gone. **The two `ListIterator` follow-up
+> questions this record left open are answered by the same run:** the
+> `[B, B2, c, d]` row was a cascade of the `lastRet` defect exactly as §"Family 2"
+> predicted — there is no second `set`/`add` defect to file.
+>
+> **The ONE surviving divergence in 864 lines, and it belongs to W7-2, not here:**
+>
+> ```text
+> HotSpot   stream.summaryStats=IntSummaryStatistics{…, average=3,000000, …}
+> CratonVM  stream.summaryStats=IntSummaryStatistics{…, average=3.000000, …}
+> ```
+>
+> The host default locale is `ru_RU`; `%f` renders a comma there. That is
+> W7-2 §5's declared KNOWN GAP in `p56_format_java_f`, now measured live rather
+> than predicted. Filed against W7-2, not against this record's four families.
+>
+> **Read the encoding before reading the diff.** A raw `diff` of the two
+> transcripts also shows `String.strip`, `Character.toUpperCase`,
+> `format.charFromSupplementary` and `format.localeFrance` differing. Those are
+> **not** VM divergences: `java` writes stdout in the console codepage on this
+> host and CratonVM writes UTF-8. Re-running the oracle as
+> `java -Dstdout.encoding=UTF-8` collapses all four. A pass that reported them
+> as four new defects would have been reporting its own terminal.
+>
+> **Still open, unchanged and deliberately:** `sort`/`replaceAll` do not bump
+> `modCount`, and the view cache has no version stamp. Both reasons below still
+> hold — and the first one's stated blocker is now DISCHARGED, since the CME
+> machinery has been executed and the differential's CME row is green. It is a
+> `al_bump_mod_count` helper plus two call sites; take it with a Spring
+> Boot/Tomcat arm, as the residual section says.
+>
+> **What this run does NOT clear:** it is `--real-jdk` only, and it is one
+> binary of unpinned provenance (a default-feature release build dated
+> 2026-08-12 15:27, behaviourally confirmed to contain `TmViewSpec`, the
+> primitive-stream terminal wiring and the `LogRecord` retirements). It
+> **predates commit `67146db71`** (17:49), which changed no-`Locale`
+> `String.format` — so the `format.*` rows above are the pre-locale-fix
+> behaviour agreeing with HotSpot, and the four `format.*` rows should be
+> re-read on a later binary before this record is called finished. `probes/`
+> is never run by `regression-suite/run.sh` at any `SUITE=` value — grepped
+> again today — so **no suite run schedules this evidence**; re-taking the
+> differential stays a by-hand step. The scheduled cover for the collection
+> half is `regression-suite/src/RJdkViews.java` (`CORE_CLASSES`), which passes
+> 107/107 in all three arms today.
+
 **Status: families 1 and 2 CHANGED 2026-08-11, NOT VERIFIED. Families 3 and 4
 still OPEN and untouched.** Nothing below has been built or run — the source
 changes landed on `fix/jdk-only-treemap-views-and-iterator-contract-20260811`
 and the differential has not been re-taken. See "What landed" at the end for
 what changed, what deliberately did not, and what still needs measuring.
+
+*(Status line above superseded by the 2026-08-12 block. Kept as written: it is
+the record of what was believed before the differential was re-taken.)*
 
 Found 2026-08-10 by the widened
 `probes/ShadowDifferentialProbe.java`, in **`--real-jdk` mode** — so this is a

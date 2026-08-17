@@ -208,7 +208,16 @@ pub(super) fn checkcast_lambda_instantiated_args(
 /// Keep this mapping in lockstep with `native-builtins`' `getClass()` mapping
 /// for maps. The backing map's physical slot layout follows the loaded JDK
 /// class, so resolve its `size` field rather than assuming a fixed slot.
-pub(super) fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
+///
+/// `pub(crate)`, not `pub(super)`: the JIT's `jit_aastore` (`vm/src/jit/
+/// helpers.rs`) is the FIFTH site asking this same question and the third
+/// `aastore` twin — see `docs/known-issues/jdk-only/W8-E11-1-jit-aastore-third-twin-and-the-check-only-helper.md`.
+/// `interpreter.rs` already does `pub use lambda::*;` and a glob re-export
+/// caps at the item's own visibility, so widening the item here is the whole
+/// change: no new re-export, and the JIT reaches it as
+/// `crate::runtime::interpreter::cce_display_class_name`, the same module path
+/// it already uses for `aastore_element_assignable`.
+pub(crate) fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
     // An array receiver must render as its own type, not its component's.
     // The header word of a reference array holds the COMPONENT class id, so
     // the caller's `class_id_of` -> `class.name` lookup yields

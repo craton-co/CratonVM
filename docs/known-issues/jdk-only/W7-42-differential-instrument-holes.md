@@ -22,12 +22,35 @@ instrument.
 > (`MISSING-OBSERVABLE`, `UNDECLARED-OBSERVABLE`, `SECTION-NEVER-RAN`,
 > `SECTION-UNDECLARED`, `DUPLICATE-OBSERVABLE`, `MANIFEST-OVERFLOW`,
 > `PROBE-MANIFEST-DIGEST`, `PROBE-LEDGER`, plus `<toString-threw:…>` and the
-> explicit `System.out.flush()`), and `native-builtins/src/lib.rs:38238` gates
-> the `[SUREFIRE-NPE]` forensic behind `surefire_npe_trace_enabled()`. Neither
-> hole is open.
+> explicit `System.out.flush()`), and `native-builtins/src/lib.rs:38324` gates
+> the `[SUREFIRE-NPE]` forensic behind `surefire_npe_trace_enabled()` (the
+> helper is defined at `native-builtins/src/lib.rs:33`; `git log -S` on the
+> symbol returns exactly one commit, `59a7ba47a`). Neither hole is open.
 >
-> **Two standing rules for anyone re-measuring this**, both of which cost this
+> Re-checked 2026-08-12 (second pass): the gate line had drifted from `:38238`
+> to `:38324` and the number above has been corrected. The sibling gate this
+> record cites is also still true — `vm/src/runtime/exceptions.rs:1941` wraps
+> the `SUREFIRE-NPE-TRACE` `eprintln!` in `if dbg_npe_trace()`.
+>
+> **Three standing rules for anyone re-measuring this**, all of which cost this
 > area a lane already:
+>
+> * **NO `regression-suite/run.sh` RUN CAN RETIRE ANYTHING IN THIS RECORD, AT
+>   ANY `SUITE=` VALUE.** Verified 2026-08-12: `run.sh` contains the string
+>   `probes` **zero** times. It schedules only `regression-suite/src/R*.java`,
+>   from the two explicit lists at `run.sh:106` and `run.sh:119`, dispatched at
+>   `run.sh:207-213` (`core` / `jdk-only` / `all`); nothing is scheduled by
+>   glob, and `modules/` and `modules-overlay/` each hold exactly one entry
+>   (`cratonvm.jdkonly.svc`), neither of them a probe. `ShadowDifferentialProbe`
+>   appears nowhere under `regression-suite/` except a provenance comment at
+>   `regression-suite/src/RJdkViews.java:29`. The only thing that runs this
+>   instrument is `probes/shadow-differential.ps1`, **by hand**.
+>   A green `SUITE=all` is not evidence here. Every hole this record names —
+>   the ledger markers and the six pipeline items P1–P6 — is evidenced only by
+>   something under `probes/`, so the suite is *structurally* incapable of
+>   discharging them. The two items with evidence outside `probes/` are the
+>   `[SUREFIRE-NPE]` gate and the `Formatter.close` item, and the suite has no
+>   vector that trips either.
 >
 > * **Diff against this record's transcript and its `PROBE-MANIFEST-DIGEST`,
 >   never against W7-4's retired oracle.** That oracle predates the manifest
@@ -307,9 +330,32 @@ no observable ever showed it). A linkage error that becomes a log line is a
 fabricated success, and it is invisible to every probe in this campaign
 because every one of them reads stdout.
 
-Not fixed here: `java.util.Formatter` has no `close` registration anywhere in
-the tree, so this is a dispatch-path question rather than a native to patch,
-and it is not this branch's surface. Repro above is six lines and deterministic.
+Not fixed here — **and the sentence that used to stand here was false.** It
+read "`java.util.Formatter` has no `close` registration anywhere in the tree".
+It does: `native-builtins/src/lib.rs:41579`, inside `register_formatter_natives`
+(`:41537`). That registration predates this record by weeks (`git log -S` on the
+register line reaches only the initial commit; the intervening `bcfb51ffd` is a
+pure `extract` refactor), so it was never a matter of drift — the claim was
+wrong when written, and a reader who greps for it bounces straight off the
+record.
+
+What survives the correction is the *underlying* observation, which is a
+dispatch-path question rather than a native to patch:
+`register_formatter_natives` is the **synthetic-mode** registrar —
+`native-builtins/src/lib.rs:21384-21394` says so in terms ("the synthetic-mode
+registrar `register_formatter_natives` DOES need the overload", and on the
+real-JDK boot path "the class is the REAL `java.util.Formatter`"). So under
+`--real-jdk` the JDK's own `Formatter.close()` bytecode runs and takes the
+`Closeable` guard the wrong way, which is what the repro shows. Not this
+branch's surface. Repro above is six lines and deterministic.
+
+Separately, the native's own swallow is still live and still bare —
+`native-builtins/src/lib.rs:41584`, `let _ = ctx.invoke_virtual(target, "close",
+"()V", &[]);` — which is W7-57 rows 48–51, confirmed OPEN.
+
+> Line-number drift note for the index: `README.md:281-283` cites the four
+> `java.util.Formatter` close/flush sites at `:21440`/`:21455`/`:41498`/`:41506`;
+> two of them are now at `:41584` and `:41592`.
 
 ---
 

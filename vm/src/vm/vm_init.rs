@@ -700,53 +700,136 @@ fn require_jdk_image_for_jdk_only(config: &VmConfig) -> Result<Option<PathBuf>, 
     }
 }
 
-/// Pre-register one of the bootstrap block's compatibility stand-ins,
-/// **refusing diagnosably** under [`CompatibilityMode::JdkOnly`].
+/// Pre-register one of the bootstrap block's compatibility stand-ins, and
+/// under [`CompatibilityMode::JdkOnly`] **do not ask at all**.
 ///
 /// # Why this exists
 ///
 /// The three call sites below (`Enumeration$Impl`, `Comparator$Native`, the
-/// eleven `cratonvm/internal/Unmodifiable*`) are the *only* fabrications a
-/// strict boot performs — measured 2026-08-05 with `--dump-class-origins`
+/// eleven `cratonvm/internal/Unmodifiable*`) are the *only* fabrications the
+/// boot block performs — measured 2026-08-05 with `--dump-class-origins`
 /// against a real JDK 25 image: 13 `compatibility-stub` rows from exactly
 /// these three lines. They used to go through the infallible
 /// `ensure_synthetic_class`, which records the `--jdk-only` violation and then
 /// fabricates anyway, so a strict run reported a violation while continuing in
 /// the state contract §5 forbids.
 ///
-/// # What a refusal means here
+/// # Under `--jdk-only` the question is not asked, because the answer is a constant
 ///
-/// `None`, and the caller skips the wiring — but never *silently*. Two
-/// independent records survive the refusal:
+/// From 2026-08-05 to 2026-08-12 this asked anyway and absorbed the refusal.
+/// Measured 2026-08-12 under `--jdk-only --explain-jdk-only --jdk-only-report`
+/// on an ordinary application: **13 of the 19 `compatibility-class-requested`
+/// rows in the entire census came from this one function**, and every one of
+/// the 13 is decided before the call is made:
 ///
-/// 1. `ClassManager::admit_compatibility_class` has already pushed a
-///    `CompatibilityClassRequested` violation naming the class, the reason and
-///    this Rust call site, so `--jdk-only-report` and `--trace-jdk-only` both
-///    show it;
-/// 2. the `warn!` below, which the CLI's default `EnvFilter` (WARN, stderr)
-///    prints with no extra flag, and which states the *consequence* — the
-///    natives bound to the class are unreachable — rather than just the fact.
+/// 1. **The refusal is unconditional.** None of the 13 names escapes
+///    `fabricated_origin_for_name`'s VM-internal arms — those are `CratonVM$…`
+///    (prefix only), the proxy supertypes, the annotation carrier and the
+///    three generated-name families — so all 13 land on
+///    `ClassOrigin::compatibility_stub` and `try_ensure_synthetic_class`
+///    refuses them on every strict run, in every workload.
+/// 2. **A fabrication that succeeded would be worse than the refusal**,
+///    because strict mode registers no method on any of the 13.
+///    `java/util/Enumeration$Impl` and `java/util/Comparator$Native` are both
+///    in `native_api::no_image_receiver::NO_IMAGE_JDK_RECEIVERS`, so
+///    `NativeMethodRegistry::register` re-tags every native on them
+///    `SyntheticStub` and `JdkOnly` drops the lot; the eleven
+///    `cratonvm/internal/Unmodifiable*` are hand-tagged `SyntheticStub` by
+///    `native-collections`' `register_unmodifiable_natives`. Wiring a
+///    superclass and an interface list onto a carrier with no implementation
+///    is the `UnsatisfiedLinkError` shape
+///    `no_image_receiver::STRICT_STILL_FABRICATES` exists to warn about, run
+///    in the other direction.
 ///
-/// The boot deliberately continues. Under `--jdk-only` a real
-/// `java.util.Collections`/`Enumeration`/`Comparator` is on the boot classpath
-/// and runs its own bytecode; these stand-ins exist for the synthetic
-/// collection shims, which strict mode does not register. Failing the boot
-/// instead would refuse a run that is otherwise conforming.
+/// So the skip is execution-identical to the absorb-and-warn it replaces —
+/// same `None`, same skipped wiring, same absent class, same dispatch — and it
+/// gives the census back its 13 rows. **Nothing diagnostic is lost.** A strict
+/// consumer that genuinely needs one of these asks for it at *its* call site
+/// and produces its own refusal row, keyed on its own `requester`; that is
+/// exactly how `System.getenv`'s dependency on
+/// `cratonvm/internal/UnmodifiableMap` was found, and it was found *despite*
+/// the boot row rather than because of it (the two were separate events with
+/// separate diagnoses — see `ClassManager`'s `jdk_only_refusals`, whose dedupe
+/// key is the `(class, site)` PAIR for precisely this reason).
 ///
-/// Under the default `Compatible` mode `try_ensure_synthetic_class` is
-/// byte-for-byte `ensure_synthetic_class`, so this is a no-op there.
+/// # The premise this doc used to carry, and why it was false
+///
+/// It said these stand-ins "exist for the synthetic collection shims, which
+/// strict mode does not register", flat. True of twelve, and **false of
+/// `cratonvm/internal/UnmodifiableMap`**: `lang_system::wrap_system_env_map`
+/// allocated it, ships in the ESSENTIAL set, and therefore survives strict
+/// mode — so `System.getenv()`, and every Spring `AbstractEnvironment::<init>`
+/// through it, died on a `NoClassDefFoundError` until 2026-08-12, when that
+/// native was moved onto the real `java.util.Collections.unmodifiableMap`.
+/// One over-general sentence is why this family went unrevisited.
+///
+/// **Before adding a name here, find who allocates it and what `NativeKind`
+/// that allocator's registration carries.** The mode flag is not the answer
+/// and the `cratonvm/` prefix is not the answer; the registration's kind is,
+/// and it is ambient (`set_category` around a block, `register()` last-write-
+/// wins), so it has to be read at the registrar and not guessed at the mint
+/// site.
+///
+/// # What a refusal still means, in `Compatible` mode
+///
+/// `ClassManager::try_ensure_synthetic_class` also refuses in **both** modes
+/// when the name is already carried by two or more distinct classes
+/// (`IncompatibleClassChangeError`), so the arm below stays live under
+/// `--real-jdk`. `None`, the caller skips the wiring, and the `warn!` states
+/// the *consequence* — the natives bound to the class are unreachable —
+/// rather than just the fact.
+///
+/// The boot deliberately continues in either mode. Under `--jdk-only` a real
+/// `java.util.Collections` / `Enumeration` / `Comparator` is on the boot
+/// classpath and runs its own bytecode. Failing the boot instead would refuse
+/// a run that is otherwise conforming.
 fn ensure_bootstrap_compat_class(
     class_manager: &mut ClassManager,
     name: &str,
     num_fields: usize,
 ) -> Option<ClassId> {
+    // The policy is already installed when this runs: `set_compatibility_mode`
+    // is the very next statement after the manager is constructed, ~120 lines
+    // above the first call site, precisely so that no class escapes the policy
+    // it was started under. Read from the manager and not from a `cfg!`: a
+    // Cargo feature cannot see a runtime mode.
+    // A class that is ALREADY LOADED is answered in every mode. This is not a
+    // fabrication — it is a lookup that happens to share an entry point with
+    // one, and `--jdk-only` has no quarrel with real bytes.
+    //
+    // Measured 2026-08-12: without this, `System.out` in strict mode is a
+    // zero-slot `java/lang/Object`. `getClass()` answers `java.lang.Object`,
+    // `instanceof PrintStream` is false, and `getSuperclass()` is null. The
+    // caller at the `java/io/PrintStream` site says so in its own comment —
+    // "the load above has already put the real java.io.PrintStream in the
+    // store, so this resolves to it and fabricates nothing" — and its refusal
+    // arm deliberately degrades to `java/lang/Object` because that arm was only
+    // ever meant to be reachable where `java.base` is absent.
+    //
+    // The blanket early return below was added the same day to stop the boot
+    // block REQUESTING the thirteen `cratonvm/internal/Unmodifiable*` stand-ins
+    // under strict mode, which it correctly does. But this function is named
+    // for its majority caller, not its contract, and one caller passes a real
+    // JDK class. That is the SECOND time this exact function's stated scope has
+    // been wrong about a caller — its doc comment previously claimed the
+    // stand-ins "exist for the synthetic collection shims", which was false for
+    // `cratonvm/internal/UnmodifiableMap` and cost `System.getenv()`.
+    //
+    // **A guard scoped by a premise about who calls you is only as good as that
+    // premise.** Ask the store, not the caller list.
+    if let Some(id) = class_manager.get_loaded_class_id(name) {
+        return Some(id);
+    }
+    if class_manager.compatibility_mode().is_jdk_only() {
+        return None;
+    }
     match class_manager.try_ensure_synthetic_class(name, num_fields) {
         Ok(id) => Some(id),
         Err(err) => {
             tracing::warn!(
                 class = name,
                 error = %err,
-                "--jdk-only: refusing to fabricate this bootstrap compatibility class. It is \
+                "refusing to fabricate this bootstrap compatibility class. It is \
                  NOT registered, the natives bound to it are unreachable, and any code that \
                  needs it will fail at its own call site naming this class."
             );
@@ -995,7 +1078,10 @@ impl BootstrapPhase<RuntimeReady> {
 
 #[cfg(test)]
 mod typed_bootstrap_phase_tests {
-    use super::{BootstrapInvariantError, BootstrapPhase};
+    use super::{
+        native_census_incomplete_header_json, native_census_invocations_json,
+        BootstrapInvariantError, BootstrapPhase, NATIVE_CENSUS_SCHEMA_VERSION,
+    };
 
     #[test]
     fn phase_invariants_fail_at_the_boundary_that_owns_them() {
@@ -1036,6 +1122,113 @@ mod typed_bootstrap_phase_tests {
             .expect("runtime")
             .finish();
         assert!(elapsed <= std::time::Duration::from_secs(1));
+    }
+
+    // ───────────────────────── native census, schema 5 ─────────────────────
+    //
+    // `G47-1`. The registry has carried a per-slot "this count is a floor" bit
+    // since 2026-08-17 and 25 slots set it; until schema 5 the census writer
+    // emitted neither the bit nor its header total, so no reader could see any
+    // of them. These pin the shape that fixed it.
+
+    /// **The tally can never be emitted without its qualifier.**
+    ///
+    /// This is the whole defect in one assertion: `invocations` alone is
+    /// unreadable — `0` means "never called" and "called through a path that
+    /// does not count" equally well — and the fix is that one function emits
+    /// both or neither. A future edit that deletes the second line has to do it
+    /// on purpose.
+    #[test]
+    fn a_census_rows_invocation_tally_always_carries_its_completeness_bit() {
+        let floor = native_census_invocations_json(1_999, false);
+        assert!(floor.contains("\"invocations\": 1999,"), "{floor}");
+        assert!(
+            floor.contains("\"invocations_complete\": false,"),
+            "{floor}"
+        );
+        // JSON booleans, not the strings "false"/"true": a quoted value would
+        // parse as truthy in every consumer that does a bare truthiness test,
+        // which is the one direction this instrument must not err in.
+        assert!(!floor.contains("\"false\""), "{floor}");
+
+        let total = native_census_invocations_json(0, true);
+        assert!(total.contains("\"invocations\": 0,"), "{total}");
+        assert!(total.contains("\"invocations_complete\": true,"), "{total}");
+
+        // Order matters for a human reading the file top to bottom: the
+        // qualifier must follow the number it qualifies, not precede it.
+        let i = floor.find("\"invocations\":").expect("tally key");
+        let c = floor.find("\"invocations_complete\":").expect("bit key");
+        assert!(i < c, "the bit must follow the tally:\n{floor}");
+    }
+
+    /// The header total is a **slot** count and says so; `0` is a real answer
+    /// (nothing declared itself) and must still be emitted, because an absent
+    /// key is exactly what schema 4 had and what nobody could read.
+    #[test]
+    fn the_header_states_the_incomplete_slot_total_even_when_it_is_zero() {
+        let none = native_census_incomplete_header_json(0);
+        assert!(
+            none.contains("\"slots_with_incomplete_invocations\": 0,"),
+            "{none}"
+        );
+        let some = native_census_incomplete_header_json(25);
+        assert!(
+            some.contains("\"slots_with_incomplete_invocations\": 25,"),
+            "{some}"
+        );
+        // Header indentation (two spaces), not row indentation (six): it sits
+        // beside `counts` and `invocations`, not inside `natives`.
+        assert!(some.starts_with("  \""), "{some}");
+    }
+
+    /// **The writer, the doc example and the schema constant cannot drift.**
+    ///
+    /// `G37-1` §6 N2 measured a binary emitting `schema_version: 3`, `G42-1`
+    /// §6 N1 measured `4` on a later one, and `--help` documented a third
+    /// shape — three records disagreeing about one integer, all of them right
+    /// about the binary they ran. The constant is the single source; this
+    /// witness is what makes editing the writer's literal impossible.
+    ///
+    /// Reads this file from the **working tree** rather than `include_str!`,
+    /// matching `registrar_call_graph_witness`: a compile-time snapshot would
+    /// keep passing against source that is no longer there.
+    #[test]
+    fn the_census_writer_emits_the_schema_constant_and_both_new_keys() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vm/vm_init.rs"))
+                .expect("witness must read vm_init.rs from the working tree");
+
+        assert_eq!(
+            NATIVE_CENSUS_SCHEMA_VERSION, 5,
+            "schema 5 is what adds invocations_complete; bumping this constant \
+             without moving scripts/jdk-only-bridge-ratchet.py's \
+             REQUIRED_CENSUS_SCHEMA (an equality test) turns the bridge ratchet \
+             red — see G47-1 NOMINATION 1"
+        );
+
+        assert!(
+            src.contains("NATIVE_CENSUS_SCHEMA_VERSION"),
+            "the writer must stamp the constant, not a literal"
+        );
+        assert!(
+            src.contains("native_census_invocations_json("),
+            "the row loop must go through the function that emits both halves"
+        );
+        assert!(
+            src.contains("native_census_incomplete_header_json("),
+            "the header must carry slots_with_incomplete_invocations"
+        );
+        // The published example a reader copies from must show the new keys,
+        // or the schema is documented as its predecessor.
+        assert!(
+            src.contains("\"invocations_complete\": false,"),
+            "the doc example must show the bit"
+        );
+        assert!(
+            src.contains("\"slots_with_incomplete_invocations\": 25,"),
+            "the doc example must show the header total"
+        );
     }
 }
 
@@ -1406,10 +1599,13 @@ impl SharedVm {
         // where `hasMoreElements`/`nextElement`/`hasNext`/`next` are bound.
         //
         // Fallible since 2026-08-05 (JDK-only wave 2, lane L7): under
-        // `--jdk-only` this is refused and the wiring below is skipped. See
-        // `ensure_bootstrap_compat_class` for what "refused" is required to
-        // mean — a recorded violation plus a WARN naming the consequence, not
-        // a silent `None`.
+        // `--jdk-only` the class is not created and the wiring below is
+        // skipped. Since 2026-08-12 the request is not even made in that mode
+        // — `ensure_bootstrap_compat_class` carries the measurement showing
+        // the refusal was a constant and the natives on the resulting class
+        // are all dropped anyway, so asking bought 13 census rows and no
+        // information. `None` here means the same thing it always did: this
+        // wiring did not happen.
         let enum_impl_id =
             ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 5);
         // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
@@ -1602,6 +1798,15 @@ impl SharedVm {
                 // Reclassifying them would silence the violation, keep
                 // fabricating, and make the zero-stub census read green while
                 // the substitution continued.
+                //
+                // That argument is about `Compatible` mode, which is the only
+                // mode that now reaches the fabrication: since 2026-08-12
+                // `ensure_bootstrap_compat_class` returns `None` under
+                // `--jdk-only` without asking, so strict mode neither
+                // fabricates these nor records them. The distinction the
+                // paragraph above protects is unchanged — a `VmInternal`
+                // reclassification would still be a lie, and it would still be
+                // a lie in the mode where the substitution actually happens.
                 let Some(cid) = ensure_bootstrap_compat_class(&mut class_manager, name, 1) else {
                     continue;
                 };
@@ -2175,6 +2380,20 @@ impl SharedVm {
                 cratonvm_native_builtins::phases_late::register_p60_process_handle(
                     &mut native_methods,
                 );
+                // 2026-08-13 (lane F30) ARM-DRIFT FIX. `register_classvalue_natives` was
+                // called only by the *other* real-JDK arm (the
+                // `#[cfg(not(feature = "synthetic-jdk"))]` block below). Both arms are
+                // real-JDK mode and neither one calls `register_synthetic_overrides` —
+                // the registrar this registration otherwise lives behind (via
+                // `register_p67_misc`) is `#[cfg(feature = "synthetic-jdk")]` AND is only
+                // ever called from `register_builtins`, i.e. from the SYNTHETIC-mode arm
+                // above. So a `--features synthetic-jdk` binary running real-JDK mode or
+                // `--jdk-only` had no `java.lang.ClassValue` natives at all.
+                // Position matches the shipping arm (io -> process-handle -> classvalue);
+                // this registry is last-write-wins, so position is semantics.
+                cratonvm_native_builtins::phases_late::register_classvalue_natives(
+                    &mut native_methods,
+                );
                 // ╔══ LAST-WRITE-WINS BOUNDARY — do not reorder ═════════════╗
                 //
                 // Everything from here to the end of this arm is ordered
@@ -2204,6 +2423,19 @@ impl SharedVm {
                 // through synthetic wrappers; register collection natives so
                 // ArrayList/Iterator/Map operations don't fail linkage.
                 register_collections_natives(&mut native_methods);
+                // 2026-08-13 (lane F30) ARM-DRIFT FIX. Must follow
+                // `register_collections_natives`, and must exist in BOTH real-JDK arms —
+                // it existed only in the shipping arm below. In real-JDK mode
+                // `java/util/Random` field 0 is the `AtomicLong seed` REFERENCE, not a
+                // long, so the aliases `register_collections_natives` re-registers read 0
+                // and every `nextInt/nextLong/nextDouble/...` on a seeded `Random`
+                // returned 0. The `securerandom` handlers keep the seed in an
+                // identity-hash-keyed side table, so they are layout-independent and must
+                // win. Absent here, a `--features synthetic-jdk` binary running real-JDK
+                // mode or `--jdk-only` produced all-zero `Random` output.
+                cratonvm_native_builtins::securerandom::register_random_and_securerandom_natives(
+                    &mut native_methods,
+                );
                 // Re-register the side-table-backed Properties natives AFTER
                 // `register_collections_natives` (see real-JDK arm below for
                 // rationale) — Surefire's BooterDeserializer needs the
@@ -2232,6 +2464,16 @@ impl SharedVm {
                 cratonvm_native_builtins::phases_late::register_phase57_nio_file(
                     &mut native_methods,
                 );
+                // 2026-08-13 (lane F30) ARM-DRIFT FIX. The 2026-08-07 note just below
+                // writes the shipping arm's order out as
+                // "nio_file -> file -> jar -> bulk -> zip-output" and then omitted `file`
+                // itself. The real-JDK `java.io.File` constructor runs `FileSystem.
+                // normalize` bytecode this interpreter does not execute cleanly (no
+                // `WinNTFileSystem.normalize` override), which is why the shipping arm
+                // routes `File` constructors and metadata accessors through
+                // `register_phase57_file`. Paired with the `check_override` allow-list
+                // entry for `java/io/File`.
+                cratonvm_native_builtins::phases_late::register_phase57_file(&mut native_methods);
                 // 2026-08-07: the jar/zip bridge, which this arm was missing.
                 //
                 // This is a REAL-JDK arm, so it has to register what the shipping
@@ -2262,6 +2504,15 @@ impl SharedVm {
                 cratonvm_native_builtins::phases_late::register_p59_zip_output_primitives(
                     &mut native_methods,
                 );
+                // 2026-08-13 (lane F30) ARM-DRIFT FIX. `register_spring_boot_logback_apply`
+                // is an empty no-op today (`native-builtins/src/logging_shims.rs`, emptied
+                // by the 2026-07-24 logging-bootstrap batch) — but its own doc comment says
+                // it is "registered unconditionally in real-JDK mode by `vm_init.rs`",
+                // which was false for this arm. Called here so the two real-JDK arms have
+                // identical registrar SEQUENCES and the witness test at the bottom of this
+                // file can assert that with no exception list to rot. If the body is ever
+                // repopulated, both arms already receive it.
+                cratonvm_native_builtins::register_spring_boot_logback_apply(&mut native_methods);
                 // KC26: Register URL codec (URLDecoder/URLEncoder) natives — the real JDK
                 // bytecode depends on internal sun.net classes we don't support.
                 //
@@ -4756,10 +5007,12 @@ impl SharedVm {
     ///
     /// ```json
     /// {
-    ///   "schema_version": 4,
+    ///   "schema_version": 5,
     ///   "mode": "compatible",
     ///   "image_adjudication": true,
     ///   "counts": { "intrinsic": 2, "bridge": 1, "synthetic-stub": 1, "total": 4 },
+    ///   "invocations": { "intrinsic": 267, "bridge": 2818, "synthetic-stub": 0 },
+    ///   "slots_with_incomplete_invocations": 25,
     ///   "natives": [
     ///     { "class": "java/lang/System", "name": "arraycopy",
     ///       "descriptor": "([Ljava/lang/Object;I[Ljava/lang/Object;II)V",
@@ -4767,6 +5020,7 @@ impl SharedVm {
     ///       "registered_by": "native-builtins/src/lib.rs:1234",
     ///       "overwrote": "synthetic-stub",
     ///       "invocations": 10,
+    ///       "invocations_complete": false,
     ///       "kind_stated": true, "kind_chosen": true,
     ///       "owns_slot": true,
     ///       "real_declaring_method": { "loaded": true, "declared": true,
@@ -4802,6 +5056,32 @@ impl SharedVm {
     ///
     /// Reading the two together is the point: `real` says whether this run
     /// exercised the slot, `image` says whether the JDK declares it at all.
+    ///
+    /// ## Schema 5 — `invocations_complete` and `slots_with_incomplete_invocations`
+    ///
+    /// `invocations` was always documented as a **lower bound**
+    /// (`NativeMethodRegistry::record_invocation`), and the registry has
+    /// carried a per-slot "this is a floor" bit
+    /// (`NativeMethodRegistry::mark_invocations_incomplete`) since
+    /// 2026-08-17. Until schema 5 **this writer emitted neither** — measured
+    /// against real dumps by `G37-1` §6 N2 and `G42-1` §6 N1 — so 25 slots
+    /// declared themselves uncounted and every reader of the file was told
+    /// `invocations: 0` with nothing to distinguish "never called" from "called
+    /// through a path that does not count".
+    ///
+    /// Schema 5 emits the bit per row and the slot total in the header. It
+    /// changes **no number**: not a count, not an invocation tally, not
+    /// `owns_slot`. What it changes is what a number licenses, and only ever in
+    /// the direction of less confidence.
+    ///
+    /// What the bit does and does not claim, spelled out because it is easy to
+    /// over-read: `false` means a dispatch path is *wired* for this slot that
+    /// will not count, not that such a dispatch has happened. `true` means no
+    /// path has declared itself — which is **not** "exact", because a bypass
+    /// nobody has audited is indistinguishable from no bypass. There is no
+    /// configuration of this VM in which the whole column is exact
+    /// (`G37-1` §2, `G42-1` §5); `--nojit` with `CRATONVM_DISABLE_INTRINSICS=1`
+    /// is the least inexact one.
     ///
     /// Notes on the fields that are easy to misread:
     ///
@@ -4934,7 +5214,15 @@ impl SharedVm {
         // row as unadjudicated, which is the exact miscount the keys exist to
         // end, so `jdk-only-bridge-ratchet.py` refuses the older shape rather
         // than degrading.
-        out.push_str("{\n  \"schema_version\": 4,\n");
+        // Schema 5 (2026-08-17): rows carry `invocations_complete` and the
+        // header carries `slots_with_incomplete_invocations`. See
+        // [`NATIVE_CENSUS_SCHEMA_VERSION`] for why this is a bump and not an
+        // additive-at-the-same-version change, and for the two consumers that
+        // pin it by equality.
+        out.push_str(&format!(
+            "{{\n  \"schema_version\": {},\n",
+            NATIVE_CENSUS_SCHEMA_VERSION
+        ));
         out.push_str(&format!(
             "  \"image_adjudication\": {},\n",
             image_verdicts.is_some()
@@ -4978,7 +5266,18 @@ impl SharedVm {
                 .native_methods
                 .invocations_of_kind(NativeKind::SyntheticStub)
         ));
-        out.push_str("  },\n  \"natives\": [");
+        out.push_str("  },\n");
+        // How many slots have a dispatch path that has declared itself
+        // uncounted. Emitted between `invocations` and `natives` so it reads as
+        // the qualifier on the block immediately above it. Cold: one relaxed
+        // load per slot, once, at report time — the same shape and the same
+        // justification as the three `invocations_of_kind` calls above.
+        out.push_str(&native_census_incomplete_header_json(
+            self.natives
+                .native_methods
+                .slots_with_incomplete_invocations(),
+        ));
+        out.push_str("  \"natives\": [");
 
         // One read lock for the whole loop: `real_declaring_method` asks the
         // class manager a question per row, and re-acquiring L10 tens of
@@ -5018,7 +5317,16 @@ impl SharedVm {
                 )),
                 None => out.push_str("      \"overwrote\": null,\n"),
             }
-            out.push_str(&format!("      \"invocations\": {},\n", row.invocations));
+            // "How many dispatches resolved this slot by name or id" — and,
+            // inseparably, whether that is a total or a floor. Before schema 5
+            // only the first half was emitted, while the registry had already
+            // been told about 25 bypassing slots; a reader could not tell a
+            // counted zero from an uncounted one. See
+            // [`native_census_invocations_json`].
+            out.push_str(&native_census_invocations_json(
+                row.invocations,
+                row.invocations_complete,
+            ));
             // "Did anyone adjudicate this kind, or did it inherit an ambient
             // `set_category`?" — the discriminator the 157-entry
             // reclassification needs. See `NativeCensusEntry::kind_stated`.
@@ -5310,9 +5618,39 @@ impl SharedVm {
     ///     "jit_direct_native_binds": 0, "jit_inline_cache_natives": 0,
     ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0,
     ///     "interpreter_shadow_unenforced": 0
+    ///   },
+    ///   "observation_sink": {
+    ///     "recorded": 81, "cap": 256, "saturated": false
     ///   }
     /// }
     /// ```
+    ///
+    /// # `observation_sink` — is `violations[]` the population, or a floor?
+    ///
+    /// Additive, and here is why it is not decoration. The §7 shadow rows in
+    /// `violations[]` come out of a bounded, deduplicated sink
+    /// ([`crate::vm::jdk_only_native_shadow_cap`], 256 distinct rows by default,
+    /// shared by both recorders), and until this object existed a TRUNCATED list
+    /// was identical in shape to a complete one. Every reader who took the list
+    /// as the population was reading a floor with nothing in the file to say
+    /// so — `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
+    /// §4 had to instruct its readers to count the rows by hand and compare them
+    /// against a constant compiled into the VM, which is not a check anyone
+    /// performs twice.
+    ///
+    /// `cap` is emitted rather than assumed for the same reason: it is an
+    /// operator override (`CRATONVM_NATIVE_SHADOW_SINK_CAP`), so a reader comparing
+    /// `recorded` against a hard-coded 256 would be comparing against the wrong
+    /// number on exactly the runs that raised it.
+    ///
+    /// `saturated` is **not** `recorded == cap`: a run whose last distinct
+    /// observation is the 256th fills the sink exactly and drops nothing. See
+    /// [`crate::vm::jdk_only_native_shadow_sink_saturated`].
+    ///
+    /// `saturated: true` also condemns a COUNTER, not just a list:
+    /// `refusals.interpreter_shadow_unenforced` stops advancing once the sink is
+    /// full, because the hierarchy walk that discovers a shadow is skipped when
+    /// the sink can no longer learn one.
     ///
     /// The **only** report writer: `--jdk-only-report` calls this. `verbose` is
     /// `--explain-jdk-only`; **false redacts and is the default**, applied
@@ -5615,6 +5953,31 @@ impl SharedVm {
         out.push_str(&format!(
             "    \"interpreter_shadow_unenforced\": {}\n",
             refusals.interpreter_shadow_unenforced
+        ));
+        // A SIBLING object, not three more `counts` keys. `counts` is a closed
+        // set of seven and these are not counts of anything that happened —
+        // they are the observation sink's capacity state, and what they do is
+        // qualify `violations[]` and `refusals.interpreter_shadow_unenforced`
+        // rather than join them.
+        //
+        // Written unconditionally, including in `Compatible` where the sink is
+        // never touched and this reads `recorded: 0, saturated: false`. An
+        // object present only when it had something to report would make its
+        // ABSENCE ambiguous between "nothing was dropped" and "this binary does
+        // not answer the question" — the same class of mistake that omitting the
+        // class buckets, rather than zeroing them, exists to avoid above.
+        out.push_str("  },\n  \"observation_sink\": {\n");
+        out.push_str(&format!(
+            "    \"recorded\": {},\n",
+            crate::vm::jdk_only_native_shadow_sink_len()
+        ));
+        out.push_str(&format!(
+            "    \"cap\": {},\n",
+            crate::vm::jdk_only_native_shadow_cap()
+        ));
+        out.push_str(&format!(
+            "    \"saturated\": {}\n",
+            crate::vm::jdk_only_native_shadow_sink_saturated()
         ));
         out.push_str("  }\n}\n");
 
@@ -5948,6 +6311,76 @@ pub fn init_service_loader_bootstrap(registry: &mut NativeMethodRegistry) {
     tracing::info!(
         "WP1.8: ServiceLoader bootstrap wired — META-INF/services classpath scan enabled"
     );
+}
+
+/// The `schema_version` [`SharedVm::dump_native_census_json`] stamps on every
+/// native census it writes.
+///
+/// **5** since 2026-08-17 (`G47-1`): rows gained `invocations_complete` and the
+/// header gained `slots_with_incomplete_invocations`. The bump is not cosmetic
+/// and the reason is the same one schema 4 was bumped for. A schema-4 reader
+/// scoring a schema-5 file is harmless (it ignores two keys); a reader that
+/// believes it is looking at schema 5 and is handed a schema-4 file concludes
+/// **every row is a total**, because the absent key reads as "nothing declared
+/// itself a bypass" — which is the exact direction
+/// `NativeMethodRegistry::mark_invocations_incomplete` says this instrument
+/// must never err in. One `schema_version` with two shapes is the hazard
+/// `dump_native_census_json`'s "only native-census writer" note is about.
+///
+/// A named constant rather than a literal because the writer, this file's doc
+/// example and the witness test below must not be able to drift apart — the
+/// state `G37-1` §6 N2 and `G42-1` §6 N1 measured, where two records disagreed
+/// about whether the shipping binary said 3 or 4 and `--help` said a third
+/// thing.
+///
+/// **Consumers that pin this exactly** (equality, not `>=`), and therefore move
+/// with it: `scripts/jdk-only-bridge-ratchet.py`'s `REQUIRED_CENSUS_SCHEMA` and
+/// the `census_schema_version` recorded in
+/// `scripts/baselines/jdk-only-bridge-ratchet.json`. Neither is in this crate;
+/// see `docs/known-issues/jdk-only/G47-1-*.md` NOMINATION 1.
+/// `scripts/jdk-only-kind-map.py` asks for `>= 2` and needs nothing.
+pub(crate) const NATIVE_CENSUS_SCHEMA_VERSION: u32 = 5;
+
+/// The `invocations` pair of a census row: the tally, and whether it is a
+/// **total** or a **floor**.
+///
+/// The two are emitted together, in this order, by one function on purpose.
+/// The whole defect `G33-1`/`G37-1`/`G42-1` chased is that `invocations` was
+/// readable without its qualifier: 25 slots carried
+/// `NativeCensusEntry::invocations_complete` `false` and **no reader could
+/// see it**, so every consumer of the column read a floor as a count. Emitting
+/// the number from a function that cannot emit it without the bit is the cheap
+/// structural way to keep that from recurring; a future editor who wants one
+/// has to delete the other deliberately.
+///
+/// `false` here means "a dispatch path has *declared* that it serves this slot
+/// without counting" — a claim carried by code, not a proof. `true` means no
+/// path has declared itself, which is weaker than "exact": see
+/// `NativeMethodRegistry::record_invocation`'s bypass list.
+fn native_census_invocations_json(invocations: u64, complete: bool) -> String {
+    format!(
+        "      \"invocations\": {},\n      \"invocations_complete\": {},\n",
+        invocations, complete
+    )
+}
+
+/// The census header's one-line summary of how much of the `invocations`
+/// column is a floor:
+/// `NativeMethodRegistry::slots_with_incomplete_invocations`.
+///
+/// In the header rather than only per row so a reader is told the column is
+/// partly a floor **before** quoting a number out of it, which is the order the
+/// mistake actually happens in — `G33-1` §4 records a lane concluding a body
+/// was dead from `invocations: 0`, and `G42-1` §4 shows zero is the *expected*
+/// reading for a hot native whose loop began after its caller was compiled.
+///
+/// Counted over **slots**, while `natives` is one row per **registration**, so
+/// this number is not the count of rows carrying `invocations_complete: false`
+/// — a superseded row shares its successor's slot and shows the same bit. That
+/// asymmetry is inherited from `counts` (registrations) versus `invocations`
+/// (slots) and is deliberate in both.
+fn native_census_incomplete_header_json(slots: usize) -> String {
+    format!("  \"slots_with_incomplete_invocations\": {},\n", slots)
 }
 
 /// Escape an arbitrary UTF-8 string as a JSON string literal, including
@@ -16454,5 +16887,433 @@ mod tests {
         // Firing the hooks with a dead entry already swept must be a no-op,
         // not a panic.
         resolution_invalidate_adapter(0);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F30 (2026-08-13) — the registrar call graph, as a gate rather than folklore
+//
+// Four separate lanes in one session each rediscovered, by hand, that a
+// `register_*` pass is reachable in fewer modes than its name suggests:
+//
+//   1. `register_p67_string_template` and the phase-64/67 registrars are
+//      reached only from `register_synthetic_overrides`, which is
+//      `#[cfg(feature = "synthetic-jdk")]` AND has exactly one caller,
+//      `register_builtins` — i.e. only the synthetic-MODE arm above. A doc
+//      comment had already claimed those rows survive `--jdk-only` because
+//      their `NativeKind` is `Bridge`: true about categories, false about
+//      that registrar.
+//   2. `register_pe_panama` likewise has one call site
+//      (`native-builtins/src/lib.rs`, inside `register_synthetic_overrides`),
+//      so real-JDK mode and `--jdk-only` never registered panama's layouts at
+//      all. The two shipping modes ran different `structLayout`
+//      implementations and the synthetic-mode tests exercised the one
+//      `--jdk-only` does not run.
+//   3. In synthetic mode `register_builtins` runs essentials and THEN the
+//      synthetic overrides, so a triple registered in both places resolves to
+//      the second; the real-JDK arms run essentials only, so the same triple
+//      resolves to the first. Two guards for one rule were live in different
+//      modes, silently drifting.
+//   4. `register_io_natives` runs AFTER `register_essential_natives_with_shims`
+//      in both real-JDK arms, so `native-io`'s bodies shadow `native-builtins`'
+//      aliasing implementations — a lane measured a clearance against a body
+//      that never runs.
+//
+// `register()` is last-write-wins and `NativeKind` is ambient, so ORDER and
+// ARM MEMBERSHIP are semantics, not style. The tests below read this file out
+// of the working tree and go red when either changes. A comment cannot do
+// that; that a comment is not a gate is this session's most repeated lesson.
+//
+// Census record:
+// `docs/known-issues/jdk-only/F30-1-the-registrar-call-graph-and-the-drifted-arm-20260813.md`.
+//
+// Deliberately NOT covered here: the inline `native_methods.register(...)`
+// rows. Three of them (`CopyOnWriteArrayList.addIfAbsent`, `ArrayList.toArray`,
+// `AbstractCollection.toArray`) exist only in the feature-OFF arm and their
+// bodies call helper `fn`s declared inside that arm, so unifying them is a
+// code move rather than a call move. Recorded in the census instead.
+#[cfg(test)]
+mod registrar_call_graph_witness {
+    /// This very file, read from the WORKING TREE at test time (not
+    /// `include_str!`, which would freeze a compile-time snapshot and let the
+    /// witness pass against source that is no longer there).
+    const VM_INIT_RS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vm/vm_init.rs");
+    const VM_CARGO_TOML: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+
+    /// Opens the synthetic-JDK **mode** arm (runtime flag, not a Cargo cfg).
+    const SYNTHETIC_ARM_OPEN: &str = "if config.use_synthetic_jdk {";
+    /// Opens real-JDK arm A — compiled when `synthetic-jdk` is ON.
+    const REAL_ARM_A_OPEN: &str = "} else {";
+    /// Opens real-JDK arm B — compiled when `synthetic-jdk` is OFF.
+    const REAL_ARM_B_OPEN: &str = "#[cfg(not(feature = \"synthetic-jdk\"))]";
+    /// Final statement of BOTH real-JDK arms. Matched against the whole
+    /// trimmed line, so this constant's own declaration cannot match it.
+    const REAL_ARM_CLOSE: &str = "\"Real JDK mode: {} native methods registered\",";
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("witness must read `{}` from the working tree: {}", path, e))
+    }
+
+    /// The first argument every registration pass takes: the registry being
+    /// built.
+    const REGISTRY_ARG: &str = "&mut native_methods";
+
+    /// Every registration pass called in `lines`, in source order, named by
+    /// the last segment of its path.
+    ///
+    /// A pass is any call whose first argument is the registry. Keying on the
+    /// ARGUMENT rather than on a `register_` name prefix is deliberate:
+    /// `init_service_loader_bootstrap` is a registration pass too, and the
+    /// first draft of this witness — a name-prefix scanner — silently skipped
+    /// it. That is the same "trace it, do not infer from names" failure the
+    /// witness exists to stop.
+    ///
+    /// Method calls (`native_methods.register_with_kind(...)`) are excluded
+    /// because their receiver is not an argument; whole-line `//` comments are
+    /// skipped, so back-ticked prose mentions never match. rustfmt moves the
+    /// argument to the next line for the longer paths, so both spellings are
+    /// accepted.
+    fn registration_passes<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+        let mut found: Vec<&'a str> = Vec::new();
+        for (i, &line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let bytes = line.as_bytes();
+            for (open, _) in line.char_indices().filter(|(_, c)| *c == '(') {
+                let mut start = open;
+                while start > 0 {
+                    let p = bytes[start - 1];
+                    if p == b'_' || p == b':' || p.is_ascii_alphanumeric() {
+                        start -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if start == open || (start > 0 && bytes[start - 1] == b'.') {
+                    continue;
+                }
+                let after = line[open + 1..].trim_start();
+                let takes_registry = if after.is_empty() {
+                    lines
+                        .get(i + 1)
+                        .is_some_and(|n| n.trim_start().starts_with(REGISTRY_ARG))
+                } else {
+                    after.starts_with(REGISTRY_ARG)
+                };
+                if takes_registry {
+                    let path = &line[start..open];
+                    found.push(path.rsplit("::").next().unwrap_or(path));
+                }
+            }
+        }
+        found
+    }
+
+    fn only(lines: &[&str], trimmed: &str) -> usize {
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == trimmed)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the registrar-arm anchor `{}` must occur exactly once in vm_init.rs; found it \
+             on lines {:?}. Anchors are how this witness locates the three registration \
+             arms — re-anchor the witness in the same change that moved them.",
+            trimmed,
+            hits.iter().map(|i| i + 1).collect::<Vec<_>>()
+        );
+        hits[0]
+    }
+
+    struct Arms<'a> {
+        /// synthetic-JDK mode, `synthetic-jdk` feature ON (configuration 3).
+        synthetic: Vec<&'a str>,
+        /// real-JDK mode, `synthetic-jdk` feature ON (configuration 1) — also
+        /// the arm `--jdk-only` takes in a feature-enabled build.
+        real_feature_on: Vec<&'a str>,
+        /// real-JDK mode, `synthetic-jdk` feature OFF (configuration 2), the
+        /// shipping `cratonvm-cli` arm. Also configuration 4: a feature-OFF
+        /// build that was *asked* for synthetic mode lands here anyway,
+        /// because this block never reads `config.use_synthetic_jdk`.
+        real_feature_off: Vec<&'a str>,
+        b_open: usize,
+        b_close: usize,
+    }
+
+    fn arms(src: &str) -> Arms<'_> {
+        let lines: Vec<&str> = src.lines().collect();
+        let syn_open = only(&lines, SYNTHETIC_ARM_OPEN);
+        let a_open = lines
+            .iter()
+            .enumerate()
+            .skip(syn_open + 1)
+            .find(|(_, l)| l.trim() == REAL_ARM_A_OPEN)
+            .map(|(i, _)| i)
+            .expect("real-JDK arm A is the `else` of `if config.use_synthetic_jdk`");
+        let closes: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == REAL_ARM_CLOSE)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            closes.len(),
+            2,
+            "exactly two real-JDK arms must exist, each ending in the `Real JDK mode: ...` \
+             tracing line; found {} such lines: {:?}",
+            closes.len(),
+            closes.iter().map(|i| i + 1).collect::<Vec<_>>()
+        );
+        let b_open = only(&lines, REAL_ARM_B_OPEN);
+        assert!(
+            syn_open < a_open && a_open < closes[0] && closes[0] < b_open && b_open < closes[1],
+            "registration arms are out of their expected source order: synthetic@{} \
+             realA@{} realA-end@{} realB@{} realB-end@{}",
+            syn_open + 1,
+            a_open + 1,
+            closes[0] + 1,
+            b_open + 1,
+            closes[1] + 1
+        );
+        Arms {
+            synthetic: registration_passes(&lines[syn_open..a_open]),
+            real_feature_on: registration_passes(&lines[a_open..closes[0]]),
+            real_feature_off: registration_passes(&lines[b_open..closes[1]]),
+            b_open,
+            b_close: closes[1],
+        }
+    }
+
+    fn position(list: &[&str], name: &str) -> usize {
+        list.iter().position(|c| *c == name).unwrap_or_else(|| {
+            panic!(
+                "`{}` is no longer called from this real-JDK arm. Registration is \
+                 last-write-wins, so dropping a registrar silently hands its triples to \
+                 whichever earlier pass registered them. If the removal is deliberate, \
+                 drop the ordering claim here in the same change.",
+                name
+            )
+        })
+    }
+
+    fn must_precede(list: &[&str], arm: &str, earlier: &str, later: &str, why: &str) {
+        let e = position(list, earlier);
+        let l = position(list, later);
+        assert!(
+            e < l,
+            "{}: `{}` (position {}) must run BEFORE `{}` (position {}). {}",
+            arm,
+            earlier,
+            e,
+            later,
+            l,
+            why
+        );
+    }
+
+    /// The drift this lane was opened for: the two real-JDK arms had grown
+    /// apart. Arm A was missing `register_classvalue_natives`,
+    /// `register_random_and_securerandom_natives` (a seeded `Random` returned
+    /// all zeros there), `register_phase57_file` and
+    /// `register_spring_boot_logback_apply`.
+    ///
+    /// Sequence equality, not set equality: order is semantics here.
+    #[test]
+    fn the_two_real_jdk_arms_run_the_same_registrars_in_the_same_order() {
+        let src = read(VM_INIT_RS);
+        let a = arms(&src);
+        assert_eq!(
+            a.real_feature_on, a.real_feature_off,
+            "the two real-JDK arms of vm_init must call the same registrars in the same \
+             order. They differ only in which Cargo feature COMPILED them, never in which \
+             class library is loaded, so a registrar in one and not the other is a \
+             mode-specific defect: the `--features synthetic-jdk` build's real-JDK and \
+             `--jdk-only` runs take the first list, every shipping `cratonvm-cli` run takes \
+             the second."
+        );
+        assert!(
+            a.real_feature_on.len() > 40,
+            "the real-JDK registrar sequence collapsed to {} entries — the witness is \
+             almost certainly parsing the wrong line range rather than seeing a real \
+             deletion",
+            a.real_feature_on.len()
+        );
+    }
+
+    /// Confusions 1 and 2 above, stated where they can be checked: the
+    /// synthetic-override family (and with it panama, phase 64 and phase 67)
+    /// is reachable ONLY through `register_builtins`, and only the
+    /// synthetic-MODE arm calls it. A fix landed inside
+    /// `register_synthetic_overrides` does not reach `--jdk-only`.
+    #[test]
+    fn only_the_synthetic_mode_arm_reaches_register_builtins() {
+        let src = read(VM_INIT_RS);
+        let a = arms(&src);
+        assert_eq!(
+            a.synthetic.first(),
+            Some(&"register_builtins"),
+            "the synthetic-mode arm must open with `register_builtins` (essentials, then \
+             `register_synthetic_overrides`); it opened with {:?}",
+            a.synthetic.first()
+        );
+        for (arm, calls) in [
+            ("real-JDK arm A (feature ON)", &a.real_feature_on),
+            ("real-JDK arm B (feature OFF)", &a.real_feature_off),
+        ] {
+            for forbidden in ["register_builtins", "register_synthetic_overrides"] {
+                assert!(
+                    !calls.contains(&forbidden),
+                    "{} must never call `{}`: it pulls in `register_synthetic_overrides`, \
+                     whose rows assume synthetic field layouts and corrupt real JDK \
+                     objects. It is also the ONLY caller of that function, which is why a \
+                     registrar reached only from there (panama's `register_pe_panama`, the \
+                     phase-64/67 families) is synthetic-mode-only however its `NativeKind` \
+                     is tagged.",
+                    arm,
+                    forbidden
+                );
+            }
+        }
+        assert!(
+            !a.synthetic
+                .contains(&"register_essential_natives_with_shims"),
+            "the synthetic arm must not re-run essentials after `register_builtins`: \
+             registration is last-write-wins, so it would demote every synthetic override \
+             back to its essential twin."
+        );
+    }
+
+    /// Confusion 4, plus the ordering claims the surrounding comments make in
+    /// prose. Every pair below is an incident, not a preference.
+    #[test]
+    fn last_write_wins_ordering_holds_inside_both_real_jdk_arms() {
+        let src = read(VM_INIT_RS);
+        let a = arms(&src);
+        for (arm, calls) in [
+            ("real-JDK arm A (feature ON)", &a.real_feature_on),
+            ("real-JDK arm B (feature OFF)", &a.real_feature_off),
+        ] {
+            must_precede(
+                calls,
+                arm,
+                "register_essential_natives_with_shims",
+                "register_io_natives",
+                "`native-io`'s bodies deliberately SHADOW `native-builtins`' aliasing \
+                 implementations for the java.io surface. A clearance measured against the \
+                 builtins body is measuring code this arm never runs.",
+            );
+            must_precede(
+                calls,
+                arm,
+                "register_concurrent_natives",
+                "register_forkjoin_quiescence",
+                "`register_concurrent_natives` registers the constant \
+                 `ForkJoinPool.awaitQuiescence -> true`; the real one polls this crate's \
+                 async worker pool and must overwrite it.",
+            );
+            must_precede(
+                calls,
+                arm,
+                "register_collections_natives",
+                "register_random_and_securerandom_natives",
+                "`register_collections_natives` re-registers the layout-dependent \
+                 `java/util/Random` aliases, which read field 0 as a long when in real-JDK \
+                 mode it is the `AtomicLong seed` REFERENCE — a seeded `Random` then emits \
+                 all zeros.",
+            );
+            must_precede(
+                calls,
+                arm,
+                "register_collections_natives",
+                "register_properties_sidetable",
+                "`register_collections_natives` re-registers `Properties.load` / \
+                 `getProperty` / `setProperty` with the legacy HashMap-layout natives, \
+                 overwriting the side-table-backed pair Surefire's `loadProperties` \
+                 round-trip needs.",
+            );
+            for (earlier, later) in [
+                ("register_phase57_nio_file", "register_phase57_file"),
+                ("register_phase57_file", "register_p59_jar"),
+                ("register_p59_jar", "register_p59_bulk_stream_transfer"),
+                (
+                    "register_p59_bulk_stream_transfer",
+                    "register_p59_zip_output_primitives",
+                ),
+            ] {
+                must_precede(
+                    calls,
+                    arm,
+                    earlier,
+                    later,
+                    "the file/jar/zip family is registered nio_file -> file -> jar -> bulk \
+                     -> zip-output; re-ordering it hands `JarFile.entries()` back to \
+                     `native-io`'s `alloc_zip_entry`, which answers `ZipEntry` where the \
+                     declared `Enumeration<JarEntry>` checkcast demands `JarEntry`.",
+                );
+            }
+        }
+    }
+
+    /// Real-JDK arm A leaves its `sun.management` / JMX registrars UNGATED
+    /// while arm B gates each one on `#[cfg(feature = "management")]`. That is
+    /// sound only because `synthetic-jdk` — the feature that compiles arm A —
+    /// itself enables `management`. Nothing said so; now something checks it.
+    /// If the implication is ever dropped, arm A stops COMPILING (loud), which
+    /// is why the cfg attributes are deliberately not mirrored onto it.
+    #[test]
+    fn the_synthetic_jdk_feature_still_implies_management() {
+        let toml = read(VM_CARGO_TOML);
+        let start = toml
+            .find("\nsynthetic-jdk = [")
+            .expect("vm/Cargo.toml must declare a multi-line `synthetic-jdk` feature list");
+        let rest = &toml[start..];
+        let end = rest
+            .find("\n]")
+            .expect("the `synthetic-jdk` feature list must be closed by a `]` at column 0");
+        let list = &rest[..end];
+        assert!(
+            list.contains("\"management\""),
+            "`synthetic-jdk` must keep enabling `management`. vm_init's real-JDK arm A \
+             (the `else` of `if config.use_synthetic_jdk`, compiled only under \
+             `synthetic-jdk`) calls the `jmx::register_*_impl` family WITHOUT a \
+             `#[cfg(feature = \"management\")]` gate, unlike arm B. The list read:\n{}",
+            list
+        );
+    }
+
+    /// The fourth configuration, recorded where it can rot loudly: a build
+    /// WITHOUT `synthetic-jdk` that is asked for synthetic mode still lands in
+    /// real-JDK arm B, because that block never reads
+    /// `config.use_synthetic_jdk`. `require_synthetic_jdk` rejects that
+    /// pairing — but only on the CLI / `libcratonvm` entry paths, not in
+    /// `SharedVm::new`, so an embedder (and `VmConfig::default()`, whose JDK
+    /// mode is Synthetic) reaches it.
+    #[test]
+    fn the_feature_off_arm_never_consults_the_runtime_jdk_mode() {
+        let src = read(VM_INIT_RS);
+        let a = arms(&src);
+        let lines: Vec<&str> = src.lines().collect();
+        let offenders: Vec<usize> = (a.b_open..a.b_close)
+            .filter(|i| {
+                let l = lines[*i];
+                !l.trim_start().starts_with("//") && l.contains("use_synthetic_jdk")
+            })
+            .map(|i| i + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the `#[cfg(not(feature = \"synthetic-jdk\"))]` arm branches on \
+             `config.use_synthetic_jdk` at lines {:?}. Today it does not, and that is a \
+             load-bearing fact: a feature-OFF build asked for synthetic mode gets the \
+             real-JDK registrar set rather than an empty registry. Adding a runtime branch \
+             here creates a fourth registration path — update the F30 census in the same \
+             change.",
+            offenders
+        );
     }
 }

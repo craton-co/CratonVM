@@ -6,6 +6,12 @@ the whole time**: §9. Nothing was built or run on 2026-08-12; every claim
 added that day is source-verified or derived by reading, and the one number
 that would need a run is not written down.
 
+**The gate is now FIRING (1253 → 1261) and the whole +8 is derived — §11.**
+Not re-frozen here, and §11.2 says which of the two constants may be re-frozen
+from the derivation alone and which needs its own run. The `stub_ratchet.rs`
+prediction of `1269 / 1259` is short by exactly two rows and the correction is
+nominated in §11.3.
+
 **Species:** blind instrument. Same family as W7-22 (the
 `CRATONVM_ENFORCE_NATIVE_SHADOW` dial that yields at most once per triple and
 then hands every later dispatch back to the native, so it is a strictly weaker
@@ -485,3 +491,138 @@ Two operational consequences:
    records what that costs when the blind instrument is the one licensing the
    change: the `java.util.logging` shadow retirement it green-lit is a live
    regression, shipped because no vector covered it.
+
+## 11. The gate is FIRING, and the whole delta is now derived — 2026-08-12
+
+**Nothing was built or run for this section.** The one measurement it rests on
+is W7-62's run of
+`cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture`,
+which printed
+
+```text
+stub-ratchet: const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1261;
+... exceeding the frozen baseline of 1253 ... 8 passed; 1 failed
+```
+
+Everything below is source-verified against today's tree. **`+8 = +6 +2`, and
+neither half is a new fake.**
+
+### 11.1 The derivation, in full
+
+| term | value | where it is verified |
+|---|---:|---|
+| frozen baseline, no-management | 1253 | `native-builtins/tests/stub_ratchet.rs`, `BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT` |
+| `java.util.logging` shadow retirements | +6 | `native-api/src/retired_shadow.rs` |
+| the `Cipher` policy-door pair | +2 | `native-builtins/src/jca/cipher.rs` |
+| **derived** | **1261** | equals the measured line above, exactly |
+
+**The +6** is the one the ratchet's own doc comment already predicts (cause
+(a), `stub_ratchet.rs`), and both edits are still live in the table today:
+`LogManager.getLogManager` / `LogManager.getLogger`, and the four `LogRecord`
+source-pair triples (`getSourceClassName`, `getSourceMethodName`,
+`setSourceClassName`, `setSourceMethodName`) under the comment recording that
+they were "retired 2026-08-12 as a SET". A triple in `RETIRED_SHADOW_TRIPLES`
+lands on `SyntheticStub` through `register()`'s retired-shadow arm whatever
+kind the site states, so these six moved `Bridge`/`Intrinsic` → `SyntheticStub`
+**without one new fabricated method**. That is the direction the gate is *not*
+built to catch, which is precisely why it must be attributed rather than
+absorbed.
+
+**The +2 is the term the ratchet's prediction is missing.**
+`native-builtins/src/jca/cipher.rs` registers
+
+* `javax/crypto/Cipher.getMaxAllowedKeyLength(Ljava/lang/String;)I`
+* `javax/crypto/Cipher.getMaxAllowedParameterSpec(Ljava/lang/String;)Ljava/security/spec/AlgorithmParameterSpec;`
+
+(W7-93's wild victim: they exist to keep `JceSecurityManager.<clinit>` off the
+path). Four facts put them, and only them, in this census's population — each
+read out of the tree, none inferred:
+
+1. They are inside `register_cipher_clinit_shim`'s **`SyntheticStub` window**:
+   the registrar takes `current_category()`, calls
+   `set_category(NativeKind::SyntheticStub)` at its top and restores at its
+   very last line, and both registrations sit between the two. They are plain
+   `r.register` calls, so the ambient decides, and the ambient is a stub. That
+   was deliberate — W7-62 records that they were left that kind so strict
+   no-stubs mode drops the family together with the sibling `isRestricted`.
+2. The registrar **is on the censused path**: `register_cipher_clinit_shim` is
+   called from `native-builtins/src/lib.rs`, inside
+   `register_essential_natives_with_shims`, which is `VM_INIT_SEQUENCE`'s first
+   entry and therefore replayed by `register_boot_path`.
+3. They are **two rows, not more**: two `register` calls, and no `alias_class`
+   in the workspace names `javax/crypto/Cipher`, so the replay-synthesised rows
+   §6.2 warns about cannot multiply them.
+4. They are **new since the freeze** — they are this campaign's repair of
+   `RCrypto`, which is why the frozen 1253 does not hold them.
+
+`1253 + 6 + 2 = 1261`, and the measured line says 1261. The earlier "+6
+unattributed" was drift measured from the **stale frozen 1253** instead of from
+the test's own **prediction of 1259** — the same reading error §2 records twice
+in the other direction.
+
+### 11.2 What may be re-frozen, and what may not
+
+The governing rule is this record's and W7-62's shared one: **a firing gate is
+loud, a wrongly frozen one is silent forever**, and *never freeze a number you
+cannot derive*. Applied here the two constants come out differently, and they
+must not be moved in one gesture:
+
+* **`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT` 1253 → 1261 is safe.** It is both
+  *measured* (the printed recount line, from the configuration named by
+  `BASELINE_CONST` in that same run) and *derived* (§11.1), and the two agree
+  to the row. Land it with §11.1's attribution written next to it, per the
+  gate's own failure text.
+* **`BASELINE_SYNTHETIC_STUBS_MANAGEMENT` 1263 → 1271 is DERIVED ONLY, and the
+  derivation should be stated as such if it is landed without a run.** All
+  eight rows land in registrars that both configurations run
+  (`register_phase54_logging_extras` and `register_cipher_clinit_shim`, both
+  reached from `register_essential_natives_with_shims`), so both baselines move
+  by the same +8. The two configurations differ *only* by the ten `jmx::*`
+  registrars — verified: `register_vm_management_impl`, `register_jmx_natives`,
+  `register_thread_impl`, `register_class_loading_impl`,
+  `register_garbage_collector_impl`, `register_memory_pool_impl`,
+  `register_memory_manager_impl`, `register_operating_system_impl`,
+  `register_hotspot_diagnostic`, `register_flag_impl` all live in
+  `native-builtins/src/jmx.rs` — and
+  `git diff 167bf048c..HEAD -- native-builtins/src/jmx.rs` (the freeze commit,
+  confirmed an ancestor of HEAD with `git merge-base --is-ancestor`, never by
+  timestamp) touches **no** `.register`, `set_category` or `NativeKind` line.
+  So the 10-stub gap between the two constants is unchanged since the freeze
+  and `1263 + 8 = 1271`.
+
+  Its one weakness is the one §5's own instruction names: 182 commits separate
+  the freeze from HEAD, and this derivation's only cross-check is that the
+  *same* derivation predicted the no-management number exactly. **Prefer one
+  `--features management` run.** What must not happen is the number being
+  pasted from a no-management run — that is the 1038-for-1032 error this file
+  already carries once.
+* **Do not freeze the observed number bare.** The attribution is the licence,
+  not the arithmetic. Anything a future run reports beyond §11.1's eight terms
+  is a new finding, and freezing over it converts the signal into a permanent
+  lie.
+
+### 11.3 The prediction in `stub_ratchet.rs` is short by exactly the Cipher pair
+
+The doc comment says *"expect **1269 / 1259**, and expect this gate to fail
+until re-frozen"* and lists three causes (a)/(b)/(c). Cause (a) is the +6;
+(b) correctly moves nothing; (c) has not landed. The `Cipher` pair is a fourth
+cause and is not in the list, so the prediction is 1271 / 1261 and the file does
+not say so. A prediction that is two low is how "+6 unattributed" got written
+down — the number a reader diffs against has to be the whole model.
+
+`stub_ratchet.rs` is not this lane's file; the correction is nominated, not
+applied. The text to add is a cause **(d)**: *the two `javax/crypto/Cipher`
+policy-door natives registered inside `register_cipher_clinit_shim`'s
+`SyntheticStub` window — **+2**, a new registration on a real JDK class rather
+than a retirement, and the only one of the four causes the gate is actually
+built to catch*, together with the corrected `1271 / 1261`.
+
+That last clause is the part worth arguing about before the re-freeze: unlike
+the six retirements, these two rows *are* the species this ratchet exists to
+report — a `SyntheticStub` newly standing in front of real JDK bytecode. They
+were admitted knowingly (W7-93 §2 measures the real path dying in
+`JceSecurityManager.<clinit>`, and the two natives are what keep it off the
+path), and the correct end state is deleting them once the `StackWalker$Option`
+`<clinit>` registration is made conditional on the runtime mode (W7-93 §7.1).
+Re-freezing them in is right; re-freezing them in **silently** would spend the
+one signal that says so.

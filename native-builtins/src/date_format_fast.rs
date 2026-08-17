@@ -252,14 +252,16 @@ struct Slots {
     sdf_class: cratonvm_types::ClassId,
     gcal_class: cratonvm_types::ClassId,
     date_class: cratonvm_types::ClassId,
-    /// The three concrete `TimeZone` classes whose `getOffset(long)` this VM
-    /// itself implements (`register_tzdb_offset_natives_for`). For those — and
-    /// ONLY those — the offset can be read straight from the tzdb helper
-    /// instead of dispatching into Java and paying a native-funnel entry. Any
-    /// other receiver may be an application subclass with its own override, so
-    /// it keeps the virtual call.
+    /// The `TimeZone` classes whose `getOffset(long)` this VM itself
+    /// implements (`register_tzdb_offset_natives_for`). For those — and ONLY
+    /// those — the offset can be read straight from the tzdb helper instead of
+    /// dispatching into Java and paying a native-funnel entry. Any other
+    /// receiver may be an application subclass with its own override, or a
+    /// `java.util.SimpleTimeZone` whose id is an opaque LABEL rather than a
+    /// zone, so it keeps the virtual call. C12-1 removed
+    /// `java/util/SimpleTimeZone` from this set; do not restore it without
+    /// reading `docs/known-issues/jdk-only/D3-1-simpledateformat-format-zone-arm.md`.
     zoneinfo_class: Option<cratonvm_types::ClassId>,
-    simple_tz_class: Option<cratonvm_types::ClassId>,
     timezone_class: Option<cratonvm_types::ClassId>,
     tz_id: usize,
 
@@ -303,7 +305,6 @@ fn slots(ctx: &mut dyn NativeContext) -> Option<&'static Slots> {
             gcal_class,
             date_class,
             zoneinfo_class: ctx.class_id_by_name("sun/util/calendar/ZoneInfo"),
-            simple_tz_class: ctx.class_id_by_name("java/util/SimpleTimeZone"),
             timezone_class,
             tz_id: timezone_class.and_then(|c| ctx.resolve_field_index_by_class_id(c, "ID"))?,
             sdf_pattern: f(sdf_class, "pattern")?,
@@ -796,15 +797,31 @@ fn gather(
     }
 
     // The UTC offset — raw + DST, exactly what `GregorianCalendar.computeFields`
-    // adds. For the three `TimeZone` classes this VM implements natively itself
+    // adds. For the two `TimeZone` classes this VM implements natively itself
     // the answer comes straight out of `tzdb`, saving a Java dispatch and a
     // native-funnel entry per format (~400-760 ns, measured). Anything else may
     // be an application subclass overriding `getOffset`, so it gets the real
     // virtual call.
     let zone = obj_slot(ctx, calendar, sl.cal_zone)?;
     let zone_class = ctx.class_id_of_object(zone);
+    // `java/util/SimpleTimeZone` is deliberately NOT here — see
+    // `docs/known-issues/jdk-only/D3-1-simpledateformat-format-zone-arm.md` and
+    // `E1-1-simpledateformat-format-zone-arm-landed.md`. The fast arm below
+    // answers from the zone's `ID` FIELD via tzdb. That is right for a
+    // `ZoneInfo` (whose id IS the zone) and for the abstract `TimeZone` itself
+    // (an instance of that exact class can only be one this VM fabricated). It
+    // is wrong for a `java.util.SimpleTimeZone`, whose id is by contract an
+    // opaque LABEL and whose offset is the `rawOffset` its constructor stored:
+    // `new SimpleTimeZone(0, "America/Sao_Paulo")` formatted an instant at
+    // -03:00 here and at +00:00 on HotSpot. Nothing in this VM fabricates a
+    // `SimpleTimeZone` any more (`alloc_synth_timezone`) and nothing implements
+    // its `getOffset` (`register_tzdb_offset_natives_for`), so every such
+    // receiver is one the APPLICATION built. The `else` arm's virtual call
+    // reaches its real bytecode, which is correct for it: `SimpleTimeZone`
+    // DECLARES `getOffset(J)I` with code, so `invoke_or_native`'s
+    // `has_own_bytecode` gate skips the superclass climb and
+    // `java/util/TimeZone`'s surviving tzdb native does not capture it either.
     let vm_implemented = Some(zone_class) == sl.zoneinfo_class
-        || Some(zone_class) == sl.simple_tz_class
         || Some(zone_class) == sl.timezone_class;
     let offset_ms = if vm_implemented {
         let (rules, id) = zone_rules_cached(ctx, sl, zone)?;
@@ -1105,6 +1122,30 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(prev);
+
+    // G28-1: the `sun.util.calendar.ZoneInfo` daylight-saving family
+    // (`getDSTSavings`, `useDaylightTime`, `observesDaylightTime`,
+    // `inDaylightTime(Date)` and the six-argument `getOffset`). It is a strange
+    // address for it and this comment exists to say why it is here anyway.
+    //
+    // The obvious home is `util_time.rs`, next to the other `java.time` doors.
+    // That module is `#[cfg(feature = "synthetic-jdk")]` and IS NOT COMPILED
+    // INTO THE DEFAULT BUILD (`lib.rs`, the `mod util_time` declaration): a
+    // registration added there would be dead code that reads as a fix, which
+    // `HANDOFF-20260814` §5 records as a trap this campaign has fallen into
+    // twice. MEASURED, not assumed: `--dump-native-registry` under `--jdk-only`
+    // carries `java/text/DateFormat format ... owns_slot=true
+    // by=date_format_fast.rs`, and names `util_time.rs` in no row at all. So
+    // `register_date_format_fast` demonstrably runs on the real-JDK path and
+    // this one does not.
+    //
+    // Relocating the call next to `register_tzdb_offset_natives_for` in
+    // `lib.rs` -- which is not this lane's file -- is NOMINATED in
+    // `docs/known-issues/jdk-only/G28-1-the-dst-rule-layer-rebuilt-20260817.md`.
+    // Whoever moves it: register on `ZoneInfo` ONLY. The reason the base class
+    // is excluded is on `register_zoneinfo_dst_natives` itself, and following
+    // the neighbouring call's two-class shape would silently undo it.
+    crate::tzdb::register_zoneinfo_dst_natives(r);
 }
 
 #[cfg(test)]

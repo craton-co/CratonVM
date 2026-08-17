@@ -47,25 +47,151 @@ use crate::{try_alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 // valid. `removeShutdownHook` resolves each handle and compares it against the
 // argument, so identity matching survives object motion.
 //
-// Known gap, unchanged by this registry: cratonvm does not yet RUN the
-// registered hooks at VM shutdown. Retaining them is what the correctness of
-// the *running* program depends on; executing them on exit is tracked
-// separately in the doc above.
+// W7-92 (2026-08-12): this list HAD no reader. `shutdown_hook_add` pushed,
+// `shutdown_hook_remove` popped, and nothing ever ran a hook on any of the five
+// exit paths — the "write-only counter" shape, with the gap named in this very
+// comment for months. The cost was not local: a corpus harness keyed on a
+// `completed=` marker printed from a shutdown hook, the marker never appeared,
+// and three separate lanes each read that as a sweeping cross-VM DIVERGE
+// verdict (12, 9 and 36 findings). See W7-100.
+//
+// `run_shutdown_hooks` below is that reader. It is reached from `System.exit`,
+// from `Runtime.exit`, from the intercepted `java/lang/Shutdown.runHooks()V`,
+// and from the launcher's post-`main` path (`vm-cli/src/main.rs`, after the
+// non-daemon join). It is deliberately NOT reached from `Runtime.halt`, which
+// is specified as forcible termination — measured on HotSpot 25.0.3+9: `halt`
+// skips hooks and `halt` called from INSIDE a hook terminates immediately.
 // ---------------------------------------------------------------------------
 static SHUTDOWN_HOOKS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// Set the moment `run_shutdown_hooks` drains the list, i.e. once shutdown has
+/// begun. From that point HotSpot's `ApplicationShutdownHooks.add`/`remove`
+/// throw `IllegalStateException("Shutdown in progress")`.
+///
+/// MEASURED on 25.0.3+9 (lane C11, `HookContract addduring` / `removeduring`):
+/// both calls, made from inside a running hook, threw
+/// `java.lang.IllegalStateException: Shutdown in progress`, and in the `remove`
+/// case the hook it tried to cancel ran anyway.
+///
+/// Without this flag a late registration would be accepted and then silently
+/// dropped — the same "a marker that never appears" shape this whole record is
+/// about, reintroduced by its own repair.
+static SHUTDOWN_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// The four refusal messages of the shutdown-hook registry, as CONSTANTS.
+//
+// Named rather than inlined for the reason the handoff's §5 gives: "messages
+// often cannot be derived, only transcribed". Every one of these was read off
+// Temurin 25.0.3+9 — three from a run (`HookProbe dup`, `HookProbe addduring`)
+// and all four confirmed against `javap -p -c java.lang.ApplicationShutdownHooks`
+// — and none of them is guessable from the method name. Constants give the
+// unit tests below something to pin, so a later "tidy" of the wording fails a
+// test instead of quietly failing a differential.
+//
+// All four are pure ASCII, and that is checked, not assumed: `HANDOFF-20260814`
+// §7 records a differential that failed with every assertion passing because
+// one em-dash crossed HotSpot's Windows console code page differently.
+
+/// `ApplicationShutdownHooks.add` pc 10 and `remove` pc 10, and
+/// `Shutdown.add` pc 97/120. MEASURED (`HookProbe addduring`) on both
+/// `addShutdownHook` and `removeShutdownHook` called from inside a hook.
+const HOOK_MSG_SHUTDOWN_IN_PROGRESS: &str = "Shutdown in progress";
+
+/// NOT an explicit check — this is HotSpot's helpful-NPE rendering of the
+/// `invokevirtual java/lang/Thread.isAlive` at `ApplicationShutdownHooks.add`
+/// pc 17, which is the first thing that touches the argument. MEASURED
+/// (`HookProbe dup`, `NULL-ADD`). The quoted `hook` is `add`'s parameter name.
+const HOOK_MSG_NULL_ADD: &str =
+    "Cannot invoke \"java.lang.Thread.isAlive()\" because \"hook\" is null";
+
+/// `ApplicationShutdownHooks.add` pc 27. MEASURED (`HookProbe dup`,
+/// `RUNNING-ADD`) by registering a `Thread` that had been `start()`ed and was
+/// parked on a latch.
+const HOOK_MSG_ALREADY_RUNNING: &str = "Hook already running";
+
+/// `ApplicationShutdownHooks.add` pc 47. MEASURED (`HookProbe dup`,
+/// `DUP-ADD`).
+const HOOK_MSG_PREVIOUSLY_REGISTERED: &str = "Hook previously registered";
+
 /// Register `hook` as a shutdown hook, rooting it for the life of the VM.
-/// Idempotent per object: re-registering the same thread does not add a second
-/// root (HotSpot throws `IllegalArgumentException` there; keeping the single
-/// existing registration is the conservative choice and never loses the root).
-fn shutdown_hook_add(ctx: &mut dyn NativeContext, hook: ObjectRef) {
+///
+/// FOUR refusals, in this exact order, and the order is the contract rather
+/// than a preference. SOURCE-VERIFIED against
+/// `javap -p -c java.lang.ApplicationShutdownHooks` on Temurin 25.0.3+9 —
+/// `add(Thread)` is `static synchronized` and its bytecode reads:
+///
+/// ```text
+///   0: getstatic hooks; ifnonnull 16  -> IllegalStateException "Shutdown in progress"
+///  16: aload_0; invokevirtual Thread.isAlive  -> NPE here when hook == null
+///  20: ifeq 33                        -> IllegalArgumentException "Hook already running"
+///  33: hooks.containsKey(hook)        -> IllegalArgumentException "Hook previously registered"
+///  53: hooks.put(hook, hook)
+/// ```
+///
+/// so:
+///
+/// * shutdown already begun → `IllegalStateException("Shutdown in progress")`,
+///   and it wins over EVERY other refusal including the null check;
+/// * `null` → `NullPointerException`. There is no explicit null check: the NPE
+///   falls out of `invokevirtual Thread.isAlive` at pc 17, which is why
+///   HotSpot's helpful-NPE text names `isAlive()` and the parameter `hook`.
+///   MEASURED (`HookProbe dup`, 25.0.3+9): message is exactly
+///   `Cannot invoke "java.lang.Thread.isAlive()" because "hook" is null`.
+///   This used to be `if let Some(Value::Object(Some(hook)))` at the
+///   registration site — a null was ACCEPTED and silently dropped, which is
+///   the fabricated-success shape this whole record is about;
+/// * an ALREADY RUNNING hook `Thread` →
+///   `IllegalArgumentException("Hook already running")`. MEASURED
+///   (`HookProbe dup`, `RUNNING-ADD`). This VM accepted it, and then
+///   `run_shutdown_hooks` counted it `skipped` — a registration that reports
+///   success and can never run;
+/// * re-registering a hook that is already registered throws
+///   `IllegalArgumentException("Hook previously registered")` (W7-92 §1.3).
+///
+/// NOT refused: a hook `Thread` that has already run to completion. It is not
+/// alive, `ApplicationShutdownHooks.add` accepts it, and HotSpot printed
+/// `TERMINATED-ADD accepted` for exactly that case. `run_shutdown_hooks` will
+/// not re-run it (HotSpot does not either — measured, `RunTerm`), it counts as
+/// `skipped`.
+fn shutdown_hook_add(
+    ctx: &mut dyn NativeContext,
+    hook: Option<ObjectRef>,
+) -> Result<(), MethodCallFailed> {
+    if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(RuntimeError::IllegalStateException {
+            message: HOOK_MSG_SHUTDOWN_IN_PROGRESS.to_string(),
+        }
+        .into());
+    }
+    // Transcribed, not derived — the handoff's §5 rule. HotSpot builds this
+    // string from the bytecode at the faulting site, so it names `isAlive()`
+    // and the `ApplicationShutdownHooks.add` parameter `hook`, not
+    // `Runtime.addShutdownHook`'s.
+    let Some(hook) = hook else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(HOOK_MSG_NULL_ADD.to_string()),
+        }
+        .into());
+    };
+    if ctx.thread_is_alive(hook) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: HOOK_MSG_ALREADY_RUNNING.to_string(),
+        }
+        .into());
+    }
     {
         let hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
         if hooks
             .iter()
             .any(|h| ctx.resolve_global_root(*h) == Some(hook))
         {
-            return;
+            // HotSpot: `ApplicationShutdownHooks.add` throws
+            // IllegalArgumentException("Hook previously registered").
+            return Err(RuntimeError::IllegalArgumentException {
+                message: HOOK_MSG_PREVIOUSLY_REGISTERED.to_string(),
+            }
+            .into());
         }
     }
     let handle = ctx.add_global_root(hook);
@@ -73,11 +199,40 @@ fn shutdown_hook_add(ctx: &mut dyn NativeContext, hook: ObjectRef) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(handle);
+    Ok(())
 }
 
 /// Drop a previously registered hook. Returns true iff it was registered —
-/// `Runtime.removeShutdownHook`'s documented contract.
-fn shutdown_hook_remove(ctx: &mut dyn NativeContext, hook: ObjectRef) -> bool {
+/// `Runtime.removeShutdownHook`'s documented contract — and throws
+/// `IllegalStateException` once shutdown has begun, as HotSpot does.
+///
+/// `null` throws `NullPointerException` **with no message**, and the two
+/// details are both contract. SOURCE-VERIFIED
+/// (`javap -p -c java.lang.ApplicationShutdownHooks`, `remove(Thread)`): the
+/// `hooks == null` test is at pc 0 and the null test is an EXPLICIT
+/// `new NullPointerException()` at pc 20 — no-arg, so `getMessage()` is
+/// `null`, unlike `add`'s helpful NPE. MEASURED (`HookProbe dup`): the two
+/// lines are `NULL-ADD threw=java.lang.NullPointerException msg=Cannot invoke
+/// "java.lang.Thread.isAlive()" because "hook" is null` and `NULL-REMOVE
+/// threw=java.lang.NullPointerException msg=null`. That asymmetry is why the
+/// message here is `None` rather than `Some("")` — `msg=null` and `msg=` are
+/// different cells and the differential prints them differently.
+///
+/// This body used to answer `false` for a null hook: a caller asking "was it
+/// registered?" got a plausible, wrong "no" instead of the throw.
+fn shutdown_hook_remove(
+    ctx: &mut dyn NativeContext,
+    hook: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(RuntimeError::IllegalStateException {
+            message: HOOK_MSG_SHUTDOWN_IN_PROGRESS.to_string(),
+        }
+        .into());
+    }
+    let Some(hook) = hook else {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    };
     let handle = {
         let mut hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
         match hooks
@@ -85,11 +240,322 @@ fn shutdown_hook_remove(ctx: &mut dyn NativeContext, hook: ObjectRef) -> bool {
             .position(|h| ctx.resolve_global_root(*h) == Some(hook))
         {
             Some(pos) => hooks.remove(pos),
-            None => return false,
+            None => return Ok(false),
         }
     };
     ctx.remove_global_root(handle);
-    true
+    Ok(true)
+}
+
+/// Decode the `Thread` argument of `Runtime.addShutdownHook` /
+/// `removeShutdownHook` out of the native argument vector.
+///
+/// Returns `Some(None)` for a **Java null** — which the two callers must turn
+/// into a `NullPointerException`, because HotSpot does — and `None` only when
+/// the vector is not the shape the descriptor guarantees (`[receiver, hook]`
+/// for a one-argument instance method).
+///
+/// Those two cases are separated on purpose. Folding them together is what the
+/// previous `if let Some(Value::Object(Some(hook)))` did, and it made a Java
+/// null indistinguishable from a VM-side decoding failure — so both were
+/// answered with silence. An NPE is the right answer to the first and a
+/// **wrong** answer to the second, since it would report a caller error for a
+/// fault inside this VM. The short-vector arm therefore says so on stderr,
+/// unconditionally, and declines to decide; it is not expected to fire, and if
+/// it ever does, the line is the finding.
+fn shutdown_hook_argument(args: &[Value], which: &str) -> Option<Option<ObjectRef>> {
+    match args.get(1) {
+        Some(Value::Object(hook)) => Some(*hook),
+        other => {
+            eprintln!(
+                "[cratonvm] Runtime.{which}: argument vector is not [receiver, Thread] \
+                 (len={len}, slot1={other:?}); the hook was neither registered nor refused. \
+                 This is a VM-side decoding fault, not an application error.",
+                len = args.len()
+            );
+            None
+        }
+    }
+}
+
+/// Push whatever the VM has buffered for fd 1 and fd 2 out to the OS.
+///
+/// Called on every path that is about to end the process, and it is the half
+/// of W7-92 that a working runner still would not have delivered.
+/// `FileDescriptorTable`'s stdout/stderr entries are buffered writers shared by
+/// every Java writer in this VM; `std::process::exit` runs no destructors, so
+/// anything a shutdown hook printed and did not force out is dropped on the
+/// floor by the very call that ends the run.
+///
+/// MEASURED on Temurin 25.0.3+9 that HotSpot does NOT lose those bytes, on
+/// both of the paths that could:
+///
+/// * `HookProbe noflush` — a hook does `System.out.print` with no newline and
+///   no `flush()`, main then calls `System.exit(0)`: `HOOK-PARTIAL-NO-NEWLINE`
+///   is delivered.
+/// * `HookProbe haltnoflush` — `System.out.print` with no newline followed by
+///   `Runtime.halt(6)`, which runs no hooks at all:
+///   `PARTIAL-NO-NEWLINE-BEFORE-HALT` is still delivered, rc 6.
+///
+/// So the flush belongs on the halt path too, and its placement there is not a
+/// "hooks also run on halt" mistake — halt still runs no hooks.
+///
+/// Failures are swallowed deliberately: this runs when the process is already
+/// committed to exiting with a code chosen elsewhere, and a broken pipe on
+/// stdout must not change that code or emit anything new. The one thing it
+/// must not do is *skip* the second stream because the first failed, which is
+/// why the two calls are independent statements rather than a `?` chain.
+pub(crate) fn flush_console_streams(ctx: &dyn NativeContext) {
+    let _ = ctx.fd_table().flush(1);
+    let _ = ctx.fd_table().flush(2);
+}
+
+/// How long `run_shutdown_hooks` waits for a started hook thread to finish.
+///
+/// HotSpot waits FOREVER (`ApplicationShutdownHooks.runHooks` loops on
+/// `hook.join()`), and a hung hook there hangs the JVM with no diagnostic at
+/// all. This VM is run overwhelmingly by harnesses that read a wedged process
+/// as "the VM hung" and produce a false finding, so the default here is a
+/// bounded wait plus a loud line naming what was still running — a stated,
+/// visible divergence rather than a silent hang.
+///
+/// `CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS=0` restores HotSpot's unbounded wait;
+/// any other value sets the bound in milliseconds. Read with `std::env::var`
+/// rather than through `nbflags()` because that struct lives in `lib.rs`, which
+/// this lane does not own; a follow-up should move it (see W7-92 §7).
+fn shutdown_hook_join_bound() -> Option<std::time::Duration> {
+    static BOUND: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        let ms = std::env::var("CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(30_000);
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    })
+}
+
+/// Has `thread` already been started (and possibly since finished)?
+///
+/// Extracted from `native_thread_start0`, which is the only other place that
+/// asks. Two readers because only one lookup route is aliasing-proof: a
+/// real-JDK mirror resolves through the process-unique `Thread.tid` index,
+/// while a fabricated mirror has no `tid` field and would fall back to an
+/// unguarded pointer walk, so it reads the on-mirror marker `vm_exec::
+/// thread_start` writes instead. Keeping this in ONE function is deliberate:
+/// the shutdown runner and `Thread.start()` must not drift apart about what
+/// "already started" means, and this tree has a written record of exactly that
+/// species of twin drifting.
+pub(crate) fn thread_already_started(ctx: &mut dyn NativeContext, thread: ObjectRef) -> bool {
+    if crate::has_real_jdk_thread_layout(ctx, thread) {
+        ctx.thread_run_state(thread) != 0
+    } else {
+        ctx.object_num_fields(thread) > 2 && matches!(ctx.get_field(thread, 2), Value::Long(_))
+    }
+}
+
+/// Capture the constructing thread's `InheritableThreadLocal` values against
+/// `child`, at CONSTRUCTION time — the moment HotSpot captures them.
+///
+/// MEASURED on Temurin 25.0.3+9 (`ItlProbe`, 2026-08-16): with
+/// `ITL.set("a"); Thread t = new Thread(r); ITL.set("b"); t.start();` the
+/// child sees `"a"` on HotSpot for BOTH the plain `Thread(Runnable)` shape and
+/// the `Thread(ThreadGroup, Runnable, String)` shape that
+/// `Executors.defaultThreadFactory()` uses; CratonVM sees `"b"` because
+/// `native_thread_start0` was the only capture point. SOURCE-VERIFIED against
+/// `javap -p -c java.lang.Thread`: the copy lives at pc 175..201 of the single
+/// package-private master constructor that all eight public constructors
+/// forward to, so "captured when the Thread object was built" is the whole
+/// contract.
+///
+/// Three properties this function must have, each of them measured:
+///
+/// * It queues even an EMPTY snapshot. `ItlProbe` case 9 — parent `set`s,
+///   `remove`s, constructs, then `set`s again — has the child see `null`. An
+///   absent queue entry would let `native_thread_start0` fall back to the
+///   parent's *current* map and hand the child the later value.
+/// * It must be called with the child's identity already stable, because the
+///   queue is keyed by `identity_hash_code` and drained by the child under its
+///   own `current_thread_object()` identity.
+/// * It is the ONLY thing `native_thread_start0` consults to decide whether to
+///   capture. There is no second flag to drift out of step with the queue.
+///
+/// Callers today: `jdk25_concurrency::…fork`, which builds a subtask worker
+/// Thread and hands it straight to `ctx.thread_start` — bypassing
+/// `native_thread_start0`, so before this its subtasks inherited NOTHING.
+/// HotSpot inherits there (MEASURED, `StsItl`: a subtask forked after
+/// `ITL.set("scope-parent")` reads `scope-parent`). The ordinary
+/// `new Thread(...)` paths cannot call this yet — see the nominations in
+/// `docs/known-issues/jdk-only/G5-1-inheritable-threadlocal-captures-at-
+/// construction-20260816.md` §6, and read that record BEFORE assuming the
+/// `new Thread` timing divergence is closed. It is not.
+pub(crate) fn capture_inheritable_tl_at_construction(
+    ctx: &mut dyn NativeContext,
+    child: ObjectRef,
+) {
+    let child_hash = ctx.identity_hash_code(child);
+    let snapshot = crate::phases_early::snapshot_inheritable_tl_entries(ctx).unwrap_or_default();
+    crate::phases_early::queue_inherited_tl_for_child(child_hash, snapshot);
+}
+
+/// Did some construction-time site already answer the inheritance question for
+/// this child Thread?
+///
+/// Asked of the pending-inheritance queue itself rather than a side flag: an
+/// entry is present if and only if a capture happened, empty entries included,
+/// so the predicate and the data it guards cannot disagree. This tree has a
+/// written record of exactly that species of twin drifting
+/// (`thread_already_started`, just above, exists for the same reason).
+pub(crate) fn inheritable_tl_captured_at_construction(child_thread_hash: i32) -> bool {
+    crate::phases_early::tl_inherited_pending()
+        .lock()
+        .contains_key(&child_thread_hash)
+}
+
+/// Run every registered `Runtime.addShutdownHook` hook, once, before the
+/// process is torn down. THE READER W7-92 is about.
+///
+/// **Each hook is genuinely `start()`ed as its own thread and then joined**,
+/// not `run()` inline on the exiting thread. That is not gold-plating:
+///
+/// * `Thread.currentThread().getName()` inside the hook is observable, and the
+///   shipped vector (`regression-suite/src/RShutdownHooks.java`) asserts on it
+///   (`ownThread=true`);
+/// * hooks run CONCURRENTLY on HotSpot — measured (`HookContract crosswait`):
+///   a hook that blocks until a second hook signals it is released, which an
+///   inline runner would deadlock on;
+/// * a hook needs a real Java frame on a real VM thread the moment it touches
+///   anything that walks the stack, and Tomcat/log4j teardown does.
+///
+/// Ordering is NOT part of the contract: HotSpot starts all hooks and then
+/// joins them all, so their relative order is unspecified (measured: three
+/// hooks came back 3, boom, 1). A fix must not be judged on hook order.
+///
+/// Idempotent: the list is drained under the lock and `SHUTDOWN_IN_PROGRESS`
+/// is set, so a hook that itself calls `System.exit` re-enters this function
+/// and finds nothing to run.
+///
+/// Four counters on ONE unconditional stderr line, because "ran three hooks"
+/// and "the list was empty" being indistinguishable in the output is the exact
+/// defect this whole record exists to close, and a repair that prints only on
+/// failure reproduces it:
+///
+/// * `ran`    — hooks whose thread was started and observed to finish.
+/// * `threw`  — hooks whose `start()` failed at the VM boundary. An exception
+///   thrown by a hook's BODY is not counted here and must not be: it lands on
+///   the hook's own thread, HotSpot swallows it (measured: rc unchanged, the
+///   other two hooks still ran) and so does this.
+/// * `skipped` — hooks that were already started or already finished. HotSpot
+///   does not re-run a terminated hook either (measured, `RunTerm`).
+/// * `unjoined` — started but still running when the wait bound expired.
+///
+/// NOT called from `native_shutdown_halt0`: `Runtime.halt` is forcible
+/// termination and the JDK runs hooks from `Shutdown.exit`, which halt
+/// bypasses. Measured both ways on 25.0.3+9. Do not "fix" that asymmetry.
+pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
+    SHUTDOWN_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+    let handles: Vec<usize> = {
+        let mut hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *hooks)
+    };
+
+    let mut threw = 0usize;
+    let mut skipped = 0usize;
+    let mut started: Vec<usize> = Vec::with_capacity(handles.len());
+
+    // Phase 1 — start them all, then phase 2 joins them all. Same shape as
+    // `ApplicationShutdownHooks.runHooks`, and the reason it is two loops
+    // rather than one start-join pair is the `crosswait` measurement above.
+    for &handle in &handles {
+        // Re-resolved from the global-root table on every use: the handles are
+        // GC-remapped, a raw `ObjectRef` cached across an `invoke_virtual`
+        // would go stale under a moving collector, and a hook body allocates.
+        let Some(hook) = ctx.resolve_global_root(handle) else {
+            skipped += 1;
+            continue;
+        };
+        if thread_already_started(ctx, hook) {
+            skipped += 1;
+            continue;
+        }
+        match ctx.invoke_virtual(hook, "start", "()V", &[]) {
+            Ok(_) => started.push(handle),
+            Err(e) => {
+                threw += 1;
+                // Unconditional, not `tracing::warn!`: tracing is compiled out
+                // of release builds of this VM, and a hook that could not even
+                // be started is precisely the state that must not be silent.
+                eprintln!(
+                    "[cratonvm] shutdown hook could not be started; continuing with the \
+                     remaining hooks: {e:?}"
+                );
+            }
+        }
+    }
+
+    // Phase 2 — join. Poll `thread_is_alive` rather than `ctx.thread_join`
+    // so the wait can be bounded; `thread_start` registers the thread as alive
+    // BEFORE spawning it, so there is no "not yet visible" race here.
+    let bound = shutdown_hook_join_bound();
+    let deadline = bound.map(|d| std::time::Instant::now() + d);
+    let mut unjoined = 0usize;
+    for &handle in &started {
+        loop {
+            let Some(hook) = ctx.resolve_global_root(handle) else {
+                break;
+            };
+            if !ctx.thread_is_alive(hook) {
+                break;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                unjoined += 1;
+                break;
+            }
+            // The blocked-region protocol is mandatory, not hygiene: the hook
+            // threads allocate, so a stop-the-world collection can be requested
+            // while we sleep here, and a thread sleeping outside a blocked
+            // region never reaches the safepoint. `native_thread_join_timed`
+            // does the same dance for the same reason.
+            ctx.begin_blocking_region();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            ctx.end_blocking_region();
+        }
+    }
+    let ran = started.len() - unjoined;
+
+    for handle in handles {
+        ctx.remove_global_root(handle);
+    }
+
+    // The hooks have finished; their bytes have NOT necessarily left this
+    // process. Flush here rather than only at the `std::process::exit` sites,
+    // for two reasons: the launcher's post-`main` path does not go through
+    // either `exit` native at all, and the summary line below is written with
+    // `eprintln!` while a hook's `System.out.println` went through the fd
+    // table, so without this the two streams can be delivered out of order in
+    // a `2>&1` capture — which is how every vector in `regression-suite` is
+    // read. See `flush_console_streams` for what HotSpot was measured to do.
+    flush_console_streams(&*ctx);
+
+    if unjoined > 0 {
+        eprintln!(
+            "[cratonvm] shutdown hooks: {unjoined} still running after {}ms; continuing exit. \
+             Set CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS=0 to wait forever (HotSpot's behaviour) \
+             or to a larger bound.",
+            bound.map(|d| d.as_millis()).unwrap_or(0)
+        );
+    }
+    // UNCONDITIONAL, on stderr, next to the `[cratonvm] System.exit(N) called`
+    // line that is already unconditional on that path. `ran=0` for a program
+    // with no hooks is the honest reading, and it is what makes `ran=0` on a
+    // program WITH hooks a finding rather than a silence.
+    eprintln!(
+        "[cratonvm] shutdown hooks: ran={ran} threw={threw} skipped={skipped} \
+         unjoined={unjoined} trigger={trigger}"
+    );
 }
 
 type PreExitHook = fn(code: i32);
@@ -1036,21 +1502,16 @@ pub(crate) fn native_thread_start0(
     // (`mark_dead` only flips `alive`), so present-but-not-alive is
     // TERMINATED and missing is NEW.
     //
-    // Two readers because only one lookup route is aliasing-proof: a real-JDK
-    // mirror resolves through the process-unique `Thread.tid` index, while a
-    // fabricated mirror has no `tid` field and would fall back to an unguarded
-    // pointer walk, so it reads the on-mirror marker `vm_exec::thread_start`
-    // writes instead. This native is the convergence point of all four
-    // registrations and of the container route, including the `--jdk-only`
-    // case where the real `start()` bytecode runs; a refusal here does not
-    // leak a container registration, because that bytecode's `finally` calls
+    // The two-reader predicate lives in `thread_already_started` (this file):
+    // W7-92's shutdown runner has to ask the identical question before it
+    // `start()`s a hook, and two copies of "has this thread already been
+    // started" would be a twin pair with nothing keeping them in step. This
+    // native is the convergence point of all four registrations and of the
+    // container route, including the `--jdk-only` case where the real
+    // `start()` bytecode runs; a refusal here does not leak a container
+    // registration, because that bytecode's `finally` calls
     // `container.onExit(this)`. See W7-27-thread-exit-java-cleanup.md §13.
-    let already_started = if crate::has_real_jdk_thread_layout(ctx, this) {
-        ctx.thread_run_state(this) != 0
-    } else {
-        ctx.object_num_fields(this) > 2 && matches!(ctx.get_field(this, 2), Value::Long(_))
-    };
-    if already_started {
+    if thread_already_started(ctx, this) {
         return Err(RuntimeError::IllegalThreadStateException {
             message: "Thread.start: this thread has already been started".to_string(),
         }
@@ -1063,9 +1524,24 @@ pub(crate) fn native_thread_start0(
     // `drain_inherited_for_current_thread` in phases_early.rs). We do
     // this *before* spawning so there's no race between parent's
     // post-start mutations and the child's drain.
-    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries(ctx) {
-        let child_hash = ctx.identity_hash_code(this);
-        crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
+    //
+    // G5-1: this is a start0-time capture, and HotSpot captures at
+    // CONSTRUCTION time — MEASURED on 25.0.3+9, `ItlProbe` case 1: with
+    // `ITL.set(a); new Thread(r); ITL.set(b); start()` the child sees `a`,
+    // not `b`. A caller that already took the construction-time snapshot
+    // through `capture_inheritable_tl_at_construction` has queued an entry
+    // for this child (possibly an EMPTY one, which is the whole point: the
+    // parent may have `remove()`d before constructing, and `ItlProbe` case 9
+    // measures the child seeing `null` while the parent holds a later value).
+    // Re-snapshotting here would overwrite that with the parent's *current*
+    // map and reintroduce the divergence, so only capture when nothing was
+    // captured at construction.
+    let child_hash = ctx.identity_hash_code(this);
+    let captured_at_construction = inheritable_tl_captured_at_construction(child_hash);
+    if !captured_at_construction {
+        if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries(ctx) {
+            crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
+        }
     }
     // TC0622: inherit the parent (creating) thread's context classloader into
     // the child, mirroring real JDK's `Thread.<init>`, which assigns
@@ -1095,22 +1571,48 @@ pub(crate) fn native_thread_start0(
             ctx.set_field_by_name(this, "contextClassLoader", Value::Object(Some(parent_ccl)));
         }
     }
-    // test-context-round2: real JDK `Thread.<init>`'s InheritableThreadLocal
-    // copy (`this.inheritableThreadLocals = ThreadLocal.createInheritedMap(
-    // parent.inheritableThreadLocals)`) silently doesn't take effect for a
-    // still-unexplained interpreter reason specifically when BOTH the
-    // ThreadGroup and name constructor arguments are explicitly non-null at
-    // the same time — confirmed via minimal repro: `Thread(Runnable)` and
-    // `Thread(ThreadGroup, Runnable)` alone each correctly propagate;
-    // `Thread(ThreadGroup, Runnable, String[, long])` — exactly what
-    // `Executors.defaultThreadFactory()` uses for every pooled worker —
-    // does not, losing the parent's InheritableThreadLocal values entirely
-    // (name/group/priority/contextClassLoader are all unaffected; only this
-    // one field is dropped). The two-condition trigger rules out a native
-    // registration gap (the constructors aren't natively overridden at all;
-    // this is real bytecode misbehaving) — root-causing it further needs
-    // interpreter-level bytecode tracing, out of scope here. Apply the copy
-    // here at start0-time instead, mirroring the TC0622 CCL fix above.
+    // test-context-round2 (ORIGINAL NOTE, CORRECTED BELOW — G5-1, 2026-08-16):
+    // "real JDK `Thread.<init>`'s InheritableThreadLocal copy silently doesn't
+    // take effect for a still-unexplained interpreter reason specifically when
+    // BOTH the ThreadGroup and name constructor arguments are explicitly
+    // non-null at the same time … `Thread(ThreadGroup, Runnable, String[,
+    // long])` — exactly what `Executors.defaultThreadFactory()` uses for every
+    // pooled worker — does not … root-causing it further needs
+    // interpreter-level bytecode tracing, out of scope here."
+    //
+    // That mechanism is impossible, SOURCE-VERIFIED against the oracle's own
+    // bytecode (`javap -p -c java.lang.Thread`, Temurin 25.0.3+9):
+    //
+    //   * ALL EIGHT public constructors are three-to-five instruction
+    //     forwarders. Every one of them ends in the SAME
+    //     `invokespecial Thread.<init>:(Ljava/lang/ThreadGroup;
+    //     Ljava/lang/String;ILjava/lang/Runnable;J)V` — the package-private
+    //     master constructor. There is no overload that skips it, and none
+    //     that reaches a different copy of the code.
+    //   * In that master constructor the ITL block is pc 164..204, and it
+    //     reads exactly three things: `attaching` (`currentThread() == this`),
+    //     `characteristics & 4` (the NO_INHERIT_THREAD_LOCALS bit that
+    //     `Thread(g,r,n,ss,false)` sets), and `parent.inheritableThreadLocals`
+    //     (null- and size-checked at pc 182/189). `group` (local 1) and `name`
+    //     (local 2) are NOT read anywhere between pc 164 and the `putfield` at
+    //     201. The bytecode cannot branch on them.
+    //
+    // The real reason the copy is inert on this VM is one line away:
+    // `ThreadLocal`/`InheritableThreadLocal` `get`/`set`/`remove`/`<init>` are
+    // registered with `NativeKind::Intrinsic`
+    // (`phases_early::register_thread_local_natives`), and §1.4 admits an
+    // `Intrinsic` over real bytecode even under `--jdk-only`
+    // (`resolve_native_dispatch_wave1`, vm/src/vm/vm_exec.rs). Their store is
+    // the Rust-side `TL_MAP`, so NOTHING in this process ever writes
+    // `Thread.inheritableThreadLocals` — for any constructor overload. The
+    // master constructor's `ifnull` at pc 182 therefore always takes the skip
+    // branch, and the block below, which asks the same question from the
+    // native side, is DEAD for the same reason: `get_field_by_name(parent,
+    // "inheritableThreadLocals")` cannot be `Object(Some(_))`. It is retained
+    // (gated) rather than deleted because it becomes live the moment the
+    // nominated fix demotes those Intrinsics — see
+    // `docs/known-issues/jdk-only/G5-1-inheritable-threadlocal-captures-at-
+    // construction-20260816.md` §5.
     //
     // Known trade-off: `characteristics` (which flags an explicit
     // `Thread(group, target, name, stackSize, false)` opt-out of
@@ -1131,7 +1633,11 @@ pub(crate) fn native_thread_start0(
         ctx.get_field_by_name(this, "inheritableThreadLocals"),
         Value::Object(None) | Value::Int(0)
     );
-    if apply_itl_workaround && child_itl_unset {
+    // G5-1: and never when the construction-time capture already answered for
+    // this child. Once the nominated demotion lands, the master constructor
+    // does the copy itself at construction; a start0-time copy on top of it
+    // would be exactly the timing divergence this record exists to remove.
+    if apply_itl_workaround && child_itl_unset && !captured_at_construction {
         let parent = ctx.current_thread_object();
         if let Value::Object(Some(parent_map)) =
             ctx.get_field_by_name(parent, "inheritableThreadLocals")
@@ -1477,8 +1983,20 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // otherwise be invisible. Log to stderr directly since tracing may not be
     // flushed before process::exit.
     eprintln!("[cratonvm] System.exit({code}) called вЂ” process terminating");
+    // W7-92: hooks first, and BEFORE the slot-map sweep — a hook is Java code
+    // that can load classes and allocate, so sweeping first would census a
+    // heap the hooks are about to change. `System.exit` from a non-main thread
+    // reaches this same native on that thread's ctx, so this one line covers
+    // two of the five exit paths (measured on HotSpot: rc 3 and rc 4, hooks
+    // ran on both).
+    run_shutdown_hooks(ctx, "System.exit");
     sweep_declared_slot_maps_before_exit(&*ctx, "System.exit");
     invoke_pre_exit_hook(code);
+    // LAST, and after the pre-exit hook, because that hook's own job is to
+    // dump diagnostics. `std::process::exit` runs no destructors, so anything
+    // still sitting in the fd table's stdout/stderr buffers dies here. `code`
+    // is untouched: this call cannot fail out and cannot change it.
+    flush_console_streams(&*ctx);
     std::process::exit(code);
 }
 
@@ -1555,9 +2073,19 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Thread;)V",
         |ctx, args| {
             // args[0] = the `Runtime` receiver, args[1] = the hook `Thread`.
-            if let Some(Value::Object(Some(hook))) = args.get(1) {
-                shutdown_hook_add(ctx, *hook);
-            }
+            //
+            // The null arm is DELIBERATELY not decided here. It used to be
+            // (`if let Some(Value::Object(Some(hook)))`, else fall through to
+            // `Ok(None)`), which accepted `addShutdownHook(null)` and dropped
+            // it — and HotSpot throws NPE there. Worse, deciding it here would
+            // put the null check ahead of the shutdown-in-progress check, and
+            // the JDK's bytecode orders them the other way round (see
+            // `shutdown_hook_add`). `Option` is threaded through so ONE
+            // function owns the whole refusal ladder in the measured order.
+            let Some(hook) = shutdown_hook_argument(args, "addShutdownHook") else {
+                return Ok(None);
+            };
+            shutdown_hook_add(ctx, hook)?;
             Ok(None)
         },
     );
@@ -1566,10 +2094,10 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "removeShutdownHook",
         "(Ljava/lang/Thread;)Z",
         |ctx, args| {
-            let removed = match args.get(1) {
-                Some(Value::Object(Some(hook))) => shutdown_hook_remove(ctx, *hook),
-                _ => false,
+            let Some(hook) = shutdown_hook_argument(args, "removeShutdownHook") else {
+                return Ok(Some(Value::Int(0)));
             };
+            let removed = shutdown_hook_remove(ctx, hook)?;
             Ok(Some(Value::Int(i32::from(removed))))
         },
     );
@@ -1593,6 +2121,31 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         // HotSpot's does nothing an application can observe.
         Ok(None)
     }, NativeKind::Bridge);
+
+    // W7-92: `java.lang.Shutdown.runHooks()` is `private static void` WITH a
+    // `Code` attribute in the real JDK, so this is an interception of the same
+    // kind as the two `exit` natives — and it is the right one while the hooks
+    // live Rust-side, because the JDK's own `Shutdown.hooks` array is empty:
+    // `Runtime.addShutdownHook` is intercepted here too, so
+    // `ApplicationShutdownHooks.hooks` is never populated and the JDK's slot 1
+    // hook is never installed. Running the real body would run nothing.
+    //
+    // This registration is what lets any JDK-side route into shutdown
+    // (`Shutdown.exit`, a future signal handler, an agent) land on the same
+    // drain as the launcher and the `exit` natives. It is NOT how the launcher
+    // reaches the hooks — `vm-cli` calls `run_shutdown_hooks` directly, because
+    // a `vm.invoke` of this triple would depend on `java/lang/Shutdown`
+    // resolving, which is a real-JDK-mode assumption.
+    registry.register_with_kind(
+        "java/lang/Shutdown",
+        "runHooks",
+        "()V",
+        |ctx, _args| {
+            run_shutdown_hooks(ctx, "Shutdown.runHooks");
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
     registry.register_with_kind(
         "java/lang/Shutdown",
         "halt0",
@@ -2751,8 +3304,12 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[cratonvm] Runtime.exit({code}) called вЂ” process terminating");
+    // W7-92: see `native_system_exit` for why the hooks run before the sweep.
+    run_shutdown_hooks(ctx, "Runtime.exit");
     sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.exit");
     invoke_pre_exit_hook(code);
+    // See `native_system_exit` — same reason, same position, same `code`.
+    flush_console_streams(&*ctx);
     std::process::exit(code);
 }
 
@@ -2764,6 +3321,14 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// bypasses. The VM-internal pre-exit hook (staged-archive cleanup, JFR
 /// dump-on-exit) still fires — it is not a Java shutdown hook, and its own
 /// comment already claims to cover `Runtime.halt`.
+///
+/// W7-92 made the `exit` paths run hooks and deliberately left this one alone.
+/// MEASURED on HotSpot 25.0.3+9: `ShutdownProbe halt` produced no hook output
+/// and rc=5, and `HookContract haltinhook` — `Runtime.halt(9)` called from
+/// INSIDE a running hook — terminated immediately at rc=9 with the remaining
+/// hooks unrun. The absence of a `run_shutdown_hooks` call below is the
+/// behaviour, not an oversight; a later sweep tidying the asymmetry away would
+/// be a regression.
 pub(crate) fn native_shutdown_halt0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2789,6 +3354,13 @@ pub(crate) fn native_shutdown_halt0(
     eprintln!("[cratonvm] Runtime.halt({code}) called - process terminating");
     sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.halt");
     invoke_pre_exit_hook(code);
+    // NO `run_shutdown_hooks` here, and that is the whole point of `halt`
+    // (MEASURED, `HookProbe halt`: `HOOK-OUT h-1 MUST-NOT-APPEAR` does not
+    // appear, rc 5). The FLUSH is a different question and HotSpot answers it
+    // the other way: `HookProbe haltnoflush` writes an unterminated,
+    // unflushed `System.out.print` and then halts, and the bytes are still
+    // delivered. So flush, run nothing.
+    flush_console_streams(&*ctx);
     std::process::exit(code);
 }
 
@@ -3210,32 +3782,120 @@ fn set_system_env_singleton(vm: usize, obj: ObjectRef) -> ObjectRef {
 /// HotSpot exposes the no-arg environment as a
 /// `java.util.Collections$UnmodifiableMap` whose private field `m` points at
 /// that backing map. System Rules reflects on that field by name, so the
-/// existing CratonVM unmodifiable-map wrapper deliberately keeps the backing in
-/// slot 0, matching the JDK's `m` field slot.
-/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7 residual R1): the
-/// wrapper stands in for `java.util.Collections$UnmodifiableMap`, whose real
-/// bytecode is not running, so under `--jdk-only` it is refused as a catchable
-/// `NoClassDefFoundError` rather than fabricated behind a recorded violation.
+/// CratonVM unmodifiable-map stand-in deliberately keeps the backing in slot 0,
+/// matching the JDK's `m` field slot.
+///
+/// # Why this asks `java.util.Collections` first (P1-B, 2026-08-12)
+///
+/// This used to go straight to `try_ensure_synthetic_class(
+/// "cratonvm/internal/UnmodifiableMap", 2)`. That stand-in is a compatibility
+/// fabrication, so under `--jdk-only` it is refused — correctly. What was wrong
+/// was the *caller*: `System.getenv` is registered from
+/// `register_essential_natives_with_shims`, so it survives strict mode, runs,
+/// asks for a fabricated receiver, and dies as `NoClassDefFoundError:
+/// cratonvm/internal/UnmodifiableMap` at the application's call site. Spring
+/// takes that in `AbstractEnvironment.<init>`, before bean one.
+///
+/// The native already holds a REAL `java/util/HashMap`, so the real
+/// `java.util.Collections.unmodifiableMap(Map)` can wrap it and there is no
+/// need to fabricate anything. `vm_init.rs::ensure_bootstrap_compat_class`
+/// claims these stand-ins "exist for the synthetic collection shims, which
+/// strict mode does not register" — that premise is FALSE for
+/// `UnmodifiableMap`, and this site was the counter-example.
+///
+/// Per mode, what the `ctx.invoke` below reaches:
+///
+/// * `--jdk-only`: `native-collections`' `Collections.unmodifiableMap`
+///   registration is `NativeKind::SyntheticStub` and is dropped at
+///   registration, so the **real `java.base` bytecode** runs and the result is a
+///   genuine `java.util.Collections$UnmodifiableMap` — HotSpot's own answer.
+/// * `--real-jdk` (default): that same registration wins and
+///   `alloc_unmod_wrapper` allocates `cratonvm/internal/UnmodifiableMap` with
+///   the backing at slot 0 — bit-for-bit what this function used to build
+///   itself, so compatible mode is unchanged.
+/// * `--synthetic-jdk`: `phases_early::register_collections_extras_natives`
+///   binds the same triple to `native_return_first_arg` and runs later, so the
+///   raw `HashMap` comes back. That is the mutable-map degradation below, and it
+///   is a pre-existing property of that mode's identity binding
+///   (`native-collections/src/lib.rs::wrap_unmodifiable`'s "vacuous-green trap"
+///   note documents the same shape for `unmodifiableSet`), not something this
+///   change introduces.
+///
+/// # Boot ordering — `allow_java_call`
+///
+/// Running Java bytecode from a native is only safe once the class library can
+/// actually answer. The caller says whether that holds:
+///
+/// * The REAL-LAYOUT path passes `true`. It has already resolved every
+///   `java/util/HashMap` and `java/util/HashMap$Node` field index off the real
+///   classes, so `java.util.HashMap` is loaded and initialized by then, and
+///   `java.util.Collections.<clinit>` — three `EMPTY_LIST`/`EMPTY_MAP`/
+///   `EMPTY_SET` allocations — cannot need more than that, cannot do I/O, and
+///   cannot re-enter `System.getenv()`.
+/// * The LEGACY 3-field fallback passes `false`. That arm exists precisely
+///   *because* the real `HashMap` layout was not resolvable, i.e. the class
+///   library is not usable yet; and a real `Collections$UnmodifiableMap`
+///   delegating to a 3-field synthetic map would be worse than the stand-in
+///   whose native shims read slot 0.
+///
+/// # Why it no longer returns `Result`
+///
+/// If every wrapper is unavailable the answer is the **raw `HashMap`**: a
+/// mutable map is far less wrong than an unloadable class, and it keeps
+/// `System.getenv()` answering instead of killing the caller. The refusal is
+/// still *recorded* — `ClassManager::try_ensure_synthetic_class` records the
+/// `CompatibilityClassRequested` violation before returning `Err`, so the
+/// `--jdk-only-report` census still sees it; only the throw is dropped.
 fn wrap_system_env_map(
     ctx: &mut dyn NativeContext,
     map: ObjectRef,
-) -> Result<ObjectRef, MethodCallFailed> {
+    allow_java_call: bool,
+) -> ObjectRef {
     let pin = ctx.pin_native_root(map);
-    // Not `?`: the pin above must be released before unwinding.
-    let wrapper_class =
-        match ctx.try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2) {
-            Ok(id) => id,
-            Err(err) => {
-                ctx.unpin_native_roots(pin);
-                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
-            }
-        };
+
+    // 1. The real `java.util.Collections.unmodifiableMap(Map)`.
+    if allow_java_call && ctx.ensure_class_initialized("java/util/Collections").is_ok() {
+        let backing = ctx.read_native_pin(pin, map);
+        // A failure here is deliberately swallowed rather than propagated: it
+        // means the real wrapper is unavailable, which is what steps 2 and 3
+        // are for. Same precedent as
+        // `jca::provider_chain::wrap_unmodifiable`, which discards a failed
+        // `Collections.unmodifiableSet` and returns the plain set.
+        if let Ok(Some(Value::Object(Some(view)))) = ctx.invoke(
+            "java/util/Collections",
+            "unmodifiableMap",
+            "(Ljava/util/Map;)Ljava/util/Map;",
+            &[Value::Object(Some(backing))],
+        ) {
+            ctx.unpin_native_roots(pin);
+            return view;
+        }
+    }
+
+    // 2. The compatibility stand-in. Refused under `--jdk-only`, which is the
+    //    whole point of the mode; `try_` rather than the infallible spelling so
+    //    the refusal is a value and not a fabrication.
+    let stand_in = ctx.try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2);
+    if let Ok(wrapper_class) = stand_in {
+        let map = ctx.read_native_pin(pin, map);
+        let wrapper = ctx.alloc_object(wrapper_class, 2);
+        let map = ctx.read_native_pin(pin, map);
+        ctx.set_field(wrapper, 0, Value::Object(Some(map)));
+        ctx.unpin_native_roots(pin);
+        return wrapper;
+    }
+
+    // 3. Degrade to the backing map itself. Mutable where HotSpot's is not —
+    //    say so in the log rather than letting it pass silently — but a real
+    //    `java.util.HashMap` that every caller can read.
+    tracing::warn!(
+        "System.getenv(): neither java.util.Collections.unmodifiableMap nor the \
+         cratonvm/internal/UnmodifiableMap stand-in was available; returning the \
+         backing HashMap, which is MUTABLE unlike HotSpot's"
+    );
     let map = ctx.read_native_pin(pin, map);
-    let wrapper = ctx.alloc_object(wrapper_class, 2);
-    let map = ctx.read_native_pin(pin, map);
-    ctx.set_field(wrapper, 0, Value::Object(Some(map)));
     ctx.unpin_native_roots(pin);
-    Ok(wrapper)
+    map
 }
 
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
@@ -3516,7 +4176,12 @@ pub(crate) fn native_system_getenv_all(
         // Cache the OpenJDK-shaped process-wide singleton (double-checked
         // publish). The wrapper's field 0 is the private `m` backing field that
         // libraries such as System Rules reach via reflection.
-        let env = wrap_system_env_map(ctx, map)?;
+        //
+        // `true`: this is the real-layout arm, so every `java/util/HashMap`
+        // field index above came off the real class and running
+        // `java.util.Collections` bytecode here is safe. See
+        // `wrap_system_env_map`'s boot-ordering note.
+        let env = wrap_system_env_map(ctx, map, true);
         let env = set_system_env_singleton(ctx.vm_identity(), env);
         return Ok(Some(Value::Object(Some(env))));
     }
@@ -3562,7 +4227,12 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, 1, Value::Int(old_size + 1));
     }
 
-    let env = wrap_system_env_map(ctx, map)?;
+    // `false`: this arm was reached BECAUSE the real `java/util/HashMap` layout
+    // was not resolvable, so the class library cannot be asked to run
+    // `java.util.Collections.unmodifiableMap` — and a real wrapper delegating to
+    // a 3-field synthetic map would be worse than the stand-in whose shims read
+    // slot 0. Uncached, as before, so a later call retries the real path.
+    let env = wrap_system_env_map(ctx, map, false);
     Ok(Some(Value::Object(Some(env))))
 }
 
@@ -4378,6 +5048,282 @@ fn define_class_format_error(class_name: &str, method: &str, message: String) ->
     .into()
 }
 
+// ---------------------------------------------------------------------------
+// defineClass0/1/2 — recovering the TYPE of a backend failure (W7-31 §Falsifier 3)
+//
+// `NativeContext::define_class_full` is typed `Result<ClassId, String>`, and the
+// VM's implementation fills that `String` with
+// `class_manager::define_class_with_options`'s `VmError` rendered by
+// `.map_err(|e| format!("{e:?}"))` — a Rust `Debug` string. Every `defineClassN`
+// failure arm then re-wrapped it as `ClassFormatError`, so a class file that
+// must raise `UnsupportedClassVersionError` produced instead:
+//
+//   HotSpot : java.lang.UnsupportedClassVersionError: Preview features are not
+//             enabled for <Unknown> (class file version 69.65535). Try running
+//             with '--enable-preview'
+//   CratonVM: java.lang.ClassFormatError: : defineClass1:
+//             Linkage(UnsupportedClassVersionError { class_name: "", message:
+//             "Preview features are not enabled for <Unknown> (class file
+//             version 69.65535). Try running with '--enable-preview'" })
+//
+// Two separate breakages in one line. The TYPE is wrong — a container catching
+// the JDK's typed exception (application servers probing whether they can load
+// a bundle, test frameworks branching on linkage kind) does not catch ours — and
+// the MESSAGE is a Rust value dump.
+//
+// The right repair is to widen `define_class_full` to carry `VmError`; that is a
+// trait-signature change across ~25 call sites in six crates and is nominated,
+// not done here. What is done here is the repair the record asks for: give the
+// `defineClassN` tail a pass-through that recovers the already-typed
+// `VmError::Linkage(..)` from the rendering it was flattened into, and rebuild
+// the typed variant so `runtime::exceptions::linkage_throwable` — which already
+// has a complete, correct arm per variant — produces the JDK exception.
+//
+// **Never re-emit the Debug text.** Every arm below either carries a field the
+// backend wrote (already human-readable — `LinkageError`'s own `#[error]`
+// strings and HotSpot's verbatim version wording) or names the variant. The raw
+// `msg` is used only when the string is NOT a `Debug` rendering at all, which is
+// the case for `define_class_full`'s own plain-string failures ("define_class_full
+// failed for X", "initialize after define failed for X: ...").
+//
+// **`class_name: ""` is not a lost name.** It is the caller's own argument: the
+// Java call was `ClassLoader.defineClass(null, bytes, off, len)`, and the class
+// manager's version check runs BEFORE `this_class` is read from the constant
+// pool, so no name exists to substitute. HotSpot has the identical ordering and
+// prints `<Unknown>` mid-message — which the recovered `message` field already
+// contains. What was visibly damaged was the outer wrapper's
+// `format!("{class_name}: {message}")`, i.e. the stray leading `": "` above;
+// that disappears with the flattening, because the `UnsupportedClassVersionError`
+// arm of `linkage_throwable` deliberately does not prefix the name.
+// ---------------------------------------------------------------------------
+
+/// Split a Rust `Debug` rendering of an enum into `(outer, inner, body)`.
+///
+/// `Linkage(ClassFormatError { class_name: "A", message: "b" })`
+///   -> `("Linkage", "ClassFormatError", "class_name: \"A\", message: \"b\"")`
+///
+/// A tuple variant with no struct body (`JdkOnly(..)`) yields an empty body.
+/// Returns `None` for anything that is not shaped like `Ident(..)` — a plain
+/// human-written error string, which the caller must pass through unchanged.
+fn split_debug_error(msg: &str) -> Option<(&str, &str, &str)> {
+    let open = msg.find('(')?;
+    let outer = &msg[..open];
+    if outer.is_empty() || !outer.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let close = msg.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let inner_all = &msg[open + 1..close];
+    // `#[derive(Debug)]` renders a struct variant as `Name { a: 1, b: 2 }`,
+    // with exactly one space inside each brace.
+    match inner_all.find(" { ") {
+        Some(brace) => {
+            let end = inner_all.rfind(" }")?;
+            if end < brace + 3 {
+                return None;
+            }
+            Some((outer, &inner_all[..brace], &inner_all[brace + 3..end]))
+        }
+        None => Some((outer, inner_all, "")),
+    }
+}
+
+/// Undo the escaping `Debug` applies to a `String`, stopping at the closing
+/// quote. `\u{..}` forms are not decoded — they are rare (control characters in
+/// a class name) and a literal `u{7f}` in a diagnostic is better than a partial
+/// parse that drops the rest of the sentence.
+fn unescape_debug_string(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('0') => out.push('\0'),
+                // Covers `\\`, `\"` and `\'`.
+                Some(other) => out.push(other),
+                None => break,
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Read a `name: "value"` `String` field out of a `Debug` struct body.
+///
+/// The name must sit at a field boundary (start of the body, or just after a
+/// `", "` separator) so a `field:` appearing INSIDE another field's text cannot
+/// be mistaken for the field itself.
+fn debug_string_field(body: &str, field: &str) -> Option<String> {
+    let mut from = 0usize;
+    while from < body.len() {
+        let at = from + body[from..].find(field)?;
+        let after = at + field.len();
+        let at_boundary = at == 0 || body[..at].ends_with(", ");
+        if at_boundary && body[after..].starts_with(": \"") {
+            return Some(unescape_debug_string(&body[after + 3..]));
+        }
+        from = after;
+    }
+    None
+}
+
+/// Turn a `define_class_full` failure string back into the typed JVM error the
+/// backend actually raised.
+///
+/// `class_name` is the caller's own name argument, used only when the recovered
+/// error names nothing (or names nothing useful). See the module note above for
+/// why an empty name here is faithful rather than lost.
+fn define_class_linkage_error(class_name: &str, method: &str, msg: String) -> MethodCallFailed {
+    match typed_define_class_error(class_name, method, &msg) {
+        Some(err) => err,
+        // Not a `Debug` rendering — `define_class_full`'s own plain-string
+        // failures land here, and they are already readable.
+        None => define_class_format_error(class_name, method, msg),
+    }
+}
+
+/// The recovery half of [`define_class_linkage_error`]. Split out so the
+/// borrow of `msg` that [`split_debug_error`] produces ends before the caller
+/// needs to move the `String` into its fallback.
+fn typed_define_class_error(class_name: &str, method: &str, msg: &str) -> Option<MethodCallFailed> {
+    let (outer, inner, body) = split_debug_error(msg)?;
+
+    // The backend's own name when it has one (a supertype-resolution failure
+    // names the SUPERTYPE, not the class being defined), else the caller's.
+    let named = |field: &str| {
+        debug_string_field(body, field)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| class_name.to_string())
+    };
+    // A recovered variant always has a readable message: the field the backend
+    // wrote, or — if the field cannot be read — the variant's own name. Never
+    // `msg`, which is the `Debug` text this function exists to remove.
+    let detail = |field: &str| {
+        debug_string_field(body, field).unwrap_or_else(|| format!("{method}: {inner}"))
+    };
+
+    Some(match (outer, inner) {
+        // -- VmError::Linkage: already the right shape, just re-typed. --------
+        ("Linkage", "UnsupportedClassVersionError") => LinkageError::UnsupportedClassVersionError {
+            class_name: named("class_name"),
+            // HotSpot's wording verbatim; it already names the class
+            // mid-sentence, which is why `linkage_throwable` does not prefix.
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "ClassFormatError") => LinkageError::ClassFormatError {
+            class_name: named("class_name"),
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "VerifyError") => LinkageError::VerifyError {
+            class_name: named("class_name"),
+            method_name: debug_string_field(body, "method_name").unwrap_or_default(),
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "NoClassDefFoundError") => LinkageError::NoClassDefFoundError {
+            class_name: named("class_name"),
+        }
+        .into(),
+        ("Linkage", "IncompatibleClassChangeError") => LinkageError::IncompatibleClassChangeError {
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "DuplicateClassDefinition") => LinkageError::DuplicateClassDefinition {
+            class_name: named("class_name"),
+            loader: debug_string_field(body, "loader").unwrap_or_else(|| "<unknown>".to_string()),
+        }
+        .into(),
+        ("Linkage", "NoSuchFieldError") => LinkageError::NoSuchFieldError {
+            class_name: named("class_name"),
+            field_name: debug_string_field(body, "field_name").unwrap_or_default(),
+        }
+        .into(),
+        ("Linkage", "NoSuchMethodError") => LinkageError::NoSuchMethodError {
+            class_name: named("class_name"),
+            method_name: debug_string_field(body, "method_name").unwrap_or_default(),
+            method_descriptor: debug_string_field(body, "method_descriptor").unwrap_or_default(),
+        }
+        .into(),
+        ("Linkage", "IllegalAccessError") => LinkageError::IllegalAccessError {
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "AbstractMethodError") => LinkageError::AbstractMethodError {
+            class_name: named("class_name"),
+            method_name: debug_string_field(body, "method_name").unwrap_or_default(),
+        }
+        .into(),
+        ("Linkage", "UnsupportedClassRedefinitionError") => {
+            LinkageError::UnsupportedClassRedefinitionError {
+                class_name: named("class_name"),
+                message: detail("message"),
+            }
+            .into()
+        }
+
+        // -- VmError::Runtime: only the one JVMS-mandated shape. --------------
+        //
+        // JVMS §5.3.5 / `ClassLoader.preDefineClass`: a non-bootstrap loader
+        // defining into `java.*` is a `SecurityException`, NOT a linkage error,
+        // and `class_manager.rs` raises it as `RuntimeError::SecurityException`.
+        // `classify_fastpath_invoke_error` routes `VmError::Runtime` to the
+        // ordinary runtime-exception path, so this arrives at Java as
+        // `java.lang.SecurityException` with the backend's own sentence.
+        ("Runtime", "SecurityException") => RuntimeError::SecurityException {
+            message: detail("message"),
+        }
+        .into(),
+
+        // -- VmError::ClassFile: MUST be re-homed onto a Linkage variant. -----
+        //
+        // Not cosmetic. `classify_fastpath_invoke_error` (vm/src/runtime/
+        // interpreter.rs) converts `VmError::Linkage` and `VmError::Runtime`
+        // into Java throwables and sends everything else to
+        // `FastPathInvokeError::Fatal` — so returning a `ClassFile` variant from
+        // a native is UNCATCHABLE and unwinds past every handler.
+        ("ClassFile", "ClassNotFound") => LinkageError::NoClassDefFoundError {
+            class_name: named("class_name"),
+        }
+        .into(),
+        ("ClassFile", "UnsupportedVersion") => LinkageError::UnsupportedClassVersionError {
+            class_name: named("class_name"),
+            // This variant carries `major`/`minor` ints rather than a message,
+            // so build HotSpot's shape by hand instead of dumping the fields.
+            message: format!("{} has an unsupported class file version", named("class_name")),
+        }
+        .into(),
+
+        // Everything else recognised-but-unmapped keeps `ClassFormatError` —
+        // today's answer — but with a readable message rather than the dump.
+        //
+        // KNOWN GAP, and it is the one shape in this set that HotSpot gives its
+        // own type: a circular hierarchy is
+        // `ClassFile(InvalidClassFile { message: "circular class hierarchy
+        // detected: ..." })` here and `java.lang.ClassCircularityError` on
+        // HotSpot. `LinkageError` has no `ClassCircularityError` variant — the
+        // spelling does not occur anywhere in this tree — so it cannot be
+        // produced from this side. Adding the variant plus its
+        // `linkage_throwable` arm is nominated in the lane report.
+        _ => LinkageError::ClassFormatError {
+            class_name: named("class_name"),
+            message: format!(
+                "{method}: {}",
+                debug_string_field(body, "message").unwrap_or_else(|| inner.to_string())
+            ),
+        }
+        .into(),
+    })
+}
+
 fn validate_classfile_header(
     class_name: &str,
     method: &str,
@@ -5016,7 +5962,7 @@ pub(crate) fn native_classloader_define_class1(
                 }
             }
             tracing::warn!("ClassLoader.defineClass1({name}) failed: {msg}");
-            Err(define_class_format_error(&name, "defineClass1", msg))
+            Err(define_class_linkage_error(&name, "defineClass1", msg))
         }
     }
 }
@@ -5104,7 +6050,7 @@ pub(crate) fn native_classloader_define_class2(
                 }
             }
             tracing::warn!("ClassLoader.defineClass2({name}) failed: {msg}");
-            Err(define_class_format_error(&name, "defineClass2", msg))
+            Err(define_class_linkage_error(&name, "defineClass2", msg))
         }
     }
 }
@@ -5252,7 +6198,7 @@ pub(crate) fn native_classloader_define_class0(
                 }
             }
             tracing::warn!("ClassLoader.defineClass0({effective_name}) failed: {msg}");
-            Err(define_class_format_error(
+            Err(define_class_linkage_error(
                 &effective_name,
                 "defineClass0",
                 msg,
@@ -6210,5 +7156,484 @@ mod runtime_version_parse_tests {
         assert!(parse_runtime_version_str("nonsense").is_none());
         // `1.8.0_392` is the pre-JEP-223 spelling; the JDK rejects it too.
         assert!(parse_runtime_version_str("1.8.0_392").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P3-C — `defineClass0/1/2` must not flatten a typed linkage error
+// (W7-31-enable-preview-wiring.md, Falsifier 3)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod define_class_error_typing_tests {
+    use super::*;
+    use cratonvm_types::error::{ClassFileError, VmError};
+
+    /// Reproduce EXACTLY what `NativeContextImpl::define_class_full` puts in its
+    /// `Err(String)`: `class_manager::define_class_with_options`' `VmError`,
+    /// rendered by `.map_err(|e| format!("{e:?}"))` (`vm/src/vm/vm_exec.rs`).
+    ///
+    /// This is deliberately not a hand-written literal. The recovery in
+    /// `typed_define_class_error` is a parse of that rendering, so the coupling
+    /// is real and these tests are the thing that notices if either side moves —
+    /// in particular if that `map_err` is ever "tidied" to `{e}` (`Display`),
+    /// which would silently return every arm below to `ClassFormatError`.
+    fn as_backend_string(err: VmError) -> String {
+        format!("{err:?}")
+    }
+
+    fn linkage_of(failed: &MethodCallFailed) -> &LinkageError {
+        match failed {
+            MethodCallFailed::InternalError(VmError::Linkage(l)) => l,
+            other => panic!("expected a LinkageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_class_version_survives_the_string_boundary() {
+        // HotSpot 25's wording verbatim, from the W7-31 falsifier. `<Unknown>`
+        // is what HotSpot prints when the caller passed a null name, and the
+        // version check runs before `this_class` is read — so the empty
+        // `class_name` here is faithful, not lost.
+        let hotspot = "Preview features are not enabled for <Unknown> (class file version \
+                       69.65535). Try running with '--enable-preview'";
+        let backend = as_backend_string(VmError::Linkage(
+            LinkageError::UnsupportedClassVersionError {
+                class_name: String::new(),
+                message: hotspot.to_string(),
+            },
+        ));
+        // The shape this test exists to defend against.
+        assert!(
+            backend.contains("Linkage(UnsupportedClassVersionError {"),
+            "the backend rendering changed shape: {backend}"
+        );
+
+        let failed = define_class_linkage_error("", "defineClass1", backend);
+        match linkage_of(&failed) {
+            LinkageError::UnsupportedClassVersionError { message, .. } => {
+                assert_eq!(message, hotspot, "the message must be HotSpot's, verbatim");
+            }
+            other => panic!("must stay an UnsupportedClassVersionError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_recovered_message_carries_a_rust_debug_rendering() {
+        for err in [
+            VmError::Linkage(LinkageError::UnsupportedClassVersionError {
+                class_name: "P".to_string(),
+                message: "bad version".to_string(),
+            }),
+            VmError::Linkage(LinkageError::ClassFormatError {
+                class_name: "P".to_string(),
+                message: "truncated constant pool".to_string(),
+            }),
+            VmError::Linkage(LinkageError::IncompatibleClassChangeError {
+                message: "already defined by application loader".to_string(),
+            }),
+            VmError::Linkage(LinkageError::VerifyError {
+                class_name: "P".to_string(),
+                method_name: "m".to_string(),
+                message: "bad stack map".to_string(),
+            }),
+            VmError::Runtime(RuntimeError::SecurityException {
+                message: "Prohibited package name: java.evil".to_string(),
+            }),
+            VmError::ClassFile(ClassFileError::InvalidClassFile {
+                class_name: "P".to_string(),
+                message: "circular class hierarchy detected: P".to_string(),
+            }),
+        ] {
+            let rendered = format!("{err:?}");
+            let failed = define_class_linkage_error("P", "defineClass1", rendered.clone());
+            // `Display`, not `Debug`: this is the text that becomes the Java
+            // exception's message. `Debug` of the *outcome* is a Rust value dump
+            // by definition and asserting on it would measure nothing.
+            let text = format!("{failed}");
+            for artifact in ["class_name:", "message:", "Linkage(", "Runtime(", "ClassFile("] {
+                assert!(
+                    !text.contains(artifact),
+                    "a Debug artifact {artifact:?} reached the Java-visible error \
+                     for {rendered}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_prohibited_package_stays_a_security_exception() {
+        let backend = as_backend_string(VmError::Runtime(RuntimeError::SecurityException {
+            message: "Prohibited package name: java.evil".to_string(),
+        }));
+        match define_class_linkage_error("java/evil/X", "defineClass1", backend) {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::SecurityException {
+                message,
+            })) => {
+                assert_eq!(message, "Prohibited package name: java.evil");
+            }
+            other => panic!("JVMS §5.3.5 wants a SecurityException, got {other:?}"),
+        }
+    }
+
+    /// A `VmError::ClassFile` returned from a native is UNCATCHABLE —
+    /// `classify_fastpath_invoke_error` sends it to `FastPathInvokeError::Fatal`.
+    /// Every `ClassFile` arm must therefore leave as a `Linkage` variant.
+    #[test]
+    fn class_file_errors_are_re_homed_onto_catchable_linkage_variants() {
+        for err in [
+            VmError::ClassFile(ClassFileError::ClassNotFound {
+                class_name: "Missing".to_string(),
+            }),
+            VmError::ClassFile(ClassFileError::InvalidClassFile {
+                class_name: "P".to_string(),
+                message: "circular class hierarchy detected: P".to_string(),
+            }),
+            VmError::ClassFile(ClassFileError::UnsupportedVersion {
+                class_name: "P".to_string(),
+                major: 99,
+                minor: 0,
+            }),
+        ] {
+            let failed = define_class_linkage_error("P", "defineClass1", format!("{err:?}"));
+            assert!(
+                matches!(&failed, MethodCallFailed::InternalError(VmError::Linkage(_))),
+                "a ClassFile error must be re-homed onto a Linkage variant, got {failed:?}"
+            );
+        }
+        let failed = define_class_linkage_error(
+            "P",
+            "defineClass1",
+            format!(
+                "{:?}",
+                VmError::ClassFile(ClassFileError::ClassNotFound {
+                    class_name: "Missing".to_string(),
+                })
+            ),
+        );
+        match linkage_of(&failed) {
+            LinkageError::NoClassDefFoundError { class_name } => assert_eq!(class_name, "Missing"),
+            other => panic!("an unresolvable supertype is a NoClassDefFoundError, got {other:?}"),
+        }
+    }
+
+    /// `define_class_full`'s own plain-string failures are not `Debug`
+    /// renderings and must pass through as they always did.
+    #[test]
+    fn a_plain_backend_string_keeps_the_old_class_format_error() {
+        let failed = define_class_linkage_error(
+            "Foo",
+            "defineClass1",
+            "define_class_full failed for Foo".to_string(),
+        );
+        match linkage_of(&failed) {
+            LinkageError::ClassFormatError {
+                class_name,
+                message,
+            } => {
+                assert_eq!(class_name, "Foo");
+                assert_eq!(message, "defineClass1: define_class_full failed for Foo");
+            }
+            other => panic!("expected the unchanged ClassFormatError fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_quoted_message_round_trips_through_the_debug_escaping() {
+        let quoted = "class \"P\" has a \\ in it";
+        let backend = as_backend_string(VmError::Linkage(LinkageError::ClassFormatError {
+            class_name: "P".to_string(),
+            message: quoted.to_string(),
+        }));
+        match linkage_of(&define_class_linkage_error("P", "defineClass1", backend)) {
+            LinkageError::ClassFormatError { message, .. } => assert_eq!(message, quoted),
+            other => panic!("expected ClassFormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_backend_name_wins_over_the_callers_when_the_caller_has_none() {
+        let backend = as_backend_string(VmError::Linkage(LinkageError::NoClassDefFoundError {
+            class_name: "Super".to_string(),
+        }));
+        match linkage_of(&define_class_linkage_error("", "defineClass1", backend)) {
+            LinkageError::NoClassDefFoundError { class_name } => assert_eq!(class_name, "Super"),
+            other => panic!("expected NoClassDefFoundError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_debug_error_rejects_a_human_written_string() {
+        assert!(split_debug_error("initialize after define failed for Foo: boom").is_none());
+        assert!(split_debug_error("").is_none());
+        assert!(split_debug_error("no parens here").is_none());
+    }
+
+    #[test]
+    fn debug_string_field_only_matches_at_a_field_boundary() {
+        let body = r#"class_name: "A", message: "the class_name: \"B\" is wrong""#;
+        assert_eq!(debug_string_field(body, "class_name").as_deref(), Some("A"));
+        assert_eq!(
+            debug_string_field(body, "message").as_deref(),
+            Some(r#"the class_name: "B" is wrong"#)
+        );
+        assert!(debug_string_field(body, "loader").is_none());
+    }
+}
+
+/// G11-1 (2026-08-17) — the shutdown-hook registration contract.
+///
+/// Everything here is a unit test of the REFUSAL LADDER and the exact text of
+/// its four messages, because that is the part of W7-92's runner that can be
+/// decided without a live VM. What these tests deliberately do NOT prove:
+///
+/// * that a hook ever RUNS. `run_shutdown_hooks` needs `invoke_virtual`, a
+///   thread registry and a real `Thread.start()`; only `RShutdownHooks`
+///   against a built binary can settle that.
+/// * the `Hook already running` arm. `test_utils`' mock answers
+///   `thread_is_alive == false` unconditionally, so that arm is reachable in
+///   the VM and not from here; it is pinned by the constant test instead.
+///
+/// `SHUTDOWN_HOOKS` and `SHUTDOWN_IN_PROGRESS` are PROCESS-global (W7-92 §9.5
+/// nominates fixing that) and `cargo test` runs these on threads of one
+/// process, so every test that touches either takes `hook_registry_guard()`
+/// and restores what it changed. Without that, one test flipping
+/// `SHUTDOWN_IN_PROGRESS` makes a sibling assert the wrong exception.
+#[cfg(test)]
+mod shutdown_hook_contract_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    // `alloc_object` lives on `NativeHeapAccess`, one of the traits
+    // `NativeContext` composes -- so importing `NativeContext` alone does NOT
+    // bring it into scope on a concrete `MockNativeContext`. This is the same
+    // import block every other test module in the crate uses; see
+    // `lang_class.rs`'s `mod tests`.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeHeapAccess, NativeInvokeAccess,
+        NativeSystemAccess, NativeThreadAccess,
+    };
+
+    /// Serialises every test in this module against the two process-global
+    /// statics. Poisoning is ignored on purpose: a panicking test must not
+    /// turn the rest of the module red for the wrong reason.
+    fn hook_registry_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Put the two globals back into the state a fresh VM has.
+    fn reset_registry() {
+        SHUTDOWN_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+        SHUTDOWN_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn hook_count() -> usize {
+        SHUTDOWN_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Unwrap to the `RuntimeError` and assert on the VARIANT and the message
+    /// STRING, never on `format!("{failed:?}")`.
+    ///
+    /// Two reasons, and the first one is a trap this test module fell into on
+    /// its first draft: `Debug` escapes the embedded quotes, so
+    /// `HOOK_MSG_NULL_ADD` — which contains `"java.lang.Thread.isAlive()"` —
+    /// never appears verbatim in a `Debug` rendering and a `.contains()` check
+    /// against it silently fails no matter what the VM does. The second is
+    /// that `Debug` of `Option<String>` is the only way to tell
+    /// `getMessage() == null` from `getMessage() == ""` here, and asserting on
+    /// the `Option` itself says it directly.
+    fn runtime_error(failed: MethodCallFailed) -> RuntimeError {
+        match failed {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(e)) => e,
+            other => panic!("expected a RuntimeError, got {other:?}"),
+        }
+    }
+
+    // -- the four messages, transcribed --------------------------------
+
+    #[test]
+    fn refusal_messages_are_the_measured_hotspot_text() {
+        assert_eq!(HOOK_MSG_SHUTDOWN_IN_PROGRESS, "Shutdown in progress");
+        assert_eq!(HOOK_MSG_ALREADY_RUNNING, "Hook already running");
+        assert_eq!(HOOK_MSG_PREVIOUSLY_REGISTERED, "Hook previously registered");
+        assert_eq!(
+            HOOK_MSG_NULL_ADD,
+            "Cannot invoke \"java.lang.Thread.isAlive()\" because \"hook\" is null"
+        );
+    }
+
+    /// HANDOFF-20260814 §7: a non-ASCII byte in a compared string makes the
+    /// oracle comparison depend on the Windows console code page, and one
+    /// differential once failed on a single em-dash with every assertion
+    /// passing. These four strings cross that boundary, so they are checked
+    /// rather than eyeballed.
+    #[test]
+    fn refusal_messages_are_pure_ascii() {
+        for m in [
+            HOOK_MSG_SHUTDOWN_IN_PROGRESS,
+            HOOK_MSG_NULL_ADD,
+            HOOK_MSG_ALREADY_RUNNING,
+            HOOK_MSG_PREVIOUSLY_REGISTERED,
+        ] {
+            assert!(m.is_ascii(), "non-ASCII in a compared message: {m:?}");
+        }
+    }
+
+    // -- argument decoding ---------------------------------------------
+
+    /// A present-but-null slot 1 is a JAVA null and must reach the NPE arm; a
+    /// short vector is a VM-side decode fault and must NOT be turned into one.
+    /// Before G11-1 both were the same silent `Ok(None)`.
+    #[test]
+    fn a_java_null_and_a_short_vector_decode_differently() {
+        let mut ctx = mock_ctx();
+        let receiver = ctx.alloc_object(cratonvm_types::ClassId::new(0), 2);
+        let hook = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+
+        assert_eq!(
+            shutdown_hook_argument(
+                &[Value::Object(Some(receiver)), Value::Object(Some(hook))],
+                "t"
+            ),
+            Some(Some(hook)),
+            "slot 1 holding a reference is the hook"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[Value::Object(Some(receiver)), Value::Object(None)], "t"),
+            Some(None),
+            "slot 1 holding null is a Java null, not a decode failure"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[Value::Object(Some(receiver))], "t"),
+            None,
+            "a one-slot vector is not [receiver, Thread] and must not be decided"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[], "t"),
+            None,
+            "an empty vector likewise"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[Value::Object(Some(receiver)), Value::Int(7)], "t"),
+            None,
+            "slot 1 holding a primitive is not a Thread reference"
+        );
+    }
+
+    // -- the refusal ladder --------------------------------------------
+
+    #[test]
+    fn null_add_throws_npe_with_the_helpful_message() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        let mut ctx = mock_ctx();
+
+        let err = shutdown_hook_add(&mut ctx, None).expect_err("null must be refused");
+        match runtime_error(err) {
+            RuntimeError::NullPointerException { message } => assert_eq!(
+                message.as_deref(),
+                Some(HOOK_MSG_NULL_ADD),
+                "add's NPE must carry HotSpot's helpful message verbatim"
+            ),
+            other => panic!("expected NullPointerException, got {other:?}"),
+        }
+        assert_eq!(hook_count(), 0, "a refused hook must not be registered");
+
+        reset_registry();
+    }
+
+    /// `remove`'s NPE is a bare `new NullPointerException()` (pc 20), so its
+    /// `getMessage()` is null — not the empty string, and not `add`'s helpful
+    /// text. MEASURED: `NULL-REMOVE threw=java.lang.NullPointerException
+    /// msg=null`.
+    #[test]
+    fn null_remove_throws_npe_with_no_message_at_all() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        let mut ctx = mock_ctx();
+
+        let err = shutdown_hook_remove(&mut ctx, None).expect_err("null must be refused");
+        match runtime_error(err) {
+            // `None`, NOT `Some("")`. `msg=null` and `msg=` are different
+            // cells and the differential prints them differently.
+            RuntimeError::NullPointerException { message } => assert_eq!(
+                message, None,
+                "remove's NPE is a no-arg `new NullPointerException()` (pc 20)"
+            ),
+            other => panic!("expected NullPointerException, got {other:?}"),
+        }
+
+        reset_registry();
+    }
+
+    /// The JDK tests `hooks == null` at pc 0, BEFORE it touches the argument
+    /// at pc 16/17. So a null hook offered during shutdown gets the ISE, not
+    /// the NPE — on both methods. This is why the null check lives inside
+    /// `shutdown_hook_add`/`_remove` rather than at the registration site.
+    #[test]
+    fn shutdown_in_progress_outranks_the_null_check() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        SHUTDOWN_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut ctx = mock_ctx();
+
+        let added = shutdown_hook_add(&mut ctx, None).expect_err("must refuse");
+        match runtime_error(added) {
+            RuntimeError::IllegalStateException { message } => {
+                assert_eq!(message, HOOK_MSG_SHUTDOWN_IN_PROGRESS)
+            }
+            other => panic!("add during shutdown must answer ISE first, got {other:?}"),
+        }
+
+        let removed = shutdown_hook_remove(&mut ctx, None).expect_err("must refuse");
+        match runtime_error(removed) {
+            RuntimeError::IllegalStateException { message } => {
+                assert_eq!(message, HOOK_MSG_SHUTDOWN_IN_PROGRESS)
+            }
+            other => panic!("remove during shutdown must answer ISE first, got {other:?}"),
+        }
+
+        reset_registry();
+    }
+
+    /// The positive path plus the duplicate refusal, in one test because the
+    /// second only means anything after the first: registering twice must
+    /// throw, and the registry must still hold exactly one entry afterwards.
+    /// The two `remove` rows are `RShutdownHooks`' first two checks, MEASURED
+    /// on the oracle as `REMOVE-1 true` / `REMOVE-2 false`.
+    #[test]
+    fn a_second_registration_of_the_same_hook_throws_and_does_not_grow_the_list() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        let mut ctx = mock_ctx();
+        let hook = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+
+        shutdown_hook_add(&mut ctx, Some(hook)).expect("first registration must be accepted");
+        assert_eq!(hook_count(), 1);
+
+        let err = shutdown_hook_add(&mut ctx, Some(hook)).expect_err("duplicate must be refused");
+        match runtime_error(err) {
+            RuntimeError::IllegalArgumentException { message } => {
+                assert_eq!(message, HOOK_MSG_PREVIOUSLY_REGISTERED)
+            }
+            other => panic!("expected the duplicate IAE, got {other:?}"),
+        }
+        assert_eq!(
+            hook_count(),
+            1,
+            "a refused registration must not leave a second entry"
+        );
+
+        assert!(shutdown_hook_remove(&mut ctx, Some(hook)).expect("must not throw"));
+        assert!(!shutdown_hook_remove(&mut ctx, Some(hook)).expect("must not throw"));
+        assert_eq!(hook_count(), 0);
+
+        reset_registry();
     }
 }

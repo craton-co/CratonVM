@@ -1895,12 +1895,51 @@ mod tests {
         assert_eq!(IOSTATUS_UNSUPPORTED, -4);
     }
 
-    /// maxDirectTransferSize0 returns the documented cap.
+    /// `maxDirectTransferSize0` must be REGISTERED and must ANSWER the
+    /// documented cap.
+    ///
+    /// The body used to be `assert_eq!(0x7fff_ffff_i32, i32::MAX)` — a fact
+    /// about two Rust literals, true on every machine that has ever run this
+    /// suite. `native_fc_max_direct_transfer_size0` was not on the call path,
+    /// so returning `0` from it, returning a `Long`, throwing, or dropping the
+    /// registration entirely all left this test green. The JDK divides its
+    /// transfer length by this number: a `0` here is a divide-by-zero or an
+    /// infinite `transferTo` loop, and an absent registration is an
+    /// `UnsatisfiedLinkError` on the first `FileChannel.transferTo`.
+    ///
+    /// It now goes through the registry (so unregistering it fails the test)
+    /// and invokes the resolved callback (so changing the returned value or
+    /// its `Value` variant fails the test).
     #[test]
     fn wp3_6_max_direct_transfer_size_is_int_max() {
-        // We can't call the registered handler without a context,
-        // but we can replicate its return.
-        assert_eq!(0x7fff_ffff_i32, i32::MAX);
+        let mut r = NativeMethodRegistry::new();
+        register_file_channel_real(&mut r);
+
+        // `register_fd_native` puts every dispatcher native under all three
+        // platform spellings; a JDK image declares whichever one it ships.
+        for cls in [
+            "sun/nio/ch/FileDispatcherImpl",
+            "sun/nio/ch/UnixFileDispatcherImpl",
+            "sun/nio/ch/WindowsFileDispatcherImpl",
+        ] {
+            let cb = r.find(cls, "maxDirectTransferSize0", "()I").unwrap_or_else(|| {
+                panic!("{cls}.maxDirectTransferSize0()I must be registered")
+            });
+
+            let mut ctx = crate::test_support::MockNativeContext::new();
+            // The JDK calls this with no arguments and uses the result as a
+            // divisor/chunk size, so both the variant and the value matter.
+            let Ok(Some(Value::Int(cap))) = cb(&mut ctx, &[]) else {
+                panic!("{cls}.maxDirectTransferSize0 must return Some(Value::Int(..))");
+            };
+            assert_eq!(
+                cap,
+                i32::MAX,
+                "{cls}.maxDirectTransferSize0 must report the documented \
+                 2 GiB - 1 cap; a smaller value throttles every transferTo and \
+                 0 is a divide-by-zero in the JDK's chunking loop"
+            );
+        }
     }
 
     // Exercise the helper code paths whose only callers are in

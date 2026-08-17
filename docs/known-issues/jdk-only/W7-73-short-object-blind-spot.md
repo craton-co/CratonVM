@@ -59,6 +59,97 @@ was validated against W7-68 §2 before it was trusted: `Pattern` 20, `ZipEntry` 
 > Nothing in §1, §2, §4, §5, §6 or §7 changes — the mechanism findings are
 > re-read and hold. The arithmetic and the line numbers are what moved.
 
+> **SOURCE-VERIFICATION BANNER — 2026-08-12, triage pass (A28). §3.3's quoted
+> comment is NOT "a correct description of the synthetic image", and the symbol
+> it cites as its authority does not exist.**
+>
+> §3.3 quotes the two carrier-thread sites' comment — *"synthetic
+> `java/lang/Thread` is 5 slots (see
+> `classloading::class_manager::synthetic_field_count`): `name=0, priority=1,
+> tid=2, target=3, virtualFlag=4`"* — and grants it *"a correct description of
+> the synthetic image"*, locating the whole defect in the real image. **Both
+> halves of that concession are wrong, and it is the tidier example of the very
+> thing §3.3 is about.** Read against the tree:
+>
+> 1. **`synthetic_field_count` does not exist.** Not in
+>    `classloading/src/class_manager.rs`, not anywhere in the workspace. The only
+>    three occurrences of the name are the three comments that cite it as their
+>    authority: `native-builtins/src/lib.rs:6677`,
+>    `native-builtins/src/vertx_eventloop.rs:710`,
+>    `native-builtins/src/xnio_io_thread.rs:938`. A citation nothing resolves is
+>    how a stale map keeps its authority after the thing it described is gone.
+> 2. **The synthetic width is not 5. It is 8.** The `"java/lang/Thread"` arm of
+>    `ClassManager::synthetic_stub_fields` (`class_manager.rs:12857`) is
+>    `instance_fields(4)` plus four pushes: `contextClassLoader`(4), `_f5`(5),
+>    `threadLocals`(6), `inheritableThreadLocals`(7).
+> 3. **Slot 4 is not the virtual flag.** It is `contextClassLoader`, on the
+>    fabricated class *and* on the real one — that agreement is deliberate, the
+>    2026-08-05 alignment. The flag is at **5**:
+>    `jdk25_concurrency.rs:196`, `pub const SYNTHETIC_THREAD_VIRTUAL_SLOT: usize
+>    = 5`, whose own doc opens *"It is not slot 4."*
+>
+> So the synthetic `java/lang/Thread` width is declared in **three** places with
+> **three different values**, none of which is the fabricated class's:
+>
+> | declaration | value | says the flag is at |
+> |---|---:|---:|
+> | `native-builtins/src/lib.rs:6682` `SYNTHETIC_THREAD_MIRROR_SLOTS` | 5 | 4 (in its doc) |
+> | `jdk25_concurrency.rs:222` `THREAD_SYNTHETIC_NUM_FIELDS` | 6 | 5 |
+> | `class_manager.rs:12857` — the fabrication itself | **8** | 5 (`_f5`, anonymous) |
+>
+> **Why this is not merely untidy.** W7-74's repair of these two sites routes
+> through `try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)` and then
+> branches on `thread_mirror_is_synthetic_layout` → `is_synthetic_thread_layout`
+> (`native-builtins/src/lib.rs:6460`), which is `num_fields <= 8`. The funnel
+> clamps the request up to the fabricated width, so in synthetic mode the mirror
+> arrives at **exactly 8** and the predicate holds **by one slot**. Add a ninth
+> field to the fabricated `java.lang.Thread` — a one-line change in a file three
+> crates away, of exactly the kind that has been made four times in this arm's
+> history — and every synthetic-mode carrier mirror silently takes the *real*
+> image arm, driving `Thread.<init>(ThreadGroup, Runnable, String)` against a
+> fabricated stub. Nothing gates the coupling: `SYNTHETIC_THREAD_MIRROR_SLOTS`,
+> the `<= 8` cutoff and the fabricated width are three independent literals in
+> three crates, and the doc comment that ties them together names a function that
+> does not exist. Nominations N-2 and N-3 below.
+>
+> **Verified true:** the ratchet is `BOUND = 28`
+> (`native-api/tests/layout_alias_coverage.rs:947`); `SC_OBJECT_SLOTS = 6`
+> (`native-io/src/socket_channel.rs:796`), so §3.4's `socket_channel.rs` row —
+> 6 against 10, short by 4 — reproduces; both `java/lang/Thread` carrier sites
+> are out of the population (the only surviving
+> `alloc_object(ClassId::new(0), 5)` in `vertx_eventloop.rs` is at `:2612`,
+> inside `#[cfg(test)]`), so §3.3's DONE and the banner's item 3 hold.
+>
+> **Nomination N-2 — the dangling citation, comment only, three sites.**
+> `native-builtins/src/lib.rs:6675`–`:6677`,
+> `native-builtins/src/vertx_eventloop.rs:708`–`:710`,
+> `native-builtins/src/xnio_io_thread.rs:936`–`:938`. In each, the exact old text
+> is the parenthesised citation plus the map that precedes it:
+>
+> ```text
+> name=0, priority=1, tid=2, target=3, virtualFlag=4`
+> (`classloading::class_manager::synthetic_field_count`).
+> ```
+>
+> (three renderings, differing only in comment leader and line wrapping — match
+> the `synthetic_field_count` line and the `virtualFlag=4` immediately above it
+> in each file). Exact new text, same leaders:
+>
+> ```text
+> name=0, priority=1, tid=2, target=3, contextClassLoader=4, virtual=5`
+> (the `"java/lang/Thread"` arm of
+> `ClassManager::synthetic_stub_fields`, which declares EIGHT fields, not five,
+> and `jdk25_concurrency::SYNTHETIC_THREAD_VIRTUAL_SLOT` = 5. There is no
+> `synthetic_field_count`; this comment cited it until 2026-08-12).
+> ```
+>
+> **Nomination N-3 — the ungated coupling.** A source gate in
+> `native-builtins/tests/` (another lane's directory) asserting that the
+> `"java/lang/Thread"` arm of `synthetic_stub_fields` declares a width for which
+> `is_synthetic_thread_layout` still answers `true`. That is the one claim
+> `alloc_carrier_thread_mirror`'s correctness rests on and the only one nothing
+> checks. It is a gate, not a renumber: none of the three literals should move.
+
 ---
 
 ## 1. The clamp-after-detect analysis: CONFIRMED, and one correction

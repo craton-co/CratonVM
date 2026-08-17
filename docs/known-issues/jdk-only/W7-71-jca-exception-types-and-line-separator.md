@@ -316,8 +316,12 @@ defect with a much wider blast radius. Measured: **they are not.**
   on every path where `line.separator` is seeded, which is every normal path.
 * `%n` in `String.format` / `Formatter` / `printf` — three sites, all
   `if cfg!(windows) { "\r\n" } else { "\n" }`. Correct on Windows.
-* `System.lineSeparator()` — two registrations; the property-driven one wins in
-  both modes. Correct.
+* `System.lineSeparator()` — two **method** registrations
+  (`native-builtins/src/lib.rs:10551` and `:23349`); both are property-driven
+  with a platform-correct fallback, so which one wins does not matter. A third
+  site, `lang_system.rs:4122`, is not a registration at all — it seeds the
+  `java/lang/System.lineSeparator` **static field** during `initPhase1`, and it
+  is property-driven too. Correct on all three. (Re-checked 2026-08-12; §11.)
 * `line.separator` seeding in `vm_init` — `"\r\n"` on Windows. Correct, and it is
   the authority the four fallbacks exist below.
 
@@ -523,3 +527,36 @@ reported as success, and a write past the end of the caller's array. The third
 branch of *raise it, raise something else, or raise nothing* is where the silent
 wrong answers live, and it is the branch a diff of two exception names cannot
 have.
+
+---
+
+## 11. Source re-verification, 2026-08-12 (A15)
+
+Read, not run. **Status is unchanged: FIXED in source, still NOT verified
+against a binary.** This section only establishes that the source today says
+what §1–§4 claim it says, so a later reader does not have to re-derive it before
+running §8.
+
+| claim | where | today |
+| --- | --- | --- |
+| §1 RSA errors carry the JCA class | `native-builtins/src/crypto_impl.rs:2517` | `RsaCipherError` present, three variants mapping to `IllegalBlockSizeException` / `BadPaddingException` / `InvalidKeyException` |
+| §3 verifier table gained the `javax.crypto` half | `classloading/src/class_manager.rs:10739`, `:10744` | `javax/crypto/BadPaddingException` present; `AEADBadTagException` → `BadPaddingException`, **not** flattened to `GeneralSecurityException` |
+| §3 `UnrecoverableKeyException` superclass | `class_manager.rs:10717` | → `java/security/UnrecoverableEntryException`. Corrected |
+| §3 `InvalidKeySpecException` under its real name | `class_manager.rs:10709` | `java/security/spec/InvalidKeySpecException` present |
+| §3 ratchet exists | `class_manager.rs:17191` | `jca_exception_hierarchy_matches_hotspot` present, including the AEAD link and the negative arms |
+| §4 #1 `Files.write(Path, Iterable)` | `phases_late/nio_file.rs:7454` | `p57_line_separator` exists; both call sites (`:6346`, `:7379`) are inside `register_phase57_nio_file` |
+| §4 #2 bootstrap property fallback | `native-builtins/src/lib.rs:127` | `"\r\n"` on Windows. The identical-arms `cfg!` is gone |
+| §4 #3 `host_line_separator` | `native-builtins/src/lib.rs:26652` | property-driven, `"\r\n"` fallback on Windows |
+| §4 #4 `native_bw_new_line` (losing registrar) | `native-io/src/lib.rs:3109` | corrected, and the comment states it is the losing registration |
+| §4 #5 `build_store_text` | `properties_sidetable.rs:3450` | property-driven with a platform fallback |
+| §7 residual: `%n` decides at compile time | `lang_string.rs:6092`, `:6500`, `lib.rs:41775` | **still three sites, still compile-time.** Residual stands |
+
+One phrasing correction landed in §4.2: `System.lineSeparator` has two *method*
+registrations plus a static-field seed, not "two registrations". The substance
+was right — every one of the three is property-driven — but the count was
+counting two different kinds of thing, which is the shape that makes a "which
+one wins" argument unfalsifiable.
+
+**Nothing in §1–§6 is retired by this pass**, because none of it can be:
+retirement here needs the §8 binary run, and this lane could not build either.
+The record's own header already says so and it stays.

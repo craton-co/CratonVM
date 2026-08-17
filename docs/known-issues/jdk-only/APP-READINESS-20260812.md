@@ -1,5 +1,31 @@
 # App readiness under `--jdk-only` — what stops a real Java application today
 
+> **RECONCILED 2026-08-17 (in-session) — §2's three harness caveats are all
+> stale, and following them now costs work rather than saving it.** MEASURED on
+> `e7e840264` (`C:/craton/target-rel5`, `--jdk-only`):
+>
+> * **A POSIX-shaped path works.** `--jdk-only-report /c/craton/CratonVM1/...`
+>   resolved to `C:\craton\CratonVM1\...` and wrote 469,035 bytes;
+>   `/tmp/rep1.json` resolved to the MSYS temp and wrote the same. The
+>   `os error 3` this document describes does not reproduce.
+> * **`System.exit` no longer loses the report.** A probe whose `main` ends in
+>   `System.exit(3)` wrote a 453,098-byte report and printed
+>   `[cratonvm] wrote JDK-only census on System.exit`. `set_pre_exit_hook` ->
+>   `write_jdk_only_dumps_on_exit` is wired, and `jdk_only_dumps_written()`
+>   makes the two writers first-caller-wins so they cannot both fire.
+>   **The `-Dprobe.noexit=1` escape every probe here grew is no longer needed.**
+> * **The exit code is HotSpot's.** `System.exit(3)` gives 3 on both VMs.
+>
+> One real asymmetry survives and is NOT fixed: the `System.exit` line says only
+> `wrote JDK-only census on System.exit`, while the ordinary path reports the
+> violation, compatibility-class and refusal-event counts. Two runs of the same
+> workload therefore print different information depending on how the program
+> ended. Recorded here rather than fixed, because the counts are read off the
+> file in every use this directory makes of them.
+>
+> §3 onward is untouched by this note.
+
+
 **Measured 2026-08-12 on this Windows host.** Everything below was RUN. No row
 in this document is inferred from source reading alone; where source is quoted
 it is to name a mechanism whose *effect* was measured first.

@@ -438,6 +438,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "irslot", on_key: Some("CRATONVM_DBG_IRSLOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "isinstance", on_key: Some("CRATONVM_DBG_ISINSTANCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jar", on_key: Some("CRATONVM_DBG_JAR"), off_key: None, off_word: None },
+    // Scalar, not a boolean: `=<n>` raises the `--jdk-only` shadow-observation
+    // sink above its 256-row default so an APPLICATION census is complete
+    // rather than truncated. Diagnostic only — it changes nothing a program can
+    // observe. Declared rather than read through bare `getenv` so it comes from
+    // the latched snapshot like every other knob; see the doc on
+    // `vm::jdk_only_native_shadow_cap`.
+    E { group: Group::DBG, token: "native-shadow-sink-cap", on_key: Some("CRATONVM_NATIVE_SHADOW_SINK_CAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jetty", on_key: Some("CRATONVM_DBG_JETTY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jetty2", on_key: Some("CRATONVM_DBG_JETTY2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-alloc", on_key: Some("CRATONVM_DBG_JIT_ALLOC"), off_key: None, off_word: None },

@@ -1031,6 +1031,22 @@ impl ModuleRegistry {
         self.modules.keys().cloned().collect()
     }
 
+    /// True when this module was registered by the APPLICATION class-path scan
+    /// and nothing re-registered it as explicit.
+    ///
+    /// `ClassManager::new` stamps `automatic = true` for every
+    /// `module-info.class` it finds on the app class path; `vm_init` then
+    /// re-registers each genuine `--module-path` module with
+    /// `automatic = false`. So within this VM `automatic` is not a JPMS
+    /// automatic-module flag in the JDK's sense — it is the record of WHERE the
+    /// descriptor came from, and that is the question the module system has to
+    /// ask before treating a descriptor as real.
+    pub fn is_class_path_only(&self, module_name: &str) -> bool {
+        self.modules
+            .get(module_name)
+            .is_some_and(|desc| desc.automatic)
+    }
+
     /// Return all provider implementation classes for a given service interface.
     ///
     /// Walks every registered module's `provides` declarations looking for

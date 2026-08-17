@@ -594,3 +594,83 @@ serves, the `signature_name_is_offered` disjunction has lost its second arm —
 i.e. `find_service_provider` is answering `None` because the provider chain, not
 the service map, is short. The repair in that case is to seed the missing
 service, in one place, where `Security.getAlgorithms` will report it too.
+
+## 11. Third pass, 2026-08-12 (record triage, doc-only — nothing built or run)
+
+A source read of today's tree, stated as such. Line numbers are today's.
+
+**§3 #2's remaining residual is DISCHARGED.** The correction block closes with
+*"Not done … the one-line repair is to fold `SHAKE128` → `SHAKE128256` and
+`SHAKE256` → `SHAKE256512` into `compute_digest`'s `upper`"*. That is applied:
+`native-builtins/src/lib.rs:36461-36479`, immediately after the `-`/`/` strip and
+before the `match`, with the reasoning and the cross-reference at the site. It is
+written as `if`/`else` rather than a `match` arm, and the comment says why (the
+`match` form moves `upper` out of an arm while the scrutinee still borrows it —
+an `E0505`). So the synthetic-mode door is now shut for the aliases too, and the
+`getInstance`-admits-but-`digest()`-refuses window that residual described is
+closed in source. **Unbuilt** — no `--synthetic-jdk` binary exists to see it.
+
+**Everything else §3 claims is present**: `canonical_algorithm`
+(`native-builtins/src/jca/message_digest.rs:539`) with
+`the_shake_aliases_resolve_but_are_not_separate_algorithms` (`:758`),
+`shake_normalisations_agree_across_the_two_filters` (`:823`),
+`shake_matches_hotspot_vectors` (`:846`), `real_md2_matches_hotspot_vectors`
+(`native-builtins/src/lib.rs:43383`), and all three §6 ratchets
+(`provider_chain.rs:4355`, `:4421`, `:4463`). Both umbrellas are de-advertised
+with the reasoning in place at `provider_chain.rs:1111-1137` and `:1265-1277`.
+
+**§8's three-arm correction: its PREMISE was checked, not taken on trust.** The
+middle arm rests on the claim that the six `unmodifiable*` factories carry
+`SyntheticStub`. They do, explicitly:
+`native-collections/src/lib.rs:51674-51692` opens a
+`set_category(NativeKind::SyntheticStub)` window around exactly those six and
+says so in a comment that scopes it away from the `empty*`/`singleton*`/
+`synchronized*` neighbours in the same registrar. So `--jdk-only` really does
+drop them and really does run the JDK's own `Collections` bytecode.
+
+**Independent corroboration of the hazard §8 reasons about, from today's
+census.** `P1-BASELINE-20260812.md` records `cratonvm/internal/UnmodifiableMap`
+as **P1-B**, one of the nine measured families that block `--jdk-only` — the
+strict refusal of a `cratonvm/internal/*` stand-in is therefore observed, not
+inferred. It is **not** a counter-example to the arm table above: P1-B's producer
+is a different one, `System.getenv()`'s
+`try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2)` at
+`native-builtins/src/lang_system.rs:3306`, not the `Collections` registrar. Both
+things are true at once, and the pair is the sharpest statement of §8's warning:
+the refusal is real and measured, so anyone retagging that window away from
+`SyntheticStub` would land `wrap_unmodifiable`'s `_ => set` fallback on a real
+refusal and silently hand back the mutable `HashSet`.
+
+**§9's `PASS RJdkSecurity (80 checks)` arithmetic verified statically.**
+`regression-suite/src/RJdkSecurity.java` has 77 `check(...)` call sites, and
+exactly one of them runs more than once — the four-name `Signature` loop at
+`:421-430` — giving 80. `advertisedVersusServed()` (`:346-445`) contributes
+19 = 3 (MD2) + 4 (the two SHAKE primaries, length and bytes) + 2 (the two
+aliases) + 3 (the advertised-set membership triple) + 1 + 1 (the two
+advertised-implies-serviceable loops, one check each) + 4 (`Signature`) + 1
+(unmodifiable), over the stated 61. No check sits inside a provider-list-sized
+loop, deliberately (`:392-394`). This is arithmetic, not a run.
+
+**Two things the fixture still leaves as prints rather than assertions.**
+
+* **The check count is printed, never asserted** (`:454`). `RJdkProcess` learned
+  this lesson in `W7-46` §1 — *a printed integer is evidence only for as long as
+  someone is reading it* — and holds `EXPECTED_CHECKS` as a constant it asserts
+  before printing. `RJdkSecurity` has no such constant, so a `check` that stops
+  running lowers a number in a transcript and nothing fails. Since the count is
+  loop-invariant by design (above), the constant is safe here. Nominated with
+  this pass.
+* **`CK RJdkSecurity … digests=` prints a VM-dependent value** (`:443-444`). It
+  is diff-safe only while the advertised `MessageDigest` set is exactly HotSpot's
+  15 — the oracle transcript's `A.MessageDigest.n = 15`
+  (`probes/JcaAdvertisedVsServedProbe.expected.txt:64`), which this branch's
+  13 → 15 was written to match. If either side's provider list drifts by one
+  name, this surfaces as an unexplained cross-VM `CK` diff rather than as a named
+  assertion. Small, recorded rather than changed.
+
+**Scheduling, per §9's own claim: confirmed.** `RJdkSecurity` is in
+`JDKONLY_CLASSES` (`regression-suite/run.sh:119`), so everything in
+`advertisedVersusServed()` runs on all three arms. `probes/` is scheduled by
+nothing — the string `probes` does not occur in `regression-suite/run.sh` at any
+`SUITE=` value — so `JcaAdvertisedVsServedProbe` remains a hand-run instrument,
+exactly as §9 says.

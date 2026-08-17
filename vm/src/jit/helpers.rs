@@ -5721,6 +5721,21 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
 /// returns `false` and the store proceeds — the pre-fix behaviour, in the rare
 /// construction-failure case only.
 ///
+/// **IMPRECISE, not merely UNPROVEN — and the difference is a measured
+/// defect.** `RArrayStoreInterfaces` s12 (`Runnable[] <- Proxy(Marker)`)
+/// answered `no-throw` in `cold` AND `hot` where HotSpot 25.0.3+9-LTS throws
+/// `ArrayStoreException`: the predicate held a `$Proxy`-named blanket that
+/// admitted every dynamic proxy into every interface-typed array. A generated
+/// `$ProxyN`'s interface set is not imprecise information — it is recorded on
+/// `ClassOrigin::GeneratedProxy` by the code that generated the class — so the
+/// blanket was scoped to proxies whose set the VM does NOT hold, and the store
+/// above is now refused. **Nothing in this file changed to achieve that**, and
+/// that is the load-bearing observation: the identical `cold`/`hot` divergence
+/// is what proved the defect was in the shared predicate rather than in
+/// lowering, and the identical fix in both tiers follows from this call being
+/// the compiled tier's ONLY type question. See
+/// `docs/known-issues/jdk-only/G12-1-the-proxy-that-any-interface-array-accepted-20260817.md`.
+///
 /// # SAFETY
 ///
 /// `vm_ptr` must be a live `SharedVm`; `array_ptr` and `val` must be live heap
@@ -5735,19 +5750,62 @@ unsafe fn aastore_store_is_refused(vm_ptr: i64, array_ptr: i64, val: i64) -> boo
     if crate::runtime::interpreter::aastore_element_assignable(vm, array_ref, value_ref) {
         return false;
     }
+    // W8-E11-1: the raw `get_class(class_id_of(value_ref)).name` lookup that
+    // used to stand here was the THIRD twin of a defect the interpreter's two
+    // `aastore` arms had already had fixed (W8-E6-1). On a reference array the
+    // header class id holds the COMPONENT's class BY DESIGN — stated in
+    // `typecheck::array_descriptor_of` and again on `cce_display_class_name`,
+    // where the same trap once produced `java.lang.String cannot be cast to
+    // java.lang.String` and cost a session as a supposed class-identity split.
+    // So for an array-valued element the message was off by exactly one array
+    // dimension, and right for everything else.
+    //
+    // HotSpot's rule is `Klass::external_name()` of the VALUE'S OWN class.
+    // MEASURED, JDK 25.0.3 (`scratchpad/e11/AseName.java`, one execution per
+    // shape so nothing is in the fast-throw regime):
+    //
+    //   String[]   <- Integer      java.lang.Integer
+    //   String[]   <- AseName$Inner  AseName$Inner      (binary-with-dots, `$` kept)
+    //   String[]   <- Plain        Plain                (default package)
+    //   String[][] <- Integer[]    [Ljava.lang.Integer;
+    //   String[][] <- String[][]   [[Ljava.lang.String;
+    //   String[]   <- Plain[]      [LPlain;
+    //   String[][] <- int[]        [I
+    //   String[][] <- int[][]      [[I
+    //   String[][] <- byte[]       [B
+    //
+    // Reuse `cce_display_class_name` rather than writing a fourth spelling of
+    // this parse: it is the same "Java-visible class name for a VM-minted type
+    // error" question `checkcast` and the two interpreter `aastore` arms ask,
+    // it reconstructs the descriptor via `array_descriptor_of`, and it carries
+    // the `UnmodifiableMap` storage-stamp translation that keeps a VM-internal
+    // class out of an app-visible message.
+    //
+    // It returns the INTERNAL (slashed) name and that is what we want here.
     // W7-37: raise through `throw_runtime_error`, the single funnel every
-    // VM-minted `RuntimeError` passes through. The funnel is where the message
-    // gains HotSpot's EXTERNAL class name — minting the throwable here printed
+    // VM-minted `RuntimeError` passes through, which is where the message gains
+    // HotSpot's EXTERNAL class name — minting the throwable here printed
     // `java/lang/Integer` where HotSpot and the interpreter's own `aastore`
     // print `java.lang.Integer`, and callers regex that message and feed the
-    // capture to `Class.forName`.
-    let elem_cls = vm
+    // capture to `Class.forName`. The funnel's `rewritable` predicate
+    // (`contains('/') && no whitespace`) correctly leaves `[I` / `[[I` / `[B`
+    // and a default-package name such as `[LPlain;` alone.
+    //
+    // Two statements, not one: `cce_display_class_name` takes the class-manager
+    // read lock itself, so the guard from the name lookup must be dropped
+    // first.
+    let raw_elem_name = vm
         .classes
         .class_manager
         .read()
         .get_class(vm.mem.heap.class_id_of(value_ref))
         .map(|c| c.name.to_string())
         .unwrap_or_else(|| "?".to_string());
+    let elem_cls = crate::runtime::interpreter::cce_display_class_name(
+        vm,
+        value_ref,
+        &raw_elem_name,
+    );
     if let Some((thread, _guard)) = jit_thread_mut() {
         use crate::error::MethodCallFailed;
         if let MethodCallFailed::ExceptionThrown(exc) =
@@ -5838,31 +5896,37 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     }
     // JVMS §aastore covariance check: a non-null element whose runtime type is
     // NOT assignment-compatible with the array's component type must throw
-    // ArrayStoreException. Mirror the interpreter `aastore` opcode so JIT and
-    // interpreter agree. `aastore_element_assignable` fails open on imprecise
-    // type info, so this is additive (never a false ArrayStoreException) — the
-    // store still proceeds below for null elements and assignable references.
+    // ArrayStoreException. It runs AFTER the null and bounds checks above and
+    // BEFORE the barrier and store below — that order is the JVMS §6.5
+    // precedence (NPE → AIOOBE → ASE), and getting it wrong is not theoretical:
+    // `RArrayStoreTiers` s15 caught the interpreter fast path reporting ASE for
+    // a past-the-end index.
     //
-    // W7-37 residual, measured 2026-08-12: **on x64 this arm does not run at
-    // all**, because nothing calls this function. `jit/src/x64/bytecode_walk.rs`
-    // lowers `aastore` (0x53) inline — null check, bounds check, SATB pre-write
-    // barrier, `MOV [array + index*8 + HEADER_SIZE], val`, card mark — and never
-    // reaches `self.helpers.aastore`. The comment at that arm justified the
-    // inline path with "the current `jit_aastore` helper does NOT enforce the
-    // ASE check … no regression"; that premise was true when it was written and
-    // was falsified when this check landed here, silently, because a premise in
-    // a comment is not a compile-time link. `RExceptions`'s tier-parity
-    // assertion reads `cold=[java.lang.Integer] hot=[no-throw]` at i=500 as a
-    // result: the compiled store completes and raises nothing.
+    // The rule itself lives in `aastore_store_is_refused`, shared with
+    // `jit_aastore_type_check` — what the x64 inline lowering calls — so the
+    // full helper and the inline path can never again enforce different rules.
+    // It was EXTRACTED rather than copied, because the way this whole defect
+    // arose was one JVMS rule implemented twice, each copy citing a property of
+    // the other that the build could not check. There must stay exactly ONE
+    // ArrayStoreException check and ONE message builder in this crate.
     //
-    // So do NOT read the funnel routing below as "the JIT and the interpreter
-    // now print the same text". They do — but only once the emitter calls this
-    // helper. See docs/known-issues/jdk-only/W7-37-differential-throwable-and-vm.md
-    // §"Part 4" for the codegen change that wires it up.
-    // JVMS §aastore covariance check — see `aastore_store_is_refused`, which
-    // is shared with `jit_aastore_type_check` so the full helper and the x64
-    // inline lowering can never again enforce different rules.
+    // A comment that used to stand here said "on x64 this arm does not run at
+    // all, because nothing calls this function". That is still true of THIS
+    // function: `jit/src/x64/bytecode_walk.rs`'s `0x53` arm lowers `aastore`
+    // inline and calls `jit_aastore_type_check`, never `self.helpers.aastore`.
+    // What is no longer true is the conclusion once drawn from it — that the
+    // funnel routing below is not what the JIT prints. It is: the emitter's
+    // check and this one are the same body. If that ever stops being so,
+    // correct the prose in the same commit; a premise stated in a comment is
+    // not a compile-time link, and this pair of comments spent months asserting
+    // incompatible things about each other. See
+    // docs/known-issues/jdk-only/W7-37-differential-throwable-and-vm.md
+    // §"Part 4" for the codegen change, and
+    // docs/known-issues/jdk-only/W7-38-jit-aastore-never-called-its-own-check.md for the
+    // defect itself.
     if val != 0 && aastore_store_is_refused(vm_ptr, array_ptr, val) {
+        // Refused; an ArrayStoreException is pending on this thread. No
+        // element is written and no barrier runs on the exception path.
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * ref_element_size()) as *mut u8;
@@ -11941,6 +12005,169 @@ static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     declaring_class_id: 0,
 };
 
+/// Every registry triple this file can reach through a **thin direct-call
+/// helper**, i.e. every slot whose `invocations` column is a floor rather than
+/// a total once the JIT is wired in this VM.
+///
+/// A site `jit::try_compile` binds to one of these helpers reaches the native's
+/// semantics without ever redeeming a `NativeMethodId`, so
+/// [`NativeMethodRegistry::record_invocation`] is never called for it. Only the
+/// helpers' own `jit_invoke_dispatch` fallbacks count, and a warm site does not
+/// take them. MEASURED
+/// (`docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`
+/// §2): 100,000 `HashMap.put` calls report **2,000** with the JIT on against
+/// **100,000** under `--nojit`, and the JIT figure does not move with the
+/// workload size or with `CRATONVM_JIT_THRESHOLD` — it is frozen at the count
+/// reached before the enclosing loop was compiled.
+///
+/// **This list is the source-verified sweep of this file, and it is longer than
+/// the two helpers `G33-1` §8 N1 nominated.** `jit_integer_value_of_direct`,
+/// `jit_integer_int_value_direct` and `jit_thread_current_thread_direct` return
+/// from their fast arms without counting too. `G33-1` §2's remark that "the
+/// `Integer` siblings in the same file route through `call_integer_native_raw`"
+/// is true of the `jit_invoke_dispatch` route ONLY: the standalone direct
+/// helpers are separate bodies that never enter that wrapper. The same section
+/// read `StringLatin1.toLowerCase` counting exactly and concluded "the
+/// direct-call family is not uniformly broken"; the body of
+/// `jit_string_latin1_to_lower_direct` contains no census call at all, so that
+/// probe's exact figure must have come from sites that never bound the helper,
+/// not from the helper counting.
+///
+/// Both `ConcurrentMap.get` and `ConcurrentHashMap.get` are listed. They are
+/// two registry slots holding the same `native_chm_get`;
+/// `CONCURRENT_HASHMAP_GET_DIRECT_INFO` names the interface while
+/// `jit_concurrent_hashmap_get_direct`'s fast arm only fires for an exact
+/// `ConcurrentHashMap` receiver, so the row that loses the call is whichever of
+/// the two the fallback would have resolved. A triple that is not registered in
+/// this VM simply does not resolve and is not marked.
+///
+/// [`NativeMethodRegistry::record_invocation`]: cratonvm_native_api::NativeMethodRegistry::record_invocation
+const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 8] = [
+    // `jit_integer_value_of_direct` — TLAB-allocated wrapper, and the cold arm
+    // that calls `intrinsic_integer_value_of` through `safe_native_call`
+    // directly. Neither counts.
+    ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+    // `jit_integer_int_value_direct` — heap-validated field-0 read.
+    ("java/lang/Integer", "intValue", "()I"),
+    // `jit_hashmap_put_direct` / `jit_hashmap_get_direct` — the overlay probe
+    // and the `safe_native_call_prevalidated_objects` arm below it.
+    (
+        "java/util/HashMap",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/HashMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    // `jit_string_latin1_to_lower_direct` — delegates to
+    // `lang_string::jit_string_to_lower_case` without touching the registry.
+    (
+        "java/lang/StringLatin1",
+        "toLowerCase",
+        "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+    ),
+    // `jit_concurrent_hashmap_get_direct` — calls `native_chm_get` directly.
+    (
+        "java/util/concurrent/ConcurrentMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    // `jit_thread_current_thread_direct` — returns the per-thread mirror. It
+    // bumps `JIT_FUNNEL_BYPASS_HITS`, which is a different instrument: that
+    // counter answers "did compiled code take this path", not "how many
+    // Java-level calls did this registry slot serve".
+    ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
+];
+
+/// Declare every [`DIRECT_CALL_HELPER_NATIVES`] slot's `invocations` count
+/// incomplete for `shared`, so the census labels those rows a floor instead of
+/// leaving the reader to know this file exists.
+///
+/// # Why here, and why not a per-call counter
+///
+/// This runs from [`build_helpers_opt`], at the point the helper addresses are
+/// published into `cratonvm_jit`'s `*_DIRECT_FN` cells — the closest thing this
+/// side of the boundary has to a bind event, and the last moment before a
+/// compiled site can be pointed at one of these bodies. It is cold by
+/// construction: a JIT compile is orders of magnitude more expensive than the
+/// eight triple hashes below, and the latch makes even those once per (VM,
+/// registry generation).
+///
+/// The alternative — `record_invocation` inside each helper — was measured and
+/// rejected. `G33-1` §5: **+9.2 ns/call** against a 1.25 ns baseline, ~6% of the
+/// ~141 ns Rust native-call boundary but plausibly *the entire margin* a thin
+/// direct-call helper exists to buy. Paying it here would partly undo
+/// `perf/halfgap-20260717`. A bit set once and read only at report time costs
+/// nothing per call and turns a number that lies into a number that says "at
+/// least".
+///
+/// # What the bit claims
+///
+/// That a bypassing path is **wired** for the slot, not that a bypassing
+/// dispatch has **happened**. That is the statically true statement, and it is
+/// the one that survives: whether a given compile binds a given site is a fact
+/// no report-time reader can recover. Under `--nojit` nothing calls
+/// `build_helpers*` at all, so those runs keep an unmarked — and, for these
+/// slots, exact — census.
+///
+/// # The latch
+///
+/// Keyed on `(vm_identity, registry generation)`, the same pair
+/// `jit_invoke_dispatch`'s site cache uses, so a `RegisterNatives` that adds one
+/// of these triples after the first compile is picked up on the next one. Races
+/// between two compiling threads can only cause the marking to be *repeated*,
+/// never skipped for a VM that was never marked: `MARKED_VM` is stored after the
+/// marks, so observing it means some thread has already marked that VM.
+/// `mark_invocations_incomplete` is idempotent and sticky, so a repeat is a
+/// no-op.
+fn mark_direct_call_helper_natives_incomplete(shared: &crate::vm::SharedVm) {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    static MARKED_ANY: AtomicBool = AtomicBool::new(false);
+    static MARKED_VM: AtomicUsize = AtomicUsize::new(0);
+    static MARKED_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+    let registry = &shared.natives.native_methods;
+    let generation = registry.generation();
+    if MARKED_ANY.load(Ordering::Relaxed)
+        && MARKED_VM.load(Ordering::Relaxed) == shared.vm_identity
+        && MARKED_GENERATION.load(Ordering::Relaxed) == generation
+    {
+        return;
+    }
+    mark_direct_call_helper_natives_incomplete_in(registry);
+    MARKED_VM.store(shared.vm_identity, Ordering::Relaxed);
+    MARKED_GENERATION.store(generation, Ordering::Relaxed);
+    MARKED_ANY.store(true, Ordering::Relaxed);
+}
+
+/// The registry half of [`mark_direct_call_helper_natives_incomplete`], split
+/// out so the marking can be driven against a registry built in a test rather
+/// than only through a live `SharedVm` and a JIT compile.
+///
+/// Returns how many of [`DIRECT_CALL_HELPER_NATIVES`] resolved in this registry.
+/// A triple that does not resolve is not an error: `register_collections_natives`
+/// is a separate registrar from `register_essential_natives`, and a VM that
+/// registered neither still gets a correct — empty — set of marks.
+fn mark_direct_call_helper_natives_incomplete_in(
+    registry: &cratonvm_native_api::NativeMethodRegistry,
+) -> usize {
+    let mut marked = 0usize;
+    for &(class_name, method_name, descriptor) in DIRECT_CALL_HELPER_NATIVES.iter() {
+        if let Some(id) = registry.resolve_id(class_name, method_name, descriptor) {
+            registry.mark_invocations_incomplete(id);
+            marked += 1;
+        }
+    }
+    marked
+}
+
 thread_local! {
     static CONCURRENT_HASHMAP_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
@@ -12208,6 +12435,12 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
 /// `toLowerCase(TURKISH)` call silently changed its answer when its caller
 /// tiered up — the interpreter said `tıtle`, the compiled code `title`.
 ///
+/// That fix was one layer too shallow: the delegate called `string_case_impl`,
+/// BELOW the null-`Locale` check, so `toLowerCase((Locale) null)` threw
+/// interpreted and answered the default-locale string compiled. Measured on
+/// OpenJDK 25.0.3+9, the oracle throws on the 200 000th warm iteration too.
+/// See `docs/known-issues/jdk-only/E18-1-the-jit-facing-string-doors-and-the-fourth-copy-of-one-search-rule.md`.
+///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     vm_ptr: i64,
@@ -12224,24 +12457,48 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     let Some(source) = vm.mem.heap.is_object_address(source as usize) else {
         return 0;
     };
-    // A null / non-heap Locale means "default locale", exactly as the
-    // interpreted native treats a missing argument.
+    // A `locale` of 0 is an explicit `null` Locale ARGUMENT, not "no argument":
+    // the only descriptor bound to this helper,
+    // `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)`, has a
+    // MANDATORY third parameter, so "absent" is not a state this site can be
+    // in. `lang_string::jit_string_to_lower_case` now goes through the same
+    // `string_case_native` the interpreted native does and throws for it —
+    // E18-1 §1. It used to sit one layer below that check and answer the
+    // default-locale string, so the same source line threw while interpreted
+    // and stopped throwing once its caller tiered up.
     let locale_obj = if locale == 0 {
         None
     } else {
-        vm.mem.heap.is_object_address(locale as usize)
+        // A non-zero address the heap does not recognise gets the same
+        // treatment `source` gets six lines above: bail, do not guess.
+        let Some(obj) = vm.mem.heap.is_object_address(locale as usize) else {
+            return 0;
+        };
+        Some(obj)
     };
     let Some((thread, _guard)) = jit_thread_mut() else {
         return 0;
     };
-    let mut ctx = crate::vm::NativeContextImpl {
-        shared: vm,
-        thread: &mut *thread,
+    // Scoped so `thread` can be re-borrowed for the error path below, exactly
+    // as `jit_hashmap_get_direct` does.
+    let outcome = {
+        let mut ctx = crate::vm::NativeContextImpl {
+            shared: vm,
+            thread: &mut *thread,
+        };
+        cratonvm_native_builtins::lang_string::jit_string_to_lower_case(
+            &mut ctx, source, locale_obj,
+        )
     };
-    let Some(result) = cratonvm_native_builtins::lang_string::jit_string_to_lower_case(
-        &mut ctx, source, locale_obj,
-    ) else {
-        return 0;
+    let result = match outcome {
+        Ok(Some(Value::Object(Some(object)))) => object,
+        Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+        Ok(Some(_)) => return 0,
+        // The JDK's NullPointerException for a null Locale arrives here. The
+        // old code could only report it as `None`, i.e. as a null String.
+        Err(error) => {
+            return handle_jit_dispatch_error(vm, thread, error, &STRING_LATIN1_LOWER_DIRECT_INFO)
+        }
     };
     thread.native_pending_return = Some(result);
     result.as_ptr() as i64
@@ -15366,6 +15623,196 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // §4 census — the thin direct-call helpers declare themselves uncounted
+    // (docs/known-issues/jdk-only/G37-1-marking-the-bypasses-20260817.md)
+    // -----------------------------------------------------------------------
+
+    fn census_probe_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(None)
+    }
+
+    /// Every helper the JIT can bind a call site to must be on the bypass list.
+    ///
+    /// The list is the only thing standing between a reader and a census row
+    /// that claims an exact `invocations` count it cannot deliver, and it is a
+    /// hand-written table over the same triples the `JitInvokeInfo` statics
+    /// carry. A helper added with a new `*_DIRECT_INFO` and no list row fails
+    /// silently and in the one direction `mark_invocations_incomplete`'s doc
+    /// says this instrument must never err.
+    ///
+    /// Note what this test does NOT assert: that every list row has an info.
+    /// `ConcurrentHashMap.get` deliberately has none — see
+    /// [`DIRECT_CALL_HELPER_NATIVES`] for why both concurrent-map slots are
+    /// listed while only the interface one appears in a `JitInvokeInfo`.
+    #[test]
+    fn every_thin_direct_call_helper_is_on_the_census_bypass_list() {
+        for info in [
+            &INTEGER_VALUE_OF_INFO,
+            &INTEGER_INT_VALUE_INFO,
+            &HASHMAP_PUT_DIRECT_INFO,
+            &HASHMAP_GET_DIRECT_INFO,
+            &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
+            &STRING_LATIN1_LOWER_DIRECT_INFO,
+            &THREAD_CURRENT_THREAD_INFO,
+        ] {
+            assert!(
+                DIRECT_CALL_HELPER_NATIVES
+                    .iter()
+                    .any(|&(class, method, descriptor)| {
+                        class == info.class_name
+                            && method == info.method_name
+                            && descriptor == info.descriptor
+                    }),
+                "{}.{}{} is served by a thin direct-call helper but is missing \
+                 from DIRECT_CALL_HELPER_NATIVES, so its census row would report \
+                 `invocations_complete: true` for a count the helper never \
+                 increments",
+                info.class_name,
+                info.method_name,
+                info.descriptor
+            );
+        }
+
+        // Duplicate-free. A duplicate is harmless at run time — the mark is
+        // idempotent — but it would let the count assertions below pass while
+        // one triple was covered twice and another not at all.
+        let mut seen: Vec<(&str, &str, &str)> = Vec::new();
+        for row in DIRECT_CALL_HELPER_NATIVES {
+            assert!(
+                !seen.contains(&row),
+                "DIRECT_CALL_HELPER_NATIVES lists {row:?} twice"
+            );
+            seen.push(row);
+        }
+    }
+
+    /// Marking must turn exactly the helper-served rows into floors, leave a
+    /// control row exact, and leave the tally itself alone.
+    ///
+    /// The last part is the one worth pinning: the whole design rests on the
+    /// count staying readable and staying a floor. A mark that zeroed or
+    /// otherwise disturbed `invocations` would replace an under-report with no
+    /// report, which is worse — `G33-1` §4's safe reading ("did this ever run,
+    /// through a counted path") depends on the number surviving.
+    #[test]
+    fn marking_the_direct_call_helpers_turns_their_rows_into_floors() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+            for (class, method, descriptor) in DIRECT_CALL_HELPER_NATIVES {
+                r.register(class, method, descriptor, census_probe_native);
+            }
+            // `G33-1` §2's control: a native with no direct helper, measured at
+            // exactly 100,000 of 100,000 calls in every arm. It must not pick
+            // up doubt from its neighbours.
+            r.register(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+                census_probe_native,
+            );
+        });
+
+        let control = registry
+            .resolve_id(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+            )
+            .expect("control registered");
+        let hashmap_put = registry
+            .resolve_id(
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            .expect("registered");
+
+        // Premise: nothing is marked until a bypassing path says so.
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+        // The counted dispatches this row DID see — the 2,000 of `G33-1` §2's
+        // table, in miniature.
+        registry.record_invocation(hashmap_put);
+        registry.record_invocation(hashmap_put);
+
+        let marked = mark_direct_call_helper_natives_incomplete_in(&registry);
+        assert_eq!(
+            marked,
+            DIRECT_CALL_HELPER_NATIVES.len(),
+            "every listed triple was registered above, so every one must resolve"
+        );
+
+        for (class, method, descriptor) in DIRECT_CALL_HELPER_NATIVES {
+            let id = registry
+                .resolve_id(class, method, descriptor)
+                .expect("registered");
+            assert_eq!(
+                registry.invocations_complete(id),
+                Some(false),
+                "{class}.{method}{descriptor} must report its count as a floor"
+            );
+        }
+        assert_eq!(
+            registry.invocations_complete(control),
+            Some(true),
+            "the flag is per slot: a native with no direct helper stays exact"
+        );
+        assert_eq!(
+            registry.slots_with_incomplete_invocations(),
+            DIRECT_CALL_HELPER_NATIVES.len()
+        );
+        assert_eq!(
+            registry.invocations_of_id(hashmap_put),
+            Some(2),
+            "the count must survive marking — it is the floor the reader falls \
+             back on, not a value the flag replaces"
+        );
+
+        // Idempotent: `build_helpers_for` runs once per compile, and the latch
+        // is an optimisation, not a correctness requirement.
+        assert_eq!(
+            mark_direct_call_helper_natives_incomplete_in(&registry),
+            DIRECT_CALL_HELPER_NATIVES.len()
+        );
+        assert_eq!(
+            registry.slots_with_incomplete_invocations(),
+            DIRECT_CALL_HELPER_NATIVES.len()
+        );
+
+        // The census is the door a reader actually uses. Every helper-served
+        // row must carry the doubt out through it.
+        let census = registry.census();
+        for entry in &census {
+            let listed = DIRECT_CALL_HELPER_NATIVES
+                .iter()
+                .any(|&(class, method, descriptor)| {
+                    entry.class == class && entry.name == method && entry.descriptor == descriptor
+                });
+            assert_eq!(
+                entry.invocations_complete, !listed,
+                "{}.{}{} census row: invocations_complete should be {}",
+                entry.class, entry.name, entry.descriptor, !listed
+            );
+        }
+    }
+
+    /// A registry that never registered the collection natives must still be
+    /// marked correctly — with nothing.
+    ///
+    /// `register_collections_natives` is a separate registrar from
+    /// `register_essential_natives`, and `jit::helpers` is reached from VM-less
+    /// unit tests as well as from a live VM. Resolving a triple that is not
+    /// there must be a quiet no-op, not a panic on the compile path.
+    #[test]
+    fn marking_an_empty_registry_marks_nothing_and_does_not_panic() {
+        let registry = cratonvm_native_api::NativeMethodRegistry::new();
+        assert_eq!(mark_direct_call_helper_natives_incomplete_in(&registry), 0);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+    }
+
     #[test]
     fn dispatch_cache_does_not_serve_another_vms_compiled_entry() {
         let info_ptr = &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
@@ -16126,6 +16573,26 @@ mod tests {
                 "an implausible array pointer must not be dereferenced"
             );
         }
+
+        // A real reference array on a real heap, with no class graph behind it.
+        // Passing the array as its own element keeps `val` a live heap pointer
+        // without a second allocation. This asserts the WHOLE helper runs to a
+        // "proceed" answer on a degenerate-but-live input:
+        // `aastore_element_assignable` fails open when it cannot resolve the
+        // component (it degrades to `[Ljava/lang/Object;`, which admits every
+        // reference), and even on the refusing branch there is no JIT thread in
+        // a unit-test thread, so the documented no-thread degradation returns
+        // `0` too. Either way the answer must be "store it" — this helper must
+        // never manufacture an ArrayStoreException out of missing information.
+        let (vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 2);
+        let vm_ptr = &*vm as *const crate::vm::SharedVm as i64;
+        // SAFETY: `vm_ptr` points at the live `SharedVm` owned by `vm` for the
+        // whole call, and `arr_ptr` is a live reference array on its heap.
+        assert_eq!(
+            unsafe { jit_aastore_type_check(vm_ptr, arr_ptr, arr_ptr) },
+            0,
+            "an unresolvable component type must fail open (never a false ASE)"
+        );
     }
 
     /// The x64 emitter must actually CALL the check.
@@ -17430,6 +17897,19 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_thread_current_thread_direct_fn(
             jit_thread_current_thread_direct as *const () as usize,
         );
+        // §4 census, declared at the wiring point rather than paid per call.
+        // Every helper wired immediately above reaches its native without a
+        // `NativeMethodId`, so `record_invocation` never fires for it and those
+        // rows' `invocations` are floors — see
+        // [`DIRECT_CALL_HELPER_NATIVES`] for the measured evidence and
+        // [`mark_direct_call_helper_natives_incomplete`] for why the bit goes
+        // here instead of a `+9.2 ns/call` counter inside bodies that exist to
+        // avoid a 141 ns boundary. A VM-less `build_helpers()` has no registry
+        // to tell, and `--nojit` never reaches this function at all, which is
+        // exactly right: those runs' counts really are exact.
+        if let Some(shared) = vm_for_helpers {
+            mark_direct_call_helper_natives_incomplete(shared);
+        }
         cratonvm_jit::set_preconditions_check_index_direct_fn(
             jit_preconditions_check_index_direct as *const () as usize,
         );
@@ -17457,6 +17937,10 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // target may not be loaded at compile time, so the site is served by a
         // CP-indexed helper. Always wired in production.
         ldc_class_cp: jit_ldc_class_cp as *const () as usize,
+        // JVMS §6.5 covariance check only — the `0x53` lowering keeps its
+        // inline store, its SATB barrier and its card mark and calls out
+        // only for this. `required: true` in `jit-api`, so a `0` here is a
+        // `validate()` failure rather than a silently unchecked store.
         aastore_type_check: jit_aastore_type_check as *const () as usize,
         // These two existed but were unreachable from the JIT: correct
         // implementations with no table slot, so `ir_lower` had nothing to call
@@ -17659,6 +18143,10 @@ const _: () = {
     let _: HelperFnNewObjectCp = jit_new_object_cp;
     let _: HelperFnAnewarrayObjectCp = jit_anewarray_object_cp;
     let _: HelperFnLdcClassCp = jit_ldc_class_cp;
+    // The compile-time link whose ABSENCE permitted the whole W7-38 /
+    // W8-E11-1 family: with this line, changing `jit_aastore_type_check`'s
+    // signature without the matching `helpers_abi.rs` row is a build error
+    // instead of a comment that quietly stops being true.
     let _: HelperFnAastoreTypeCheck = jit_aastore_type_check;
     let _: HelperFnMultianewarray2d = jit_multianewarray_2d;
     let _: HelperFnTlabPostInit = jit_post_tlab_init;
@@ -18495,6 +18983,143 @@ mod jit_monitor_jmx_pairing {
         assert!(
             after_outer.is_empty(),
             "the outermost release left the publish standing"
+        );
+    }
+}
+
+/// The compiled tier asks exactly one type question about an `aastore`, and
+/// this pins which question it is.
+///
+/// `RArrayStoreInterfaces` s12 (`Runnable[] <- Proxy(Marker)`) was MEASURED
+/// divergent against HotSpot 25.0.3+9-LTS in `cold` AND `hot` — the same wrong
+/// answer in both tiers. That is only possible because both tiers route the
+/// decision to one predicate: the interpreter's `aastore` opcode calls
+/// `aastore_element_assignable` directly, and every compiled `aastore`
+/// ([`jit_aastore`] and the x64 inline lowering's [`jit_aastore_type_check`])
+/// reaches it through the single call in [`aastore_store_is_refused`]. So a fix
+/// in `typecheck.rs` moves both, and no edit in this file was needed.
+///
+/// That claim is worth an assertion rather than a comment, because this file
+/// has already been the site of the opposite: R20/HIGH-5 replaced the helper
+/// call with an inline store on the strength of a comment that was true when
+/// written and silently false afterwards (`RExceptions`: `cold=[java.lang.Integer]
+/// hot=[no-throw]`). A premise in a comment is not a compile-time link.
+///
+/// docs/known-issues/jdk-only/G12-1-the-proxy-that-any-interface-array-accepted-20260817.md
+#[cfg(test)]
+mod g12_compiled_aastore_asks_the_shared_predicate {
+    use super::*;
+    use crate::config::VmConfig;
+    use cratonvm_classloading::ClassOrigin;
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use std::sync::Arc;
+
+    /// Fabricate an INTERFACE.
+    ///
+    /// A plain `fn`, not a closure: the guard must be dropped before the next
+    /// statement (`aastore_element_assignable` takes the read lock itself, and a
+    /// live write guard would deadlock the test rather than fail it), and the
+    /// `Arc<SharedVm>` is moved into the returned tuple below, which a closure
+    /// borrowing it would complicate for no gain.
+    fn mk_iface(shared: &SharedVm, name: &str) -> ClassId {
+        let mut cm = shared.classes.class_manager.write();
+        let id = cm
+            .try_ensure_synthetic_class(name, 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.class_store
+            .get_mut(id)
+            .expect("just fabricated")
+            .access_flags |= ClassAccessFlags::INTERFACE;
+        id
+    }
+
+    /// One VM, two unrelated fabricated interfaces, and a `$ProxyN` whose
+    /// RECORDED interface set is `[G12JitMarker]` — the shape
+    /// `define_or_get_proxy_class` produces from real `proxy_gen` bytes.
+    ///
+    /// The proxy class is deliberately given no `interfaces` vector and no
+    /// proxy superclass, so the hierarchy walk inside the predicate declines for
+    /// it: whatever these assertions observe comes from the recorded interface
+    /// set, not from the class graph.
+    ///
+    /// Returns `(vm, G12JitMarker[], G12JitOther[], the proxy)`.
+    fn vm_with_a_recorded_proxy() -> (Arc<SharedVm>, ObjectRef, ObjectRef, ObjectRef) {
+        let shared: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let marker = mk_iface(&shared, "cratonvm/test/G12JitMarker");
+        let other = mk_iface(&shared, "cratonvm/test/G12JitOther");
+        let proxy_cid = {
+            let mut cm = shared.classes.class_manager.write();
+            let id = cm
+                .try_ensure_synthetic_class("jdk/proxy12/$Proxy0", 0)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+            cm.class_store
+                .get_mut(id)
+                .expect("just fabricated")
+                .set_origin(ClassOrigin::GeneratedProxy {
+                    interfaces: Arc::from(vec![marker]),
+                });
+            id
+        };
+        // A reference array's own class id IS its component class id
+        // (JVMS §4.4.1).
+        let marker_arr = shared
+            .mem
+            .heap
+            .alloc_array(marker, ArrayElementType::Reference, 1);
+        let other_arr = shared
+            .mem
+            .heap
+            .alloc_array(other, ArrayElementType::Reference, 1);
+        let proxy = shared.mem.heap.alloc_object(proxy_cid, 0);
+        (shared, marker_arr, other_arr, proxy)
+    }
+
+    /// The LEGAL direction, end to end through the extern entry point compiled
+    /// code actually calls. `s25` on the fixture, and the row that goes red if
+    /// the fix were phrased as "refuse every proxy" — which is how this vector
+    /// goes from 2 fails to 20.
+    ///
+    /// It needs no exception machinery at all (a `0` is the allow path), which
+    /// is why the legal direction is the one asserted here and the refusal is
+    /// asserted at the predicate below: reaching `i64::MIN` requires an
+    /// installed JIT thread AND a throwable built through
+    /// `throw_runtime_error`, i.e. two mechanisms that are `RExceptions`'
+    /// subject and not this one's.
+    #[test]
+    fn the_compiled_entry_point_admits_a_proxy_into_its_own_interfaces_array() {
+        let (shared, marker_arr, _other_arr, proxy) = vm_with_a_recorded_proxy();
+        let vm_ptr = Arc::as_ptr(&shared) as i64;
+        // SAFETY: `vm_ptr` names the live `SharedVm` above and both refs are
+        // live heap objects from its own heap — the contract compiled code
+        // satisfies.
+        unsafe {
+            assert_eq!(
+                jit_aastore_type_check(vm_ptr, marker_arr.as_ptr() as i64, proxy.as_ptr() as i64),
+                0,
+                "a proxy generated for G12JitMarker must still store into a \
+                 G12JitMarker[] in COMPILED code"
+            );
+            assert_eq!(
+                jit_aastore_type_check(vm_ptr, marker_arr.as_ptr() as i64, 0),
+                0,
+                "a null element is always storable and must never reach the \
+                 predicate at all"
+            );
+        }
+    }
+
+    /// The REFUSED direction, at the predicate `aastore_store_is_refused`
+    /// consults two lines in. Everything after that call in this file is
+    /// message construction and throwable delivery — the *decision* is here,
+    /// and it is the same `false` the interpreter's `aastore` arm reads.
+    #[test]
+    fn the_predicate_the_compiled_path_consults_refuses_the_measured_row() {
+        let (shared, _marker_arr, other_arr, proxy) = vm_with_a_recorded_proxy();
+        assert!(
+            !crate::runtime::interpreter::aastore_element_assignable(&shared, other_arr, proxy),
+            "`Runnable[] <- Proxy(Marker)` is ArrayStoreException on HotSpot \
+             25.0.3 (MEASURED, RArrayStoreInterfaces s12) in both tiers; the \
+             compiled tier reads this predicate and nothing else"
         );
     }
 }

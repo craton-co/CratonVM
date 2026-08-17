@@ -1,5 +1,143 @@
 # Three strict failures, one refusal: `java/lang/annotation/AnnotationProxy`
 
+> **RUN AND ADJUDICATED 2026-08-12 (lane A32, record triage). THE HEADLINE IS
+> CLOSED BY MEASUREMENT, AND §R2.4's `toString` CLAIM IS FALSE.**
+>
+> The block below says "**Cannot adjudicate without a run**". This is that run:
+> `cratonvm-merged-dev.exe` against `jdk-25.0.3.9-hotspot`, `--jdk-only` and
+> `--real-jdk`, HotSpot 25 as the same-session oracle.
+>
+> **1. The census row is gone — adjudicated.** `--jdk-only --explain-jdk-only
+> --jdk-only-report r.json` over an annotation-exercising program yields
+> **1324** `synthetic-native-registered`, **55** `native-shadows-bytecode` and
+> **14** `compatibility-class-requested` rows, and the string `AnnotationProxy`
+> appears **zero** times in the whole census. The prediction this record could
+> not test is confirmed. (The 14 that remain are 11 `cratonvm/internal/
+> Unmodifiable*`, `java/util/Comparator$Native`, `java/util/Enumeration$Impl`
+> and `java/util/LinkedList$Itr` — all other lanes' families.)
+>
+> **2. The three vectors pass.** `PASS RReflect (40 checks)` in **both** arms —
+> the vector this record measured as `AssertionError: getAnnotation present` at
+> `RReflect.java:35`. `getAnnotation` on a type, a field and a method all return
+> a live annotation whose `value()` and `n()` read back correctly;
+> `getAnnotations()` has component type `java.lang.annotation.Annotation`;
+> `Proxy.isProxyClass(annotation.getClass())` is `true`. An absent annotation
+> still answers `null` rather than throwing. R1's swallow is not observable from
+> outside, consistent with §R2.4's claim that R1 is fixed.
+>
+> **3. `Proxy.newProxyInstance` passes under `--jdk-only`**, as the wave brief
+> states — dynamic proxy dispatch, `isProxyClass` and `getInvocationHandler` all
+> match HotSpot.
+>
+> **4. The gate-1 / gate-2 question, corrected.** The premise handed to this
+> lane was that *both* `java/lang/reflect/Proxy$Instance` and
+> `java/lang/annotation/AnnotationProxy` sit in `NO_IMAGE_JDK_RECEIVERS`, i.e.
+> gate 2 closed with gate 1 open. **That is half wrong, and the half that is
+> wrong is this record's class.** `native-api/src/no_image_receiver.rs:137`
+> lists `java/lang/reflect/Proxy$Instance` only;
+> `java/lang/annotation/AnnotationProxy` **does not appear anywhere in that
+> file**. So for this record's carrier there is no gate-2/gate-1 split to
+> reconcile: gate 1 was the only gate, hunk 1 opened it, and hunk 2 stops a
+> second minting route re-acquiring the wrong label. The configuration is
+> intended and is not the shape that produced the defect elsewhere this wave.
+> `Proxy$Instance` genuinely is in both tables, but zero natives are registered
+> under `AnnotationProxy` (this record measures that itself), so the
+> registration gate has nothing to close over for it either way.
+>
+> **5. A DEFECT THIS RECORD ASSERTS DOES NOT EXIST — `Annotation.toString()`
+> does NOT match HotSpot.** §R2.4 argues no fixture is possible for R2 because
+> "`equals`/`hashCode`/`toString` already match HotSpot through
+> `annotation_proxy_dispatch_impl`". `equals` and `hashCode` do. `toString` does
+> not, in **both** arms, and it is wrong in two independent ways:
+>
+> ```text
+> HotSpot 25   @AnnToString.Multi(zeta="Z", mid="M", alpha=9)
+> --jdk-only   @AnnToString$Multi(alpha=9, mid="M", zeta="Z")
+> --real-jdk   @AnnToString$Multi(alpha=9, mid="M", zeta="Z")
+> ```
+>
+> * **the type name is the binary name, not the canonical one** — `$` where
+>   HotSpot writes `.`. This VM's own `getCanonicalName()` answers
+>   `AnnToString.Multi` correctly, so the datum is available and only the
+>   accessor is wrong;
+> * **members are sorted alphabetically; HotSpot does not sort them.** HotSpot
+>   emits class-file `element_value_pairs` order, which here is `zeta, mid,
+>   alpha` — neither alphabetical nor `getDeclaredMethods()` order (that is
+>   `mid alpha zeta` on HotSpot, and method order is explicitly unspecified, so
+>   the `getDeclaredMethods()` difference is **not** a defect and should not be
+>   chased).
+>
+> The alphabetical rule is deliberate and is asserted as HotSpot parity in two
+> places, both falsified by the measurement above: the doc comment on
+> `annotation_proxy_to_string` (`vm/src/vm/vm_exec.rs:19634-19638`, "matching
+> HotSpot's `AnnotationInvocationHandler.toString()` reference output") and the
+> module doc at `vm/tests/wp2_7_annotation_proxy.rs:11`. **No test asserts the
+> ordering**, so nothing freezes the divergence and the fix is unblocked — see
+> the nominations below.
+>
+> **Severity, stated so it is not over-read.** This is a wrong answer with no
+> refusal, which is this wave's worst species — but it is at the **detectable**
+> end of it: the output is a string the caller can read, and the two contracts
+> the JLS actually specifies are correct (`hashCode` matches the
+> `(127 * name.hashCode()) ^ value.hashCode()` sum exactly, measured; `equals`
+> is `true` across two independently-obtained instances). Nothing is
+> mis-bucketed in a `HashMap` and no comparison silently inverts. What breaks is
+> golden-output tests, log scraping, and diagnostics that print an annotation —
+> Spring and JUnit both do.
+>
+> ### Nominations (doc-only lane; not applied, not compiled)
+>
+> Both in `vm/src/vm/vm_exec.rs::annotation_proxy_to_string`.
+>
+> **N1 — drop the sort.** Replace
+>
+> ```rust
+>     let mut elems = annotation_proxy_elements(shared, proxy);
+>     elems.sort_by(|a, b| a.0.cmp(&b.0));
+> ```
+>
+> with
+>
+> ```rust
+>     // HotSpot's AnnotationInvocationHandler iterates `memberValues`, a
+>     // LinkedHashMap that AnnotationParser fills in class-file
+>     // `element_value_pairs` order — NOT alphabetically, and not in
+>     // `getDeclaredMethods()` order either. Measured 2026-08-12 on JDK 25:
+>     // `@AnnToString.Multi(zeta="Z", mid="M", alpha=9)` where the alphabetical
+>     // rendering would be `(alpha=9, mid="M", zeta="Z")`. Sorting here was the
+>     // divergence; the parse order is the contract.
+>     let elems = annotation_proxy_elements(shared, proxy);
+> ```
+>
+> **Precondition, which this lane could not check by running:** that
+> `annotation_proxy_elements` returns the pairs in class-file order rather than
+> in some order of its own. If it does not, the fix belongs at the point the
+> element names are parsed, not here. Verify that before landing N1 — deleting
+> the sort while the source is unordered trades a wrong order for an unstable
+> one, which is worse.
+>
+> **N2 — render the canonical name.** The `dotted` binding is built from the
+> type descriptor via `descriptor_to_class_name` + `internal_to_dotted`, which
+> only maps `/`→`.` and leaves `$` in place. It needs the canonical form, i.e.
+> the nest separator mapped too. An annotation type is always a top-level or
+> member type — never local or anonymous — so its canonical name always exists
+> and this is total, unlike the general case. If a helper already computes
+> `getCanonicalName()` for the `Class` mirror, call it; the mirror is reachable
+> from `ANN_PROXY_TYPE_MIRROR` (slot 1) and this VM already answers
+> `getCanonicalName()` correctly.
+>
+> **N3 — correct the two doc sites** that assert alphabetical order is HotSpot
+> parity: `vm/src/vm/vm_exec.rs:19636-19638` and
+> `vm/tests/wp2_7_annotation_proxy.rs:11`. Whoever takes N1 should take N3 in
+> the same commit, or the next reader re-derives the wrong premise from a
+> comment that outlived it.
+>
+> **Scheduled?** Partly. `RReflect` is in `run.sh`'s `CORE_CLASSES` and covers
+> the headline. **No vector covers `Annotation.toString()`** — the probe above
+> is a scratch file outside the tree, and `probes/` is not run by `run.sh` at
+> any `SUITE=` value. N1/N2 need a vector added alongside them, and it must
+> assert the **rendered string**, not that `toString()` is non-null.
+
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — "NOT APPLIED" IS
 > FALSE. BOTH HUNKS ARE IN THE TREE.** Commit `5266bf8c7` *fix(jdk-only): route
 > the annotation carrier through the VM-internal door*. Hunk 1:

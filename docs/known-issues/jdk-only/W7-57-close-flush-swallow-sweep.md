@@ -423,6 +423,69 @@ If the two are ever merged, the two roots and `absorb_class_absent`'s
 `InternalError` and `absorb_class_absent` deliberately does not, for a reason
 stated at its definition.
 
+## Re-verified 2026-08-12 against the working tree, by the P3-D lane
+
+Owned files this pass: `native-io/src/**` plus the three close-family records.
+Nothing built, nothing run. Four results.
+
+**1. The `native-io` half of the sweep is LANDED and correct.** Rows 24–34 were
+re-read in the tree rather than trusted:
+
+| row | site | today |
+|---|---|---|
+| 24 | `native_isr_close`, `native-io/src/lib.rs:2599` | `ctx.invoke_virtual(stream, "close", "()V", &[])?` — propagates, with the JDK-body citation in the comment |
+| 27 | `native_reader_close`, `native-io/src/lib.rs:10599` | `ctx.invoke_virtual(inner, "close", "()V", &[])?` — propagates |
+| 30/31 | `native-io/src/stream_decoder.rs:511`, `:516` | `.map(\|_\| ())` on the `Result`, consumed by the caller — propagates |
+| 32 | `native-io/src/stream_encoder.rs:783` | `ctx.invoke_virtual(os, "flush", "()V", &[])?` |
+| 33/34 | `native-io/src/stream_encoder.rs:822`, `:824` | bound to `flushed` / `closed` and both inspected — the flush-wins ordering row 33 describes |
+
+`native-api/src/delegated_close.rs` is referenced from **nowhere** in
+`native-io`, and that is correct rather than a gap: every `native-io` row in this
+record is a *propagate* row, and the helper exists only for the *absorb* rows
+(35–43), all of which are in `native-builtins`.
+
+**2. Rows 48–51 are STILL OPEN. The line numbers in the residual audit have
+drifted and are re-cited here** so the next grep lands:
+
+```
+native-builtins/src/lib.rs:21485   let _ = ctx.invoke_virtual(target, "close", "()V", &[]);
+native-builtins/src/lib.rs:21500   let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
+native-builtins/src/lib.rs:41584   let _ = ctx.invoke_virtual(target, "close", "()V", &[]);
+native-builtins/src/lib.rs:41592   let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
+```
+
+(was `:21440 / :21455 / :41498 / :41506`). `W7-52-formatter-close-and-locale.md`
+has still not merged. Out-of-file for this lane.
+
+**3. A row of the same species that this record's scope excluded, and which is
+now FIXED** — `native-io/src/lib.rs`, `native_fos_close` (`:2237`). Not a
+delegated-Java-call swallow, so correctly outside the 51, but the identical fault
+shape one layer down: `let _ = ctx.fd_table().flush(fd); let _ = ctx.fd_table()
+.close(fd);` where `java.io.FileOutputStream.close()` declares `throws
+IOException` and catches nothing. Our writer entries are `BufWriter`s — HotSpot's
+`FileOutputStream` is unbuffered — so **the flush is the byte delivery** and
+dropping it is lost data reported as success, which is what this record exists
+for. It now propagates for `fd >= 3`, flush-failure-wins with the close still
+attempted; `fd < 3` keeps the swallow because `FdTable::close` answers `Ok(())`
+there anyway and the flush half would be flushing the shared process console.
+Its own neighbour `native_fos_flush` (`:2224`) already propagated, so this body
+was the odd one out rather than a considered policy.
+
+**4. And a SECOND site for the same defect that no record had counted** —
+`native_fd_close0`, `native-io/src/lib.rs:1846`. This is the body the
+**Compatible / real-JDK arm actually reaches**: the real
+`FileOutputStream.close()` bytecode routes through `FileDescriptor.closeAll` →
+`close()` → `close0()`. Repairing only `native_fos_close` would have fixed the
+fallback and left the shipping default swallowing while the row came off the
+census — the shape this family's records keep refusing. Only the **flush** half
+is propagated there, deliberately: the body is registered for three receivers,
+one of which is `sun/nio/ch/UnixDispatcher.close0` on sockets, and
+`FdTable::flush` ends in `_ => Ok(())` for every non-writable entry, so the
+blast radius outside buffered file writers is provably empty. The close half
+stays swallowed and is named, not quietly counted.
+`native_fis_close` (`:1903`) has the same swallowed close and was left alone for
+the same reason — a read-side close cannot lose buffered data.
+
 ## What is left
 
 * **Rows 48–51 — the four `java.util.Formatter` sites**, if

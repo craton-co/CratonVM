@@ -51,6 +51,89 @@ Every Java value quoted as "HotSpot says" is a transcript of
 >
 > §1.1, §1.2, §1.3, §2, §2.1, §3, §4 and §6 are otherwise re-read and hold.
 
+> **RE-VERIFIED AGAINST THE TREE 2026-08-12 (later pass, A9 record triage).**
+> Read only — nothing was built or run in that pass. Two things changed under
+> this record, and every line number moved again.
+>
+> **1. The repair itself was AMENDED after this record was written, by
+> `395e5790c fix(thread): a refused Thread.<init> must not publish an
+> unconstructed mirror`.** §3.2's step 3 said "drive `Thread.<init>` … through
+> `ctx.invoke`" and the landed helper discarded the result with `let _ =`. That
+> was a hole this record did not see: allocation succeeds, so `mirror` is a
+> full-width real `java.lang.Thread`, but if the constructor fails nothing ran —
+> `holder` null, `name` null, `tid` 0 — and the callers **publish it to the
+> thread registry anyway. That is byte-for-byte §4.1's `Unsafe.allocateInstance`
+> object, the very shape this record measured as RED on HotSpot.** Today
+> `alloc_carrier_thread_mirror` (`native-builtins/src/lib.rs:6772`) checks
+> `.is_err()`, unpins and returns `None`, which is §3.2's step 5 outcome. Worth
+> naming as a lesson, not just as a diff: **a repair that widens an object and
+> then runs a constructor has TWO failure modes, and this record only reasoned
+> about the first.** §4.1's own red-proof was the discriminator for the second
+> and it was already in the file.
+>
+> **2. §3.3's hoist is real but is reached through a wrapper.**
+> `is_synthetic_thread_layout` is at module scope
+> (`native-builtins/src/lib.rs:6460`) and is still crate-root-private; the
+> cross-module callers go through `pub(crate) fn
+> thread_mirror_is_synthetic_layout` (`:6703`), which is what
+> `alloc_carrier_thread_mirror` (`:6795`) and `jdk25_concurrency::sts_fork`
+> (`jdk25_concurrency.rs:898`) call. Same value, one declaration, so the claim
+> holds; the name in §3.3 is not the one you will grep for.
+>
+> **3. Everything else re-verified, item by item.** The ratchet is
+> `const BOUND: usize = 28` with "**12** of today's 28" in its doc comment and
+> "12 of the 28" in its failure message
+> (`native-api/tests/layout_alias_coverage.rs:947`, `:877`, `:1006`) — the
+> banner's arithmetic correction is in the code. Both carrier sites call the
+> helper (`vertx_eventloop.rs:731`, `xnio_io_thread.rs:951`). Row 13's registrar
+> is still dead: `register_apps_h2_overrides` still has exactly one reference,
+> `let _ = apps_h2::register_apps_h2_overrides;` at `native-builtins/src/lib.rs:9118`.
+> §1.1's two same-named helpers both still exist
+> (`native-builtins/src/lib.rs:30779`, `native-builtins/src/util_time.rs:133`),
+> so the mis-attribution that produced the row is still there to be made again.
+> §1.3's `MappedByteBuffer` argument still holds verbatim: both arms of the
+> `match` request `mbb_base + MBB_PRIVATE_WIDTH` (`native-io/src/lib.rs:17138`).
+>
+> **4. Line numbers, re-derived (§1.4's method, applied again).** `native-io/src/lib.rs`:
+> `Pattern` 5058 -> **5062**, `ByteBuffer` 7548 -> **7663**, `FileChannel`
+> **9811** (as the banner already had it), `java/io/File` 12853 -> **13124**,
+> `ArrayList` 13113 -> **13384**, `CharBuffer`/`alloc_typed_buffer` 15087 ->
+> **15494**, `MappedByteBuffer` 16734 -> **17139**.
+> `native-builtins/src/lib.rs`'s `alloc_time_synthetic` 30418 -> **30779**.
+> Unmoved: `async_socket.rs:1980`, `nio_native.rs:1410`, `socket_channel.rs:637`,
+> `zip_real_jar.rs:650`, `apps_h2.rs:62`, `util_time.rs:140`,
+> `vertx_eventloop.rs`/`xnio_io_thread.rs` (now the helper call sites above).
+>
+> These are against the **committed** tree at `768ac2de0`, and the distinction
+> matters this time: a concurrent lane holds uncommitted edits to
+> `native-io/src/lib.rs` around lines 1858-2324 (`native_fd_close0` /
+> `native_fos_close`) which add ~72 net lines, so every `native-io/src/lib.rs`
+> row above moves down by about that much the moment they land. A first read of
+> this file during that lane's window returned exactly those +72 numbers. This is
+> the same trap §1.4 records, arriving from a new direction: **on a tree nine
+> lanes are editing, a line number is only meaningful with the tree state it was
+> taken against.**
+>
+> **5. Per-item disposition, since §2's table mixes three verdicts.** *Fixed:*
+> rows 1 and 2 (the two `java/lang/Thread` carrier mirrors), and fixed a second
+> time by `395e5790c`. *Never real:* row 4 (`MappedByteBuffer`, §1.3), row 12
+> (`FileChannel`, banner item 2), and the `native-builtins/src/lib.rs`
+> `alloc_time_synthetic` row (§1.1) — three rows the census produced by reading
+> the wrong arm or the wrong helper. *Dead code, so not live but not fixed
+> either:* rows 5 (`Iocp`), 13 (`Thread$State` via `apps_h2`) and 15
+> (`util_time`, synthetic-only registrar). *Still live, latent behind an
+> `Err(_)` arm:* rows 3, 6, 7, 8, 9, 10, 11, 14 and `socket_channel.rs:637` —
+> nine, unchanged, and §2.1's argument for leaving them is unchanged with them.
+>
+> **6. One thing to know before anyone deletes row 13.** `apps_h2`'s dead
+> `thread_state_runnable` fabricates a `Thread$State` by writing the string
+> `"RUNNABLE"` into slot 0 and `Int(1)` into slot 1 of a fresh object. That is
+> the *fabricated enum constant* shape — non-null, correctly named, and not
+> identical to `Thread.State.RUNNABLE`, so `==` against the real constant and any
+> `switch` over it would fail while every metadata query answered right. It is
+> **not a live defect** (nothing calls the registrar), but it is one more reason
+> the deletion §7.4 asks for is the right disposition rather than a re-enable.
+
 ---
 
 ## 1. The width re-verification, and three disagreements with the 16

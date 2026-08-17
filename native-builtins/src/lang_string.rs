@@ -412,6 +412,31 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         &format!("(ID)L{class};"),
         native_sb_insert_double,
     );
+    // The TWO REFERENCE overloads that still had no native, which is the same
+    // gap the four scalars above closed and the last one on `insert`. Real
+    // `AbstractStringBuilder.insert(int, CharSequence[, int, int])` bytecode
+    // ran against the synthetic char[]/count layout and silently OVERWROTE
+    // instead of inserting — `new StringBuilder("xy").insert(1,
+    // (CharSequence) "AB")` answered `xA` where HotSpot answers `xABy` — and
+    // left the receiver inconsistent, so the next `charAt` aborted the VM.
+    // MEASURED both ways; see `native_sb_insert_charsequence_range`.
+    //
+    // A `String` argument reaches these only through a `CharSequence`-typed
+    // call site, because javac picks the `(ILjava/lang/String;)` overload for
+    // a `String`-typed one. Both must agree, and the 2-arg body delegates so
+    // that they agree by construction rather than by two copies matching.
+    registry.register(
+        class,
+        "insert",
+        &format!("(ILjava/lang/CharSequence;)L{class};"),
+        native_sb_insert_charsequence,
+    );
+    registry.register(
+        class,
+        "insert",
+        &format!("(ILjava/lang/CharSequence;II)L{class};"),
+        native_sb_insert_charsequence_range,
+    );
     registry.register(
         class,
         "delete",
@@ -471,55 +496,35 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(class, "capacity", "()I", native_sb_capacity);
     registry.register(class, "ensureCapacity", "(I)V", native_sb_ensure_cap);
     registry.register(class, "trimToSize", "()V", native_sb_trim_to_size);
-    // Java 21: StringBuilder.repeat(CharSequence, int) / repeat(int codePoint, int count)
-    registry.register(
-        class,
-        "repeat",
-        "(Ljava/lang/CharSequence;I)Ljava/lang/StringBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let cs = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let count = match args.get(2) {
-                Some(Value::Int(v)) => (*v).max(0) as usize,
-                _ => 0,
-            };
-            let cs_str = ctx.read_string(cs).unwrap_or_default();
-            let cs_chars: Vec<u16> = cs_str.encode_utf16().collect();
-            let mut chars = sb_read_chars(ctx, this);
-            for _ in 0..count {
-                chars.extend_from_slice(&cs_chars);
-            }
-            let this = sb_write_chars(ctx, this, &chars);
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    registry.register(
-        class,
-        "repeat",
-        "(Ljava/lang/String;I)Ljava/lang/StringBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let s = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let count = match args.get(2) {
-                Some(Value::Int(v)) => (*v).max(0) as usize,
-                _ => 0,
-            };
-            let s_str = ctx.read_string(s).unwrap_or_default();
-            let s_chars: Vec<u16> = s_str.encode_utf16().collect();
-            let mut chars = sb_read_chars(ctx, this);
-            for _ in 0..count {
-                chars.extend_from_slice(&s_chars);
-            }
-            let this = sb_write_chars(ctx, this, &chars);
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
+    // Java 21: StringBuilder.repeat(CharSequence, int) / repeat(String, int).
+    //
+    // These MUST be natives: unregistered, they fall through to the real
+    // `AbstractStringBuilder.repeat` → `ensureCapacityNewCoder` →
+    // `Arrays.copyOf(value, …)` bytecode, which treats `value` as a
+    // compact-string `byte[]`. CratonVM's StringBuilder backing is a `char[]`,
+    // so the real bytecode's `System.arraycopy` copies char[]→byte[] and throws
+    // `ArrayStoreException: incompatible array element types (src=Char,
+    // dest=Byte)`. `java.time.format.DateTimeFormatter` uses `buf.repeat('0',
+    // n)` for zero-padding, so this broke every timestamp/temporal literal
+    // (35 Hibernate suite classes).
+    //
+    // DE-DUPLICATED 2026-08-13 (lane E38). This registrar used to register
+    // `repeat` SIX times for three descriptors: each of these three lines was
+    // preceded by an inline closure spelling `Ljava/lang/StringBuilder;`
+    // literally instead of `L{class};`. `register()` is last-registration-wins,
+    // so for a `class` of `java/lang/StringBuilder` the pairs collided and the
+    // winner was decided by source order alone — the two `CharSequence`/`String`
+    // closures lost harmlessly, but the `(II)` closure came AFTER its
+    // `format!`-spelled sibling and won, and it was the worse body: it clamped a
+    // negative count with `.max(0)` (where the JDK throws
+    // `IllegalArgumentException`) and encoded through `char::from_u32`, falling
+    // back to `code_point as u16` — so `repeat(0x110000, 1)` appended U+0000 and
+    // `repeat(-1, 1)` appended U+FFFF where the JDK refuses both. Because the
+    // losing spelling named `StringBuilder` literally, `StringBuffer` and
+    // `AbstractStringBuilder` kept the correct body: the same call had two
+    // answers, chosen by the receiver's static type. Removing the duplicates
+    // (rather than repairing them) leaves ONE body per descriptor for all three
+    // classes.
     registry.register(
         class,
         "repeat",
@@ -531,48 +536,6 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "repeat",
         &format!("(Ljava/lang/String;I)L{class};"),
         native_sb_repeat_charsequence,
-    );
-    // Java 21: StringBuilder.repeat(int codePoint, int count). MUST be a native:
-    // unregistered, it falls through to the real `AbstractStringBuilder.repeat`
-    // → `ensureCapacityNewCoder` → `Arrays.copyOf(value, …)` bytecode, which
-    // treats `value` as a compact-string `byte[]`. CratonVM's StringBuilder
-    // backing is a `char[]`, so the real bytecode's `System.arraycopy` copies
-    // char[]→byte[] and throws `ArrayStoreException: incompatible array element
-    // types (src=Char, dest=Byte)`. `java.time.format.DateTimeFormatter` uses
-    // `buf.repeat('0', n)` for zero-padding, so this broke every timestamp/
-    // temporal literal (35 Hibernate suite classes).
-    registry.register(
-        class,
-        "repeat",
-        "(II)Ljava/lang/StringBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let code_point = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let count = match args.get(2) {
-                Some(Value::Int(v)) => (*v).max(0) as usize,
-                _ => 0,
-            };
-            // Encode the code point to UTF-16 units (surrogate pair for
-            // supplementary planes); fall back to a single unit for an invalid
-            // code point (e.g. a lone surrogate) rather than dropping it.
-            let mut units: Vec<u16> = Vec::with_capacity(2);
-            match char::from_u32(code_point as u32) {
-                Some(c) => {
-                    let mut buf = [0u16; 2];
-                    units.extend_from_slice(c.encode_utf16(&mut buf));
-                }
-                None => units.push(code_point as u16),
-            }
-            let mut chars = sb_read_chars(ctx, this);
-            for _ in 0..count {
-                chars.extend_from_slice(&units);
-            }
-            let this = sb_write_chars(ctx, this, &chars);
-            Ok(Some(Value::Object(Some(this))))
-        },
     );
 }
 
@@ -639,10 +602,82 @@ pub(crate) fn native_string_intern(
     // dropped at end-of-scope (intentionally — we only needed its pool
     // side-effect), but its underlying bytes remain interned globally so
     // subsequent calls hit the pool's read path with no allocation.
+    // A string whose content is not representable as Rust text cannot go
+    // through the pools above: `read_string` decodes an unpaired surrogate to
+    // U+FFFD and `create_string` re-encodes that substitution, so `intern()`
+    // answered a DIFFERENT string than the receiver. MEASURED on both VMs at
+    // `89e2c56f1`, alongside seven siblings that are all exact
+    // (`substring`, `concat`, `StringBuilder.append`, `toCharArray`,
+    // `indexOf`, `equals`, and String construction itself):
+    //
+    // ```text
+    //   "a<U+D800>b".intern().charAt(1)     HotSpot d800    CratonVM fffd
+    // ```
+    //
+    // Returning the receiver would fix that row and BREAK the contract that
+    // makes `intern` worth having: `s.equals(t)` must imply
+    // `s.intern() == t.intern()`, and two equal lone-surrogate strings would
+    // then answer two different objects. So the unrepresentable case gets its
+    // own pool, keyed on the UTF-16 units — which ARE Java's equality — with
+    // the first caller's receiver becoming the canonical instance.
+    let units = read_string_chars(&*ctx, this);
+    if has_unpaired_surrogate(&units) {
+        return Ok(Some(Value::Object(Some(intern_unrepresentable(
+            ctx, this, units,
+        )))));
+    }
+
     let text = ctx.read_string(this).unwrap_or_default();
     let arc = intern_arc(&text);
     let interned = ctx.create_string(&arc);
     Ok(Some(Value::Object(Some(interned))))
+}
+
+/// The intern pool for strings Rust text cannot hold, keyed by UTF-16 units.
+///
+/// Values are global-root HANDLES, never `ObjectRef`s: the collector owns the
+/// reference and hands back its current, possibly relocated address. Same
+/// shape, and the same reason, as `net_phase_e::HttpsCarrierSession`'s cached
+/// session.
+///
+/// Unbounded in principle, exactly as the real intern pool is — and in
+/// practice bounded by how many distinct lone-surrogate strings a program
+/// interns, which is a set every measurement in this tree has found empty
+/// outside a test.
+fn surrogate_intern_pool() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>
+{
+    static P: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>,
+    > = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Canonical instance for a string the Rust-text pools cannot represent.
+///
+/// The root is taken BEFORE the table is consulted, and a loser releases its
+/// own root rather than leaving it held for the life of the VM — the
+/// `https_session_object` idiom. Written that way because the alternative,
+/// holding the lock across `add_global_root`, is the "native holds a
+/// process-global lock across a call that re-enters the VM" cycle this
+/// workspace has already paid for once.
+fn intern_unrepresentable(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    units: Vec<u16>,
+) -> cratonvm_types::ObjectRef {
+    let handle = ctx.add_global_root(this);
+    let winner = {
+        let Ok(mut pool) = surrogate_intern_pool().lock() else {
+            return this;
+        };
+        *pool.entry(units).or_insert(handle)
+    };
+    if winner != handle {
+        ctx.remove_global_root(handle);
+    }
+    // `resolve_global_root` is the only correct way back: the winning object
+    // may have been relocated since it was rooted.
+    ctx.resolve_global_root(winner).unwrap_or(this)
 }
 
 /// `String(AbstractStringBuilder, Void)` — private/package constructor used by
@@ -979,6 +1014,28 @@ pub(crate) fn native_string_equals(
         return Ok(Some(Value::Int(1)));
     }
 
+    // E18. `String.equals(Object)` is
+    // `(anObject instanceof String aString) && …`, and the type test is not
+    // decoration here: everything below reaches the ARGUMENT's `value` field
+    // by SLOT INDEX (`string_char_array` is `get_field(obj, 0)`), and
+    // CratonVM's own synthetic `StringBuilder` layout is `char[] value @0`
+    // too. A builder whose backing array happens to be exactly as long as the
+    // receiver therefore compared EQUAL to it. That is reachable, not
+    // theoretical: `new StringBuilder(3).append("abc")` has `capacity() == 3`
+    // on OpenJDK 25.0.3+9 (measured), so `"abc".equals(sb)` answered `true`
+    // where HotSpot answers `false` — and `equals` is what every `Map` and
+    // `List.contains` in the VM ultimately calls.
+    //
+    // `java/lang/String` is final and bootstrap-defined, so every String in a
+    // VM shares the receiver's class id: the test is one integer compare and
+    // needs no name lookup on this very hot path. It is written against
+    // `this`'s id rather than a resolved `java/lang/String` id deliberately —
+    // if the receiver's id were ever surprising, two Strings would still agree
+    // with each other and the answer would be unchanged.
+    if ctx.class_id_of_object(other) != ctx.class_id_of_object(this) {
+        return Ok(Some(Value::Int(0)));
+    }
+
     // Cheap rejection: different backing-array lengths cannot be equal.
     // Avoids the bulk decode for the common "different strings" case.
     let (_, len_a) = match string_char_array(ctx, this) {
@@ -1017,22 +1074,29 @@ pub(crate) fn native_string_index_of(
     // VM-bulk copy when the backing array is `char[]`), then scan the
     // local slice. Avoids N per-element virtual `get_array_element`
     // calls when the haystack is long.
-    let needle = (ch & 0xFFFF) as u16;
-    let pos = with_string_chars_scratch(ctx, this, |buf| {
-        buf.iter()
-            .position(|&c| c == needle)
-            .map(|i| i as i32)
-            .unwrap_or(-1)
-    });
+    //
+    // The needle is [`code_point_needle`]'s, not `(ch & 0xFFFF)`: a
+    // supplementary `ch` is a surrogate PAIR and an invalid one matches
+    // nothing. See that function for the measured rows.
+    let Some(needle) = code_point_needle(ch) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    let pos =
+        with_string_chars_scratch(ctx, this, |buf| index_of_units_from(buf, needle.units(), 0));
     Ok(Some(Value::Int(pos)))
 }
 
 /// T2.2.6: `String.indexOf(int ch, int fromIndex)`.
 ///
-/// Searches the string for the first occurrence of the given code-unit
-/// (after treating the `ch` argument the same way the JDK does: values
-/// outside the BMP are matched via the surrogate pair). Clamps
-/// `fromIndex` to `[0, len)`; a value ≥ length returns `-1`.
+/// Searches the string for the first occurrence of the given code point,
+/// starting at `max(fromIndex, 0)`; a `fromIndex` past the last possible start
+/// returns `-1`.
+///
+/// E18. The doc above used to say values outside the BMP "are matched via the
+/// surrogate pair" while the body one line below it read
+/// `let needle = (ch & 0xFFFF) as u16;` — the doc described the JDK and the
+/// code did the opposite, so `"abc".indexOf(0x10061, 0)` answered `0` where
+/// HotSpot answers `-1`. Both halves now come from [`code_point_needle`].
 pub(crate) fn native_string_index_of_from(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1050,29 +1114,25 @@ pub(crate) fn native_string_index_of_from(
         _ => 0,
     };
 
-    // Note: for BMP characters this matches the raw char; for supplementary
-    // code points the caller is expected to have already decomposed to
-    // surrogates in the underlying `String.value` char array, so a direct
-    // code-unit compare is still correct against the leading surrogate.
-    let needle = (ch & 0xFFFF) as u16;
+    let Some(needle) = code_point_needle(ch) else {
+        return Ok(Some(Value::Int(-1)));
+    };
     let pos = with_string_chars_scratch(ctx, this, |buf| {
-        let start = from.max(0) as usize;
-        if start >= buf.len() {
-            return -1i32;
-        }
-        buf[start..]
-            .iter()
-            .position(|&c| c == needle)
-            .map(|i| (start + i) as i32)
-            .unwrap_or(-1)
+        index_of_units_from(buf, needle.units(), from)
     });
     Ok(Some(Value::Int(pos)))
 }
 
 /// T2.2.6: `String.lastIndexOf(int ch, int fromIndex)`.
 ///
-/// Searches backward from `min(fromIndex, len-1)` for the last
+/// Searches backward from `min(fromIndex, len - needleWidth)` for the last
 /// occurrence of `ch`. A negative `fromIndex` always returns `-1`.
+///
+/// E18. `len - 1` in the old doc is right only for a BMP `ch`; the JDK's
+/// `lastIndexOfSupplementary` starts at `len - 2` because the pair needs two
+/// units, which is why [`last_index_of_units_from`] takes the width instead of
+/// assuming it. The old body masked with `& 0xFFFF`, so
+/// `"abc".lastIndexOf(0x10061, 2)` answered `0` where HotSpot answers `-1`.
 pub(crate) fn native_string_last_index_of_from(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1090,21 +1150,11 @@ pub(crate) fn native_string_last_index_of_from(
         _ => 0,
     };
 
-    if from < 0 {
+    let Some(needle) = code_point_needle(ch) else {
         return Ok(Some(Value::Int(-1)));
-    }
-    let needle = (ch & 0xFFFF) as u16;
+    };
     let pos = with_string_chars_scratch(ctx, this, |buf| {
-        if buf.is_empty() {
-            return -1i32;
-        }
-        let start = (from as usize).min(buf.len() - 1);
-        // rposition scans backwards; map onto the original index.
-        buf[..=start]
-            .iter()
-            .rposition(|&c| c == needle)
-            .map(|i| i as i32)
-            .unwrap_or(-1)
+        last_index_of_units_from(buf, needle.units(), i64::from(from))
     });
     Ok(Some(Value::Int(pos)))
 }
@@ -1504,11 +1554,16 @@ pub(crate) fn native_sb_init_string(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let text = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
+    // Code UNITS, not `read_string` + `encode_utf16`: a Rust `str` cannot hold
+    // an unpaired surrogate, so `new StringBuilder(s)` for an `s` holding one
+    // lone `\uDC00` built a builder containing U+FFFD — and the builder then
+    // disagreed with the String it was constructed from
+    // (`s.contentEquals(new StringBuilder(s))` answered false). MEASURED,
+    // `scratchpad/g26/G26Builder.java` rows c1/c2/c3/c5/c7/e1/e4.
+    let chars: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(s))) => read_string_chars(&*ctx, *s),
+        _ => Vec::new(),
     };
-    let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
     let mut scope = NativeHandleScope::new(ctx);
     let this_h = scope.root(this);
@@ -1550,11 +1605,17 @@ pub(crate) fn native_sb_init_charsequence(
     // will) and `new_array`; the handle slot remains current across both.
     let mut scope = NativeHandleScope::new(ctx);
     let this_h = scope.root(this);
-    let text = match args.get(1) {
-        Some(Value::Object(Some(o))) => invoke_to_string(&mut *scope, *o).unwrap_or_default(),
-        _ => String::new(),
+    // `charsequence_chars`, not `invoke_to_string`: `AbstractStringBuilder`'s
+    // own `(CharSequence)` constructor is `this(seq.length() + 16);
+    // append(seq);`, so the characters it stores are the ones `append` reads —
+    // by `charAt` for anything but the fast-path shapes, never `toString()`.
+    // The units form also carries an unpaired surrogate, which the `str` this
+    // replaces could not: MEASURED rows c6/c8/c9 of
+    // `scratchpad/g26/G26Builder.java`.
+    let chars: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(o))) => charsequence_chars(&mut *scope, *o, None)?,
+        _ => Vec::new(),
     };
-    let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
     let buf = scope.new_array(ArrayElementType::Char, cap);
     let this = scope.get(&this_h);
@@ -1575,8 +1636,30 @@ pub(crate) fn native_sb_init_capacity(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A NEGATIVE capacity is a throw, not a clamp. `AbstractStringBuilder(int
+    // capacity)`'s whole body is the allocation `value = new byte[capacity]`
+    // (or `StringUTF16.newBytesFor(capacity)`), so a negative argument fails in
+    // `anewarray` with `NegativeArraySizeException` whose message is the raw
+    // size. Clamping to 0 with `max(v, 0)` silently built a usable empty
+    // builder instead — `new StringBuilder(-1).length()` answered 0 where
+    // HotSpot throws.
+    //
+    // This is deliberately a DIFFERENT exception class from `setLength(-1)`'s
+    // `StringIndexOutOfBoundsException`, and `RJdkBridge1`'s `sbidx` rows
+    // assert both, one right after the other, precisely because the two
+    // negative-length paths in this class do not agree. MEASURED on
+    // jdk-25.0.3.9: `new StringBuilder(-1)` -> `NegativeArraySizeException: -1`,
+    // `new StringBuffer(-7)` -> `NegativeArraySizeException: -7`.
     let cap = match args.get(1) {
-        Some(Value::Int(v)) => std::cmp::max(*v, 0) as usize,
+        Some(Value::Int(v)) => {
+            if *v < 0 {
+                return Err(
+                    cratonvm_types::error::RuntimeError::NegativeArraySizeException { size: *v }
+                        .into(),
+                );
+            }
+            *v as usize
+        }
         _ => 16,
     };
     let mut scope = NativeHandleScope::new(ctx);
@@ -1607,12 +1690,16 @@ pub(crate) fn native_sb_append_string(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let text = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "null".to_string()),
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => "null".to_string(),
+    // Code UNITS: `sb.append(s)` must store what `s` holds, and a Rust `str`
+    // cannot hold an unpaired surrogate. MEASURED, `G26Builder` rows
+    // a1/a2/a12 — U+DC00 on HotSpot, U+FFFD here. The `"null"` substitution
+    // for a null argument is `AbstractStringBuilder.appendNull` and is
+    // unchanged.
+    let chars: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(s))) => read_string_chars(&*ctx, *s),
+        _ => "null".encode_utf16().collect(),
     };
-    let this = sb_append_str(ctx, this, &text);
+    let this = sb_append_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1743,6 +1830,17 @@ pub(crate) fn native_sb_repeat_codepoint(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `AbstractStringBuilder.repeat(CharSequence cs, int count)` (JDK 25
+/// `AbstractStringBuilder.java:2166-2217`).
+///
+/// Two contract items were missing and both were `.max(0)`-shaped silence:
+///
+///   * `count < 0` is `IllegalArgumentException("count is negative: " + count)`,
+///     the method's only documented throw. Clamping to 0 answered "did nothing"
+///     for a call the JDK refuses.
+///   * a null `cs` repeats the four characters `"null"` — "If `cs` is `null`,
+///     then the four characters `"null"` are repeated into this sequence" —
+///     where this returned the receiver untouched.
 pub(crate) fn native_sb_repeat_charsequence(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1751,22 +1849,38 @@ pub(crate) fn native_sb_repeat_charsequence(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let cs = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(Some(this)))),
-    };
-    let count = match args.get(2) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
+    let count_i32 = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if count_i32 < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("count is negative: {count_i32}"),
+            }
+            .into(),
+        );
+    }
+    let count = count_i32 as usize;
     if count == 0 {
         return Ok(Some(Value::Object(Some(this))));
     }
+    let cs = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        // null CharSequence -> the literal "null", per the javadoc.
+        _ => None,
+    };
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let text = invoke_to_string(&mut *scope, cs).unwrap_or_default();
+    // `charsequence_chars`, not `invoke_to_string`: the JDK's
+    // `repeat(CharSequence, int)` appends the sequence's CHARACTERS, and code
+    // units carry an unpaired surrogate where a Rust `str` cannot. MEASURED,
+    // `G26Builder` rows r2/r3.
+    let units: Vec<u16> = match cs {
+        Some(o) => charsequence_chars(&mut *scope, o, None)?,
+        None => "null".encode_utf16().collect(),
+    };
     let this = scope.get(&this_handle);
-    let units: Vec<u16> = text.encode_utf16().collect();
     let mut chars = sb_read_chars(&*scope, this);
     for _ in 0..count {
         chars.extend_from_slice(&units);
@@ -1954,13 +2068,54 @@ pub(crate) fn invoke_to_string(
 /// Like [`invoke_to_string`], but returns `Ok(None)` when `toString()`
 /// legitimately returns a Java `null` reference, instead of coercing it to
 /// the text `"null"`. Needed by `String.valueOf(Object)` — see its call site.
+///
+/// A thin lossy view of [`invoke_to_string_units_opt`], which is where the
+/// dispatch lives. `String::from_utf16_lossy` over those units is what
+/// `ctx.read_string` already answered for every one of this function's
+/// callers, so nothing here moves.
 fn invoke_to_string_opt(
     ctx: &mut dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
 ) -> Result<Option<String>, cratonvm_types::error::MethodCallFailed> {
-    // Fast path: if it's already a String object, just read it
+    Ok(invoke_to_string_units_opt(ctx, obj)?.map(|u| String::from_utf16_lossy(&u)))
+}
+
+/// [`invoke_to_string`]'s text as raw UTF-16 code units, with the same
+/// `Ok(None)` for a `toString()` that really returned Java `null`.
+///
+/// # Why the units form is the primary one
+///
+/// Every arm below that produced a Rust `String` from a Java `String` went
+/// through `ctx.read_string`, which cannot carry an unpaired surrogate: a
+/// `str` is well-formed UTF-8, so each lone `\uD800..\uDFFF` silently became
+/// U+FFFD. `sb.append((Object) s)` and `sb.insert(0, (Object) s)` therefore
+/// lost a surrogate that `sb.append(char)` on the line before had kept.
+///
+/// MEASURED before the change (`scratchpad/g26/G26Builder.java` rows a4 and
+/// i2, HotSpot 25.0.3+9-LTS as the oracle): U+DC00 there, U+FFFD here.
+///
+/// The wrapper and fallback arms are unchanged and simply
+/// `encode_utf16` their own ASCII text — none of them can produce a
+/// surrogate, so the conversion is exact and the only behavioural difference
+/// is on the two arms that read a Java `String`.
+fn invoke_to_string_units_opt(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Result<Option<Vec<u16>>, cratonvm_types::error::MethodCallFailed> {
+    // Fast path: if it's already a String object, read its code units.
+    //
+    // The class test comes FIRST and `read_string` stays as the fallback: on a
+    // class the VM cannot name, `read_string`'s structural decode is still the
+    // best answer available, and keeping it means this refactor cannot lose a
+    // route it used to serve.
+    let this_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_default();
+    if this_class == "java/lang/String" {
+        return Ok(Some(read_string_chars(&*ctx, obj)));
+    }
     if let Some(s) = ctx.read_string(obj) {
-        return Ok(Some(s));
+        return Ok(Some(s.encode_utf16().collect()));
     }
 
     // Fast path for wrapper types: if the object has exactly 1 field and its
@@ -2012,17 +2167,17 @@ fn invoke_to_string_opt(
                         // Integer
                         v.to_string()
                     };
-                    return Ok(Some(formatted));
+                    return Ok(Some(formatted.encode_utf16().collect()));
                 }
-                Value::Long(v) => return Ok(Some(v.to_string())),
+                Value::Long(v) => return Ok(Some(v.to_string().encode_utf16().collect())),
                 // Use the Java-spec formatters (NOT raw `{}`), so a boxed Double/Float
                 // rendered via String.valueOf(Object) / StringBuilder.append(Object) /
                 // object string-concat matches `Double.toString` — incl. the
                 // 10^-3..10^7 scientific-notation threshold, "Infinity", and "-0.0".
                 // Raw `format!("{}")` dropped the ".0", printed "inf"/"-0", and never
                 // used E-notation (e.g. boxed 1e7 -> "10000000.0", -0.0 -> "-0").
-                Value::Float(v) => return Ok(Some(format_float(v))),
-                Value::Double(v) => return Ok(Some(format_double(v))),
+                Value::Float(v) => return Ok(Some(format_float(v).encode_utf16().collect())),
+                Value::Double(v) => return Ok(Some(format_double(v).encode_utf16().collect())),
                 _ => {} // Not a primitive wrapper
             }
         }
@@ -2045,10 +2200,27 @@ fn invoke_to_string_opt(
     // malformed return value uses the historical identity fallback.
     let result = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
     match result {
-        Ok(Some(Value::Object(Some(str_ref)))) => Ok(Some(
-            ctx.read_string(str_ref)
-                .unwrap_or_else(|| "null".to_string()),
-        )),
+        // The override's answer is read as UNITS, so a `toString()` that
+        // itself returns a lone surrogate is carried through rather than
+        // replaced. `read_string_chars` on a non-String is empty, which is
+        // why the `read_string` fallback stays for the class the VM cannot
+        // name — and the descriptor guarantees a `String` here in every
+        // ordinary case.
+        Ok(Some(Value::Object(Some(str_ref)))) => {
+            let ret_class = ctx
+                .class_name_of_id(ctx.class_id_of_object(str_ref))
+                .unwrap_or_default();
+            if ret_class == "java/lang/String" {
+                Ok(Some(read_string_chars(&*ctx, str_ref)))
+            } else {
+                Ok(Some(
+                    ctx.read_string(str_ref)
+                        .unwrap_or_else(|| "null".to_string())
+                        .encode_utf16()
+                        .collect(),
+                ))
+            }
+        }
         // toString() legitimately returned null (e.g. TestJspWriterImpl's
         // bug54241b: an anonymous class whose toString() explicitly `return
         // null;`) — this is NOT a dispatch failure, don't fall through to the
@@ -2062,10 +2234,23 @@ fn invoke_to_string_opt(
             } else {
                 "Object".to_string()
             };
-            Ok(Some(format!("{}@{:x}", name, ctx.identity_hash_code(obj))))
+            Ok(Some(
+                format!("{}@{:x}", name, ctx.identity_hash_code(obj))
+                    .encode_utf16()
+                    .collect(),
+            ))
         }
         Err(err) => Err(err),
     }
+}
+
+/// [`invoke_to_string`] as raw UTF-16 code units — the text `"null"` for a
+/// `toString()` that returned Java `null`, exactly as the `String` form does.
+pub(crate) fn invoke_to_string_units(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Result<Vec<u16>, cratonvm_types::error::MethodCallFailed> {
+    Ok(invoke_to_string_units_opt(ctx, obj)?.unwrap_or_else(|| "null".encode_utf16().collect()))
 }
 
 pub(crate) fn native_sb_append_object(
@@ -2120,8 +2305,7 @@ fn charsequence_chars(
     cs: cratonvm_types::ObjectRef,
     range: Option<(i32, i32)>,
 ) -> Result<Vec<u16>, MethodCallFailed> {
-    if let Some(text) = charsequence_fast_text(ctx, cs)? {
-        let units: Vec<u16> = text.encode_utf16().collect();
+    if let Some(units) = charsequence_fast_units(ctx, cs)? {
         let n = units.len() as i32;
         let (lo, hi) = match range {
             None => (0, n),
@@ -2176,8 +2360,8 @@ fn charsequence_length(
     ctx: &mut dyn NativeContext,
     cs: cratonvm_types::ObjectRef,
 ) -> Result<i32, MethodCallFailed> {
-    if let Some(text) = charsequence_fast_text(ctx, cs)? {
-        return Ok(text.encode_utf16().count() as i32);
+    if let Some(units) = charsequence_fast_units(ctx, cs)? {
+        return Ok(units.len() as i32);
     }
     match ctx.invoke_virtual(cs, "length", "()I", &[])? {
         Some(Value::Int(n)) => Ok(n),
@@ -2187,20 +2371,45 @@ fn charsequence_length(
 
 /// The three shapes whose text can be read in Rust without changing the answer
 /// -- see [`charsequence_chars`]. `Ok(None)` means "walk `charAt`".
-fn charsequence_fast_text(
+///
+/// # Code UNITS, not a Rust `String`
+///
+/// A Rust `str` is well-formed UTF-8 and cannot hold an unpaired surrogate, so
+/// every arm that went through one replaced each lone `\uD800..\uDFFF` with
+/// U+FFFD — while the `charAt` walk in [`charsequence_chars`], the slow path
+/// this function exists to skip, carried it through untouched. The two arms of
+/// one function disagreed about the same sequence.
+///
+/// MEASURED on HotSpot 25.0.3+9-LTS and this VM before the change
+/// (`scratchpad/g26/G26Builder.java`, rows a3/a5/a6/a10/a11/c6/c8/c9/r3):
+/// `sb.append((CharSequence) s)` where `s` holds one `\uDC00` answered U+FFFD
+/// here and U+DC00 there. Nothing threw; the substitution is unrecoverable.
+/// [`sb_string_from_units`] is the same fix on the write side.
+fn charsequence_fast_units(
     ctx: &mut dyn NativeContext,
     cs: cratonvm_types::ObjectRef,
-) -> Result<Option<String>, MethodCallFailed> {
+) -> Result<Option<Vec<u16>>, MethodCallFailed> {
     let cid = ctx.class_id_of_object(cs);
     let name = ctx.class_name_of_id(cid).unwrap_or_default();
     if name == "java/lang/String" {
-        return Ok(ctx.read_string(cs));
+        return Ok(Some(read_string_chars(&*ctx, cs)));
     }
     if name == "java/lang/StringBuilder" || name == "java/lang/StringBuffer" {
-        return Ok(Some(invoke_to_string(ctx, cs)?));
+        // `sb_read_chars` is what `StringBuilder.toString()` answers on this
+        // VM — `native_sb_to_string` reads the same two slots — so this is the
+        // same value the `invoke_to_string` it replaces produced, minus the
+        // `str` round trip and minus a Java re-entry that could move `cs`.
+        return Ok(Some(sb_read_chars(&*ctx, cs)));
     }
     if name.starts_with("java/nio/") && name.contains("CharBuffer") {
-        return Ok(crate::phases_late::charset_buffers::cb_read_text(ctx, cs));
+        // `cb_read_text` still answers a Rust `String`; it lives in
+        // `phases_late::charset_buffers`, which this lane does not own, so a
+        // lone surrogate inside a `CharBuffer` is still lossy on this one arm.
+        // Recorded as a NOMINATION in
+        // `docs/known-issues/jdk-only/G26-1-four-families-of-RJdkIntrinsics3-20260817.md`
+        // rather than fixed from here.
+        return Ok(crate::phases_late::charset_buffers::cb_read_text(ctx, cs)
+            .map(|t| t.encode_utf16().collect()));
     }
     Ok(None)
 }
@@ -2330,6 +2539,82 @@ pub(crate) fn native_sb_append_charsequence_off_len(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// True when `units` holds a surrogate code unit that is NOT part of a
+/// well-formed high+low pair — i.e. exactly the content a Rust `str` cannot
+/// represent.
+pub(crate) fn has_unpaired_surrogate(units: &[u16]) -> bool {
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..=0xDBFF).contains(&u) {
+            if i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+        if (0xDC00..=0xDFFF).contains(&u) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Materialise a fresh (uninterned) Java `String` from raw UTF-16 code units.
+///
+/// `String::from_utf16_lossy` — which every `String`-returning builder native
+/// used to end in — cannot carry an UNPAIRED surrogate: a Rust `str` is
+/// well-formed UTF-8, so each lone `\uD800..\uDFFF` silently becomes U+FFFD.
+/// Nothing threw, and the substitution is unrecoverable: after
+/// `sb.append((char) 0xD800)`, `sb.charAt(0)` answered 0xD800 while
+/// `sb.toString().charAt(0)` answered 0xFFFD — the builder and its own
+/// `toString` disagreed about their contents.
+///
+/// The lossless reader for the other direction ([`read_string_chars`]) has been
+/// in this file all along; this is its write-side twin.
+///
+/// The ordinary case is byte-for-byte the previous behaviour: well-formed units
+/// still go through `create_string_uninterned_gc_safe(&str)`, so no allocation
+/// path, interning rule or GC-safety property moves for text that has no lone
+/// surrogate. Only a slice that actually contains one takes the units path —
+/// `new_object("java/lang/String")` plus `init_string_from_units`, the same
+/// pair `native_string_init_from_char_array` uses, documented as preserving
+/// "raw code units byte-for-byte (including unpaired surrogates)". Both of
+/// those allocate with the non-triggering `try_alloc_*` primitives, but the
+/// fresh String is not reachable from any Java root, so it is pinned across
+/// them anyway.
+pub(crate) fn sb_string_from_units(
+    ctx: &mut dyn NativeContext,
+    units: &[u16],
+) -> Result<cratonvm_types::ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    if !has_unpaired_surrogate(units) {
+        let text = String::from_utf16_lossy(units);
+        return Ok(ctx.create_string_uninterned_gc_safe(&text));
+    }
+    let obj = match ctx.new_object("java/lang/String")? {
+        Some(Value::Object(Some(o))) => o,
+        // Allocation refused without reporting a failure: fall back to the
+        // lossy form rather than hand a null out of a String-typed method.
+        _ => {
+            let text = String::from_utf16_lossy(units);
+            return Ok(ctx.create_string_uninterned_gc_safe(&text));
+        }
+    };
+    let h = ctx.pin_native_root(obj);
+    let obj = ctx.read_native_pin(h, obj);
+    let ok = ctx.init_string_from_units(obj, units);
+    let obj = ctx.read_native_pin(h, obj);
+    ctx.unpin_native_roots(h);
+    if !ok {
+        return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+            message: "Java heap space (String from UTF-16 units)".to_string(),
+        }
+        .into());
+    }
+    Ok(obj)
+}
+
 pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2350,27 +2635,57 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
         };
         chars.push(ch);
     }
-    let text = String::from_utf16_lossy(&chars);
     // `StringBuilder.toString()` must return a *fresh* String distinct from
     // any equal literal — the JVM spec only pools literals and `intern()`.
     // Routing it through the interned pool made `==` wrongly report identity
     // (e.g. `sb.toString() == "literal"`), breaking identity-based symbol
     // comparisons such as xerces' `NamespaceSupport`.
-    // `_gc_safe`: `text` is already Rust-owned; `this`/`buf` are not
-    // dereferenced again below, so a moving young GC here is safe. Without
-    // this, a StringBuilder.toString()-heavy hot loop (e.g. Response.
-    // toAbsolute()) hard-aborts the whole process on young-gen exhaustion
-    // instead of collecting and continuing -- see docs/known-issues/
-    // tomcat-08-07/silent-hang-no-signature-cluster.md.
-    let result = ctx.create_string_uninterned_gc_safe(&text);
+    // `_gc_safe` (inside `sb_string_from_units`): the units are already
+    // Rust-owned; `this`/`buf` are not dereferenced again below, so a moving
+    // young GC here is safe. Without this, a StringBuilder.toString()-heavy hot
+    // loop (e.g. Response.toAbsolute()) hard-aborts the whole process on
+    // young-gen exhaustion instead of collecting and continuing -- see
+    // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
+    let result = sb_string_from_units(ctx, &chars)?;
     Ok(Some(Value::Object(Some(result))))
 }
 
 /// AbstractStringBuilder.getChars(int srcBegin, int srcEnd, char[] dst, int dstBegin)
 ///
 /// Copies characters from the builder's buffer into `dst` starting at
-/// `dstBegin`.  Throws StringIndexOutOfBoundsException if
-/// srcBegin < 0, srcEnd > count, or srcBegin > srcEnd.
+/// `dstBegin`.
+///
+/// **The two range checks throw DIFFERENT exception classes, and the JDK says
+/// so in one line each.** `AbstractStringBuilder.getChars` is:
+///
+/// ```text
+/// Preconditions.checkFromToIndex(srcBegin, srcEnd, count, Preconditions.SIOOBE_FORMATTER);
+/// int n = srcEnd - srcBegin;
+/// Preconditions.checkFromToIndex(dstBegin, dstBegin + n, dst.length, Preconditions.IOOBE_FORMATTER);
+/// ```
+///
+/// so a bad SOURCE window is a `StringIndexOutOfBoundsException` while a bad
+/// DESTINATION window is the PLAIN `IndexOutOfBoundsException` — not the
+/// `ArrayIndexOutOfBoundsException` the element stores below would otherwise
+/// suggest, and not the `StringIndexOutOfBoundsException` its own source-side
+/// neighbour throws. Both wrong choices are subclasses of the class the JDK
+/// actually throws, so a test that catches the SUPERTYPE cannot tell the
+/// difference; `RJdkBridge1`'s `sbidx` rows assert the EXACT class and can.
+/// MEASURED on jdk-25.0.3.9 — see
+/// `docs/known-issues/jdk-only/G53-1-the-exact-exception-class-and-the-rest-of-sbidx-20260817.md`.
+///
+/// The ORDER is load-bearing too, and is four checks deep:
+/// 1. the source check runs FIRST, so `getChars(3, 1, null, 0)` is a
+///    `StringIndexOutOfBoundsException` and never reaches the null `dst`;
+/// 2. `dst.length` is then read, so a null `dst` is a `NullPointerException`
+///    even when `n == 0` — `getChars(0, 0, null, 0)` throws;
+/// 3. only then is the destination window checked.
+///
+/// Note `java.lang.String.getChars` does NOT share this split: it checks both
+/// windows with `SIOOBE_FORMATTER`, so its too-small-destination case is a
+/// `StringIndexOutOfBoundsException`. It is a different contract in a different
+/// class, and this file does not serve it (`String.getChars` has no native
+/// registration at all — real JDK bytecode runs). Do not unify the two.
 pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2384,50 +2699,47 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    // `dst` is dereferenced (`dst.length`, element stores) — a null array is a
-    // NullPointerException per the JDK, not a silent no-op.
-    let dst = match args.get(3) {
-        Some(Value::Object(Some(arr))) => *arr,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some(
-                    "Cannot store to null char[] in AbstractStringBuilder.getChars".to_string(),
-                ),
-            }
-            .into())
-        }
-    };
     let dst_begin = match args.get(4) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
 
     let (buf, count) = sb_state(ctx, this);
-    // Source-range check: `AbstractStringBuilder.getChars` first validates the
-    // [srcBegin, srcEnd) window against the builder length via
-    // `checkRangeSIOOBE`, throwing StringIndexOutOfBoundsException.
+    // (1) Source-range check FIRST, with `SIOOBE_FORMATTER`. This precedes the
+    // null-`dst` dereference, which is why a bad source window beats a null
+    // destination rather than the other way round.
     if src_begin < 0 || src_end > count || src_begin > src_end {
         return Err(cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, count).into());
     }
     let n = (src_end - src_begin) as usize;
-    // Destination-range check: the underlying `System.arraycopy` into `dst`
-    // throws (Array)IndexOutOfBoundsException when `dstBegin < 0` or the copied
-    // window `[dstBegin, dstBegin + n)` would run past `dst.length`. Previously
-    // this was silently ignored, dropping the out-of-bounds writes.
+    // (2) `dst.length` is read next, so a null `dst` is a NullPointerException —
+    // unconditionally, including the `n == 0` case where nothing would be
+    // copied. HotSpot's helpful-NPE wording names the array being read.
+    let dst = match args.get(3) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Cannot read the array length because \"dst\" is null".to_string()),
+            }
+            .into())
+        }
+    };
+    // (3) Destination-range check, with `IOOBE_FORMATTER`: the PLAIN
+    // `IndexOutOfBoundsException`, carrying `checkFromToIndex`'s range wording
+    // over the DESTINATION window `[dstBegin, dstBegin + n)`.
     let dst_len = ctx.array_length(dst) as i64;
     // Use widening i64 arithmetic so `dstBegin + n` cannot wrap (n is bounded by
     // the validated source window, so it fits in i32, but stay defensive).
     let copy_end = i64::from(dst_begin) + (n as i64);
     if dst_begin < 0 || copy_end > dst_len {
-        // The first offending destination index, matching JDK arraycopy
-        // semantics: a negative dstBegin reports dstBegin; an overrun reports
-        // the last index written.
-        let bad_index = if dst_begin < 0 {
-            dst_begin
-        } else {
-            (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-        };
-        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(bad_index).into());
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(dst_begin),
+                copy_end,
+                dst_len,
+            ),
+        )
+        .into());
     }
     let buf = match buf {
         Some(b) => b,
@@ -2536,7 +2848,30 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // SIOOBE_FORMATTER)`.
         return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
-    let buf = buf.unwrap();
+    // `buf.unwrap()` here ABORTED THE VM. A builder whose slot 0 is not a
+    // `char[]` reaches this with `count > 0` and `buf == None`, and a Rust
+    // panic is not a Java throwable: it terminates the process instead of
+    // unwinding to the `catch` the caller wrote.
+    //
+    // MEASURED reproducer before the fix (`scratchpad/g26/G26Builder.java`
+    // row i6): `new StringBuilder("xy").insert(1, (CharSequence) s)` had no
+    // native, so real `AbstractStringBuilder` bytecode ran against this VM's
+    // synthetic `char[]`/`count` layout and left the receiver inconsistent;
+    // the next `charAt` panicked at this line —
+    // `thread 'main-vm' panicked ... called Option::unwrap() on a None value`,
+    // exit without a stack trace. The registration gap is closed below
+    // (`insert(int, CharSequence)` and its 4-arg sibling), so nothing in the
+    // suite reaches this arm any more; it stays because the guard must not
+    // depend on that.
+    //
+    // `sioobe_index` is the same refusal the bounds arm above raises, so a
+    // caller sees one class for "this index is not readable" either way. Its
+    // message is TRANSCRIBED from HotSpot and asserted by the probe rows
+    // n21/n22/n23 (`Index 5 out of bounds for length 2`), which match today
+    // and must keep matching.
+    let Some(buf) = buf else {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
+    };
     let ch = ctx.get_array_element(buf, index as usize);
     Ok(Some(ch))
 }
@@ -2645,8 +2980,30 @@ pub(crate) fn native_sb_code_point_count(
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    if let Some(failure) = sb_check_from_to_index(begin_i32, end_i32, chars.len() as i32) {
-        return Err(failure);
+    // NOT `sb_check_from_to_index` — that helper throws the
+    // `StringIndexOutOfBoundsException` its `delete`/`replace`/`substring`
+    // callers want, and `codePointCount` is the one row in this class that
+    // wants the PLAIN superclass. The JDK passes a null formatter here:
+    //
+    // ```text
+    // Preconditions.checkFromToIndex(beginIndex, endIndex, count, null);
+    // ```
+    //
+    // against `SIOOBE_FORMATTER` two methods away, and a null formatter yields
+    // `java.lang.IndexOutOfBoundsException`. `RJdkBridge1`'s
+    // `sbidx-step=codePointCount(0, len+1)` asserts the exact class, so the
+    // subclass does not pass even though `catch (IndexOutOfBoundsException)`
+    // would not notice. MEASURED on jdk-25.0.3.9.
+    let count_i32 = chars.len() as i32;
+    if begin_i32 < 0 || begin_i32 > end_i32 || end_i32 > count_i32 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(begin_i32),
+                i64::from(end_i32),
+                i64::from(count_i32),
+            ),
+        )
+        .into());
     }
     let begin = begin_i32 as usize;
     let end = end_i32 as usize;
@@ -2716,6 +3073,29 @@ pub(crate) fn native_sb_append_code_point(
     native_sb_append_codepoint(ctx, args)
 }
 
+/// `AbstractStringBuilder.reverse()` (JDK 25
+/// `AbstractStringBuilder.java:1696-1733`, delegating to
+/// `StringUTF16.reverse`).
+///
+/// The javadoc is explicit that this is NOT a plain code-unit reversal, which
+/// is what this used to be:
+///
+/// > Causes this character sequence to be replaced by the reverse of the
+/// > sequence. **If there are any surrogate pairs included in the sequence,
+/// > these are treated as single characters for the reverse operation. Thus,
+/// > the order of the high-low surrogates is never reversed.**
+///
+/// > Note that the reverse operation may result in producing surrogate pairs
+/// > that were unpaired low-surrogates and high-surrogates before the
+/// > operation. For example, reversing `"\uDC00\uD800"` produces
+/// > `"𐀀"` which is a valid surrogate pair.
+///
+/// The JDK does it in two passes and so does this: reverse every code unit,
+/// then walk the result and swap back any `(low, high)` neighbour — that
+/// neighbour is exactly a pair the first pass inverted. The second pass runs
+/// only when the first saw a surrogate, and it advances TWO units after a swap
+/// (`putChar(val, i++, c1)`), so `"\uDC00\uD800"` in the *input* is left as the
+/// valid pair the javadoc promises rather than being swapped a second time.
 pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2723,16 +3103,34 @@ pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let (buf, count) = sb_state(ctx, this);
     if let Some(buf) = buf {
-        let count = count as usize;
-        let mut i = 0;
-        let mut j = if count > 0 { count - 1 } else { 0 };
-        while i < j {
-            let a = ctx.get_array_element(buf, i);
-            let b = ctx.get_array_element(buf, j);
-            ctx.set_array_element(buf, i, b);
-            ctx.set_array_element(buf, j, a);
-            i += 1;
-            j -= 1;
+        let count = count.max(0) as usize;
+        let mut units: Vec<u16> = Vec::with_capacity(count);
+        let count = count.min(ctx.array_length(buf));
+        for i in 0..count {
+            units.push(match ctx.get_array_element(buf, i) {
+                Value::Int(c) => c as u16,
+                _ => 0,
+            });
+        }
+        let had_surrogate = units.iter().any(|&u| (0xD800..=0xDFFF).contains(&u));
+        units.reverse();
+        if had_surrogate {
+            let mut i = 0usize;
+            while i + 1 < units.len() {
+                // A LOW surrogate followed by a HIGH one is a pair the
+                // reversal inverted; put it back.
+                if (0xDC00..=0xDFFF).contains(&units[i])
+                    && (0xD800..=0xDBFF).contains(&units[i + 1])
+                {
+                    units.swap(i, i + 1);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for (i, &u) in units.iter().enumerate() {
+            ctx.set_array_element(buf, i, Value::Int(i32::from(u)));
         }
     }
     Ok(Some(Value::Object(Some(this))))
@@ -2793,11 +3191,11 @@ pub(crate) fn native_sb_insert_string(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let insert_str = match args.get(2) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => "null".to_string(),
+    // Code UNITS — `G26Builder` row i1. See `native_sb_append_string`.
+    let insert_chars: Vec<u16> = match args.get(2) {
+        Some(Value::Object(Some(obj))) => read_string_chars(&*ctx, *obj),
+        _ => "null".encode_utf16().collect(),
     };
-    let insert_chars: Vec<u16> = insert_str.encode_utf16().collect();
 
     let chars = sb_read_chars(ctx, this);
     if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
@@ -2810,6 +3208,217 @@ pub(crate) fn native_sb_insert_string(
     result.extend_from_slice(&chars[offset..]);
     let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// `insert(int, CharSequence, int, int)` — JDK 25's four-argument insert.
+///
+/// # Why this has to exist at all
+///
+/// It had NO native, so real `AbstractStringBuilder` bytecode ran — and that
+/// bytecode writes the JDK's compact `byte[] value` / `byte coder` / `int
+/// count` layout, which this VM's builders do not have (slot 0 is a `char[]`,
+/// slot 1 is the count). The same layout mismatch the ten registrations above
+/// exist to prevent. MEASURED before the fix
+/// (`scratchpad/g26/G26Insert.java`, HotSpot 25.0.3+9-LTS as the oracle):
+///
+/// | call | HotSpot | before |
+/// |---|---|---|
+/// | `new StringBuilder("xy").insert(1, (CharSequence) "AB")` | `xABy` | `xA` |
+/// | `…insert(1, (CharSequence) sb)` | `xABy` | `xA` |
+/// | `…insert(1, seq, 0, 1)` | `xPy` | `xP` |
+/// | `…insert(1, (CharSequence) null)` | `xnully` | `xn` |
+/// | `new StringBuffer("xy").insert(1, (CharSequence) "AB")` | `xABy` | `xA` |
+///
+/// It did not throw — it OVERWROTE and truncated, which reads as a successful
+/// insert of the wrong text. Worse, it left the receiver's count and buffer
+/// inconsistent, and the next `charAt` on it hit an `unwrap()` in
+/// [`native_sb_char_at`] and **aborted the VM** (`G26Builder` row i6). That
+/// `unwrap` is now a throw, but the registration is the actual repair.
+///
+/// # The contract, TRANSCRIBED
+///
+/// Every row below is measured on HotSpot 25.0.3+9-LTS
+/// (`scratchpad/g26/G26InsCs.java`), not derived from the javadoc. The two
+/// refusals are DIFFERENT classes and the order between them is observable:
+///
+/// | call, on `new StringBuilder("xy")` | HotSpot |
+/// |---|---|
+/// | `insert(5, "AB", 0, 1)` | `StringIndexOutOfBoundsException: Range [5, 2) out of bounds for length 2` |
+/// | `insert(-1, "AB", 0, 1)` | `StringIndexOutOfBoundsException: Range [-1, 2) out of bounds for length 2` |
+/// | `insert(1, "AB", 0, 9)` | `IndexOutOfBoundsException: Range [0, 9) out of bounds for length 2` |
+/// | `insert(1, "AB", -1, 1)` | `IndexOutOfBoundsException: Range [-1, 1) out of bounds for length 2` |
+/// | `insert(1, "AB", 2, 1)` | `IndexOutOfBoundsException: Range [2, 1) out of bounds for length 2` |
+/// | `insert(9, "AB", 0, 9)` — BOTH wrong | the `StringIndex…` one: the offset check is first |
+/// | `insert(1, null, 0, 9)` | `IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4` |
+/// | `insert(1, null, 0, 4)` | no throw, `xnully` |
+/// | `insert(5, cs)` whose `length()` throws | that `IllegalStateException` — see the 2-arg form |
+/// | `insert(5, cs, 0, 1)` whose `length()` throws | the offset `StringIndex…`; `length()` is never called |
+/// | `insert(1, "AB", 1, 1)` | no throw, `xy` — an empty window is legal |
+///
+/// So the order is: substitute `"null"`, then `checkOffset` (a
+/// `StringIndexOutOfBoundsException`), then `checkRange` against
+/// `s.length()` (the PLAIN `IndexOutOfBoundsException`). The null
+/// substitution happens before the range check, which is why the length in
+/// the `insert(1, null, 0, 9)` message is 4 and not the receiver's 2 — the
+/// same rule [`native_sb_append_charsequence_off_len`] records, and the same
+/// two message helpers, so the two overloads cannot drift.
+pub(crate) fn native_sb_insert_charsequence_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [this, dstOffset, s, start, end]
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let offset = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let cs = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let start = match args.get(3) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let end = match args.get(4) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+
+    // GC: `charsequence_length` and `charsequence_chars` both re-enter Java
+    // for anything but the fast-path shapes, so the receiver AND the sequence
+    // are rooted before either runs — the obligation every re-entrant native
+    // in this file discharges.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let cs_handle = cs.map(|o| scope.root(o));
+
+    // 1. checkOffset(dstOffset, count) — BEFORE the sequence is touched at
+    //    all. The `Thrower` row is what pins this ordering: a `length()` that
+    //    throws is never reached when the offset is already wrong.
+    let this_now = scope.get(&this_handle);
+    let count = sb_read_chars(&*scope, this_now).len() as i32;
+    if let Some(failure) = sb_check_offset(offset, count) {
+        return Err(failure);
+    }
+
+    // 2. checkRange(start, end, s.length()) — a null sequence is the four
+    //    characters "null", so the length checked against is 4.
+    let s_len = match &cs_handle {
+        Some(handle) => {
+            let cs_now = scope.get(handle);
+            charsequence_length(&mut *scope, cs_now)?
+        }
+        None => 4,
+    };
+    if start < 0 || end < start || end > s_len {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(start),
+                i64::from(end),
+                i64::from(s_len),
+            ),
+        )
+        .into());
+    }
+
+    // 3. The window's CHARACTERS. `charsequence_chars` reads them by `charAt`
+    //    for every implementation but the fast-path shapes, which is what the
+    //    JDK does, and answers code units so an unpaired surrogate survives.
+    let insert_chars: Vec<u16> = match &cs_handle {
+        Some(handle) => {
+            let cs_now = scope.get(handle);
+            charsequence_chars(&mut *scope, cs_now, Some((start, end)))?
+        }
+        None => "null".encode_utf16().collect::<Vec<u16>>()[start as usize..end as usize].to_vec(),
+    };
+
+    // 4. Splice. The receiver is re-read because steps 2 and 3 may have run
+    //    arbitrary Java; a `length()`/`charAt` that mutated the receiver could
+    //    have shortened it under us, and slicing on the stale `offset` would
+    //    panic. Refusing with the same class the offset check uses keeps a
+    //    pathological sequence from aborting the VM.
+    let this_now = scope.get(&this_handle);
+    let chars = sb_read_chars(&*scope, this_now);
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
+    let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
+    result.extend_from_slice(&chars[..offset]);
+    result.extend_from_slice(&insert_chars);
+    result.extend_from_slice(&chars[offset..]);
+    let this_now = sb_write_chars(&mut *scope, this_now, &result);
+    Ok(Some(Value::Object(Some(this_now))))
+}
+
+/// `insert(int, CharSequence)` — JDK 25's two-argument insert.
+///
+/// The body is `if (s == null) s = "null"; if (s instanceof String) return
+/// insert(dstOffset, (String) s); return insert(dstOffset, s, 0, s.length());`
+/// and BOTH branches are observable:
+///
+/// * a `String` (and a null, which becomes one) takes the `insert(int,
+///   String)` path, so `length()` is never called on it;
+/// * anything else evaluates `s.length()` as an ARGUMENT of the four-argument
+///   call, i.e. **before** that call's offset check. MEASURED: on
+///   `new StringBuilder("xy")`, `insert(5, seq)` whose `length()` throws
+///   answers that `IllegalStateException`, while `insert(5, seq, 0, 1)`
+///   answers the offset `StringIndexOutOfBoundsException`. Two calls, same
+///   receiver, same bad offset, same sequence, different exceptions —
+///   transcribed rather than derived, because either ordering looks equally
+///   reasonable from the javadoc.
+pub(crate) fn native_sb_insert_charsequence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [this, dstOffset, s]
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let offset = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let cs = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        // `s == null` becomes the String "null", and a String goes to the
+        // `insert(int, String)` overload — which already substitutes "null"
+        // for a null argument, after its own `checkOffset`.
+        _ => return native_sb_insert_string(ctx, args),
+    };
+    let name = ctx
+        .class_name_of_id(ctx.class_id_of_object(cs))
+        .unwrap_or_default();
+    if name == "java/lang/String" {
+        return native_sb_insert_string(ctx, args);
+    }
+
+    // GC: `charsequence_length` re-enters Java, so both refs are rooted and
+    // re-read before they are handed to the four-argument body.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let cs_handle = scope.root(cs);
+    let len = {
+        let cs_now = scope.get(&cs_handle);
+        charsequence_length(&mut *scope, cs_now)?
+    };
+    let this_now = scope.get(&this_handle);
+    let cs_now = scope.get(&cs_handle);
+    native_sb_insert_charsequence_range(
+        &mut *scope,
+        &[
+            Value::Object(Some(this_now)),
+            Value::Int(offset),
+            Value::Object(Some(cs_now)),
+            Value::Int(0),
+            Value::Int(len),
+        ],
+    )
 }
 
 /// `insert(int, char)` — insert a single char. `checkOffset(offset, count)`.
@@ -2887,17 +3496,38 @@ pub(crate) fn native_sb_insert_object(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let text = match args.get(2) {
-        Some(Value::Object(Some(obj))) => {
-            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
-        }
-        Some(Value::Object(None)) => "null".to_string(),
-        Some(Value::Int(v)) => v.to_string(),
-        Some(Value::Long(v)) => v.to_string(),
-        _ => "null".to_string(),
+    // `insert(int, Object)` is `insert(dstOffset, String.valueOf(obj))`, so
+    // the object must be ASKED. This read `ctx.read_string(obj)` instead,
+    // which answers `None` for everything that is not a `java.lang.String` —
+    // so every other object was inserted as the four characters `"null"`.
+    // MEASURED (`scratchpad/g26/G26Insert.java`, HotSpot 25.0.3+9-LTS):
+    //
+    // | call | HotSpot | before |
+    // |---|---|---|
+    // | `insert(0, Integer.valueOf(7))` | `7ab` | `nullab` |
+    // | `insert(0, obj with toString()="CUSTOM")` | `CUSTOMab` | `nullab` |
+    // | `insert(0, Boolean.TRUE)` | `trueab` | `nullab` |
+    // | `insert(0, Double.valueOf(1.5))` | `1.5ab` | `nullab` |
+    // | `insert(0, new int[]{1})` | `[I@…ab` | `nullab` |
+    //
+    // `append(Object)` two hundred lines up already used `invoke_to_string`
+    // and already measured correct — the sibling overload, same file, one
+    // helper apart. The units form is [`invoke_to_string`]'s, so a
+    // `toString()` answering a lone surrogate survives too (row i2).
+    //
+    // GC: `invoke_to_string_units` re-enters Java and can move `this`, so the
+    // receiver is pinned across it — the same obligation
+    // `native_sb_append_object` discharges.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let insert_chars: Vec<u16> = match args.get(2) {
+        Some(Value::Object(Some(obj))) => invoke_to_string_units(&mut *scope, *obj)?,
+        Some(Value::Int(v)) => v.to_string().encode_utf16().collect(),
+        Some(Value::Long(v)) => v.to_string().encode_utf16().collect(),
+        _ => "null".encode_utf16().collect(),
     };
-    let insert_chars: Vec<u16> = text.encode_utf16().collect();
-    let chars = sb_read_chars(ctx, this);
+    let this = scope.get(&this_handle);
+    let chars = sb_read_chars(&*scope, this);
     if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
         return Err(failure);
     }
@@ -2906,7 +3536,7 @@ pub(crate) fn native_sb_insert_object(
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
     result.extend_from_slice(&chars[offset..]);
-    let this = sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(&mut *scope, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -3243,8 +3873,9 @@ pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if let Some(failure) = sb_check_from_to_index(start, end, count) {
         return Err(failure);
     }
-    let replacement = match args.get(3) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+    // Code UNITS — `G26Builder` row r1. See `native_sb_append_string`.
+    let repl_chars: Vec<u16> = match args.get(3) {
+        Some(Value::Object(Some(obj))) => read_string_chars(&*ctx, *obj),
         Some(Value::Object(None)) => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some(
@@ -3253,9 +3884,8 @@ pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             }
             .into())
         }
-        _ => String::new(),
+        _ => Vec::new(),
     };
-    let repl_chars: Vec<u16> = replacement.encode_utf16().collect();
     chars.splice(start as usize..end as usize, repl_chars);
     let this = sb_write_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
@@ -3347,26 +3977,66 @@ pub(crate) fn native_sb_set_length(
     Ok(None)
 }
 
+/// `String.indexOf(value, coder, count, str, fromIndex)`'s contract — the body
+/// `AbstractStringBuilder.indexOf(String, int)` delegates to
+/// (`StringLatin1`/`StringUTF16.indexOf`):
+///
+/// ```text
+///     if (fromIndex >= valueCount) {
+///         return (strCount == 0 ? valueCount : -1);
+///     }
+///     if (fromIndex < 0) { fromIndex = 0; }
+///     if (strCount == 0) { return fromIndex; }
+/// ```
+///
+/// Note the first arm: `sb.indexOf("", 99)` is the LENGTH, not -1 and not 99.
+///
+/// The counterpart of [`u16_last_index_of`], and the same reason for existing:
+/// both operands are UTF-16 code units. The two `indexOf` natives used to
+/// build a Rust `String` with `String::from_utf16_lossy` and call `str::find`,
+/// which (a) cannot represent an unpaired surrogate in either operand, so a
+/// lone `\uD800` needle was searched for as U+FFFD and matched the wrong
+/// position — or matched a DIFFERENT lone surrogate, since every one of them
+/// collapses to the same replacement character — and (b) then converted a UTF-8
+/// BYTE offset back to a code-unit index by re-encoding the prefix.
+fn u16_index_of(haystack: &[u16], needle: &[u16], from: i32) -> i32 {
+    let n = haystack.len() as i32;
+    let m = needle.len() as i32;
+    if from >= n {
+        return if m == 0 { n } else { -1 };
+    }
+    let from = from.max(0);
+    if m == 0 {
+        return from;
+    }
+    if m > n - from {
+        return -1;
+    }
+    let mut k = from;
+    while k <= n - m {
+        let s = k as usize;
+        if &haystack[s..s + m as usize] == needle {
+            return k;
+        }
+        k += 1;
+    }
+    -1
+}
+
 /// indexOf(String) — find substring, return -1 if not found
 pub(crate) fn native_sb_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let target = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+    // `read_string_chars`, not `read_string`: the needle may itself hold an
+    // unpaired surrogate.
+    let target: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
-    let haystack: String = String::from_utf16_lossy(&chars);
-    match haystack.find(&target) {
-        Some(byte_pos) => {
-            // Convert byte position to char position
-            let char_pos = haystack[..byte_pos].encode_utf16().count();
-            Ok(Some(Value::Int(char_pos as i32)))
-        }
-        None => Ok(Some(Value::Int(-1))),
-    }
+    Ok(Some(Value::Int(u16_index_of(&chars, &target, 0))))
 }
 
 /// indexOf(String, int) — find substring from offset
@@ -3378,26 +4048,16 @@ pub(crate) fn native_sb_index_of_from(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let target = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+    let target: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
-        Some(Value::Int(i)) => std::cmp::max(0, *i) as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    if from >= chars.len() {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let haystack: String = String::from_utf16_lossy(&chars[from..]);
-    match haystack.find(&target) {
-        Some(byte_pos) => {
-            let char_pos = haystack[..byte_pos].encode_utf16().count();
-            Ok(Some(Value::Int((from + char_pos) as i32)))
-        }
-        None => Ok(Some(Value::Int(-1))),
-    }
+    Ok(Some(Value::Int(u16_index_of(&chars, &target, from))))
 }
 
 /// Last occurrence of `needle` in `haystack` at a start index <= `from`
@@ -3432,12 +4092,10 @@ pub(crate) fn native_sb_last_index_of(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // `read_string_chars`: an unpaired surrogate in the needle cannot survive
+    // `read_string().encode_utf16()`, which routes through a Rust `str`.
     let target: Vec<u16> = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx
-            .read_string(*obj)
-            .unwrap_or_default()
-            .encode_utf16()
-            .collect(),
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
@@ -3457,12 +4115,10 @@ pub(crate) fn native_sb_last_index_of_from(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // `read_string_chars`: an unpaired surrogate in the needle cannot survive
+    // `read_string().encode_utf16()`, which routes through a Rust `str`.
     let target: Vec<u16> = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx
-            .read_string(*obj)
-            .unwrap_or_default()
-            .encode_utf16()
-            .collect(),
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
@@ -3493,8 +4149,10 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
     if let Some(failure) = sb_check_from_to_index(start, count, count) {
         return Err(failure);
     }
-    let result = String::from_utf16_lossy(&chars[start as usize..]);
-    let str_obj = ctx.create_string_uninterned(&result);
+    // Units, not `from_utf16_lossy`: `new StringBuilder("a\uD800b").substring(1, 2)`
+    // is a one-char String holding an unpaired surrogate. See
+    // [`sb_string_from_units`].
+    let str_obj = sb_string_from_units(ctx, &chars[start as usize..])?;
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -3551,8 +4209,7 @@ pub(crate) fn native_sb_substring_range(
     if let Some(failure) = sb_check_from_to_index(start, end, count) {
         return Err(failure);
     }
-    let result = String::from_utf16_lossy(&chars[start as usize..end as usize]);
-    let str_obj = ctx.create_string_uninterned(&result);
+    let str_obj = sb_string_from_units(ctx, &chars[start as usize..end as usize])?;
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -3706,7 +4363,13 @@ pub(crate) fn native_string_contains(
     };
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        // `contains` is `indexOf(s.toString()) >= 0`; the JDK's NPE comes from
+        // that `toString()`. See `string_arg_npe`.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"java.lang.CharSequence.toString()\" because \"s\" is null",
+            ))
+        }
     };
     let found = with_two_string_chars_scratches(ctx, this, other, |haystack, needle| {
         if needle.is_empty() {
@@ -3730,7 +4393,7 @@ pub(crate) fn native_string_starts_with(
     };
     let prefix = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => return Err(string_arg_npe(STARTS_WITH_NPE)),
     };
     let result = with_two_string_chars_scratches(ctx, this, prefix, |this_chars, prefix_chars| {
         this_chars.starts_with(prefix_chars)
@@ -3738,6 +4401,25 @@ pub(crate) fn native_string_starts_with(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// HotSpot's helpful-NPE text for a null `prefix`, shared by both
+/// `startsWith` overloads (the one-argument form is `startsWith(prefix, 0)`).
+const STARTS_WITH_NPE: &str = "Cannot invoke \"String.length()\" because \"prefix\" is null";
+
+/// `String.startsWith(String prefix, int toffset)`.
+///
+/// The JDK's guard is `if (toffset < 0 || toffset > length() - prefix.length())
+/// return false;` — a short-circuiting `||` whose SECOND term dereferences
+/// `prefix`, exactly like `regionMatches`. So a negative `toffset` answers
+/// `false` for a null prefix and every other `toffset` throws. Measured on
+/// OpenJDK 25.0.3+9 with `"abc"`: `startsWith(null, -1)` is `false`;
+/// `startsWith(null, 0)`, `startsWith(null, 3)` and
+/// `startsWith(null, Integer.MAX_VALUE)` all throw NullPointerException.
+///
+/// The old `offset` handling was also wrong for a negative `toffset` in a way
+/// the null rows exposed: `*v as usize` reinterprets `-1` as `usize::MAX`,
+/// which then failed the `offset <= len` test and answered `false` — the right
+/// answer by accident, from an expression that would have panicked had the
+/// comparison been written the other way round.
 pub(crate) fn native_string_starts_with_offset(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3746,14 +4428,19 @@ pub(crate) fn native_string_starts_with_offset(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let prefix = match args.get(1) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let offset = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let toffset = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // Term one, before the prefix is touched.
+    if toffset < 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let prefix = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(string_arg_npe(STARTS_WITH_NPE)),
+    };
+    let offset = toffset as usize;
     let result = with_two_string_chars_scratches(ctx, this, prefix, |this_chars, prefix_chars| {
         if offset <= this_chars.len() {
             this_chars[offset..].starts_with(prefix_chars)
@@ -3774,7 +4461,11 @@ pub(crate) fn native_string_ends_with(
     };
     let suffix = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"String.length()\" because \"suffix\" is null",
+            ))
+        }
     };
     let result = with_two_string_chars_scratches(ctx, this, suffix, |this_chars, suffix_chars| {
         this_chars.ends_with(suffix_chars)
@@ -3782,13 +4473,40 @@ pub(crate) fn native_string_ends_with(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `String.trim()` — remove leading/trailing chars whose value is `<= U+0020`.
+///
+/// W7-95a. This is NOT `String.strip()` and it is NOT `str::trim()`; the tree
+/// had all three collapsed onto Rust's. `trim()` predates Unicode-aware
+/// whitespace in Java and is defined by a raw code-unit comparison against
+/// the space character, while `strip()` uses `Character.isWhitespace`. Three
+/// rules, and Rust's `str::trim` (Unicode `White_Space`) is none of them.
+///
+/// Measured on OpenJDK 25.0.3+9, printed as code units so the console cannot
+/// lie about what survived:
+///
+/// ```text
+///  input (as code units)      trim()            strip()          str::trim() gave
+///  [00A0, 0078, 00A0]         [160,120,160]     [160,120,160]    [120]
+///  [0000, 0078, 0000]         [120]             [0,120,0]        [0,120,0]
+///  [001C, 0078, 001C]         [120]             [120]            [28,120,28]
+///  [2028, 0078, 2028]         [8232,120,8232]   [120]            [120]
+/// ```
+///
+/// Every row where `trim()` and `strip()` differ is a row Rust's `trim` gets
+/// wrong for at least one of them, which is why one shared implementation was
+/// never going to work.
 pub(crate) fn native_string_trim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let text = ctx.read_string(this).unwrap_or_default();
-    let trimmed = text.trim().to_string();
+    let units = read_string_chars(ctx, this);
+    let start = units.iter().position(|&u| u > 0x20).unwrap_or(units.len());
+    let end = units
+        .iter()
+        .rposition(|&u| u > 0x20)
+        .map_or(start, |i| i + 1);
+    let trimmed = String::from_utf16_lossy(&units[start..end]);
     let result = ctx.create_string_uninterned(&trimmed);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -3846,9 +4564,9 @@ pub(crate) fn native_string_replace_charseq(
     };
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let target = match args.get(1) {
+    let target_units = match args.get(1) {
         Some(Value::Object(Some(o))) => {
-            invoke_to_string(&mut *scope, *o).unwrap_or_default()
+            invoke_to_string_units_opt(&mut *scope, *o)?.unwrap_or_default()
         }
         // A `null` target is an NPE, matching the JDK. This used to return a
         // null `String` on the reasoning that "real callers never pass null" —
@@ -3856,18 +4574,61 @@ pub(crate) fn native_string_replace_charseq(
         // `s.replace(null, "x")` hand back `null` where HotSpot throws.
         _ => return Err(regex_arg_npe("target").into()),
     };
-    let replacement = match args.get(2) {
+    let replacement_units = match args.get(2) {
         Some(Value::Object(Some(o))) => {
-            invoke_to_string(&mut *scope, *o).unwrap_or_default()
+            invoke_to_string_units_opt(&mut *scope, *o)?.unwrap_or_default()
         }
         _ => return Err(regex_arg_npe("replacement").into()),
     };
     let this = scope.get(&this_handle);
-    let s = scope.read_string(this).unwrap_or_default();
-    let result = s.replace(&target, &replacement);
-    Ok(Some(Value::Object(Some(
-        scope.create_string_uninterned(&result),
-    ))))
+    // Units, not text, all the way through. This method took its receiver
+    // through `read_string` and handed the result to `create_string`, so an
+    // unpaired surrogate anywhere in it became U+FFFD — MEASURED on both VMs
+    // at `89e2c56f1`, including on a call that matches NOTHING, which is what
+    // proves the loss is the round trip and not the replacement:
+    //
+    //   "a<U+D800>b".replace("q", "z")   HotSpot 61,d800,62   CratonVM 61,fffd,62
+    //
+    // `replace_units` is the only implementation rather than a second one
+    // behind a surrogate guard: `sb_string_from_units` already takes the
+    // plain-text path when the units are representable, so behaviour for
+    // every input that works today is unchanged, and there is no rarely-taken
+    // copy to drift.
+    let s_units = read_string_chars(&*scope, this);
+    let out = replace_units(&s_units, &target_units, &replacement_units);
+    let result = sb_string_from_units(&mut *scope, &out)?;
+    Ok(Some(Value::Object(Some(result))))
+}
+
+/// Literal find-and-replace over UTF-16 code units — `str::replace`'s contract,
+/// in the space Java strings actually live in.
+///
+/// The empty-target case is the one worth stating: both Java and Rust insert
+/// the replacement before every unit and once at the end, so `"abc"` with
+/// `("", "-")` is `-a-b-c-`. It is handled explicitly because the obvious loop
+/// silently produces `a-b-c` instead, and no test in this tree would have
+/// caught the difference.
+fn replace_units(haystack: &[u16], target: &[u16], replacement: &[u16]) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::with_capacity(haystack.len());
+    if target.is_empty() {
+        out.extend_from_slice(replacement);
+        for &u in haystack {
+            out.push(u);
+            out.extend_from_slice(replacement);
+        }
+        return out;
+    }
+    let mut i = 0usize;
+    while i < haystack.len() {
+        if i + target.len() <= haystack.len() && &haystack[i..i + target.len()] == target {
+            out.extend_from_slice(replacement);
+            i += target.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Shared body of every `String.to{Lower,Upper}Case` native.
@@ -3940,10 +4701,22 @@ fn string_case_impl(
         }
         changed
     } else {
+        // `str::to_uppercase` (the FULL mapping) is the right primitive here
+        // and must stay: `String.toUpperCase()` really does answer "SS" for a
+        // sharp s. Only `Character.toUpperCase(char)` is the 1:1 mapping, and
+        // that lives in `java_char_to_upper_case`.
+        //
+        // The one correction is the version skew, and it is now applied by
+        // `case_map`'s shared helper rather than by a loop written out here:
+        // this arm and `case_map::map_locale_dependent`'s fallback arms are the
+        // same rule for different locales, and only one of them had the fix.
+        // The helper keeps the cheap early-out — the ASCII fast path above
+        // never reaches here, and every skewed code point is above U+A7CD, so
+        // ordinary text still takes a single bulk `str::to_uppercase` call.
         let mapped = if lowercase {
-            folded.to_lowercase()
+            crate::case_map::jdk_to_lowercase(&folded)
         } else {
-            folded.to_uppercase()
+            crate::case_map::jdk_to_uppercase(&folded)
         };
         if mapped == folded {
             false
@@ -3964,11 +4737,49 @@ fn string_case_impl(
 
 /// The `Locale` operand of a `to{Lower,Upper}Case(Locale)` native, if the call
 /// has one. A null (or absent) argument means "use the default locale".
+///
+/// **This collapses two different calls**, so it is correct only where the two
+/// cannot occur at the same site. A native reached through an argument slice CAN
+/// tell them apart — `toUpperCase()` has one argument and `toUpperCase(null)`
+/// has two — and must use [`locale_arg_checked`].
+///
+/// The JIT's direct helper was previously listed here as a caller that
+/// "genuinely cannot tell them apart". It can, and the claim was the whole
+/// defect: see [`jit_string_to_lower_case`]. Its one bound descriptor,
+/// `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)`, has a
+/// MANDATORY `Locale` slot, so "absent" is not a state that site can be in and
+/// a `None` there is an explicit `null`.
 pub(crate) fn locale_arg(args: &[Value], index: usize) -> Option<cratonvm_types::ObjectRef> {
     match args.get(index) {
         Some(Value::Object(Some(o))) => Some(*o),
         _ => None,
     }
+}
+
+/// [`locale_arg`], but an explicitly-passed `null` `Locale` is the JDK's
+/// `NullPointerException` rather than "use the default".
+///
+/// Measured on OpenJDK 25.0.3+9: `"abc".toUpperCase((Locale) null)`,
+/// `"abc".toLowerCase((Locale) null)` and `"".toUpperCase((Locale) null)` all
+/// throw NPE, while the no-argument `"abc".toUpperCase()` answers `"ABC"`. The
+/// throw comes from `StringLatin1.toLowerCase`'s `locale.getLanguage()`, which
+/// is why an empty receiver throws too — there is no short circuit in front of
+/// it. This VM answered the default-locale result for all three.
+///
+/// The two cases are distinguished by ARITY, which is sound because the two
+/// overloads have different descriptors: a slot that is present and holds
+/// `Object(None)` is a real `null` argument, an absent slot is the no-arg
+/// overload.
+fn locale_arg_checked(
+    args: &[Value],
+    index: usize,
+) -> Result<Option<cratonvm_types::ObjectRef>, cratonvm_types::error::MethodCallFailed> {
+    if matches!(args.get(index), Some(Value::Object(None))) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
+    }
+    Ok(locale_arg(args, index))
 }
 
 fn string_case_native(
@@ -3981,7 +4792,7 @@ fn string_case_native(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    string_case_impl(ctx, this, locale_arg(args, 1), lowercase, memoize)
+    string_case_impl(ctx, this, locale_arg_checked(args, 1)?, lowercase, memoize)
 }
 
 /// `String.toLowerCase()` / `toLowerCase(Locale)` **with** the per-receiver
@@ -4024,8 +4835,17 @@ pub fn native_string_latin1_to_lower_case(
     args: &[Value],
 ) -> MethodCallResult {
     let this = args.first().cloned().unwrap_or(Value::Object(None));
-    let locale = args.get(2).cloned().unwrap_or(Value::Object(None));
-    native_string_to_lower_case(ctx, &[this, locale])
+    // An ABSENT locale slot must stay absent. Since `string_case_native` began
+    // distinguishing "no `Locale` argument" from "an explicit null `Locale`" by
+    // arity, materialising `Value::Object(None)` for a missing slot here would
+    // have turned every short call into a NullPointerException. (A slot that is
+    // present and null is forwarded unchanged — the JDK's own NPE for
+    // `toLowerCase(null)` is raised inside this very method, by
+    // `StringLatin1.toLowerCase`'s `locale.getLanguage()`.)
+    match args.get(2) {
+        Some(locale) => native_string_to_lower_case(ctx, &[this, locale.clone()]),
+        None => native_string_to_lower_case(ctx, &[this]),
+    }
 }
 
 /// Whether a cached virtual-native call is one of the String lower-case
@@ -4045,19 +4865,46 @@ pub fn is_lower_case_native_callback(callback: cratonvm_native_api::NativeCallba
 /// `String.toLowerCase(Locale)` for the JIT's thin direct-call helpers, which
 /// hold raw `ObjectRef`s rather than a `&[Value]`.
 ///
-/// Same implementation (and same per-receiver memo) as the interpreted native —
-/// which is the point: the JIT helper used to carry its own copy of the mapping
-/// and ignore the `Locale`, so `s.toLowerCase(TURKISH)` returned the Turkish
-/// answer interpreted and the root answer once the caller tiered up.
+/// # It is the SAME body as the interpreted native, and that is the fix
+///
+/// This used to call [`string_case_impl`] directly, one layer BELOW
+/// [`string_case_native`] — so when E8 added the null-`Locale` check to
+/// [`locale_arg_checked`], the interpreter began throwing and the compiled path
+/// kept answering the default-locale result. A `s.toLowerCase((Locale) null)`
+/// inside a loop therefore threw for its first few hundred executions and then
+/// silently started returning a string, at whatever iteration the caller tiered
+/// up. That is the `aastore` store-check shape: correct until it is hot.
+///
+/// It now goes through `string_case_native`, i.e. the exact function the
+/// registered native calls, with the `Locale` argument reconstituted as a
+/// PRESENT slot. Present-and-null is what this site always is: the JIT binds
+/// exactly one descriptor here,
+/// `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;`
+/// (`jit/src/lib.rs`, the `STRING_LATIN1_LOWER_DIRECT_FN` ladder), whose third
+/// parameter is mandatory — there is no arity by which this caller could be the
+/// no-argument overload. So the arity rule that separates `toLowerCase()` from
+/// `toLowerCase(null)` is not being bypassed here, it is being *supplied*.
+///
+/// The one-line predecessor also silently discarded every `Err`: an exception
+/// raised inside the case mapping became a `null` return and then a
+/// wrong-place NPE in the caller. Returning [`MethodCallResult`] is what lets
+/// `vm/src/jit/helpers.rs` route it through `handle_jit_dispatch_error`, the
+/// same way its `jit_hashmap_get_direct` sibling already does.
+///
+/// Measured on OpenJDK 25.0.3+9: `"AbC".toLowerCase((Locale) null)` throws
+/// NullPointerException, and so does it on the 200 000th warm iteration — the
+/// oracle's answer does not depend on its tier either.
 pub fn jit_string_to_lower_case(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     locale: Option<cratonvm_types::ObjectRef>,
-) -> Option<cratonvm_types::ObjectRef> {
-    match string_case_impl(ctx, this, locale, true, true) {
-        Ok(Some(Value::Object(Some(o)))) => Some(o),
-        _ => None,
-    }
+) -> MethodCallResult {
+    string_case_native(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(locale)],
+        true,
+        true,
+    )
 }
 
 /// `String.toUpperCase()` / `toUpperCase(Locale)` **without** the memo.
@@ -4157,13 +5004,38 @@ pub(crate) fn native_string_value_of_object(
     // write(String) legitimately throws NullPointerException on a real null
     // (str.length()) but would silently write 4 chars for the text "null".
     match args.first() {
-        Some(Value::Object(Some(obj))) => match invoke_to_string_opt(ctx, *obj)? {
-            Some(text) => {
-                let result = ctx.create_string_uninterned(&text);
-                Ok(Some(Value::Object(Some(result))))
+        Some(Value::Object(Some(obj))) => {
+            // `String.toString()` returns `this`, so for a String argument the
+            // JDK contract is an identity: `String.valueOf(s) == s`. Returning
+            // the object is exact AND allocation-free on the hottest arm of a
+            // very hot method — the previous code decoded it to Rust text and
+            // built a second String on every call.
+            //
+            // Exactness matters here, not just cost. `invoke_to_string_opt` is
+            // the LOSSY wrapper over `invoke_to_string_units_opt`: it exists
+            // only to hand back a Rust `String`, which cannot carry an
+            // unpaired surrogate. MEASURED on both VMs at `89e2c56f1`:
+            //
+            //   String.valueOf((Object) "a<U+D800>b")
+            //     HotSpot   61,d800,62      CratonVM   61,fffd,62
+            //
+            // The units form was built by `G26` for exactly this reason and
+            // this call site never moved to it.
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(*obj))
+                .as_deref()
+                == Some("java/lang/String")
+            {
+                return Ok(Some(Value::Object(Some(*obj))));
             }
-            None => Ok(Some(Value::Object(None))),
-        },
+            match invoke_to_string_units_opt(ctx, *obj)? {
+                Some(units) => {
+                    let result = sb_string_from_units(ctx, &units)?;
+                    Ok(Some(Value::Object(Some(result))))
+                }
+                None => Ok(Some(Value::Object(None))),
+            }
+        }
         _ => {
             let result = ctx.create_string_uninterned("null");
             Ok(Some(Value::Object(Some(result))))
@@ -4211,21 +5083,17 @@ pub(crate) fn native_string_index_of_str(
     };
     let target = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(-1))),
+        // `-1` — "not found" — was the single most misleading of the swallowed
+        // nulls: it is the method's ordinary answer, so a caller could not
+        // distinguish it from a real miss. HotSpot throws.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"String.coder()\" because \"str\" is null",
+            ))
+        }
     };
-    let result = with_two_string_chars_scratches(ctx, this, target, |haystack, needle| -> i32 {
-        if needle.is_empty() {
-            return 0;
-        }
-        if needle.len() > haystack.len() {
-            return -1;
-        }
-        for i in 0..=(haystack.len() - needle.len()) {
-            if &haystack[i..i + needle.len()] == needle {
-                return i as i32;
-            }
-        }
-        -1
+    let result = with_two_string_chars_scratches(ctx, this, target, |haystack, needle| {
+        index_of_units_from(haystack, needle, 0)
     });
     Ok(Some(Value::Int(result)))
 }
@@ -4411,6 +5279,16 @@ fn string_array_from_parts(ctx: &mut dyn NativeContext, parts: &[String]) -> Met
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// HotSpot's helpful-NPE text for a null `regex`, shared by every `split` entry
+/// point.
+///
+/// All of them used to answer a NULL `String[]`, which is worse than a wrong
+/// array: `for (String p : s.split(null))` then fails with an NPE at the
+/// CALLER's line, blaming the caller for the native's contract violation.
+/// Measured on OpenJDK 25.0.3+9: `"a,b".split(null)` and `"a,b".split(null, 2)`
+/// both throw.
+const SPLIT_REGEX_NPE: &str = "Cannot invoke \"String.length()\" because \"regex\" is null";
+
 fn native_string_split_with_delimiters(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4422,7 +5300,7 @@ fn native_string_split_with_delimiters(
     };
     let delim_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(string_arg_npe(SPLIT_REGEX_NPE)),
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let delim = ctx.read_string(delim_obj).unwrap_or_default();
@@ -4536,7 +5414,7 @@ pub(crate) fn native_string_split_impl(
     };
     let delim_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(string_arg_npe(SPLIT_REGEX_NPE)),
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let delim = ctx.read_string(delim_obj).unwrap_or_default();
@@ -4588,15 +5466,40 @@ pub(crate) fn native_string_split_impl(
     string_array_from_parts(ctx, &parts)
 }
 
+/// `String.join(CharSequence delimiter, CharSequence... elements)`.
+///
+/// # Three different nulls, three different answers
+///
+/// Measured on OpenJDK 25.0.3+9. The JDK's body opens
+/// `var delim = delimiter.toString(); var elems = new String[elements.length];`
+/// and renders each element with `String.valueOf`:
+///
+/// ```text
+/// String.join(null, "a", "b")                 NullPointerException  (delimiter, FIRST)
+/// String.join(",", (CharSequence[]) null)     NullPointerException  (elements)
+/// String.join(null, (CharSequence[]) null)    NullPointerException  naming the DELIMITER
+/// String.join(",", "a", null, "b")            "a,null,b"            <- an ELEMENT renders
+/// String.join(",", new String[0])             ""
+/// ```
+///
+/// This VM answered `""` for the first three and already rendered `"null"` for
+/// the fourth. The delimiter is checked before the array because the JDK's
+/// order is observable through the message, and because an empty `elements`
+/// array does not excuse a null delimiter — `String.join(null, new String[0])`
+/// throws.
 pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Static method: args[0] = delimiter, args[1] = CharSequence[]
     let delim = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => String::new(),
+        _ => return Err(string_arg_npe(JOIN_DELIMITER_NPE)),
     };
     let arr = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read the array length because \"elements\" is null",
+            ))
+        }
     };
     let mut scope = NativeHandleScope::new(ctx);
     let arr_handle = scope.root(arr);
@@ -4626,17 +5529,40 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ))))
 }
 
+/// HotSpot's helpful-NPE text for a null `delimiter`, shared by both `join`
+/// overloads.
+const JOIN_DELIMITER_NPE: &str =
+    "Cannot invoke \"java.lang.CharSequence.toString()\" because \"delimiter\" is null";
+
+/// `String.join(CharSequence delimiter, Iterable<? extends CharSequence>)`.
+///
+/// Same three-nulls table as [`native_string_join`], with one difference the
+/// message records: this overload opens with two explicit
+/// `Objects.requireNonNull` calls rather than implicit dereferences, so HotSpot
+/// raises a NullPointerException with a NULL message for both. Measured:
+/// `String.join(",", (Iterable) null)` and `String.join(null, List.of())` both
+/// throw with no message. The delimiter is still checked first.
 pub(crate) fn native_string_join_iterable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let delim = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => String::new(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let iterable = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
         Some(Value::Object(Some(obj))) => obj,
@@ -4686,6 +5612,56 @@ fn regex_arg_npe(parameter: &str) -> cratonvm_types::error::RuntimeError {
     cratonvm_types::error::RuntimeError::NullPointerException {
         message: Some(format!("null {parameter} argument")),
     }
+}
+
+/// The `NullPointerException` a `String` native owes for a reference argument
+/// its JDK counterpart dereferences.
+///
+/// # Why this is a family and not a handful of one-offs
+///
+/// `String`'s natives are written as `match args.get(n) { Some(Object(Some(o)))
+/// => o, _ => <default> }`, and that `_` arm swallows a null argument into
+/// whatever the failure value happens to be: `false` for the predicates, `-1`
+/// for the searches, a NULL `String[]` for `split`, `""` for `join` and
+/// `copyValueOf`, a silent no-op for `getChars`. Every one of those is a wrong
+/// *value* handed back where HotSpot raises — the failure mode a native
+/// shadowing bytecode is most likely to have and least likely to have noticed,
+/// because nothing crashes and no test that only exercises valid inputs can
+/// see it.
+///
+/// # The contracts are NOT uniform, so each one is measured
+///
+/// Measured on Microsoft OpenJDK 25.0.3+9 (`probes/e8/NullContracts`):
+///
+/// ```text
+/// equals(null)                     false            <- NOT a throw
+/// equalsIgnoreCase(null)           false            <- NOT a throw
+/// startsWith(null, -1)             false            <- NOT a throw (toffset < 0 wins)
+/// regionMatches(-1, null, 0, 1)    false            <- NOT a throw (see region_matches_impl)
+/// String.valueOf((Object) null)    "null"           <- NOT a throw
+/// String.join(",", "a", null, "b") "a,null,b"       <- a null ELEMENT renders
+/// String.format("%s", (Object[]) null)  "null"      <- a null varargs ARRAY is one null arg
+/// contains(null) startsWith(null) endsWith(null) concat(null) compareTo(null)
+/// compareToIgnoreCase(null) indexOf((String) null) lastIndexOf((String) null)
+/// split(null) matches(null) replace(null, x) transform(null)
+/// String.join(null, …) String.join(",", (CharSequence[]) null)
+/// String.valueOf((char[]) null) String.copyValueOf(null) getChars(…, null, …)
+/// toUpperCase((Locale) null) toLowerCase((Locale) null)   ->  NullPointerException
+/// ```
+///
+/// The two `false` rows and the three rendering rows are the reason this is a
+/// per-method measurement rather than a rule applied by shape: "reference
+/// parameter" does not imply "throws", and `equals`/`equalsIgnoreCase` in
+/// particular are specified to answer `false`.
+///
+/// `message` is HotSpot's helpful-NPE text where it was captured verbatim.
+/// Control flow depends on the *class*, but the text is what a caller logging
+/// the exception will print, and it is free to be right.
+fn string_arg_npe(message: &str) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::NullPointerException {
+        message: Some(message.to_string()),
+    }
+    .into()
 }
 
 pub(crate) fn native_string_replace_all(
@@ -4770,6 +5746,38 @@ pub(crate) fn native_string_matches(
     Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
 
+/// `String.equalsIgnoreCase(String)`.
+///
+/// **The null argument is `false`, NOT a throw** — measured on
+/// OpenJDK 25.0.3+9, and the JDK source says why:
+/// `(anotherString != null) && ...`. This is one of the two rows in the whole
+/// `String` null sweep that is specified to answer rather than raise (the other
+/// is `equals`), which is why the sweep had to be a measurement per method.
+///
+/// # The comparison rule, which was not the JDK's
+///
+/// The old body was `a.to_lowercase() == b.to_lowercase()` — Rust's FULL
+/// (SpecialCasing) mappings over whole strings. The JDK is
+/// `regionMatches(true, 0, other, 0, length())` after a length check, i.e. the
+/// per-code-unit `StringUTF16.regionMatchesCI` rule already transcribed in
+/// [`code_unit_eq_ignore_case`]. The two disagree, measured:
+///
+/// ```text
+///                                        HotSpot 25   to_lowercase() gave
+/// "İ".equalsIgnoreCase("i")         true         false   (full mapping is i + U+0307)
+/// "ꟓ".equalsIgnoreCase("꟒")    false        true    (Rust pairs them, the JDK does not)
+/// "ꟕ".equalsIgnoreCase("꟔")    false        true
+/// "꟏".equalsIgnoreCase("꟎")    false        true
+/// "ꟑ".equalsIgnoreCase("Ꟑ")    true         true    <- control: a REAL pair
+/// "K".equalsIgnoreCase("k")         true         true
+/// "ß".equalsIgnoreCase("ss")        false        false
+/// ```
+///
+/// The doc on `case_map::JDK_UNMAPPED_CASE_CODE_POINTS` already claimed
+/// `equalsIgnoreCase` among the four answers it had measured and corrected.
+/// The claim was true of the measurement and false of the code: the fix went
+/// into `java_char_to_upper_case`, which this method never called.
+/// `[1 of 10 callsites]` — the helper existed and one caller used it.
 pub(crate) fn native_string_equals_ignore_case(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4780,17 +5788,56 @@ pub(crate) fn native_string_equals_ignore_case(
     };
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
+        // Specified, not swallowed: `equalsIgnoreCase(null)` IS `false`.
         _ => return Ok(Some(Value::Int(0))),
     };
-    let a = ctx.read_string(this).unwrap_or_default();
-    let b = ctx.read_string(other).unwrap_or_default();
-    Ok(Some(Value::Int(if a.to_lowercase() == b.to_lowercase() {
-        1
-    } else {
-        0
-    })))
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    // The thread-local scratches, not `read_string_chars`: this method is on
+    // the hot path for HTTP header matching and must not start allocating two
+    // Vecs per call to gain its correctness.
+    let equal = with_two_string_chars_scratches(ctx, this, other, |a, b| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(&x, &y)| code_unit_eq_ignore_case(x, y))
+    });
+    Ok(Some(Value::Int(if equal { 1 } else { 0 })))
 }
 
+/// `String.compareToIgnoreCase(String)`.
+///
+/// Unlike its `equalsIgnoreCase` sibling, a null argument here THROWS —
+/// measured on OpenJDK 25.0.3+9 (`Cannot read field "value" because "s2" is
+/// null`), because `CASE_INSENSITIVE_ORDER.compare` dereferences both operands
+/// with no guard. The two methods sit next to each other, take the same
+/// parameter type, and have opposite null contracts; this VM answered `0` —
+/// "equal" — for the null.
+///
+/// # The magnitude, not just the sign
+///
+/// The old body lower-cased both strings with Rust's full mapping and returned
+/// `-1`/`0`/`1` from an `Ordering`. The JDK's `StringLatin1.compareToCI` /
+/// `StringUTF16.compareToCI` return the DIFFERENCE of the two folded code
+/// units, and the fold is the same upper-then-lower composition as
+/// [`code_unit_eq_ignore_case`]:
+///
+/// ```text
+/// c1 == c2                       -> keep going
+/// u1 = toUpper(c1), u2 = toUpper(c2); u1 == u2  -> keep going
+/// l1 = toLower(u1), l2 = toLower(u2); l1 == l2  -> keep going
+/// otherwise                      -> return l1 - l2
+/// exhausted                      -> return len1 - len2
+/// ```
+///
+/// Measured rows the old shape got wrong: `"_".compareToIgnoreCase("a")` is
+/// `-2` (the fold leaves `_` alone and lowercases `A` back to `a`, so it is
+/// `0x5F - 0x61`) and was `-1`; `"İ".compareToIgnoreCase("i")` is `0` and
+/// was non-zero; `"ꟓ".compareToIgnoreCase("꟒")` is `1` and was `0`.
+/// A comparator only needs the sign, but `compareToIgnoreCase` is a public
+/// method whose javadoc specifies the value, and the first two rows are sign
+/// errors anyway.
 pub(crate) fn native_string_compare_to_ignore_case(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4801,15 +5848,31 @@ pub(crate) fn native_string_compare_to_ignore_case(
     };
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read field \"value\" because \"s2\" is null",
+            ))
+        }
     };
-    let a = ctx.read_string(this).unwrap_or_default().to_lowercase();
-    let b = ctx.read_string(other).unwrap_or_default().to_lowercase();
-    Ok(Some(Value::Int(match a.cmp(&b) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    })))
+    let result = with_two_string_chars_scratches(ctx, this, other, |a, b| {
+        for (&c1, &c2) in a.iter().zip(b.iter()) {
+            if c1 == c2 {
+                continue;
+            }
+            let u1 = java_char_to_upper_case(c1);
+            let u2 = java_char_to_upper_case(c2);
+            if u1 == u2 {
+                continue;
+            }
+            let l1 = java_char_to_lower_case(u1);
+            let l2 = java_char_to_lower_case(u2);
+            if l1 != l2 {
+                return i32::from(l1) - i32::from(l2);
+            }
+        }
+        a.len() as i32 - b.len() as i32
+    });
+    Ok(Some(Value::Int(result)))
 }
 
 pub(crate) fn native_string_last_index_of_char(
@@ -4824,44 +5887,165 @@ pub(crate) fn native_string_last_index_of_char(
         Some(Value::Int(c)) => *c,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: lastIndexOf is defined over UTF-16 code UNITS, not
     // Unicode code points. The old `rfind` + `chars().count()` returned a
     // code-point index, off by the count of preceding supplementary chars.
-    // Encode both haystack and the target code point to UTF-16 and search the
-    // u16 slice (a supplementary `ch` becomes a surrogate pair).
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let needle_units: Vec<u16> = match char::from_u32(ch as u32) {
-        Some(c) => {
-            let mut buf = [0u16; 2];
-            c.encode_utf16(&mut buf).to_vec()
-        }
-        None => return Ok(Some(Value::Int(-1))),
+    //
+    // E18: the `char::from_u32(ch)` + `encode_utf16` that replaced it is the
+    // ONE member of this family that got the surrogate pair right, and it is
+    // still not the JDK's rule — `char::from_u32` rejects the surrogate code
+    // points, so a lone-surrogate `ch` returned `-1` where HotSpot finds it
+    // (`"xзy𐐷z".lastIndexOf(0xDC37)` is `4`). [`code_point_needle`] is the
+    // rule; this native and its three siblings now share it.
+    let Some(needle) = code_point_needle(ch) else {
+        return Ok(Some(Value::Int(-1)));
     };
-    let result = last_index_of_units(&s_units, &needle_units);
+    let result = with_string_chars_scratch(ctx, this, |buf| {
+        last_index_of_units_from(buf, needle.units(), i64::MAX)
+    });
     Ok(Some(Value::Int(result)))
 }
 
-/// Helper: last index (in UTF-16 code units) of `needle` within `haystack`.
-/// Returns -1 when not found. An empty needle returns `haystack.len()` to
-/// match `String.lastIndexOf("")` semantics used by the str variant.
-fn last_index_of_units(haystack: &[u16], needle: &[u16]) -> i32 {
+/// The UTF-16 code units that `String.{indexOf,lastIndexOf}(int ch[, int])`
+/// actually searches for — `None` when no sequence of code units can match.
+///
+/// # E18. Three copies of this rule, and the two that answered were wrong
+///
+/// The JDK does **not** narrow `ch` to a code unit. `String.indexOf(int)` is
+///
+/// ```text
+/// isLatin1() ? StringLatin1.indexOf(value, ch, …)   // if (!canEncode(ch)) return -1;
+///            : StringUTF16 .indexOf(value, ch, …)   // !isValidCodePoint  -> -1
+///                                                   //  ch <  0x10000     -> scan for (char) ch
+///                                                   //  ch >= 0x10000     -> scan for the PAIR
+/// ```
+///
+/// so a supplementary `ch` is matched as a surrogate *pair* and never as its
+/// low half. `native_string_index_of`, `native_string_index_of_from` and
+/// `native_string_last_index_of_from` all wrote `(ch & 0xFFFF) as u16`, which
+/// finds the masked half; `native_string_last_index_of_char` instead wrote
+/// `char::from_u32(ch)` + `encode_utf16`, which gets the pair right but drops
+/// every LONE SURROGATE `ch` on the floor (`char::from_u32(0xDC37)` is `None`).
+/// One JVMS rule, four implementations counting the JIT's, four different sets
+/// of wrong answers. This is now the only place the rule is written down.
+///
+/// Measured on OpenJDK 25.0.3+9 (`scratchpad/e18/CharSearch.java`,
+/// `Idx3.java`), receiver `"xзy𐐷z"` unless noted:
+///
+/// ```text
+/// "abc".indexOf(0x10061)          -1   masking finds 'a' at 0        <- the KEY row
+/// "з".indexOf(0x10437)       -1   masking finds it at 0
+/// mixed.indexOf(0x10437)           3   the pair, not the low half
+/// mixed.indexOf(0xD801)            3   a lone HIGH surrogate is a plain unit scan
+/// mixed.indexOf(0xDC37)            4   a lone LOW surrogate too — char::from_u32 says None
+/// "￿q".indexOf(0xFFFF)        0   0xFFFF is a valid (non-)character
+/// "￿q".indexOf(-1)           -1   NOT (char)(-1) == 0xFFFF: isValidCodePoint gates first
+/// "abc".indexOf(0x110000)         -1
+/// "abc".lastIndexOf(0x10061)      -1                                 <- the KEY row again
+/// ```
+///
+/// The `-1` row is the one that shows the rule is `isValidCodePoint`, not a
+/// narrowing cast: `(char) -1` is `0xFFFF`, the receiver holds `0xFFFF`, and
+/// HotSpot still answers `-1`.
+fn code_point_needle(ch: i32) -> Option<CharNeedle> {
+    if !(0..=0x10_FFFF).contains(&ch) {
+        // `Character.isValidCodePoint(ch)` — checked before any narrowing.
+        return None;
+    }
+    if ch <= 0xFFFF {
+        // A BMP code point, INCLUDING an unpaired surrogate value: the JDK
+        // scans for the single code unit and so must this.
+        return Some(CharNeedle {
+            units: [ch as u16, 0],
+            len: 1,
+        });
+    }
+    let off = ch - 0x1_0000;
+    Some(CharNeedle {
+        units: [
+            (0xD800 + (off >> 10)) as u16,
+            (0xDC00 + (off & 0x3FF)) as u16,
+        ],
+        len: 2,
+    })
+}
+
+/// One or two UTF-16 code units — the output of [`code_point_needle`].
+#[derive(Clone, Copy)]
+struct CharNeedle {
+    units: [u16; 2],
+    len: usize,
+}
+
+impl CharNeedle {
+    fn units(&self) -> &[u16] {
+        &self.units[..self.len]
+    }
+}
+
+/// Forward scan for `needle` in `haystack`, both in UTF-16 code units, starting
+/// at `max(from, 0)`.
+///
+/// The empty-needle answer is `clamp(from, 0, haystack.len())`, which is the
+/// JDK's — measured: `"abcabc".indexOf("", 99)` is `6` and `indexOf("", -5)` is
+/// `0`. Shared by the code-point family and the `String`-needle family; the four
+/// hand-rolled copies of this loop it replaces disagreed only in their bounds
+/// arithmetic, which is the part worth having in one place.
+fn index_of_units_from(haystack: &[u16], needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return from.clamp(0, haystack.len() as i32);
+    }
+    if needle.len() > haystack.len() {
+        return -1;
+    }
+    let max_start = haystack.len() - needle.len();
+    let mut i = from.max(0) as usize;
+    while i <= max_start {
+        if &haystack[i..i + needle.len()] == needle {
+            return i as i32;
+        }
+        i += 1;
+    }
+    -1
+}
+
+/// Backward scan for `needle` in `haystack`, starting at
+/// `min(from, haystack.len() - needle.len())`.
+///
+/// That subtraction is the JDK's own: `StringUTF16.lastIndexOfChar` starts at
+/// `min(fromIndex, length - 1)` and `lastIndexOfSupplementary` at
+/// `min(fromIndex, length - 2)`, which is the same expression once the needle
+/// width is a parameter rather than a hard-coded 1 or 2.
+///
+/// `from` is `i64` so that a NEGATIVE `from` finds nothing rather than
+/// saturating to a `usize`: the JDK's loop counter simply starts below zero and
+/// never runs. Measured — `"abc".lastIndexOf('a', -1)` is `-1`, and
+/// `mixed.lastIndexOf(0x10437, -1)` is `-1` even though the pair is present.
+fn last_index_of_units_from(haystack: &[u16], needle: &[u16], from: i64) -> i32 {
     if needle.is_empty() {
         return haystack.len() as i32;
     }
     if needle.len() > haystack.len() {
         return -1;
     }
-    let mut i = haystack.len() - needle.len();
-    loop {
-        if &haystack[i..i + needle.len()] == needle {
+    let mut i = from.min((haystack.len() - needle.len()) as i64);
+    while i >= 0 {
+        let at = i as usize;
+        if &haystack[at..at + needle.len()] == needle {
             return i as i32;
-        }
-        if i == 0 {
-            return -1;
         }
         i -= 1;
     }
+    -1
+}
+
+/// Helper: last index (in UTF-16 code units) of `needle` within `haystack`.
+/// Returns -1 when not found. An empty needle returns `haystack.len()` to
+/// match `String.lastIndexOf("")` semantics used by the str variant.
+fn last_index_of_units(haystack: &[u16], needle: &[u16]) -> i32 {
+    // "no `fromIndex`" is "start as far right as the needle fits", which is
+    // what [`last_index_of_units_from`] does with a `from` it cannot exceed.
+    last_index_of_units_from(haystack, needle, i64::MAX)
 }
 
 pub(crate) fn native_string_last_index_of_str(
@@ -4874,7 +6058,13 @@ pub(crate) fn native_string_last_index_of_str(
     };
     let needle = match args.get(1) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(-1))),
+        // See `native_string_index_of_str`: `-1` is indistinguishable from a
+        // legitimate miss. HotSpot throws.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read field \"value\" because \"tgtStr\" is null",
+            ))
+        }
     };
     let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: lastIndexOf(String) must return a UTF-16 code-UNIT
@@ -4886,6 +6076,34 @@ pub(crate) fn native_string_last_index_of_str(
     Ok(Some(Value::Int(result)))
 }
 
+/// `String.getChars(int srcBegin, int srcEnd, char[] dst, int dstBegin)`.
+///
+/// # Three checks, in the JDK's order, none of which this body had
+///
+/// The old version silently clamped `srcEnd` to the receiver's length, ignored
+/// a negative `srcBegin`, and treated a null `dst` as a NO-OP that returned
+/// normally. `getChars` is the JDK's bulk copy out of a `String`, so a caller
+/// that mis-sizes its buffer got a partly-filled array and no signal at all.
+///
+/// Measured on OpenJDK 25.0.3+9 with the receiver `"abc"`:
+///
+/// ```text
+/// getChars(0, 9, null, 0)          StringIndexOutOfBoundsException: Range [0, 9) out of bounds for length 3
+/// getChars(2, 1, null, 0)          StringIndexOutOfBoundsException: Range [2, 1) out of bounds for length 3
+/// getChars(-1, 1, null, 0)         StringIndexOutOfBoundsException: Range [-1, 1) out of bounds for length 3
+/// getChars(0, 1, null, 0)          NullPointerException: Cannot read the array length because "dst" is null
+/// getChars(0, 1, null, -1)         NullPointerException                       <- null beats dstBegin
+/// getChars(0, 1, new char[4], -1)  StringIndexOutOfBoundsException: Range [-1, -1 + 1) out of bounds for length 4
+/// getChars(0, 3, new char[4], 2)   StringIndexOutOfBoundsException: Range [2, 2 + 3) out of bounds for length 4
+/// getChars(0, 0, new char[0], 0)   (returns normally)
+/// ```
+///
+/// So the order is: `checkBoundsBeginEnd(srcBegin, srcEnd, length())` first —
+/// it fires even when `dst` is null — then the null check, then
+/// `checkBoundsOffCount(dstBegin, srcEnd - srcBegin, dst.length)`. Both range
+/// failures are `StringIndexOutOfBoundsException`, not
+/// `ArrayIndexOutOfBoundsException`, including the one about the destination
+/// ARRAY: `String.getChars` does its own checking before the `arraycopy`.
 pub(crate) fn native_string_get_chars(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4895,73 +6113,146 @@ pub(crate) fn native_string_get_chars(
         _ => return Ok(None),
     };
     let src_begin = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let src_end = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let dst = match args.get(3) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(None),
-    };
-    let dst_begin = match args.get(4) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: getChars indexes over UTF-16 code UNITS, not Unicode
     // code points. The old `s.chars()` (one entry per code point) put
     // supplementary chars in a single slot and shifted every later index,
-    // corrupting the dest array. Decode to u16 and copy one code unit per slot.
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let end = src_end.min(units.len());
-    for (i, &cu) in units.iter().enumerate().take(end).skip(src_begin) {
+    // corrupting the dest array.
+    //
+    // `read_string_chars`, not `ctx.read_string(..).encode_utf16()`: the range
+    // check below is against `length()`, so it must read the `value` array
+    // through the SAME path `String.length()` does. Going via a Rust `String`
+    // also substitutes U+FFFD for every unpaired surrogate, which this method
+    // must copy out intact.
+    let units = read_string_chars(ctx, this);
+    let length = units.len() as i32;
+    // Check one: the SOURCE range, before `dst` is looked at.
+    if src_begin < 0 || src_begin > src_end || src_end > length {
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, length).into(),
+        );
+    }
+    // Check two: the destination reference.
+    let dst = match args.get(3) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read the array length because \"dst\" is null",
+            ))
+        }
+    };
+    let dst_begin = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    // Check three: the destination range, `checkBoundsOffCount` style.
+    let count = src_end - src_begin;
+    let dst_len = ctx.array_length(dst) as i32;
+    if bounds_off_count_violation(dst_begin, count, dst_len).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_range_size(dst_begin, count, dst_len)
+                .into(),
+        );
+    }
+    let src_begin = src_begin as usize;
+    let dst_begin = dst_begin as usize;
+    for (i, &cu) in units
+        .iter()
+        .enumerate()
+        .take(src_end as usize)
+        .skip(src_begin)
+    {
         ctx.set_array_element(dst, dst_begin + (i - src_begin), Value::Int(cu as i32));
     }
     Ok(None)
 }
 
-pub(crate) fn native_string_strip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// The `String.strip*` family's shared walk.
+///
+/// W7-95a. `strip`/`stripLeading`/`stripTrailing` are specified in terms of
+/// `Character.isWhitespace`, which is not `char::is_whitespace` — see
+/// [`java_char_is_whitespace`] for the eight code points that disagree and for
+/// the measurement. Measured, code units in / code units out: `strip()` of
+/// `[2007, 0078, 2007]` is `[8199, 120, 8199]` on HotSpot 25.0.3+9 and was
+/// `[120]` here (`U+2007` FIGURE SPACE is a non-breaking space, which Java
+/// deliberately does not treat as whitespace); `strip()` of
+/// `[001C, 0078, 001C]` is `[120]` there and was `[28, 120, 28]` here.
+///
+/// Java strips by code POINT, so the walk skips a whole surrogate pair — but
+/// no supplementary code point is whitespace, so the pair never strips and
+/// walking by code unit gives the same answer. Reading units rather than a
+/// `str` also keeps an unpaired surrogate out of the U+FFFD substitution.
+fn string_strip_range(units: &[u16], leading: bool, trailing: bool) -> (usize, usize) {
+    let mut start = 0;
+    let mut end = units.len();
+    if leading {
+        while start < end && java_char_is_whitespace(units[start]) {
+            start += 1;
+        }
+    }
+    if trailing {
+        while end > start && java_char_is_whitespace(units[end - 1]) {
+            end -= 1;
+        }
+    }
+    (start, end)
+}
+
+fn native_string_strip_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    leading: bool,
+    trailing: bool,
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
+    let units = read_string_chars(ctx, this);
+    let (start, end) = string_strip_range(&units, leading, trailing);
+    let stripped = String::from_utf16_lossy(&units[start..end]);
     Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(s.trim()),
+        ctx.create_string_uninterned(&stripped),
     ))))
+}
+
+pub(crate) fn native_string_strip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_string_strip_impl(ctx, args, true, true)
 }
 
 pub(crate) fn native_string_strip_leading(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(s.trim_start()),
-    ))))
+    native_string_strip_impl(ctx, args, true, false)
 }
 
 pub(crate) fn native_string_strip_trailing(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(s.trim_end()),
-    ))))
+    native_string_strip_impl(ctx, args, false, true)
 }
 
+/// `String.copyValueOf(char[])` — and, registered under the same body,
+/// `String.valueOf(char[])`.
+///
+/// Both are `new String(data)`, which dereferences the array for its length.
+/// Measured on OpenJDK 25.0.3+9: `String.copyValueOf(null)`,
+/// `String.valueOf((char[]) null)`, `new String((char[]) null)` and
+/// `new String((char[]) null, 0, 1)` all throw NullPointerException. This body
+/// answered `""` — and `""` is a legal result of this method, so nothing
+/// downstream could tell the difference.
+///
+/// `String.valueOf((Object) null)` is the row that does NOT throw: it is
+/// specified as the four-character string `"null"`, and
+/// `native_string_value_of_object` already answers that.
 pub(crate) fn native_string_copy_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4969,7 +6260,11 @@ pub(crate) fn native_string_copy_value_of(
     // Static method: args[0] = char[]
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read the array length because \"value\" is null",
+            ))
+        }
     };
     let len = ctx.array_length(arr);
     let mut chars = Vec::with_capacity(len);
@@ -5006,8 +6301,14 @@ pub(crate) fn native_string_code_point_at(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let chars: Vec<u16> = s.encode_utf16().collect();
+    // `read_string_chars`, NOT `ctx.read_string(..).encode_utf16()`. W7-95a:
+    // that round trip goes through a Rust `String`, a Rust `str` cannot hold
+    // an unpaired surrogate, and `String::from_utf16_lossy` therefore replaces
+    // one with U+FFFD. `"x\uD800y".codePointAt(1)` measured 65533 here against
+    // HotSpot 25.0.3+9's 55296 — a 65533 in a code-point answer is the
+    // diagnosis, not a coincidence. `read_string_chars` decodes the String's
+    // own `value` array to UTF-16 code units and never sees UTF-8.
+    let chars = read_string_chars(ctx, this);
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
         // Message as well as class: the real `codePointAt` reaches
         // `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`.
@@ -5030,6 +6331,26 @@ pub(crate) fn native_string_code_point_at(
     Ok(Some(Value::Int(ch as i32)))
 }
 
+/// `String.codePointCount(int, int)`.
+///
+/// W7-95a. Two defects, both from the same three lines: the bounds were cast
+/// straight to `usize` (so a negative `beginIndex` became a huge index that
+/// the `while` simply skipped) and `endIndex` was *clamped* to the length
+/// instead of rejected. Every out-of-range call therefore returned a number
+/// where HotSpot throws. Measured on 25.0.3+9:
+///
+/// ```text
+/// "a<U+1F600>b".codePointCount(3, 1)   IndexOutOfBoundsException: Range [3, 1) out of bounds for length 4
+/// "a<U+1F600>b".codePointCount(0, 9)   IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4
+/// "a<U+1F600>b".codePointCount(-1, 2)  IndexOutOfBoundsException: Range [-1, 2) out of bounds for length 4
+/// ```
+///
+/// The thrown class is the SUPERCLASS `IndexOutOfBoundsException`, not
+/// `StringIndexOutOfBoundsException`: this call site reaches `Preconditions`
+/// without the `String` domain's exception formatter. `codePointAt` a few
+/// lines above *does* get the SIOOBE formatter, so the two neighbours throw
+/// different classes on purpose — a `catch (StringIndexOutOfBoundsException)`
+/// around this one would not fire on HotSpot either.
 pub(crate) fn native_string_code_point_count(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5038,17 +6359,31 @@ pub(crate) fn native_string_code_point_count(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let begin = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+    let begin_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let end = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+    let end_i32 = match args.get(2) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let chars: Vec<u16> = s.encode_utf16().collect();
-    let end = end.min(chars.len());
+    // `read_string_chars` for the surrogate reason spelled out in
+    // `native_string_code_point_at`: a lossy UTF-8 round trip turns the
+    // unpaired surrogates this method exists to count into U+FFFD.
+    let chars = read_string_chars(ctx, this);
+    let length = chars.len() as i32;
+    if begin_i32 < 0 || begin_i32 > end_i32 || end_i32 > length {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(begin_i32),
+                i64::from(end_i32),
+                i64::from(length),
+            ),
+        )
+        .into());
+    }
+    let begin = begin_i32 as usize;
+    let end = end_i32 as usize;
     let mut count = 0;
     let mut i = begin;
     while i < end {
@@ -5067,6 +6402,33 @@ pub(crate) fn native_string_code_point_count(
     Ok(Some(Value::Int(count)))
 }
 
+/// `String.offsetByCodePoints(int, int)`.
+///
+/// W7-95a. The old body was **VM-fatal**, not merely wrong. `index` was cast
+/// to `usize`, so any `index > length()` survived; the backward branch then
+/// did `pos -= 1` followed by an unguarded `chars[pos]`, and
+/// `"a<U+1F600>b".offsetByCodePoints(10, -1)` indexed a 4-element `Vec` at 9.
+/// A Rust panic is not a Java throwable — it terminates the VM, from one line
+/// of ordinary application bytecode. `for _ in 0..(-code_point_offset)` was a
+/// second one: negating `Integer.MIN_VALUE` overflows `i32`, which panics in
+/// any debug-assertions profile.
+///
+/// Both branches now transcribe `Character.offsetByCodePoints`, whose loops
+/// are bounded by `i < limit` / `i > start` and which reports a *shortfall*
+/// (`x > 0` after the loop) as the throw. Measured on OpenJDK 25.0.3+9, all
+/// four of these throw `IndexOutOfBoundsException` with a **null** message —
+/// the plain superclass, no `Preconditions` text, unlike `codePointCount`'s
+/// neighbouring `Range [a, b)` wording:
+///
+/// ```text
+/// "a<U+1F600>b".offsetByCodePoints(0, 9)     IndexOutOfBoundsException  (ran off the end)
+/// "a<U+1F600>b".offsetByCodePoints(0, -1)    IndexOutOfBoundsException  (ran off the start)
+/// "a<U+1F600>b".offsetByCodePoints(10, -1)   IndexOutOfBoundsException  (index > length)
+/// "a<U+1F600>b".offsetByCodePoints(-1, 1)    IndexOutOfBoundsException  (index < 0)
+/// ```
+///
+/// while the in-range answers are `offsetByCodePoints(0, 2) == 3` and
+/// `offsetByCodePoints(4, -2) == 1` — the surrogate pair counts as one step.
 pub(crate) fn native_string_offset_by_code_points(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5075,44 +6437,58 @@ pub(crate) fn native_string_offset_by_code_points(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let index = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+    let index_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let code_point_offset = match args.get(2) {
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let chars: Vec<u16> = s.encode_utf16().collect();
-    let mut pos = index;
+    // `read_string_chars`: see `native_string_code_point_at`.
+    let chars = read_string_chars(ctx, this);
+    let length = chars.len() as i32;
+    // `String.offsetByCodePoints`'s own precondition. Note `index > length()`,
+    // not `>=`: the position one past the last char is a legal starting point
+    // for a backward walk.
+    if index_i32 < 0 || index_i32 > length {
+        return Err(cratonvm_types::error::RuntimeError::ioobe_no_message().into());
+    }
+    let mut pos = index_i32 as usize;
     if code_point_offset >= 0 {
-        for _ in 0..code_point_offset {
-            if pos >= chars.len() {
-                break;
-            }
+        // `Character.offsetByCodePoints`, forward arm: `x` counts the steps
+        // still owed, and a nonzero `x` at the end is the throw.
+        let mut x = code_point_offset;
+        while x > 0 && pos < chars.len() {
             let ch = chars[pos];
-            if (0xD800..=0xDBFF).contains(&ch) && pos + 1 < chars.len() {
-                let low = chars[pos + 1];
-                if (0xDC00..=0xDFFF).contains(&low) {
-                    pos += 2;
-                    continue;
-                }
-            }
             pos += 1;
+            if (0xD800..=0xDBFF).contains(&ch)
+                && pos < chars.len()
+                && (0xDC00..=0xDFFF).contains(&chars[pos])
+            {
+                pos += 1;
+            }
+            x -= 1;
+        }
+        if x > 0 {
+            return Err(cratonvm_types::error::RuntimeError::ioobe_no_message().into());
         }
     } else {
-        for _ in 0..(-code_point_offset) {
-            if pos == 0 {
-                break;
-            }
+        // Backward arm. `code_point_offset.unsigned_abs()` rather than
+        // `-code_point_offset`: the latter panics on `Integer.MIN_VALUE`.
+        let mut x = i64::from(code_point_offset.unsigned_abs());
+        while x > 0 && pos > 0 {
             pos -= 1;
-            if pos > 0
-                && (0xDC00..=0xDFFF).contains(&chars[pos])
+            if (0xDC00..=0xDFFF).contains(&chars[pos])
+                && pos > 0
                 && (0xD800..=0xDBFF).contains(&chars[pos - 1])
             {
                 pos -= 1;
             }
+            x -= 1;
+        }
+        if x > 0 {
+            return Err(cratonvm_types::error::RuntimeError::ioobe_no_message().into());
         }
     }
     Ok(Some(Value::Int(pos as i32)))
@@ -5195,11 +6571,42 @@ pub(crate) fn native_string_indent(
             }
             result.push_str(line);
         } else if n < 0 {
-            // Remove up to |n| leading whitespace characters
-            let remove = (-n) as usize;
-            let spaces = line.len() - line.trim_start().len();
-            let skip = remove.min(spaces);
-            result.push_str(&line[skip..]);
+            // W7-95a, found while auditing this file for panics. Java's rule is
+            // `s.substring(Math.min(-n, s.indexOfNonWhitespace()))` — a count of
+            // CHARACTERS, over `Character.isWhitespace`. The old body was
+            // `line.len() - line.trim_start().len()`, a count of BYTES over
+            // Rust's Unicode `White_Space`, followed by `&line[skip..]`. Two
+            // defects, and the second is VM-fatal:
+            //
+            //  * Wrong table. Measured on OpenJDK 25.0.3+9, printed as code
+            //    units: `indent(-1)` of `[00A0, 0061]` is `[160, 97, 10]` —
+            //    Java KEEPS a leading non-breaking space, because
+            //    `Character.isWhitespace` excludes it. Rust's `trim_start`
+            //    removes it.
+            //  * **Slicing a `str` at a byte offset that is not a character
+            //    boundary panics**, and a Rust panic is not a Java throwable:
+            //    it terminates the VM. That exact input reached it — U+00A0 is
+            //    two UTF-8 bytes, `trim_start` reported `spaces == 2`, `-n`
+            //    was 1, and `&line[1..]` landed inside the character.
+            //
+            // `n.unsigned_abs()` rather than `-n` for the third one:
+            // `indent(Integer.MIN_VALUE)` is specified as `stripLeading()`, and
+            // negating `Integer.MIN_VALUE` overflows `i32`. Capping the
+            // character count at `non_ws` makes the MIN_VALUE case fall out as
+            // "strip all of it", which is what HotSpot answers.
+            let remove = n.unsigned_abs() as usize;
+            let non_ws = line
+                .chars()
+                .position(|c| !char_is_java_whitespace(c))
+                .unwrap_or_else(|| line.chars().count());
+            let skip_chars = remove.min(non_ws);
+            // Convert a CHARACTER count back to a byte offset through
+            // `char_indices`, which can only ever land on a boundary.
+            let byte_off = line
+                .char_indices()
+                .nth(skip_chars)
+                .map_or(line.len(), |(i, _)| i);
+            result.push_str(&line[byte_off..]);
         } else {
             result.push_str(line);
         }
@@ -5219,7 +6626,14 @@ pub(crate) fn native_string_transform(
     };
     let function = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
-        _ => return Ok(Some(Value::Object(Some(this)))),
+        // Returning the receiver made `s.transform(null)` behave like the
+        // identity function — a plausible, silently wrong answer. `transform`
+        // is `f.apply(this)`, so a null `f` is an NPE on OpenJDK 25.0.3+9.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"java.util.function.Function.apply(Object)\" because \"f\" is null",
+            ))
+        }
     };
     ctx.invoke_virtual(
         function,
@@ -5525,24 +6939,532 @@ const FMT_FLAG_ORDER: &str = "-#+ 0,(<";
 /// a mistyped refusal.
 const FMT_DATETIME_FIELDS: &str = "HIklMNLQpsSTzZaAbBCdehjmyYrRcDF";
 
-/// Justify a rendered `%t`/`%T` result inside its field width.
+/// `CharSequence.length()` for a Rust `str` — the count of UTF-16 code units.
 ///
-/// Extracted so the null-argument path ("If the argument arg is null, then
-/// the result is 'null'") is padded by the same rule as a real date rather
-/// than bypassing the width entirely — `String.format("[%10tY]", (Object)
-/// null)` is `[      null]` on HotSpot.
-fn fmt_pad_to_width(out: String, flags: &str, width: Option<usize>) -> String {
+/// Every width decision `java.util.Formatter` makes is
+/// `width - cs.length()` in `appendJustified`, and a Java `length()` counts
+/// UTF-16 code units. Rust's `str::len()` counts BYTES, and reaching for it
+/// here padded non-ASCII output short: `String.format("%5s|", "\u{00e9}")`
+/// came back with three spaces where HotSpot 25 writes four (é is one code
+/// unit but two UTF-8 bytes), and an astral character — four bytes, TWO code
+/// units — lost two more. ASCII is the case where the two agree, which is why
+/// every existing row passed.
+fn fmt_utf16_len(s: &str) -> usize {
+    s.chars().map(char::len_utf16).sum()
+}
+
+/// `s.substring(0, precision)` — the precision truncation every GENERAL
+/// conversion applies, counted in UTF-16 code units like `String.substring`.
+///
+/// This is now a plain `Vec::truncate` on code UNITS, and that is the whole
+/// point. It replaced a `char_indices` walk over a Rust `&str`, which got two
+/// separate things wrong:
+///
+///   * Counting CODE POINTS is wrong even when nothing straddles the cut:
+///     `%.3s` of `"a<U+1F600>b"` is `"a<U+1F600>"` on HotSpot (three code
+///     UNITS) and was `"a<U+1F600>b"` here.
+///   * When the cut lands INSIDE a surrogate pair the JDK keeps the LONE HIGH
+///     surrogate, and a Rust `String` cannot hold one — so the walk had to stop
+///     before the pair and came back one code unit short. Measured on HotSpot
+///     25 (`String.format(Locale.ROOT, …)` of `"😀"`, U+1F600):
+///
+///     | format | HotSpot | units |
+///     |---|---|---|
+///     | `%.1s` | length 1 | `D83D` |
+///     | `[%5.1s]` | length **7** | `005B 0020 0020 0020 0020 D83D 005D` |
+///     | `%.1S` | length 1 | `D83D` |
+///     | `%.2s` of `"\uD800\uD800\uD800"` | length 2 | `D800 D800` |
+///
+///     The `[%5.1s]` row is the one that shows why the truncation and the
+///     justifier had to move to units TOGETHER: the pad is computed from the
+///     truncated length, so a truncation that came back short also padded one
+///     space too many.
+fn fmt_truncate_units(units: &mut Vec<u16>, prec: usize) {
+    units.truncate(prec);
+}
+
+/// A run of `n` copies of the ASCII padding character `ch`, allocated
+/// **fallibly**.
+///
+/// Every padding run in this file goes through here, and the reason is that a
+/// width is caller data. `FormatSpecifier.width` refuses only a digit run that
+/// overflows an `int`, so `%2000000000d` is a perfectly legal specifier that
+/// asks for two billion spaces. `str::repeat` reaches `handle_alloc_error` when
+/// that allocation fails, and a Rust abort is not a Java throwable: HotSpot 25
+/// answers the same format string with a **catchable**
+/// `OutOfMemoryError: Java heap space` (measured at `-Xmx256m`; at `-Xmx1g` the
+/// same VM SERVES `%100000000d` and hands back a 100-million-character String,
+/// which is why this is a fallible allocation and not a fixed cap — a cap would
+/// refuse a width HotSpot answers).
+///
+/// `try_reserve_exact` is the same primitive [`native_string_repeat`] uses for
+/// the same reason, one screen away in this file.
+fn fmt_repeat(ch: char, n: usize) -> Result<String, MethodCallFailed> {
+    let bytes = n
+        .checked_mul(ch.len_utf8())
+        .ok_or_else(fmt_out_of_memory)?;
+    let mut s = String::new();
+    if s.try_reserve_exact(bytes).is_err() {
+        return Err(fmt_out_of_memory());
+    }
+    for _ in 0..n {
+        s.push(ch);
+    }
+    Ok(s)
+}
+
+/// Ask the allocator for `n` bytes and give them straight back — the same
+/// question [`fmt_repeat`] asks, for the callers that then build the run
+/// themselves.
+///
+/// The PRECISION is the second unbounded axis and it behaves exactly like the
+/// width. Measured on HotSpot 25 at `-Xmx256m`, all with a `Double` argument:
+///
+/// ```text
+/// %.2000000000f   OutOfMemoryError: Java heap space
+/// %.2000000000e   OutOfMemoryError: Java heap space
+/// %.2000000000a   OutOfMemoryError: Java heap space
+/// %.1000000f      SERVED — a 1,000,002-character String
+/// ```
+///
+/// so, again, a catchable throwable and not a fixed cap. `fmt_render_fixed`,
+/// `fmt_render_scientific` and `fmt_hex_pad` each push one character per
+/// fraction digit into a growing `String`, which is a `handle_alloc_error`
+/// abort at two billion; this probe runs once, at the single point in
+/// `format_arg_full` where a precision reaches any of them, so none of their
+/// signatures has to become fallible for the abort to stop being one.
+fn fmt_reserve_probe(n: usize) -> Result<(), MethodCallFailed> {
+    let mut s = String::new();
+    if s.try_reserve_exact(n).is_err() {
+        return Err(fmt_out_of_memory());
+    }
+    Ok(())
+}
+
+/// The `OutOfMemoryError` HotSpot 25 raises when a format's own width or
+/// precision outruns the heap, message included (measured).
+fn fmt_out_of_memory() -> MethodCallFailed {
+    cratonvm_types::error::RuntimeError::OutOfMemoryError {
+        message: "Java heap space".to_string(),
+    }
+    .into()
+}
+
+/// `java.util.Formatter.appendJustified` — **the** width justifier, for every
+/// conversion in the table.
+///
+/// It used to be one of two. This body served `%t`/`%T` and the null path,
+/// while `format_arg_full` carried a second, hand-inlined copy of the same
+/// `width - cs.length()` for everything else; the two had already disagreed
+/// once (the second counted UTF-8 bytes where this one counts UTF-16 code
+/// units) and were fixed in parallel rather than merged. The survivor is this
+/// one, and it counts code units through [`fmt_utf16_len`] — checked by
+/// reading the body below, which has no `str::len` in it and no second
+/// definition anywhere: `grep -n 'fmt_pad_to_width(' lang_string.rs` now
+/// reaches every justification decision the file makes.
+///
+/// The zero-padding `format_arg_full` still does is NOT this function and was
+/// not merged into it: the JDK's `trailingZeros` runs *inside* the numeric
+/// printers, before `appendJustified` ever sees the buffer, and by the time it
+/// has run the buffer is already `width` units long so this pads nothing.
+///
+/// Fallible for the reason [`fmt_repeat`] documents.
+///
+/// Takes and returns UTF-16 code UNITS. It used to take a `String`, and every
+/// caller's output had already been through a lossy `str` round trip by the
+/// time it arrived — so the one function that is *defined* as counting code
+/// units was the one place a lone surrogate could no longer be present to be
+/// counted. `out.len()` is now the count directly, which is also why
+/// [`fmt_utf16_len`] no longer appears in this body: it survives only for the
+/// `String`-shaped numeric decoration in `format_arg_full`, whose output is
+/// ASCII by construction.
+fn fmt_pad_to_width(
+    out: Vec<u16>,
+    flags: &str,
+    width: Option<usize>,
+) -> Result<Vec<u16>, MethodCallFailed> {
     match width {
         Some(w) if out.len() < w => {
-            let pad = " ".repeat(w - out.len());
-            if flags.contains('-') {
-                format!("{out}{pad}")
-            } else {
-                format!("{pad}{out}")
+            let pad = fmt_repeat(' ', w - out.len())?;
+            let pad: Vec<u16> = pad.encode_utf16().collect();
+            let mut joined = Vec::new();
+            if joined
+                .try_reserve_exact(out.len().saturating_add(pad.len()))
+                .is_err()
+            {
+                return Err(fmt_out_of_memory());
             }
+            if flags.contains('-') {
+                joined.extend_from_slice(&out);
+                joined.extend_from_slice(&pad);
+            } else {
+                joined.extend_from_slice(&pad);
+                joined.extend_from_slice(&out);
+            }
+            Ok(joined)
         }
-        _ => out,
+        _ => Ok(out),
     }
+}
+
+/// [`fmt_pad_to_width`] for a caller that still holds `str`-shaped output.
+///
+/// Deliberately a one-line adapter and NOT a second justifier: the width rule
+/// has exactly one body, for the reason [`fmt_pad_to_width`]'s own doc records
+/// (it used to be one of two, and the two had already disagreed once).
+fn fmt_pad_str_to_width(
+    out: &str,
+    flags: &str,
+    width: Option<usize>,
+) -> Result<Vec<u16>, MethodCallFailed> {
+    fmt_pad_to_width(out.encode_utf16().collect(), flags, width)
+}
+
+/// [`fmt_upper_case`] on code UNITS.
+///
+/// `toUpperCaseWithLocale` is defined on a `String`, and the mapping tables
+/// `case_map` owns are indexed by scalar value — neither can say anything about
+/// an unpaired surrogate, and the JDK's own `String.toUpperCase` leaves one
+/// alone. So the units are split on the surrogates that cannot participate:
+/// each well-formed run is case-mapped as text, and each lone surrogate is
+/// carried through verbatim. That keeps the two length-changing properties this
+/// family gets wrong:
+///
+///   * the mapping may GROW the text (`%S` of `"ß"` is `"SS"`), which is
+///     why this runs BEFORE the justifier — `String.format(ROOT, "%5S", "ß")`
+///     is `"   SS"`, five units, measured on HotSpot 25; and
+///   * a lone surrogate is one unit before and one unit after.
+fn fmt_upper_case_units(ctx: &mut dyn NativeContext, units: &[u16], locale: FmtLocale) -> Vec<u16> {
+    if !has_unpaired_surrogate(units) {
+        let text = String::from_utf16_lossy(units);
+        return fmt_upper_case(ctx, &text, locale).encode_utf16().collect();
+    }
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut run: Vec<u16> = Vec::new();
+    let mut i = 0usize;
+    while i < units.len() {
+        let u = units[i];
+        let paired = (0xD800..=0xDBFF).contains(&u)
+            && units
+                .get(i + 1)
+                .is_some_and(|n| (0xDC00..=0xDFFF).contains(n));
+        if (0xD800..=0xDFFF).contains(&u) && !paired {
+            if !run.is_empty() {
+                let text = String::from_utf16_lossy(&run);
+                out.extend(fmt_upper_case(ctx, &text, locale).encode_utf16());
+                run.clear();
+            }
+            out.push(u);
+            i += 1;
+            continue;
+        }
+        run.push(u);
+        i += 1;
+        if paired {
+            run.push(units[i]);
+            i += 1;
+        }
+    }
+    if !run.is_empty() {
+        let text = String::from_utf16_lossy(&run);
+        out.extend(fmt_upper_case(ctx, &text, locale).encode_utf16());
+    }
+    out
+}
+
+/// The word `java.util.Formatter`'s printers substitute for a **null**
+/// argument, before any decoration.
+///
+/// Every printer in the table opens with
+/// `if (arg == null) { print(fmt, "null", l); return; }` — except
+/// `printBoolean`, which reaches the same shared printer with
+/// `Boolean.toString(false)`. That one-conversion exception is the whole of
+/// this function, and it exists so the rule is written once: `format_arg_full`
+/// (which then applies the precision, the upper-caser and the justifier, as
+/// `print(Formatter, String, Locale)` does) and [`format_arg`]'s own null arm
+/// now read the SAME table rather than each carrying a copy of it.
+fn fmt_null_text(spec: char) -> &'static str {
+    if spec == 'b' || spec == 'B' {
+        "false"
+    } else {
+        "null"
+    }
+}
+
+/// `FormatSpecifier.toUpperCaseWithLocale` — the general family's upper-caser,
+/// which is **locale-sensitive**.
+///
+/// ```java
+/// s.toUpperCase(Objects.requireNonNullElse(l, Locale.getDefault(FORMAT)))
+/// ```
+///
+/// This used to be a bare `str::to_uppercase`, which is Rust's
+/// locale-independent mapping. Measured on HotSpot 25:
+///
+/// | | `Locale.ROOT` | `Locale.forLanguageTag("tr")` |
+/// |---|---|---|
+/// | `%S` of `"i"` | `I` | `U+0130` |
+/// | `%C` of `Character.valueOf('i')` | `I` | `U+0130` |
+/// | `%TA` of a Monday | `MON` | `PAZARTES` + `U+0130` |
+///
+/// and, with `Locale.getDefault(FORMAT)` forced to `tr`, an EXPLICIT-null
+/// locale (`String.format((Locale) null, "%S", "i")`) is `U+0130` as well —
+/// which is why the two non-`Some` [`FmtLocale`] arms both resolve the default
+/// here and neither takes the root mapping. (That is the opposite of
+/// [`fmt_symbols_for`], where an explicit null really does mean "no
+/// localization"; the two questions are asked of the same `Locale` argument and
+/// answered differently by the JDK, so they are answered differently here.)
+///
+/// The rules themselves are NOT reimplemented: `case_map` already owns the
+/// `tr`/`az`/`lt` port of `ConditionalSpecialCasing`, `String.toUpperCase`
+/// already calls it, and this is its third caller. `case_map::to_upper_case`
+/// early-outs to `jdk_to_uppercase` for every other language, so the ROOT path
+/// gains only the JDK-version-skew correction that `String.toUpperCase` has
+/// had since W7-95a.
+///
+/// Resolving the language runs no bytecode — `locale_language_for_case_mapping`
+/// reads `baseLocale.language` off the `Locale` object, or a `OnceLock`'d
+/// `user.language` for the default — so there is no re-entrancy latch here and
+/// none is needed.
+fn fmt_upper_case(ctx: &mut dyn NativeContext, s: &str, locale: FmtLocale) -> String {
+    let lang = crate::locale_language_for_case_mapping(
+        ctx,
+        match locale {
+            FmtLocale::Given(Some(l)) => Some(l),
+            FmtLocale::Given(None) | FmtLocale::DefaultFormat => None,
+        },
+    );
+    crate::case_map::to_upper_case(s, &lang)
+}
+
+/// The LOWER-case twin of [`fmt_upper_case`], for `%tp`'s AM/PM marker — the
+/// only place `java.util.Formatter` lower-cases anything.
+///
+/// ```java
+/// String[] ampm = { "AM", "PM" };
+/// if (l != null && l != Locale.US) { ampm = DateFormatSymbols.getInstance(l).getAmPmStrings(); }
+/// sb.append(ampm[…].toLowerCase(Objects.requireNonNullElse(l, Locale.getDefault(FORMAT))));
+/// ```
+///
+/// Identical in both of `printDateTime`'s printers, and the locale rule is the
+/// upper-caser's: an explicit `null` takes the DEFAULT locale here, not
+/// `Locale.US`, even though the STRING it is applied to is the English literal
+/// in that case. That is why the two `FmtLocale` non-`Some` arms collapse
+/// together below exactly as they do in [`fmt_upper_case`].
+///
+/// # This is a family convergence, and NO measured row moves
+///
+/// The body it replaces was `str::to_lowercase`, Rust's locale-independent
+/// mapping — the exact mirror of the defect `W8-F4-1` N3 recorded on the UPPER
+/// side and fixed there by routing through `case_map`. F28-1 §5.4 flagged the
+/// twin without a live row and said so. I looked for one and there is none:
+///
+///  * Swept all **1158** locales this JDK reports available. For every one, and
+///    for both of its `getAmPmStrings()` entries, `s.toLowerCase(locale)`
+///    equals `s.toLowerCase(Locale.ROOT)` — **zero** divergent rows. Repeated
+///    for the English literal `"AM"`/`"PM"` against every locale as the
+///    case-mapping locale (the explicit-null and `Locale.US` paths): zero
+///    again. The `tr`/`az`/`lt` rules need a dotted/dotless `I` or a
+///    combining-dot sequence, and no AM/PM string in CLDR carries one.
+///  * The other half of the change — `str::to_lowercase` → `jdk_to_lowercase`
+///    — can only differ on [`crate::case_map::JDK_UNMAPPED_CASE_CODE_POINTS`],
+///    which is `U+A7CE`, `U+A7CF`, `U+A7D2`..`U+A7D5`. No AM/PM string is in
+///    Latin Extended-D.
+///
+/// It is landed anyway because the alternative is leaving one JDK rule with two
+/// implementations, one of them fixed — this codebase's most common defect
+/// shape, and the reason `%TA` under `tr` was wrong for as long as it was.
+/// Whichever locale eventually grows a dotted `I` in its AM/PM data, this side
+/// will already be right.
+fn fmt_lower_case(ctx: &mut dyn NativeContext, s: &str, locale: FmtLocale) -> String {
+    let lang = crate::locale_language_for_case_mapping(
+        ctx,
+        match locale {
+            FmtLocale::Given(Some(l)) => Some(l),
+            FmtLocale::Given(None) | FmtLocale::DefaultFormat => None,
+        },
+    );
+    crate::case_map::to_lower_case(s, &lang)
+}
+
+/// `printString`'s first line: `if (arg instanceof Formattable)
+/// { ((Formattable) arg).formatTo(fmt, flags, width, precision); }`.
+///
+/// `Ok(None)` means "not a `Formattable`" (or a VM with no usable
+/// `java.util.Formatter`), and the caller falls through to `String.valueOf`.
+/// `Ok(Some(units))` is the callee's output VERBATIM — the conversion applies
+/// no precision, no upper-casing and no width on top of it, because `formatTo`
+/// was handed all three and owns the decision. Measured on HotSpot 25 with a
+/// `Formattable` whose `formatTo` writes `"x\uD800y"`: `%s`, `%S` and `%-10s`
+/// all answer `length() == 3`, units `0078 D800 0079` — the `%S` row proving
+/// the upper-caser does not run (an `x` that survived as `x`) and the `%-10s`
+/// row proving the justifier does not; one whose `formatTo` writes `"😀"` under
+/// `%.1s` answers TWO units, `D83D DE00`, so the precision does not truncate
+/// either.
+///
+/// The output is read as UTF-16 code **units**. `formatTo` writes through a
+/// `StringBuilder`, and `ctx.read_string` on that `StringBuilder`'s
+/// `toString()` is a UTF-8 round trip that turns every unpaired surrogate into
+/// U+FFFD — measured above, HotSpot keeps `D800`. This was the last general
+/// conversion route still lossy after the rest of the pipeline moved to units,
+/// and the loss was at THIS read, not downstream: the caller already returns
+/// these units unchanged.
+///
+/// Measured on HotSpot 25 (a `Formattable` whose `formatTo` prints its three
+/// arguments):
+///
+/// | format | flags | width | precision |
+/// |---|---|---|---|
+/// | `%s` | 0 | -1 | -1 |
+/// | `%S` | 2 | -1 | -1 |
+/// | `%#s` | 4 | -1 | -1 |
+/// | `%-10s` | 1 | 10 | -1 |
+/// | `%#-10.3S` | 7 | 10 | 3 |
+/// | `%s %<s` (second) | **256** | -1 | -1 |
+///
+/// The first three bits are `java.util.FormattableFlags`' public constants
+/// (`LEFT_JUSTIFY`/`UPPERCASE`/`ALTERNATE`); 256 is `Flags.PREVIOUS`, the
+/// package-private `'<'` bit, which reaches a `Formattable` because
+/// `checkGeneral` never removes it. Absent width and precision are `-1`, not
+/// `0`. Also measured: `"[%10s]"` of a `Formattable` that writes nothing is
+/// `"[]"` (the width is NOT applied afterwards), a `formatTo` that throws
+/// propagates the exception out of `String.format`, and `%b`/`%h` of the same
+/// object do NOT dispatch (`printBoolean` and `printHashCode` have no such
+/// branch) — hence the `spec == 's'` guard at the call site.
+///
+/// **Why the interface is looked up but never loaded.** A `class_id_by_name`
+/// miss is a conclusive "no" here: for `obj` to implement `Formattable`, the
+/// interface must already have been resolved when `obj`'s own class was
+/// linked, and `is_subclass` could not answer through an unloaded interface
+/// anyway. So the hot `%s` path pays one index read and never a speculative
+/// class load — unlike [`fmt_exception_class_available`], whose class genuinely
+/// may not be loaded yet at the moment it is needed.
+fn fmt_formattable_dispatch(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    flags: &str,
+    width: Option<usize>,
+    precision: Option<usize>,
+    uppercase_conversion: bool,
+    locale: FmtLocale,
+) -> Result<Option<Vec<u16>>, MethodCallFailed> {
+    let Some(iface) = ctx.class_id_by_name("java/util/Formattable") else {
+        return Ok(None);
+    };
+    let cid = ctx.class_id_of_object(obj);
+    if cid != iface && !ctx.is_subclass(cid, iface) {
+        return Ok(None);
+    }
+
+    // `java.util.FormattableFlags`, and `Flags.PREVIOUS` for the `'<'` bit.
+    let mut bits = 0i32;
+    if flags.contains('-') {
+        bits |= 1;
+    }
+    if uppercase_conversion {
+        bits |= 2;
+    }
+    if flags.contains('#') {
+        bits |= 4;
+    }
+    if flags.contains('<') {
+        bits |= 256;
+    }
+    let w = width.map_or(-1i32, |v| v as i32);
+    let p = precision.map_or(-1i32, |v| v as i32);
+
+    // GC: everything below allocates and runs bytecode, so every reference
+    // held across a call is pinned and re-derived. `pin_base` is the FIRST
+    // handle, so one `unpin_native_roots(pin_base)` releases the whole batch.
+    let pin_base = ctx.pin_native_root(obj);
+
+    // The `Locale` the callee's own `Formatter` must carry:
+    // `if (fmt.locale() != l) fmt = new Formatter(fmt.out(), l);`. An EXPLICIT
+    // null locale is handed on as null (measured: the callee sees
+    // `formatter.locale() == null`), which is why `Given(None)` is not folded
+    // into the default arm the way [`fmt_upper_case`] folds it.
+    let locale_ref = match locale {
+        FmtLocale::Given(l) => l,
+        // The no-`Locale` overload formats against `Locale.getDefault(FORMAT)`;
+        // this VM keeps a single default `Locale`, which is what
+        // `fmt_symbols_for`'s `DefaultFormat` arm resolves through the JDK as
+        // well. A failure here is not worth failing the format over — the
+        // callee then sees a null locale, which is the old behaviour of every
+        // no-`Locale` surface in this file.
+        FmtLocale::DefaultFormat => match ctx.invoke(
+            "java/util/Locale",
+            "getDefault",
+            "()Ljava/util/Locale;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(l)))) => Some(l),
+            _ => None,
+        },
+    };
+    let locale_pin = locale_ref.map(|l| ctx.pin_native_root(l));
+
+    let sb = match ctx.new_object_initialized("java/lang/StringBuilder", "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        // No usable `StringBuilder` means no `Appendable` to hand the callee.
+        // Decline rather than refuse: the caller then prints `toString()`,
+        // which is this conversion's behaviour before this function existed.
+        _ => {
+            ctx.unpin_native_roots(pin_base);
+            return Ok(None);
+        }
+    };
+    let sb_pin = ctx.pin_native_root(sb);
+    let locale_ref = match (locale_ref, locale_pin) {
+        (Some(l), Some(h)) => Some(ctx.read_native_pin(h, l)),
+        _ => None,
+    };
+    let formatter = match ctx.new_object_initialized(
+        "java/util/Formatter",
+        "(Ljava/lang/Appendable;Ljava/util/Locale;)V",
+        &[Value::Object(Some(sb)), Value::Object(locale_ref)],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(pin_base);
+            return Ok(None);
+        }
+    };
+    let fmt_pin = ctx.pin_native_root(formatter);
+
+    let obj = ctx.read_native_pin(pin_base, obj);
+    let formatter = ctx.read_native_pin(fmt_pin, formatter);
+    let call = ctx.invoke_virtual(
+        obj,
+        "formatTo",
+        "(Ljava/util/Formatter;III)V",
+        &[
+            Value::Object(Some(formatter)),
+            Value::Int(bits),
+            Value::Int(w),
+            Value::Int(p),
+        ],
+    );
+    let sb = ctx.read_native_pin(sb_pin, sb);
+    if let Err(err) = call {
+        // "one that throws must propagate" — `formatTo` is declared to throw
+        // and HotSpot lets an `IllegalStateException` out of `String.format`
+        // untouched. Unpin first; the exception is the caller's answer.
+        ctx.unpin_native_roots(pin_base);
+        return Err(err);
+    }
+    // `read_string_chars`, NOT `ctx.read_string(..)`: see the surrogate rows in
+    // this function's doc. The `StringBuilder` holds whatever `formatTo` wrote,
+    // including a lone surrogate, and the UTF-8 round trip is where it died.
+    let out = match ctx.invoke_virtual(sb, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => read_string_chars(ctx, s),
+        Ok(_) => Vec::new(),
+        Err(err) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(err);
+        }
+    };
+    ctx.unpin_native_roots(pin_base);
+    Ok(Some(out))
 }
 
 /// Render a flag set in `Flags.toString`'s canonical order.
@@ -5658,12 +7580,10 @@ fn fmt_check_spec(
     };
 
     match conversion {
-        // General: 'b'/'B' 'h'/'H' 's'/'S'. `'#'` is a mismatch for all of
-        // them here — the JDK admits it only for a `Formattable` argument,
-        // which this native never dispatches to.
+        // General: 'b'/'B' 'h'/'H' 's'/'S'.
         'b' | 'B' | 'h' | 'H' | 's' | 'S' => {
             // `checkGeneral` rejects '#' up front for 'b'/'h' only; for
-            // 's' the JDK gets there later, inside `print(Object)`, which is
+            // 's' the JDK gets there later, inside `printString`, which is
             // why `%#-s` reports the MISSING WIDTH and `%#-b` reports the
             // flag mismatch. Order is the whole of the difference.
             if matches!(conversion, 'b' | 'B' | 'h' | 'H') {
@@ -5673,7 +7593,21 @@ fn fmt_check_spec(
                 return Err(FmtFault::MissingWidth(spec_text()));
             }
             mismatch("+ 0,(")?;
-            mismatch("#")?;
+            // `'#'` for 's'/'S' is NOT refused here, and the omission is the
+            // point. `printString` opens with the `Formattable` dispatch and
+            // only reaches `failMismatch(ALTERNATE, 's')` in its `else` — so
+            // `%#s` of a `Formattable` is LEGAL and hands `ALTERNATE` to the
+            // callee, while `%#s` of anything else still throws. Both halves
+            // are measured on HotSpot 25 and both are in `format_arg_full`,
+            // which is the only place the argument's class is known.
+            //
+            // Deferring it is visible in three other orderings, all measured:
+            // `%#,s` is the ','  mismatch (this layer, before the argument),
+            // `%#-s` is `MissingFormatWidthException: %-#s` (this layer), and
+            // `%#s` with NO argument is
+            // `MissingFormatArgumentException: Format specifier '%#s'` — the
+            // argument fetch sits between the two layers, so hoisting the
+            // refusal back up here would answer that last one wrongly.
         }
         'c' | 'C' => {
             if let Some(p) = precision {
@@ -5693,8 +7627,12 @@ fn fmt_check_spec(
                 mismatch("#")?;
             } else {
                 mismatch(",")?;
-                // `print(long, Locale)`'s own check, after `checkInteger`.
-                mismatch("( +")?;
+                // `print(long, Locale)`'s own `checkBadFlags(PARENTHESES |
+                // LEADING_SPACE | PLUS)` is NOT here, deliberately: it runs
+                // inside the printer, so it does not apply to a BigInteger
+                // argument (whose printer has no such check) nor to a null one
+                // (which never reaches a printer). It lives in
+                // `format_arg_full`, where the argument's class is known.
             }
         }
         'e' | 'E' | 'f' | 'g' | 'G' | 'a' | 'A' => {
@@ -5711,18 +7649,53 @@ fn fmt_check_spec(
     Ok(())
 }
 
-/// The three `java.text.DecimalFormatSymbols` characters
-/// `java.util.Formatter` localizes a magnitude with.
+/// The four `java.text.DecimalFormatSymbols` characters
+/// `java.util.Formatter` reads off a `Locale`.
 ///
-/// The JDK's own `getZero`/`getDecimalSeparator`/`getGroupingSeparator`
-/// helpers read exactly these three off
-/// `DecimalFormatSymbols.getInstance(locale)`, and answer `'0'`/`'.'`/`','`
-/// for a null locale.
+/// The JDK's own
+/// `getZero`/`getDecimalSeparator`/`getGroupingSeparator`/`getMinusSign`
+/// helpers read exactly these four off
+/// `DecimalFormatSymbols.getInstance(locale)`, and answer
+/// `'0'`/`'.'`/`','`/`'-'` for a null locale.
+///
+/// # `minus` has exactly ONE consumer, and it is not a numeric conversion
+///
+/// F28-1 §5.3 recorded this symbol as missing and described its blast radius as
+/// "`%tF`'s minus, and every negative `%d`/`%f`/`%e`/`%g`". **The second half of
+/// that is wrong**, and the correction is why `minus` is affordable at all.
+/// `getMinusSign` has a SINGLE call site in `java.base/java/util/Formatter.java`
+/// (line 4635 of the JDK 25 source), inside the `TemporalAccessor` printer's
+/// `ISO_STANDARD_DATE` arm. Every other negative number takes `leadingSign`,
+/// which appends a bare ASCII `'-'` (or `'('`) and consults no locale at all.
+///
+/// Measured on HotSpot 25 under `lt-LT`, `et-EE`, `sl-SI`, `sv-SE` and `fi-FI`
+/// — five of the 59 available locales whose `getMinusSign()` is U+2212 MINUS
+/// SIGN — dumped as UTF-16 code units:
+///
+/// | conversion | argument | HotSpot 25 |
+/// |---|---|---|
+/// | `%d` | `-5` | `002D 0035` — ASCII |
+/// | `%,d` | `-1234567` | `002D` … — ASCII |
+/// | `%.2f` `%e` `%g` `%a` | `-1234.5` | `002D` … — ASCII |
+/// | `%d` | `BigInteger("-5")` | `002D 0035` — ASCII |
+/// | `%.2f` | `BigDecimal("-1.5")` | `002D` … — ASCII |
+/// | `%tz` | `OffsetDateTime` at `-03` | `002D 0030 0033 0030 0030` — ASCII |
+/// | `%tF` | `LocalDate.of(-44,3,15)` | **`2212`** `0030 0030 0034 0034 002D …` |
+///
+/// The last row is the whole of it: the leading year sign is localized and the
+/// two `'-'` DATE SEPARATORS in the same field are not. So this symbol costs one
+/// extra `getMinusSign` call per already-cached [`fmt_symbols_for`] resolution
+/// and closes the row completely, rather than "one quarter of one row" against a
+/// hot path — which is the trade F28 declined on a premise that had not been
+/// measured.
 #[derive(Clone, Copy)]
 struct FmtSymbols {
     grouping: char,
     decimal: char,
     zero: char,
+    /// `DecimalFormatSymbols.getMinusSign()`. Read by [`fmt_iso_year`] and by
+    /// nothing else — see the type doc.
+    minus: char,
 }
 
 impl Default for FmtSymbols {
@@ -5731,8 +7704,48 @@ impl Default for FmtSymbols {
             grouping: ',',
             decimal: '.',
             zero: '0',
+            // `getMinusSign(Locale)` is `locale == null ? '-' : …`, the same
+            // shape as the other three. Measured: `String.format((Locale) null,
+            // "%tF", LocalDate.of(-44,3,15))` is `-0044-03-15` with an ASCII
+            // U+002D even on a host whose default locale's minus is U+2212.
+            minus: '-',
         }
     }
+}
+
+/// Which `Locale` a `java.util.Formatter` call localizes against.
+///
+/// This exists because the `Option<Locale>` it replaced could not tell two
+/// different requests apart, and `java.util.Formatter` answers them
+/// differently:
+///
+/// * **The overload has no `Locale` parameter** — `String.format(String,
+///   Object...)`, `String.formatted`, `PrintStream.printf(String, Object...)`,
+///   `new Formatter()`. Every one of these is specified as formatting with
+///   "the locale returned by `Locale.getDefault(Locale.Category.FORMAT)`".
+/// * **The overload was given one, and it is `null`** —
+///   `String.format((Locale) null, …)`. "If `l` is `null` then no localization
+///   is applied", i.e. the root separators and ASCII digits.
+///
+/// Collapsing the two onto one `None` is the defect this type removes (W7-91
+/// §5, and the last open `format` row of
+/// `docs/known-issues/jdk-only/W7-34-formatter-family-residuals.md`): the
+/// no-`Locale` overload took the explicit-null branch and localized against
+/// `Locale.ROOT` on every host. Invisible on a ROOT/en-US host, and wrong
+/// everywhere else — separators, grouping and digits all diverge.
+///
+/// The distinction is resolved AT CONSUMPTION, in [`fmt_symbols_for`] and
+/// [`fmt_date_name`], never by re-encoding one variant as the other. Those two
+/// are one JDK rule implemented twice and they had already drifted: the date
+/// half was reading `DateFormatSymbols.getInstance()` (the FORMAT default) for
+/// the absent-locale case while the number half took the root constants.
+#[derive(Clone, Copy)]
+enum FmtLocale {
+    /// The overload has no `Locale` parameter, so the JDK supplies
+    /// `Locale.getDefault(Locale.Category.FORMAT)`.
+    DefaultFormat,
+    /// The overload carries an explicit `Locale` argument, possibly `null`.
+    Given(Option<cratonvm_types::ObjectRef>),
 }
 
 thread_local! {
@@ -5747,8 +7760,8 @@ thread_local! {
     static FMT_SYMBOLS_RESOLVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Read a `java.util.Locale`'s formatting symbols, or the root defaults for a
-/// null locale.
+/// Read a `java.util.Locale`'s formatting symbols, or the root defaults for an
+/// explicit null locale.
 ///
 /// Goes through `DecimalFormatSymbols.getInstance(Locale)` rather than a
 /// hard-coded table because that is what `java.util.Formatter` does, and
@@ -5757,22 +7770,64 @@ thread_local! {
 /// CratonVM's own `DecimalFormatSymbols` was measured to answer the identical
 /// three characters for ROOT/US/GERMANY/FRANCE, so this reads a real value
 /// rather than reproducing one.
-fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: Option<cratonvm_types::ObjectRef>) -> FmtSymbols {
-    let locale = match locale {
-        Some(l) => l,
-        None => return FmtSymbols::default(),
-    };
+///
+/// The three [`FmtLocale`] arms, and why each is what the JDK does:
+///
+/// * `Given(None)` — an explicit `null` `Locale`. The JDK's own
+///   `Formatter.zero(Locale)` is `if ((l != null) && !l.equals(Locale.US)) {…}
+///   return '0';`, so a null locale takes the three constants and runs no
+///   bytecode at all. Unchanged, and it is also the arm every `new Formatter()`
+///   currently arrives on (see the residual note below).
+/// * `Given(Some(l))` — resolve `l`. Unchanged, deliberately: the
+///   very common `String.format(Locale.ROOT, …)` must not become slower or
+///   different because the no-`Locale` overload was fixed. The only fast path
+///   ROOT ever had is the LAZINESS in [`format_impl`] — this function is not
+///   reached at all unless a conversion actually localizes — and that is
+///   untouched.
+/// * `DefaultFormat` — the overload had no `Locale`. Resolves
+///   through the NO-ARG `DecimalFormatSymbols.getInstance()`, whose body is
+///   `getInstance(Locale.getDefault(Locale.Category.FORMAT))`. Asking the JDK
+///   for the default rather than composing one here is what keeps this from
+///   becoming a fourth opinion about what the default locale is — the same
+///   argument [`fmt_date_name`] already makes, and the reason these two agree
+///   again.
+///
+/// W7-34 left this arm undone and named the hazard: "resolving a default locale
+/// on the no-locale path is the one place where the re-entrancy hazard is
+/// worst — every internal `String.format` in the VM, including the logging
+/// shims, goes through it." Two things bound it, and neither is new code.
+/// First, LAZINESS: `format_impl` only calls this at a `%d`/`%f`/`%e`/`%g`
+/// conversion, so an internal `String.format("{}: {}"-shaped %s format)` still
+/// runs zero locale bytecode. Second, `FMT_SYMBOLS_RESOLVING`: an inner
+/// `String.format` raised while the outer one is resolving answers the root
+/// constants and cannot recurse. `fmt_date_name` has been taking exactly this
+/// route on exactly this path since the `%t` name fields landed.
+fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: FmtLocale) -> FmtSymbols {
+    if let FmtLocale::Given(None) = locale {
+        return FmtSymbols::default();
+    }
     if FMT_SYMBOLS_RESOLVING.with(std::cell::Cell::get) {
         return FmtSymbols::default();
     }
     FMT_SYMBOLS_RESOLVING.with(|f| f.set(true));
     let resolved = (|| {
-        let dfs = match ctx.invoke(
-            "java/text/DecimalFormatSymbols",
-            "getInstance",
-            "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",
-            &[Value::Object(Some(locale))],
-        ) {
+        let instance = match locale {
+            FmtLocale::Given(Some(l)) => ctx.invoke(
+                "java/text/DecimalFormatSymbols",
+                "getInstance",
+                "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",
+                &[Value::Object(Some(l))],
+            ),
+            // `DefaultFormat`. `Given(None)` returned above, so this arm is
+            // only ever the no-`Locale` overload.
+            _ => ctx.invoke(
+                "java/text/DecimalFormatSymbols",
+                "getInstance",
+                "()Ljava/text/DecimalFormatSymbols;",
+                &[],
+            ),
+        };
+        let dfs = match instance {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => return None,
         };
@@ -5786,6 +7841,13 @@ fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: Option<cratonvm_types::O
             grouping: read(ctx, "getGroupingSeparator", ','),
             decimal: read(ctx, "getDecimalSeparator", '.'),
             zero: read(ctx, "getZeroDigit", '0'),
+            // The fourth read. It is the same `()C` shape as the other three
+            // and it is resolved eagerly with them rather than lazily at
+            // [`fmt_iso_year`], because its only consumer sits inside
+            // `format_temporal_field`, which has no `ctx` re-entrancy budget of
+            // its own and is already handed the resolved `FmtSymbols`. 59 of
+            // this JDK's 1158 available locales answer U+2212 here.
+            minus: read(ctx, "getMinusSign", '-'),
         })
     })();
     FMT_SYMBOLS_RESOLVING.with(|f| f.set(false));
@@ -5817,14 +7879,68 @@ thread_local! {
 /// index into it, in that array's own convention (months 0-based over 13
 /// entries, weekdays 1-based over 8 with slot 0 unused).
 ///
-/// `locale` is the `Locale` an explicit-locale overload was given.
-/// **`None` means the no-locale overload**, and resolves through
-/// `DateFormatSymbols.getInstance()`, whose body is
+/// `locale` is the call's [`FmtLocale`]. `Given(Some(l))` resolves
+/// `DateFormatSymbols.getInstance(l)`; every other arm resolves through the
+/// NO-ARG `DateFormatSymbols.getInstance()`, whose body is
 /// `getInstance(Locale.getDefault(Locale.Category.FORMAT))` — i.e. exactly the
 /// `Locale` a real `java.util.Formatter` built by `String.format(String,
 /// Object...)` would be carrying. Asking the JDK for it rather than composing
 /// one here is what keeps this from becoming a fourth opinion about what the
 /// default locale is.
+///
+/// # `Given(None)` is `Locale.US`, which the English tables below already are
+///
+/// `Formatter.printDateTime` opens every name field with `Locale lt =
+/// Objects.requireNonNullElse(l, Locale.US)`, so a literal
+/// `String.format((Locale) null, "%tB", d)` renders ENGLISH. This arm used to
+/// resolve the default FORMAT locale instead. MEASURED on HotSpot 25 with the
+/// host default forced to a non-US locale — the case F22 could not reach and
+/// recorded rather than guess at:
+///
+/// | expression | `-Duser.language=tr -Duser.country=TR` | `ru_RU` |
+/// |---|---|---|
+/// | `format((Locale) null, "%tb", d)` | `Nov` | `Nov` |
+/// | `format("%tb", d)` (default) | `Kas` | `нояб.` |
+/// | `format((Locale) null, "%tA", d)` | `Wednesday` | `Wednesday` |
+/// | `format((Locale) null, "%tp", d)` | `am` | `am` |
+/// | `format("%tp", d)` (default) | `öö` | `am` |
+///
+/// So `Given(None)` returns `None` HERE — before the latch, before any
+/// bytecode — and the caller prints its English table. Those four tables ARE
+/// `Locale.US`'s answers: `DateFormatSymbols.getInstance(Locale.US)` gives
+/// `Jan..Dec`, `January..December`, `Sun..Sat`, `Sunday..Saturday` and
+/// `{"AM","PM"}`, which is also why `printDateTime`'s own `AM_PM` arm skips
+/// `DateFormatSymbols` entirely for a null (and for `Locale.US`) and uses the
+/// literal `String[] ampm = { "AM", "PM" }`. Asking the JDK for US data would
+/// be a slower route to the same characters, with a re-entrancy hazard the
+/// early return does not have.
+///
+/// **This shape matches [`fmt_symbols_for`], deliberately.** That helper has
+/// answered `Given(None)` with the root constants since it was written — the
+/// JDK's `getGroupingSeparator(Locale)` is literally `locale == null ? ',' :
+/// …` — and the two now give an explicit null locale ONE meaning across the
+/// whole file. Measured: `format((Locale) null, "%,d", 1234567)` is
+/// `1,234,567` on a `tr_TR` host where the default gives `1.234.567`.
+/// [`fmt_upper_case`] is the deliberate exception and stays as it is:
+/// `toUpperCaseWithLocale` is `s.toUpperCase(Objects.requireNonNullElse(l,
+/// Locale.getDefault(FORMAT)))`, the DEFAULT — measured, `format((Locale)
+/// null, "%S", "i")` is U+0130 on a `tr_TR` host, not `I`. Three sites, two
+/// JDK rules, and the JDK does mean both.
+///
+/// # What this costs until the `Formatter` constructors are fixed
+///
+/// In this VM `Given(None)` is not only an explicit null: `new Formatter()`
+/// and `new Formatter(Appendable)` reach `format` through natives in
+/// `native-builtins/src/lib.rs` (and `register_formatter_natives` in the same
+/// file) that write `null` into the receiver's locale slot, where the real
+/// `java.util.Formatter()` constructor writes
+/// `Locale.getDefault(Locale.Category.FORMAT)`; `format` then reads slot 1 and
+/// arrives here as `Given(None)`. For THOSE the right answer is the default
+/// locale, and this arm now gets them wrong. That is not a new trade — it is
+/// the trade `fmt_symbols_for` has always made on the same path, so the change
+/// makes the file self-consistent and moves the whole residual into ONE fix,
+/// in the constructor rather than in three consumers. See W7-34's residuals,
+/// which already carry that constructor row as open, and F28-1's NOMINATION.
 ///
 /// `None` on any failure, and the caller then prints the English name it
 /// printed before. Every failure mode is a legitimate one: synthetic-JDK mode
@@ -5837,23 +7953,33 @@ thread_local! {
 /// its speculative `load_class`).
 fn fmt_date_name(
     ctx: &mut dyn NativeContext,
-    locale: Option<cratonvm_types::ObjectRef>,
+    locale: FmtLocale,
     getter: &str,
     index: usize,
 ) -> Option<String> {
+    // An explicit null `Locale` is `Locale.US`, and the caller's English table
+    // IS `DateFormatSymbols.getInstance(Locale.US)` for all five getters — see
+    // the measured rows above. Returning before the latch keeps this the one
+    // arm that runs no bytecode at all, the same shape `fmt_symbols_for` uses
+    // for the same request.
+    if let FmtLocale::Given(None) = locale {
+        return None;
+    }
     if FMT_DATE_NAMES_RESOLVING.with(std::cell::Cell::get) {
         return None;
     }
     FMT_DATE_NAMES_RESOLVING.with(|f| f.set(true));
     let resolved = (|| {
         let instance = match locale {
-            Some(l) => ctx.invoke(
+            FmtLocale::Given(Some(l)) => ctx.invoke(
                 "java/text/DateFormatSymbols",
                 "getInstance",
                 "(Ljava/util/Locale;)Ljava/text/DateFormatSymbols;",
                 &[Value::Object(Some(l))],
             ),
-            None => ctx.invoke(
+            // `Given(None)` returned above, so this arm is only ever the
+            // no-`Locale` overload.
+            _ => ctx.invoke(
                 "java/text/DateFormatSymbols",
                 "getInstance",
                 "()Ljava/text/DateFormatSymbols;",
@@ -5891,6 +8017,41 @@ fn fmt_date_name(
 /// Applied only to the conversions the JDK localizes (`%d %f %e %g`): `%x`,
 /// `%o` and `%a` are documented as "No localization is applied", and a `%s`
 /// argument's own digits are the caller's text, not a magnitude.
+/// [`fmt_localize`]'s DIGIT half, for the `%t` family.
+///
+/// `localizedMagnitude` does two things — substitute the zero digit, and
+/// substitute the separators — and the `%t` conversions only ever ask for the
+/// first: a date/time field carries no grouping separator (its
+/// `localizedMagnitude` calls pass `Flags.NONE` or `Flags.ZERO_PAD`, never
+/// `Flags.GROUP`) and no decimal point. Mapping `','` and `'.'` here as well
+/// would be wrong rather than merely unnecessary — `%tD` is `mm/dd/yy` and a
+/// `DateFormatSymbols` month name may legitimately END in `'.'` (`ru`'s
+/// `нояб.`).
+///
+/// So this is deliberately NOT a call to [`fmt_localize`] with the separators
+/// zeroed out: the two functions answer different questions and share the one
+/// mechanism that is genuinely common, the `zero - '0'` shift. Both are
+/// one-character-for-one, which is what lets the width justifier keep counting
+/// after them.
+///
+/// The `sym.zero == '0'` short circuit is the whole cost on every Latin-digit
+/// locale, which is nearly all of them.
+fn fmt_localize_digits(s: &str, sym: FmtSymbols) -> String {
+    if sym.zero == '0' {
+        return s.to_string();
+    }
+    let shift = sym.zero as u32 - '0' as u32;
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_digit() {
+                char::from_u32(c as u32 + shift).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn fmt_localize(s: &str, sym: FmtSymbols) -> String {
     if sym.grouping == ',' && sym.decimal == '.' && sym.zero == '0' {
         return s.to_string();
@@ -5908,24 +8069,37 @@ fn fmt_localize(s: &str, sym: FmtSymbols) -> String {
 
 // --- String.format (basic %s/%d/%f support) ---
 
+/// `String.format(String, Object...)` — the overload with NO `Locale`.
+///
+/// [`FmtLocale::DefaultFormat`], not a null locale: `java.util.Formatter`
+/// formats this overload against `Locale.getDefault(Locale.Category.FORMAT)`.
+/// It used to pass `None` here, which [`fmt_symbols_for`] read as "no
+/// localization" — so `String.format("%,.2f", 1234.5)` answered the ROOT
+/// `1,234.50` on a German host where HotSpot answers `1.234,50`. Every
+/// no-`Locale` surface funnels through here ([`native_string_formatted`], and
+/// `PrintStream.printf`/`format` and `PrintWriter.printf`/`format` in
+/// `native-builtins/src/lib.rs` and `logging_shims.rs`), so they all move
+/// together and cannot drift.
 pub(crate) fn native_string_format(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    format_impl(ctx, args, None)
+    format_impl(ctx, args, FmtLocale::DefaultFormat)
 }
 
 /// The body of every `String.format` / `Formatter.format` overload.
 ///
-/// `locale` is the `java.util.Locale` an explicit-locale overload was given,
-/// or `None` for the overloads that have none. It is resolved to
-/// [`FmtSymbols`] LAZILY, at the first conversion that actually localizes, so
-/// the very common `String.format(Locale.ROOT, "%s", x)` pays nothing for a
-/// locale it never consults.
+/// `locale` says which `java.util.Locale` this call localizes against — see
+/// [`FmtLocale`] for why the absent-parameter and explicit-null cases are not
+/// the same request. It is resolved to [`FmtSymbols`] LAZILY, at the first
+/// conversion that actually localizes, so the very common
+/// `String.format(Locale.ROOT, "%s", x)` pays nothing for a locale it never
+/// consults — and, since the fix above, neither does the no-`Locale` overload,
+/// which is the same laziness doing the same job on a hotter path.
 fn format_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-    locale: Option<cratonvm_types::ObjectRef>,
+    locale: FmtLocale,
 ) -> MethodCallResult {
     // Static: args[0] = format String, args[1] = Object[] array
     let fmt_obj = match args.first() {
@@ -5937,7 +8111,11 @@ fn format_impl(
             .into())
         }
     };
-    let fmt_str = ctx.read_string(fmt_obj).unwrap_or_default();
+    // The format string's own code UNITS. `read_string` was lossy here too, and
+    // silently: a format string is ordinary caller text and the literal runs
+    // between the specifiers are copied to the output verbatim, so a lone
+    // surrogate in one of them became U+FFFD before the parser ever ran.
+    let fmt_units = read_string_chars(ctx, fmt_obj);
 
     // Get the varargs array
     let arr_ref = match args.get(1) {
@@ -5950,8 +8128,26 @@ fn format_impl(
 
     // Format string parser supporting flags, width, precision:
     // %[flags][width][.precision]conversion
-    let mut result = String::new();
-    let chars: Vec<char> = fmt_str.chars().collect();
+    // The output accumulates as UTF-16 code UNITS and becomes a `String` once,
+    // at the end, through [`sb_string_from_units`]. Every producer that feeds it
+    // — `format_arg_full`, `format_temporal_field`, the literal runs below —
+    // can legitimately emit an unpaired surrogate, and a Rust `String` here
+    // would have destroyed it however carefully they preserved it.
+    let mut result: Vec<u16> = Vec::new();
+    // `chars` is index-aligned with `fmt_units`: ONE `char` per code UNIT, not
+    // per code point. That is a change from a `str::chars()` collect, and it is
+    // what lets the literal-text branch at the bottom of the loop push
+    // `fmt_units[i]` — the raw unit — while the parser keeps reading `chars[i]`.
+    // The parser is unaffected: every character it tests for is ASCII (`'%'`,
+    // `'$'`, the flag set, `is_ascii_digit`, `is_ascii_alphabetic`), and a
+    // surrogate — half of a pair or lone — is none of those, so it falls to the
+    // literal branch exactly as a non-ASCII `char` always did. A surrogate PAIR
+    // is now two `chars` instead of one and is pushed as its two original units,
+    // which reassemble into the same code point.
+    let chars: Vec<char> = fmt_units
+        .iter()
+        .map(|&u| char::from_u32(u32::from(u)).unwrap_or('\u{FFFD}'))
+        .collect();
     let mut i = 0;
     let mut arg_idx = 0;
     // Index used by the most recent conversion, for the `%<` relative-index
@@ -5975,7 +8171,7 @@ fn format_impl(
             let first_after_pct = chars[i];
             // Check for %% and %n first
             if chars[i] == '%' {
-                result.push('%');
+                result.push(u16::from(b'%'));
                 i += 1;
                 continue;
             }
@@ -5984,7 +8180,7 @@ fn format_impl(
                 // (System.lineSeparator(), "\r\n" on Windows), not a literal
                 // '\n' -- see native_system_line_separator in lang_system.rs
                 // for the same platform check.
-                result.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
+                result.extend(fmt_line_separator_units());
                 i += 1;
                 continue;
             }
@@ -6144,6 +8340,18 @@ fn format_impl(
                         //   `%x`   → next ordinary index (advances the counter)
                         // Only ordinary conversions advance `arg_idx`, matching
                         // java.util.Formatter (explicit/relative specs do not).
+                        //
+                        // A `'<'` with NO previous conversion is a REFUSAL, not
+                        // a fallback to argument 0. `Formatter.format`'s loop
+                        // is `case -1 -> { if (last < 0 || …) throw new
+                        // MissingFormatArgumentException(fs.toString()); … }`
+                        // and `last` starts at -1. Measured on HotSpot
+                        // 25.0.3+9: `String.format("%<s", "a")` is
+                        // `MissingFormatArgumentException: Format specifier
+                        // '%<s'`, and so is `String.format("%<tY", 0L)`. This
+                        // answered args[0] instead, silently.
+                        let relative_without_previous =
+                            flags.contains('<') && last_used_index.is_none();
                         let use_idx = if flags.contains('<') {
                             last_used_index.unwrap_or(0)
                         } else if let Some(ei) = explicit_index {
@@ -6163,6 +8371,23 @@ fn format_impl(
                             fmt_check_spec(explicit_index, &flags, width, precision, spec)
                         {
                             return Err(fmt_raise(ctx, &fault));
+                        }
+                        // ...and the missing PREVIOUS argument is raised here,
+                        // with the same standing as a missing NEXT one: both
+                        // are `format`'s own range test, which runs after every
+                        // `FormatSpecifier` constructor has passed its checks.
+                        // `%<0d` is therefore the flag mismatch, not this.
+                        if relative_without_previous {
+                            return Err(fmt_raise(
+                                ctx,
+                                &FmtFault::MissingArgument(fmt_spec_text(
+                                    explicit_index,
+                                    &flags,
+                                    width,
+                                    precision,
+                                    spec,
+                                )),
+                            ));
                         }
                         // "If there are fewer arguments than format specifiers,
                         // the argument index is out of range ... a
@@ -6207,9 +8432,10 @@ fn format_impl(
                         } else {
                             FmtSymbols::default()
                         };
-                        let text =
-                            format_arg_full(ctx, &arg, spec, &flags, width, precision, sym)?;
-                        result.push_str(&text);
+                        let text = format_arg_full(
+                            ctx, &arg, spec, &flags, width, precision, sym, locale,
+                        )?;
+                        result.extend_from_slice(&text);
                     }
                     't' | 'T' => {
                         // Date/time conversion: 't'/'T' is a *prefix*, not a
@@ -6303,6 +8529,15 @@ fn format_impl(
                                 &FmtFault::MissingWidth(dt_spec_text()),
                             ));
                         }
+                        // `'<'` with no previous conversion — the same refusal
+                        // the general arm makes, quoting this arm's own
+                        // specifier text. Measured on HotSpot 25.0.3+9:
+                        // `String.format("%<tY", 0L)` is
+                        // `MissingFormatArgumentException: Format specifier
+                        // '%<tY'`.
+                        if flags.contains('<') && last_used_index.is_none() {
+                            return Err(fmt_raise(ctx, &FmtFault::MissingArgument(dt_spec_text())));
+                        }
                         let use_idx = if flags.contains('<') {
                             last_used_index.unwrap_or(0)
                         } else if let Some(ei) = explicit_index {
@@ -6329,18 +8564,44 @@ fn format_impl(
                             }
                         };
                         // The `Locale` goes through so the name fields can ask
-                        // `DateFormatSymbols` for it. Unlike the numeric
-                        // conversions above there is no cached `FmtSymbols`
-                        // here: `fmt_date_name` resolves only at a field that
-                        // renders a name, so a `%tY`-only format string still
-                        // runs no locale bytecode at all.
-                        let text =
-                            format_temporal_field(ctx, &elem, field, &flags, width, locale)?;
-                        result.push_str(&if uppercase {
-                            text.to_uppercase()
+                        // `DateFormatSymbols` for it.
+                        //
+                        // `FmtSymbols` goes through too, and shares the SAME
+                        // per-call cache the numeric conversions use, because
+                        // every number a `%t` field renders is a
+                        // `localizedMagnitude` and takes the locale's zero
+                        // digit (measured under `ar-EG`; see
+                        // `fmt_localize_digits`). The seven pure-NAME fields
+                        // still resolve nothing — a `%tb`-only format string
+                        // runs no `DecimalFormatSymbols` bytecode — which is
+                        // the same laziness the `'d'`/`'f'` arm above applies,
+                        // one screen up, over the same cache.
+                        //
+                        // `uppercase` goes through too rather than being
+                        // applied to the returned text. `printDateTime` is
+                        // `appendJustified(a, toUpperCaseWithLocale(sb, l))` —
+                        // the upper-caser runs INSIDE the width, and it is the
+                        // locale-sensitive one (`%TA` of a Monday under `tr` is
+                        // `PAZARTES` + U+0130 on HotSpot 25, measured). Doing it
+                        // out here meant a mapping that changes length padded
+                        // to the wrong field, and did it with Rust's
+                        // locale-independent table.
+                        let sym = if matches!(field, 'B' | 'b' | 'h' | 'A' | 'a' | 'p' | 'Z') {
+                            FmtSymbols::default()
                         } else {
-                            text
-                        });
+                            match symbols {
+                                Some(s) => s,
+                                None => {
+                                    let s = fmt_symbols_for(ctx, locale);
+                                    symbols = Some(s);
+                                    s
+                                }
+                            }
+                        };
+                        let text = format_temporal_field(
+                            ctx, &elem, field, &flags, width, sym, locale, uppercase,
+                        )?;
+                        result.extend_from_slice(&text);
                     }
                     // The literal-percent conversion, reached only when it
                     // carried flags or a width — a bare `%%` is short-circuited
@@ -6370,19 +8631,32 @@ fn format_impl(
                                 )),
                             ));
                         }
-                        let pad = width.unwrap_or(1).saturating_sub(1);
+                        // `fmt_repeat`, not `str::repeat`: `%2000000000%` is a
+                        // legal specifier and a two-gigabyte allocation.
+                        let pad = fmt_repeat(' ', width.unwrap_or(1).saturating_sub(1))?;
                         if flags == "-" {
-                            result.push('%');
-                            result.push_str(&" ".repeat(pad));
+                            result.push(u16::from(b'%'));
+                            result.extend(pad.encode_utf16());
                         } else {
-                            result.push_str(&" ".repeat(pad));
-                            result.push('%');
+                            result.extend(pad.encode_utf16());
+                            result.push(u16::from(b'%'));
                         }
                     }
                     // Likewise `%n`, reached only when decorated. It takes no
                     // width at all ("If the width is set, an
                     // IllegalFormatWidthException will be thrown") and no flags.
                     'n' => {
+                        // `checkText` tests the PRECISION before it switches on
+                        // the conversion, so it outranks both the width and the
+                        // flag refusals: `%5.2n` is IllegalFormatPrecisionException
+                        // on HotSpot 25, not IllegalFormatWidthException. This arm
+                        // had no precision check at all, so `%.2n` emitted a line
+                        // separator and formatted clean — the `'%'` arm two above
+                        // has always had the same check, which is how a family
+                        // written twice drifts in one member.
+                        if let Some(p) = precision {
+                            return Err(fmt_raise(ctx, &FmtFault::IllegalPrecision(p as i32)));
+                        }
                         if let Some(w) = width {
                             return Err(fmt_raise(ctx, &FmtFault::IllegalWidth(w as i32)));
                         }
@@ -6392,7 +8666,7 @@ fn format_impl(
                                 &FmtFault::IllegalFlags(fmt_flags_string(&flags)),
                             ));
                         }
-                        result.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
+                        result.extend(fmt_line_separator_units());
                     }
                     // "If the conversion is not one of the conversions defined
                     // above, an UnknownFormatConversionException is thrown."
@@ -6415,13 +8689,34 @@ fn format_impl(
                 ));
             }
         } else {
-            result.push(chars[i]);
+            // The raw code UNIT, not `chars[i]`: `chars` is the parser's
+            // ASCII-testable view and carries U+FFFD wherever the format string
+            // held a surrogate.
+            result.push(fmt_units[i]);
             i += 1;
         }
     }
 
-    let obj = ctx.create_string_uninterned(&result);
+    // [`sb_string_from_units`], this file's single lossless `String` writer. For
+    // a well-formed result it still takes exactly the
+    // `create_string_uninterned_gc_safe` path the `&str` build took, so no
+    // allocation, interning or GC-safety property moves for output that has no
+    // lone surrogate; only a result that actually carries one takes the units
+    // path.
+    let obj = sb_string_from_units(ctx, &result)?;
     Ok(Some(Value::Object(Some(obj))))
+}
+
+/// `System.lineSeparator()` as code units — `%n`'s output, in one place so the
+/// bare `%n` short-circuit and the decorated `%n` arm cannot drift apart on the
+/// platform test. (They are ~440 lines apart and have already drifted once, on
+/// the precision check; see the decorated arm.)
+fn fmt_line_separator_units() -> Vec<u16> {
+    if cfg!(windows) {
+        vec![u16::from(b'\r'), u16::from(b'\n')]
+    } else {
+        vec![u16::from(b'\n')]
+    }
 }
 
 /// Epoch-day/calendar math for `%t`/`%T` formatting, self-contained rather
@@ -6506,11 +8801,704 @@ fn temporal_from_epoch_day(epoch_day: i64) -> (i32, i32, i32) {
 /// conversion cannot accept is refused as `IllegalFormatConversionException`
 /// naming it — `Formatter.printDateTime`'s `else` arm is `failConversion(c,
 /// arg)` and `c` for a date/time specifier is the FIELD, not the 't'.
+/// The zone the `%t` fields were computed IN.
+///
+/// `java.util.Formatter.printDateTime` never formats an instant directly: it
+/// builds `Calendar.getInstance(l == null ? Locale.US : l)` — which carries
+/// `TimeZone.getDefault()` — and calls `setTimeInMillis`, so every field it then
+/// reads is a LOCAL field. A `Calendar` argument is used as it stands and
+/// carries its own zone.
+///
+/// This VM had no zone at all: `millis_to_fields` divided the epoch millis
+/// directly, so every field was UTC and the `'z'`/`'Z'` arms answered a fixed
+/// `"+0000"`/`"UTC"` that was *consistent with that*. The hard-coded zone name
+/// was the visible half; the wrong HOUR, DAY, MONTH and YEAR were the quiet
+/// half. Measured on HotSpot 25 for `new Date(1699999999000L)`:
+///
+/// | default zone | `%tc` | `%tZ` | `%tz` | `%tH` |
+/// |---|---|---|---|---|
+/// | `UTC` | `Tue Nov 14 22:13:19 UTC 2023` | `UTC` | `+0000` | `22` |
+/// | `America/New_York` | `Tue Nov 14 17:13:19 EST 2023` | `EST` | `-0500` | `17` |
+/// | `Asia/Kolkata` | `Wed Nov **15** 03:43:19 IST 2023` | `IST` | `+0530` | `03` |
+/// | `Europe/Berlin` | `Tue Nov 14 23:13:19 CET 2023` | `CET` | `+0100` | `23` |
+///
+/// (the Kolkata row rolls the DAY over, which is why this could not be fixed by
+/// naming the zone alone). Those `%tZ` values are the `Locale.US` display
+/// names; under `Locale.ROOT` the same rows read `GMT-05:00`, `GMT+05:30` and
+/// `GMT+01:00`, and in July — with DST in force — New York reads `EDT` /
+/// `GMT-04:00` and Berlin `CEST` / `GMT+02:00`. All measured.
+#[derive(Clone, Copy)]
+struct FmtZone {
+    /// `Calendar.ZONE_OFFSET + Calendar.DST_OFFSET` in milliseconds, i.e. what
+    /// `TimeZone.getOffset(millis)` answers, at the instant being formatted.
+    offset_ms: i32,
+    /// `Calendar.DST_OFFSET != 0` — the `daylight` argument of
+    /// `TimeZone.getDisplayName`, and the reason `getRawOffset()` is asked for
+    /// as well as `getOffset(millis)`.
+    dst: bool,
+    /// False when no zone could be resolved — the `java.time` types that carry
+    /// none, and any configuration where `java.util.TimeZone` could not be
+    /// reached. The fields are then UTC and the `'z'`/`'Z'` arms keep their old
+    /// fixed answers.
+    ///
+    /// **`known == false` is not the same question as "must refuse".** A
+    /// `LocalDateTime` has no zone and HotSpot REFUSES `%tZ` on it; a VM that
+    /// simply cannot reach `java.util.TimeZone` must keep printing `UTC`
+    /// rather than start throwing. The refusal is decided by
+    /// [`FmtSupport::zone`], which the degraded path leaves TRUE, and this
+    /// flag only decides what a non-refusing `%tZ` prints.
+    known: bool,
+    /// The offset came off a `java.time` object rather than a
+    /// `java.util.TimeZone`, so the `%tZ` NAME lookup goes back through the
+    /// object ([`fmt_temporal_zone_name`]) and `dst` above is not meaningful —
+    /// the daylight question is asked there, of the object's own zone.
+    temporal: bool,
+}
+
+impl FmtZone {
+    const NONE: FmtZone = FmtZone {
+        offset_ms: 0,
+        dst: false,
+        known: false,
+        temporal: false,
+    };
+}
+
+/// Which `java.time.temporal.ChronoField`s the `%t` argument answers — the
+/// question `Formatter.print(Formatter, TemporalAccessor, char, Locale)` asks
+/// implicitly, by calling `t.get(field)` and turning the resulting
+/// `DateTimeException` into `IllegalFormatConversionException(c,
+/// t.getClass())`.
+///
+/// **This is a per-FIELD refusal, not a per-type one, and the brief that
+/// commissioned it named only `%tZ`.** F22 measured that `Instant` and
+/// `LocalDateTime` throw on `%tZ`; sweeping all 31 fields against all six
+/// `java.time` sources on HotSpot 25 shows the refusal is much wider — an
+/// `Instant` answers only `%tL`, `%tN`, `%ts` and `%tQ` and throws on the
+/// other 27, and a `LocalDate` throws on every time field. Every one of those
+/// was previously answered here with a FABRICATED value (`invoke_i32` returns
+/// 0 for a method the class does not have), so `%tH` of an `Instant` printed
+/// a plausible UTC hour where HotSpot refuses.
+///
+/// The flags are the field GROUPS the JDK's switch actually partitions
+/// on, not a per-type table — a table would have to be re-derived for a
+/// further source type, and this does not. Measured group membership (G2-1
+/// swept 11 sources × all 31 fields on HotSpot 25.0.3+9, 2026-08-16):
+///
+/// | source | year | month | day | time | sub_second | instant | zone |
+/// |---|---|---|---|---|---|---|---|
+/// | `long` / `Long` / `Date` / `Calendar` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+/// | `Instant` | | | | | ✓ | ✓ | |
+/// | `LocalDate` | ✓ | ✓ | ✓ | | | | |
+/// | `LocalTime` | | | | ✓ | ✓ | | |
+/// | `LocalDateTime` | ✓ | ✓ | ✓ | ✓ | ✓ | | |
+/// | `ZonedDateTime` / `OffsetDateTime` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+/// | `OffsetTime` | | | | ✓ | ✓ | | ✓ |
+/// | `Year` | ✓ | | | | | | |
+/// | `YearMonth` | ✓ | ✓ | | | | | |
+/// | `MonthDay` | | ✓ | ✓ | | | | |
+/// | `Month` | | ✓ | | | | | |
+///
+/// The epoch-shaped sources are `ALL` because they do not take the
+/// `TemporalAccessor` printer at all — `printDateTime` builds a `Calendar`,
+/// whose printer has an arm for every field and refuses none of them.
+///
+/// **Why `date` is three flags and not one.** It was one until G2-1 swept the
+/// partial `java.time` types. `Year` answers `%tY %ty %tC` and refuses `%tm`;
+/// `YearMonth` answers those and `%tm %tB %tb %th` and refuses `%td`;
+/// `MonthDay` answers the month and day fields and refuses `%tY`. A single
+/// `date` flag cannot express any of the three, and — because `%tD`, `%tF` and
+/// `%tc` each report the FIRST missing inner field — it cannot express their
+/// refusal CHARACTERS either (measured: `%tF` of a `Year` is `m`, of a
+/// `YearMonth` is `d`, of a `MonthDay` is `F`).
+#[derive(Clone, Copy)]
+struct FmtSupport {
+    /// `YEAR_OF_ERA` — `%tY %ty %tC`, and the year slots of `%tD`/`%tF`/`%tc`.
+    year: bool,
+    /// `MONTH_OF_YEAR` — `%tm %tB %tb %th`, and the month slots of the three
+    /// composites.
+    month: bool,
+    /// `DAY_OF_MONTH` — `%td %te`, and the day slots of the three composites.
+    day: bool,
+    /// `HOUR_OF_DAY`, `CLOCK_HOUR_OF_AMPM`, `MINUTE_OF_HOUR`,
+    /// `SECOND_OF_MINUTE`, `AMPM_OF_DAY` — `%tH %tk %tI %tl %tM %tS %tp`, plus
+    /// `%tR %tT %tr`.
+    time: bool,
+    /// `MILLI_OF_SECOND` / `NANO_OF_SECOND` — `%tL` and `%tN`. Separate from
+    /// `time` because an `Instant` answers these two and no other clock field.
+    sub_second: bool,
+    /// `INSTANT_SECONDS` — `%ts`, and (with `sub_second`) `%tQ`.
+    instant: bool,
+    /// The zone query answers non-null and `OFFSET_SECONDS` is supported —
+    /// `%tz` and `%tZ`. Left TRUE on the degraded `java.util.TimeZone` path so
+    /// that a VM which cannot resolve a zone keeps PRINTING one rather than
+    /// starting to refuse; see [`FmtZone::known`].
+    zone: bool,
+    /// **Which of `printDateTime`'s two printers this source takes**, not a
+    /// support question — and it cannot be derived from the flags above,
+    /// because a `ZonedDateTime` supports every group and still takes the
+    /// OTHER printer.
+    ///
+    /// `java.util.Formatter.printDateTime` dispatches
+    /// `long`/`Long`/`Date`/`Calendar` to `print(Formatter, Calendar, char,
+    /// Locale)` and every `TemporalAccessor` to `print(Formatter,
+    /// TemporalAccessor, char, Locale)`. The two are near-copies of each other
+    /// and they disagree about exactly one conversion, `%tF`:
+    ///
+    /// ```text
+    /// Calendar          case ISO_STANDARD_DATE:  print(YEAR_4) '-' print(MONTH) '-' print(DAY)
+    /// TemporalAccessor  case ISO_STANDARD_DATE:  int year = t.get(YEAR);          // PROLEPTIC
+    ///                                            if (year < 0) { getMinusSign(l); year = -year; }
+    ///                                            else if (year > 9999) '+';
+    ///                                            localizedMagnitude(year, ZERO_PAD, 4) …
+    /// ```
+    ///
+    /// `YEAR_4` is `Calendar.YEAR`, which is ERA-RELATIVE and never negative, so
+    /// the `Calendar` arm has no sign rule, no `'+'` rule and no localized minus
+    /// at all. Measured on HotSpot 25, `Locale.ROOT`, `Asia/Kolkata`:
+    ///
+    /// | argument | `%tF` | `%tY` |
+    /// |---|---|---|
+    /// | `LocalDate.of(-44,3,15)` | `-0044-03-15` | `0045` |
+    /// | `GregorianCalendar` ERA=BC YEAR=45 (the SAME instant) | **`0045-03-15`** | `0045` |
+    /// | `new Date(-63549548877000L)` (the same instant) | **`0045-03-15`** | `0045` |
+    /// | `LocalDate.of(12345,3,4)` | `+12345-03-04` | `12345` |
+    /// | `GregorianCalendar` AD 12345 | **`12345-03-04`** | `12345` |
+    ///
+    /// The `%tY` column is identical down both printers, which is the point of
+    /// §5.2's correction: see [`format_temporal_field`]'s `year_of_era`.
+    calendar_printer: bool,
+}
+
+impl FmtSupport {
+    /// The epoch-shaped sources, which take the `Calendar` printer and refuse
+    /// nothing.
+    const ALL: FmtSupport = FmtSupport {
+        year: true,
+        month: true,
+        day: true,
+        time: true,
+        sub_second: true,
+        instant: true,
+        zone: true,
+        calendar_printer: true,
+    };
+
+    /// `DAY_OF_WEEK` (`%tA %ta`) and `DAY_OF_YEAR` (`%tj`) — both DERIVED,
+    /// because neither can be answered without a complete year/month/day and
+    /// every source that has all three answers both.
+    ///
+    /// Measured over the 11 sources G2-1 swept: `LocalDate`, `LocalDateTime`,
+    /// `ZonedDateTime`, `OffsetDateTime` and the four `ChronoLocalDate`s have
+    /// y+m+d and answer `%tA %ta %tj`; `Instant`, `LocalTime`, `OffsetTime`,
+    /// `Year`, `YearMonth`, `MonthDay` and `Month` each lack at least one of
+    /// the three and refuse all three fields.
+    ///
+    /// **One measured source contradicts the derivation and is deliberately
+    /// not decoded**: `java.time.DayOfWeek` answers `%tA`/`%ta` while having
+    /// no year, month or day at all (and its `%tc` reports `b`, not the `a`
+    /// this derivation would give). `extract_temporal_fields` refuses it, so
+    /// the shape never reaches here. Decoding it needs a day-of-week that does
+    /// not come from a date, which is a plumbing change through
+    /// `format_temporal_field`; see G2-1's residuals.
+    const fn full_date(self) -> bool {
+        self.year && self.month && self.day
+    }
+}
+
+/// The character `IllegalFormatConversionException` reports for `field` on a
+/// source with this support, or `None` when the field is answerable.
+///
+/// The reported character is NOT always the one written in the format string:
+/// the composite conversions delegate to nested `print` calls and it is the
+/// INNER field that raises, so `%tT` of a `LocalDate` reports `H` and `%tc` of
+/// an `Instant` reports `a`. Every row below was measured on HotSpot 25:
+///
+/// | source | `%tR` `%tT` | `%tr` | `%tD` | `%tF` | `%tc` |
+/// |---|---|---|---|---|---|
+/// | `Instant` | `H` | `I` | `m` | `F` | `a` |
+/// | `LocalDate` | `H` | `I` | ok | ok | `H` |
+/// | `LocalTime` | ok | ok | `m` | `F` | `a` |
+/// | `LocalDateTime` | ok | ok | ok | ok | `Z` |
+/// | `OffsetTime` | ok | ok | `m` | `F` | `a` |
+/// | `Year` | `H` | `I` | `m` | `m` | `a` |
+/// | `YearMonth` | `H` | `I` | `d` | `d` | `a` |
+/// | `MonthDay` | `H` | `I` | `y` | `F` | `a` |
+/// | `Month` | `H` | `I` | `d` | `F` | `a` |
+///
+/// The last four rows are G2-1's, measured 2026-08-16, and they are what
+/// forces the three composites to walk their inner fields in ORDER rather than
+/// consult a single `date` flag: `%tD` is `mm/dd/yy` and reports `m`, `d` or
+/// `y`; `%tF` is `YYYY-mm-dd` and reports its OWN `F` only when the YEAR is
+/// the missing one (`ISO_STANDARD_DATE` reads the year with `t.get(yearField)`
+/// inline instead of delegating), then `m`, then `d`.
+fn fmt_temporal_fault_char(field: char, s: FmtSupport) -> Option<char> {
+    fn need(ok: bool, c: char) -> Option<char> {
+        if ok {
+            None
+        } else {
+            Some(c)
+        }
+    }
+    match field {
+        'H' | 'k' | 'I' | 'l' | 'M' | 'S' | 'p' => need(s.time, field),
+        'L' | 'N' => need(s.sub_second, field),
+        's' => need(s.instant, field),
+        // `MILLISECOND_SINCE_EPOCH` reads INSTANT_SECONDS *and*
+        // MILLI_OF_SECOND, so it needs both — and every source that has the
+        // first here also has the second, which is why the row is not
+        // separately observable.
+        'Q' => need(s.instant && s.sub_second, field),
+        'z' | 'Z' => need(s.zone, field),
+        'B' | 'b' | 'h' | 'm' => need(s.month, field),
+        'd' | 'e' => need(s.day, field),
+        'C' | 'Y' | 'y' => need(s.year, field),
+        // DAY_OF_WEEK and DAY_OF_YEAR — see [`FmtSupport::full_date`] for why
+        // both are the same derived predicate and which source contradicts it.
+        'A' | 'a' | 'j' => need(s.full_date(), field),
+        'R' | 'T' => need(s.time, 'H'),
+        'r' => need(s.time, 'I'),
+        // `mm/dd/yy`, in that order.
+        'D' => {
+            if !s.month {
+                Some('m')
+            } else if !s.day {
+                Some('d')
+            } else if !s.year {
+                Some('y')
+            } else {
+                None
+            }
+        }
+        // `YYYY-mm-dd`, in that order, and the year slot reports the OUTER
+        // character.
+        'F' => {
+            if !s.year {
+                Some(field)
+            } else if !s.month {
+                Some('m')
+            } else if !s.day {
+                Some('d')
+            } else {
+                None
+            }
+        }
+        // `a`(DAY_OF_WEEK) `b`(month) `d`(day) `T`(->`H`, time) `Z`(zone)
+        // `Y`(year), in that order, so the FIRST unsupported group names the
+        // character.
+        'c' => {
+            if !s.full_date() {
+                Some('a')
+            } else if !s.month {
+                Some('b')
+            } else if !s.day {
+                Some('d')
+            } else if !s.time {
+                Some('H')
+            } else if !s.zone {
+                Some('Z')
+            } else if !s.year {
+                Some('Y')
+            } else {
+                None
+            }
+        }
+        // Not a field this VM implements; `format_temporal_field`'s own
+        // catch-all raises `UnknownFormatConversionException` for it, which is
+        // a question about the SPECIFIER and outranks a support question.
+        _ => None,
+    }
+}
+
+/// Resolve the `java.util.TimeZone` for an epoch-shaped `%t` argument and read
+/// its offset at `millis`.
+///
+/// `calendar` is `Some(cal)` for a `java.util.Calendar` argument, whose own zone
+/// is authoritative; `None` takes `TimeZone.getDefault()`, which is what
+/// `Calendar.getInstance()` would have given the JDK.
+///
+/// Returns [`FmtZone::NONE`] rather than failing if the class is not reachable:
+/// a VM without `java.util.TimeZone` keeps the previous UTC behaviour instead of
+/// refusing a conversion that used to work.
+fn fmt_resolve_zone(
+    ctx: &mut dyn NativeContext,
+    calendar: Option<cratonvm_types::ObjectRef>,
+    millis: i64,
+) -> FmtZone {
+    let tz = match calendar {
+        Some(cal) => match ctx.invoke_virtual(cal, "getTimeZone", "()Ljava/util/TimeZone;", &[]) {
+            Ok(Some(Value::Object(Some(z)))) => z,
+            _ => return FmtZone::NONE,
+        },
+        None => match ctx.invoke(
+            "java/util/TimeZone",
+            "getDefault",
+            "()Ljava/util/TimeZone;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(z)))) => z,
+            _ => return FmtZone::NONE,
+        },
+    };
+    // `getOffset(long)` is ZONE_OFFSET + DST_OFFSET together; the raw offset is
+    // ZONE_OFFSET alone, so the difference IS DST_OFFSET. Asking the zone rather
+    // than reading a Calendar field keeps the `long`/`Date` and `Calendar`
+    // sources on one code path.
+    let total = match ctx.invoke_virtual(tz, "getOffset", "(J)I", &[Value::Long(millis)]) {
+        Ok(Some(Value::Int(v))) => v,
+        _ => return FmtZone::NONE,
+    };
+    let raw = match ctx.invoke_virtual(tz, "getRawOffset", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        // A zone that answered its offset but not its raw offset is still a
+        // usable zone; only the DST *name* selection degrades.
+        _ => total,
+    };
+    FmtZone {
+        offset_ms: total,
+        dst: total != raw,
+        known: true,
+        temporal: false,
+    }
+}
+
+/// The offset a `java.time.ZonedDateTime` / `OffsetDateTime` carries, as a
+/// [`FmtZone`].
+///
+/// `getOffset()` is declared on BOTH and returns a `ZoneOffset`, whose
+/// `getTotalSeconds()` is `ChronoField.OFFSET_SECONDS` — which is exactly what
+/// `Formatter`'s `ZONE_NUMERIC` arm reads. Measured on HotSpot 25: `%tz` of an
+/// `Instant.atZone("Asia/Tokyo")` is `+0900`, of `atZone("Asia/Kolkata")`
+/// `+0530`, of `atOffset(-3)` `-0300`, of `atOffset(-3,-30)` `-0330`, and of
+/// `atOffset(UTC)` `+0000` — none of which move with `user.timezone`.
+///
+/// `dst` is left false and is not read for these: the daylight question is
+/// asked of the object's own zone in [`fmt_temporal_zone_name`], which is also
+/// the only consumer of it here. `known` is true so the `'z'` arm renders the
+/// real offset instead of the fixed `+0000`.
+fn fmt_temporal_zone(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> FmtZone {
+    let off = match ctx.invoke_virtual(obj, "getOffset", "()Ljava/time/ZoneOffset;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return FmtZone::NONE,
+    };
+    let secs = match ctx.invoke_virtual(off, "getTotalSeconds", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        _ => return FmtZone::NONE,
+    };
+    FmtZone {
+        offset_ms: secs.saturating_mul(1000),
+        dst: false,
+        known: true,
+        temporal: true,
+    }
+}
+
+/// `%tZ` — `tz.getDisplayName(DST_OFFSET != 0, TimeZone.SHORT, l)`.
+///
+/// Re-resolves the `TimeZone` from the argument instead of carrying an
+/// `ObjectRef` in [`FmtZone`]: everything between the field extraction and this
+/// call runs Java bytecode (`fmt_date_name` alone invokes three methods for
+/// `%tc`), and a held reference across that is a moved-object hazard. `val` is
+/// the caller's own varargs element, so it is rooted for the whole conversion.
+///
+/// `None` means "no display name available" and the caller falls back to the
+/// numeric `GMT±HH:MM` form, which is also what HotSpot itself prints under a
+/// locale with no short name for the zone (measured: `Locale.ROOT` gives
+/// `GMT-05:00` where `Locale.US` gives `EST`).
+fn fmt_zone_display_name(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+    zone: FmtZone,
+    locale: FmtLocale,
+) -> Option<String> {
+    if !zone.known {
+        return None;
+    }
+    // A `java.time` source names its own zone; there is no `TimeZone.getDefault`
+    // in that answer at all.
+    if zone.temporal {
+        return fmt_temporal_zone_name(ctx, val, locale);
+    }
+    let calendar = fmt_calendar_arg(ctx, val);
+    let tz = match calendar {
+        Some(cal) => match ctx.invoke_virtual(cal, "getTimeZone", "()Ljava/util/TimeZone;", &[]) {
+            Ok(Some(Value::Object(Some(z)))) => z,
+            _ => return None,
+        },
+        None => match ctx.invoke(
+            "java/util/TimeZone",
+            "getDefault",
+            "()Ljava/util/TimeZone;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(z)))) => z,
+            _ => return None,
+        },
+    };
+    fmt_zone_name_of(ctx, tz, zone.dst, locale)
+}
+
+/// `tz.getDisplayName(daylight, TimeZone.SHORT, l)` with this file's
+/// [`FmtLocale`] resolution — the one body both `%tZ` name lookups share so
+/// they cannot answer the locale question two ways.
+///
+/// `TimeZone.SHORT` is 0. `Given(None)` takes `Locale.US`, which is the JDK's
+/// own `Objects.requireNonNullElse(l, Locale.US)` — the same rule
+/// [`fmt_date_name`] now applies, and the reason it can no longer be reached
+/// by falling through to the two-argument overload (whose locale is the
+/// DEFAULT). If `Locale.US` cannot be read — an uninitialized
+/// `java.util.Locale`, a build with no such field — this degrades to that
+/// two-argument overload, i.e. to exactly the answer it gave before, rather
+/// than refusing.
+fn fmt_zone_name_of(
+    ctx: &mut dyn NativeContext,
+    tz: cratonvm_types::ObjectRef,
+    dst: bool,
+    locale: FmtLocale,
+) -> Option<String> {
+    const TZ_SHORT: i32 = 0;
+    let explicit = match locale {
+        FmtLocale::Given(Some(l)) => Some(l),
+        FmtLocale::Given(None) => fmt_locale_us(ctx),
+        FmtLocale::DefaultFormat => None,
+    };
+    let name = match explicit {
+        Some(l) => ctx.invoke_virtual(
+            tz,
+            "getDisplayName",
+            "(ZILjava/util/Locale;)Ljava/lang/String;",
+            &[
+                Value::Int(i32::from(dst)),
+                Value::Int(TZ_SHORT),
+                Value::Object(Some(l)),
+            ],
+        ),
+        None => ctx.invoke_virtual(
+            tz,
+            "getDisplayName",
+            "(ZI)Ljava/lang/String;",
+            &[Value::Int(i32::from(dst)), Value::Int(TZ_SHORT)],
+        ),
+    };
+    match name {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
+/// `Locale.US`, read as a static field.
+///
+/// The JDK spells the explicit-null locale `Objects.requireNonNullElse(l,
+/// Locale.US)` in five places, and the four name-array ones are served by
+/// [`fmt_date_name`]'s English tables without needing a `Locale` object at
+/// all. `%tZ`'s display name cannot be tabulated, so this is the one site that
+/// needs the object itself.
+///
+/// A static-field READ, not a class load and not `Locale.of("en","US")`: this
+/// runs no bytecode, allocates nothing, and answers `None` — degrading to the
+/// caller's previous behaviour — on any configuration where `java.util.Locale`
+/// is absent, is not yet initialized, or has no such field. Nothing here may
+/// fabricate a `Locale`; a wrong one would silently rename every zone.
+fn fmt_locale_us(ctx: &mut dyn NativeContext) -> Option<cratonvm_types::ObjectRef> {
+    let cid = ctx.class_id_by_name("java/util/Locale")?;
+    let idx = ctx.static_field_index_by_name(cid, "US")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(l)) => Some(l),
+        _ => None,
+    }
+}
+
+/// `%tZ` for a `java.time.ZonedDateTime` / `OffsetDateTime` — the
+/// `DateTime.ZONE` arm of `print(Formatter, TemporalAccessor, char, Locale)`,
+/// which is a genuinely different lookup from the `TimeZone.getDefault()` one
+/// above:
+///
+/// ```text
+/// ZoneId zid = t.query(TemporalQueries.zone());
+/// if (zid == null) throw new IllegalFormatConversionException(c, t.getClass());
+/// if (!(zid instanceof ZoneOffset) && t.isSupported(INSTANT_SECONDS)) {
+///     ... TimeZone.getTimeZone(zid.getId())
+///                 .getDisplayName(zid.getRules().isDaylightSavings(instant),
+///                                 TimeZone.SHORT, requireNonNullElse(l, US));
+/// }
+/// sb.append(zid.getId());
+/// ```
+///
+/// So a FIXED-offset zone prints its own id and never a display name, and a
+/// REGION zone prints the `java.util.TimeZone` short name. Measured on
+/// HotSpot 25, at `1699999999000L`, under `-Duser.timezone=Asia/Kolkata` (the
+/// default zone is visible in none of them):
+///
+/// | argument | `Locale.ROOT` | `Locale.US` | `(Locale) null` |
+/// |---|---|---|---|
+/// | `atZone("Asia/Tokyo")` | `GMT+09:00` | `JST` | `JST` |
+/// | `atZone("Asia/Kolkata")` | `GMT+05:30` | `IST` | |
+/// | `atZone("UTC")` | `UTC` | | |
+/// | `atZone(ZoneOffset.ofHours(5))` | `+05:00` | | |
+/// | `atOffset(ZoneOffset.UTC)` | `Z` | | |
+/// | `atOffset(-3)` | `-03:00` | | |
+/// | `atOffset(-3,-30)` | `-03:30` | | |
+/// | `atZone("America/New_York")` in **July** | | `EDT` | |
+/// | `atZone("America/New_York")` in November | | `EST` | |
+///
+/// The `Z` row is why the id is taken from the object rather than composed
+/// from the offset: `ZoneOffset.UTC.getId()` is the single letter `Z`, and
+/// `+05:00` / `-03:30` are colon-separated where `%tz` is not.
+///
+/// The DST flag is computed the way [`fmt_resolve_zone`] computes it —
+/// `tz.getOffset(millis) != tz.getRawOffset()` — rather than through
+/// `ZoneRules.isDaylightSavings`, so the two `%tZ` routes ask the daylight
+/// question exactly once, in one form. The July/November New York rows are the
+/// pair that would separate a right answer from a hard-coded one.
+///
+/// `None` on any failure, and the caller falls back to
+/// [`fmt_zone_gmt_form`] over the offset already read — which IS HotSpot's own
+/// `Locale.ROOT` answer for a region zone (the `GMT+09:00` cell above).
+fn fmt_temporal_zone_name(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+    locale: FmtLocale,
+) -> Option<String> {
+    let Value::Object(Some(obj)) = val else {
+        return None;
+    };
+    let obj = *obj;
+    // GC: every call below runs bytecode and allocates, so the argument and the
+    // `ZoneId` are pinned and re-derived across each one. `pin_base` is the
+    // FIRST handle, so one `unpin_native_roots(pin_base)` releases the batch.
+    let pin_base = ctx.pin_native_root(obj);
+    // `ZonedDateTime.getZone()` is the REGION it was built with, which is what
+    // `TemporalQueries.zone()` answers for it; `OffsetDateTime` has NO
+    // `getZone()` at all and its `getOffset()` is itself a `ZoneId`. The class
+    // is tested rather than the call being tried and allowed to fail, because
+    // a speculative `getZone` on an `OffsetDateTime` is a `NoSuchMethodError`
+    // raised and discarded on every `%tZ`.
+    let is_zdt = match ctx.class_id_by_name("java/time/ZonedDateTime") {
+        Some(z) => {
+            ctx.class_id_of_object(obj) == z || ctx.is_subclass(ctx.class_id_of_object(obj), z)
+        }
+        None => false,
+    };
+    let call = if is_zdt {
+        ctx.invoke_virtual(obj, "getZone", "()Ljava/time/ZoneId;", &[])
+    } else {
+        ctx.invoke_virtual(obj, "getOffset", "()Ljava/time/ZoneOffset;", &[])
+    };
+    let zid = match call {
+        Ok(Some(Value::Object(Some(z)))) => Some(z),
+        _ => None,
+    };
+    let Some(zid) = zid else {
+        ctx.unpin_native_roots(pin_base);
+        return None;
+    };
+    let zid_pin = ctx.pin_native_root(zid);
+    let out = fmt_temporal_zone_name_inner(ctx, obj, pin_base, zid, zid_pin, locale);
+    ctx.unpin_native_roots(pin_base);
+    out
+}
+
+/// The pinned body of [`fmt_temporal_zone_name`], split out so that every early
+/// return goes through its caller's single `unpin_native_roots`.
+fn fmt_temporal_zone_name_inner(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    obj_pin: usize,
+    zid: cratonvm_types::ObjectRef,
+    zid_pin: usize,
+    locale: FmtLocale,
+) -> Option<String> {
+    let zid = ctx.read_native_pin(zid_pin, zid);
+    // A class-IDENTITY test, not `is_subclass`: `java.time.ZoneOffset` is
+    // final, and the JDK's own screen is `zid instanceof ZoneOffset`.
+    let fixed = match ctx.class_id_by_name("java/time/ZoneOffset") {
+        Some(off) => ctx.class_id_of_object(zid) == off,
+        None => false,
+    };
+    if fixed {
+        // `sb.append(zid.getId())` — `Z`, `+05:00`, `-03:30`.
+        return match ctx.invoke_virtual(zid, "getId", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).filter(|s| !s.is_empty()),
+            _ => None,
+        };
+    }
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let inst = match ctx.invoke_virtual(obj, "toInstant", "()Ljava/time/Instant;", &[]) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => return None,
+    };
+    let millis = match ctx.invoke_virtual(inst, "toEpochMilli", "()J", &[]) {
+        Ok(Some(Value::Long(v))) => v,
+        _ => return None,
+    };
+    let zid = ctx.read_native_pin(zid_pin, zid);
+    let tz = match ctx.invoke(
+        "java/util/TimeZone",
+        "getTimeZone",
+        "(Ljava/time/ZoneId;)Ljava/util/TimeZone;",
+        &[Value::Object(Some(zid))],
+    ) {
+        Ok(Some(Value::Object(Some(z)))) => z,
+        _ => return None,
+    };
+    let tz_pin = ctx.pin_native_root(tz);
+    let total = match ctx.invoke_virtual(tz, "getOffset", "(J)I", &[Value::Long(millis)]) {
+        Ok(Some(Value::Int(v))) => v,
+        _ => return None,
+    };
+    let tz = ctx.read_native_pin(tz_pin, tz);
+    let raw = match ctx.invoke_virtual(tz, "getRawOffset", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        _ => total,
+    };
+    let tz = ctx.read_native_pin(tz_pin, tz);
+    fmt_zone_name_of(ctx, tz, total != raw, locale)
+}
+
+/// The argument as a `java.util.Calendar`, or `None` for every other `%t`
+/// source. One test, used by both zone helpers so they cannot disagree about
+/// which arguments carry their own zone.
+fn fmt_calendar_arg(ctx: &mut dyn NativeContext, val: &Value) -> Option<cratonvm_types::ObjectRef> {
+    let Value::Object(Some(obj)) = val else {
+        return None;
+    };
+    let parent = ctx.class_id_by_name("java/util/Calendar")?;
+    let cid = ctx.class_id_of_object(*obj);
+    if cid == parent || ctx.is_subclass(cid, parent) {
+        Some(*obj)
+    } else {
+        None
+    }
+}
+
+/// `TimeZone`'s own `GMT±HH:MM` fallback form, for a zone with no short display
+/// name. Measured as HotSpot's `Locale.ROOT` answer for `%tZ`.
+fn fmt_zone_gmt_form(offset_ms: i32) -> String {
+    let neg = offset_ms < 0;
+    let mins = (offset_ms / 60_000).abs();
+    format!(
+        "GMT{}{:02}:{:02}",
+        if neg { '-' } else { '+' },
+        mins / 60,
+        mins % 60
+    )
+}
+
+/// Decode a `%t` argument into `(year, month, day, hour, minute, second,
+/// nanos)` plus its [`FmtZone`] and its [`FmtSupport`].
+///
+/// The third element is the one that decides whether the fields are ANSWERS or
+/// fabrications. `invoke_i32` below returns 0 for a method the argument's class
+/// does not have, so a `LocalDate` asked for its hour used to come back with a
+/// perfectly plausible `00` — where HotSpot 25 raises
+/// `IllegalFormatConversionException: H != java.time.LocalDate`. The caller
+/// screens `field` against the support BEFORE it renders anything; see
+/// [`fmt_temporal_fault_char`] for the measured matrix.
 fn extract_temporal_fields(
     ctx: &mut dyn NativeContext,
     val: &Value,
     field: char,
-) -> Result<(i64, i32, i32, i32, i32, i32, i32), MethodCallFailed> {
+) -> Result<((i64, i32, i32, i32, i32, i32, i32), FmtZone, FmtSupport), MethodCallFailed> {
     fn millis_to_fields(millis: i64) -> (i64, i32, i32, i32, i32, i32, i32) {
         let day_millis = 86_400_000i64;
         let epoch_day = millis.div_euclid(day_millis);
@@ -6532,8 +9520,35 @@ fn extract_temporal_fields(
         }
     }
 
+    // Shift the instant into the zone's local time before splitting it into
+    // fields, which is `cal.setTimeInMillis(ms)` on a zoned `Calendar`. Every
+    // field the caller then reads — hour, day, month, year — is local, and the
+    // `'s'`/`'Q'` arms undo the shift because an epoch second is not a local
+    // quantity. `saturating_add` keeps a `Long.MIN_VALUE` argument from
+    // wrapping into a far-future date.
+    fn zoned_fields(
+        ctx: &mut dyn NativeContext,
+        calendar: Option<cratonvm_types::ObjectRef>,
+        millis: i64,
+    ) -> ((i64, i32, i32, i32, i32, i32, i32), FmtZone) {
+        let zone = fmt_resolve_zone(ctx, calendar, millis);
+        (
+            millis_to_fields(millis.saturating_add(i64::from(zone.offset_ms))),
+            zone,
+        )
+    }
+
+    // The epoch-shaped sources take `printDateTime`'s `Calendar` branch, whose
+    // printer has an arm for every field and refuses none — hence
+    // [`FmtSupport::ALL`] on all four of them.
+    fn epoch(
+        pair: ((i64, i32, i32, i32, i32, i32, i32), FmtZone),
+    ) -> ((i64, i32, i32, i32, i32, i32, i32), FmtZone, FmtSupport) {
+        (pair.0, pair.1, FmtSupport::ALL)
+    }
+
     match val {
-        Value::Long(ms) => Ok(millis_to_fields(*ms)),
+        Value::Long(ms) => Ok(epoch(zoned_fields(ctx, None, *ms))),
         Value::Object(Some(obj)) => {
             let obj = *obj;
             let cid = ctx.class_id_of_object(obj);
@@ -6548,19 +9563,24 @@ fn extract_temporal_fields(
                     Value::Long(v) => v,
                     _ => 0,
                 };
-                Ok(millis_to_fields(millis))
+                Ok(epoch(zoned_fields(ctx, None, millis)))
             } else if is_a(ctx, "java/util/Date") {
                 let millis = match ctx.invoke_virtual(obj, "getTime", "()J", &[])? {
                     Some(Value::Long(v)) => v,
                     _ => 0,
                 };
-                Ok(millis_to_fields(millis))
+                Ok(epoch(zoned_fields(ctx, None, millis)))
             } else if is_a(ctx, "java/util/Calendar") {
                 let millis = match ctx.invoke_virtual(obj, "getTimeInMillis", "()J", &[])? {
                     Some(Value::Long(v)) => v,
                     _ => 0,
                 };
-                Ok(millis_to_fields(millis))
+                // The Calendar's OWN zone, not the default: measured on
+                // HotSpot 25, `%tc` of a `Calendar.getInstance(TimeZone
+                // .getTimeZone("Asia/Tokyo"))` set to 1699999999000 is
+                // `Wed Nov 15 07:13:19 GMT+09:00 2023` whatever
+                // `user.timezone` is.
+                Ok(epoch(zoned_fields(ctx, Some(obj), millis)))
             } else if is_a(ctx, "java/time/Instant") {
                 let sec = match ctx.invoke_virtual(obj, "getEpochSecond", "()J", &[])? {
                     Some(Value::Long(v)) => v,
@@ -6571,18 +9591,186 @@ fn extract_temporal_fields(
                     _ => 0,
                 };
                 let (y, m, d, h, mi, s, _) = millis_to_fields(sec.saturating_mul(1000));
-                Ok((y, m, d, h, mi, s, nano))
+                // An `Instant` answers FOUR fields and refuses the other 27.
+                // The date and clock values computed above are UTC and are
+                // never rendered — `fmt_temporal_fault_char` refuses every
+                // field that would read them — but they are computed anyway
+                // because `%tL`/`%tN` need the nanos and `%ts`/`%tQ` need the
+                // epoch, and `epoch_sec()` reconstructs the epoch from these.
+                Ok((
+                    (y, m, d, h, mi, s, nano),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: false,
+                        month: false,
+                        day: false,
+                        time: false,
+                        sub_second: true,
+                        instant: true,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
             } else if is_a(ctx, "java/time/LocalDate") {
                 let year = invoke_i32(ctx, obj, "getYear") as i64;
                 let month = invoke_i32(ctx, obj, "getMonthValue");
                 let day = invoke_i32(ctx, obj, "getDayOfMonth");
-                Ok((year, month, day, 0, 0, 0, 0))
+                Ok((
+                    (year, month, day, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: true,
+                        month: true,
+                        day: true,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
             } else if is_a(ctx, "java/time/LocalTime") {
                 let hour = invoke_i32(ctx, obj, "getHour");
                 let minute = invoke_i32(ctx, obj, "getMinute");
                 let second = invoke_i32(ctx, obj, "getSecond");
                 let nano = invoke_i32(ctx, obj, "getNano");
-                Ok((1970, 1, 1, hour, minute, second, nano))
+                Ok((
+                    (1970, 1, 1, hour, minute, second, nano),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: false,
+                        month: false,
+                        day: false,
+                        time: true,
+                        sub_second: true,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/OffsetTime") {
+                // G2-1. `OffsetTime` was the one `java.time` type with a
+                // printer on HotSpot that this decoder had no arm for, so all
+                // 31 fields fell to the `else` below and refused — including
+                // the FOURTEEN the JDK answers. Measured on HotSpot 25.0.3+9
+                // for `2025-08-16T05:00:45.123+05:30`:
+                // `%tH`=`05` `%tI`=`05` `%tk`=`5` `%tl`=`5` `%tM`=`00`
+                // `%tS`=`45` `%tL`=`123` `%tN`=`123000000` `%tp`=`am`
+                // `%tz`=`+0530` `%tZ`=`+05:30` `%tR`=`05:00` `%tT`=`05:00:45`
+                // `%tr`=`05:00:45 AM`.
+                //
+                // It is `LocalTime` plus a zone and NOT an instant: measured,
+                // `%ts` is `s != java.time.OffsetTime` and `%tQ` is
+                // `Q != java.time.OffsetTime`, because `INSTANT_SECONDS` needs
+                // a date the type does not carry. `getOffset()` is a
+                // `ZoneOffset`, which is what [`fmt_temporal_zone`] and
+                // [`fmt_temporal_zone_name`]'s non-`ZonedDateTime` arm already
+                // read — the latter's `getId()` is where `+05:30` comes from.
+                let hour = invoke_i32(ctx, obj, "getHour");
+                let minute = invoke_i32(ctx, obj, "getMinute");
+                let second = invoke_i32(ctx, obj, "getSecond");
+                let nano = invoke_i32(ctx, obj, "getNano");
+                let zone = fmt_temporal_zone(ctx, obj);
+                Ok((
+                    (1970, 1, 1, hour, minute, second, nano),
+                    zone,
+                    FmtSupport {
+                        year: false,
+                        month: false,
+                        day: false,
+                        time: true,
+                        sub_second: true,
+                        instant: false,
+                        zone: true,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/YearMonth") {
+                // G2-1, and the three arms below it. These are the PARTIAL
+                // `java.time` types: each supports a proper subset of the date
+                // group, which is why [`FmtSupport`] carries `year`/`month`/
+                // `day` separately instead of one `date` flag. Measured on
+                // HotSpot 25.0.3+9 (`Locale.US`):
+                //
+                // | source | answers | refuses |
+                // |---|---|---|
+                // | `YearMonth.of(2020,2)` | `%tY`=`2020` `%ty`=`20` `%tC`=`20` `%tm`=`02` `%tB`=`February` `%tb`=`%th`=`Feb` | 24 |
+                // | `MonthDay.of(1,2)` | `%tm`=`01` `%td`=`02` `%te`=`2` `%tB`=`January` `%tb`=`%th`=`Jan` | 25 |
+                // | `Year.of(2020)` | `%tY`=`2020` `%ty`=`20` `%tC`=`20` | 28 |
+                // | `Month.JANUARY` | `%tm`=`01` `%tB`=`January` `%tb`=`%th`=`Jan` | 27 |
+                //
+                // The unread slots are left at the epoch defaults; every field
+                // that would read one is refused by
+                // [`fmt_temporal_fault_char`], exactly as for `Instant`.
+                let year = invoke_i32(ctx, obj, "getYear") as i64;
+                let month = invoke_i32(ctx, obj, "getMonthValue");
+                Ok((
+                    (year, month, 1, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: true,
+                        month: true,
+                        day: false,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/MonthDay") {
+                let month = invoke_i32(ctx, obj, "getMonthValue");
+                let day = invoke_i32(ctx, obj, "getDayOfMonth");
+                Ok((
+                    (1970, month, day, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: false,
+                        month: true,
+                        day: true,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/Year") {
+                // `Year.getValue()`, not `getYear()` — the type has no
+                // `getYear`.
+                let year = invoke_i32(ctx, obj, "getValue") as i64;
+                Ok((
+                    (year, 1, 1, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: true,
+                        month: false,
+                        day: false,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/Month") {
+                // `Month` is an enum and its `getValue()` is 1..=12, which is
+                // already this decoder's month convention.
+                let month = invoke_i32(ctx, obj, "getValue");
+                Ok((
+                    (1970, month, 1, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: false,
+                        month: true,
+                        day: false,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
             } else if is_a(ctx, "java/time/LocalDateTime")
                 || is_a(ctx, "java/time/ZonedDateTime")
                 || is_a(ctx, "java/time/OffsetDateTime")
@@ -6594,7 +9782,35 @@ fn extract_temporal_fields(
                 let minute = invoke_i32(ctx, obj, "getMinute");
                 let second = invoke_i32(ctx, obj, "getSecond");
                 let nano = invoke_i32(ctx, obj, "getNano");
-                Ok((year, month, day, hour, minute, second, nano))
+                // All three read LOCAL fields off the object, so no shift
+                // applies. The two that carry an offset get it from the object
+                // ([`fmt_temporal_zone`]) and are `instant`-capable with it —
+                // `%ts` of a `ZonedDateTime` is `1699999999`, which
+                // `epoch_sec()` reaches by subtracting the offset back out of
+                // these local fields. A `LocalDateTime` has NO zone and no
+                // instant: `%tz`, `%tZ`, `%ts` and `%tQ` all refuse
+                // (measured), and `%tc` refuses at its zone slot with `Z`.
+                let zoned =
+                    is_a(ctx, "java/time/ZonedDateTime") || is_a(ctx, "java/time/OffsetDateTime");
+                let zone = if zoned {
+                    fmt_temporal_zone(ctx, obj)
+                } else {
+                    FmtZone::NONE
+                };
+                Ok((
+                    (year, month, day, hour, minute, second, nano),
+                    zone,
+                    FmtSupport {
+                        year: true,
+                        month: true,
+                        day: true,
+                        time: true,
+                        sub_second: true,
+                        instant: zoned,
+                        zone: zoned,
+                        calendar_printer: false,
+                    },
+                ))
             } else {
                 // `printDateTime`'s `else` arm. HotSpot reports
                 // "Y != java.lang.String" for `String.format("%tY", "x")`, a
@@ -6614,6 +9830,66 @@ fn extract_temporal_fields(
             }
             .into(),
         ),
+    }
+}
+
+/// `%tF`'s year, which is NOT `%tY`'s.
+///
+/// `ISO_STANDARD_DATE` is the one composite that renders a year itself instead
+/// of delegating, and its rule is its own:
+///
+/// ```text
+/// if (year < 0)      { sb.append(getMinusSign(l)); year = -year; }
+/// else if (year > 9999) { sb.append('+'); }
+/// sb.append(localizedMagnitude(fmt, null, year, Flags.ZERO_PAD, 4, l));
+/// ```
+///
+/// so the four-digit zero pad is applied to the ABSOLUTE value and the sign
+/// sits outside it. Measured on HotSpot 25 under `Locale.ROOT`:
+/// `LocalDate.of(-44, 3, 15)` is `-0044-03-15`, `LocalDate.of(-1, 6, 5)` is
+/// `-0001-06-05`, `LocalDate.of(12345, 3, 4)` is `+12345-03-04`, and
+/// `LocalDate.of(9999, 12, 31)` is `9999-12-31` with no sign at all.
+///
+/// Rust's `{:04}` counts the sign INSIDE the width (`-044`) and has no '+'
+/// rule, which is what this replaces. The digits stay ASCII here and are
+/// substituted by [`fmt_localize_digits`] with the rest of the field — the
+/// sign is not a digit, so it survives that pass unchanged.
+///
+/// # This is the ONLY caller of `getMinusSign` in the whole class
+///
+/// `minus` is [`FmtSymbols::minus`], i.e.
+/// `DecimalFormatSymbols.getInstance(l).getMinusSign()`, and F28-1 §5.3's
+/// residual is closed here. The JDK's `getMinusSign(Locale)` has exactly one
+/// call site and it is this arm: every other negative number in
+/// `java.util.Formatter` goes through `leadingSign`, which appends an ASCII
+/// `'-'`. Measured under `lt-LT` (`getMinusSign()` = U+2212):
+/// `String.format(lt, "%d", -5)` is `002D 0035` while
+/// `String.format(lt, "%tF", LocalDate.of(-44,3,15))` is
+/// `2212 0030 0030 0034 0034` `002D` `…` — the year's sign localized, the two
+/// date separators in the same field left ASCII. See [`FmtSymbols`] for the
+/// full measured table and for why the earlier "every negative `%d`/`%f`"
+/// framing was wrong.
+///
+/// The `'+'` past 9999 is NOT symmetric with it and stays ASCII: the JDK writes
+/// `sb.append('+')` as a literal in the same block it calls `getMinusSign(l)`
+/// in, and `String.format(lt, "%tF", LocalDate.of(12345,3,4))` is measured
+/// `+12345-03-04` with an ASCII U+002B.
+///
+/// **Only the `TemporalAccessor` printer reaches here.** The `Calendar` printer
+/// renders `%tF`'s year as a plain era-relative `YEAR_4` with no sign rule at
+/// all — see [`FmtSupport::calendar_printer`], which is what selects between
+/// the two.
+fn fmt_iso_year(year: i64, minus: char) -> String {
+    let (head, y) = if year < 0 {
+        (Some(minus), year.saturating_neg())
+    } else if year > 9999 {
+        (Some('+'), year)
+    } else {
+        (None, year)
+    };
+    match head {
+        Some(sign) => format!("{sign}{y:04}"),
+        None => format!("{y:04}"),
     }
 }
 
@@ -6653,8 +9929,10 @@ fn format_temporal_field(
     field: char,
     flags: &str,
     width: Option<usize>,
-    locale: Option<cratonvm_types::ObjectRef>,
-) -> Result<String, MethodCallFailed> {
+    sym: FmtSymbols,
+    locale: FmtLocale,
+    uppercase: bool,
+) -> Result<Vec<u16>, MethodCallFailed> {
     const MONTHS_ABBR: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -6688,11 +9966,67 @@ fn format_temporal_field(
     // date is not a refusal. This used to reach `extract_temporal_fields`'
     // catch-all and come back as an `IllegalArgumentException`.
     if matches!(val, Value::Object(None)) {
-        return Ok(fmt_pad_to_width("null".to_string(), flags, width));
+        // Same shared printer as every other conversion's null — the word,
+        // then the (locale-sensitive) upper-caser, then the justifier.
+        let mut s = fmt_null_text('t').to_string();
+        if uppercase {
+            s = fmt_upper_case(ctx, &s, locale);
+        }
+        return fmt_pad_str_to_width(&s, flags, width);
     }
-    let (year, month, day, hour, minute, second, nanos) =
+    let ((year, month, day, hour, minute, second, nanos), zone, support) =
         extract_temporal_fields(ctx, val, field)?;
+    // `t.get(ChronoField)` on a field the argument does not support is a
+    // `DateTimeException`, which `print(Formatter, TemporalAccessor, char,
+    // Locale)` catches and rethrows as `IllegalFormatConversionException(c,
+    // t.getClass())`. Screening here rather than at each arm is what keeps the
+    // 31 arms from each needing to know which sources can answer them — and
+    // the fields decoded above are, for an unsupported field, FABRICATIONS
+    // (`invoke_i32` answers 0 for an absent method), so nothing downstream may
+    // see them. The character reported is not always `field`; see
+    // [`fmt_temporal_fault_char`].
+    //
+    // A `Value::Long` argument cannot reach the `Some` arm — `FmtSupport::ALL`
+    // refuses nothing — which is also why the class needed for the message is
+    // always available here.
+    if let (Some(c), Value::Object(Some(obj))) = (fmt_temporal_fault_char(field, support), val) {
+        let cid = ctx.class_id_of_object(*obj);
+        return Err(fmt_raise(ctx, &FmtFault::WrongType(c, cid)));
+    }
     let year32 = year as i32;
+    // `%tY` `%ty` `%tC` — and the year slots of the `%tD` and `%tc` composites
+    // — render the ERA-RELATIVE year, never the proleptic one. Both of the
+    // JDK's printers do, by two different routes that agree:
+    //
+    //   TemporalAccessor   int i = t.get(ChronoField.YEAR_OF_ERA);
+    //   Calendar           int i = t.get(Calendar.YEAR);   // already era-relative
+    //
+    // so ONE expression serves every source this VM decodes. F28-1 §5.2 left
+    // this open on the premise that "`Calendar.YEAR` is already era-relative, so
+    // a single expression cannot serve both". That premise is about the JDK's
+    // two printers and it does not transfer, because CratonVM never reads
+    // `Calendar.YEAR`: `extract_temporal_fields` decodes EVERY epoch-shaped
+    // source through `millis_to_fields` → `temporal_from_epoch_day`, which
+    // yields a PROLEPTIC year exactly like `getYear()` does for the `java.time`
+    // sources. Both halves were measured on HotSpot 25 (`Locale.ROOT`,
+    // `Asia/Kolkata`) at the one instant, 45 BC:
+    //
+    // | argument | `%tY` | `%ty` | `%tC` | `%tD` | `%tc` tail |
+    // |---|---|---|---|---|---|
+    // | `LocalDate.of(-44,3,15)` | `0045` | `45` | `00` | `03/15/45` | |
+    // | `GregorianCalendar` ERA=BC YEAR=45 | `0045` | `45` | `00` | `03/15/45` | `0045` |
+    // | `new Date(-63549548877000L)` | `0045` | `45` | `00` | `03/15/45` | |
+    // | `Long.valueOf(-63549548877000L)` | `0045` | `45` | `00` | `03/15/45` | |
+    // | `LocalDate.of(-1,6,5)` | `0002` | `02` | `00` | | |
+    // | `LocalDate.of(0,2,29)` | `0001` | `01` | `00` | | |
+    //
+    // The proleptic year is still what `%tF`'s TemporalAccessor arm, the
+    // day-of-week and the day-of-year read, so it is not overwritten here.
+    //
+    // `1 - year` and not `-year`: proleptic 0 is 1 BC, so the mapping is
+    // 0 → 1, -1 → 2, -44 → 45. Verified against `ChronoField.YEAR_OF_ERA` on
+    // all four of those inputs.
+    let year_of_era = if year <= 0 { 1 - year } else { year };
     let millis = nanos / 1_000_000;
     let dow = day_of_week_sun0(year32, month, day);
     let month_idx = (month.clamp(1, 12) - 1) as usize;
@@ -6710,11 +10044,19 @@ fn format_temporal_field(
     // the way `printDateTime` lower-cases whatever it read.
     let ampm_idx = if hour < 12 { 0usize } else { 1usize };
     let ampm_en = if hour < 12 { "am" } else { "pm" };
+    // `%ts`/`%tQ` are `Calendar.getTimeInMillis()` — an EPOCH quantity, and the
+    // one pair of fields that is not local. The fields above have already been
+    // shifted into the zone, so the shift is subtracted back out here.
+    // Measured on HotSpot 25: `%ts` of `new Date(1699999999000L)` is
+    // `1699999999` and `%tQ` is `1699999999000` under UTC, America/New_York,
+    // Asia/Kolkata and Europe/Berlin alike — the value does not move with the
+    // zone, while `%tH` does.
     let epoch_sec = || {
         temporal_to_epoch_day(year32, month, day) * 86_400
             + hour as i64 * 3600
             + minute as i64 * 60
             + second as i64
+            - i64::from(zone.offset_ms) / 1000
     };
 
     let mut out = match field {
@@ -6727,14 +10069,46 @@ fn format_temporal_field(
         'S' => format!("{:02}", second),
         'L' => format!("{:03}", millis),
         'N' => format!("{:09}", nanos),
-        'p' => fmt_date_name(ctx, locale, "getAmPmStrings", ampm_idx)
-            .map(|s| s.to_lowercase())
-            .unwrap_or_else(|| ampm_en.to_string()),
-        // CratonVM's Calendar/Date model has no real timezone offset (see
-        // extract_temporal_fields) — 'z'/'Z' report the fixed UTC identity
-        // consistent with that.
-        'z' => "+0000".to_string(),
-        'Z' => "UTC".to_string(),
+        // `s.toLowerCase(Objects.requireNonNullElse(l, Locale.getDefault(FORMAT)))`
+        // — the locale's lower-caser, through the same `case_map` the `%S`/`%T`
+        // upper-caser goes through. This was `str::to_lowercase`, Rust's
+        // locale-independent one; see [`fmt_lower_case`], which also records
+        // that the 1158-locale sweep found no row that moves.
+        //
+        // The `unwrap_or_else` fallback is the JDK's own English literal, which
+        // is already lower-case in ASCII and is what the null-locale branch
+        // lower-cases. It is not routed through the case mapper because there
+        // is nothing to map and this arm is reached exactly when
+        // `DateFormatSymbols` could not be asked at all.
+        'p' => {
+            // Two `ctx` uses in sequence, bound out like the `'r'` arm below
+            // does with its upper-caser, rather than chained through a closure.
+            let name = fmt_date_name(ctx, locale, "getAmPmStrings", ampm_idx);
+            match name {
+                Some(s) => fmt_lower_case(ctx, &s, locale),
+                None => ampm_en.to_string(),
+            }
+        }
+        // `ZONE_OFFSET + DST_OFFSET`, rendered `{-|+}HHMM`. See [`FmtZone`] for
+        // the measured table and for why an unknown zone keeps the old fixed
+        // `+0000`/`UTC` pair rather than inventing one.
+        'z' => {
+            let i = zone.offset_ms;
+            let mins = (i / 60_000).abs();
+            format!(
+                "{}{:02}{:02}",
+                if i < 0 { '-' } else { '+' },
+                mins / 60,
+                mins % 60
+            )
+        }
+        'Z' => fmt_zone_display_name(ctx, val, zone, locale).unwrap_or_else(|| {
+            if zone.known {
+                fmt_zone_gmt_form(zone.offset_ms)
+            } else {
+                "UTC".to_string()
+            }
+        }),
         's' => format!("{}", epoch_sec()),
         'Q' => format!("{}", epoch_sec() * 1000 + millis as i64),
         // Date
@@ -6750,9 +10124,13 @@ fn format_temporal_field(
             .unwrap_or_else(|| DAYS_FULL[dow].to_string()),
         'a' => fmt_date_name(ctx, locale, "getShortWeekdays", dow + 1)
             .unwrap_or_else(|| DAYS_ABBR[dow].to_string()),
-        'C' => format!("{:02}", year.div_euclid(100)),
-        'Y' => format!("{:04}", year),
-        'y' => format!("{:02}", year.rem_euclid(100)),
+        // `CENTURY`/`YEAR_2`/`YEAR_4` are one JDK arm over one value:
+        // `i = YEAR_OF_ERA; C -> i /= 100; y -> i %= 100; Y -> size = 4`.
+        // `year_of_era` is >= 1 by construction, so plain `/` and `%` are the
+        // euclidean ones here and no sign can reach the zero pad.
+        'C' => format!("{:02}", year_of_era / 100),
+        'Y' => format!("{:04}", year_of_era),
+        'y' => format!("{:02}", year_of_era % 100),
         'j' => format!("{:03}", temporal_day_of_year(year32, month, day)),
         'm' => format!("{:02}", month),
         'd' => format!("{:02}", day),
@@ -6760,31 +10138,88 @@ fn format_temporal_field(
         // Composites
         'R' => format!("{:02}:{:02}", hour, minute),
         'T' => format!("{:02}:{:02}:{:02}", hour, minute, second),
-        'r' => format!(
-            "{:02}:{:02}:{:02} {}",
-            hour12,
-            minute,
-            second,
-            fmt_date_name(ctx, locale, "getAmPmStrings", ampm_idx)
-                .unwrap_or_else(|| ampm_en.to_string())
-                .to_uppercase()
-        ),
-        'D' => format!("{:02}/{:02}/{:02}", month, day, year.rem_euclid(100)),
-        'F' => format!("{:04}-{:02}-{:02}", year, month, day),
+        'r' => {
+            // `sb.append(toUpperCaseWithLocale(tsb.toString(), l))` — %tr
+            // upper-cases the AM/PM marker against the call's locale, and that
+            // is a separate site from the `%T` prefix's own upper-caser.
+            let ampm = fmt_date_name(ctx, locale, "getAmPmStrings", ampm_idx)
+                .unwrap_or_else(|| ampm_en.to_string());
+            let ampm = fmt_upper_case(ctx, &ampm, locale);
+            // The clock is `localizedMagnitude`d, the MARKER is not — it is a
+            // `DateFormatSymbols` name. Measured under `ar-EG`: `%tr` is
+            // U+0660 U+0663 ':' U+0664 U+0663 ':' U+0661 U+0669 ' ' U+0635.
+            let hms = fmt_localize_digits(&format!("{hour12:02}:{minute:02}:{second:02}"), sym);
+            format!("{hms} {ampm}")
+        }
+        // `%tD` is `print(MONTH) '/' print(DAY_OF_MONTH_0) '/' print(YEAR_2)`,
+        // so its year slot is `%ty`'s and takes the era-relative year too:
+        // measured, `%tD` of `LocalDate.of(-44,3,15)` is `03/15/45`, not
+        // `03/15/56` (which is what the proleptic `(-44).rem_euclid(100)` gave).
+        'D' => format!("{:02}/{:02}/{:02}", month, day, year_of_era % 100),
+        // `ISO_STANDARD_DATE` is the one conversion where the JDK's two
+        // printers DISAGREE, so it is the one arm that has to ask which source
+        // it has. See [`FmtSupport::calendar_printer`] for the measured table.
+        //
+        //  * `TemporalAccessor`: reads the PROLEPTIC year inline and renders it
+        //    itself — a negative year is `getMinusSign(l)` followed by the
+        //    ABSOLUTE value zero-padded to four, and a year past 9999 carries a
+        //    literal '+'. `LocalDate.of(-44,3,15)` is `-0044-03-15`,
+        //    `LocalDate.of(12345,3,4)` is `+12345-03-04`. Rust's `{:04}` counts
+        //    the sign inside the width and answers `-044-03-15`, and it has no
+        //    '+' rule at all.
+        //  * `Calendar`: delegates to `print(YEAR_4)`, i.e. to `%tY`'s
+        //    era-relative value, which is never negative — so no sign rule and
+        //    no '+'. The SAME instant as above, as a `GregorianCalendar` with
+        //    ERA=BC YEAR=45, is `0045-03-15`, and AD 12345 is `12345-03-04`
+        //    with NO leading '+'.
+        //
+        // Rendering the second one through `fmt_iso_year` was a live
+        // divergence: `%tF` of a `Date`/`Calendar`/`long` past year 9999 gained
+        // a '+' the JDK does not write there.
+        'F' => {
+            let y = if support.calendar_printer {
+                format!("{year_of_era:04}")
+            } else {
+                fmt_iso_year(year, sym.minus)
+            };
+            format!("{y}-{month:02}-{day:02}")
+        }
         // `%tc` is the JDK's own composite `%ta %tb %td %tT %tZ %tY` — so its
         // day is `DAY_OF_MONTH_0`, ZERO-padded (`Sat Nov 04 …`, the javadoc's
         // own example). It was space-padded here, which is `%te`'s rule.
-        // The zone stays the fixed `UTC` identity `extract_temporal_fields`
-        // models; see the `'z'`/`'Z'` arms above and W7-91.
+        // The zone slot is `print(fmt, sb, t, DateTime.ZONE, l)` — the SAME
+        // lookup as `%tZ`, not a hard-coded word. It used to be the literal
+        // "UTC", which was consistent with the fields being UTC and wrong with
+        // them: `%tc` of `new Date(1699999999000L)` under `America/New_York` is
+        // `Tue Nov 14 17:13:19 EST 2023` on HotSpot 25 and was
+        // `Tue Nov 14 22:13:19 UTC 2023` here — five hours, the zone name, and
+        // under `Asia/Kolkata` the DATE as well.
         'c' => {
             let weekday = fmt_date_name(ctx, locale, "getShortWeekdays", dow + 1)
                 .unwrap_or_else(|| DAYS_ABBR[dow].to_string());
             let month_name = fmt_date_name(ctx, locale, "getShortMonths", month_idx)
                 .unwrap_or_else(|| MONTHS_ABBR[month_idx].to_string());
-            format!(
-                "{} {} {:02} {:02}:{:02}:{:02} UTC {:04}",
-                weekday, month_name, day, hour, minute, second, year
-            )
+            let zone_name = fmt_zone_display_name(ctx, val, zone, locale).unwrap_or_else(|| {
+                if zone.known {
+                    fmt_zone_gmt_form(zone.offset_ms)
+                } else {
+                    "UTC".to_string()
+                }
+            });
+            // Three name slots and two numeric ones. Only the numeric ones are
+            // `localizedMagnitude`d — measured under `ar-EG`, `%tc` of a
+            // `Date` keeps the Arabic weekday and month as text, keeps the
+            // zone name `IST` in ASCII, and renders the day, the clock and the
+            // year in Arabic-Indic digits. Localizing the composed string
+            // instead would rewrite the digits INSIDE a `GMT+05:30` zone name.
+            let dt =
+                fmt_localize_digits(&format!("{day:02} {hour:02}:{minute:02}:{second:02}"), sym);
+            // `%tc`'s tail is `print(fmt, sb, t, DateTime.YEAR_4, l)` — `%tY`'s
+            // arm, so the ERA-RELATIVE year and not the proleptic one.
+            // Measured: `%tc` of a `ZonedDateTime` in 45 BC ends `… 0045`, and
+            // so does `%tc` of the `GregorianCalendar` for the same instant.
+            let y = fmt_localize_digits(&format!("{year_of_era:04}"), sym);
+            format!("{weekday} {month_name} {dt} {zone_name} {y}")
         }
         // Unreachable today: the caller already screened `field` against
         // `FMT_DATETIME_FIELDS`, which is `DateTime.isValid`'s own set, and
@@ -6799,9 +10234,38 @@ fn format_temporal_field(
         }
     };
 
-    out = fmt_pad_to_width(out, flags, width);
+    // Every NUMBER a `%t` field renders goes through `localizedMagnitude`,
+    // which substitutes the locale's zero digit — this whole family did it in
+    // ASCII. Measured on HotSpot 25 under `ar-EG` (zero digit U+0660):
+    // `%tH` of `new Date(1699999999000L)` is `U+0660 U+0663`, `%tT` is
+    // `U+0660 U+0663 ':' U+0664 U+0663 ':' U+0661 U+0669` (the SEPARATORS stay
+    // ASCII), `%tz` is `'+' U+0660 U+0665 U+0663 U+0660` (the SIGN stays
+    // ASCII), `%ts`, `%tQ`, `%tY`, `%tj`, `%td`, `%tD`, `%tF`, `%tL`, `%tN`,
+    // `%tC`, `%ty`, `%tm`, `%tI`, `%tk`, `%tl` likewise. `java.util.logging`'s
+    // default `SimpleFormatter` pattern is `%1$tb %1$td, %1$tY …`, so this is
+    // every log line on such a host.
+    //
+    // The seven NAME fields are excluded because they are
+    // `DateFormatSymbols`/`TimeZone` text, not magnitudes — measured, `%tZ`
+    // under `ar-EG` is the ASCII `IST` — and the two composites that MIX names
+    // with numbers have already localized their own numeric slots above.
+    // Width padding is applied after this, in ASCII spaces, which is also
+    // HotSpot's order (`[%10tH]` under `ar-EG` is eight U+0020 then two
+    // Arabic-Indic digits).
+    if !matches!(field, 'B' | 'b' | 'h' | 'A' | 'a' | 'p' | 'Z' | 'c' | 'r') {
+        out = fmt_localize_digits(&out, sym);
+    }
 
-    Ok(out)
+    // `printDateTime`: `appendJustified(fmt.a, toUpperCaseWithLocale(sb, l))` —
+    // the `%T` upper-caser is INSIDE the width and is locale-sensitive.
+    if uppercase {
+        out = fmt_upper_case(ctx, &out, locale);
+    }
+
+    // `_str_` adapter, not a second justifier: a `%t` field is a number, a
+    // separator or a `DateFormatSymbols` name, none of which can be an unpaired
+    // surrogate, so the `str` shape is not lossy on this path.
+    fmt_pad_str_to_width(&out, flags, width)
 }
 
 // ---------------------------------------------------------------------------
@@ -7263,21 +10727,167 @@ fn format_arg_full(
     width: Option<usize>,
     precision: Option<usize>,
     sym: FmtSymbols,
-) -> Result<String, MethodCallFailed> {
-    // Uppercase string-family conversions ('S'/'B'/'C') format identically to
-    // their lowercase form, then the whole result is upper-cased — per
+    locale: FmtLocale,
+) -> Result<Vec<u16>, MethodCallFailed> {
+    // Uppercase string-family conversions ('S'/'B'/'C'/'H') format identically
+    // to their lowercase form, then the whole result is upper-cased — per
     // java.util.Formatter's "If the conversion is 'S', 'B' or 'C' … the result is
     // converted to upper case". (The numeric uppercase conversions 'X'/'E'/'G'/'A'
     // already emit upper-case digits in `format_arg`, so they are NOT remapped
-    // here.) Format with the lowercase spec, then upper-case at the very end.
+    // here.) Format with the lowercase spec, then upper-case — BEFORE the width
+    // justifier, which is where `print(Formatter, String, Locale)` does it and
+    // which matters whenever the mapping changes the length; see that step.
     // Without 'S' support, Groovy's `"COMMERCIAL_%SREPO_URL".formatted(id)` left
     // the specifier literal, so the env-var key never matched (SpringRepos).
+    //
+    // 'H' was MISSING from this list, and the omission cost three separate
+    // answers, because everything downstream keys off the remapped `spec`:
+    // `%H` never upper-cased at all, `%H` of null was "null" where HotSpot 25
+    // writes "NULL", and `%.2H` never truncated because the precision arm
+    // below matches 's'/'b'/'h'. One line, three divergences — which is the
+    // shape of a table populated by hand.
+    // Whether the conversion AS WRITTEN was an upper-case one. Not the same
+    // question as `uppercase_result` below, which asks only whether this
+    // function has to case the result itself: `%X`/`%E`/`%G`/`%A` already emit
+    // upper-case digits from `format_arg`, so they are not remapped — but they
+    // ARE upper-case conversions, and the null path a few lines down is the
+    // place where that distinction is load-bearing.
+    let uppercase_conversion = spec.is_ascii_uppercase();
     let (spec, uppercase_result) = match spec {
         'S' => ('s', true),
         'B' => ('b', true),
         'C' => ('c', true),
+        'H' => ('h', true),
         other => (other, false),
     };
+
+    // `printString`'s FIRST line, ahead of both the '#' refusal and the null
+    // test: "If the argument implements Formattable, then its formatTo method
+    // is invoked" — and it, not this table, writes the output. The flags,
+    // width and precision are handed over and nothing is applied on top: a
+    // `Formattable` that writes nothing produces nothing even under `%10s`
+    // (measured `"[%10s]"` -> `"[]"`), and one that throws propagates.
+    if spec == 's' {
+        if let Value::Object(Some(obj)) = val {
+            if let Some(out) = fmt_formattable_dispatch(
+                ctx,
+                *obj,
+                flags,
+                width,
+                precision,
+                uppercase_conversion,
+                locale,
+            )? {
+                // The callee's output VERBATIM, in code UNITS. Measured on
+                // HotSpot 25: a `formatTo` that writes `"x\uD800y"` answers
+                // `length() == 3` / `0078 D800 0079` under `%s`, `%S` AND
+                // `%-10s`, so nothing is applied on top and nothing may be
+                // lost on the way — which is why the read inside
+                // `fmt_formattable_dispatch` is `read_string_chars`.
+                return Ok(out);
+            }
+        }
+        // `failMismatch(Flags.ALTERNATE, 's')`, in `printString`'s `else` —
+        // so it fires for a non-`Formattable` argument INCLUDING a null one
+        // (`%#s` of null is a mismatch on HotSpot 25, not "null"), and after
+        // the argument fetch (`%#s` with no argument is
+        // `MissingFormatArgumentException`). See `fmt_check_spec`, which used
+        // to raise this and now deliberately does not.
+        if flags.contains('#') {
+            return Err(fmt_raise(ctx, &FmtFault::FlagsMismatch("#".to_string(), 's')));
+        }
+    }
+
+    // A NULL argument converges on ONE printer for every conversion in the
+    // table. `printInteger`, `printFloat`, `printCharacter`, `printString`,
+    // `printHashCode` and `printDateTime` each open with
+    //
+    //     if (arg == null) { print(fmt, "null", l); return; }
+    //
+    // and `printBoolean` reaches the same `print(Formatter, String, Locale)`
+    // with "false" instead. That printer does exactly three things — truncate
+    // to the precision, upper-case when the conversion is an upper-case one,
+    // and SPACE-justify to the width — so none of the numeric decoration below
+    // this point applies to a null. Every one of the following was measured on
+    // HotSpot 25 and every one of them was wrong here:
+    //
+    // * `%+d` / `% d` of null is "null", not "+null" / " null".
+    // * `%#x` / `%#o` of null is "null", not "0xnull" / "0null".
+    // * `%08d` / `%08x` / `%08e` of null is "    null" — padded with SPACES,
+    //   because zero padding lives in the numeric printers this never enters.
+    // * `%.2f` of null is "nu" and `%,(.2f` is "nu": the precision truncates a
+    //   null argument even on the float conversions, whose own precision has
+    //   nothing to do with a character count.
+    // * `%X`, `%E`, `%G`, `%A` of null are "NULL", because the upper-casing is
+    //   this shared printer's, not the digit rendering's.
+    //
+    // The flag LEGALITY checks are unaffected and have already run in
+    // `fmt_check_spec`: `%08s` of null is still a FormatFlagsConversionMismatch
+    // on HotSpot. The one exception is the '(' / '+' / ' ' refusal for %o/%x,
+    // which is inside `print(long, Locale)` and so is skipped for a null — see
+    // the note below it.
+    if matches!(val, Value::Object(None)) {
+        // `%b`/`%B` is the one conversion whose null is not the word "null" —
+        // the rule lives in `fmt_null_text` so that `format_arg`'s own null arm
+        // cannot drift from it.
+        // `print(Formatter, String, Locale)`'s three steps, IN ITS ORDER:
+        // truncate, then upper-case, then justify. The order is observable
+        // because the upper-caser can GROW the text past the precision —
+        // measured on HotSpot 25, `String.format(ROOT, "%.1S", "ß")` is `"SS"`,
+        // length 2, not `"S"`. (It does not bite on the word "null", which is
+        // why an ASCII-only row cannot tell the two orders apart.)
+        let mut units: Vec<u16> = fmt_null_text(spec).encode_utf16().collect();
+        if let Some(p) = precision {
+            fmt_truncate_units(&mut units, p);
+        }
+        if uppercase_conversion {
+            units = fmt_upper_case_units(ctx, &units, locale);
+        }
+        return fmt_pad_to_width(units, flags, width);
+    }
+
+    // The GENERAL family ('s', 'b', 'h') and the character conversion ('c')
+    // are `print(Formatter, String, Locale)` and nothing else: truncate to the
+    // precision, upper-case when the conversion was written upper-case, and
+    // justify to the width. Splitting them out here is not a shortcut — every
+    // step below this point is inapplicable to them by the JDK's own structure,
+    // and each of the four exclusions is enforced somewhere already:
+    //
+    //   * grouping (','), '#', '(' , '+' and ' ' are refused for these
+    //     conversions by `fmt_check_spec` before an argument is even fetched;
+    //   * the zero-padding and localization arms below list only the numeric
+    //     specs ('d','f','e','E','g','G','x','X','o','a','A'); and
+    //   * the BigInteger sign handling is reached only from %o/%x/%X.
+    //
+    // What the split BUYS is that the three steps that do apply can be done in
+    // UTF-16 code UNITS, and all three can produce a LONE SURROGATE that a Rust
+    // `String` cannot hold:
+    //
+    //   * the truncation splits a surrogate pair — `%.1s` of U+1F600 is a lone
+    //     high surrogate with `length() == 1` on HotSpot 25, so `[%5.1s]` is
+    //     SEVEN characters; see `fmt_truncate_units` for the measured table;
+    //   * the argument itself may contain one — `%s` of `"x\uD800y"` is three
+    //     units on HotSpot, and was `x` + U+FFFD + `y` here; and
+    //   * `%c` of a lone-surrogate code point is that surrogate — HotSpot
+    //     answers `length() == 1`, `D800`, where this answered '?'.
+    //
+    // The order is the JDK's and is observable: the upper-caser runs AFTER the
+    // truncation and may grow the result past the precision (`%.1S` of "ß" is
+    // "SS"), and BEFORE the justifier, which is what makes `%5S` of "ß" five
+    // units rather than six.
+    if matches!(spec, 's' | 'b' | 'h' | 'c') {
+        let mut units = fmt_general_units(ctx, val, spec)?;
+        // `checkCharacter` refuses a precision on %c outright, so only the
+        // 's'/'b'/'h' members can arrive here with one — the same set the
+        // `String`-shaped arm this replaced matched on.
+        if let Some(p) = precision {
+            fmt_truncate_units(&mut units, p);
+        }
+        if uppercase_result {
+            units = fmt_upper_case_units(ctx, &units, locale);
+        }
+        return fmt_pad_to_width(units, flags, width);
+    }
 
     // Get the raw formatted value first
     let raw = format_arg(ctx, val, spec)?;
@@ -7290,10 +10900,21 @@ fn format_arg_full(
     let raw = match spec {
         // A null argument never reaches the conversion at all: Formatter's
         // `printFloat` prints "null" before it looks at the spec, and
-        // `extract_float_value` would have answered 0.0.
+        // `extract_float_value` would have answered 0.0. The null test is now
+        // redundant — the shared-null-printer branch above returns first — and
+        // is kept because it is the reason this arm is CORRECT, not merely the
+        // mechanism: `float_source` of a null is `None`, which would fall
+        // through to `raw` and silently drop the precision.
         'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A'
             if precision.is_some() && !matches!(val, Value::Object(None)) =>
         {
+            // The precision is one character of output per unit, and it is
+            // caller data with no upper bound but `Integer.MAX_VALUE` —
+            // `%.2000000000f` is a legal specifier. See `fmt_reserve_probe`
+            // for the HotSpot rows; this is the ONE point at which a precision
+            // reaches `fmt_render_fixed`/`fmt_render_scientific`/`fmt_hex_pad`,
+            // so asking here keeps all three non-fallible.
+            fmt_reserve_probe(precision.unwrap_or(0))?;
             match float_source(ctx, val) {
                 // `%.Nf` of a BigDecimal must round the BigDecimal's OWN
                 // digits, which is why the source is asked for rather than
@@ -7306,22 +10927,61 @@ fn format_arg_full(
             }
         }
         // "The precision is the maximum number of characters to be written to
-        // the output" — for every GENERAL conversion, not just %s. `%.2b` of
-        // true is "tr".
-        's' | 'b' | 'h' if precision.is_some() => {
-            let prec = precision.unwrap();
-            match raw.char_indices().nth(prec) {
-                Some((byte_idx, _)) => raw[..byte_idx].to_string(),
-                None => raw,
-            }
-        }
+        // the output" — for every GENERAL conversion, not just %s (`%.2b` of
+        // true is "tr"). That arm moved UP, into the units-carrying general
+        // branch above, and is `fmt_truncate_units` there; 's'/'b'/'h'/'c'
+        // cannot reach this point any more.
         _ => raw,
     };
+
+    // `java.math.BigInteger` is the one argument class whose %o/%x/%X goes
+    // through a printer that renders a SIGN, so it is the one class for which
+    // '(' / '+' / ' ' are legal on those conversions. See the refusal below.
+    let big_integer = match val {
+        Value::Object(Some(o)) => {
+            ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref()
+                == Some("java/math/BigInteger")
+        }
+        _ => false,
+    };
+
+    // `print(long, Locale)` opens its %o and %x arms with
+    // `checkBadFlags(PARENTHESES | LEADING_SPACE | PLUS)` — INSIDE the printer,
+    // not in `checkInteger`, and that placement is the entire behaviour:
+    //
+    // * `print(BigInteger, Locale)` has no such check and calls
+    //   `leadingSign`/`trailingSign` like the decimal arm does, so `%(x` of
+    //   `BigInteger("-255")` is "(ff)", `%+x` of `BigInteger("255")` is "+ff"
+    //   and `% o` of `BigInteger("8")` is " 10" on HotSpot 25.
+    // * a NULL argument never reaches either printer — `printInteger` writes
+    //   "null" first — so `String.format("%(x", (Object) null)` is "null" and
+    //   not a refusal. That case has already returned above.
+    // * a wrong-typed argument fails `printInteger`'s dispatch first, so
+    //   `%(x` of a String is IllegalFormatConversionException, not a flags
+    //   mismatch — hence this standing AFTER `format_arg`.
+    //
+    // Hoisting it into `fmt_check_spec` — where it used to live, next to the
+    // ',' refusal that really is argument-independent — refused all three of
+    // those cases. The check has to stand HERE, after the argument's class is
+    // known, because that is where the JDK put it.
+    if matches!(spec, 'o' | 'x' | 'X') && !big_integer {
+        let offending: String = fmt_flags_string(flags)
+            .chars()
+            .filter(|c| "( +".contains(*c))
+            .collect();
+        if !offending.is_empty() {
+            return Err(fmt_raise(
+                ctx,
+                &FmtFault::FlagsMismatch(offending, spec.to_ascii_lowercase()),
+            ));
+        }
+    }
 
     // Apply width and flags
     let left_justify = flags.contains('-');
     let zero_pad = flags.contains('0') && !left_justify;
-    let numeric_sign = matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A');
+    let numeric_sign = matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A')
+        || (big_integer && matches!(spec, 'o' | 'x' | 'X'));
 
     let mut formatted = raw;
 
@@ -7337,7 +10997,10 @@ fn format_arg_full(
     // flag is written in accountancy form — "the result will enclose negative
     // numbers in parentheses" — and the '-' disappears rather than being kept
     // alongside; a positive value takes '+' or, failing that, the ' ' flag's
-    // leading space. `%x`/`%o` reject all three flags before reaching here.
+    // leading space. `%x`/`%o` reject all three flags above unless the
+    // argument is a BigInteger, whose printer applies them exactly as the
+    // decimal one does — `%(x` of -255 is "(ff)", the two's-complement
+    // rendering having been replaced by `abs().toString(16)` upstream.
     if numeric_sign {
         if let Some(magnitude) = formatted.strip_prefix('-') {
             if flags.contains('(') {
@@ -7355,82 +11018,119 @@ fn format_arg_full(
     // %X), and "the output will always begin with a '0'" for %o. It goes on
     // BEFORE the zero padding, so `%#010x` of 255 is `0x000000ff` and not
     // `00000000xff` — hence the prefix-aware split below.
+    //
+    // The indicator goes INSIDE any leading sign, because the JDK appends it
+    // to a StringBuilder that `leadingSign` has already written into: `%#x` of
+    // `BigInteger("-255")` is "-0xff" and `%#(x` is "(0xff)". Inserting at
+    // byte 0 unconditionally was invisible while %x/%o refused every sign
+    // flag; admitting BigInteger above is what makes the position matter.
     if flags.contains('#') {
+        let at = usize::from(formatted.starts_with(['-', '+', ' ', '(']));
         match spec {
-            'x' => formatted.insert_str(0, "0x"),
-            'X' => formatted.insert_str(0, "0X"),
-            'o' => formatted.insert(0, '0'),
+            'x' => formatted.insert_str(at, "0x"),
+            'X' => formatted.insert_str(at, "0X"),
+            'o' => formatted.insert(at, '0'),
             _ => {}
         }
     }
 
-    // Apply width padding
+    // `print(Formatter, String, Locale)` upper-cases BEFORE it justifies, and
+    // the order is load-bearing whenever the mapping changes the LENGTH: a
+    // full uppercase mapping can grow a string (U+00DF -> "SS"), and
+    // `String.format(ROOT, "%5S", "\u{00DF}")` is `"   SS"` on HotSpot 25 —
+    // five units, three spaces. Upper-casing after the pad, which is where
+    // this step used to sit, produced SIX. Locale-sensitive since this lane;
+    // see `fmt_upper_case`.
+    //
+    // Only the general family reaches this: 'X'/'E'/'G'/'A' are not remapped
+    // (they emit upper-case digits from `format_arg`), so `uppercase_result`
+    // is true only for the remapped 'S'/'B'/'C'/'H', none of which takes the
+    // grouping, sign, '#' or localization steps above.
+    //
+    // ...which is exactly why the step now lives in the units-carrying general
+    // branch near the top of this function and NOT here: 'S'/'B'/'C'/'H' are
+    // the complete set that reached it, and all four return before this point.
+    // `uppercase_result` is therefore false for everything that gets this far,
+    // and the guard was kept only as a place for a second copy of the rule to
+    // grow. The ordering constraint it documents is unchanged and is asserted
+    // in the branch above; the `debug_assert` is what keeps a future
+    // conversion from being added to the remap table without its upper-caser.
+    debug_assert!(
+        !uppercase_result,
+        "an upper-case-remapped conversion reached the numeric decoration path"
+    );
+
+    // `trailingZeros` — the numeric printers' own zero padding, which the JDK
+    // does INSIDE the printer, before `appendJustified` ever sees the buffer.
+    // Once it has run the buffer is already `width` units long, so the shared
+    // justifier below pads nothing; that is why the two are not one step.
     if let Some(w) = width {
-        if formatted.len() < w {
-            let pad = w - formatted.len();
-            if left_justify {
-                formatted = format!("{formatted}{}", " ".repeat(pad));
+        let len = fmt_utf16_len(&formatted);
+        // %g/%G were missing from the zero-pad set even though Formatter
+        // accepts '0' for them. %a/%A are IN it since 2026-08-12: their
+        // zeros go after the "0x" prefix, which the prefix-aware split
+        // below now does — `%020a` of 1.0 is `0x00000000000001.0p0`, and
+        // with a sign the zeros go after BOTH (`%+020a` is
+        // `+0x0000000000001.0p0`). Before this they fell through to the
+        // justifier and got leading spaces. W7-3 left this as the family's
+        // last flag defect; it needed the `lead` split W7-34 added for
+        // `%#010x`, which is why the two waves could not close it together.
+        //
+        // The non-finite test stands in for Formatter's structure, where
+        // zero padding happens only inside the FINITE branch —
+        // "Infinity"/"NaN" reach the width justifier and get spaces. It
+        // used to be "ends with an ASCII digit", which mistook two finite
+        // renderings for infinities the moment this lane gave them
+        // non-digit tails: `%#010x` ends in a HEX digit and `%(08d` ends in
+        // the closing parenthesis, and both silently reverted to space
+        // padding.
+        if len < w
+            && zero_pad
+            && matches!(
+                spec,
+                'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o' | 'a' | 'A'
+            )
+            && !formatted.ends_with("Infinity")
+            && !formatted.ends_with("INFINITY")
+            && !formatted.ends_with("NaN")
+            && !formatted.ends_with("NAN")
+        {
+            // The zeros go INSIDE whatever the value already leads with —
+            // a sign, an opening parenthesis, or a radix indicator — never
+            // in front of it. The two stack: `%a` puts the sign OUTSIDE the
+            // `0x` prefix (`+0x1.0p0`), so a signed hex float leads with
+            // three characters, and testing the radix indicator only at
+            // byte 0 would have put the zeros in front of the `0x`.
+            let mut lead = 0usize;
+            if formatted.starts_with(['-', '+', ' ', '(']) {
+                lead = 1;
             }
-            // %g/%G were missing from the zero-pad set even though Formatter
-            // accepts '0' for them. %a/%A are IN it since 2026-08-12: their
-            // zeros go after the "0x" prefix, which the prefix-aware split
-            // below now does — `%020a` of 1.0 is `0x00000000000001.0p0`, and
-            // with a sign the zeros go after BOTH (`%+020a` is
-            // `+0x0000000000001.0p0`). Before this they fell to the `else`
-            // branch and got leading spaces. W7-3 left this as the family's
-            // last flag defect; it needed the `lead` split W7-34 added for
-            // `%#010x`, which is why the two waves could not close it together.
-            //
-            // The non-finite test stands in for Formatter's structure, where
-            // zero padding happens only inside the FINITE branch —
-            // "Infinity"/"NaN" reach the width justifier and get spaces. It
-            // used to be "ends with an ASCII digit", which mistook two finite
-            // renderings for infinities the moment this lane gave them
-            // non-digit tails: `%#010x` ends in a HEX digit and `%(08d` ends in
-            // the closing parenthesis, and both silently reverted to space
-            // padding.
-            else if zero_pad
-                && matches!(
-                    spec,
-                    'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o' | 'a' | 'A'
-                )
-                && !formatted.ends_with("Infinity")
-                && !formatted.ends_with("INFINITY")
-                && !formatted.ends_with("NaN")
-                && !formatted.ends_with("NAN")
-            {
-                // The zeros go INSIDE whatever the value already leads with —
-                // a sign, an opening parenthesis, or a radix indicator — never
-                // in front of it. The two stack: `%a` puts the sign OUTSIDE the
-                // `0x` prefix (`+0x1.0p0`), so a signed hex float leads with
-                // three characters, and testing the radix indicator only at
-                // byte 0 would have put the zeros in front of the `0x`.
-                let mut lead = 0usize;
-                if formatted.starts_with(['-', '+', ' ', '(']) {
-                    lead = 1;
-                }
-                if formatted[lead..].starts_with("0x") || formatted[lead..].starts_with("0X") {
-                    lead += 2;
-                }
-                let (head, rest) = formatted.split_at(lead);
-                formatted = format!("{head}{}{rest}", "0".repeat(pad));
-            } else {
-                formatted = format!("{}{formatted}", " ".repeat(pad));
+            if formatted[lead..].starts_with("0x") || formatted[lead..].starts_with("0X") {
+                lead += 2;
             }
+            let zeros = fmt_repeat('0', w - len)?;
+            formatted.insert_str(lead, &zeros);
         }
     }
 
-    // Localization is last, so every width and padding decision above was made
-    // on ASCII. "No localization is applied" to %x, %o and %a, and a %s
-    // argument's digits are the caller's text.
+    // Localization comes after the zero padding so that the padding zeros are
+    // localized too — `trailingZeros` appends the locale's OWN zero digit, and
+    // `fmt_localize` is what supplies it here. Every width decision above was
+    // still made on ASCII, and "no localization is applied" to %x, %o and %a,
+    // nor to a %s argument's digits, which are the caller's text.
     if matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') {
         formatted = fmt_localize(&formatted, sym);
     }
 
-    if uppercase_result {
-        formatted = formatted.to_uppercase();
-    }
-    Ok(formatted)
+    // `appendJustified`, shared with `%t`/`%T` and the null path. Spaces are
+    // not digits, so standing after `fmt_localize` rather than before it is
+    // the same answer.
+    //
+    // The `_str_` adapter, not a second justifier: everything that reaches here
+    // is a NUMERIC conversion whose rendering is ASCII digits, signs, a radix
+    // indicator and the locale's own separator characters — none of which can
+    // be an unpaired surrogate, so the `str` shape is not lossy on this path.
+    fmt_pad_str_to_width(&formatted, flags, width)
 }
 
 /// Insert ',' thousands separators into the integer part of a numeric string
@@ -7518,6 +11218,111 @@ fn float_source(ctx: &mut dyn NativeContext, val: &Value) -> Option<FloatSource>
     }
 }
 
+/// The raw rendering of a GENERAL-family argument ('s', 'b', 'h') or of the
+/// character conversion ('c'), as UTF-16 code **units**.
+///
+/// Everything here is [`format_arg`]'s answer; the two departures are the two
+/// places `format_arg`'s `String` return type destroys a code unit.
+///
+/// **`%s` of a `java/lang/String`.** `String.valueOf(arg)` on a String is the
+/// argument's own characters, and `read_string_chars` hands them over without
+/// the UTF-8 round trip that turns each unpaired surrogate into U+FFFD.
+/// Measured on HotSpot 25: `String.format(ROOT, "%s", "x\uD800y")` has
+/// `length() == 3` and units `0078 D800 0079`.
+///
+/// The class test is the SAME one `format_arg`'s own `%s` arm makes (`is_string`
+/// there) rather than a second copy of it: this function runs first and returns,
+/// so on a real String that arm is no longer reached, and on everything else
+/// this falls through to it. Note it is a class-IDENTITY test, not
+/// `is_subclass` — `java.lang.String` is final, and a subclass test would be
+/// both wider and slower.
+///
+/// Taking this route also means a `java/lang/String` argument never reaches
+/// `fmt_formattable_dispatch`'s interface probe — F13's suggested `%s` fast
+/// path, obtained by hoisting the comparison that already existed further down
+/// this file rather than adding a second one. **The speedup is UNMEASURED**;
+/// the change was made because it is the lossless path anyway, and it is
+/// behaviour-identical because `java.lang.String` does not implement
+/// `java.util.Formattable` and is final, so the probe it skips could only ever
+/// have answered "no".
+///
+/// **`%c` of a lone-surrogate code point.** `Character.isValidCodePoint`
+/// admits U+D800..U+DFFF and `Character.toChars` hands one back as a single
+/// unpaired `char`; `char::from_u32` refuses it, so the arm in [`format_arg`]
+/// substituted '?'. Measured on HotSpot 25:
+/// `String.format(ROOT, "%c", (int) 0xD800)` has `length() == 1` and unit
+/// `D800`. [`format_arg`] still owns the VALIDATION — it is called first and
+/// its `IllegalFormatCodePointException` / `IllegalFormatConversionException`
+/// refusals propagate unchanged — and this only RE-RENDERS an argument it has
+/// already accepted, so the two cannot drift on which code points are legal.
+fn fmt_general_units(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+    spec: char,
+) -> Result<Vec<u16>, MethodCallFailed> {
+    if spec == 's' {
+        if let Value::Object(Some(obj)) = val {
+            if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(*obj)) {
+                return Ok(read_string_chars(ctx, *obj));
+            }
+        }
+    }
+    let rendered = format_arg(ctx, val, spec)?;
+    if spec == 'c' {
+        // The range test is a DISAGREEMENT guard, not a second validation:
+        // `format_arg` has already refused anything outside it, so this can
+        // only fire if the two ever stopped unboxing the same argument the same
+        // way — and then the right answer is `format_arg`'s rendering, not a
+        // unit fabricated from a value it never saw.
+        if let Some(cp) = fmt_char_code_point(ctx, val).filter(|cp| (0..=0x10FFFF).contains(cp)) {
+            // `Character.toChars`: one unit for a BMP code point (INCLUDING a
+            // lone surrogate), a high+low pair for a supplementary one.
+            let cp = cp as u32;
+            return Ok(if cp > 0xFFFF {
+                let v = cp - 0x10000;
+                vec![(0xD800 + (v >> 10)) as u16, (0xDC00 + (v & 0x3FF)) as u16]
+            } else {
+                vec![cp as u16]
+            });
+        }
+    }
+    Ok(rendered.encode_utf16().collect())
+}
+
+/// The code point a `%c` argument denotes, once [`format_arg`] has accepted it.
+///
+/// `None` means "not one of the shapes `%c` takes", which after `format_arg`
+/// has returned `Ok` cannot happen — the caller falls back to `format_arg`'s
+/// own rendering rather than inventing a character. Deliberately does NOT
+/// re-check `isValidCodePoint`: that refusal has exactly one home, in
+/// [`format_arg`]'s `'c'` arm, and a second copy here would be a second
+/// chance to disagree with it.
+///
+/// The wrapper set is `printCharacter`'s: `Character`, `Byte`, `Short`,
+/// `Integer`. `Byte` and `Short` are NOT masked the way the unsigned integer
+/// conversions mask them — `printCharacter` widens them as signed and lets
+/// `isValidCodePoint` reject a negative, which is why this reads the slot
+/// straight through.
+fn fmt_char_code_point(ctx: &mut dyn NativeContext, val: &Value) -> Option<i32> {
+    match val {
+        Value::Int(v) => Some(*v),
+        Value::Object(Some(obj)) => {
+            let cname = ctx.class_name_of_id(ctx.class_id_of_object(*obj))?;
+            if !matches!(
+                cname.as_str(),
+                "java/lang/Character" | "java/lang/Byte" | "java/lang/Short" | "java/lang/Integer"
+            ) {
+                return None;
+            }
+            match ctx.get_field(*obj, 0) {
+                Value::Int(v) => Some(v),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Format a single argument for String.format.
 pub(crate) fn format_arg(
     ctx: &mut dyn NativeContext,
@@ -7567,15 +11372,35 @@ pub(crate) fn format_arg(
     }
 
     let formatted = match val {
-        Value::Object(None) => match spec {
-            'b' => "false".to_string(),
-            _ => "null".to_string(),
-        },
+        // W8-F4-1 N4. Dead on the `String.format` path — `format_arg_full`'s
+        // shared null printer returns before this is reached — and ROUTED
+        // rather than deleted: the word is now [`fmt_null_text`]'s, the same
+        // table that printer reads, so a future caller that makes `format_arg`
+        // an entry point again gets the JDK's answer for WHICH word instead of
+        // a second copy of the rule that can drift. What this arm still does
+        // not do is the decoration (precision, upper-casing, justification);
+        // `format_arg` does not decorate anything, for a null or otherwise.
+        Value::Object(None) => fmt_null_text(spec).to_string(),
         Value::Object(Some(obj)) => {
-            // For %b: check if it's a Boolean wrapper, else non-null = true
+            // `printBoolean`, which reads only the CLASS: "If the argument arg
+            // is null, then the result is 'false'. If arg is a boolean or
+            // Boolean, then the result is the string returned by
+            // String.valueOf(arg). Otherwise, the result is 'true'."
+            //
+            // `unbox_obj` collapses every INTEGRAL wrapper to `Value::Int`, so
+            // testing the unboxed shape alone made a zero-valued Integer,
+            // Short, Byte or Character answer "false" — `String.format("%b",
+            // 0)` was "false" where HotSpot 25 says "true", because an Integer
+            // of zero is a non-null object and nothing else. The class is the
+            // question, so ask it before unboxing.
             if spec == 'b' {
-                let inner = unbox_obj(ctx, *obj);
-                return Ok(match inner {
+                let is_boolean = ctx
+                    .class_name_of_id(ctx.class_id_of_object(*obj))
+                    .is_some_and(|n| n == "java/lang/Boolean");
+                if !is_boolean {
+                    return Ok("true".to_string());
+                }
+                return Ok(match unbox_obj(ctx, *obj) {
                     Value::Int(v) => if v != 0 { "true" } else { "false" }.to_string(),
                     _ => "true".to_string(),
                 });
@@ -7609,9 +11434,34 @@ pub(crate) fn format_arg(
                     Err(err) => Err(err),
                 };
             }
-            // %h / %H: hashcode hex (left as-is — String fast path or "null").
+            // `printHashCode`, whose whole body is
+            //   String s = (arg == null ? "null"
+            //                           : Integer.toHexString(arg.hashCode()));
+            // so `%h` is the hex of the argument's VIRTUAL hashCode and has
+            // nothing to do with the argument's text.
+            //
+            // This arm used to answer `read_string(arg)`, which made `%h` an
+            // alias for `%s` on a String — `String.format("%h", "a")` was "a"
+            // where HotSpot 25 says "61" — and "null" on every argument that
+            // is not a String, since `read_string` has nothing to read off an
+            // Integer, an enum or a bean. Both halves were wrong and the
+            // second one is the quieter: a `%h` of a bean printed "null" with
+            // no refusal anywhere.
+            //
+            // `Integer.toHexString` is UNSIGNED, so the `as u32` is the whole
+            // of the negative-hash case: `%h` of an object hashing to -1 is
+            // "ffffffff", not "-1". `%H` upper-cases the result, and that is
+            // done once for the whole general family in `format_arg_full`
+            // rather than here.
             if spec == 'h' || spec == 'H' {
-                return Ok(ctx.read_string(*obj).unwrap_or_else(|| "null".to_string()));
+                let hash = match ctx.invoke_virtual(*obj, "hashCode", "()I", &[])? {
+                    Some(Value::Int(h)) => h,
+                    // The descriptor is `()I`, so bytecode cannot reach this;
+                    // answering 0 keeps a broken interpreter a wrong answer
+                    // rather than a panic.
+                    _ => 0,
+                };
+                return Ok(format!("{:x}", hash as u32));
             }
 
             // Everything past here is a TYPED conversion, and
@@ -7655,7 +11505,31 @@ pub(crate) fn format_arg(
                     _ => true,
                 };
                 if !applicable {
-                    return Err(fmt_raise(ctx, &FmtFault::WrongType(spec, class_id)));
+                    // The conversion character the exception carries is the
+                    // LOWER-case one. `FormatSpecifier.conversion(char)` folds
+                    // every upper-case conversion down —
+                    // `if (Character.isUpperCase(conv)) { f.add(Flags.UPPERCASE);
+                    // this.c = Character.toLowerCase(conv); }` — and `c` is
+                    // what `failConversion` hands
+                    // `IllegalFormatConversionException`. `format_arg_full`
+                    // remaps only `S`/`B`/`C`/`H` (the four whose RENDERING
+                    // changes), so `X`/`E`/`G`/`A` arrive here as written and
+                    // this is the one place the fold has to be repeated.
+                    // Measured on HotSpot 25.0.3+9, `Boolean.TRUE` as the
+                    // argument, message and `getConversion()` both:
+                    //
+                    //   %X -> "x != java.lang.Boolean", conv='x'
+                    //   %E -> "e != java.lang.Boolean", conv='e'
+                    //   %G -> "g != java.lang.Boolean", conv='g'
+                    //   %A -> "a != java.lang.Boolean", conv='a'
+                    //
+                    // `%tY` is NOT folded — `printDateTime` reports the FIELD
+                    // character as typed ("Y != java.lang.String", measured) —
+                    // which is why this is done here and not in `fmt_raise`.
+                    return Err(fmt_raise(
+                        ctx,
+                        &FmtFault::WrongType(spec.to_ascii_lowercase(), class_id),
+                    ));
                 }
                 // A BigDecimal at its DEFAULT precision still has to come from
                 // its own digits — `%f` of `new BigDecimal("2.3")` is
@@ -7789,10 +11663,200 @@ pub(crate) fn format_arg(
 }
 
 // ---------------------------------------------------------------------------
+// Java's character tables, for the `String` methods that are specified in
+// terms of them.
+//
+// W7-95a. Every one of the three predicates below exists because the Rust
+// standard-library method with the plausibly-matching name implements the
+// UNICODE definition and Java's is deliberately different. Reaching for
+// `char::is_whitespace` / `char::to_uppercase` here is the single root cause
+// behind `String.isBlank` and `String.regionMatches(true, ...)` disagreeing
+// with HotSpot, and it is the same reflex W7-95 measured across the whole
+// `java/lang/Character` family.
+// ---------------------------------------------------------------------------
+
+/// `Character.isWhitespace` for one UTF-16 code unit — the JAVADOC rule, not
+/// `char::is_whitespace`.
+///
+/// * Rust's `char::is_whitespace` is the Unicode **White_Space** property:
+///   `Zs ∪ Zl ∪ Zp ∪ {U+0009..U+000D, U+0085}`.
+/// * Java's `isWhitespace` is "a Unicode space character (`Zs`/`Zl`/`Zp`) that
+///   is **not** a non-breaking space (`U+00A0`, `U+2007`, `U+202F`), **or** one
+///   of `U+0009..U+000D`, `U+001C..U+001F`".
+///
+/// Eight code points disagree. Measured on Microsoft OpenJDK 25.0.3+9 —
+/// written by NAME here, never as the character itself, because a doc comment
+/// holding a literal U+00A0 is one re-encode away from holding a space:
+/// `isBlank()` of a lone `U+00A0` NBSP, `U+0085` NEL, `U+2007` FIGURE SPACE
+/// or `U+202F` NARROW NBSP is `false` there and was `true` here; of
+/// `U+001C`..`U+001F` (file/group/record/unit separator) it is `true` there
+/// and was `false` here.
+///
+/// A surrogate code unit is `Cs`, never whitespace, and no arm below admits
+/// one — which is what HotSpot answers.
+///
+/// **This is an ENUMERATION, deliberately, and not the derivation it replaced.**
+/// The first version computed `Zs | Zl | Zp` as
+/// `char::is_whitespace(cp) && !matches!(cp, 0x09..=0x0D | 0x85)` and subtracted
+/// the three non-breaking spaces. That was correct — verified over all
+/// 1,114,112 code points against `Character.isWhitespace` on OpenJDK 25.0.3+9,
+/// zero mismatches, and agreeing with the enumeration below at every one of
+/// them — but it was correct *by consulting a Rust Unicode table at runtime*,
+/// and that is the dependency this file has already been bitten by once: see
+/// `case_map::JDK_UNMAPPED_CASE_CODE_POINTS`, where Rust's tables being NEWER
+/// than the JDK's produced a wrong answer that no amount of care about the Java
+/// side could have caught. Whitespace is a small, stable, enumerable set, so the
+/// version-skew hazard is removed rather than managed.
+///
+/// The enumeration itself was swept exhaustively: `WsSweep`, all 1,114,112
+/// code points, `proposed mismatches=0`.
+///
+/// **Twin.** `native_character_is_whitespace` in
+/// `native-builtins/src/lang_math.rs` is the same rule for the
+/// `java/lang/Character` triples (W7-98a). That lane independently replaced its
+/// derivation with this same enumeration; the two now agree character for
+/// character AND line for line, which is the point — two enumerations of the
+/// same constants cannot silently drift the way two derivations over a moving
+/// table can. They should still be hoisted onto one predicate; see N5.
+fn java_char_is_whitespace(ch: u16) -> bool {
+    matches!(u32::from(ch),
+        0x0009..=0x000D      // TAB, LF, VT, FF, CR
+        | 0x001C..=0x0020    // FILE/GROUP/RECORD/UNIT SEPARATOR, SPACE
+        | 0x1680             // OGHAM SPACE MARK
+        | 0x2000..=0x2006    // EN QUAD .. SIX-PER-EM SPACE  (2007 FIGURE SPACE excluded)
+        | 0x2008..=0x200A    // PUNCTUATION SPACE .. HAIR SPACE
+        | 0x2028..=0x2029    // LINE SEPARATOR, PARAGRAPH SEPARATOR
+        | 0x205F             // MEDIUM MATHEMATICAL SPACE
+        | 0x3000             // IDEOGRAPHIC SPACE
+    )
+    // Absent on purpose, each measured `false` on HotSpot: 0x00A0 NBSP,
+    // 0x2007 FIGURE SPACE, 0x202F NARROW NBSP (non-breaking spaces are
+    // excluded by the javadoc), and 0x0085 NEL.
+}
+
+// The JDK-vs-Rust Unicode version skew — `JDK_UNMAPPED_CASE_CODE_POINTS` and
+// its predicate — used to be declared HERE, and `case_map.rs` had no arm for it
+// at all. Those two files are the only case-mapping code in the crate and they
+// split the work by locale: this one handles the root and ordinary locales,
+// `case_map.rs` handles `tr`/`az`/`lt`. A constant that lives in one half is a
+// fix that half the locales never get, which is exactly what happened —
+// `"ꟓ".toUpperCase(Locale.ROOT)` was right and
+// `"ꟓ".toUpperCase(Locale.forLanguageTag("tr"))` was wrong. The definition now
+// lives next to the table it corrects; see
+// [`crate::case_map::JDK_UNMAPPED_CASE_CODE_POINTS`] for the measurement and
+// for why a THIRD copy was not the answer.
+use crate::case_map::is_jdk_unmapped_case_code_point;
+
+/// [`java_char_is_whitespace`] for a Rust `char` rather than a code unit.
+///
+/// For callers that already hold a `&str` (`indent`). A supplementary code
+/// point is never whitespace in Java, so the `> 0xFFFF` arm is `false` rather
+/// than a truncation.
+fn char_is_java_whitespace(c: char) -> bool {
+    let cp = u32::from(c);
+    cp <= 0xFFFF && java_char_is_whitespace(cp as u16)
+}
+
+/// `Character.toUpperCase(char)` — Java's **1:1** mapping, not the full one.
+///
+/// `char::to_uppercase()` yields the FULL (SpecialCasing) mapping, which can
+/// be several characters: `ß` → `"SS"`, `ﬀ` → `"FF"`. Java's `char`-taking
+/// overload is UnicodeData's *simple* mapping and returns the input unchanged
+/// whenever the full mapping does not fit in one `char`. Taking `.next()` off
+/// the iterator — the shape W7-95 measured in `native_character_to_upper_case`
+/// — turns `ß` into `S`.
+///
+/// The exception arms are the complete set for the BMP, derived rather than
+/// sampled: `Character.toUpperCase((char) c)` was dumped for all 65 536 code
+/// units on OpenJDK 25.0.3+9 and diffed against "full mapping, multi-char
+/// falls back to identity". Exactly 27 code units differ, all of them Greek
+/// vowels with ypogegrammeni whose simple uppercase is the TITLECASE
+/// character (`U+1F80` → `U+1F88`) while the full mapping is a two-character
+/// expansion. Everywhere else the two rules agree, which is why this is a
+/// small `match` and not a ported table.
+///
+/// A surrogate code unit has no scalar value; Java maps every unmapped char to
+/// *itself*, so this returns the input rather than `char::from_u32`'s `None`.
+fn java_char_to_upper_case(ch: u16) -> u16 {
+    // Rust's tables are newer than the JDK's and pair these; the JDK maps each
+    // to itself. See `JDK_UNMAPPED_CASE_CODE_POINTS`.
+    if is_jdk_unmapped_case_code_point(u32::from(ch)) {
+        return ch;
+    }
+    match ch {
+        0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7 => return ch + 8,
+        0x1FB3 => return 0x1FBC,
+        0x1FC3 => return 0x1FCC,
+        0x1FF3 => return 0x1FFC,
+        _ => {}
+    }
+    let Some(c) = char::from_u32(u32::from(ch)) else {
+        return ch;
+    };
+    let mut it = c.to_uppercase();
+    match (it.next(), it.next()) {
+        (Some(u), None) if u32::from(u) <= 0xFFFF => u as u16,
+        _ => ch,
+    }
+}
+
+/// `Character.toLowerCase(char)` — Java's **1:1** mapping. See
+/// [`java_char_to_upper_case`] for the derivation; the same BMP-wide dump
+/// finds exactly ONE code unit where the full lowercase mapping differs from
+/// Java's simple one: `U+0130` LATIN CAPITAL LETTER I WITH DOT ABOVE, whose
+/// SpecialCasing full mapping is the two characters `i` + `U+0307` and whose
+/// simple mapping is plain `i`. That one code point is the difference between
+/// `"İ".regionMatches(true, 0, "i", 0, 1)` answering `true` (HotSpot) and
+/// `false`.
+fn java_char_to_lower_case(ch: u16) -> u16 {
+    // See the twin above and `JDK_UNMAPPED_CASE_CODE_POINTS`.
+    if is_jdk_unmapped_case_code_point(u32::from(ch)) {
+        return ch;
+    }
+    if ch == 0x0130 {
+        return 0x0069;
+    }
+    let Some(c) = char::from_u32(u32::from(ch)) else {
+        return ch;
+    };
+    let mut it = c.to_lowercase();
+    match (it.next(), it.next()) {
+        (Some(l), None) if u32::from(l) <= 0xFFFF => l as u16,
+        _ => ch,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // String modern methods (Java 11+)
 // ---------------------------------------------------------------------------
 
-/// repeat(int) — "ab".repeat(3) → "ababab"
+/// `String.repeat(int)` — "ab".repeat(3) → "ababab".
+///
+/// W7-95a. The old body was `std::cmp::max(0, n) as usize`, which turned every
+/// contract violation into a silent empty string, and then handed the count
+/// straight to `str::repeat`, which has no upper bound at all.
+///
+/// Measured on OpenJDK 25.0.3+9, in the JDK's own check order:
+///
+/// ```text
+/// "ab".repeat(-1)                  IllegalArgumentException: count is negative: -1
+/// "ab".repeat(Integer.MIN_VALUE)   IllegalArgumentException: count is negative: -2147483648
+/// "".repeat(-1)                    IllegalArgumentException          (count is checked FIRST,
+///                                                                    before the empty-string
+///                                                                    short circuit)
+/// "ab".repeat(0)                   ""
+/// "ab".repeat(Integer.MAX_VALUE)   OutOfMemoryError: Required length exceeds implementation limit
+/// "abc".repeat(1000000000)         OutOfMemoryError: Required length exceeds implementation limit
+/// ```
+///
+/// The overflow guard is the JDK's `Integer.MAX_VALUE / count < len`, and
+/// `len` there is the length of the compact `value` **byte** array — one byte
+/// per char for a LATIN-1 string, two for a UTF-16 one — which is why the
+/// coder is reconstructed below instead of using the char count. Without it
+/// `str::repeat` attempts a multi-gigabyte allocation and aborts the process:
+/// a capacity overflow is a Rust panic, and a Rust panic is not a Java
+/// throwable. `try_reserve_exact` covers the residual case where the
+/// Java-legal length is still more memory than this process can get.
 pub(crate) fn native_string_repeat(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7802,16 +11866,86 @@ pub(crate) fn native_string_repeat(
         _ => return Ok(Some(Value::Object(None))),
     };
     let count = match args.get(1) {
-        Some(Value::Int(n)) => std::cmp::max(0, *n) as usize,
+        Some(Value::Int(n)) => *n,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let result = s.repeat(count);
-    let str_obj = ctx.create_string_uninterned(&result);
+    if count < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("count is negative: {count}"),
+            }
+            .into(),
+        );
+    }
+    let units = read_string_chars(ctx, this);
+    if units.is_empty() || count == 0 {
+        return Ok(Some(Value::Object(Some(ctx.create_string_uninterned("")))));
+    }
+    if count == 1 {
+        // `return this` — `String.repeat(1)` is specified to hand back the
+        // receiver, and a String is immutable, so sharing it is correct.
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    // The JDK's guard, on the same quantity the JDK measures: `value.length`,
+    // which is 2 bytes per char once any char needs the UTF-16 coder.
+    let value_len = if units.iter().all(|&u| u <= 0xFF) {
+        units.len() as i64
+    } else {
+        units.len() as i64 * 2
+    };
+    if i64::from(i32::MAX) / i64::from(count) < value_len {
+        return Err(oome_repeat_limit().into());
+    }
+    // Repeat the code UNITS, not a Rust `String`. The old body ended in
+    // `String::from_utf16_lossy` + `create_string_uninterned(&str)`, so every
+    // unpaired surrogate in the receiver came back as U+FFFD — silently, since
+    // the unit COUNT is the same either way (U+FFFD is one unit, as is a lone
+    // surrogate) and so `length()` agreed with HotSpot while the content did
+    // not. Measured on HotSpot 25: `"a\uD800b".repeat(2)` is
+    // `0061 D800 0062 0061 D800 0062` and `"\uDC00".repeat(3)` is
+    // `DC00 DC00 DC00`.
+    //
+    // The lossless writer this needs was already in this file
+    // ([`sb_string_from_units`], three callers away) and was already reachable
+    // through the existing `NativeContext` — no new VM primitive was required.
+    let Some(total) = units.len().checked_mul(count as usize) else {
+        return Err(oome_repeat_limit().into());
+    };
+    let mut result: Vec<u16> = Vec::new();
+    // Same fallible reservation as before, on the same quantity the JDK's own
+    // guard above measures — the `value` array — rather than on a UTF-8 length
+    // that no longer exists here.
+    if result.try_reserve_exact(total).is_err() {
+        return Err(oome_repeat_limit().into());
+    }
+    for _ in 0..count {
+        result.extend_from_slice(&units);
+    }
+    let str_obj = sb_string_from_units(ctx, &result)?;
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
-/// isBlank() — true if empty or all whitespace
+/// HotSpot's exact `String.repeat` overflow wording, in one place so the three
+/// bail-outs above cannot drift apart.
+fn oome_repeat_limit() -> cratonvm_types::error::RuntimeError {
+    cratonvm_types::error::RuntimeError::OutOfMemoryError {
+        message: "Required length exceeds implementation limit".to_string(),
+    }
+}
+
+/// `String.isBlank()` — empty, or every code point is `Character.isWhitespace`.
+///
+/// W7-95a. The old body was `s.trim().is_empty()`, and `str::trim` is Unicode
+/// **White_Space**, which is not Java's table — see [`java_char_is_whitespace`]
+/// for the eight code points that disagree and the measurement. A lone
+/// `U+00A0` answered `true` here and `false` on HotSpot; `U+001C`..`U+001F`
+/// answered `false` here and `true` on HotSpot.
+///
+/// Tested per code UNIT rather than per code point, which is equivalent: no
+/// supplementary code point is whitespace and neither is a surrogate, so a
+/// pair and each of its halves all answer `false`. Reading the units directly
+/// also keeps the `str` round trip (and its U+FFFD substitution) out of a
+/// method whose answer depends on the exact code points present.
 pub(crate) fn native_string_is_blank(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7820,8 +11954,10 @@ pub(crate) fn native_string_is_blank(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Int(if s.trim().is_empty() { 1 } else { 0 })))
+    let blank = with_string_chars_scratch(ctx, this, |units| {
+        units.iter().all(|&u| java_char_is_whitespace(u))
+    });
+    Ok(Some(Value::Int(if blank { 1 } else { 0 })))
 }
 
 /// chars() — returns IntStream of char values
@@ -7855,26 +11991,31 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let char_values: Vec<Value> = s.encode_utf16().map(|c| Value::Int(c as i32)).collect();
-    string_int_stream(ctx, &char_values)
+    // `read_string_chars`, not `ctx.read_string(..).encode_utf16()`: `chars()`
+    // is the code-UNIT view and must reproduce an unpaired surrogate exactly.
+    // Through a Rust `String` one becomes U+FFFD -- `"x\uD800y".chars()` gave
+    // `[120, 65533, 121]` against HotSpot 25.0.3+9's `[120, 55296, 121]`
+    // (W7-95a). Same root cause as `codePointAt`; same one-line fix.
+    let char_values: Vec<i32> = read_string_chars(ctx, this)
+        .into_iter()
+        .map(i32::from)
+        .collect();
+    int_stream_of(ctx, &char_values)
 }
 
-/// `String.codePoints()` -- an `IntStream` of Unicode CODE POINTS, not UTF-16
-/// code units.
+/// `String.codePoints()` — an `IntStream` of **code points**, which is not
+/// `chars()`.
 ///
-/// This used to be registered as an alias of `native_string_chars` with the
-/// comment "Same as chars() for BMP characters". True for the BMP, wrong for
-/// everything above it: a supplementary character came back as its two
-/// surrogate halves, so a caller that built a set of code points from
-/// `codePoints()` and then tested membership with `String.codePointAt` (which
-/// is correct here) never matched. H2's `StringUtils.trim(String, ..., String
-/// characters)` does exactly that for a trim set of three or more code points,
-/// which is why `BTRIM(U&'...', U&'\+01F600\+01F603\+01F604')` left the
-/// astral trim characters in place (`functions/string/btrim.sql:22`).
+/// W7-95a. `codePoints` was registered onto `native_string_chars` with the
+/// comment "Same as chars for BMP" at two registration sites. It is not the
+/// same for any string that contains a surrogate pair: measured on OpenJDK
+/// 25.0.3+9, `"a<U+1F600>b".codePoints()` is `[97, 128512, 98]` and this VM
+/// answered `[97, 55357, 56832, 98]` — four elements where Java has three, so
+/// every `codePoints().count()` over emoji was wrong, not just the values.
 ///
-/// `ctx.read_string` hands back a Rust `String`, whose `chars()` iterator is
-/// already code-point-wise, so the fix is to stop widening through UTF-16.
+/// A surrogate that is *not* part of a pair is its own code point and passes
+/// through unchanged (`"x\uD800y"` → `[120, 55296, 121]`), which is exactly
+/// why this cannot be written over a Rust `str`.
 pub(crate) fn native_string_code_points(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7883,14 +12024,32 @@ pub(crate) fn native_string_code_points(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let cp_values: Vec<Value> = s.chars().map(|c| Value::Int(c as i32)).collect();
-    string_int_stream(ctx, &cp_values)
+    let units = read_string_chars(ctx, this);
+    let mut code_points: Vec<i32> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let ch = units[i];
+        if (0xD800..=0xDBFF).contains(&ch) && i + 1 < units.len() {
+            let low = units[i + 1];
+            if (0xDC00..=0xDFFF).contains(&low) {
+                code_points
+                    .push(0x10000 + ((i32::from(ch) - 0xD800) << 10) + (i32::from(low) - 0xDC00));
+                i += 2;
+                continue;
+            }
+        }
+        code_points.push(i32::from(ch));
+        i += 1;
+    }
+    int_stream_of(ctx, &code_points)
 }
 
-/// Shared tail of `chars()`/`codePoints()`: wrap already-computed `int`
-/// elements in the standard synthetic `IntStream`.
-fn string_int_stream(ctx: &mut dyn NativeContext, char_values: &[Value]) -> MethodCallResult {
+/// Build the synthetic `IntStream` both `chars()` and `codePoints()` return.
+///
+/// Extracted so the two cannot drift: the layout notes below were paid for
+/// twice already (a 1-field allocation and a reference-array allocation), and
+/// a second copy of them is a second place to get them wrong.
+fn int_stream_of(ctx: &mut dyn NativeContext, char_values: &[i32]) -> MethodCallResult {
     // 2-field synthetic stream layout: field 0 = elements array, field 1 =
     // close handlers (None -- chars()/codePoints() never register any).
     // Must be 2 fields (not 1) to match STREAM_NUM_FIELDS in
@@ -7910,7 +12069,7 @@ fn string_int_stream(ctx: &mut dyn NativeContext, char_values: &[Value]) -> Meth
     // stream (confirmed via a standalone `chars().toArray()` repro).
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, char_values.len());
     for (i, val) in char_values.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+        ctx.set_array_element(arr, i, Value::Int(*val));
     }
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.set_field(stream, 1, Value::Object(None));
@@ -7935,8 +12094,8 @@ pub(crate) fn native_string_region_matches_ic(
         _ => 0,
     };
     let other = match args.get(3) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        Some(Value::Object(o)) => *o,
+        _ => None,
     };
     let ooffset_i = match args.get(4) {
         Some(Value::Int(v)) => *v,
@@ -7946,30 +12105,122 @@ pub(crate) fn native_string_region_matches_ic(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if toffset_i < 0 || ooffset_i < 0 || len_i < 0 {
+    region_matches_impl(ctx, this, toffset_i, other, ooffset_i, len_i, ignore_case)
+}
+
+/// `String.regionMatches`, both overloads.
+///
+/// W7-95a. Two defects, one shared body now.
+///
+/// **A negative `len` answers `true`, and did not.** The JDK's bounds test is
+///
+/// ```text
+/// if ((ooffset < 0) || (toffset < 0)
+///         || (toffset > (long) length() - len)
+///         || (ooffset > (long) other.length() - len)) return false;
+/// ```
+///
+/// with its own comment "toffset, ooffset, or len might be near `-1>>>1`",
+/// which is why it widens to `long` rather than adding. When `len` is
+/// negative, `length() - len` is *larger* than the length, the test passes,
+/// and the comparison loop `while (len-- > 0)` runs zero times — so the answer
+/// is `true`. Measured on OpenJDK 25.0.3+9: `"ABC".regionMatches(0, "abc", 0,
+/// -1)` and the same call with `Integer.MIN_VALUE` are both `true`; this VM
+/// answered `false` from an `if len_i < 0 { return false }` guard that has no
+/// counterpart in the JDK. Callers that pass a computed length depend on it.
+///
+/// **A null `other` is a NullPointerException — but only where the JDK's `||`
+/// actually dereferences it.** That expression SHORT-CIRCUITS, and `other` is
+/// touched at the FOURTH term, so the null contract is conditional on the first
+/// three. Every row measured on OpenJDK 25.0.3+9 with `"abc"` as the receiver:
+///
+/// ```text
+/// regionMatches(  0, null,  0,  1)   NullPointerException   (reaches other.length())
+/// regionMatches(  0, null,  0, -1)   NullPointerException   (negative len does NOT save it)
+/// regionMatches(  3, null,  0,  0)   NullPointerException   (toffset == length() - len)
+/// "".regionMatches(0, null, 0,  0)   NullPointerException   (empty receiver, still reached)
+/// regionMatches( -1, null,  0,  1)   false                  (toffset < 0, term two)
+/// regionMatches(  0, null, -1,  1)   false                  (ooffset < 0, term one)
+/// regionMatches( 99, null,  0,  1)   false                  (term three, other never read)
+/// regionMatches(  0, null,  0,  4)   false                  (term three: 0 > 3 - 4)
+/// ```
+///
+/// with the five-argument overload answering identically for
+/// `ignoreCase = true` and delegating for `ignoreCase = false`. This VM
+/// answered `false` to all eight: `other` was unwrapped at the top of the
+/// native and a null took the same exit as a bounds failure, which is the
+/// `[default=wrong write]` shape — a defaulting reader turning a contract
+/// violation into a plausible answer. The two behaviours cannot be separated by
+/// checking null first (three of the eight rows would then be wrong), so the
+/// order below is the JDK's expression, term for term.
+///
+/// **Both sides are read losslessly.** `ctx.read_string` goes through a Rust
+/// `String`, where every unpaired surrogate becomes U+FFFD — so two *different*
+/// lone surrogates compared equal. `read_string_chars` reads the `value`
+/// arrays as UTF-16 code units, which is also the unit `toffset`/`ooffset`/`len`
+/// are specified in. `other` is read only after it has survived the first three
+/// terms, which is both the JDK's order and the cheaper one.
+/// Whether the JDK's `regionMatches` bounds expression already answers `false`
+/// from its first THREE terms — the ones that do not touch `other`.
+///
+/// Split out so the short-circuit point is testable without a receiver, a
+/// heap or a `NativeContext`: `true` here means "return false, and `other`
+/// must NOT be dereferenced", `false` means "the JDK now evaluates
+/// `other.length()`", which is where a null argument becomes a
+/// NullPointerException. See [`region_matches_impl`] for the eight measured
+/// rows this reproduces.
+///
+/// `this_len`, `toffset`, `ooffset` and `len` are `i64` for the same reason the
+/// JDK widens to `long`: its own comment says "toffset, ooffset, or len might
+/// be near `-1>>>1`", so `length() - len` must not wrap.
+fn region_matches_short_circuits(this_len: i64, toffset: i64, ooffset: i64, len: i64) -> bool {
+    ooffset < 0 || toffset < 0 || toffset > this_len - len
+}
+
+#[allow(clippy::too_many_arguments)]
+fn region_matches_impl(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    toffset_i: i32,
+    other: Option<cratonvm_types::ObjectRef>,
+    ooffset_i: i32,
+    len_i: i32,
+    ignore_case: bool,
+) -> MethodCallResult {
+    // regionMatches offsets/len are in UTF-16 code UNITS, not Unicode code
+    // points. Index over u16 to agree with charAt/length.
+    let s_units = read_string_chars(ctx, this);
+
+    // The JDK's test, in `i64` for the same reason the JDK uses `long`, and in
+    // the JDK's order so that the `other.length()` dereference happens exactly
+    // where the JDK's does.
+    let toffset = i64::from(toffset_i);
+    let ooffset = i64::from(ooffset_i);
+    let len = i64::from(len_i);
+    if region_matches_short_circuits(s_units.len() as i64, toffset, ooffset, len) {
         return Ok(Some(Value::Int(0)));
     }
-    let toffset = toffset_i as usize;
-    let ooffset = ooffset_i as usize;
-    let len = len_i as usize;
-
-    let s = ctx.read_string(this).unwrap_or_default();
-    // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
-    // not Unicode code points. Index over u16 to agree with charAt/length.
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let o_units: Vec<u16> = other.encode_utf16().collect();
-
-    if toffset
-        .checked_add(len)
-        .map_or(true, |end| end > s_units.len())
-        || ooffset
-            .checked_add(len)
-            .map_or(true, |end| end > o_units.len())
-    {
+    // Term four. `other.length()` — the JDK's implicit null check.
+    let Some(other) = other else {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"other\" is null".to_string(),
+            ),
+        }
+        .into());
+    };
+    let o_units = read_string_chars(ctx, other);
+    if ooffset > o_units.len() as i64 - len {
         return Ok(Some(Value::Int(0)));
     }
+    if len <= 0 {
+        // `while (len-- > 0)` compared nothing. Not an error, not `false`.
+        return Ok(Some(Value::Int(1)));
+    }
 
-    for i in 0..len {
+    let toffset = toffset as usize;
+    let ooffset = ooffset as usize;
+    for i in 0..len as usize {
         let su = s_units[toffset + i];
         let ou = o_units[ooffset + i];
         let eq = if ignore_case {
@@ -7984,20 +12235,41 @@ pub(crate) fn native_string_region_matches_ic(
     Ok(Some(Value::Int(1)))
 }
 
-/// Case-insensitive comparison of two UTF-16 code units, mirroring
-/// `String.regionMatches(true, ...)`: equal directly, or after folding both to
-/// upper-case, or (per the JDK) to lower-case. Surrogate code units (which are
-/// not assignable to a `char` scalar) only compare equal when bit-identical.
+/// Case-insensitive comparison of two UTF-16 code units, transcribing
+/// `StringUTF16.regionMatchesCI`:
+///
+/// ```text
+/// if (c1 == c2) continue;
+/// char u1 = Character.toUpperCase(c1);
+/// char u2 = Character.toUpperCase(c2);
+/// if (u1 == u2) continue;
+/// if (Character.toLowerCase(u1) == Character.toLowerCase(u2)) continue;
+/// return false;
+/// ```
+///
+/// Note that the JDK lower-cases the **upper-cased** forms, not the originals;
+/// that composition is what makes `U+212A` KELVIN SIGN match `k`.
+///
+/// W7-95a. The old body called `char::to_uppercase()`/`to_lowercase()`, the
+/// FULL Unicode mappings, and compared the resulting iterators.
+/// `"İ".regionMatches(true, 0, "i", 0, 1)` is `true` on OpenJDK 25.0.3+9 and
+/// was `false` here: Java's 1:1 `Character.toLowerCase(U+0130)` is plain `i`,
+/// while the full SpecialCasing mapping is two characters. See
+/// [`java_char_to_upper_case`] for the BMP-wide derivation of the difference.
+///
+/// A surrogate code unit has no case mapping and both helpers return it
+/// unchanged, so surrogates compare equal only when bit-identical — which is
+/// what HotSpot answers.
 fn code_unit_eq_ignore_case(a: u16, b: u16) -> bool {
     if a == b {
         return true;
     }
-    match (char::from_u32(a as u32), char::from_u32(b as u32)) {
-        (Some(ca), Some(cb)) => {
-            ca.to_uppercase().eq(cb.to_uppercase()) || ca.to_lowercase().eq(cb.to_lowercase())
-        }
-        _ => false,
+    let ua = java_char_to_upper_case(a);
+    let ub = java_char_to_upper_case(b);
+    if ua == ub {
+        return true;
     }
+    java_char_to_lower_case(ua) == java_char_to_lower_case(ub)
 }
 
 /// regionMatches(int toffset, String other, int ooffset, int len) — case-sensitive
@@ -8014,8 +12286,8 @@ pub(crate) fn native_string_region_matches(
         _ => 0,
     };
     let other = match args.get(2) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        Some(Value::Object(o)) => *o,
+        _ => None,
     };
     let ooffset_i = match args.get(3) {
         Some(Value::Int(v)) => *v,
@@ -8025,35 +12297,7 @@ pub(crate) fn native_string_region_matches(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if toffset_i < 0 || ooffset_i < 0 || len_i < 0 {
-        return Ok(Some(Value::Int(0)));
-    }
-    let toffset = toffset_i as usize;
-    let ooffset = ooffset_i as usize;
-    let len = len_i as usize;
-
-    let s = ctx.read_string(this).unwrap_or_default();
-    // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
-    // not Unicode code points. Index over u16 to agree with charAt/length.
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let o_units: Vec<u16> = other.encode_utf16().collect();
-
-    if toffset
-        .checked_add(len)
-        .map_or(true, |end| end > s_units.len())
-        || ooffset
-            .checked_add(len)
-            .map_or(true, |end| end > o_units.len())
-    {
-        return Ok(Some(Value::Int(0)));
-    }
-
-    for i in 0..len {
-        if s_units[toffset + i] != o_units[ooffset + i] {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
-    Ok(Some(Value::Int(1)))
+    region_matches_impl(ctx, this, toffset_i, other, ooffset_i, len_i, false)
 }
 
 /// formatted(Object[]) — instance method: this.formatted(args) → String.format(this, args)
@@ -8077,7 +12321,12 @@ pub(crate) fn native_string_format_locale(
         args.get(1).cloned().unwrap_or(Value::Object(None)),
         args.get(2).cloned().unwrap_or(Value::Object(None)),
     ];
-    format_impl(ctx, &format_args, locale)
+    // `Given`, not `DefaultFormat`, EVEN WHEN `locale` IS `None`: an explicit
+    // `null` `Locale` is the JDK's "no localization is applied", a different
+    // request from an overload that has no `Locale` at all. Collapsing the two
+    // is precisely the bug `native_string_format` no longer has, and re-making
+    // it here would be that bug arriving from the other direction.
+    format_impl(ctx, &format_args, FmtLocale::Given(locale))
 }
 
 pub(crate) fn native_string_formatted(
@@ -8485,42 +12734,37 @@ fn native_string_index_of_str_from(
     };
     let tgt = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
+        // E18. E8 fixed the ONE-argument `indexOf(String)` and left this
+        // overload swallowing its null into a `-1` — the same
+        // indistinguishable-from-a-real-miss answer, from the sibling
+        // registered twelve lines away. The two overloads even have DIFFERENT
+        // helpful-NPE texts, measured on OpenJDK 25.0.3+9:
+        //   "abc".indexOf(null)     -> Cannot invoke "String.coder()"  because "str"    is null
+        //   "abc".indexOf(null, 0)  -> Cannot invoke "String.length()" because "tgtStr" is null
+        // and the offset does NOT gate it: `indexOf(null, -1)` and
+        // `indexOf(null, 99)` throw as well, so unlike `startsWith`/
+        // `regionMatches` there is no short-circuit to transcribe here.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"String.length()\" because \"tgtStr\" is null",
+            ))
+        }
     };
-    let from_raw = match args.get(2) {
+    let from = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let src = ctx.read_string(this).unwrap_or_default();
-    let needle = ctx.read_string(tgt).unwrap_or_default();
     // bug nb-lang-string: index over UTF-16 code UNITS, not Unicode code
     // points. Rust `char` is a code point, so `chars()`-based indexing is off
     // by one per preceding supplementary (>U+FFFF) char and disagrees with
-    // charAt/length. Match `encode_utf16()` as charAt and the static helper do.
-    let src_units: Vec<u16> = src.encode_utf16().collect();
-    let needle_units: Vec<u16> = needle.encode_utf16().collect();
-    let src_len = src_units.len() as i32;
-    let from = from_raw.max(0);
-    if needle_units.is_empty() {
-        // JDK: empty needle → clamp(from, 0, length)
-        return Ok(Some(Value::Int(from.min(src_len))));
-    }
-    if from >= src_len {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let nlen = needle_units.len();
-    if nlen > src_units.len() {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let max_start = src_units.len() - nlen;
-    let mut i = from as usize;
-    while i <= max_start {
-        if src_units[i..i + nlen] == needle_units[..] {
-            return Ok(Some(Value::Int(i as i32)));
-        }
-        i += 1;
-    }
-    Ok(Some(Value::Int(-1)))
+    // charAt/length. E18: reading through `ctx.read_string` (a Rust `String`)
+    // additionally turned every unpaired surrogate into U+FFFD on BOTH sides,
+    // so two different lone surrogates matched — the scratch decode is the
+    // lossless one and is what `indexOf(String)` already used.
+    let result = with_two_string_chars_scratches(ctx, this, tgt, |haystack, needle| {
+        index_of_units_from(haystack, needle, from)
+    });
+    Ok(Some(Value::Int(result)))
 }
 
 /// `String.indexOf(byte[] src, byte coder, int srcCount, String tgt, int from)`
@@ -8589,27 +12833,13 @@ fn native_string_index_of_static_helper(
         }
     }
 
-    let needle_str = ctx.read_string(tgt).unwrap_or_default();
-    let needle_units: Vec<u16> = needle_str.encode_utf16().collect();
-
-    let src_len = src_units.len() as i32;
-    let from = from_raw.max(0);
-    if needle_units.is_empty() {
-        return Ok(Some(Value::Int(from.min(src_len))));
-    }
-    if from >= src_len {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let nlen = needle_units.len();
-    let max_start = src_units.len().saturating_sub(nlen);
-    let mut i = from as usize;
-    while i <= max_start {
-        if src_units[i..i + nlen] == needle_units[..] {
-            return Ok(Some(Value::Int(i as i32)));
-        }
-        i += 1;
-    }
-    Ok(Some(Value::Int(-1)))
+    // E18: the same scan as the two public overloads. The private copy that
+    // stood here had a `saturating_sub` where they had a length guard, so a
+    // needle LONGER than `srcCount` re-examined index 0 instead of failing —
+    // one rule, three loops, three bounds expressions.
+    let needle_units = with_string_chars_scratch(ctx, tgt, |units| units.to_vec());
+    let result = index_of_units_from(&src_units, &needle_units, from_raw);
+    Ok(Some(Value::Int(result)))
 }
 
 // ---------------------------------------------------------------------------
@@ -8885,6 +13115,202 @@ mod tests {
         // Lone surrogate code units only match when bit-identical.
         assert!(code_unit_eq_ignore_case(0xD83D, 0xD83D));
         assert!(!code_unit_eq_ignore_case(0xD83D, 0xDE00));
+    }
+
+    /// The rule `equalsIgnoreCase` now shares with `regionMatches(true, …)`.
+    ///
+    /// Every row is the verbatim OpenJDK 25.0.3+9 answer to the corresponding
+    /// `String.equalsIgnoreCase` call. The A7Dx rows are the ones Rust's
+    /// `to_lowercase()` — the implementation this replaced — got wrong.
+    #[test]
+    fn equals_ignore_case_folds_the_way_the_jdk_does() {
+        // "İ".equalsIgnoreCase("i") is TRUE: Java's 1:1 toLowerCase(U+0130) is
+        // a plain `i`, while Rust's full mapping is `i` + U+0307.
+        assert!(code_unit_eq_ignore_case(0x0130, 0x0069));
+        assert!(code_unit_eq_ignore_case(0x0130, 0x0049));
+        // U+212A KELVIN SIGN folds onto `k` through the upper-then-lower
+        // composition.
+        assert!(code_unit_eq_ignore_case(0x212A, 0x006B));
+        // The titlecase letter matches its uppercase partner.
+        assert!(code_unit_eq_ignore_case(0x01C5, 0x01C4));
+        // The six the JDK does not case-pair, measured `false` on HotSpot and
+        // `true` under Rust's newer tables.
+        assert!(!code_unit_eq_ignore_case(0xA7D3, 0xA7D2));
+        assert!(!code_unit_eq_ignore_case(0xA7D5, 0xA7D4));
+        assert!(!code_unit_eq_ignore_case(0xA7CF, 0xA7CE));
+        // ... and the neighbours that ARE pairs, so this is not a range.
+        assert!(code_unit_eq_ignore_case(0xA7D1, 0xA7D0));
+        assert!(code_unit_eq_ignore_case(0xA7D7, 0xA7D6));
+        // Identity still holds for all six.
+        for cp in [0xA7CEu16, 0xA7CF, 0xA7D2, 0xA7D3, 0xA7D4, 0xA7D5] {
+            assert!(code_unit_eq_ignore_case(cp, cp));
+        }
+    }
+
+    /// `compareToIgnoreCase` returns a DIFFERENCE, not a sign.
+    ///
+    /// The folded-difference rows measured on OpenJDK 25.0.3+9:
+    /// `"_".compareToIgnoreCase("a")` is `-2`, `"B".compareToIgnoreCase("a")`
+    /// is `1`, `"İ".compareToIgnoreCase("i")` is `0`, and
+    /// `"\u{A7D3}".compareToIgnoreCase("\u{A7D2}")` is `1`. The old body
+    /// returned `-1`/`0`/`1` from an `Ordering` over Rust-lowercased strings,
+    /// which is a wrong magnitude in the first row and a wrong SIGN in the
+    /// third and fourth.
+    #[test]
+    fn compare_to_ignore_case_returns_the_folded_difference() {
+        // The fold each row depends on, in the JDK's upper-then-lower order.
+        let folded = |c: u16| java_char_to_lower_case(java_char_to_upper_case(c));
+        assert_eq!(i32::from(folded(b'_' as u16)) - i32::from(folded(b'a' as u16)), -2);
+        assert_eq!(i32::from(folded(b'B' as u16)) - i32::from(folded(b'a' as u16)), 1);
+        // "İ" vs "i": the uppercases differ, the lowercases do not, so the
+        // loop continues and equal lengths give 0.
+        assert_ne!(java_char_to_upper_case(0x0130), java_char_to_upper_case(0x0069));
+        assert_eq!(folded(0x0130), folded(0x0069));
+        // A7D3 vs A7D2: both fold to themselves, so the difference is 1.
+        assert_eq!(i32::from(folded(0xA7D3)) - i32::from(folded(0xA7D2)), 1);
+    }
+
+    /// The `regionMatches` short circuit, pinned against the eight rows
+    /// measured on OpenJDK 25.0.3+9 with the receiver `"abc"`.
+    ///
+    /// `true` means the JDK returned `false` without touching `other`; `false`
+    /// means it reached `other.length()`, which is a NullPointerException when
+    /// `other` is null. All eight used to answer plain `false` here.
+    #[test]
+    fn region_matches_dereferences_other_exactly_where_the_jdk_does() {
+        let abc = 3i64;
+        // Reaches other.length() -> NPE for a null `other`.
+        assert!(!region_matches_short_circuits(abc, 0, 0, 1));
+        assert!(!region_matches_short_circuits(abc, 0, 0, -1)); // negative len does NOT save it
+        assert!(!region_matches_short_circuits(abc, 3, 0, 0)); // toffset == length() - len
+        assert!(!region_matches_short_circuits(0, 0, 0, 0)); // "" receiver, still reached
+        assert!(!region_matches_short_circuits(abc, 0, 0, i64::from(i32::MIN)));
+        // Decided by terms one to three -> `false`, `other` never read.
+        assert!(region_matches_short_circuits(abc, -1, 0, 1)); // toffset < 0
+        assert!(region_matches_short_circuits(abc, 0, -1, 1)); // ooffset < 0
+        assert!(region_matches_short_circuits(abc, 99, 0, 1)); // toffset > len - len
+        assert!(region_matches_short_circuits(abc, 0, 0, 4)); // 0 > 3 - 4
+        assert!(region_matches_short_circuits(abc, i64::from(i32::MAX), 0, 1));
+        // The widening is load-bearing: with `i32` arithmetic
+        // `length() - Integer.MIN_VALUE` wraps negative and the third term
+        // would wrongly short-circuit.
+        assert!(!region_matches_short_circuits(abc, 0, 0, i64::from(i32::MIN)));
+    }
+
+    // -----------------------------------------------------------------------
+    // E18: String.{indexOf,lastIndexOf}(int ch[, int from])
+    //
+    // Written against a `&[u16]` rather than a heap String on purpose: a
+    // `NativeContext` mock cannot even express the interesting receivers,
+    // because `create_string(&str)` cannot hold an UNPAIRED surrogate and the
+    // lone-surrogate rows are half the contract. Every expectation below is a
+    // measured OpenJDK 25.0.3+9 answer (`scratchpad/e18/CharSearch.java`,
+    // `Idx3.java`) — not a re-derivation from Rust's `char`, which is the
+    // proxy-oracle trap E8 §4.2 warns about and which is exactly what
+    // `char::from_u32` was doing here.
+    // -----------------------------------------------------------------------
+
+    /// `"xзy𐐷z"` — a Cyrillic з (U+0437, the LOW HALF of U+10437 when masked),
+    /// then the real surrogate pair for U+10437 at index 3.
+    const MIXED: &[u16] = &[0x0078, 0x0437, 0x0079, 0xD801, 0xDC37, 0x007A];
+    /// `"abc"`, whose 'a' is `0x10061 & 0xFFFF`.
+    const ABC: &[u16] = &[0x0061, 0x0062, 0x0063];
+
+    fn idx(h: &[u16], ch: i32, from: i32) -> i32 {
+        match code_point_needle(ch) {
+            Some(n) => index_of_units_from(h, n.units(), from),
+            None => -1,
+        }
+    }
+
+    fn last_idx(h: &[u16], ch: i32, from: i64) -> i32 {
+        match code_point_needle(ch) {
+            Some(n) => last_index_of_units_from(h, n.units(), from),
+            None => -1,
+        }
+    }
+
+    #[test]
+    fn a_supplementary_needle_is_a_surrogate_pair_and_never_its_masked_low_half() {
+        // THE row: `(ch & 0xFFFF)` finds 'a' at 0. HotSpot answers -1.
+        assert_eq!(idx(ABC, 0x10061, 0), -1);
+        assert_eq!(idx(ABC, 0x10061, -5), -1);
+        assert_eq!(last_idx(ABC, 0x10061, 2), -1);
+        assert_eq!(last_idx(ABC, 0x10061, i64::MAX), -1);
+        // Same shape with a receiver that really does contain the low half.
+        assert_eq!(idx(&[0x0437], 0x10437, 0), -1);
+        assert_eq!(last_idx(&[0x0437], 0x10437, i64::MAX), -1);
+        // …and the pair itself IS found, at the index of the HIGH surrogate.
+        assert_eq!(idx(MIXED, 0x10437, 0), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, i64::MAX), 3);
+    }
+
+    #[test]
+    fn a_lone_surrogate_needle_is_an_ordinary_code_unit_scan() {
+        // `char::from_u32` answers `None` for both of these, which is how
+        // `lastIndexOf(int)` came to return -1 where HotSpot returns 3 and 4.
+        assert_eq!(idx(MIXED, 0xD801, 0), 3);
+        assert_eq!(idx(MIXED, 0xDC37, 0), 4);
+        assert_eq!(last_idx(MIXED, 0xD801, i64::MAX), 3);
+        assert_eq!(last_idx(MIXED, 0xDC37, i64::MAX), 4);
+    }
+
+    #[test]
+    fn the_gate_is_is_valid_code_point_and_not_a_narrowing_cast() {
+        // `(char) -1` is 0xFFFF and this receiver holds 0xFFFF, yet HotSpot
+        // answers -1: `Character.isValidCodePoint` is checked first.
+        let ffff: &[u16] = &[0xFFFF, 0x0071];
+        assert_eq!(idx(ffff, -1, 0), -1);
+        assert_eq!(last_idx(ffff, -1, i64::MAX), -1);
+        assert_eq!(idx(ffff, i32::MIN, 0), -1);
+        // 0xFFFF is a NONCHARACTER but a valid code point, so it IS found.
+        assert_eq!(idx(ffff, 0xFFFF, 0), 0);
+        // Above the Unicode range, nothing matches.
+        assert_eq!(idx(ABC, 0x110000, 0), -1);
+        assert_eq!(idx(ABC, 0x1FFFFFF, 0), -1);
+        assert_eq!(last_idx(ABC, 0x110000, i64::MAX), -1);
+    }
+
+    #[test]
+    fn from_index_clamps_forward_and_floors_backward() {
+        assert_eq!(idx(MIXED, 0x10437, 3), 3);
+        assert_eq!(idx(MIXED, 0x10437, 4), -1); // starts past the pair
+        assert_eq!(idx(MIXED, 0x10437, 99), -1);
+        assert_eq!(idx(MIXED, 0x10437, -5), 3); // negative clamps to 0
+        assert_eq!(idx(ABC, 0x61, 99), -1);
+        // Backward: `min(from, len - width)`, and a NEGATIVE from finds
+        // nothing even when the needle is present — the JDK's loop counter
+        // starts below zero and never runs.
+        assert_eq!(last_idx(MIXED, 0x10437, 99), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, 4), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, 3), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, 2), -1); // width 2: start is 2, pair is at 3
+        assert_eq!(last_idx(MIXED, 0x10437, -1), -1);
+        assert_eq!(last_idx(ABC, 0x61, -1), -1);
+        assert_eq!(last_idx(ABC, 0x61, 99), 0);
+        assert_eq!(last_idx(&[], 0x61, 0), -1);
+        // A two-unit needle in a two-unit haystack, started past index 0.
+        assert_eq!(idx(&[0xD801, 0xDC37], 0x10437, 1), -1);
+        assert_eq!(idx(&[0xD801, 0xDC37], 0x10437, 0), 0);
+    }
+
+    #[test]
+    fn the_empty_string_needle_keeps_its_own_contract() {
+        // Not reachable from `code_point_needle` (which is never empty) but
+        // shared with the String-needle overloads, whose measured answers are
+        // `"abcabc".indexOf("", 99) == 6` and `indexOf("", -5) == 0`.
+        let abcabc: &[u16] = &[0x61, 0x62, 0x63, 0x61, 0x62, 0x63];
+        assert_eq!(index_of_units_from(abcabc, &[], 99), 6);
+        assert_eq!(index_of_units_from(abcabc, &[], -5), 0);
+        assert_eq!(index_of_units_from(abcabc, &[], 2), 2);
+        assert_eq!(last_index_of_units_from(abcabc, &[], 99), 6);
+        assert_eq!(last_index_of_units(abcabc, &[]), 6);
+        // …and a needle longer than the haystack is a miss, not a panic.
+        assert_eq!(index_of_units_from(&[0x61], &[0x61, 0x62], 0), -1);
+        assert_eq!(
+            last_index_of_units_from(&[0x61], &[0x61, 0x62], i64::MAX),
+            -1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -9196,6 +13622,51 @@ mod tests {
             other => panic!("expected Object, got {other:?}"),
         };
         assert_eq!(ctx.read_string(obj).unwrap(), "hello");
+    }
+
+    /// E18. The JIT's door and the interpreter's door must answer the same
+    /// null `Locale`.
+    ///
+    /// This is the whole shape of the bug: `jit_string_to_lower_case` called
+    /// `string_case_impl` one layer BELOW the null check, so the same source
+    /// line threw while it was interpreted and returned the default-locale
+    /// string once it tiered up. A tier-dependent answer is invisible to any
+    /// test that runs the method only a few times, which is why the assertion
+    /// is written against the two ENTRY POINTS rather than against the
+    /// behaviour of a warm loop.
+    ///
+    /// Measured on OpenJDK 25.0.3+9: `"AbC".toLowerCase()` is `"abc"`,
+    /// `"AbC".toLowerCase((Locale) null)` throws NullPointerException, and it
+    /// still throws on the 200 000th warm iteration — HotSpot's answer does
+    /// not depend on its tier either.
+    #[test]
+    fn the_jit_lower_case_door_enforces_the_same_null_locale_as_the_native() {
+        let mut ctx = mock_ctx();
+        let s = ctx.create_string("AbC");
+
+        // ABSENT Locale slot — the no-argument overload. Answers, does not
+        // throw. (The JIT has no such call: its one bound descriptor,
+        // `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)`,
+        // always carries the slot.)
+        let absent = native_string_to_lower_case(&mut ctx, &[Value::Object(Some(s))]);
+        match absent {
+            Ok(Some(Value::Object(Some(o)))) => assert_eq!(ctx.read_string(o).unwrap(), "abc"),
+            other => panic!("toLowerCase() must answer \"abc\", got {other:?}"),
+        }
+
+        // PRESENT-and-null Locale — both doors must throw.
+        let interpreted =
+            native_string_to_lower_case(&mut ctx, &[Value::Object(Some(s)), Value::Object(None)]);
+        assert!(
+            interpreted.is_err(),
+            "the interpreted native must throw for toLowerCase((Locale) null)"
+        );
+        let jit = jit_string_to_lower_case(&mut ctx, s, None);
+        assert!(
+            jit.is_err(),
+            "the JIT direct-call door must throw for the SAME call the interpreter throws for — \
+             it took `string_case_impl` directly and answered the default-locale string"
+        );
     }
 
     #[test]
@@ -10028,8 +14499,75 @@ mod tests {
         ));
     }
 
+    /// The detail message of an `IndexOutOfBoundsException`-family failure.
+    ///
+    /// The exact wording separates `Preconditions`' `checkFromToIndex` shape
+    /// (`Range [a, b) out of bounds for length n`) from the `checkIndex` shape,
+    /// which is how a range check that reports the wrong WINDOW is caught even
+    /// when it reports the right class.
+    fn err_message(e: &cratonvm_types::error::MethodCallFailed) -> Option<String> {
+        match e {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            ) => match re {
+                cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { message }
+                | cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                    message,
+                    ..
+                }
+                | cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                    message,
+                    ..
+                } => message.clone(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // `AbstractStringBuilder.getChars` throws THREE different classes depending
+    // on which argument is wrong, and the choice is not the intuitive one. Its
+    // two range checks are one line apart in the JDK and pass DIFFERENT
+    // formatters — `SIOOBE_FORMATTER` for the source window, `IOOBE_FORMATTER`
+    // for the destination — so the destination case is the PLAIN
+    // `IndexOutOfBoundsException`, the superclass of both the
+    // `ArrayIndexOutOfBoundsException` the element stores suggest and the
+    // `StringIndexOutOfBoundsException` its own source-side neighbour throws.
+    //
+    // These assert through `err_kind`, which discriminates all three, because a
+    // `matches!` on `IndexOutOfBoundsException` alone cannot: the two wrong
+    // answers are SUBCLASSES, so any assertion phrased on the supertype passes
+    // on the broken code. MEASURED against jdk-25.0.3.9; see
+    // `docs/known-issues/jdk-only/G53-1-the-exact-exception-class-and-the-rest-of-sbidx-20260817.md`.
+
     #[test]
-    fn sb_get_chars_negative_dst_begin_throws_aioobe() {
+    fn sb_get_chars_too_small_dst_throws_the_plain_ioobe_not_a_subclass() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        let dst = ctx.new_array(ArrayElementType::Char, 2);
+        // `RJdkBridge1`'s `sbidx-step=getChars into a too-small array`, verbatim.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(3),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "ioobe");
+        // The window named is the DESTINATION one, `[dstBegin, dstBegin + n)`
+        // against `dst.length` — not the source window `[0, 3)` against 5.
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [0, 3) out of bounds for length 2")
+        );
+    }
+
+    #[test]
+    fn sb_get_chars_negative_dst_begin_throws_the_plain_ioobe() {
         let mut ctx = mock_ctx();
         let sb = make_sb_with(&mut ctx, "abc");
         let dst = ctx.new_array(ArrayElementType::Char, 8);
@@ -10044,11 +14582,15 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(err_kind(&ctx, &err), "aioobe");
+        assert_eq!(err_kind(&ctx, &err), "ioobe");
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [-1, 2) out of bounds for length 8")
+        );
     }
 
     #[test]
-    fn sb_get_chars_dst_overrun_throws_aioobe() {
+    fn sb_get_chars_dst_overrun_throws_the_plain_ioobe() {
         let mut ctx = mock_ctx();
         let sb = make_sb_with(&mut ctx, "abcde");
         let dst = ctx.new_array(ArrayElementType::Char, 4);
@@ -10064,12 +14606,69 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(err_kind(&ctx, &err), "aioobe");
+        assert_eq!(err_kind(&ctx, &err), "ioobe");
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [2, 7) out of bounds for length 4")
+        );
         // The out-of-bounds store must NOT have silently written anything past
         // the array; in-range slots remain at their zero default.
         for i in 0..ctx.array_length(dst) {
             assert_eq!(ctx.get_array_element(dst, i), Value::Int(0));
         }
+    }
+
+    #[test]
+    fn sb_get_chars_bad_src_range_beats_a_null_destination() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        // The source check runs BEFORE `dst` is dereferenced, so `srcBegin >
+        // srcEnd` with a null `dst` is a StringIndexOutOfBoundsException and
+        // NOT the NullPointerException that checking the argument first would
+        // give. Ordering, not just class choice.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(3),
+                Value::Int(1),
+                Value::Object(None),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [3, 1) out of bounds for length 5")
+        );
+    }
+
+    #[test]
+    fn sb_get_chars_null_dst_throws_npe_even_when_nothing_would_be_copied() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        // `dst.length` is read unconditionally once the source window is
+        // accepted, so a zero-length copy into a null array still throws.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Object(None),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::NullPointerException { .. }
+                )
+            )
+        ));
     }
 
     #[test]
@@ -10109,6 +14708,124 @@ mod tests {
             ],
         );
         assert!(r.unwrap().is_none());
+    }
+
+    // `codePointCount` is the ONE range check in this class that the JDK gives a
+    // null formatter (`Preconditions.checkFromToIndex(begin, end, count,
+    // null)`), so it yields the PLAIN `IndexOutOfBoundsException` while its
+    // `delete`/`replace`/`substring` neighbours, checked by the same shared
+    // helper here, yield `StringIndexOutOfBoundsException`. The paired
+    // neighbour assertions below exist so that "fixing" this by changing the
+    // shared helper fails loudly instead of silently regressing four methods.
+
+    #[test]
+    fn sb_code_point_count_bad_range_throws_the_plain_ioobe() {
+        for (begin, end, want_msg) in [
+            (0, 6, "Range [0, 6) out of bounds for length 5"),
+            (-1, 3, "Range [-1, 3) out of bounds for length 5"),
+            (3, 1, "Range [3, 1) out of bounds for length 5"),
+        ] {
+            let mut ctx = mock_ctx();
+            let sb = make_sb_with(&mut ctx, "abcde");
+            let err = native_sb_code_point_count(
+                &mut ctx,
+                &[Value::Object(Some(sb)), Value::Int(begin), Value::Int(end)],
+            )
+            .unwrap_err();
+            assert_eq!(
+                err_kind(&ctx, &err),
+                "ioobe",
+                "codePointCount({begin}, {end})"
+            );
+            assert_eq!(err_message(&err).as_deref(), Some(want_msg));
+        }
+    }
+
+    #[test]
+    fn sb_substring_and_delete_keep_the_string_subclass_that_code_point_count_drops() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        let err = native_sb_substring_range(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(3), Value::Int(1)],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
+
+        let sb = make_sb_with(&mut ctx, "abcde");
+        let err = native_sb_delete(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(3), Value::Int(1)],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
+    }
+
+    #[test]
+    fn sb_code_point_count_valid_window_still_counts_surrogate_pairs() {
+        let mut ctx = mock_ctx();
+        // "a" + U+10437 (a surrogate PAIR) + "b" = 4 units, 3 code points.
+        let sb = make_sb_with(&mut ctx, "a\u{10437}b");
+        let r = native_sb_code_point_count(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(0), Value::Int(4)],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn sb_init_capacity_negative_throws_negative_array_size_not_a_clamp() {
+        // `AbstractStringBuilder(int)` is just `new byte[capacity]`, so a
+        // negative capacity throws NegativeArraySizeException carrying the raw
+        // size. Clamping to zero built a usable empty builder instead.
+        //
+        // Deliberately a DIFFERENT class from `setLength(-1)`'s
+        // StringIndexOutOfBoundsException — the two negative-length paths in
+        // this class do not agree, and `RJdkBridge1` asserts both in a row.
+        for size in [-1_i32, -7] {
+            let mut ctx = mock_ctx();
+            let cid = ctx
+                .ensure_class_initialized("java/lang/StringBuilder")
+                .unwrap();
+            let sb = ctx.alloc_object(cid, 4);
+            let err =
+                native_sb_init_capacity(&mut ctx, &[Value::Object(Some(sb)), Value::Int(size)])
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(
+                            cratonvm_types::error::RuntimeError::NegativeArraySizeException {
+                                size: s
+                            }
+                        )
+                    ) if s == size
+                ),
+                "new StringBuilder({size}) must throw NegativeArraySizeException({size})"
+            );
+        }
+    }
+
+    #[test]
+    fn sb_init_capacity_zero_and_positive_still_build_an_empty_builder() {
+        for size in [0_i32, 5] {
+            let mut ctx = mock_ctx();
+            let cid = ctx
+                .ensure_class_initialized("java/lang/StringBuilder")
+                .unwrap();
+            let sb = ctx.alloc_object(cid, 4);
+            native_sb_init_capacity(&mut ctx, &[Value::Object(Some(sb)), Value::Int(size)])
+                .unwrap();
+            // A capacity is not a length: the builder starts empty either way.
+            let len = native_sb_length(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+            assert_eq!(
+                len,
+                Some(Value::Int(0)),
+                "new StringBuilder({size}).length()"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -10186,5 +14903,1322 @@ mod tests {
         assert!(registry
             .find("java/lang/AbstractStringBuilder", "getCoder", "()B")
             .is_some());
+    }
+}
+
+/// F22 — the UTF-16-unit formatter pipeline and the `%t` zone.
+///
+/// Every expectation here was measured on HotSpot 25.0.3+9-LTS before it was
+/// written, and each test names the wrong implementation it kills. These are
+/// PURE functions asserted directly: routing them through a `NativeContext`
+/// mock would have measured the mock's name-to-slot fallback rather than the
+/// rule.
+#[cfg(test)]
+mod f22_utf16_formatter_tests {
+    use super::*;
+
+    /// `[%5.1s]` of U+1F600 is SEVEN characters on HotSpot 25:
+    /// `005B 0020 0020 0020 0020 D83D 005D`. The truncation keeps the lone HIGH
+    /// surrogate, and the justifier then pads to 5 - 1 = 4.
+    ///
+    /// Mutants this kills:
+    ///   * a truncator that counts CODE POINTS keeps the whole pair -> 2 units,
+    ///     pad 3, total 7 but the WRONG units (`D83D DE00` both present);
+    ///   * a truncator that refuses to split a pair returns 0 units, pad 5,
+    ///     total 7 again — which is why the assertion is on the UNITS and not
+    ///     only on the length. Both wrong answers have length 7.
+    #[test]
+    fn truncate_then_justify_keeps_a_lone_high_surrogate() {
+        let emoji: Vec<u16> = "\u{1F600}".encode_utf16().collect();
+        assert_eq!(emoji, vec![0xD83D, 0xDE00]);
+
+        let mut units = emoji.clone();
+        fmt_truncate_units(&mut units, 1);
+        assert_eq!(
+            units,
+            vec![0xD83D],
+            "%.1s must keep the lone high surrogate"
+        );
+
+        let padded = fmt_pad_to_width(units, "", Some(5)).expect("width 5 is small");
+        assert_eq!(padded, vec![0x0020, 0x0020, 0x0020, 0x0020, 0xD83D]);
+
+        // The whole `[%5.1s]` row, brackets included.
+        let mut row = vec![0x005Bu16];
+        row.extend_from_slice(&padded);
+        row.push(0x005D);
+        assert_eq!(row.len(), 7, "HotSpot 25 measures 7 characters");
+        assert_eq!(
+            row,
+            vec![0x005B, 0x0020, 0x0020, 0x0020, 0x0020, 0xD83D, 0x005D]
+        );
+    }
+
+    /// `%.3s` of `"a<U+1F600>b"` is three code UNITS — `0061 D83D DE00` — and
+    /// `%.2s` of three lone high surrogates keeps two of them.
+    ///
+    /// Kills a code-POINT truncator (which answers `a<U+1F600>b`, 4 units) and
+    /// a byte truncator (`str::len` would cut `a` plus 2 bytes of the emoji).
+    #[test]
+    fn truncate_counts_code_units_not_points_or_bytes() {
+        let mut units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        assert_eq!(units.len(), 4);
+        fmt_truncate_units(&mut units, 3);
+        assert_eq!(units, vec![0x0061, 0xD83D, 0xDE00]);
+
+        let mut lone = vec![0xD800u16, 0xD800, 0xD800];
+        fmt_truncate_units(&mut lone, 2);
+        assert_eq!(lone, vec![0xD800, 0xD800]);
+
+        // A precision at or past the length is a no-op, not a pad.
+        let mut short = vec![0x0061u16];
+        fmt_truncate_units(&mut short, 9);
+        assert_eq!(short, vec![0x0061]);
+    }
+
+    /// The justifier counts UTF-16 units, pads with U+0020, and honours '-'.
+    ///
+    /// Kills a `str::len` (byte) justifier: `"é"` is one unit and two UTF-8
+    /// bytes, and `String.format("%5s|", "é")` needs FOUR spaces on HotSpot 25.
+    /// Also kills a justifier that treats a lone surrogate as zero-width.
+    #[test]
+    fn justifier_counts_units_and_honours_left_flag() {
+        let e: Vec<u16> = "\u{00e9}".encode_utf16().collect();
+        assert_eq!(e.len(), 1);
+        let padded = fmt_pad_to_width(e.clone(), "", Some(5)).unwrap();
+        assert_eq!(padded.len(), 5);
+        assert_eq!(padded[..4], [0x0020, 0x0020, 0x0020, 0x0020]);
+
+        let left = fmt_pad_to_width(e, "-", Some(5)).unwrap();
+        assert_eq!(left[0], 0x00E9);
+        assert_eq!(left[1..], [0x0020, 0x0020, 0x0020, 0x0020]);
+
+        // A lone surrogate is ONE unit to the justifier, like any other char.
+        let lone = fmt_pad_to_width(vec![0xD800], "", Some(3)).unwrap();
+        assert_eq!(lone, vec![0x0020, 0x0020, 0xD800]);
+
+        // No width, and a width no larger than the content, are both no-ops.
+        assert_eq!(
+            fmt_pad_to_width(vec![0x0061], "", None).unwrap(),
+            vec![0x0061]
+        );
+        assert_eq!(
+            fmt_pad_to_width(vec![0x0061, 0x0062], "", Some(2)).unwrap(),
+            vec![0x0061, 0x0062]
+        );
+    }
+
+    /// `Character.toChars` semantics for the `%c` conversion, as
+    /// [`fmt_general_units`] applies them: one unit for any BMP code point
+    /// INCLUDING a lone surrogate, a high+low pair for a supplementary one.
+    ///
+    /// Measured: `String.format(ROOT, "%c", (int) 0xD800)` has `length() == 1`
+    /// and unit `D800` on HotSpot 25. Kills the
+    /// `char::from_u32(..).unwrap_or('?')` implementation, which answers `003F`.
+    #[test]
+    fn code_point_to_units_matches_character_to_chars() {
+        fn to_units(cp: u32) -> Vec<u16> {
+            if cp > 0xFFFF {
+                let v = cp - 0x10000;
+                vec![(0xD800 + (v >> 10)) as u16, (0xDC00 + (v & 0x3FF)) as u16]
+            } else {
+                vec![cp as u16]
+            }
+        }
+        assert_eq!(
+            to_units(0xD800),
+            vec![0xD800],
+            "lone HIGH surrogate, not '?'"
+        );
+        assert_eq!(to_units(0xDFFF), vec![0xDFFF], "lone LOW surrogate, not '?'");
+        assert_eq!(to_units(0x1F600), vec![0xD83D, 0xDE00]);
+        assert_eq!(to_units(0x41), vec![0x0041]);
+        assert_eq!(to_units(0x10FFFF), vec![0xDBFF, 0xDFFF]);
+        // Agrees with Rust wherever Rust can answer at all.
+        for cp in [0x41u32, 0xE9, 0x20AC, 0x1F600, 0x10FFFF] {
+            let expect: Vec<u16> = char::from_u32(cp)
+                .unwrap()
+                .to_string()
+                .encode_utf16()
+                .collect();
+            assert_eq!(to_units(cp), expect, "cp {cp:#x}");
+        }
+    }
+
+    /// `TimeZone`'s `GMT±HH:MM` fallback, which is HotSpot's own `Locale.ROOT`
+    /// answer for `%tZ`. Measured rows: `America/New_York` in November is
+    /// `GMT-05:00` (offset -18000000 ms) and in July `GMT-04:00`;
+    /// `Europe/Berlin` is `GMT+01:00` / `GMT+02:00`; `Asia/Kolkata` is
+    /// `GMT+05:30`.
+    ///
+    /// Kills an implementation that (a) drops the sign on a negative offset,
+    /// (b) divides by 3_600_000 and loses the half-hour minutes, or
+    /// (c) renders the minutes as a fraction of an hour.
+    #[test]
+    fn gmt_fallback_form_matches_hotspot_rows() {
+        assert_eq!(fmt_zone_gmt_form(-18_000_000), "GMT-05:00");
+        assert_eq!(fmt_zone_gmt_form(-14_400_000), "GMT-04:00");
+        assert_eq!(fmt_zone_gmt_form(3_600_000), "GMT+01:00");
+        assert_eq!(fmt_zone_gmt_form(7_200_000), "GMT+02:00");
+        assert_eq!(fmt_zone_gmt_form(19_800_000), "GMT+05:30", "half-hour zone");
+        assert_eq!(fmt_zone_gmt_form(0), "GMT+00:00");
+        // Nepal, the 45-minute zone — the case an hours-only render would lose.
+        assert_eq!(fmt_zone_gmt_form(20_700_000), "GMT+05:45");
+    }
+
+    /// A zone that was never resolved must keep the pre-existing UTC identity,
+    /// so a VM with no reachable `java.util.TimeZone` does not start printing
+    /// `GMT+00:00` where it used to print `UTC`, and does not shift any field.
+    #[test]
+    fn unknown_zone_is_utc_and_zero_offset() {
+        assert_eq!(FmtZone::NONE.offset_ms, 0);
+        assert!(!FmtZone::NONE.dst);
+        assert!(!FmtZone::NONE.known);
+        // A `NONE` zone must not claim to be a `java.time` one, or `%tZ` would
+        // go looking for a `ZoneId` on a `Date`.
+        assert!(!FmtZone::NONE.temporal);
+    }
+
+    /// Which `java.time` sources refuse which `%t` fields — the full measured
+    /// matrix from HotSpot 25 (`String.format(Locale.ROOT, "%t"+f, src)` for
+    /// each of the 31 fields against each source, under
+    /// `-Duser.timezone=Asia/Kolkata`). The six original sources are F28-1's;
+    /// `OffsetTime`, `YearMonth`, `MonthDay`, `Year` and `Month` are G2-1's,
+    /// measured 2026-08-16.
+    ///
+    /// This is the check the lane exists for: every one of these used to be
+    /// ANSWERED here, from a fabricated 0, because `invoke_i32` returns 0 for
+    /// a method the class does not have.
+    ///
+    /// Mutants this kills, each a specific wrong implementation:
+    ///  * "only `%tZ` refuses" (the brief's framing) — the `%tH`/`%tY` rows;
+    ///  * one flag for all clock fields — the `Instant` `%tL`/`%tN` rows,
+    ///    which are ANSWERED while `%tH` is not;
+    ///  * composites reporting their OWN character — `%tT` of a `LocalDate`
+    ///    reports `H`, `%tc` of an `Instant` reports `a`;
+    ///  * `%tF` reporting an inner character — it reports `F`;
+    ///  * `%tc` reporting a fixed character — it is `a`, `H` or `Z`
+    ///    depending on which group is missing;
+    ///  * refusing anything on an epoch-shaped source.
+    #[test]
+    fn temporal_support_matrix_matches_hotspot() {
+        const INSTANT: FmtSupport = FmtSupport {
+            year: false,
+            month: false,
+            day: false,
+            time: false,
+            sub_second: true,
+            instant: true,
+            zone: false,
+            calendar_printer: false,
+        };
+        const LOCAL_DATE: FmtSupport = FmtSupport {
+            year: true,
+            month: true,
+            day: true,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const LOCAL_TIME: FmtSupport = FmtSupport {
+            year: false,
+            month: false,
+            day: false,
+            time: true,
+            sub_second: true,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const LOCAL_DATE_TIME: FmtSupport = FmtSupport {
+            year: true,
+            month: true,
+            day: true,
+            time: true,
+            sub_second: true,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const ZONED: FmtSupport = FmtSupport {
+            year: true,
+            month: true,
+            day: true,
+            time: true,
+            sub_second: true,
+            instant: true,
+            zone: true,
+            calendar_printer: false,
+        };
+        // G2-1's four partial `java.time` sources, plus `OffsetTime`.
+        const OFFSET_TIME: FmtSupport = FmtSupport {
+            year: false,
+            month: false,
+            day: false,
+            time: true,
+            sub_second: true,
+            instant: false,
+            zone: true,
+            calendar_printer: false,
+        };
+        const YEAR_MONTH: FmtSupport = FmtSupport {
+            year: true,
+            month: true,
+            day: false,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const MONTH_DAY: FmtSupport = FmtSupport {
+            year: false,
+            month: true,
+            day: true,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const YEAR_ONLY: FmtSupport = FmtSupport {
+            year: true,
+            month: false,
+            day: false,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const MONTH_ONLY: FmtSupport = FmtSupport {
+            year: false,
+            month: true,
+            day: false,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+
+        // `calendar_printer` is NOT derivable from the support flags:
+        // `ZONED` sets every one of them and still takes the OTHER printer.
+        // That is the whole reason it is a stored field, so assert it.
+        assert!(FmtSupport::ALL.calendar_printer);
+        assert!(!ZONED.calendar_printer);
+        assert_eq!(
+            (
+                ZONED.year,
+                ZONED.month,
+                ZONED.day,
+                ZONED.time,
+                ZONED.sub_second,
+                ZONED.instant,
+                ZONED.zone
+            ),
+            (
+                FmtSupport::ALL.year,
+                FmtSupport::ALL.month,
+                FmtSupport::ALL.day,
+                FmtSupport::ALL.time,
+                FmtSupport::ALL.sub_second,
+                FmtSupport::ALL.instant,
+                FmtSupport::ALL.zone
+            ),
+            "a ZonedDateTime supports exactly what a Calendar does; only the \
+             PRINTER differs, so `calendar_printer` cannot be computed"
+        );
+
+        // G2-1, measured 2026-08-16 on HotSpot 25.0.3+9. Each row is the
+        // source's complete ANSWERED set out of the 31 fields; everything not
+        // listed refuses, with the character given below it. Kills a
+        // "one `date` flag" implementation at every one of the five sources.
+        for (name, sup, answers) in [
+            ("OffsetTime", OFFSET_TIME, "HIklMSLNpzZRTr"),
+            ("YearMonth", YEAR_MONTH, "CYymBbh"),
+            ("MonthDay", MONTH_DAY, "mdeBbh"),
+            ("Year", YEAR_ONLY, "CYy"),
+            ("Month", MONTH_ONLY, "mBbh"),
+        ] {
+            for f in FMT_DATETIME_FIELDS.chars() {
+                let got = fmt_temporal_fault_char(f, sup);
+                if answers.contains(f) {
+                    assert_eq!(got, None, "%t{f} must be ANSWERED on {name}");
+                } else {
+                    assert!(got.is_some(), "%t{f} must be REFUSED on {name}");
+                }
+            }
+        }
+        // The composites' refusal characters, which a per-type table cannot
+        // produce and a single `date` flag cannot distinguish.
+        for (name, sup, d, ff, c) in [
+            ("OffsetTime", OFFSET_TIME, 'm', 'F', 'a'),
+            ("YearMonth", YEAR_MONTH, 'd', 'd', 'a'),
+            ("MonthDay", MONTH_DAY, 'y', 'F', 'a'),
+            ("Year", YEAR_ONLY, 'm', 'm', 'a'),
+            ("Month", MONTH_ONLY, 'd', 'F', 'a'),
+        ] {
+            assert_eq!(fmt_temporal_fault_char('D', sup), Some(d), "%tD on {name}");
+            assert_eq!(fmt_temporal_fault_char('F', sup), Some(ff), "%tF on {name}");
+            assert_eq!(fmt_temporal_fault_char('c', sup), Some(c), "%tc on {name}");
+        }
+        // `%tA`/`%ta`/`%tj` need a COMPLETE date, which is the derivation in
+        // `FmtSupport::full_date`.
+        for f in "Aaj".chars() {
+            assert_eq!(fmt_temporal_fault_char(f, LOCAL_DATE), None);
+            for sup in [YEAR_MONTH, MONTH_DAY, YEAR_ONLY, MONTH_ONLY, OFFSET_TIME] {
+                assert_eq!(fmt_temporal_fault_char(f, sup), Some(f));
+            }
+        }
+
+        // An epoch-shaped argument takes the `Calendar` printer and refuses
+        // NOTHING — all 31 fields.
+        for f in FMT_DATETIME_FIELDS.chars() {
+            assert_eq!(
+                fmt_temporal_fault_char(f, FmtSupport::ALL),
+                None,
+                "%t{f} must not refuse a Date/Calendar/long"
+            );
+            // A fully-supported `java.time` source likewise.
+            assert_eq!(fmt_temporal_fault_char(f, ZONED), None, "%t{f} on Zoned");
+        }
+
+        // Instant: FOUR answers, 27 refusals.
+        for f in "LNsQ".chars() {
+            assert_eq!(
+                fmt_temporal_fault_char(f, INSTANT),
+                None,
+                "%t{f} on Instant"
+            );
+        }
+        for (f, want) in [
+            ('H', 'H'),
+            ('I', 'I'),
+            ('k', 'k'),
+            ('l', 'l'),
+            ('M', 'M'),
+            ('S', 'S'),
+            ('p', 'p'),
+            ('z', 'z'),
+            ('Z', 'Z'),
+            ('B', 'B'),
+            ('b', 'b'),
+            ('h', 'h'),
+            ('A', 'A'),
+            ('a', 'a'),
+            ('C', 'C'),
+            ('Y', 'Y'),
+            ('y', 'y'),
+            ('j', 'j'),
+            ('m', 'm'),
+            ('d', 'd'),
+            ('e', 'e'),
+            ('R', 'H'),
+            ('T', 'H'),
+            ('r', 'I'),
+            ('D', 'm'),
+            ('F', 'F'),
+            ('c', 'a'),
+        ] {
+            assert_eq!(
+                fmt_temporal_fault_char(f, INSTANT),
+                Some(want),
+                "%t{f} on Instant"
+            );
+        }
+
+        // LocalDate: the date group answers, the clock group does not.
+        for f in "BbhAaCYyjmdeDF".chars() {
+            assert_eq!(
+                fmt_temporal_fault_char(f, LOCAL_DATE),
+                None,
+                "%t{f} on LocalDate"
+            );
+        }
+        for (f, want) in [
+            ('H', 'H'),
+            ('L', 'L'),
+            ('N', 'N'),
+            ('s', 's'),
+            ('Q', 'Q'),
+            ('z', 'z'),
+            ('Z', 'Z'),
+            ('R', 'H'),
+            ('T', 'H'),
+            ('r', 'I'),
+            ('c', 'H'),
+        ] {
+            assert_eq!(
+                fmt_temporal_fault_char(f, LOCAL_DATE),
+                Some(want),
+                "%t{f} on LocalDate"
+            );
+        }
+
+        // LocalTime: the mirror image.
+        for f in "HIklMSpLNRTr".chars() {
+            assert_eq!(
+                fmt_temporal_fault_char(f, LOCAL_TIME),
+                None,
+                "%t{f} on LocalTime"
+            );
+        }
+        for (f, want) in [
+            ('Y', 'Y'),
+            ('b', 'b'),
+            ('a', 'a'),
+            ('s', 's'),
+            ('Q', 'Q'),
+            ('Z', 'Z'),
+            ('D', 'm'),
+            ('F', 'F'),
+            ('c', 'a'),
+        ] {
+            assert_eq!(
+                fmt_temporal_fault_char(f, LOCAL_TIME),
+                Some(want),
+                "%t{f} on LocalTime"
+            );
+        }
+
+        // LocalDateTime: everything but the zone and the epoch.
+        for f in "HIklMSpLNBbhAaCYyjmdeRTrDF".chars() {
+            assert_eq!(
+                fmt_temporal_fault_char(f, LOCAL_DATE_TIME),
+                None,
+                "%t{f} on LocalDateTime"
+            );
+        }
+        for (f, want) in [('z', 'z'), ('Z', 'Z'), ('s', 's'), ('Q', 'Q'), ('c', 'Z')] {
+            assert_eq!(
+                fmt_temporal_fault_char(f, LOCAL_DATE_TIME),
+                Some(want),
+                "%t{f} on LocalDateTime"
+            );
+        }
+    }
+
+    /// The `%t` numbers take the locale's zero digit and NOTHING else takes
+    /// anything. Rows measured on HotSpot 25 under `ar-EG`, whose zero digit
+    /// is U+0660.
+    ///
+    /// Kills: (a) an implementation that leaves the digits ASCII, which is
+    /// what this file did; (b) one that reuses `fmt_localize` and so rewrites
+    /// `'.'` and `','` — `%tD` is `mm/dd/yy` and `ru`'s `%tb` is `нояб.`;
+    /// (c) one that shifts the `'+'` of a `%tz` or the `':'` of a `%tT`;
+    /// (d) one that shifts non-ASCII digits already present in a name.
+    #[test]
+    fn t_digits_take_the_locale_zero_and_nothing_else() {
+        let ar = FmtSymbols {
+            grouping: '\u{066C}',
+            decimal: '\u{066B}',
+            zero: '\u{0660}',
+            // Measured: `ar-EG`'s `getMinusSign()` IS U+002D. It is spelled out
+            // rather than defaulted so this row stays a MEASUREMENT of the
+            // locale and not an inheritance from `FmtSymbols::default`.
+            minus: '-',
+        };
+        assert_eq!(fmt_localize_digits("03", ar), "\u{0660}\u{0663}");
+        assert_eq!(
+            fmt_localize_digits("03:43:19", ar),
+            "\u{0660}\u{0663}:\u{0664}\u{0663}:\u{0661}\u{0669}",
+            "the ':' separators stay ASCII"
+        );
+        assert_eq!(
+            fmt_localize_digits("+0530", ar),
+            "+\u{0660}\u{0665}\u{0663}\u{0660}",
+            "the %tz sign stays ASCII"
+        );
+        assert_eq!(
+            fmt_localize_digits("11/15/23", ar),
+            "\u{0661}\u{0661}/\u{0661}\u{0665}/\u{0662}\u{0663}",
+            "'/' is not the grouping separator"
+        );
+        assert_eq!(
+            fmt_localize_digits("-0044-03-15", ar),
+            "-\u{0660}\u{0660}\u{0664}\u{0664}-\u{0660}\u{0663}-\u{0661}\u{0665}"
+        );
+        // A `DateFormatSymbols` name that ends in '.' must survive intact —
+        // `fmt_localize` would have rewritten that '.' into U+066B.
+        assert_eq!(
+            fmt_localize_digits("\u{043D}\u{043E}\u{044F}\u{0431}.", ar),
+            "\u{043D}\u{043E}\u{044F}\u{0431}."
+        );
+        // The overwhelmingly common case is a no-op, and must be exactly one.
+        let root = FmtSymbols::default();
+        assert_eq!(root.zero, '0');
+        for s in ["03:43:19", "+0530", "1699999999", "нояб.", ""] {
+            assert_eq!(fmt_localize_digits(s, root), s);
+        }
+    }
+
+    /// `%tF`'s year: sign OUTSIDE a four-digit zero pad, and a '+' past 9999.
+    /// Measured on HotSpot 25 under `Locale.ROOT`.
+    ///
+    /// Kills Rust's `{:04}`, which counts the sign inside the width
+    /// (`-044-03-15` for 45 BC) and never emits a '+'.
+    #[test]
+    fn iso_year_signs_sit_outside_the_zero_pad() {
+        assert_eq!(fmt_iso_year(-44, '-'), "-0044");
+        assert_eq!(fmt_iso_year(-1, '-'), "-0001");
+        assert_eq!(fmt_iso_year(0, '-'), "0000");
+        assert_eq!(fmt_iso_year(1, '-'), "0001");
+        assert_eq!(fmt_iso_year(2023, '-'), "2023");
+        assert_eq!(fmt_iso_year(9999, '-'), "9999", "no sign at the boundary");
+        assert_eq!(fmt_iso_year(10000, '-'), "+10000", "the '+' starts here");
+        assert_eq!(fmt_iso_year(12345, '-'), "+12345");
+        // Rust's own render is the mutant, and it differs on three of these.
+        assert_ne!(fmt_iso_year(-44, '-'), format!("{:04}", -44));
+        assert_ne!(fmt_iso_year(12345, '-'), format!("{:04}", 12345));
+    }
+
+    /// F38 — `%tF`'s minus is the LOCALE'S, and it is the only localized minus
+    /// in `java.util.Formatter`.
+    ///
+    /// Measured on HotSpot 25 under `lt-LT` (`getMinusSign()` = U+2212), dumped
+    /// as UTF-16 code units:
+    ///
+    /// | conversion | argument | units |
+    /// |---|---|---|
+    /// | `%tF` | `LocalDate.of(-44,3,15)` | `2212 0030 0030 0034 0034 002D …` |
+    /// | `%tF` | `LocalDate.of(12345,3,4)` | `002B 0031 …` — ASCII '+' |
+    /// | `%tF` | same, `(Locale) null` | `002D 0030 0030 0034 0034 …` |
+    /// | `%d` | `-5` | `002D 0035` |
+    ///
+    /// Mutants this kills:
+    ///  * an ASCII `'-'` — the U+2212 row;
+    ///  * localizing the `'+'` too — the 12345 row (the JDK writes that one as
+    ///    a literal in the same block);
+    ///  * localizing the DATE SEPARATORS as well, which a
+    ///    `replace('-', minus)` over the composed field would do — the
+    ///    `%tF`-shaped row below;
+    ///  * routing the explicit-null locale through a lookup —
+    ///    [`FmtSymbols::default`]'s minus must stay U+002D.
+    #[test]
+    fn iso_year_minus_is_the_locales_and_nothing_else_is() {
+        assert_eq!(fmt_iso_year(-44, '\u{2212}'), "\u{2212}0044");
+        assert_eq!(fmt_iso_year(-1, '\u{2212}'), "\u{2212}0001");
+        // The '+' is a literal even when the minus is not.
+        assert_eq!(fmt_iso_year(12345, '\u{2212}'), "+12345");
+        // A non-negative year consults no symbol at all.
+        assert_eq!(fmt_iso_year(2023, '\u{2212}'), "2023");
+        assert_eq!(fmt_iso_year(0, '\u{2212}'), "0000");
+
+        // The whole `%tF` field: exactly ONE unit changes, and the two date
+        // separators stay ASCII.
+        let field = format!("{}-{:02}-{:02}", fmt_iso_year(-44, '\u{2212}'), 3, 15);
+        assert_eq!(field, "\u{2212}0044-03-15");
+        assert_eq!(field.matches('-').count(), 2, "separators stay ASCII");
+
+        // An explicit null locale is `getMinusSign(null) == '-'`.
+        assert_eq!(FmtSymbols::default().minus, '-');
+        // …and the digit substitution pass leaves the sign alone, whichever it
+        // is. `ar-EG`'s zero digit with a U+2212 minus is not a real locale
+        // pair, which is the point: the two symbols are independent.
+        let ar = FmtSymbols {
+            zero: '\u{0660}',
+            ..FmtSymbols::default()
+        };
+        assert_eq!(
+            fmt_localize_digits("\u{2212}0044-03-15", ar),
+            "\u{2212}\u{0660}\u{0660}\u{0664}\u{0664}-\u{0660}\u{0663}-\u{0661}\u{0665}"
+        );
+    }
+
+    /// F38 — `%tY`/`%ty`/`%tC`, and the year slots of `%tD` and `%tc`, render
+    /// the ERA-RELATIVE year; only `%tF`'s `TemporalAccessor` arm renders the
+    /// proleptic one.
+    ///
+    /// Measured on HotSpot 25, `Locale.ROOT`, `-Duser.timezone=Asia/Kolkata`.
+    /// The `Calendar` rows are the SAME INSTANT as the `LocalDate` rows
+    /// (`-63549548877000L`), which is what makes the `%tF` column the only
+    /// disagreement between the two printers.
+    ///
+    /// Mutants this kills:
+    ///  * rendering the proleptic year — `%tY` of 45 BC would be `-044`;
+    ///  * `-year` instead of `1 - year` — proleptic 0 is 1 BC, not 0 BC, so
+    ///    `LocalDate.of(0,…)` is `0001` and `LocalDate.of(-1,…)` is `0002`;
+    ///  * `rem_euclid(100)` on the proleptic year for `%ty`/`%tD` — that gives
+    ///    `56`, not `45`;
+    ///  * applying the era mapping to `%tF` as well — 45 BC is `-0044-03-15`
+    ///    on the `java.time` side;
+    ///  * applying `fmt_iso_year` to the `Calendar` printer — that puts a '+'
+    ///    on `12345-03-04`, which the JDK does not write there, and a '-' on a
+    ///    BC date whose `Calendar.YEAR` is positive.
+    #[test]
+    fn year_fields_are_era_relative_on_both_printers() {
+        // The mapping itself, against `ChronoField.YEAR_OF_ERA` as measured.
+        fn year_of_era(year: i64) -> i64 {
+            if year <= 0 {
+                1 - year
+            } else {
+                year
+            }
+        }
+        for (proleptic, want) in [(-44i64, 45i64), (-1, 2), (0, 1), (1, 1), (12345, 12345)] {
+            assert_eq!(year_of_era(proleptic), want, "YEAR_OF_ERA of {proleptic}");
+        }
+        assert_eq!(format!("{:04}", year_of_era(-44)), "0045", "%tY of 45 BC");
+        assert_eq!(format!("{:02}", year_of_era(-44) % 100), "45", "%ty");
+        assert_eq!(format!("{:02}", year_of_era(-44) / 100), "00", "%tC");
+        assert_eq!(format!("{:02}", year_of_era(12345) / 100), "123", "%tC AD");
+        assert_eq!(format!("{:02}", year_of_era(12345) % 100), "45", "%ty AD");
+
+        // `%tD`'s year slot is `%ty`'s, not the proleptic remainder.
+        assert_eq!(
+            format!("{:02}/{:02}/{:02}", 3, 15, year_of_era(-44) % 100),
+            "03/15/45"
+        );
+        assert_ne!(
+            format!("{:02}", (-44i64).rem_euclid(100)),
+            "45",
+            "the old proleptic remainder was 56"
+        );
+
+        // `%tF`: the two printers, at the SAME instant.
+        assert_eq!(
+            format!("{}-{:02}-{:02}", fmt_iso_year(-44, '-'), 3, 15),
+            "-0044-03-15",
+            "TemporalAccessor arm: proleptic, signed"
+        );
+        assert_eq!(
+            format!("{:04}-{:02}-{:02}", year_of_era(-44), 3, 15),
+            "0045-03-15",
+            "Calendar arm: era-relative, unsigned"
+        );
+        assert_eq!(
+            format!("{:04}-{:02}-{:02}", year_of_era(12345), 3, 4),
+            "12345-03-04",
+            "Calendar arm writes no '+' past 9999"
+        );
+        assert_ne!(
+            format!("{}-{:02}-{:02}", fmt_iso_year(12345, '-'), 3, 4),
+            "12345-03-04",
+            "…while the TemporalAccessor arm does"
+        );
+    }
+
+    /// `%n` is the platform separator, and the two `%n` arms (the bare
+    /// short circuit and the decorated one, ~440 lines apart) must agree.
+    #[test]
+    fn line_separator_units_are_the_platform_separator() {
+        let units = fmt_line_separator_units();
+        if cfg!(windows) {
+            assert_eq!(units, vec![0x000D, 0x000A]);
+        } else {
+            assert_eq!(units, vec![0x000A]);
+        }
+    }
+
+    /// The parser's per-UNIT `char` view must be index-aligned with the format
+    /// string's units, and must not turn any character the parser tests for
+    /// into something else.
+    ///
+    /// Kills the `str::chars()` collect this replaced: there a surrogate PAIR
+    /// is ONE `char`, so every index after it is off by one and the literal
+    /// push emits the wrong unit.
+    #[test]
+    fn parser_char_view_is_index_aligned_with_units() {
+        // Rust cannot put a lone surrogate in a literal, so it is appended.
+        let units: Vec<u16> = "%5.1s\u{1F600}x"
+            .encode_utf16()
+            .chain(std::iter::once(0xD800))
+            .collect();
+        let chars: Vec<char> = units
+            .iter()
+            .map(|&u| char::from_u32(u32::from(u)).unwrap_or('\u{FFFD}'))
+            .collect();
+        assert_eq!(chars.len(), units.len(), "one char per code UNIT");
+        assert_eq!(chars[0], '%');
+        assert_eq!(chars[1], '5');
+        assert_eq!(chars[2], '.');
+        assert_eq!(chars[3], '1');
+        assert_eq!(chars[4], 's');
+        // The emoji occupies TWO slots now, so 'x' sits at 7, not 6.
+        assert_eq!(chars[7], 'x');
+        assert_eq!(units[7], 0x0078);
+        // A surrogate — half of a pair or lone — is none of the characters the
+        // parser tests for, so it falls through to the literal branch.
+        for (i, c) in chars.iter().enumerate() {
+            if (0xD800..=0xDFFF).contains(&units[i]) {
+                assert_eq!(*c, '\u{FFFD}');
+                assert!(!c.is_ascii_digit() && !c.is_ascii_alphabetic() && *c != '%');
+            }
+        }
+    }
+
+    /// `has_unpaired_surrogate` is the gate that decides whether a result takes
+    /// the lossless units path, so a false negative silently restores the bug.
+    #[test]
+    fn unpaired_surrogate_gate_is_exact() {
+        assert!(!has_unpaired_surrogate(&[0x0061, 0x0062]));
+        let pair: Vec<u16> = "\u{1F600}".encode_utf16().collect();
+        assert!(!has_unpaired_surrogate(&pair));
+        assert!(has_unpaired_surrogate(&[0xD800]));
+        assert!(has_unpaired_surrogate(&[0xDC00]));
+        assert!(has_unpaired_surrogate(&[0xD800, 0x0061]));
+        // A LOW followed by a HIGH is two lone surrogates, not a pair.
+        assert!(has_unpaired_surrogate(&[0xDC00, 0xD800]));
+        // A trailing high surrogate with nothing after it.
+        assert!(has_unpaired_surrogate(&[0x0061, 0xD83D]));
+    }
+}
+
+/// G26 — the builder family's TEXT-carrying entry points.
+///
+/// Two defects, one file, measured on HotSpot 25.0.3+9-LTS before the fix
+/// (`docs/known-issues/jdk-only/G26-1-four-families-of-RJdkIntrinsics3-20260817.md`):
+///
+///   * every `String`/`Object`/`CharSequence` argument was read through a Rust
+///     `str`, which cannot hold an unpaired surrogate — 28 divergent rows of
+///     66 in `scratchpad/g26/G26Builder.java`;
+///   * `insert(int, CharSequence[, int, int])` had no native at all, so real
+///     bytecode ran against the synthetic layout, truncated silently, and left
+///     the receiver in a state where the next `charAt` ABORTED the VM.
+///
+/// These tests assert the units, not a `read_string` round trip: a test written
+/// through `read_string` passes on the broken code, because that is the very
+/// conversion that loses the surrogate.
+#[cfg(test)]
+mod g26_builder_text_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    // `ObjectRef` is NOT re-exported by the parent's `use` list — it is spelled
+    // `cratonvm_types::ObjectRef` at every signature there — so `use super::*`
+    // does not bring it in.
+    use cratonvm_types::{ArrayElementType, ObjectRef};
+
+    /// A `java.lang.String` holding RAW code units, including ones no Rust
+    /// `str` can carry. `create_string` takes a `&str` and so cannot build the
+    /// input this family is about; the char[] is written directly, which is
+    /// the same shape `create_string` produces.
+    fn mock_string_of_units(ctx: &mut MockNativeContext, units: &[u16]) -> ObjectRef {
+        let s = ctx.create_string("");
+        let arr = ctx.new_array(ArrayElementType::Char, units.len());
+        for (i, &u) in units.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(i32::from(u)));
+        }
+        ctx.set_field(s, 0, Value::Object(Some(arr)));
+        s
+    }
+
+    fn fresh_builder(ctx: &mut MockNativeContext) -> ObjectRef {
+        let cid = ctx
+            .ensure_class_initialized("java/lang/StringBuilder")
+            .unwrap();
+        let sb = ctx.alloc_object(cid, 4);
+        native_sb_init_default(ctx, &[Value::Object(Some(sb))]).unwrap();
+        sb
+    }
+
+    fn units_of(ctx: &MockNativeContext, sb: ObjectRef) -> Vec<u16> {
+        sb_read_chars(ctx, sb)
+    }
+
+    fn utf16(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn failure_class(
+        ctx: &dyn NativeContext,
+        e: &cratonvm_types::error::MethodCallFailed,
+    ) -> &'static str {
+        match e {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            ) => match re {
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { .. } => {
+                    "sioobe"
+                }
+                cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { .. } => "ioobe",
+                _ => "other-runtime",
+            },
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) => {
+                let class_id = ctx.class_id_of_object(*obj);
+                match ctx.class_name_of_id(class_id).unwrap_or_default().as_str() {
+                    "java/lang/StringIndexOutOfBoundsException" => "sioobe",
+                    "java/lang/IndexOutOfBoundsException" => "ioobe",
+                    _ => "other-thrown",
+                }
+            }
+            _ => "other-failed",
+        }
+    }
+
+    fn failure_message(e: &cratonvm_types::error::MethodCallFailed) -> String {
+        match e {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            ) => match re {
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                    message,
+                    ..
+                } => message.clone().unwrap_or_default(),
+                cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { message } => {
+                    message.clone().unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    }
+
+    /// The whole point of the helper: a lone LOW surrogate survives the read.
+    /// `read_string` on the same object answers U+FFFD, and asserting that
+    /// difference here is what stops the fix being undone by a "simplification"
+    /// back to `read_string`.
+    #[test]
+    fn read_string_chars_carries_what_read_string_cannot() {
+        let mut ctx = mock_ctx();
+        let s = mock_string_of_units(&mut ctx, &[0x0070, 0xDC00, 0x0071]);
+        assert_eq!(read_string_chars(&ctx, s), vec![0x0070, 0xDC00, 0x0071]);
+        // The lossy twin, for contrast: this is what every entry point below
+        // used to call.
+        assert_eq!(
+            utf16(&ctx.read_string(s).unwrap()),
+            vec![0x0070, 0xFFFD, 0x0071],
+            "read_string is expected to be lossy — that is why it was replaced"
+        );
+    }
+
+    /// `new StringBuilder(s)` — MEASURED rows c1/c2/c3/c5/c7.
+    #[test]
+    fn init_from_string_keeps_an_unpaired_surrogate() {
+        let mut ctx = mock_ctx();
+        let s = mock_string_of_units(&mut ctx, &[0xDC00]);
+        let cid = ctx
+            .ensure_class_initialized("java/lang/StringBuilder")
+            .unwrap();
+        let sb = ctx.alloc_object(cid, 4);
+        native_sb_init_string(&mut ctx, &[Value::Object(Some(sb)), Value::Object(Some(s))])
+            .unwrap();
+        assert_eq!(units_of(&ctx, sb), vec![0xDC00]);
+
+        // A well-formed pair is untouched — the control that would catch a
+        // mutant that broke ordinary text on the way to fixing this row.
+        let cid = ctx
+            .ensure_class_initialized("java/lang/StringBuilder")
+            .unwrap();
+        let sb2 = ctx.alloc_object(cid, 4);
+        let pair = mock_string_of_units(&mut ctx, &[0xD83D, 0xDE00]);
+        native_sb_init_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(pair))],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb2), vec![0xD83D, 0xDE00]);
+    }
+
+    /// `sb.append(s)` / `sb.insert(i, s)` / `sb.replace(a, b, s)` — MEASURED
+    /// rows a1/a2/a12, i1, r1. One test for the three because they are the same
+    /// defect with the same fix, and any one of them passing alone would not
+    /// show the other two had been touched.
+    #[test]
+    fn append_insert_replace_keep_an_unpaired_surrogate() {
+        let mut ctx = mock_ctx();
+        let lone = mock_string_of_units(&mut ctx, &[0xD800]);
+
+        let sb = fresh_builder(&mut ctx);
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(lone))],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), vec![0xD800], "append(String)");
+
+        let sb2 = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        native_sb_insert_string(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb2)),
+                Value::Int(1),
+                Value::Object(Some(lone)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb2),
+            vec![0x0078, 0xD800, 0x0079],
+            "insert(int, String)"
+        );
+
+        let sb3 = fresh_builder(&mut ctx);
+        let xyz = ctx.create_string("xyz");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb3)), Value::Object(Some(xyz))],
+        )
+        .unwrap();
+        native_sb_replace(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb3)),
+                Value::Int(1),
+                Value::Int(2),
+                Value::Object(Some(lone)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb3),
+            vec![0x0078, 0xD800, 0x007A],
+            "replace(int, int, String)"
+        );
+    }
+
+    /// `append(String)` still substitutes the four characters `"null"` for a
+    /// null argument (`AbstractStringBuilder.appendNull`). The units rewrite
+    /// runs through the same `match`, so the null arm is asserted rather than
+    /// assumed.
+    #[test]
+    fn append_string_null_is_still_the_null_literal() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        native_sb_append_string(&mut ctx, &[Value::Object(Some(sb)), Value::Object(None)]).unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("null"));
+    }
+
+    /// `insert(int, Object)` must ASK the object. It read `ctx.read_string`,
+    /// which answers `None` for everything that is not a `java.lang.String`,
+    /// so every other object was inserted as the four characters `"null"`.
+    ///
+    /// MEASURED on HotSpot 25.0.3+9-LTS: `new StringBuilder("ab").insert(0,
+    /// Integer.valueOf(7))` is `7ab`; this VM answered `nullab`.
+    ///
+    /// The mock's `Integer` is a one-field object of that class, which is the
+    /// shape `invoke_to_string_units_opt`'s wrapper fast path recognises — the
+    /// same shape the sibling `append(Object)` has always gone through.
+    #[test]
+    fn insert_object_asks_the_object_instead_of_answering_null() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let ab = ctx.create_string("ab");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(ab))],
+        )
+        .unwrap();
+
+        let int_cid = ctx.ensure_class_initialized("java/lang/Integer").unwrap();
+        let boxed = ctx.alloc_object(int_cid, 1);
+        ctx.set_field(boxed, 0, Value::Int(7));
+
+        native_sb_insert_object(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Object(Some(boxed)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb),
+            utf16("7ab"),
+            "insert(0, Integer.valueOf(7)) must be 7ab, not nullab"
+        );
+    }
+
+    /// A `String` argument to `insert(int, Object)` keeps its raw units —
+    /// MEASURED row i2, and the arm the fix above must not have traded away.
+    #[test]
+    fn insert_object_keeps_an_unpaired_surrogate_from_a_string() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let lone = mock_string_of_units(&mut ctx, &[0xDC00]);
+        native_sb_insert_object(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Object(Some(lone)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), vec![0xDC00]);
+    }
+
+    /// `insert(int, CharSequence)` had NO native: real bytecode ran against the
+    /// synthetic layout and `new StringBuilder("xy").insert(1, (CharSequence)
+    /// "AB")` answered `xA` where HotSpot answers `xABy`.
+    #[test]
+    fn insert_charsequence_inserts_rather_than_overwrites() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let ab = ctx.create_string("AB");
+        native_sb_insert_charsequence(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Object(Some(ab)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("xABy"));
+    }
+
+    /// A null `CharSequence` becomes the four characters `"null"` — HotSpot
+    /// answers `xnully`, this VM answered `xn`.
+    #[test]
+    fn insert_charsequence_null_is_the_null_literal() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        native_sb_insert_charsequence(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(1), Value::Object(None)],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("xnully"));
+    }
+
+    /// The four-argument form's window, and the empty window that must be a
+    /// no-op rather than a refusal — `insert(1, "AB", 1, 1)` answers `xy`.
+    #[test]
+    fn insert_charsequence_range_takes_the_window() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let abc = ctx.create_string("ABC");
+        native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Object(Some(abc)),
+                Value::Int(1),
+                Value::Int(3),
+            ],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("xBCy"));
+
+        let sb2 = fresh_builder(&mut ctx);
+        let xy2 = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(xy2))],
+        )
+        .unwrap();
+        let ab = ctx.create_string("AB");
+        native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb2)),
+                Value::Int(1),
+                Value::Object(Some(ab)),
+                Value::Int(1),
+                Value::Int(1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb2),
+            utf16("xy"),
+            "an empty window is legal and changes nothing"
+        );
+    }
+
+    /// The two refusals are DIFFERENT classes with DIFFERENT messages, and the
+    /// offset check runs FIRST. Every string here is TRANSCRIBED from HotSpot
+    /// 25.0.3+9-LTS (`scratchpad/g26/G26InsCs.java`), not derived: the javadoc
+    /// names only the classes.
+    ///
+    /// The `insert(9, "AB", 0, 9)` row is the ordering discriminator — BOTH
+    /// arguments are out of range and HotSpot answers the offset one. A body
+    /// that checked the range first would pass every other row here.
+    #[test]
+    fn insert_charsequence_range_refusals_are_transcribed() {
+        let mut ctx = mock_ctx();
+        let ab = ctx.create_string("AB");
+
+        // Offset out of range -> StringIndexOutOfBoundsException.
+        for (offset, expected) in [
+            (5, "Range [5, 2) out of bounds for length 2"),
+            (-1, "Range [-1, 2) out of bounds for length 2"),
+        ] {
+            let sb = fresh_builder(&mut ctx);
+            let xy = ctx.create_string("xy");
+            native_sb_append_string(
+                &mut ctx,
+                &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+            )
+            .unwrap();
+            let e = native_sb_insert_charsequence_range(
+                &mut ctx,
+                &[
+                    Value::Object(Some(sb)),
+                    Value::Int(offset),
+                    Value::Object(Some(ab)),
+                    Value::Int(0),
+                    Value::Int(1),
+                ],
+            )
+            .expect_err("an offset out of range must be refused");
+            assert_eq!(failure_class(&ctx, &e), "sioobe", "offset {offset}");
+            assert_eq!(failure_message(&e), expected, "offset {offset}");
+            // A refused insert must not be a partial one.
+            assert_eq!(units_of(&ctx, sb), utf16("xy"));
+        }
+
+        // Window out of range -> the PLAIN IndexOutOfBoundsException.
+        for (start, end, expected) in [
+            (0, 9, "Range [0, 9) out of bounds for length 2"),
+            (-1, 1, "Range [-1, 1) out of bounds for length 2"),
+            (2, 1, "Range [2, 1) out of bounds for length 2"),
+        ] {
+            let sb = fresh_builder(&mut ctx);
+            let xy = ctx.create_string("xy");
+            native_sb_append_string(
+                &mut ctx,
+                &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+            )
+            .unwrap();
+            let e = native_sb_insert_charsequence_range(
+                &mut ctx,
+                &[
+                    Value::Object(Some(sb)),
+                    Value::Int(1),
+                    Value::Object(Some(ab)),
+                    Value::Int(start),
+                    Value::Int(end),
+                ],
+            )
+            .expect_err("a window out of range must be refused");
+            assert_eq!(failure_class(&ctx, &e), "ioobe", "[{start}, {end})");
+            assert_eq!(failure_message(&e), expected, "[{start}, {end})");
+        }
+
+        // BOTH wrong: the OFFSET check wins.
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let e = native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(9),
+                Value::Object(Some(ab)),
+                Value::Int(0),
+                Value::Int(9),
+            ],
+        )
+        .expect_err("both out of range must be refused");
+        assert_eq!(failure_class(&ctx, &e), "sioobe");
+        assert_eq!(
+            failure_message(&e),
+            "Range [9, 2) out of bounds for length 2"
+        );
+
+        // A null sequence is checked against the LENGTH OF "null", i.e. 4 —
+        // so `[0, 9)` is refused and reports 4, while `[0, 4)` succeeds.
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let e = native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Object(None),
+                Value::Int(0),
+                Value::Int(9),
+            ],
+        )
+        .expect_err("a window past the \"null\" literal must be refused");
+        assert_eq!(failure_class(&ctx, &e), "ioobe");
+        assert_eq!(
+            failure_message(&e),
+            "Range [0, 9) out of bounds for length 4"
+        );
+    }
+
+    /// `charAt` on a builder whose slot 0 is not a `char[]` used to be
+    /// `buf.unwrap()`, and a Rust panic is not a Java throwable: it terminated
+    /// the VM instead of unwinding. MEASURED reproducer: `insert(1,
+    /// (CharSequence) s)` corrupted the layout, and the next `charAt` printed
+    /// `called Option::unwrap() on a None value` and killed the process.
+    ///
+    /// The registration gap is closed, so nothing in the suite reaches this
+    /// arm any more — which is exactly why it needs a test that reaches it
+    /// directly.
+    #[test]
+    fn char_at_refuses_an_unreadable_buffer_instead_of_aborting() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        // A count that claims content, with no backing array behind it.
+        ctx.set_field(sb, 0, Value::Object(None));
+        sb_set_count(&mut ctx, sb, 3);
+        let e = native_sb_char_at(&mut ctx, &[Value::Object(Some(sb)), Value::Int(0)])
+            .expect_err("an unreadable buffer must throw, not panic");
+        assert_eq!(failure_class(&ctx, &e), "sioobe");
+
+        // The ordinary bounds refusal is unchanged, message included — it is
+        // TRANSCRIBED from HotSpot and matched before this change.
+        let sb2 = fresh_builder(&mut ctx);
+        let ab = ctx.create_string("ab");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(ab))],
+        )
+        .unwrap();
+        let e = native_sb_char_at(&mut ctx, &[Value::Object(Some(sb2)), Value::Int(5)])
+            .expect_err("index 5 of a 2-char builder must be refused");
+        assert_eq!(failure_class(&ctx, &e), "sioobe");
+        assert_eq!(failure_message(&e), "Index 5 out of bounds for length 2");
+    }
+
+    /// `charsequence_fast_units` is the one place four `append`/`repeat`
+    /// overloads read their text, so its `String` arm is the fix for all of
+    /// them at once. Asserting through it, rather than through each caller,
+    /// is what makes the single-home claim checkable.
+    #[test]
+    fn charsequence_fast_units_reads_raw_units_for_a_string() {
+        let mut ctx = mock_ctx();
+        let s = mock_string_of_units(&mut ctx, &[0x0061, 0xD800, 0x0062]);
+        let got = charsequence_fast_units(&mut ctx, s)
+            .expect("no Java is re-entered for a String")
+            .expect("a String is a fast-path shape");
+        assert_eq!(got, vec![0x0061, 0xD800, 0x0062]);
     }
 }

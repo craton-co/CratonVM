@@ -2838,8 +2838,33 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // BinaryOperator.maxBy(Comparator) → BinaryOperator
-    r.register(
+    // BinaryOperator.maxBy/minBy — `SyntheticStub`, same family and same
+    // argument as `Function.compose/andThen/identity` and the `Predicate` and
+    // `Consumer` blocks below. Both are `static` methods of
+    // `java.util.function.BinaryOperator` with real bodies in every supported
+    // image (`(a, b) -> comparator.compare(a, b) >= 0 ? a : b`), and both mint a
+    // `BinaryOperator$MaxBy` / `$MinBy` no image declares.
+    //
+    // Found by auditing the family rather than by a probe, and it is worse than
+    // its two measured siblings, not better: **no `apply` is registered on
+    // either minted class anywhere in the workspace** (grep both names — these
+    // two mint sites are the only hits). So the carrier that comes back has no
+    // implementation in ANY mode; the `BinaryOperator.apply` interface bridge a
+    // few lines above re-dispatches `apply` on the receiver, which resolves back
+    // to that same interface native. Under `--jdk-only` the mint is refused
+    // first (`$MaxBy` has no `$$Lambda` infix, so §5's door is shut — see the
+    // `Predicate` block) and the caller gets a `NoClassDefFoundError`.
+    //
+    // Not measured under a probe, so stated as reading, not as a repro: what is
+    // verified here is that the classes are fabricated and that nothing
+    // implements them. Dropping the pair under strict can only improve on a
+    // carrier with no methods, and `Compatible` keeps `SyntheticStub`
+    // registrations, so that mode is byte-for-byte unchanged either way.
+    //
+    // Deliberately NOT added to `NO_IMAGE_JDK_RECEIVERS`: that table re-tags
+    // natives BY RECEIVER, and neither class has a native to re-tag. Adding them
+    // would be inert. The mint sites are the only half that exists.
+    r.register_with_kind(
         bo,
         "maxBy",
         "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
@@ -2861,10 +2886,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Object(Some(proxy))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // BinaryOperator.minBy(Comparator) → BinaryOperator
-    r.register(
+    r.register_with_kind(
         bo,
         "minBy",
         "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
@@ -2885,6 +2911,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Object(Some(proxy))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // ToIntFunction, ToLongFunction, ToDoubleFunction interface dispatch
@@ -3074,6 +3101,50 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Predicate.and/or/negate/not — `SyntheticStub`, not the enclosing
+    // registrar's `Bridge`. This is the `Function.compose/andThen/identity`
+    // treatment (L7 item 4, 2026-08-05; second copy 2026-08-06) applied to the
+    // sibling two thirds of the family that lane did not reach.
+    //
+    // All four are `default`/`static` methods of `java.util.function.Predicate`
+    // with real bodies in every supported image — `and` is
+    // `(t) -> test(t) && other.test(t)` — so a working real-bytecode fallback
+    // plainly exists, which is exactly what `Bridge` asserts there is not. What
+    // they mint (`Predicate$$Lambda$And` / `$Or` / `$Negate`) is declared by no
+    // image; all three are already in `NO_IMAGE_JDK_RECEIVERS`.
+    //
+    // # Why the strict symptom was `AbstractMethodError`, not `NoClassDefFoundError`
+    //
+    // These four are the measured counter-example to `no_image_receiver.rs`'s
+    // gate-1/gate-2 pairing rule, running in the direction that record warns
+    // about: gate 2 (the `test` natives on the minted classes) was closed
+    // automatically by `register`'s `NO_IMAGE_JDK_RECEIVERS` re-tag, while gate
+    // 1 (this mint site) stayed `Bridge` and kept minting. Strict mode was
+    // therefore handed a well-formed carrier with no implementation.
+    //
+    // And the mint was NOT refused, because of the name. `fabricate_class`
+    // applies the `--jdk-only` policy refusal only when
+    // `origin.is_compatibility_stub()`, and `fabricated_origin_for_name` routes
+    // anything containing `$$Lambda` to `ClassOrigin::GeneratedLambda` instead —
+    // so the `$$Lambda$` infix in these three names walks past §5's door, where
+    // the otherwise identical `Consumer$AndThen` below is refused outright. That
+    // is why one half of this family reported a missing class and the other half
+    // reported `java/util/function/Predicate.test … has no Code attribute`: the
+    // fabricated class exists, carries no `test`, and dispatch resolves up to
+    // the interface's abstract declaration. Two error shapes, one missing half.
+    //
+    // (`class_manager.rs`'s note on that arm records "none of the three fires on
+    // a strict boot", measured 2026-08-05/06 against boot probes. A strict run
+    // of `Predicate.and` fires it. That measurement is stale, not wrong — no
+    // boot probe called a Predicate combinator.)
+    //
+    // Tagged `SyntheticStub`, strict mode drops all four (recording a
+    // `SyntheticNativeRegistered` violation naming this site), nothing mints the
+    // three classes, and `java.base`'s own default methods run.
+    // `Compatible` / `--real-jdk` keep `SyntheticStub` registrations, so both
+    // are byte-for-byte unchanged.
+    let __pred_prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // Predicate.and/or/negate — composite predicates via 2-field synthetic
     let pred = "java/util/function/Predicate";
     r.register(
@@ -3164,6 +3235,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(composite))))
         },
     );
+    r.set_category(__pred_prev_cat);
 
     // --- M3 fix: register test() on synthetic Predicate composition classes ---
 
@@ -3373,9 +3445,23 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__func_prev_cat);
 
-    // Consumer.andThen
+    // Consumer.andThen — `SyntheticStub`, the third and last mint site of this
+    // family that L7 item 4 left `Bridge`. `java.util.function.Consumer.andThen`
+    // is a `default` method returning `(T t) -> { accept(t); after.accept(t); }`,
+    // so the real-bytecode fallback exists, and `Consumer$AndThen` is declared
+    // by no image (it is already in `NO_IMAGE_JDK_RECEIVERS`, which is what
+    // re-tagged its `accept` below).
+    //
+    // Unlike its `Predicate` siblings above, this name carries no `$$Lambda`
+    // infix, so `fabricated_origin_for_name` gives it
+    // `ClassOrigin::CompatibilityStub` and §5 refuses the mint outright: the
+    // strict symptom was `NoClassDefFoundError: java/util/function/Consumer$AndThen`
+    // thrown from `andThen` itself. Same missing half as `Predicate`, different
+    // error shape purely because of how the fabricated name reads — see the long
+    // note on the `Predicate` block for why that distinction is the whole of the
+    // difference between the two.
     let cons = "java/util/function/Consumer";
-    r.register(
+    r.register_with_kind(
         cons,
         "andThen",
         "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
@@ -3398,6 +3484,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // --- M3 fix: register apply/accept on synthetic composition classes ---
@@ -4430,68 +4517,69 @@ pub(crate) fn register_p64_collectors_teeing(r: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // java.util.stream.Gatherer — Java 22 (preview → final Java 24)
-// Stub for the Gatherer API
+//
+// ONE slot map for this class, and it is NOT this file's.
+//
+// `java/util/stream/Gatherer` has NO `synthetic_stub_fields` arm, so
+// `class_num_total_fields` answers 0 and `try_alloc_concurrent_synthetic`'s
+// closing `let n = num_fields.max(real)` leaves the caller's request as the
+// LITERAL object width — there is no clamp to hide a disagreement behind. This
+// registrar used to model the class at 3 slots (initializer 0, integrator 1,
+// finisher 2) while `lib.rs::register_pd_stream_gatherers` models it at 5
+// (initializer 0, integrator 1, combiner 2, finisher 3, VM-internal KIND 4).
+// Not two widths — two INCOMPATIBLE maps: `finisher` was slot 2 here and slot 3
+// there, and slot 2 there is the `combiner`.
+//
+// The 5-slot map is the right one on both authorities available without a run:
+//
+//   * the ORACLE. `Gatherer` itself is an interface; the carrier the real JDK
+//     returns from every one of its static factories is the record
+//     `java.util.stream.Gatherers.GathererImpl`, whose components are
+//     `initializer, integrator, combiner, finisher` in that order (JDK 25
+//     source, `java.base/java/util/stream/Gatherers.java:502-506`). Slots 0..3
+//     of the 5-slot map ARE that record, in order; slot 4 is a VM-internal kind
+//     tag anchored past it. The 3-slot map dropped `combiner` — which is a real
+//     interface method, `Gatherer.combiner()` — and so mis-seated `finisher`.
+//   * the CONSUMERS. `register_phase_d_natives` (`lib.rs:24181`) runs AFTER
+//     `register_phase67_natives` (`lib.rs:24124`) inside
+//     `register_synthetic_overrides`, and `register()` is
+//     last-registration-wins, so every reader that actually executes is
+//     lib.rs's: `pd_stream_gather` opens with `ctx.get_field(gatherer, 4)`,
+//     `finisher()` reads slot 3, `combiner()` reads slot 2.
+//
+// So every factory here was minting objects for readers that disagreed with it.
+// Six of the seven were already shadowed by a 5-slot twin in `lib.rs`; the
+// seventh, `ofSequential(Supplier,Integrator)`, was registered ONLY here, and
+// its 3-slot product reached `get_field(gatherer, 4)`. `Heap::get_field`
+// (`gc/src/heap.rs:652`) opens with `assert!(index < num_slots)`, so
+// `stream.gather(Gatherer.ofSequential(sup, integ))` aborted the VM with
+// "field index 4 out of bounds (num_slots=3)". That overload is now registered
+// in the 5-slot shape at `lib.rs:42681`.
+//
+// The producers and accessors are therefore DELETED here rather than widened to
+// 5: widening would leave two copies of one slot map to drift apart again,
+// which is the defect itself. Deleted (each already re-registered later, and
+// already winning, in `lib.rs::register_pd_stream_gatherers`):
+//
+//   Gatherer.of(Integrator)                                lib.rs:42693
+//   Gatherer.ofSequential(Supplier,Integrator)             lib.rs:42681
+//   Gatherer.ofSequential(Supplier,Integrator,BiConsumer)  lib.rs:42636
+//   Gatherer.initializer() / integrator() / finisher()     lib.rs:42599..42634
+//   Gatherers.fold / scan / windowFixed / windowSliding    lib.rs:42741..42811
+//   Stream.gather(Gatherer)                                lib.rs:42591
+//
+// `lib.rs` additionally serves `Gatherer.combiner()`, `Gatherer$Downstream.push`
+// and `Gatherers.mapConcurrent`, which this file never had. What is left below
+// is the ONE pair `lib.rs` does not register.
+//
+// See docs/known-issues/jdk-only/E35-R11-SYNTHETIC-WIDTH-SWEEP-20260813.md §3.1
+// and E41's record for the full derivation.
 // =============================================================================
 
 pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let g = "java/util/stream/Gatherer";
-    // Gatherer.of(integrator) → Gatherer
-    r.register(
-        g,
-        "of",
-        "(Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            // 3-field: initializer=0, integrator=1, finisher=2
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, Value::Object(None));
-            ctx.set_field(obj, 1, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-        ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 2, Value::Object(None));
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;Ljava/util/function/BiConsumer;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-        ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 2, args.get(2).copied().unwrap_or(Value::Object(None)));
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    r.register(
-        g,
-        "integrator",
-        "()Ljava/util/stream/Gatherer$Integrator;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
-        },
-    );
-    r.register(
-        g,
-        "initializer",
-        "()Ljava/util/function/Supplier;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
-    r.register(
-        g,
-        "finisher",
-        "()Ljava/util/function/BiConsumer;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        },
-    );
     // Gatherer.defaultInitializer / defaultFinisher
     //
     // KEEP — but the wave-3 one-liner ("null IS the Gatherer sentinel") is only
@@ -4503,13 +4591,15 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
     // are considered to be stateless, and invoking their initializer is
     // optional" (`java.base/java/util/stream/Gatherer.java`, @implSpec).
     //
-    // That identity test is the only spec-defined observation, and this model
-    // passes it: `Gatherer.of(..)` above stores null in slots 0 and 2, and
-    // `initializer()`/`finisher()` hand those same slots straight back, so
-    // `g.initializer() == Gatherer.defaultInitializer()` compares null with
-    // null and answers `true` exactly where the real JDK would. The gather
-    // engine (`pd_gather_fold` / `pd_gather_scan` / `pd_gather_custom` in
-    // lib.rs) reads the same sentinel by branching on `Value::Object(Some(_))`.
+    // That identity test is the only spec-defined observation, and the model
+    // passes it: `Gatherer.of(..)` (now `lib.rs:42693`, the 5-slot map) stores
+    // null in the initializer slot 0 and the finisher slot 3, and
+    // `initializer()`/`finisher()` (`lib.rs:42599`/`:42626`) hand those same
+    // slots straight back, so `g.initializer() == Gatherer.defaultInitializer()`
+    // compares null with null and answers `true` exactly where the real JDK
+    // would. The gather engine (`pd_gather_fold` / `pd_gather_scan` /
+    // `pd_gather_custom` in lib.rs) reads the same sentinel by branching on
+    // `Value::Object(Some(_))`.
     // Manufacturing a synthetic Supplier / BiConsumer here would flip that
     // identity test to `false` for every default gatherer AND hand the engine a
     // value it then has to call.
@@ -4533,72 +4623,6 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "defaultFinisher",
         "()Ljava/util/function/BiConsumer;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-
-    // Gatherers utility class (Java 22)
-    let gs = "java/util/stream/Gatherers";
-    // Gatherers.fold(initial, folder)
-    r.register(
-        gs,
-        "fold",
-        "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // Gatherers.scan(initial, scanner)
-    r.register(
-        gs,
-        "scan",
-        "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // Gatherers.windowFixed(size) → Gatherer
-    r.register(
-        gs,
-        "windowFixed",
-        "(I)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // Gatherers.windowSliding(size) → Gatherer
-    r.register(
-        gs,
-        "windowSliding",
-        "(I)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // Stream.gather(Gatherer) — add to Stream
-    r.register(
-        "java/util/stream/Stream",
-        "gather",
-        "(Ljava/util/stream/Gatherer;)Ljava/util/stream/Stream;",
-        |_ctx, args| {
-            // Simplified: return a new empty stream (real impl would transform elements)
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
     );
     r.set_category(__prev_cat);
 }

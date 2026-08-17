@@ -24,6 +24,12 @@
 //!   `JavaIOAccess.console` / `charset`, `JavaNetUriAccess.create` —
 //!   ~10 lines of code each.
 //!
+//!   `parseCookie` is **not a JDK method name**; the real interface declares
+//!   `parse(String)` and `header(HttpCookie)`. See `register_factories` for the
+//!   measured registered-vs-declared table across the four fabricated carriers,
+//!   and for why `--jdk-only` now refuses their factories rather than handing
+//!   back an object no `invokeinterface` can hit.
+//!
 //! Medium-thickness:
 //!
 //! * `JavaLangAccess.currentCarrierThread`, `blockedOn`,
@@ -39,8 +45,6 @@
 //!
 //! * `JavaLangAccess.getDeclaredPublicMethods` —
 //!   reflects `Class` declared methods and filters for ACC_PUBLIC.
-//! * `JavaSecurityAccess.doIntersectionPrivilege` — invokes the
-//!   `PrivilegedAction.run()` interface method via `ctx.invoke`.
 //! * `JavaLangReflectAccess.copyMethod` / `copyField` /
 //!   `copyConstructor` — delegate to existing lang_class natives.
 
@@ -56,8 +60,17 @@ use crate::try_alloc_concurrent_synthetic;
 /// WP1.4 — Re-export of the canonical concrete-class mapping.
 /// Mirrors `vm/src/runtime/shared_secrets.rs::SharedSecretsInterface`
 /// (we can't `use` it here because native-builtins does not depend
-/// on vm; a compile-time `#[test]` in the vm crate asserts the two
-/// lists stay in sync).
+/// on vm). The mirror is NOT exact and must not be made exact: this
+/// table has `java/io/FileDescriptor$1`, that one additionally has
+/// `java/io/ObjectInputStream$1`, whose getter is deliberately not
+/// intercepted. F24-1 (2026-08-13) added the check that keeps the
+/// difference to exactly that — `owner_classes_mirror_the_native_builtins_bridge`,
+/// a vm-crate unit test reading `owner_classes()` — after the claim
+/// that used to sit here ("a compile-time `#[test]` in the vm crate
+/// asserts the two lists stay in sync") turned out to describe a
+/// test nobody had written, while the two lists disagreed in both
+/// directions at equal length. Applied by F33-1, which owns this
+/// file; F24-1 could only nominate it.
 const FACTORIES: &[(&str, &str, &str)] = &[
     // (factory_method, return_type_descriptor, owner_class)
     (
@@ -110,13 +123,49 @@ const FACTORIES: &[(&str, &str, &str)] = &[
         "Ljdk/internal/access/JavaNioAccess;",
         "java/nio/Buffer$2",
     ),
+    // F17-1 (2026-08-13): `getJavaSecurityAccess` USED TO BE HERE AND IS GONE.
+    // Do not re-add it. JEP 486 removed the Security Manager and took
+    // `jdk.internal.access.JavaSecurityAccess` with it, so there is no
+    // differently-spelled equivalent to correct this to — the whole interface is
+    // absent, not just the getter. Measured on Microsoft 25.0.3+9-LTS:
+    //
+    //     $ javap jdk.internal.access.JavaSecurityAccess
+    //     Error: class not found: jdk.internal.access.JavaSecurityAccess
+    //     $ javap jdk.internal.access.SharedSecrets | grep -c getJavaSecurityAccess
+    //     0
+    //
+    // `getJavaxSecurityAccess()Ljdk/internal/access/JavaxSecurityAccess;` IS on
+    // the JDK 25 surface and looks like a near-miss for it in a name-keyed
+    // search. It is a different interface (`javax.security.auth.Subject`
+    // plumbing), not a rename of this one — see
+    // scripts/baselines/jdk25-jdk.internal.access.SharedSecrets.tsv, which lists
+    // both `getJavaxSecurityAccess` and `setJavaxSecurityAccess` and neither
+    // spelling of the `Java`-prefixed pair.
+    //
+    // Nothing dispatched to the deleted triple: no `.java` in this tree names
+    // `SharedSecrets.getJavaSecurityAccess`, and no JDK 25 bytecode can call a
+    // method its own `SharedSecrets` does not declare, so `call_native` had no
+    // reachable path to it in any mode. F17-1 nonetheless KEPT
+    // `register_java_security_access`, which registered two natives on the
+    // fabricated `java/security/AccessController$1`; F33-1 (2026-08-13) deleted
+    // those too, after re-verifying that nothing mints or names that receiver.
+    // See the `// JavaSecurityAccess — DELETED` note further down for the three
+    // closed doors and for what had to move in the same commit.
+    //
+    // `javaUtilJarAccess` — NOT `getJavaUtilJarAccess`. This one is a spelling
+    // correction, not a deletion: the interface exists and the descriptor was
+    // already right, but the real method has never carried the `get` prefix.
+    //
+    //     $ javap jdk.internal.access.SharedSecrets | grep JarAccess
+    //       public static ...JavaUtilJarAccess javaUtilJarAccess();
+    //       (and setJavaUtilJarAccess(JavaUtilJarAccess) — the setter DOES have
+    //        the prefix, which is how the getter's spelling got invented)
+    //
+    // `getJavaUtilJarAccess` was measured dead everywhere before this change
+    // (scripts/baselines/jdk-only-dead-everywhere.tsv:192, bucket
+    // `method-nowhere`) precisely because no caller could ever name it.
     (
-        "getJavaSecurityAccess",
-        "Ljdk/internal/access/JavaSecurityAccess;",
-        "java/security/AccessController$1",
-    ),
-    (
-        "getJavaUtilJarAccess",
+        "javaUtilJarAccess",
         "Ljdk/internal/access/JavaUtilJarAccess;",
         "cratonvm/internal/ss/JavaUtilJarAccess$1",
     ),
@@ -155,6 +204,25 @@ pub fn owner_classes() -> impl Iterator<Item = &'static str> {
     FACTORIES.iter().map(|(_, _, owner)| *owner)
 }
 
+/// `(factory_method, owner_class)` for every row of `FACTORIES`.
+///
+/// F33-1 (2026-08-13). [`owner_classes`] projects away the half that the
+/// `--jdk-only` pairing invariant is about: a factory and the owner it returns
+/// must be admitted or refused TOGETHER, and with only the owner column an
+/// out-of-crate check can see the owner's fate but not the factory's. The
+/// integration ratchet
+/// (`no_shared_secrets_factory_outlives_the_owner_strict_mode_drops` in
+/// `native-builtins/tests/stub_ratchet.rs`) reads this instead of restating
+/// fourteen name/owner pairs it would then have to keep in sync — a second copy
+/// of this table is precisely how the two `SharedSecrets` lists drifted while
+/// every length check on both sides passed (F24-1).
+///
+/// The return descriptor is deliberately not exposed: it is derivable
+/// (`format!("(){ret}")`) and no consumer outside this crate needs it yet.
+pub fn factory_methods_and_owners() -> impl Iterator<Item = (&'static str, &'static str)> {
+    FACTORIES.iter().map(|(method, _, owner)| (*method, *owner))
+}
+
 /// Allocate a fresh singleton of `owner_class`.
 ///
 /// We intentionally allocate fresh every call — every registered
@@ -163,6 +231,30 @@ pub fn owner_classes() -> impl Iterator<Item = &'static str> {
 /// implementation simple and avoids heap-GC interactions.  If a
 /// future bridge decides to stash state on the singleton, it
 /// should move to a per-(VM, interface) cache.
+///
+/// # The `Err` arm returns a WRONG-CLASS receiver, not an error
+///
+/// F33-1 (2026-08-13) corrects the claim that used to sit on that arm — *"the
+/// invokeinterface resolution still routes through the stored class name in the
+/// native registry"*. That is a premise, and `--jdk-only` invalidates it: the
+/// registry is the thing strict mode edits. `NativeMethodRegistry::register`
+/// re-tags by RECEIVER CLASS
+/// (`native-api/src/no_image_receiver.rs`), so under `--jdk-only` a stand-in
+/// owner has NO registered methods left to route to, and the `ClassId(0)` object
+/// this arm hands back is typed as a `Java*Access` while being a class nobody
+/// asked for. The failure is silent — a wrong-class receiver, not a throw —
+/// which is why it survived unnoticed.
+///
+/// The premise is restored for the `SharedSecrets` factories by
+/// `register_factories` below, which now refuses a factory in exactly the modes
+/// that refuse its owner, so this arm is unreachable for those owners in strict
+/// mode. It is NOT restored for the other two callers
+/// (`jdk/internal/reflect/ReflectionFactory` and
+/// `java/lang/management/BufferPoolMXBean`), which still take it deliberately;
+/// both are real JDK class names, so `ensure_class_initialized` is expected to
+/// succeed and the `Err` arm is the not-loadable fallback. **Do not read this
+/// function as infallible-and-fine.** See
+/// docs/known-issues/jdk-only/F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md
 fn alloc_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef {
     // Resolve (or synthesise) the class id, then allocate.  The
     // synthetic class has 1 field slot reserved so downstream
@@ -174,9 +266,9 @@ fn alloc_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef 
             ctx.alloc_object(cid, real_fields.max(1))
         }
         Err(_) => {
-            // Class did not exist; use ClassId(0) as a placeholder —
-            // the invokeinterface resolution still routes through
-            // the stored class name in the native registry.
+            // Class did not exist. `ClassId(0)` is NOT a placeholder that keeps
+            // dispatch working — it is a receiver of the wrong class, handed to
+            // a caller that will invokeinterface on it. See the doc comment.
             ctx.alloc_object(cratonvm_types::ClassId::new(0), 1)
         }
     }
@@ -223,17 +315,118 @@ fn alloc_java_nio_access_singleton(
 /// class.  We register on both `jdk/internal/access/SharedSecrets`
 /// (JDK 11+) and `jdk/internal/misc/SharedSecrets` (legacy) so
 /// bytecode compiled against either package resolves correctly.
+///
+/// # A factory is exactly as admissible as the receiver it hands out
+///
+/// F33-1 (2026-08-13). This registrar's ambient kind is `Bridge`
+/// (`register_wp1_4_shared_secrets`), but `NativeMethodRegistry::register`
+/// re-tags by RECEIVER CLASS, and the receiver of a *factory* registration is
+/// `SharedSecrets` — not the object it returns. Those two facts used to split
+/// this one registrar down the middle:
+///
+/// | registered on | kind | `--jdk-only` |
+/// |---|---|---|
+/// | `jdk/internal/access/SharedSecrets` — every factory | `Bridge` | survived |
+/// | `cratonvm/internal/ss/…$1` — four owners' methods | `SyntheticStub` | dropped |
+///
+/// So strict mode kept four natives that shadow real JDK bytecode getters and
+/// hand back a carrier on which it had just dropped every method — a
+/// wrong-class receiver rather than an error, because `alloc_singleton`'s `Err`
+/// arm is infallible (see its doc comment).
+///
+/// The fix is the rule this loop now applies: **a factory carries the kind of
+/// the owner it returns.** `receiver_declared_by_no_supported_image` is exactly
+/// the predicate that adjudicated the owner, so asking it again about the owner
+/// — not about `SharedSecrets` — makes the two halves refuse together or
+/// survive together, atomically, with no second list to drift.
+///
+/// It is a DERIVED rule, deliberately: add a `cratonvm/…` stand-in owner to
+/// `VM_MINTED_STAND_IN_RECEIVERS`, or add `java/io/ObjectInputStream$1` to
+/// `NO_IMAGE_JDK_RECEIVERS` (nominated in that module), and its factory follows
+/// automatically. `factory_kind_follows_the_owner_it_hands_out` pins both
+/// directions.
+///
+/// **Why refusing is the honest disposition and "make it work" is not**, for
+/// the four owners this fires on today. Measured with `javap -p` on Microsoft
+/// 25.0.3+9-LTS, the methods registered on those carriers against the interface
+/// the factory's return descriptor promises:
+///
+/// ```text
+///   JavaIORandomAccessFileAccess  registered: open(String,String), openAsChannel(RandomAccessFile)
+///                                 JDK 25:     openAndDelete(File,String)          -> 0 of 1
+///   JavaNetHttpCookieAccess       registered: parseCookie(String)
+///                                 JDK 25:     parse(String), header(HttpCookie)   -> 0 of 2
+///   JavaUtilJarAccess             registered: jarFileHasClassPathAttribute, ensureInitialization
+///                                 JDK 25:     + getTrustedAttributes, isInitializing, entryFor
+///                                                                                  -> 2 of 5
+///   JavaNetUriAccess              registered: create(String,String)                -> 1 of 1
+/// ```
+///
+/// Two of the four carry NO method the interface declares, so an
+/// `invokeinterface JavaNetHttpCookieAccess.parse` on the object this factory
+/// returns misses in **every** mode, not just strict. `parseCookie` and `open`
+/// are names CratonVM invented; nothing else in the tree names them
+/// (`grep -rn 'parseCookie\|openAsChannel'` finds only this file and the
+/// tables that list its owners). Retargeting these onto the JDK's own
+/// implementation classes — `java/util/jar/JavaUtilJarAccessImpl`,
+/// `java/net/URI$1`, and the two anonymous classes in `HttpCookie.<clinit>` /
+/// `RandomAccessFile.<clinit>` — is a real option and a bigger change; it would
+/// make the natives shadow live bytecode on real classes in BOTH modes, which
+/// is a §1.4 question needing a strict-corpus measurement. Refusing in strict
+/// needs none: the alternative being refused is already broken.
 fn register_factories(registry: &mut NativeMethodRegistry) {
     for (method, ret_desc, owner) in FACTORIES {
         let full_desc = format!("(){}", ret_desc);
         let owner_name: &'static str = owner;
+        // Only the demotion is STATED. The other ten factories keep inheriting
+        // the registrar's ambient `Bridge` through plain `register`, so this
+        // change cannot move a row it is not about — and if a future author
+        // re-scopes `register_wp1_4_shared_secrets`, the ten follow the new
+        // ambient instead of a `Bridge` frozen into this function.
+        let demote = factory_is_orphaned_by_strict_mode(owner_name);
 
         let cb: cratonvm_native_api::NativeCallback = make_factory_callback(owner_name);
-        registry.register("jdk/internal/access/SharedSecrets", method, &full_desc, cb);
-        // Legacy package alias.
         let cb2: cratonvm_native_api::NativeCallback = make_factory_callback(owner_name);
-        registry.register("jdk/internal/misc/SharedSecrets", method, &full_desc, cb2);
+        // Legacy package alias. `jdk/internal/misc/SharedSecrets` is itself in
+        // `NO_IMAGE_JDK_RECEIVERS`, so `register` re-tags every row on it
+        // `SyntheticStub` regardless of which arm we take below; it is written
+        // the same way only so the two spellings do not read as two rules.
+        if demote {
+            registry.register_with_kind(
+                "jdk/internal/access/SharedSecrets",
+                method,
+                &full_desc,
+                cb,
+                cratonvm_native_api::NativeKind::SyntheticStub,
+            );
+            registry.register_with_kind(
+                "jdk/internal/misc/SharedSecrets",
+                method,
+                &full_desc,
+                cb2,
+                cratonvm_native_api::NativeKind::SyntheticStub,
+            );
+        } else {
+            registry.register("jdk/internal/access/SharedSecrets", method, &full_desc, cb);
+            registry.register("jdk/internal/misc/SharedSecrets", method, &full_desc, cb2);
+        }
     }
+}
+
+/// Whether `--jdk-only` would drop every method on `owner_class`, so that a
+/// factory handing it out must be dropped with them.
+///
+/// This is [`receiver_declared_by_no_supported_image`] asked about the object a
+/// factory RETURNS instead of about the class the factory is registered on.
+/// Split out as a named function so the guard below calls the code the
+/// registrar runs rather than restating the rule — a second copy of a
+/// predicate is how the two `SharedSecrets` lists drifted in the first place
+/// (F24-1).
+///
+/// [`receiver_declared_by_no_supported_image`]:
+///     cratonvm_native_api::no_image_receiver::receiver_declared_by_no_supported_image
+fn factory_is_orphaned_by_strict_mode(owner_class: &str) -> bool {
+    cratonvm_native_api::no_image_receiver::receiver_declared_by_no_supported_image(owner_class)
 }
 
 /// Build a `NativeCallback` that returns a fresh instance of the
@@ -266,7 +459,6 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     gen_factory!(f_jiofd, "java/io/FileDescriptor$1");
     gen_factory!(f_jniaa, "java/net/InetAddress$1");
     gen_factory!(f_jnuri, "cratonvm/internal/ss/JavaNetUriAccess$1");
-    gen_factory!(f_jsec, "java/security/AccessController$1");
     gen_factory!(f_jujar, "cratonvm/internal/ss/JavaUtilJarAccess$1");
     gen_factory!(f_juzf, "java/util/zip/ZipFile$1");
     gen_factory!(f_jnhc, "cratonvm/internal/ss/JavaNetHttpCookieAccess$1");
@@ -289,7 +481,11 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
         "java/net/InetAddress$1" => f_jniaa,
         "cratonvm/internal/ss/JavaNetUriAccess$1" => f_jnuri,
         "java/nio/Buffer$2" => f_jnio,
-        "java/security/AccessController$1" => f_jsec,
+        // `"java/security/AccessController$1" => f_jsec` was here until
+        // 2026-08-13 (F33-1). It had been unreachable since F17-1 deleted the
+        // `getJavaSecurityAccess` row from `FACTORIES` — `make_factory_callback`
+        // is only ever called with an owner from that table — so this arm was
+        // the last thing keeping the fabricated receiver mintable at all.
         "cratonvm/internal/ss/JavaUtilJarAccess$1" => f_jujar,
         "java/util/zip/ZipFile$1" => f_juzf,
         "cratonvm/internal/ss/JavaNetHttpCookieAccess$1" => f_jnhc,
@@ -2549,66 +2745,53 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     );
 }
 
-// JavaSecurityAccess ----------------------------------------------------------
-
-fn jsec_do_intersection_privilege(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // (PrivilegedAction action, AccessControlContext stack,
-    //  AccessControlContext context) -> Object
-    // Invokes action.run() ignoring the contexts (cratonvm has no
-    // real SecurityManager — AC natives already degrade to
-    // "always allow").
-    // INSTANCE method: args[0] = receiver (AccessController$1),
-    // args[1] = action, args[2..4] = the two AccessControlContexts.
-    if let Some(Value::Object(Some(action))) = args.get(1) {
-        ctx.invoke(
-            "java/security/PrivilegedAction",
-            "run",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(*action))],
-        )
-    } else {
-        Ok(Some(Value::Object(None)))
-    }
-}
-
-fn jsec_get_protect_domains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Returns ProtectionDomain[] for a given AccessControlContext.
-    // We synthesise a single-element array with the PD from
-    // `Class.getProtectionDomain0` on the caller's class — which
-    // Session 92's N1 agent already landed.
-    // INSTANCE method: args[0] = receiver (AccessController$1), args[1] = acc.
-    if let Some(Value::Object(Some(acc))) = args.get(1) {
-        let _ = acc; // acc currently unused — session92 AC accepts any ACC.
-        let pd = ctx.new_object("java/security/ProtectionDomain")?;
-        let arr = ctx.new_ref_array(
-            ctx.class_id_by_name("java/security/ProtectionDomain")
-                .unwrap_or(cratonvm_types::ClassId::new(0)),
-            1,
-        );
-        if let Some(Value::Object(Some(pd_ref))) = pd {
-            ctx.set_array_element(arr, 0, Value::Object(Some(pd_ref)));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    } else {
-        Ok(Some(Value::Object(None)))
-    }
-}
-
-fn register_java_security_access(registry: &mut NativeMethodRegistry) {
-    let owner = "java/security/AccessController$1";
-    registry.register(
-        owner,
-        "doIntersectionPrivilege",
-        "(Ljava/security/PrivilegedAction;Ljava/security/AccessControlContext;Ljava/security/AccessControlContext;)Ljava/lang/Object;",
-        jsec_do_intersection_privilege,
-    );
-    registry.register(
-        owner,
-        "getProtectDomains",
-        "(Ljava/security/AccessControlContext;)[Ljava/security/ProtectionDomain;",
-        jsec_get_protect_domains,
-    );
-}
+// JavaSecurityAccess — DELETED 2026-08-13 (F33-1) --------------------------
+//
+// `register_java_security_access` and its two bodies
+// (`jsec_do_intersection_privilege`, `jsec_get_protect_domains`) stood here,
+// registering `doIntersectionPrivilege` and `getProtectDomains` on
+// `java/security/AccessController$1`. Do not restore them; there is nothing to
+// restore them FOR. Three independent facts, each measured on Microsoft
+// 25.0.3+9-LTS:
+//
+//   $ javap -p jdk.internal.access.JavaSecurityAccess
+//   Error: class not found: jdk.internal.access.JavaSecurityAccess
+//   $ javap -p 'java.security.AccessController$1'
+//   Error: class not found: java.security.AccessController$1
+//   $ javap -p jdk.internal.access.SharedSecrets | grep -c getJavaSecurityAccess
+//   0
+//
+// JEP 486 removed the Security Manager and took the whole interface with it, so
+// the interface, its implementation class and its accessor are all absent —
+// this was never a bridge to anything, on any JDK 25 image.
+//
+// REACHABILITY, re-verified before deleting, because `call_native` panics on an
+// unregistered triple and a Rust panic is not a Java throwable — it kills the
+// VM. Three doors, all closed:
+//
+//   * no bytecode can name the triples: a JDK 25 class file cannot hold an
+//     invokeinterface whose receiver type its own image does not declare;
+//   * no native mints the receiver: `grep -rn 'AccessController[$]1'` over
+//     *.rs / *.java finds no `ensure_class_initialized`, `new_object` or
+//     `alloc_object` on that name — the only mint site was the `f_jsec` factory
+//     callback, deleted with `getJavaSecurityAccess` by F17-1;
+//   * no factory hands the owner out: `owner_classes()` iterates `FACTORIES`,
+//     which has had no `java/security/` row since F17-1.
+//
+// WHAT ELSE MOVED WITH IT. `native-api/src/no_image_receiver.rs` keeps its
+// `java/security/AccessController$1` row on purpose — the image fact it records
+// is TRUE and the gate script that re-derives the table should keep checking
+// it. That entry was the ONLY thing tagging these two natives `SyntheticStub`;
+// deleting it instead of the registrations would have promoted two fabricated
+// natives to `Bridge` and admitted them to `--jdk-only`. The entry is now
+// inert, which is the correct end state, and its doc says so.
+//
+// Two generated baselines still name the deleted triples —
+// `scripts/baselines/jdk-only-gated-never-delete.tsv:86-87` and
+// `jdk-only-kind-map-25-linux.tsv:5790-5791`. They must be REGENERATED from a
+// Linux census, not hand-edited: a frozen census row edited by hand is a claim
+// about a tree nobody censused. Both gate scripts exit 2 ("REFUSING") off
+// Linux, so neither is red on a Windows or macOS checkout meanwhile.
 
 // JavaUtilJarAccess -----------------------------------------------------------
 
@@ -2839,7 +3022,8 @@ pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
     register_java_net_inet_address_access(registry);
     register_java_net_uri_access(registry);
     register_java_nio_access(registry);
-    register_java_security_access(registry);
+    // `register_java_security_access(registry)` was called here until 2026-08-13
+    // (F33-1). See the deletion note above `// JavaUtilJarAccess`.
     register_java_util_jar_access(registry);
     register_java_util_zip_file_access(registry);
     register_java_net_http_cookie_access(registry);
@@ -2861,16 +3045,121 @@ mod tests {
     fn all_factories_listed() {
         // getJavaObjectInputStreamAccess removed: JDK 25 uses an invokedynamic
         // lambda (no ObjectInputStream$1), so the real getter must run.
-        assert_eq!(FACTORIES.len(), 15);
+        //
+        // F17-1 (2026-08-13): 15 -> 14. `getJavaSecurityAccess` was deleted —
+        // JEP 486 removed `jdk.internal.access.JavaSecurityAccess` and the
+        // getter with it. See the comment at the deletion site in `FACTORIES`.
+        assert_eq!(FACTORIES.len(), 14);
     }
 
+    /// F17-1 (2026-08-13) — REPLACES a guard that could not fail.
+    ///
+    /// The previous body of this test was, in full:
+    ///
+    /// ```ignore
+    /// for (method, ret, _) in FACTORIES {
+    ///     assert!(method.starts_with("getJava"));
+    ///     assert!(method.ends_with("Access"));
+    ///     assert!(ret.contains("Access;"));
+    /// }
+    /// ```
+    ///
+    /// Every name in `FACTORIES` was written to that shape, so the test checked
+    /// the list against itself: it had no way to distinguish a JDK-true getter
+    /// from an invented one, and it passed on both `getJavaSecurityAccess` (a
+    /// method JDK 25 does not declare at all) and `getJavaUtilJarAccess` (a
+    /// misspelling of `javaUtilJarAccess`) for as long as both were listed.
+    /// Worse, its `starts_with("getJava")` clause actively *punished* the
+    /// correct spelling: `javaUtilJarAccess` has no `get` prefix, so repairing
+    /// the table would have reddened the guard that was supposed to protect it.
+    ///
+    /// The oracle is now external: the JDK 25 class surface as walked out of the
+    /// runtime image by `scripts/jdk-baseline/generate.py` and frozen in
+    /// `scripts/baselines/jdk25-jdk.internal.access.SharedSecrets.tsv`.
+    ///
+    /// SOUNDNESS OF THIS PARTICULAR ORACLE — **the paragraph that used to be
+    /// here was true when written and is now false; F33-1 (2026-08-13) replaces
+    /// it rather than leaving two readings of the same file.**
+    ///
+    /// It read: *"the generator keeps only rows whose flags contain `public`
+    /// (`generate.py:175`), so a baseline is blind to package-private, private
+    /// and `private static native` members … every member of `SharedSecrets` is
+    /// `public static`, so its 65 baseline rows are its whole surface."* Both
+    /// halves have moved. The public-only filter was FIXED during this session
+    /// (F23-1), and the baseline was regenerated: it now carries **101 data rows
+    /// = 1 CLASS + 1 EXTENDS + 1 SUPERTYPE + 32 FIELD + 66 METHOD**, i.e. the 98
+    /// members `javap -p` reports, 33 of them `private,static`. The old "65" was
+    /// the public-method count, and reasoning from it would now under-count the
+    /// surface by a third.
+    ///
+    /// The conclusion survives its premise, which is why this is a correction
+    /// and not a retraction: every *accessor* on `SharedSecrets` really is
+    /// `public static`, so the factory-name question this test asks is answered
+    /// the same way by either baseline. Re-measured for this note:
+    ///
+    /// ```text
+    /// $ javap -p jdk.internal.access.SharedSecrets | wc -l      # 98 members + wrapper
+    /// $ javap    jdk.internal.access.SharedSecrets | wc -l      # 65 — the public view
+    /// ```
+    ///
+    /// The one *method* plain `javap` hides is `ensureClassInitialized`; the
+    /// other 32 hidden members are the private static backing fields. **Any
+    /// claim about a member of this class must be checked at `-p`** — the
+    /// public view is missing exactly the machinery the four self-initialising
+    /// getters (`javaUtilJarAccess`, `getJavaNetUriAccess`,
+    /// `getJavaNetHttpCookieAccess`, `getJavaIORandomAccessFileAccess`) run
+    /// through, which is what `register_factories`' disposition turns on.
     #[test]
-    fn every_factory_returns_access_interface() {
+    fn every_factory_is_declared_by_jdk25_shared_secrets() {
+        let baseline = crate::jdk_baseline::parse(crate::jdk_baseline::SHARED_SECRETS);
         for (method, ret, _) in FACTORIES {
-            assert!(method.starts_with("getJava"));
-            assert!(method.ends_with("Access"));
-            assert!(ret.contains("Access;"));
+            let desc = format!("(){ret}");
+            assert!(
+                baseline.declares(method, &desc),
+                "SharedSecrets bridge registers `{method}{desc}`, which JDK 25's \
+                 jdk.internal.access.SharedSecrets does not declare. Candidate \
+                 descriptors the JDK does declare under that name: {:?}. If the \
+                 list is empty the member is absent outright (delete the entry); \
+                 if it is non-empty you have the descriptor wrong. Oracle: \
+                 scripts/baselines/jdk25-jdk.internal.access.SharedSecrets.tsv.",
+                baseline.descriptors_named(method),
+            );
         }
+    }
+
+    /// Mutation check for the guard above: it must actually reject the two
+    /// spellings F17-1 removed, not merely accept the ones that survived.
+    ///
+    /// Without this, `every_factory_is_declared_by_jdk25_shared_secrets` would
+    /// be one silent `parse()` change away from being as vacuous as the test it
+    /// replaced (a `Baseline` that parsed to zero rows would make `declares`
+    /// return `false` for everything — but an empty `FACTORIES` loop would still
+    /// pass). Asserting a KNOWN-BAD name is rejected and a KNOWN-GOOD one is
+    /// accepted pins both directions.
+    #[test]
+    fn jdk25_baseline_rejects_the_two_spellings_f17_1_removed() {
+        let baseline = crate::jdk_baseline::parse(crate::jdk_baseline::SHARED_SECRETS);
+        assert!(
+            !baseline.declares(
+                "getJavaSecurityAccess",
+                "()Ljdk/internal/access/JavaSecurityAccess;"
+            ),
+            "JEP 486 removed JavaSecurityAccess; nothing declares this getter"
+        );
+        assert!(
+            !baseline.declares(
+                "getJavaUtilJarAccess",
+                "()Ljdk/internal/access/JavaUtilJarAccess;"
+            ),
+            "the real spelling has never carried the `get` prefix"
+        );
+        assert!(
+            baseline.declares(
+                "javaUtilJarAccess",
+                "()Ljdk/internal/access/JavaUtilJarAccess;"
+            ),
+            "…and the corrected spelling must be the one the JDK declares"
+        );
     }
 
     #[test]
@@ -2880,8 +3169,8 @@ mod tests {
             assert!(seen.insert(owner), "duplicate owner class: {owner}");
         }
         // Every factory has a distinct owner class, so the unique-owner count
-        // tracks FACTORIES.len() (15 after `getJavaObjectInputStreamAccess` was
-        // removed — see `all_factories_listed`). Derive it so the two stay in
+        // tracks FACTORIES.len() (14 since F17-1 removed `getJavaSecurityAccess`
+        // — see `all_factories_listed`). Derive it so the two stay in
         // lock-step instead of drifting on the next factory add/remove.
         assert_eq!(seen.len(), FACTORIES.len());
     }
@@ -2908,9 +3197,25 @@ mod tests {
 
     #[test]
     fn representative_method_registered_per_owner() {
-        // For each of the 15 owner classes, probe for one
+        // For each of the 14 owner classes, probe for one
         // representative method we know is registered. This is
         // a sanity check that every `register_*` call landed.
+        //
+        // F17-1 (2026-08-13): 14 here is NOT `FACTORIES.len()` (also 14, by
+        // coincidence since F33-1) and must not be re-derived from it — the two
+        // lists have never had the same membership. Measured against the current
+        // tree, the owner probed below that has NO entry in `FACTORIES` is
+        // `java/io/ObjectInputStream$1` (deliberately not intercepted, so the
+        // real invokedynamic getter runs — see the note in `FACTORIES`), and the
+        // factory owner NOT probed below is `java/io/FileDescriptor$1`. Reading
+        // either count as the other is how the two drift with nothing noticing.
+        //
+        // F33-1 (2026-08-13): 15 -> 14. The `java/security/AccessController$1`
+        // probe went with `register_java_security_access`, whose whole family —
+        // interface, implementation class and `SharedSecrets` accessor — JEP 486
+        // removed. This assertion is the reason that deletion could not be made
+        // by the two earlier lanes that tried: it names the triple, so the
+        // registrar and the probe have to move in one commit.
         let mut r = NativeMethodRegistry::new();
         register_wp1_4_shared_secrets(&mut r);
         let expected: &[(&str, &str, &str)] = &[
@@ -2956,11 +3261,6 @@ mod tests {
                 "()Ljava/lang/management/BufferPoolMXBean;",
             ),
             (
-                "java/security/AccessController$1",
-                "getProtectDomains",
-                "(Ljava/security/AccessControlContext;)[Ljava/security/ProtectionDomain;",
-            ),
-            (
                 "cratonvm/internal/ss/JavaUtilJarAccess$1",
                 "jarFileHasClassPathAttribute",
                 "(Ljava/util/jar/JarFile;)Z",
@@ -2986,7 +3286,7 @@ mod tests {
                 "(Ljava/util/ResourceBundle;Ljava/util/ResourceBundle;)V",
             ),
         ];
-        assert_eq!(expected.len(), 15);
+        assert_eq!(expected.len(), 14);
         for (owner, method, desc) in expected {
             assert!(
                 r.find(owner, method, desc).is_some(),
@@ -3142,5 +3442,121 @@ mod tests {
                 .is_some(),
             "JavaLangAccess.findNative not registered on interface fallback"
         );
+    }
+
+    /// F33-1 (2026-08-13) — **a factory must carry the kind of the owner it
+    /// hands out, not the kind its own receiver class earns.**
+    ///
+    /// This is the guard for the capability defect described on
+    /// [`register_factories`]. It is deliberately an IFF and not a list check:
+    /// the interesting failure is not "the wrong four are demoted", it is
+    /// "a factory and its owner disagree", which is what a future author
+    /// reintroduces by adding a stand-in owner without thinking about the
+    /// getter that returns it.
+    ///
+    /// # It is red on the tree this replaced
+    ///
+    /// Before this change every factory was a plain `register` under the
+    /// registrar's ambient `Bridge`, so all fourteen came back `Bridge` and the
+    /// four `cratonvm/internal/ss/…$1` rows failed the `==`. That is the
+    /// mutation check in the direction that matters, and it is worth being
+    /// precise that the OTHER direction is also covered: making
+    /// `register_factories` demote unconditionally reddens the ten real-JDK
+    /// owners, so "fix it by demoting everything" cannot pass either.
+    ///
+    /// The frozen four at the end are a second, weaker assertion on the same
+    /// run. They do not carry the invariant — the loop does — but they name the
+    /// population, so a change that legitimately shrinks it (retargeting a
+    /// carrier onto the JDK's own implementation class, e.g.
+    /// `java/util/jar/JavaUtilJarAccessImpl`) has to say so here.
+    #[test]
+    fn factory_kind_follows_the_owner_it_hands_out() {
+        use cratonvm_native_api::NativeKind;
+
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+
+        let mut demoted: Vec<&str> = Vec::new();
+        for (method, ret, owner) in FACTORIES {
+            let desc = format!("(){ret}");
+            let kind = r
+                .kind_of("jdk/internal/access/SharedSecrets", method, &desc)
+                .unwrap_or_else(|| panic!("SharedSecrets.{method}{desc} is not registered at all"));
+            let owner_is_dropped = factory_is_orphaned_by_strict_mode(owner);
+            assert_eq!(
+                kind == NativeKind::SyntheticStub,
+                owner_is_dropped,
+                "SharedSecrets.{method}{desc} is registered `{}` while its owner \
+                 `{owner}` is {} by `--jdk-only`. A factory and the receiver it \
+                 returns must be admitted or refused TOGETHER: a surviving \
+                 factory over a dropped owner shadows the real JDK getter and \
+                 hands back a carrier with no methods (`alloc_singleton`'s `Err` \
+                 arm makes that a wrong-class receiver, not an error), and a \
+                 refused factory over a live owner removes a working bridge for \
+                 nothing. Fix `register_factories`, not this test.",
+                kind.as_str(),
+                if owner_is_dropped { "DROPPED" } else { "kept" },
+            );
+            if owner_is_dropped {
+                demoted.push(*owner);
+            }
+        }
+
+        demoted.sort_unstable();
+        assert_eq!(
+            demoted,
+            [
+                "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1",
+                "cratonvm/internal/ss/JavaNetHttpCookieAccess$1",
+                "cratonvm/internal/ss/JavaNetUriAccess$1",
+                "cratonvm/internal/ss/JavaUtilJarAccess$1",
+            ],
+            "the set of SharedSecrets factories `--jdk-only` refuses has changed. \
+             GROWTH means a new fabricated owner (or a real owner newly added to \
+             `NO_IMAGE_JDK_RECEIVERS`) — check that its getter really is better \
+             served by the JDK's own bytecode. SHRINKAGE means a carrier was \
+             retargeted onto a real class, which is a fix: shrink this list with \
+             it and say which class in the commit message. See \
+             docs/known-issues/jdk-only/F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md"
+        );
+    }
+
+    /// A `cratonvm/…` owner that nobody listed keeps `Bridge` and re-opens the
+    /// defect silently.
+    ///
+    /// [`factory_kind_follows_the_owner_it_hands_out`] cannot catch that on its
+    /// own: it asks `factory_is_orphaned_by_strict_mode` about the owner, and an
+    /// unlisted `cratonvm/` name answers `false`, so factory and owner would
+    /// agree — both `Bridge`, both surviving strict, and the methods on a class
+    /// no image declares would be dispatching in the mode that exists to refuse
+    /// exactly that. The IFF is satisfied by the wrong shared answer.
+    ///
+    /// So the population needs its own statement. Every `cratonvm/`-namespaced
+    /// owner in [`FACTORIES`] is a stand-in for a JDK shape by construction —
+    /// it exists only because the bridge had no real class to name — so it
+    /// belongs in `VM_MINTED_STAND_IN_RECEIVERS`. (The `VM_SERVICE_RECEIVERS`
+    /// escape hatch does not apply: a reviewed VM service is not something
+    /// `SharedSecrets` hands to JDK bytecode as a `Java*Access`.)
+    #[test]
+    fn every_fabricated_factory_owner_is_a_listed_stand_in() {
+        for (method, _, owner) in FACTORIES {
+            if !owner.starts_with("cratonvm/") {
+                continue;
+            }
+            assert!(
+                cratonvm_native_api::no_image_receiver::VM_MINTED_STAND_IN_RECEIVERS
+                    .contains(owner),
+                "`{owner}` is a fabricated receiver handed out by \
+                 SharedSecrets.{method}, and it is NOT in \
+                 `VM_MINTED_STAND_IN_RECEIVERS` \
+                 (native-api/src/no_image_receiver.rs). Unlisted, its methods \
+                 keep `NativeKind::Bridge` and dispatch under `--jdk-only` on a \
+                 class no JDK image declares — and this factory keeps `Bridge` \
+                 with them, so the two agree and \
+                 `factory_kind_follows_the_owner_it_hands_out` stays green while \
+                 the whole family is wrong. Add the name to that table IN SORTED \
+                 POSITION (it is binary-searched)."
+            );
+        }
     }
 }

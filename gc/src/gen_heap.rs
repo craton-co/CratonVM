@@ -4217,26 +4217,59 @@ impl GenerationalHeap {
     // ----- T10.9.E descriptor-aware field access --------------------------
 
     /// Descriptor-aware get — normalizes the returned `Value` to the declared
-    /// field type. See [`crate::heap::coerce_field_value_by_descriptor`].
+    /// field type. See [`crate::heap::coerce_field_value_for_slot`].
+    ///
+    /// # G45: provenance
+    ///
+    /// These four inherent methods are the direct-`&GenerationalHeap`
+    /// spelling of the four `GarbageCollector` defaults in `collector.rs`,
+    /// which `GenerationalHeap`'s trait impl (`:17200`) does NOT override —
+    /// so a VM run reaches the trait bodies and these are for callers
+    /// holding the concrete heap. They coerced identically and reported
+    /// identically badly (`class_id=-1 index=-1`), so they are repaired
+    /// identically; letting the two spellings disagree about what the
+    /// instrument says would be worse than either answer.
+    ///
+    /// Hot path unchanged: `site` is a three-word `Copy` value that
+    /// `coerce_field_value_for_slot` passes only to the `#[cold]`
+    /// reporter, and [`Self::class_id_of`] is one load from the object
+    /// header that the neighbouring `get_field`/`set_field` dereferences
+    /// in the same call.
     pub fn get_field_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
         let raw = self.get_field(obj_ref, index);
-        crate::heap::coerce_field_value_by_descriptor(raw, desc_byte)
+        crate::heap::coerce_field_value_for_slot(
+            raw,
+            desc_byte,
+            crate::heap::FieldCoercionSite::read(Some(self.class_id_of(obj_ref)), index),
+        )
     }
 
-    /// Volatile descriptor-aware get.
+    /// Volatile descriptor-aware get. Provenance as in [`Self::get_field_as`].
     pub fn get_field_volatile_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
         let raw = self.get_field_volatile(obj_ref, index);
-        crate::heap::coerce_field_value_by_descriptor(raw, desc_byte)
+        crate::heap::coerce_field_value_for_slot(
+            raw,
+            desc_byte,
+            crate::heap::FieldCoercionSite::read(Some(self.class_id_of(obj_ref)), index),
+        )
     }
 
     /// Descriptor-aware set — normalizes the written `Value` to the declared
     /// field type before the underlying slot write.
+    ///
+    /// Reports `access="store"`: a coercing store destroyed something a
+    /// writer meant, where a coercing read is usually a never-initialised
+    /// slot repairing its own tag.
     pub fn set_field_as(&self, obj_ref: ObjectRef, index: usize, value: Value, desc_byte: u8) {
-        let coerced = crate::heap::coerce_field_value_by_descriptor(value, desc_byte);
+        let coerced = crate::heap::coerce_field_value_for_slot(
+            value,
+            desc_byte,
+            crate::heap::FieldCoercionSite::store(Some(self.class_id_of(obj_ref)), index),
+        );
         self.set_field(obj_ref, index, coerced);
     }
 
-    /// Volatile descriptor-aware set.
+    /// Volatile descriptor-aware set. Provenance as in [`Self::set_field_as`].
     pub fn set_field_volatile_as(
         &self,
         obj_ref: ObjectRef,
@@ -4244,7 +4277,11 @@ impl GenerationalHeap {
         value: Value,
         desc_byte: u8,
     ) {
-        let coerced = crate::heap::coerce_field_value_by_descriptor(value, desc_byte);
+        let coerced = crate::heap::coerce_field_value_for_slot(
+            value,
+            desc_byte,
+            crate::heap::FieldCoercionSite::store(Some(self.class_id_of(obj_ref)), index),
+        );
         self.set_field_volatile(obj_ref, index, coerced);
     }
 
@@ -22863,6 +22900,133 @@ mod tests {
         drop(young_from);
         for (index, object) in roots.iter().copied().enumerate() {
             assert_eq!(heap.get_field(object, 0), Value::Int(index as i32));
+        }
+    }
+
+    // ----- G45: the four descriptor-aware accessors carry provenance -------
+    //
+    // These pin the inherent-method half of the change. The trait-default
+    // half lives in `collector.rs`, and the two must not drift: Rust
+    // resolves `h.get_field_as(..)` on a `&GenerationalHeap` to the INHERENT
+    // method, so `VmHeap`'s `dispatch!` (`vm_heap.rs:222`) reaches these
+    // bodies on a `-XX:+UseGenerationalGC` run and the trait defaults on a
+    // default (ZGC) run. Both are live; neither is the other's dead twin.
+    //
+    // Counter isolation: nothing here fires a lossy coercion. The
+    // process-global loss counters are asserted with EXACT deltas by
+    // `heap.rs`'s G30 tests under a module-private lock this module cannot
+    // take, so a lossy input here would make those exact deltas flaky from
+    // another module for no gain. What these can test locally is the half
+    // that carries the risk — that the value reaching the slot is byte-for
+    // byte what the descriptor-only helper produced.
+
+    /// G45: a descriptor-aware round trip through the provenance-carrying
+    /// accessors lands and returns exactly what the descriptor-only helper
+    /// would have.
+    ///
+    /// This is the risk assertion. These accessors sit on the allocation and
+    /// collection hot path and 97 of 99 `--jdk-only` vectors run over them,
+    /// so the acceptable behavioural delta from adding provenance is zero.
+    /// It holds by construction —
+    /// [`crate::heap::coerce_field_value_for_slot`] reads its `site`
+    /// argument in exactly one place, as an argument to the `#[cold]`
+    /// reporter — and this pins it against a future edit that makes the site
+    /// load-bearing.
+    #[test]
+    fn descriptor_aware_accessors_land_exactly_what_the_bare_helper_lands() {
+        let heap = GenerationalHeap::with_capacity(256 * 1024);
+        // Normalising and identity arms only: no case here reaches
+        // `note_field_coercion_loss`.
+        let cases: &[(Value, u8)] = &[
+            (Value::Int(-7), b'J'),
+            (Value::Float(1.5), b'J'),
+            (Value::Long(0x0102_0304_0506_0708), b'D'),
+            (Value::Int(3), b'F'),
+            (Value::Long(0x1_0000_0001), b'I'),
+            (Value::Double(2.5), b'S'),
+            (Value::Object(None), b'L'),
+            // Unknown descriptor: the `_ => value` arm, untouched.
+            (Value::Int(99), b'V'),
+        ];
+        for &(value, desc) in cases {
+            let expected = crate::heap::coerce_field_value_by_descriptor(value, desc);
+            let obj = heap.alloc_object(ClassId::new(11), 2);
+
+            heap.set_field_as(obj, 0, value, desc);
+            assert_eq!(
+                heap.get_field(obj, 0),
+                expected,
+                "set_field_as({value:?}, '{}') must land what the \
+                 descriptor-only helper lands",
+                desc as char,
+            );
+            assert_eq!(
+                heap.get_field_as(obj, 0, desc),
+                expected,
+                "get_field_as re-reading a '{}' slot",
+                desc as char,
+            );
+
+            heap.set_field_volatile_as(obj, 1, value, desc);
+            assert_eq!(
+                heap.get_field_volatile(obj, 1),
+                expected,
+                "set_field_volatile_as({value:?}, '{}')",
+                desc as char,
+            );
+            assert_eq!(
+                heap.get_field_volatile_as(obj, 1, desc),
+                expected,
+                "get_field_volatile_as re-reading a '{}' slot",
+                desc as char,
+            );
+        }
+    }
+
+    /// G45: the inherent accessors and the inherited `GarbageCollector`
+    /// defaults must answer identically.
+    ///
+    /// They are two spellings of one operation, reached by two live
+    /// configurations of the same VM, and until 2026-08-17 they were also
+    /// two copies of the same defect. Letting them disagree about what a
+    /// slot receives would make a bug reproduce under one `-XX:+Use…GC` flag
+    /// and not the other, which is the single most expensive shape of
+    /// divergence this collector zoo can produce (see `autobox.rs`'s module
+    /// note on W7-84, where exactly that happened).
+    #[test]
+    fn the_inherent_accessors_and_the_trait_defaults_agree() {
+        use crate::collector::GarbageCollector;
+        let heap = GenerationalHeap::with_capacity(256 * 1024);
+        let cases: &[(Value, u8)] = &[
+            (Value::Int(-7), b'J'),
+            (Value::Long(0x1_0000_0001), b'I'),
+            (Value::Double(2.5), b'S'),
+            (Value::Object(None), b'L'),
+            (Value::Int(99), b'V'),
+        ];
+        for &(value, desc) in cases {
+            let via_inherent = heap.alloc_object(ClassId::new(11), 1);
+            let via_trait = heap.alloc_object(ClassId::new(11), 1);
+
+            heap.set_field_as(via_inherent, 0, value, desc);
+            // Fully qualified: plain method syntax would pick the inherent
+            // method and this test would compare it with itself.
+            GarbageCollector::set_field_as(&heap, via_trait, 0, value, desc);
+
+            assert_eq!(
+                heap.get_field(via_inherent, 0),
+                heap.get_field(via_trait, 0),
+                "the inherent and trait spellings of set_field_as disagree \
+                 for {value:?} at a '{}' slot",
+                desc as char,
+            );
+            assert_eq!(
+                heap.get_field_as(via_inherent, 0, desc),
+                GarbageCollector::get_field_as(&heap, via_trait, 0, desc),
+                "the inherent and trait spellings of get_field_as disagree \
+                 for {value:?} at a '{}' slot",
+                desc as char,
+            );
         }
     }
 }

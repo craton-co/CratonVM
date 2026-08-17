@@ -1,5 +1,39 @@
 # The preview gate had no switch, and HotSpot's nameless-class placeholder is `<Unknown>`
 
+> # A34 2026-08-12 (third pass) — §7's live row REPRODUCES, is WIDER than §7
+> # states, and is ALREADY FIXED IN SOURCE. See §8. Do not write the patch.
+>
+> Three things, in the order a reader needs them.
+>
+> 1. **All three falsifiers were re-run on a fresh binary and §7's verdict
+>    holds.** `--enable-preview` parses and gates; `defineClass` on a 69.65535
+>    class file still throws `ClassFormatError` wrapping a Rust `Debug` string
+>    where HotSpot throws `UnsupportedClassVersionError`.
+> 2. **§7 measured the defect through too narrow an aperture.** It probed only
+>    `defineClass(null, …)` and filed the finding under the `<Unknown>`
+>    falsifier, which frames it as a nameless-define problem. It is not.
+>    `defineClass("P", …)` — an ordinary NAMED define — flattens identically.
+>    The defect is the `defineClass` road, not the nameless case on it, and any
+>    fix scoped to nameless defines would have closed the wrong half.
+> 3. **The fix landed in `67146db71` (2026-08-12 17:49) and this record has not
+>    caught up.** `native-builtins/src/lang_system.rs` grew
+>    `define_class_linkage_error` / `typed_define_class_error`, which parse the
+>    backend's `Debug` rendering back into the typed `LinkageError` and are
+>    wired into `defineClass0`, `defineClass1` **and** `defineClass2` — the
+>    three roads §7 names — with unit tests beside them. §7's own prescription
+>    (*"give `define_class_format_error` a pass-through for an already-typed
+>    `VmError::Linkage`"*) is superseded by a recovery that also handles the
+>    already-flattened case. **Anyone acting on §7 would be re-writing landed
+>    work**, which is the failure mode this campaign carries fifteen instances
+>    of.
+>
+> The reproduction below is therefore a statement about BINARIES, not about the
+> tree: no binary available to this lane carries `67146db71`. Verified rather
+> than assumed — neither `scratchpad/bin/cratonvm-merged-dev.exe` (15:27) nor
+> `C:/craton/synjdk-target/release/cratonvm.exe` (17:57) contains the symbol
+> `typed_define_class_error`, and both reproduce the old shape identically in
+> `--jdk-only` and `--real-jdk`.
+
 > # NOT RETIRED 2026-08-12 (second pass). The build arrived, the falsifiers were
 > # run, and the third one found a LIVE row. See §7.
 >
@@ -420,6 +454,56 @@ deliberately **not given a new record number**: two other lanes were running and
 `W7-94` would collide. The fix is to give `define_class_format_error` a
 pass-through for an already-typed `VmError::Linkage`, and it needs the same
 exhaustiveness care §4(C) applied — plus a falsifier, which this section now is.
+
+## 8. 2026-08-12 (A34) — re-run on a fresh binary, and the aperture correction
+
+Method, so the provenance is unambiguous: `P.class` and `Q.class` compiled at
+`69.0` and hand-stamped `ff ff` at bytes 4..5 (`od -An -tx1 -N8` reads
+`ca fe ba be ff ff 00 45`), Microsoft JDK 25.0.3.9 as oracle, CratonVM rows on
+`scratchpad/bin/cratonvm-merged-dev.exe` with `--java-home` passed.
+
+**Falsifier 1 — the flag and the gate. PASSES, again.**
+
+```text
+HotSpot                        -> UnsupportedClassVersionError: Preview features are not enabled for Q (class file version 69.65535). Try running with '--enable-preview'
+HotSpot --enable-preview       -> ran-Q
+cratonvm --jdk-only            -> linkage error: Preview features are not enabled for Q (class file version 69.65535). Try running with '--enable-preview'
+cratonvm --jdk-only --enable-preview -> ran-Q
+```
+
+**Falsifier 3 — and the correction that matters.** §7 printed one row. Printing
+the named define beside it changes what the finding is:
+
+| define call | HotSpot | CratonVM (`--jdk-only` and `--real-jdk`, identical) |
+|---|---|---|
+| `defineClass(null, b, 0, b.length)` | `UnsupportedClassVersionError: … for <Unknown> …` | `ClassFormatError: : defineClass1: Linkage(UnsupportedClassVersionError { class_name: "", message: "… <Unknown> …" })` |
+| **`defineClass("P", b, 0, b.length)`** | `UnsupportedClassVersionError: … for P …` | **`ClassFormatError: P: defineClass1: Linkage(UnsupportedClassVersionError { class_name: "P", message: "… P …" })`** |
+
+Both rows carry HotSpot's sentence intact inside a Rust `Debug` rendering, and
+both are the wrong exception type. **The nameless case is not special here.**
+§7 reached the right site by the wrong road: it found the defect while chasing
+`<Unknown>`, and then described it as living on the nameless-define path,
+which is one row of a two-row table. The generalisable version:
+
+> A defect found while running a falsifier for something else inherits that
+> falsifier's framing. Before filing it, vary the input the falsifier was
+> holding fixed — here, the name argument — and check the finding is still
+> about what you think it is about.
+
+**Why the type matters more than the spelling**, restating §7 because it is
+correct and now applies to a wider surface: a caller that catches
+`UnsupportedClassVersionError` — which is what a container does when it probes
+whether it can load a bundle, and exactly the `catch` HotSpot's message invites
+— does not catch a `ClassFormatError`. That is now known to apply to every
+`ClassLoader.defineClass` caller, not to the nameless ones.
+
+**Disposition: fixed in source, NOT BUILT, and this section is the falsifier
+for the rebuild.** After a build carrying `67146db71`, both rows above must
+read `java.lang.UnsupportedClassVersionError` with HotSpot's sentence and **no**
+`Linkage(...)`/`class_name:` `Debug` residue, in both modes. If only the named
+row converts, the recovery is keying on a non-empty `class_name` and the
+nameless road still flattens — which would be §7's framing coming true after
+the fact, and the one outcome that would make its narrow aperture the right one.
 
 ## What is not claimed
 

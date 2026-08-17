@@ -153,7 +153,15 @@ const LM_FIELD_READY: usize = LM_REAL_FIELDS + 1;
 
 /// Real `Logger` instance-field count on JDK 21–25.
 const LOGGER_REAL_FIELDS: usize = 12;
-const LOGGER_NUM_FIELDS: usize = LOGGER_REAL_FIELDS + 1;
+/// The width `ClassManager::synthetic_stub_fields` declares for
+/// `java/util/logging/Logger` (`class_manager.rs:14191`): the 12 real fields
+/// plus the one VM-internal slot [`LOGGER_FIELD_LEVEL`] is anchored on.
+///
+/// `pub(crate)` because it is the width every JUL Logger producer in the tree
+/// must ask for. `logging_shims` used to ask 2 or 3 and write its own
+/// name/level slots at 0/1 — a second slot map for a class that already had a
+/// declaration, which put the name on `config` and the level on `manager`.
+pub(crate) const LOGGER_NUM_FIELDS: usize = LOGGER_REAL_FIELDS + 1;
 pub(crate) const LOGGER_FIELD_NAME: usize = 2;
 pub(crate) const LOGGER_FIELD_PARENT: usize = 8;
 /// VM-internal: a real `Logger` has no `level` field at all — the effective
@@ -1183,6 +1191,15 @@ fn tomcat_classloader_log_manager_requested(ctx: &dyn NativeContext) -> bool {
 }
 
 fn native_jul_static_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // STATIC: args[0] is the name, not a receiver. Same null rule, and the
+    // same message, as `LogManager.getLogger` — both land in the same map.
+    // This also covers the two-arg overload, which delegates here: measured,
+    // `Logger.getLogger(null, "bundle")` NPEs on the NAME before the bundle is
+    // looked at, while `Logger.getLogger("more.a", null)` RETURNS a logger.
+    // The bundle half of that pair is the "legal null" and must stay legal.
+    if jul_arg_is_null(args, 0) {
+        return jul_throw_npe(JUL_NPE_NULL_KEY);
+    }
     let name = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
@@ -1398,6 +1415,14 @@ fn native_jboss_init(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 
 fn native_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `getLogger(String)` — receiver in args[0], name in args[1].
+    //
+    // A null name is NOT the empty name. HotSpot reaches
+    // `ConcurrentHashMap.get(name)` and NPEs there; this body coerced null to
+    // `""` and handed back the ROOT logger, so `LogManager.getLogger(null)`
+    // returned a live object where the JDK throws.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_KEY);
+    }
     let name = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
@@ -1410,11 +1435,16 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let vm = ctx.vm_identity();
     // `addLogger(Logger)` — args[0]=this, args[1]=Logger.
     let Some(Value::Object(Some(logger))) = args.get(1).cloned() else {
-        // null Logger -> contract says NullPointerException, but we
-        // prefer to swallow + return false so the caller's bootstrap
-        // path keeps going; this is consistent with the permissive
-        // behaviour T19.H1 established elsewhere.
-        return Ok(Some(Value::Int(0)));
+        // The old comment here said "contract says NullPointerException, but
+        // we prefer to swallow + return false so the caller's bootstrap path
+        // keeps going". Measured, that preference protects nobody: HotSpot
+        // throws, so any bootstrap that reached this line was already dead on
+        // a real JDK and the swallow only moved the failure somewhere less
+        // legible. Returning `false` for a DUPLICATE logger is a different
+        // rule and is still correct — that arm is below, and it is measured
+        // too (`addLogger(realLogger)` twice answers `false,false` on both
+        // VMs, because the name is already registered by `getLogger`).
+        return jul_throw_npe(JUL_NPE_NULL_LOGGER);
     };
     // `wildfly_core::get_logger` below can allocate and trigger a moving GC.
     // Keep the real-JDK Logger receiver rooted through that call before
@@ -2274,12 +2304,10 @@ fn native_level_find_level(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_level_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(s))) => *s,
-        _ => {
-            return Err(RuntimeError::NullPointerException {
-                message: Some("Name cannot be null".to_string()),
-            }
-            .into());
-        }
+        // The CLASS was already right; the MESSAGE was invented. HotSpot's
+        // `Level.parse` opens `name.length()`, so the helpful-NPE names
+        // `String.length()`. See `JUL_NPE_NULL_LEVEL_NAME`.
+        _ => return jul_throw_npe(JUL_NPE_NULL_LEVEL_NAME),
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let upper = name.to_uppercase();
@@ -3344,6 +3372,13 @@ fn native_jul_logger_log_level_msg(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Null `Level` throws; a null MESSAGE does not. Measured both ways:
+    // `log(null, "msg")` NPEs, `log(SEVERE, (String) null)` returns. This
+    // overload does not route through `native_jul_logger_is_loggable`, so the
+    // check is restated here rather than inherited.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_LEVEL);
+    }
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
         _ => None,
@@ -3385,6 +3420,12 @@ fn native_jul_logger_log_level_msg(
 /// `LogRecord.getParameters()` must report it exactly that way, so do the same
 /// here rather than pre-formatting the text.
 fn native_jul_logger_log_param(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null `Level` throws. A null single PARAMETER does not — measured:
+    // `log(SEVERE, "msg", (Object) null)` returns on HotSpot, and the JDK
+    // still wraps that null in a one-element array.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_LEVEL);
+    }
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
         _ => None,
@@ -3448,6 +3489,11 @@ fn native_jul_logger_log_param(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// substitution belongs to the Formatter, and only the console-sink fallback
 /// (for a logger with no handler chain at all) performs it here.
 fn native_jul_logger_log_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null `Level` throws. A null PARAMETER ARRAY does not — measured:
+    // `log(SEVERE, "msg", (Object[]) null)` returns on HotSpot.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_LEVEL);
+    }
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
         _ => None,
@@ -3943,6 +3989,15 @@ fn publish_jul_handlers_src(
 /// "Bootstrap rc=0, no output" symptom for `Bootstrap version` and
 /// every other JULI-driven Tomcat command.
 fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null `Level` throws. The SOURCE CLASS and SOURCE METHOD do not —
+    // measured: `logp(SEVERE, null, null, "msg")` returns on HotSpot, and so
+    // does `entering(null, null)` / `exiting(null, null)` / `throwing(null,
+    // null, null)`. Three nulls in one call, one of which is fatal and two of
+    // which are ordinary: this signature is the clearest single refutation of
+    // a blanket JUL null rule in the whole package.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_LEVEL);
+    }
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
         _ => None,
@@ -5048,8 +5103,28 @@ pub(crate) fn native_jul_logger_log_throwable(
     ) {
         return Ok(None);
     }
-    // `jul_resolve_msg` may invoke Java supplier code and allocate. Keep the
-    // receiver/level rooted while identifying the throwable so the later
+    // A null `Supplier` throws here exactly as it does in the no-throwable
+    // sibling — but this callback serves THREE descriptors and is never told
+    // which one it was invoked under, so "the supplier slot is null" has to be
+    // decided the same way the throwable is: by type.
+    //
+    // `(Level, Throwable, Supplier)` is the only one of the three whose slot 2
+    // holds a `Throwable`, so a `Throwable` in slot 2 makes slot 3 the
+    // supplier, and a null there is the NPE. Everything else is left alone,
+    // and deliberately: measured, `log(SEVERE, (String) null, (Throwable)
+    // null)` RETURNS — two nulls in the same two slots, and the opposite
+    // verdict. Discriminating on the descriptor is not available; without the
+    // type test this arm would have thrown on that legal call.
+    if !jul_arg_is_null(args, 2) && jul_arg_is_null(args, 3) {
+        if let Some(Value::Object(Some(o))) = args.get(2) {
+            let o = *o;
+            if jul_is_throwable(ctx, o) {
+                return jul_throw_npe(JUL_NPE_NULL_SUPPLIER);
+            }
+        }
+    }
+    // Resolving the message may invoke Java supplier code and allocate. Keep
+    // the receiver/level rooted while identifying the throwable so the later
     // record never receives an old moving-GC address.
     let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
     let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
@@ -5101,7 +5176,18 @@ pub(crate) fn native_jul_logger_log_throwable(
             if ctx.read_string(o).is_some() {
                 Some(o)
             } else {
-                let text = jul_resolve_msg(ctx, o);
+                // Strict, for the reason given on `jul_resolve_msg_strict`: a
+                // supplier that throws must propagate rather than be rendered
+                // as its own `toString()`. Unpin before propagating.
+                let text = match jul_resolve_msg_strict(ctx, o) {
+                    Ok(t) => t.unwrap_or_else(|| "null".to_string()),
+                    Err(e) => {
+                        if let Some(base) = base_pin {
+                            ctx.unpin_native_roots(base);
+                        }
+                        return Err(e);
+                    }
+                };
                 Some(ctx.create_string(&text))
             }
         }
@@ -5182,17 +5268,43 @@ fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -
     ) {
         return Ok(None);
     }
-    // GC SAFETY: `jul_resolve_msg` INVOKES the supplier — arbitrary Java that
-    // allocates — so the receiver and the level can both move across it. Same
-    // pin/re-derive discipline as `native_jul_logger_log_throwable`, which
-    // resolves a supplier for the throwable-carrying overloads.
+    // AFTER the gate, not before it. HotSpot's body is
+    // `if (!isLoggable(level)) return; new LogRecord(level, msgSupplier.get())`
+    // — so a null supplier on a SUPPRESSED level returns quietly and only
+    // throws once the record is actually going to be built. Checking before
+    // the gate would throw where the JDK returns.
+    if jul_arg_is_null(args, 2) {
+        return jul_throw_npe(JUL_NPE_NULL_SUPPLIER);
+    }
+    // GC SAFETY: resolving the message INVOKES the supplier — arbitrary Java
+    // that allocates — so the receiver and the level can both move across it.
+    // Same pin/re-derive discipline as `native_jul_logger_log_throwable`,
+    // which resolves a supplier for the throwable-carrying overloads.
     let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
     let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
     let base_pin = this_pin.map(|(p, _)| p).or_else(|| level_pin.map(|(p, _)| p));
-    let msg = match args.get(2) {
-        Some(Value::Object(Some(o))) => jul_resolve_msg(ctx, *o),
-        _ => String::new(),
+    // A supplier that THROWS propagates; `jul_resolve_msg` used to catch it
+    // and log the supplier's `toString()` instead. Unpin on the way out —
+    // an early `?` here would strand the roots pinned above.
+    let resolved = match args.get(2) {
+        Some(Value::Object(Some(o))) => jul_resolve_msg_strict(ctx, *o),
+        _ => Ok(Some(String::new())),
     };
+    let msg = match resolved {
+        Ok(m) => m,
+        Err(e) => {
+            if let Some(base) = base_pin {
+                ctx.unpin_native_roots(base);
+            }
+            return Err(e);
+        }
+    };
+    // `Supplier.get()` returning null is a null LogRecord message, which
+    // `SimpleFormatter` renders as the four characters `null` — measured on
+    // HotSpot as `SEVERE: null`. Rendering it here keeps the FORMATTED output
+    // identical; `LogRecord.getMessage()` on such a record is not reachable
+    // through this native and is not adjudicated.
+    let msg = msg.unwrap_or_else(|| "null".to_string());
     let message_obj = ctx.create_string(&msg);
     let message_pin = ctx.pin_native_root(message_obj);
     // `jul_resolve_msg`/`create_string` both allocate: re-derive everything.
@@ -5234,6 +5346,12 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // `log((LogRecord) null)` is `record.getLevel()` on HotSpot — the level
+    // gate documented above IS the dereference, so the null record throws
+    // before anything is published. This body returned quietly instead.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_RECORD);
+    }
     let rec = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -5316,6 +5434,129 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// The `java.util.logging` null axis
+// ---------------------------------------------------------------------------
+//
+// MEASURED against HotSpot 25.0.3+9-LTS, one probe per method, printing the
+// exception class AND its exact `getMessage()` — see
+// docs/known-issues/jdk-only/G15-1-the-jul-null-axis-and-how-far-RJdkIntrinsics3-got-20260817.md
+// for the full table. **The axis is not one rule.** In the same package, on the
+// same argument:
+//
+//   * `Logger.setLevel(null)`, `Logger.setFilter(null)`, `Logger.removeHandler
+//     (null)`, `Logger.getLogger(name, null)`, `Logger.severe((String) null)`,
+//     `Logger.logp(level, null, null, msg)`, `Logger.entering(null, null)` and
+//     every `LogRecord` setter except `setLevel`/`setInstant` RETURN NORMALLY;
+//   * `Logger.addHandler(null)`, `Logger.setParent(null)`, a null `Level` on
+//     any `log`/`logp`/`isLoggable` overload, a null `Supplier` on the two
+//     supplier overloads, a null name on `Logger.getLogger`/`Level.parse`, a
+//     null key on `LogManager.getLogger`/`getProperty`, a null `Logger` on
+//     `LogManager.addLogger` and a null record on `Logger.log(LogRecord)`
+//     THROW.
+//
+// A blanket "JUL rejects null" rule would break the first list; a blanket "JUL
+// tolerates null" rule is what the second list was, and is the defect these
+// constants close. HANDOFF-20260814 §5 names this exact family as the one where
+// generalising from three rows cost real time. Only the rows below are
+// adjudicated — nothing here licenses a null check on a method not listed.
+
+/// HotSpot's helpful-NPE text for a null `Level` reaching a `Logger` entry
+/// point whose real body opens on `level.intValue()`.
+const JUL_NPE_NULL_LEVEL: &str =
+    "Cannot invoke \"java.util.logging.Level.intValue()\" because \"level\" is null";
+
+/// HotSpot's text for a null `Supplier` on `log(Level, Supplier)` /
+/// `log(Level, Throwable, Supplier)`. The JDK's parameter is named
+/// `msgSupplier`, and the helpful-NPE quotes the parameter name.
+const JUL_NPE_NULL_SUPPLIER: &str =
+    "Cannot invoke \"java.util.function.Supplier.get()\" because \"msgSupplier\" is null";
+
+/// HotSpot's text for a null key reaching the `ConcurrentHashMap` behind
+/// `Logger.getLogger` / `LogManager.getLogger` / `LogManager.getProperty`.
+/// The NPE is raised by the map, not by JUL, which is why all three read
+/// identically and why none of them names a `java.util.logging` type.
+const JUL_NPE_NULL_KEY: &str = "Cannot invoke \"Object.hashCode()\" because \"key\" is null";
+
+/// HotSpot's text for `Logger.log((LogRecord) null)`.
+const JUL_NPE_NULL_RECORD: &str =
+    "Cannot invoke \"java.util.logging.LogRecord.getLevel()\" because \"record\" is null";
+
+/// HotSpot's text for `LogManager.addLogger(null)`.
+const JUL_NPE_NULL_LOGGER: &str =
+    "Cannot invoke \"java.util.logging.Logger.getName()\" because \"logger\" is null";
+
+/// HotSpot's text for `Level.parse(null)`. `Level.parse` opens with
+/// `name.length()`, so the helpful-NPE names `String.length()` — NOT a
+/// hand-written "Name cannot be null", which is what this file answered
+/// before and which no HotSpot build produces.
+const JUL_NPE_NULL_LEVEL_NAME: &str = "Cannot invoke \"String.length()\" because \"name\" is null";
+
+/// Raise the JUL null-argument NPE with HotSpot's own message text.
+fn jul_throw_npe(message: &str) -> MethodCallResult {
+    Err(RuntimeError::NullPointerException {
+        message: Some(message.to_string()),
+    }
+    .into())
+}
+
+/// Is `args[idx]` absent or a null reference?
+///
+/// Deliberately distinguishes "no such argument" from "argument present and
+/// null" nowhere: a native invoked under a descriptor that declares the slot
+/// always receives it, and a missing slot means the callback was reached under
+/// a descriptor it does not serve — in which case refusing is still right.
+fn jul_arg_is_null(args: &[Value], idx: usize) -> bool {
+    !matches!(args.get(idx), Some(Value::Object(Some(_))))
+}
+
+/// Resolve a `Logger.log` message argument that may be a `String` or a
+/// `Supplier<String>`, with the real JDK's THREE outcomes rather than the
+/// one-string-or-empty answer [`jul_resolve_msg`] gives.
+///
+/// `Ok(Some(s))` — resolved. `Ok(None)` — the supplier returned null, which the
+/// JDK stores as a null `LogRecord` message and `SimpleFormatter` renders as
+/// the four characters `null`. `Err(..)` — the supplier itself threw, and the
+/// JDK lets that propagate to the caller of `log`; [`jul_resolve_msg`] caught
+/// it and fell through to `toString()`, so a `Supplier` that blew up was
+/// logged as `com.example.Sup@1a2b3c` and the exception vanished. Measured:
+/// HotSpot propagates `IllegalStateException: supplier blew up`, this file
+/// printed `JulSup$Boom@53c`.
+fn jul_resolve_msg_strict(
+    ctx: &mut dyn NativeContext,
+    o: ObjectRef,
+) -> Result<Option<String>, MethodCallFailed> {
+    if let Some(s) = ctx.read_string(o) {
+        return Ok(Some(s));
+    }
+    let supplier_class = ctx.class_id_by_name("java/util/function/Supplier");
+    let object_class = ctx.class_id_of_object(o);
+    if supplier_class
+        .is_some_and(|supplier| object_class == supplier || ctx.is_subclass(object_class, supplier))
+    {
+        // NOT swallowed: `?` on purpose. This is the whole point of the strict
+        // variant.
+        return match ctx.invoke_virtual(o, "get", "()Ljava/lang/Object;", &[])? {
+            Some(Value::Object(Some(r))) => Ok(Some(match ctx.read_string(r) {
+                Some(s) => s,
+                // `get()` answered a non-`String`, which generics make
+                // unreachable from javac-compiled code and which nothing
+                // measured produces. Keep [`jul_resolve_msg`]'s historical
+                // answer for it rather than changing an unadjudicated row in
+                // the same edit as three adjudicated ones.
+                None => jul_resolve_msg(ctx, o),
+            })),
+            // `Supplier.get()` returned null — a null message, not an empty
+            // one, and not a `toString()` of the supplier.
+            _ => Ok(None),
+        };
+    }
+    // Not a `Supplier` and not a `String`: keep the historical `toString()`
+    // rendering rather than inventing a refusal for a shape no measurement
+    // covers.
+    Ok(Some(jul_resolve_msg(ctx, o)))
+}
+
 /// `java/util/logging/Logger.isLoggable(Level)Z`.
 ///
 /// Our synthetic Logger objects carry a null `level` field and have no
@@ -5331,6 +5572,15 @@ pub(crate) fn native_jul_logger_is_loggable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // `Logger.isLoggable(null)` is `level.intValue()` on HotSpot and therefore
+    // an NPE — and because the `log(Level, Supplier)` / `log(Level, Throwable,
+    // Supplier)` / `log(LogRecord)` overloads all gate through this function,
+    // this one check is also what makes a null `Level` throw there, in the
+    // right ORDER: HotSpot evaluates the level before touching the supplier,
+    // so `log(null, validSupplier)` reports the level and never calls `get()`.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_LEVEL);
+    }
     let logger = match args.first() {
         Some(Value::Object(Some(o))) => Some(*o),
         _ => None,
@@ -5762,6 +6012,12 @@ fn native_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // own constructor bytecode querying `LogManager.getProperty(cname +
     // ".level")` observes the same config `apply_jul_config_entries`
     // already applied directly.
+    // A null key is an NPE from the backing map, not a miss. `getProperty` of
+    // an ABSENT key still answers null on both VMs — that arm is below and is
+    // measured; only the null key changes.
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_KEY);
+    }
     let key = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s),
         _ => None,
@@ -7975,5 +8231,422 @@ mod tests {
             before, after,
             "addresses absent from the pointer map must be left unchanged"
         );
+    }
+
+    // ======================================================================
+    // The JUL null axis
+    //
+    // Every expectation below is a transcription of a HotSpot 25.0.3+9-LTS
+    // run, not a reading of the JDK source. The table is in
+    // docs/known-issues/jdk-only/G15-1-the-jul-null-axis-and-how-far-RJdkIntrinsics3-got-20260817.md
+    //
+    // The tests come in PAIRS on purpose. A test file that only asserts the
+    // throws would be passed by a blanket "JUL rejects null" rule — which is
+    // the rule HANDOFF-20260814 §5 records as having broken working paths in
+    // this exact family. The `..._is_legal_and_must_not_throw` half is what
+    // fails if someone generalises.
+    // ======================================================================
+
+    fn runtime_error(failed: MethodCallFailed) -> RuntimeError {
+        match failed {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(e)) => e,
+            other => panic!("expected a RuntimeError, got {other:?}"),
+        }
+    }
+
+    /// Assert an NPE carrying HotSpot's message VERBATIM. The message is the
+    /// point: every row on this axis already threw the right CLASS somewhere,
+    /// and `Level.parse` threw the right class with a message
+    /// (`"Name cannot be null"`) that no HotSpot build produces.
+    fn assert_npe(result: MethodCallResult, expected: &str, what: &str) {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{what}: expected a throw, got a return"));
+        match runtime_error(err) {
+            RuntimeError::NullPointerException { message } => assert_eq!(
+                message.as_deref(),
+                Some(expected),
+                "{what}: NPE message must be HotSpot's text verbatim"
+            ),
+            other => panic!("{what}: expected NullPointerException, got {other:?}"),
+        }
+    }
+
+    /// The six messages, transcribed. If HotSpot's text ever changes these
+    /// are the cells to re-measure; nothing else in this module hard-codes it.
+    #[test]
+    fn the_jul_null_messages_are_the_measured_hotspot_text() {
+        assert_eq!(
+            JUL_NPE_NULL_LEVEL,
+            "Cannot invoke \"java.util.logging.Level.intValue()\" because \"level\" is null"
+        );
+        assert_eq!(
+            JUL_NPE_NULL_SUPPLIER,
+            "Cannot invoke \"java.util.function.Supplier.get()\" because \"msgSupplier\" is null"
+        );
+        assert_eq!(
+            JUL_NPE_NULL_KEY,
+            "Cannot invoke \"Object.hashCode()\" because \"key\" is null"
+        );
+        assert_eq!(
+            JUL_NPE_NULL_RECORD,
+            "Cannot invoke \"java.util.logging.LogRecord.getLevel()\" because \"record\" is null"
+        );
+        assert_eq!(
+            JUL_NPE_NULL_LOGGER,
+            "Cannot invoke \"java.util.logging.Logger.getName()\" because \"logger\" is null"
+        );
+        assert_eq!(
+            JUL_NPE_NULL_LEVEL_NAME,
+            "Cannot invoke \"String.length()\" because \"name\" is null"
+        );
+    }
+
+    /// `Level.parse(null)` threw the right class with an invented message.
+    #[test]
+    fn level_parse_null_npe_carries_hotspots_message_not_an_invented_one() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        assert_npe(
+            native_level_parse(&mut ctx, &[Value::Object(None)]),
+            JUL_NPE_NULL_LEVEL_NAME,
+            "Level.parse(null)",
+        );
+    }
+
+    /// `Level.findLevel` is `parse`'s non-throwing sibling and MUST keep
+    /// answering `null` for the same input — the message change above must not
+    /// leak through it. `LogManager.getLevelProperty` depends on this.
+    #[test]
+    fn level_find_level_null_is_still_null_and_must_not_throw() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        assert!(
+            matches!(
+                native_level_find_level(&mut ctx, &[Value::Object(None)]),
+                Ok(Some(Value::Object(None)))
+            ),
+            "findLevel must report an unresolvable name as null, never throw"
+        );
+    }
+
+    /// A null name is not the empty name: this used to hand back the ROOT
+    /// logger, so `getLogger(null)` returned a live object where HotSpot NPEs.
+    #[test]
+    fn log_manager_get_logger_null_key_throws() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!("no LogManager"),
+        };
+        assert_npe(
+            native_get_logger(&mut ctx, &[Value::Object(Some(mgr)), Value::Object(None)]),
+            JUL_NPE_NULL_KEY,
+            "LogManager.getLogger(null)",
+        );
+    }
+
+    /// The static factory takes the name in slot 0, not slot 1. Getting that
+    /// wrong would make the check fire on the RECEIVER of a method that has
+    /// none.
+    #[test]
+    fn logger_static_get_logger_null_name_throws() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        assert_npe(
+            native_jul_static_get_logger(&mut ctx, &[Value::Object(None)]),
+            JUL_NPE_NULL_KEY,
+            "Logger.getLogger(null)",
+        );
+    }
+
+    /// The other half of the same signature. MEASURED: `Logger.getLogger
+    /// ("more.a", null)` returns a Logger — the BUNDLE may be null even
+    /// though the NAME may not.
+    #[test]
+    fn logger_static_get_logger_null_bundle_is_legal_and_must_not_throw() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let name = ctx.create_string("axis.named");
+        let got = native_jul_static_get_logger_with_bundle(
+            &mut ctx,
+            &[Value::Object(Some(name)), Value::Object(None)],
+        );
+        assert!(
+            matches!(got, Ok(Some(Value::Object(Some(_))))),
+            "a null resourceBundleName is legal and must still yield a Logger"
+        );
+    }
+
+    #[test]
+    fn log_manager_get_property_null_key_throws_but_a_missing_key_is_null() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!("no LogManager"),
+        };
+        assert_npe(
+            native_get_property(&mut ctx, &[Value::Object(Some(mgr)), Value::Object(None)]),
+            JUL_NPE_NULL_KEY,
+            "LogManager.getProperty(null)",
+        );
+        // The ABSENT key is a different rule and stays null on both VMs.
+        let missing = ctx.create_string("no.such.key.at.all");
+        assert!(
+            matches!(
+                native_get_property(
+                    &mut ctx,
+                    &[Value::Object(Some(mgr)), Value::Object(Some(missing))]
+                ),
+                Ok(Some(Value::Object(None)))
+            ),
+            "an absent key must still answer null, not throw"
+        );
+    }
+
+    /// This one reverses a DELIBERATE swallow whose comment said the contract
+    /// was NPE but that returning `false` kept bootstraps alive. It kept
+    /// nothing alive that HotSpot would have run.
+    #[test]
+    fn log_manager_add_logger_null_throws_instead_of_answering_false() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!("no LogManager"),
+        };
+        assert_npe(
+            native_add_logger(&mut ctx, &[Value::Object(Some(mgr)), Value::Object(None)]),
+            JUL_NPE_NULL_LOGGER,
+            "LogManager.addLogger(null)",
+        );
+    }
+
+    /// `isLoggable` is the level gate the supplier overloads share, so this
+    /// single check is also what orders `log(null, supplier)` correctly: the
+    /// level is reported and the supplier is never called.
+    #[test]
+    fn logger_is_loggable_null_level_throws() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = make_logger(&mut ctx, "axis.recv");
+        assert_npe(
+            native_jul_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(logger)), Value::Object(None)],
+            ),
+            JUL_NPE_NULL_LEVEL,
+            "Logger.isLoggable(null)",
+        );
+    }
+
+    #[test]
+    fn logger_log_record_null_throws() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = make_logger(&mut ctx, "axis.recv");
+        assert_npe(
+            native_jul_logger_log_record(
+                &mut ctx,
+                &[Value::Object(Some(logger)), Value::Object(None)],
+            ),
+            JUL_NPE_NULL_RECORD,
+            "Logger.log((LogRecord) null)",
+        );
+    }
+
+    /// Every `log`/`logp` overload that does NOT route through the shared gate
+    /// restates the level check, so every one of them is asserted here. A
+    /// missing restatement is invisible otherwise: the overload simply logs at
+    /// the INFO default and returns.
+    #[test]
+    fn every_log_overload_refuses_a_null_level() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = make_logger(&mut ctx, "axis.recv");
+        let msg = ctx.create_string("m");
+        let recv = Value::Object(Some(logger));
+        let text = Value::Object(Some(msg));
+        let null = Value::Object(None);
+
+        assert_npe(
+            native_jul_logger_log_level_msg(&mut ctx, &[recv.clone(), null.clone(), text.clone()]),
+            JUL_NPE_NULL_LEVEL,
+            "log(null, String)",
+        );
+        assert_npe(
+            native_jul_logger_log_param(
+                &mut ctx,
+                &[recv.clone(), null.clone(), text.clone(), null.clone()],
+            ),
+            JUL_NPE_NULL_LEVEL,
+            "log(null, String, Object)",
+        );
+        assert_npe(
+            native_jul_logger_log_params(
+                &mut ctx,
+                &[recv.clone(), null.clone(), text.clone(), null.clone()],
+            ),
+            JUL_NPE_NULL_LEVEL,
+            "log(null, String, Object[])",
+        );
+        assert_npe(
+            native_jul_logger_logp(
+                &mut ctx,
+                &[
+                    recv.clone(),
+                    null.clone(),
+                    null.clone(),
+                    null.clone(),
+                    text.clone(),
+                ],
+            ),
+            JUL_NPE_NULL_LEVEL,
+            "logp(null, null, null, String)",
+        );
+        assert_npe(
+            native_jul_logger_log_throwable(
+                &mut ctx,
+                &[recv.clone(), null.clone(), text.clone(), null.clone()],
+            ),
+            JUL_NPE_NULL_LEVEL,
+            "log(null, String, Throwable)",
+        );
+        assert_npe(
+            native_jul_logger_log_supplier(&mut ctx, &[recv, null.clone(), null]),
+            JUL_NPE_NULL_LEVEL,
+            "log(null, Supplier)",
+        );
+    }
+
+    /// The half a blanket rule would break. `logp`'s SOURCE CLASS and SOURCE
+    /// METHOD are nulls in the same call whose level null is fatal — measured,
+    /// `logp(SEVERE, null, null, "msg")` returns on HotSpot. If someone
+    /// "tidies" the level check into a loop over the reference arguments, this
+    /// is the test that fails.
+    #[test]
+    fn logp_null_source_class_and_method_are_legal_and_must_not_throw() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = make_logger(&mut ctx, "axis.recv");
+        let level = make_level(&mut ctx, "SEVERE", 1000);
+        let msg = ctx.create_string("m");
+        let got = native_jul_logger_logp(
+            &mut ctx,
+            &[
+                Value::Object(Some(logger)),
+                Value::Object(Some(level)),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(Some(msg)),
+            ],
+        );
+        assert!(
+            got.is_ok(),
+            "a null source class/method pair is legal on HotSpot and must not throw: {got:?}"
+        );
+    }
+
+    /// The other legal nulls in the same family, asserted together so a
+    /// blanket rule cannot pass this module. MEASURED on HotSpot: all return.
+    #[test]
+    fn the_legal_nulls_in_the_log_family_must_not_throw() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = make_logger(&mut ctx, "axis.recv");
+        let level = make_level(&mut ctx, "SEVERE", 1000);
+        let recv = Value::Object(Some(logger));
+        let lvl = Value::Object(Some(level));
+        let null = Value::Object(None);
+
+        // log(SEVERE, (String) null)
+        let got =
+            native_jul_logger_log_level_msg(&mut ctx, &[recv.clone(), lvl.clone(), null.clone()]);
+        assert!(got.is_ok(), "log(level, null message) is legal: {got:?}");
+
+        // log(SEVERE, "m", (Object[]) null)
+        let msg = ctx.create_string("m");
+        let got = native_jul_logger_log_params(
+            &mut ctx,
+            &[
+                recv.clone(),
+                lvl.clone(),
+                Value::Object(Some(msg)),
+                null.clone(),
+            ],
+        );
+        assert!(got.is_ok(), "a null parameter array is legal: {got:?}");
+
+        // log(SEVERE, (String) null, (Throwable) null) — TWO nulls in the same
+        // two slots whose `(Level, Throwable, Supplier)` reading is fatal.
+        let got = native_jul_logger_log_throwable(&mut ctx, &[recv, lvl, null.clone(), null]);
+        assert!(
+            got.is_ok(),
+            "log(level, null message, null throwable) is legal and must not be \
+             mistaken for a null Supplier: {got:?}"
+        );
+    }
+
+    /// `jul_arg_is_null` is the whole discriminator; a primitive in the slot
+    /// must not read as "null" (that would make a `(Z)V`-shaped sibling throw).
+    #[test]
+    fn jul_arg_is_null_distinguishes_absent_null_and_primitive() {
+        assert!(jul_arg_is_null(&[], 0), "an absent slot reads as null");
+        assert!(
+            jul_arg_is_null(&[Value::Object(None)], 0),
+            "an explicit null reference reads as null"
+        );
+        assert!(
+            jul_arg_is_null(&[Value::Int(0)], 0),
+            "a primitive is not a non-null REFERENCE"
+        );
+    }
+
+    /// Build a `Logger`-shaped receiver. A `String` standing in for the
+    /// receiver would be read at `LOGGER_FIELD_NAME` by half these natives,
+    /// which is a field index a `String` does not have — the same raw-slot
+    /// aliasing hazard `jul_logger_handlers_table`'s doc comment describes,
+    /// reproduced in a test instead of in production.
+    fn make_logger(ctx: &mut crate::test_utils::MockNativeContext, name: &str) -> ObjectRef {
+        let cid = ctx.ensure_class_initialized(CLS_JUL_LOGGER).unwrap();
+        let obj = ctx.alloc_object(cid, LOGGER_NUM_FIELDS);
+        let n = ctx.create_string(name);
+        ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(n)));
+        ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
+        obj
+    }
+
+    /// Build a `Level`-shaped object the threshold walk can read. Same
+    /// `ensure_class_initialized` + `alloc_object` + `set_field_by_name`
+    /// idiom the Tomcat-layout logger test above uses; the by-name `value`
+    /// field is the first thing `native_jul_logger_is_loggable` tries, and
+    /// slot 0/1 are also populated so the synthetic-shape fallback agrees.
+    fn make_level(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        name: &str,
+        value: i32,
+    ) -> ObjectRef {
+        let cid = ctx.ensure_class_initialized(CLS_JUL_LEVEL).unwrap();
+        let obj = ctx.alloc_object(cid, 2);
+        let n = ctx.create_string(name);
+        ctx.set_field(obj, 0, Value::Object(Some(n)));
+        ctx.set_field(obj, 1, Value::Int(value));
+        ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
+        ctx.set_field_by_name(obj, "value", Value::Int(value));
+        obj
     }
 }

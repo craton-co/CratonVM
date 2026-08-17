@@ -259,7 +259,24 @@ pub fn register_deprecated_io_util_natives(r: &mut NativeMethodRegistry) {
     register_date_constructors(r);
     register_date_getters_setters(r);
     register_string_deprecated(r);
-    register_character_deprecated(r);
+    // T8.2.5 (`register_character_deprecated`) removed 2026-08-13, lane E23.
+    // `Character.isJavaLetter(C)Z`, `isJavaLetterOrDigit(C)Z` and `isSpace(C)Z`
+    // were registered from HERE *and* from
+    // `native-builtins/src/deprecated_util.rs:2076/2078/2083`.  The registry
+    // dump recorded all three of this file's copies as `owns_slot: false,
+    // overwrote: bridge` — they lost the slot to `deprecated_util.rs` and never
+    // ran.  A duplicate registration that loses today wins tomorrow if either
+    // file's registration order shifts, which is exactly how four `Character`
+    // bridge copies came to beat the real intrinsics (§5.4 of
+    // `docs/known-issues/jdk-only/`
+    // `E17-1-character-digit-int-and-the-fifteen-unregistered.md`), so the dead
+    // copies are gone rather than left as a latent coin-flip.
+    //
+    // Deleting them is behaviour-neutral: the two bodies were transliterated
+    // and diffed over all 65,536 `char` values and disagree **0** times
+    // (`E23-1-synthetic-jdk-nosuchmethoderror-census.md` §6).  The surviving
+    // copy is NOT correct — it is wrong on 949 / 1,010 chars vs HotSpot 25 —
+    // but that is one defect in one place now instead of two.
     register_class_new_instance(r);
     register_number_defaults(r);
     register_properties_save(r);
@@ -924,43 +941,14 @@ fn register_string_deprecated(r: &mut NativeMethodRegistry) {
 
 // ---------------------------------------------------------------------------
 // T8.2.5 — Character.isJavaLetter / isJavaLetterOrDigit / isSpace
+//
+// REMOVED 2026-08-13 (lane E23).  These three were dead duplicate
+// registrations of triples owned by `native-builtins/src/deprecated_util.rs`
+// (`native_char_is_java_letter` / `_or_digit` / `native_char_is_space`, lines
+// 865/877/891, registered at 2076/2078/2083).  See the tombstone in
+// `register_deprecated_io_util_natives` for the measurement and the reason the
+// losers were deleted rather than left in place.
 // ---------------------------------------------------------------------------
-
-fn register_character_deprecated(r: &mut NativeMethodRegistry) {
-    let ch = "java/lang/Character";
-
-    // isJavaLetter(C)Z — delegates to isJavaIdentifierStart
-    r.register(ch, "isJavaLetter", "(C)Z", |_ctx, args| {
-        let c = match args.get(0) {
-            Some(Value::Int(v)) => *v as u16,
-            _ => 0,
-        };
-        let ch = char::from_u32(c as u32).unwrap_or('\0');
-        let result = ch.is_alphabetic() || ch == '_' || ch == '$';
-        Ok(Some(Value::Int(if result { 1 } else { 0 })))
-    });
-
-    // isJavaLetterOrDigit(C)Z — delegates to isJavaIdentifierPart
-    r.register(ch, "isJavaLetterOrDigit", "(C)Z", |_ctx, args| {
-        let c = match args.get(0) {
-            Some(Value::Int(v)) => *v as u16,
-            _ => 0,
-        };
-        let ch = char::from_u32(c as u32).unwrap_or('\0');
-        let result = ch.is_alphanumeric() || ch == '_' || ch == '$';
-        Ok(Some(Value::Int(if result { 1 } else { 0 })))
-    });
-
-    // isSpace(C)Z — true for ' ', '\t', '\n', '\r', '\f'
-    r.register(ch, "isSpace", "(C)Z", |_ctx, args| {
-        let c = match args.get(0) {
-            Some(Value::Int(v)) => *v as u16,
-            _ => 0,
-        };
-        let result = matches!(c, 0x20 | 0x09 | 0x0A | 0x0D | 0x0C);
-        Ok(Some(Value::Int(if result { 1 } else { 0 })))
-    });
-}
 
 // ---------------------------------------------------------------------------
 // T8.2.6 — Class.newInstance()
@@ -2218,91 +2206,20 @@ mod tests {
     }
 
     // --- T8.2.5 Character deprecated ---
-
-    #[test]
-    fn test_character_is_java_letter() {
-        let reg = setup();
-        let mut ctx = MockNativeContext::new();
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Character",
-            "isJavaLetter",
-            "(C)Z",
-            &[Value::Int('A' as i32)],
-        );
-        assert_eq!(result.unwrap(), Some(Value::Int(1)));
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Character",
-            "isJavaLetter",
-            "(C)Z",
-            &[Value::Int('$' as i32)],
-        );
-        assert_eq!(result.unwrap(), Some(Value::Int(1)));
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Character",
-            "isJavaLetter",
-            "(C)Z",
-            &[Value::Int('3' as i32)],
-        );
-        assert_eq!(result.unwrap(), Some(Value::Int(0)));
-    }
-
-    #[test]
-    fn test_character_is_java_letter_or_digit() {
-        let reg = setup();
-        let mut ctx = MockNativeContext::new();
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Character",
-            "isJavaLetterOrDigit",
-            "(C)Z",
-            &[Value::Int('3' as i32)],
-        );
-        assert_eq!(result.unwrap(), Some(Value::Int(1)));
-    }
-
-    #[test]
-    fn test_character_is_space() {
-        let reg = setup();
-        let mut ctx = MockNativeContext::new();
-
-        for &ch in &[' ', '\t', '\n', '\r', '\x0c'] {
-            let result = call_native(
-                &reg,
-                &mut ctx,
-                "java/lang/Character",
-                "isSpace",
-                "(C)Z",
-                &[Value::Int(ch as i32)],
-            );
-            assert_eq!(
-                result.unwrap(),
-                Some(Value::Int(1)),
-                "Expected true for {:?}",
-                ch
-            );
-        }
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Character",
-            "isSpace",
-            "(C)Z",
-            &[Value::Int('x' as i32)],
-        );
-        assert_eq!(result.unwrap(), Some(Value::Int(0)));
-    }
+    //
+    // `test_character_is_java_letter`, `test_character_is_java_letter_or_digit`
+    // and `test_character_is_space` were deleted with the registrations they
+    // covered (see the tombstone in `register_deprecated_io_util_natives`).
+    // They asserted against `setup()`, which registers ONLY this file, so they
+    // exercised the copy that loses the registry slot at VM start-up and never
+    // runs — three green tests over a dead body.  The live copies are covered
+    // by `deprecated_util.rs`'s own tests (`isJavaLetter` at 2863/2874/2885,
+    // `isJavaLetterOrDigit` at 2901/2911, `isSpace` at 2928/2943).
+    //
+    // Neither test set can see the real defect: both bodies answer 949
+    // (`isJavaLetter`) and 1,010 (`isJavaLetterOrDigit`) of the 65,536 `char`
+    // values differently from HotSpot 25, and every character these tests probe
+    // (`A`, `$`, `3`, the five ASCII spaces) is in the agreeing majority.
 
     // --- T8.2.7 Number.byteValue / shortValue ---
 

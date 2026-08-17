@@ -399,3 +399,136 @@ The probe does not yet cover the HALF_UP ties, `%a`, `%g`'s zero and
 branch-boundary cases, or twelve of the thirteen bounds methods. Widening it to
 those is the cheapest next step, and until that runs, everything in this record
 is javadoc-derived rather than measured.
+
+---
+
+## Triage re-read against source, 2026-08-12 (lane A24, doc-only)
+
+Nothing here was built or run — this lane may not invoke `cargo`. Every row says
+what was read and where.
+
+### 1. The four "closed" residuals are present in the tree
+
+The head banner's table checks out, item by item:
+
+| residual | read at |
+|---|---|
+| `insert(int, boolean/long/float/double)` have no native | **four registrations present** — `native-builtins/src/lang_string.rs:393` `(IZ)`, `:399` `(IJ)`, `:405` `(IF)`, `:411` `(ID)`, all inside `register_string_builder_natives` alongside the six pre-existing `insert` overloads at `:352-384`. |
+| `append(CharSequence,int,int)` clamps | the pin the banner says it replaced is gone and the replacement is there: `sb_append_charsequence_off_len_rejects_an_out_of_range_window` (`:9530`). No `…_clamps_out_of_range` remains. |
+| `appendCodePoint` truncates | fixed — see §2, which is the row worth reading. |
+| `%a` with the `0` flag and a width | the surrounding fix landed with the family; not separately re-derived here. |
+| unit cover for the scalar inserts | `sb_scalar_insert_overloads_render_and_check_the_offset` (`:9659`). |
+
+### 2. `appendCodePoint` — the duplicate registration is STILL THERE, and the banner's wording invites the wrong follow-up
+
+The banner says *"The winner is now the delegation."* That is **true**, and it is
+true by a different mechanism than a reader will assume, which matters for the
+next lane.
+
+`register_string_builder_natives` still registers `appendCodePoint(I)L{class};`
+**twice** — `lang_string.rs:215-220` → `native_sb_append_codepoint`, and
+`:328-333` → `native_sb_append_code_point`. Last-write-wins, so the **second**
+still owns the slot. What changed is not the registration order and not the
+duplicate: it is that the loser's body was replaced by a delegation. At `:2712`:
+
+```rust
+pub(crate) fn native_sb_append_code_point(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_sb_append_codepoint(ctx, args)
+}
+```
+
+and the doc above it states the choice explicitly: *"the duplicate registration
+is left in place because removing it would move a census count for no
+behavioural gain."*
+
+**Two consequences to write down, because the shape is this campaign's recurring
+trap.**
+
+1. **Deleting the "redundant" second registration is a no-op today and must not
+   be sold as a cleanup.** It would move a census count — which is precisely the
+   reason it was kept — and the census rows are frozen artefacts.
+2. **The shadow can silently come back.** Two registrations of one triple, whose
+   safety now rests entirely on the two bodies being the same function. A lane
+   that edits one body — the natural thing to do when fixing a code-point bug —
+   reintroduces exactly the `Integer.toString(II)` shape the banner diagnosed,
+   inside a single registrar function, where "compare by enclosing registrar"
+   gives no signal. The invariant is undefended by any test. See NOMINATION 2.
+
+### 3. Is this record's evidence SCHEDULED?
+
+| evidence | scheduled? |
+|---|---|
+| `probes/ShadowDifferentialProbe.java` — the whole "Reproducing" section, and W7-1's original measurement | **NO.** The string `probes` occurs **zero** times in `regression-suite/run.sh`, at any `SUITE=` value. Nothing in the suite runs it, ever. |
+| the banner's `RStrings` additions (both `append(CharSequence,int,int)` polarities, the `appendCodePoint` surrogate/refusal pair, the four `insert` overloads, `%a`/`%020a`/`%+020a`) | **YES.** `RStrings` is in `run.sh`'s `CORE_CLASSES` word list, so it runs in a plain `run.sh` and again under `CRATONVM_ARGS=--jdk-only`. |
+| the seven extracted pure functions run over 37 cases with `rustc` | **NO** — a standalone file, not in any crate's test tree. It was an oracle check, and the record says so. |
+| the unit tests named in §1 above | **YES**, under `cargo test -p cratonvm-native-builtins`, which this lane cannot run. |
+
+So the *behavioural* half of this record is scheduled and the *derivation* half
+is not — which is the right way round, and better than the record's own "Status:
+source landed, UNVERIFIED" line suggests. That line is now only true of the two
+items in §4.
+
+### 4. Still genuinely unverified
+
+1. **The ~20-significant-digit cap.** Unchanged and unresolvable from here: it
+   needs `String.format("%f", 1e300)` and `String.format("%.30f", 0.1)` on a
+   HotSpot 25. The record's refusal to emulate an unconfirmed cap remains the
+   right call.
+2. **`setLength(-1)`'s message text** and `append(CharSequence,int,int)`'s
+   `Range [from, to) out of bounds for length n` wording — only the exception
+   *classes* are pinned by javadoc. Both are still un-run against JDK 25.
+3. **The ratchet arithmetic** ("up to twelve new `Bridge`-over-bytecode rows",
+   `jdk-only-bridge-ratchet.json` +12, `jdk-only-kind-map-25-linux.tsv` +12
+   rows). Still arithmetic. The four registrations §1 confirms are the input to
+   it, and `register_essential_natives_with_shims` does call
+   `register_string_builder_natives` for three receivers — but the artefacts are
+   keyed `25/linux` and cannot be re-frozen from this host. Do not paste the
+   numbers.
+
+### 5. NOMINATION 2 — defend the one-expansion-rule invariant, or drop the duplicate deliberately
+
+Doc-only lane; not applied. **Preferred form: a unit test, not a source change**
+— it costs no census movement and pins the property that actually matters.
+
+Add to `native-builtins/src/lang_string.rs`'s test module (which already holds
+`sb_append_code_point_admits_surrogates_and_refuses_non_code_points` at `:9613`):
+
+```rust
+    /// W7-3. `appendCodePoint(I)` is registered TWICE in
+    /// `register_string_builder_natives` (`:215` and `:328`) and `register()`
+    /// is last-write-wins, so the SECOND owns the slot. The truncating body
+    /// that used to sit there is now a delegation to the first, which means
+    /// the two registrations are safe only for as long as the two bodies stay
+    /// the same expansion. That is undefended by anything else: a lane fixing
+    /// a code-point bug in one body reintroduces the shadow, inside a single
+    /// registrar function, where "compare by enclosing registrar" gives no
+    /// signal and only reading both bodies does. This is that reading, as a
+    /// gate.
+    #[test]
+    fn both_append_code_point_registrations_expand_identically() {
+        for cp in [
+            0i32, 0x41, 0x7F, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xFFFF, 0x10000, 0x10FFFF,
+            -1, 0x110000,
+        ] {
+            // build two identical fresh builders, drive one through each
+            // entry point, and require the same outcome INCLUDING the
+            // refusal — an `is_ok()` comparison would pass for two functions
+            // that both throw for different reasons.
+            // (assert on the resulting char sequence and on the raised
+            // exception's class + message, not merely on Ok/Err.)
+        }
+    }
+```
+
+**Read before writing it.** The body above is a sketch, deliberately: this lane
+cannot compile, and the two existing sibling tests at `:9613` and `:9659` are the
+right template for how a builder is constructed and how a refusal is asserted in
+this module — copy their shape rather than this one. And assert **identity of the
+outcome**, not `is_ok()` on both: non-null-and-no-panic is not the contract, and
+two defects have survived in this tree behind exactly that check.
+
+The alternative — deleting the `:328` registration — is **not** recommended
+without a Linux re-freeze, for the reason §2(1) gives.

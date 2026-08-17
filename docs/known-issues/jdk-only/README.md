@@ -1,6 +1,45 @@
 # JDK-only mode — open defects
 
-**Status:** OPEN, **94 records** (recount before quoting; this drifts on every merge — the count is `ls docs/known-issues/jdk-only/*.md | wc -l` minus this file, `HANDOFF-*`, the `RETIREMENT-*` docs and any dated census deliverable such as `STUB-CENSUS-*`, which is 100 − 6 at 15:10 on 2026-08-12, after the eight moves in `RETIREMENT-20260812B.md`). Index rebuilt from the tree on **2026-08-12**
+> **Start at [`INDEX.md`](INDEX.md)** (added 2026-08-13, lane C18): one line per
+> record — status read from the record's own prose rather than its filename,
+> provenance (**MEASURED / PREDICTED / SOURCE-ONLY**), grouped by subsystem. It
+> also carries the corrections this directory's records had drifted away from,
+> the `W7-39` number-collision resolution, and the contradictions that are
+> stated rather than guessed. `INDEX.md` was rebuilt again on **2026-08-17**
+> (lane G40, FOURTH PASS): 36 records had no row, including the whole wave-G
+> line and both of the two most current documents here. That pass also carries
+> **§B, seven standing claims this directory got wrong**, and **§C**, the eight
+> vectors measurement closed. Read §B.1 before trusting any "this body is dead"
+> conclusion, and §B.2 before reasoning about native-versus-bytecode dispatch.
+>
+> **The headline count below is corrected as of 2026-08-17, and it will rot
+> again** — the directory has gone 105 → 155 → 227 → 280 files in a fortnight.
+> Recount before quoting.
+
+**Status:** OPEN. **280 `.md` files** in this directory on **2026-08-17**, at
+`HEAD = 9ae371468`, taken with `ls docs/known-issues/jdk-only/*.md | wc -l`.
+**That is the file count, not a defect-record count, and the distinction is the
+whole reason the old headline was wrong three times running.** Applying this
+README's own exclusion rule mechanically — this file, `INDEX.md`, `HANDOFF-*`,
+`RETIREMENT-*`, `STUB-CENSUS-*`, `BASELINE-*` (10 files), plus the dated
+deliverables that match no pattern at all (`APP-READINESS-`,
+`JDK-ONLY-REPORT-CENSUS-`, `P1-*`, `P2-*`, `P4A-*`, `P4B-*`, `C8-*`, `C17-*`,
+`WAVE-D-QUEUE`; 17 files) — leaves **253**. Read 253 as an **upper bound on
+defect records, not a count of them**: a dozen more files in the remainder are
+`META` by their own prose (`W7-55`, `W7-40`, `W7-100`, `W7-60`, `E23-1`,
+`E39-1`, `W8-D2-1`, `G3-1`, `G20-1`, `G27-1`, `G33-1`, `G34-1`, …) and match no
+naming pattern, which is exactly the drift the previous headline described and
+then fell to.
+
+**The old headline, kept because its lesson is the point.** It read *"OPEN, **94
+records**"*, with a paragraph explaining that the arithmetic producing 94 —
+`105 − 11` — had two terms that both moved and cancelled, so "a reader who
+quoted 94 without recounting would have been right for the wrong reason, and the
+next deliverable to land breaks that coincidence." It did. **The exclusion list
+is the thing that drifts, not the count**; that sentence is still the most useful
+line in this section. Note also that records land from parallel lanes and some
+are **untracked when you count**, so `git ls-files` and `ls` disagree here by
+design. Index rebuilt from the tree on **2026-08-12**
 by W7-78-inherited-residual-closeout.md, on top of the reconciliation pass
 W7-55-record-reconciliation.md. **Fourteen records left the directory that day,
 in two passes.** Six in the first — four retired by RETIREMENT-20260812.md, and
@@ -45,6 +84,19 @@ that builds a VM with no class library at all. **Conflating the feature with the
 mode is a defect species in its own right**: it produced all six of
 W7-50-synthetic-jdk-strict-six.md's findings.
 
+**"Feature ≠ mode" is true but incomplete, and the missing half was measured on
+2026-08-12: the mode REQUIRES the feature.** A shipping binary given
+`--synthetic-jdk` **refuses outright, exit 1**, during argument parsing — none
+of the ~5,200 synthetic stubs are compiled in, and running without either them
+or a real-JDK boot classpath is rejected rather than allowed to fail later as an
+unexplained `NoClassDefFoundError`. So the two are not independent axes: the
+feature is necessary and not sufficient (you still need the flag). The
+consequence for this directory is concrete — **any residual living only in
+`--synthetic-jdk` mode cannot be adjudicated by any run of a shipping binary**,
+not by `run.sh` at any `SUITE=` value, not by a corpus run, not by a census. A
+record marked "unreproducible" on such a residual measured the wrong binary.
+Evidence: P4B-SYNTHETIC-JDK-MODE-20260812.md.
+
 * **Normative contract:**
   [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md)
   — owned by the orchestrator; do not edit.
@@ -61,6 +113,23 @@ W7-50-synthetic-jdk-strict-six.md's findings.
   [`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md),
   [`docs/jdk-only-native-review.md`](../../jdk-only-native-review.md),
   [`docs/jdk-only-migration.md`](../../jdk-only-migration.md).
+* **The 2026-08-12 measurement deliverables, which live in this directory but
+  are not defect records** (and are excluded from the count above):
+  `APP-READINESS-20260812.md` (what actually stops a real app),
+  `STUB-CENSUS-20260812.md` (the native surface per row),
+  `P2-COLLECTIONS-SHADOWS-20260812.md`,
+  `P1-BASELINE-20260812.md` (the Phase 1 baseline, and **nine** blocking
+  families where `docs/feature-designs/jdk-only-completion-roadmap.md` had
+  named three), `JDK-ONLY-REPORT-CENSUS-20260812.md` (the census instrument and
+  the request-is-not-a-failure rule, §3) and
+  `P4B-SYNTHETIC-JDK-MODE-20260812.md`. **Six of those nine fabricated classes
+  are NOT under `cratonvm/internal/`** — they sit in JDK namespaces
+  (`…atomic/…$RustJvmImpl`, `javax/net/ssl/SSLSocket*Stream`,
+  `java/util/function/Consumer$AndThen`, `java/lang/foreign/DowncallHandle`,
+  `java/util/Enumeration$Impl`, `java/util/concurrent/CompletedFuture`), so any
+  screen written as a `cratonvm/internal/` prefix match reports clean while
+  they are all still fabricated. Screen on the refused-class set, whatever the
+  package.
 
 ### The corpus, and what a green corpus licenses
 
@@ -598,12 +667,12 @@ line as "probably fixed".**
 | Does the `unreflect*` mode gate hold, and does `Constructor.newInstance` still construct? (W6-8, L15) | `CRATONVM_MH_STRICT_INVOKEEXACT=1 cratonvm --java-home "<jdk-25>" --jdk-only -cp regression-suite/build RJdkHandles`, expecting `PASS RJdkHandles (54 checks)`, then the full `CRATONVM_ARGS=--jdk-only SUITE=all bash regression-suite/run.sh`. **The whole-suite run is the real instrument for L15's narrowing**: a new `IllegalAccessException` from a reflective construction anywhere in the corpus is the thing to look for, and the record's *Blast radius* section lists every site it has already been checked against. |
 | Does arming `BootLoader.loadLibrary` flip `RJdkJni`'s `net` probe? (W5-1, W6-6) | `cratonvm --java-home "<jdk-25>"` on `RJdkJni` in both modes, **with and without** the one-line arming, diffing the `CK RJdkJni loadedLibrary=` line, against `java -cp regression-suite/build RJdkJni`. The arming can only turn a success into an `UnsatisfiedLinkError`, and the first library it claims is `net` — which `is_vm_provided_jdk_library` still carries *because* the dynamic rule cannot fire. **Take it on LINUX (2026-08-12).** The road at risk is the Linux boot-class `<clinit>` one (`lib.rs:14062-14067`, `java.net.NetworkInterface`); the plausible Windows caller is `Inflater.<clinit>` claiming `zip`, which changes nothing observable because `zip` already throws. A green Windows A/B measures the wrong road and is not a licence to arm. **The fixture now fails hard rather than diverging quietly:** `RJdkJni` asserts `loaded` is `"net"` (40 → **41 checks**), so a boot claim on `net` is an `AssertionError`, not a changed `CK` line — which also matters because `run.sh` SKIPS the cross-VM diff entirely when no HotSpot is on the host. And read the outcome carefully: the arming's input is CratonVM's own boot sequence, so a flip means CratonVM boot-touches `java.net` where HotSpot does not — a different defect, not one this bookkeeping fixes. |
 | ~~Does W6-2's stream path really hand out an illegal provider?~~ **ANSWERED — the fixture asked for here already EXISTS.** W7-85 wrote it (`Rejected` ← `WrongFactory`, `Nulled` ← `NullProvider`) and 2026-08-12's second pass added the constructor-form pair (`Unsub` ← `NotSubProvider`, `Ctored` ← `HiddenCtor`). Four illegal providers, not one, each asserted from **both** `iterator()` and `stream()`. What is left is the RUN, not the writing. | `ONLY=RJdkModule CV=<cratonvm.exe> JDK="<jdk-25>" bash regression-suite/run.sh` — `run.sh`'s `class_args` supplies `--module-path regression-suite/build-modules --add-modules cratonvm.jdkonly.svc`, and **the module flags are required**: omitting them produces a harness error already misread once as a VM defect. Expect `PASS RJdkModule (155 checks)` on HotSpot and on both CratonVM arms. A red on **both** VMs means `modules-overlay/` did not land, not a VM defect — `javap -p -classpath regression-suite/build-modules/cratonvm.jdkonly.svc com.cratonvm.jdkonly.svc.internal.HiddenCtor` must show a **private** constructor. |
-| Do the `--synthetic-jdk`-**mode** residuals reproduce? (W6-12, W7-10, L8, W7-63 §8) | A `--features synthetic-jdk` binary now **exists** (W7-50, 63/7 under `--jdk-only`). What has never been run is that binary in `--synthetic-jdk` **mode**, which is the only configuration these residuals live in. Feature ≠ mode. |
+| Do the `--synthetic-jdk`-**mode** residuals reproduce? (W6-12, W7-10, L8, W7-63 §8) | A `--features synthetic-jdk` binary now **exists** (W7-50, 63/7 under `--jdk-only`). What has never been run is that binary in `--synthetic-jdk` **mode**, which is the only configuration these residuals live in. Feature ≠ mode — **and the mode requires the feature**, §1: a shipping binary refuses `--synthetic-jdk` with exit 1 at argument parsing, so this row can never be discharged by any binary already on disk here. It needs its own build, from a clean `git archive HEAD` export rather than a campaign-edited working tree. **Do not restate this as "the mode has never been executed, ever"** — that is falsified by `apps/h2database-suite-runner/RESULTS-20260721.md:91-95` (a synthetic-mode boot that died in `TestBase.<clinit>` on a missing `DateTimeFormatter.ofPattern`), and four in-tree runners pass the flag today (`h2database-`, `spring-`, `hib-`, `tomcat-suite-runner`). The true statement is narrower and unchanged in force: **the feature build has never been run in that mode, no `RJdk*` vector ever has, and nothing gating launches it** — not `regression-suite/`, not CI, not `scripts/`. P4B-SYNTHETIC-JDK-MODE-20260812.md. |
 | Do the Linux / non-Windows `process.rs` arms even type-check? (W6-10, **W7-46 §8.1**) | A Linux host build, plus the advisory macOS CI job (`.github/workflows/cross-platform.yml`). Then `cargo test -p cratonvm-native-io process`. W6-10's finding 4 widened five signatures across arms that **have never been compiled by any lane that edited them** — those five are now audited by source read and consistent on every arm (`W7-46` §8.4), which rules out a one-arm `Result` or a drifted arity and rules out nothing inside a body. **The debt GREW on 2026-08-12**: `W7-46` §8.1 added `linux_liveness_and_start_time`, `linux_stat_line_times`, a third `foreign_start_time_or_dead` arm and a Linux-only `#[test]`, all written on Windows. This row is the gate on calling `W7-46`'s first residual closed. |
 | W7-28's falsifier, carried forward after its retirement | `javac --release 25 --enable-preview` a 69.65535 class `P` and a 69.0 class `Q`; `cratonvm -cp . P` must fail with HotSpot's wording, `--enable-preview -cp . P` must run, `-cp . Q` must be unchanged, and the over-deny canary `B55p` must still run. |
 | Is `RJdkProcess` back to `checks=53`? (W7-46) | `cratonvm --jdk-only -cp regression-suite/build RJdkProcess` vs HotSpot. **A control binary pre-dating the 2026-08-12 merges fails this identically, so the failure is pre-existing.** |
 | Does `RJdkLogging` pass? (W7-25, W7-35, W7-56) | `CRATONVM_ARGS=--jdk-only SUITE=all bash regression-suite/run.sh`. **Same control-binary caveat.** |
-| Does `StructuredTaskScope` behave? (W7-18) | `probes/StructuredTaskScopeProbe` on both arms, three consecutive byte-identical runs, watching for `join()` hanging. **And a THIRD arm, which is the one nothing has ever taken:** the same probe on a `--features synthetic-jdk` binary in `--synthetic-jdk` **mode**. W7-50's feature binary was run under `--jdk-only`, where every `StructuredTaskScope` registrar is unreachable, so it measured none of W7-18's B or C. That third arm is the single run both B's remainder and C are blocked on. |
+| Does `StructuredTaskScope` behave? (W7-18) | `probes/StructuredTaskScopeProbe` on both arms, three consecutive byte-identical runs, watching for `join()` hanging. **And a THIRD arm, which is the one nothing has ever taken:** the same probe on a `--features synthetic-jdk` binary in `--synthetic-jdk` **mode**. W7-50's feature binary was run under `--jdk-only`, where every `StructuredTaskScope` registrar is unreachable, so it measured none of W7-18's B or C. That third arm is the single run both B's remainder and C are blocked on — **and it is a build, not a run**: the shipping binary refuses `--synthetic-jdk` outright (exit 1, §1 and the row above), so no probe invocation of any binary on this host can take it. |
 | Does the `duplicate_registration_gate` still hold? (W6-9) | `cargo test -p cratonvm-native-builtins --test duplicate_registration_gate`. **W6-9 explicitly forbids re-seeding that number without a real run.** |
 | Are W7-20's baselines correct now? (W7-62) | `JAVA_HOME=<jdk25> bash regression-suite/bridge-ratchet.sh` — one census, both gates. **ON LINUX**: both artefacts are keyed `<jdk-feature>/<os>` and the gates read the OS from the running host, so on Windows they look up `25/windows`, find nothing and exit 2 ("REFUSING") — not a pass. Expect three separable contributions (W7-20's retag; the `StringBuilder.insert` overloads, +12 here and 0 on `stub_ratchet`; the rest of the 182 commits). Anything else is a finding, not a re-freeze. |
 | Is `stub_ratchet` where W7-62 says? | `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture`. Expected to FIRE. **Paste what it prints; do not cite a remembered number.** The `StringBuilder.insert` overloads move it by **zero** (ambient `Bridge`); the unlanded `java/io/Print*` retirement would move it up by up to seven. |
@@ -654,6 +723,49 @@ line as "probably fixed".**
   the numbers are not. Line citations in these records have rotted by thousands
   of lines — L8's were the worst found, and W6-6's and W4-3's rotted again
   between 2026-08-11 and 2026-08-12.
+* **A request is not a failure.** `--jdk-only-report`'s
+  `compatibility-class-requested` rows record that a native *asked* the VM to
+  fabricate a class and was refused. In the same run,
+  `java/util/HashMap$KeyItr`, `java/util/Comparator$Native` and
+  `java/util/Enumeration$Impl` are all requested-and-refused while `HashMap`
+  iteration, the `Comparator` combinators and `Collections.enumeration`
+  **pass** — the caller recovers onto real JDK bytecode, which is strict mode
+  working as designed. So **the census over-reports** (reading its 19 rows
+  alone would put 19 classes on the Phase 1 worklist when a handful break
+  anything) and **a probe under-reports** (it sees only the routes it thought to
+  take, and can never prove absence). **The live set is the intersection —
+  refused *and* not recovered from.** Measured both ways on 2026-08-12: three of
+  the nine Phase 1 blocking families came from a source audit no probe had a
+  route to, and the audit's own scoping was wrong exactly where the probe was
+  right — `Properties.propertyNames()` was predicted the widest failure and
+  passes. Neither instrument's verdict survives without the other's.
+  (JDK-ONLY-REPORT-CENSUS-20260812.md, P1-BASELINE-20260812.md.)
+* **`--jdk-only-report` is a complete, machine-readable census and nothing was
+  consuming it.**
+  `cratonvm --jdk-only --explain-jdk-only --jdk-only-report r.json -cp <cp> <Main>`
+  emitted 1569 violations on one ordinary program — 19
+  `compatibility-class-requested`, 226 `native-shadows-bytecode`, 1324
+  `synthetic-native-registered` — each with `class`, `requester` (`file:line`),
+  `initiating_loader` and `reason`, under `schema_version: 1`. Three traps: the
+  flag is silently ignored if placed **after** the main class, it needs a
+  **Windows-shaped path** on this host, and it is **not written when the program
+  calls `System.exit`**.
+* **`--explain-jdk-only` reports boot refusals and only boot refusals.** All 13
+  it names come from `vm/src/vm/vm_init.rs`'s boot block, before `main`; every
+  runtime refusal is silent. A strict run that boots cleanly has proved nothing
+  about what its natives will do at call time, and a record citing the banner as
+  a completeness check is citing a boot-time instrument for a runtime question.
+* **Do not read your own pipeline's behaviour as the VM's.** The shutdown
+  `[jdk-only:shutdown]` report was filed as "names one class, apparently
+  truncated"; it was a `head -40` on a 1570-line run and the report is complete.
+  That is the **third** instance of the species in one campaign — a successful
+  25-minute build read as failed because the command ended in `grep -c`, and a
+  census claim whose `exit=0` was grep's. Check the last stage of your own
+  command before attributing a truncation, a silence or an exit code to the VM.
+* **"I cannot derive your claim from the source" is evidence, not a lane
+  failing.** The lane handed the truncation claim above said its reading of the
+  source disagreed, said so plainly, and attached the check that settled it —
+  against the claim. Treat that response as a signal about the claim.
 * **Run the probe under both modes with a HotSpot control before trusting any
   strict-mode claim in this directory.**
 

@@ -503,6 +503,25 @@ pub(crate) fn native_random_next_bytes(
     };
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
+        // `Random.nextBytes` is specified `@throws NullPointerException if the
+        // byte array is null` (`Random.java:458`) and its body opens
+        // `bytes.length`. A `Value::Object(None)` here IS that null, and this
+        // arm used to swallow it: `new Random(42).nextBytes(null)` returned
+        // normally, which `RJdkIntrinsics2 --only=random` check 41 reports as
+        // "got none". Message measured on OpenJDK 25.0.3+9.
+        Some(Value::Object(None)) => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some(
+                        "Cannot read the array length because \"bytes\" is null".to_string(),
+                    ),
+                }
+                .into(),
+            );
+        }
+        // A missing or non-reference argument is an arity/marshalling bug, not
+        // a Java null — keep the defensive return rather than reporting an NPE
+        // the program did not cause.
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
@@ -1011,6 +1030,17 @@ pub(crate) fn native_secure_random_init(
 ) -> MethodCallResult {
     // Per the JDK SecureRandom contract the no-arg ctor selects a default
     // provider; we always select "OS-CSPRNG", the strongest source available.
+    //
+    // This body is registered for BOTH `<init>()V` and `<init>([B)V`, so the
+    // null check is arity-gated: `new SecureRandom((byte[]) null)` NPEs on
+    // HotSpot 25 (measured) — `SecureRandom.java:266` is
+    // `Objects.requireNonNull(seed)`, reached before `getDefaultPRNG` can
+    // discard the seed. `<init>()V` has no second argument and is unaffected.
+    if args.len() >= 2 && matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
+    }
     secure_random_record_algorithm(ctx, args)?;
     Ok(None)
 }
@@ -1060,6 +1090,15 @@ pub(crate) fn native_secure_random_set_seed_bytes(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // The null check precedes the receiver check: `setSeed(null)` NPEs on
+    // HotSpot 25 (measured) regardless of algorithm, and the SHA1PRNG-only
+    // early return below would otherwise swallow it for every other algorithm.
+    // `SecureRandom.java:724` is `Objects.requireNonNull(seed)` — no message.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
+    }
     let Some(this) = secure_random_receiver(args) else {
         return Ok(None);
     };
@@ -1257,6 +1296,19 @@ pub(crate) fn native_secure_random_next_bytes(
 ) -> MethodCallResult {
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
+        // `SecureRandom.nextBytes(null)` NPEs on HotSpot 25 (measured), same as
+        // the `java.util.Random` parent — see `native_random_next_bytes`. The
+        // source is `Objects.requireNonNull(bytes)` with no message argument
+        // (`SecureRandom.java:774`), so the message is genuinely null here and
+        // `message: None` is the faithful answer, not a shortcut.
+        Some(Value::Object(None)) => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into(),
+            );
+        }
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
@@ -1476,7 +1528,10 @@ pub(crate) fn native_secure_random_generate_seed(
     if n < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "numBytes must be non-negative".to_string(),
+                // `SecureRandom.java:878` verbatim. "must be non-negative" is
+                // `RandomSupport.BAD_SIZE`, which is a DIFFERENT method's
+                // message (`ints`/`longs`/`doubles` stream size).
+                message: "numBytes cannot be negative".to_string(),
             }
             .into(),
         );
@@ -1546,18 +1601,26 @@ pub(crate) fn native_secure_random_get_instance(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Two different answers, not one. `getInstance(null)` is
+    // `Objects.requireNonNull(algorithm, "null algorithm name")`
+    // (`SecureRandom.java:391`) — a NullPointerException. `getInstance("")` is
+    // a NoSuchAlgorithmException whose message is `" SecureRandom not
+    // available"`, which the `secure_random_algorithm_supported` branch below
+    // already produces for the empty string. Both were collapsed into one
+    // IllegalArgumentException, so the type was wrong for null and the type and
+    // the wording were wrong for "". Measured on OpenJDK 25.0.3+9.
     let algo = match args.first() {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        Some(Value::Object(None)) | None => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("null algorithm name".to_string()),
+                }
+                .into(),
+            );
+        }
         _ => String::new(),
     };
-    if algo.is_empty() {
-        return Err(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "null algorithm name".to_string(),
-            }
-            .into(),
-        );
-    }
     // Real JDK dead-ends an unknown name in `GetInstance` with
     // `NoSuchAlgorithmException("<algo> SecureRandom not available")`. Because
     // this native bypasses the provider search entirely it used to fabricate a
@@ -1582,10 +1645,36 @@ pub(crate) fn native_secure_random_get_instance_with_provider(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // ORDER IS OBSERVABLE, and it was backwards. All three 2-arg overloads
+    // OPEN with `Objects.requireNonNull(algorithm, "null algorithm name")`
+    // (`SecureRandom.java:439` for the `String` provider, `:481` for the
+    // `Provider` one) — before any provider resolution. So a null algorithm
+    // beats a bad provider, and the provider is resolved first only among
+    // NON-null algorithm names. Measured on OpenJDK 25.0.3+9:
+    //
+    //   getInstance(null, "SUN")           -> NPE "null algorithm name"
+    //   getInstance(null, "NOPE")          -> NPE "null algorithm name"
+    //   getInstance(null, (String) null)   -> NPE "null algorithm name"
+    //   getInstance(null, (Provider) null) -> NPE "null algorithm name"
+    //   getInstance("SHA1PRNG", (String) null) -> IAE "missing provider"
+    //
+    // Running the provider checks first answered rows 2–4 with
+    // NoSuchProviderException / IllegalArgumentException instead. Hoisting the
+    // null-algorithm check here rather than relying on the 1-arg body it
+    // delegates to is the whole fix: that body is reached only AFTER both
+    // provider checks have already had their chance to throw.
+    if matches!(args.first(), Some(Value::Object(None)) | None) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("null algorithm name".to_string()),
+            }
+            .into(),
+        );
+    }
     // The provider argument is otherwise discarded (every algorithm here is
-    // served by the OS CSPRNG regardless), but real JDK still resolves the
-    // named provider first and rejects one that was never registered — see
-    // `check_named_provider_arg`.
+    // served by the OS CSPRNG regardless), but real JDK does resolve the named
+    // provider before looking the algorithm up, and rejects one that was never
+    // registered — see `check_named_provider_arg`.
     crate::jca::provider_chain::check_named_provider_arg(
         ctx,
         args,

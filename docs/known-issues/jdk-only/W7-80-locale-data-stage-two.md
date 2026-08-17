@@ -1,5 +1,49 @@
 # W7-80 — stage 2: the locale data was in the JDK image all along
 
+> ## 2026-08-12 (P3-E) — this record's data is now reachable from a THIRD consumer, and §7's "No test was weakened" was re-checked rather than inherited
+>
+> **Verified against today's source, not assumed.** `load_cldr_table`
+> (`native-builtins/src/locale_resources.rs:585`) and the six surfaces §2 lists
+> are all present; `getNumberPatterns` reads
+> `cldr_number_strings(&t, "NumberPatterns")` per locale, so §4's table is a
+> description of the tree as it stands. Nothing in this record was found stale.
+>
+> **What changed above it.** `String.format(String, Object...)` — the overload
+> with no `Locale` — used to localize against `Locale.ROOT`, so it never reached
+> this data at all. It now resolves through the no-arg
+> `DecimalFormatSymbols.getInstance()`, i.e. through
+> `Locale.getDefault(Locale.Category.FORMAT)` → `getInstance(Locale)` → the
+> native this record rewrote. W7-34 §"What is left" bullet 4 is the row; the fix
+> is in `native-builtins/src/lang_string.rs`.
+>
+> That makes §3's `de_DE` "chimera" observation load-bearing in a new place: on a
+> non-en host, **plain `String.format("%.2f", x)` anywhere in the VM now reads
+> this table.** Every claim in §6 about what does and does not move on an en_US
+> host still holds (CLDR en `NumberElements` is byte-identical to the old
+> hardcoded values), but the *population* of callers that can see a wrong answer
+> just grew from "explicit-`Locale` callers" to "every formatting call in the
+> process". If a locale row in §2's coverage table is wrong, it is now much more
+> visible. Re-running `probes/DefaultLocaleProbe.java` per §8 is worth more than
+> it was.
+>
+> **§7 "No test was weakened", re-checked under the NEW rule.** That bullet's
+> argument was that the formatting vectors pin `Locale.ROOT`/`Locale.US`, so the
+> host locale cannot reach them. Under the old rule the no-`Locale` calls were
+> *also* safe, because they were ROOT by construction; under the new rule they
+> are not, so the grep had to be redone. Result, over all of
+> `regression-suite/src/*.java`:
+>
+> | site | verdict |
+> |---|---|
+> | `RJdkViews`, `RStrings`, `RJdkHello` numeric formatting | every localizing conversion pins `Locale.ROOT` or `Locale.US` — unaffected |
+> | `RStrings:131` `new Formatter(fsink, Locale.GERMANY).format("%,.2f", …)` | receiver locale, not the no-`Locale` rule — unaffected |
+> | `RStrings:195` `String.format("%tb", …)` vs `DateFormatSymbols.getInstance()` | already asserts the FORMAT-default rule, on the date helper that was already correct — unaffected, and now the numeric helper agrees with it |
+> | `RJdkLogging:715` `String.format("%d:%02d:%02d", …)` | no locale, but its own comment says it is built through `String.format` precisely so it moves with the formatter. Both sides of that `contains` go through the same native, before and after. Digits only change at all for a FORMAT default whose zero digit is not ASCII `'0'` (ar-EG's U+0660); de/ru/fr are ASCII |
+> | **`RJdkHello:99` `ps.printf(Locale.ROOT, " [%s\|%d\|%05.2f]", …)`** | **BREAKS**, and not because of this record: `native_printf_locale` in `native-builtins/src/lib.rs` DROPS its `Locale` and delegates to the no-`Locale` entry, so on a non-ROOT-default host this now renders the host's separators against a pinned `" [x\|7\|01.50]"`. The two-line fix is in the P3-E lane report and must land in the same change |
+>
+> One site at risk, one fix, both named. On an en-US CI box nothing moves at all
+> — which is the same hiding place the defect being fixed had used.
+
 **Status: SOURCE LANDED, NOT RE-MEASURED ON A CRATONVM BUILD FROM THIS BRANCH.**
 This lane does not run `cargo build`. Every HotSpot column below is a live run on
 jdk-25.0.3.9-hotspot on this host (Windows 11, **ru_RU**). Every "CratonVM today" column

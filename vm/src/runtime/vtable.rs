@@ -2022,14 +2022,40 @@ mod tests {
         assert!(mgr.resolve_virtual_slot(999_999, 0).is_none());
     }
 
-    /// T10.9.A — when the install adapter sees a `VtableSlotDescriptor`
-    /// with `dispatch: None`, the resulting `VtableEntry` has
-    /// `resolved_method: None` (and `is_native: false` unless the
-    /// snapshot explicitly flagged native).
+    /// **THIS TEST CANNOT FAIL, and its name overstates what it covers.**
+    ///
+    /// The property the name claims — "when `vtable_install_adapter` sees a
+    /// `VtableSlotDescriptor` with `dispatch: None`, the resulting
+    /// `VtableEntry` has `resolved_method: None`" — is NOT asserted here.
+    /// The body constructs a descriptor and then asserts `dispatch.is_none()`
+    /// and `method_index == 3`, which are the two fields the four lines above
+    /// just set. `vtable_install_adapter` is never called. Make the adapter
+    /// hand a `dispatch: None` descriptor a `resolved_method: Some(..)` —
+    /// i.e. dispatch an abstract method to a body — and this test does not
+    /// move.
+    ///
+    /// It is left in place rather than deleted because what it constructs is
+    /// still a live compile-time check that the `VtableSlotDescriptor` shape
+    /// the adapter consumes has not drifted. The behavioural half needs a
+    /// production change and is recorded as a residual:
+    ///
+    /// * The conversion lives inside a closure in `vtable_install_adapter`,
+    ///   with no separately callable entry point, so the only route to it is
+    ///   the adapter itself.
+    /// * The adapter reaches its manager through `GLOBAL_VTABLE_MANAGER`, a
+    ///   `OnceLock` that is documented as "one VM per process" and that
+    ///   `MemberResolver::vtable_manager` uses (via `Arc::ptr_eq`) to decide
+    ///   whether a manager is foreign. A unit test that installed its own
+    ///   manager would latch that cell for the whole `vm` lib-test binary and
+    ///   make every `SharedVm` in it report `ForeignVtableManager`.
+    ///
+    /// The repair is to lift the descriptor -> entry conversion out of the
+    /// closure into a standalone function that `vtable_install_adapter` calls,
+    /// so it can be tested with no manager and no global at all.
     #[test]
     fn t10_9_a_adapter_preserves_empty_dispatch() {
-        // We can't call vtable_install_adapter without a global
-        // manager; simulate the conversion manually.
+        // Shape-only: this is a compile-time check on `VtableSlotDescriptor`,
+        // NOT a check on the adapter. See the doc comment above.
         let desc = cratonvm_classloading::VtableSlotDescriptor {
             declaring_class_id: 77,
             method_index: 3,
@@ -2037,7 +2063,6 @@ mod tests {
             descriptor: Arc::<str>::from("()I"),
             dispatch: None, // abstract method — no snapshot
         };
-        // Sanity — field is accessible and defaults to None.
         assert!(desc.dispatch.is_none());
         assert_eq!(desc.method_index, 3);
     }

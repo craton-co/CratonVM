@@ -1,5 +1,109 @@
 # W7-61 — the `SSLEngine` layout row is a false positive, and the four TLS blocking sites need a different fix from the other nineteen
 
+> ## Third pass, 2026-08-12 (lane A3 / P1-C) — both items re-verified, and a THIRD `SSLSocket` defect found and fixed
+>
+> **Re-verification of what this record claims, against today's tree.** Every
+> named symbol from items 1 and 2 is present:
+> `native-builtins/src/tls.rs` carries `mod registry_ordering_tests` with all
+> three tests (`net_phase_e_wins_create_ssl_engine_on_the_essential_path`,
+> `p68_ssl_is_the_last_writer_on_the_ssl_engine_surface`,
+> `t27_covers_every_engine_triple_p68_registers_on_the_abstract_class`);
+> `servlet::TlsEntry` still carries `raw: Option<TcpStream>` and
+> `s2_tls_classify_after_block` / `t27_tls::rustls_classify_after_block` both
+> exist; `probes/AsyncCloseProbe.java` and its `.expected.txt` are in the tree.
+> `ssleng_alloc` is still in `ssl_security.rs`. **Nothing was built or run on
+> this pass either** — this is a source reading, and it does not re-open or
+> re-close any verdict above. The Windows half of item 2 stays OPEN.
+>
+> **The new defect, and why this record did not see it.** Items 1 and 2 are
+> about the `SSLEngine` layout and about *waking* a TLS stream. Neither asked
+> what class the stream OBJECT is. Under `--jdk-only` that was the whole
+> failure:
+>
+> ```
+> OK   P1-C SSLContext from PKCS12 keystore
+> OK   P1-C SSLServerSocket binds
+> OK   P1-C client handshake completes
+> FAIL P1-C connected streams are real types
+>   -> java.lang.NoClassDefFoundError: javax/net/ssl/SSLSocketOutputStream
+> ```
+>
+> (orchestrator's loopback TLS witness, real RSA PKCS12 identity, real
+> handshake; HotSpot 25 is 6/6 on the identical program.) The handshake
+> succeeded and the FIRST stream access died, so no `SSLEngine`, `SSLContext`
+> or unconnected-`SSLSocket` check could have reached it — three such checks
+> were green on the same run.
+>
+> `javax/net/ssl/SSLSocketInputStream` and `…OutputStream` are **declared by no
+> supported JDK image** — they are listed as such in
+> `native-api/src/no_image_receiver.rs::NO_IMAGE_JDK_RECEIVERS`, which is what
+> re-tags their eight natives `SyntheticStub`. Strict mode refuses the mint, and
+> the refusal is correct; the defect was that `SSLSocket.getInputStream()` /
+> `getOutputStream()` are `bridge` rows that survive strict mode and then ask
+> for it.
+>
+> **Fixed by making the receiver real**, in `ssl_security.rs`: the two carriers
+> are now `sun/security/ssl/SSLSocketImpl$AppInputStream` and `$AppOutputStream`
+> — the exact pair real JSSE returns, so `getClass().getName()` gains HotSpot
+> parity instead of naming a class no JDK has ever had. `javap -p` against JDK
+> 25 on this host confirms both, their supertypes (`java.io.InputStream` /
+> `OutputStream`) and their declared methods. The eight legacy registrations are
+> **kept**, because `net_phase_e`'s own layered-socket branch still mints the old
+> names and because `scripts/baselines/jdk-only-gated-never-delete.tsv` pins all
+> eight rows.
+>
+> **Three hazards this record's readers should know about, because two of them
+> are dispatch rules item 1 analysed and did not connect to this surface:**
+>
+> 1. `vm_exec.rs` (~21095, and again in the `check_override` chain ~21393) and
+>    `invoke.rs` (~3234) each route any receiver whose class name
+>    `starts_with("sun/security/ssl/SSLSocketImpl")` to `javax/net/ssl/SSLSocket`
+>    's native for a fixed tuple list. `$AppInputStream` and `$AppOutputStream`
+>    match that PREFIX, and `("close", "()V")` is in the list — so `in.close()`
+>    on a stream would have run the SOCKET close against a stream receiver,
+>    writing `Value::Int` over `NEW13_SOCK_TLSID`/`NEW13_SOCK_CLOSED`, which on
+>    a real `AppInputStream` are `appDataIsAvailable` (boolean) and `readLock`
+>    (a `ReentrantLock` reference). Neutralised inside `ssl_security.rs` by a
+>    receiver-class guard at the top of `SSLSocket.close()V` that delegates to
+>    `ssl_stream_close`. The durable fix is to narrow the three predicates so
+>    they do not catch the nested classes; that is **nominated**, not applied,
+>    and the guard is correct either way. `close()V` is the only pair in the
+>    list that a Java call site can produce on a stream — the rest are not
+>    declared on `InputStream`/`OutputStream`.
+> 2. Moving onto a real receiver means every concrete method the real class
+>    declares must be shadowed or be safe on an all-null layout.
+>    `AppInputStream` declares `skip(long)`, whose body takes `this.readLock`
+>    and reads `this.buffer` — both null on a carrier allocated without the real
+>    constructor. `skip(J)J` is therefore registered for the first time. This is
+>    the general form of the trap and is worth restating whenever a fabricated
+>    carrier is retargeted at a real class.
+> 3. The private `Int` moved off raw slot 0 to an APPENDED slot
+>    (`try_alloc_with_appended_slots`), because slot 0 on the real layout is
+>    `oneByte`, a `byte[]`. Readers take it from `object_num_fields(this) - 1`,
+>    which is sound only because every such carrier is one this file allocated
+>    with `width == 1`; a foreign instance reads a reference there, `as_int()`
+>    answers `None`, and the identity-keyed side table answers instead. Chosen
+>    over `appended_slot_base_for_class` per call to protect this record's own
+>    measured ~265 ns body budget for `read()I`.
+>
+> **NO CLOSE-PATH CHANGE WAS MADE.** Nothing in item 2 — neither classifier,
+> neither `raw`-duplicate shutdown, nor any readiness gate — was touched, added
+> to or removed. The `SSLSocket.close()` guard above is a receiver-type
+> discrimination, not close-awareness: it changes which of two existing close
+> bodies runs, and neither body's blocking behaviour changed. The Windows half
+> of item 2 is untouched and still open, and the "socket readiness is not stream
+> readiness" deadlock warned about in "The Windows half, re-derived" was
+> deliberately not gone near.
+>
+> **Also correcting a stale verdict in a neighbouring record.**
+> `W7-17-vm-internal-door-sweep.md`'s table row for these two classes reads
+> *"behaviour carriers; door correct — none"*, with `strict?` = **no**. That was
+> a true statement about the strict corpus AS IT THEN REACHED, not about the
+> classes: the corpus had no connected-TLS vector. The orchestrator's witness is
+> that vector, and it makes the row `strict? YES, fatal` — the same shape W7-17
+> itself assigned to `CratonVM$HttpServerLoop`. That file is not this lane's;
+> the correction is **nominated**.
+
 **Branch:** `fix/sslengine-layout-and-tls-blocking-20260812`, based on dev
 `2d2467c81`.
 

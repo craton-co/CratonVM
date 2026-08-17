@@ -1,0 +1,61 @@
+# jdk-baseline	2
+# kind	class
+# name	jdk.internal.misc.CDS
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/jdk/internal/misc/CDS.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	12
+# protected-methods	0
+# declared-methods	28
+# declared-fields	13
+# rows	45
+# columns	kind	name	descriptor	flags
+CLASS	jdk.internal.misc.CDS		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	()V	public
+METHOD	containsExcludedFlags	(Ljava/lang/String;)Z	private,static
+METHOD	defineArchivedModules	(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V	public,static,native
+METHOD	drainOutput	(Ljava/io/InputStream;JLjava/lang/String;Ljava/util/List;)Ljava/lang/String;	private,static
+METHOD	dumpClassList	(Ljava/lang/String;)V	private,static,native
+METHOD	dumpDynamicArchive	(Ljava/lang/String;)V	private,static,native
+METHOD	dumpSharedArchive	(ZLjava/lang/String;)Ljava/lang/String;	private,static
+METHOD	generateLambdaFormHolderClasses	([Ljava/lang/String;)[Ljava/lang/Object;	private,static
+METHOD	getCDSConfigStatus	()I	private,static,native
+METHOD	getKeepAliveObjects	()[Ljava/lang/Object;	private,static
+METHOD	getRandomSeedForDumping	()J	public,static,native
+METHOD	initializeFromArchive	(Ljava/lang/Class;)V	public,static,native
+METHOD	isBasicTypeChar	(C)Z	private,static
+METHOD	isDumpingArchive	()Z	public,static
+METHOD	isDumpingStaticArchive	()Z	public,static
+METHOD	isLoggingLambdaFormInvokers	()Z	public,static
+METHOD	isSingleThreadVM	()Z	public,static
+METHOD	isUsingArchive	()Z	public,static
+METHOD	isValidHolderName	(Ljava/lang/String;)Z	private,static
+METHOD	isValidMethodType	(Ljava/lang/String;)Z	private,static
+METHOD	keepAlive	(Ljava/lang/Object;)V	public,static
+METHOD	lambda$drainOutput$0	(Ljava/io/InputStream;Ljava/lang/String;Ljava/util/List;)V	private,static,synthetic
+METHOD	logLambdaFormInvoker	(Ljava/lang/String;)V	private,static,native
+METHOD	logLambdaFormInvoker	(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V	public,static
+METHOD	logSpeciesType	(Ljava/lang/String;Ljava/lang/String;)V	public,static
+METHOD	needsClassInitBarrier	(Ljava/lang/Class;)Z	public,static
+METHOD	needsClassInitBarrier0	(Ljava/lang/Class;)Z	private,static,native
+METHOD	validateInputLines	([Ljava/lang/String;)V	private,static
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	BASIC_FORMS_HOLDER_CLASS_NAME	Ljava/lang/String;	static,final
+FIELD	DELEGATING_HOLDER_CLASS_NAME	Ljava/lang/String;	static,final
+FIELD	DIRECT_HOLDER_CLASS_NAME	Ljava/lang/String;	static,final
+FIELD	INVOKERS_HOLDER_CLASS_NAME	Ljava/lang/String;	static,final
+FIELD	IS_DUMPING_ARCHIVE	I	private,static,final
+FIELD	IS_DUMPING_METHOD_HANDLES	I	private,static,final
+FIELD	IS_DUMPING_STATIC_ARCHIVE	I	private,static,final
+FIELD	IS_LOGGING_LAMBDA_FORM_INVOKERS	I	private,static,final
+FIELD	IS_USING_ARCHIVE	I	private,static,final
+FIELD	configStatus	I	private,static,final
+FIELD	excludeFlags	[Ljava/lang/String;	private,static
+FIELD	keepAliveList	Ljava/util/ArrayList;	private,static

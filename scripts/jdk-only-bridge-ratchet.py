@@ -118,7 +118,14 @@ BLOCK_SCHEMA = 1
 # `SampleModel`. A schema-3 census scored with this file's arithmetic would be
 # 19 too high, in the direction that reads as "more work outstanding", so the
 # older shape is REFUSED rather than degraded.
-REQUIRED_CENSUS_SCHEMA = 4
+# 4 -> 5 on 2026-08-17: the census writer now emits `invocations_complete`
+# per row and `slots_with_incomplete_invocations` in the header, so that a
+# reader can tell that an `invocations` figure is a FLOOR rather than a count.
+# This pin is an equality test, so it has to move in the same commit as the
+# writer or this gate refuses every dump. Schema 5 is a superset of 4 --
+# image_declaring_method, which is the question this gate actually asks, is
+# unchanged.
+REQUIRED_CENSUS_SCHEMA = 5
 
 # Slack on top of the observed count when freezing a baseline. Zero, and it
 # stays zero: see `stub_ratchet.rs`'s SLACK for the same argument.

@@ -15,9 +15,70 @@ use cratonvm_types::error::{
 };
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
-use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
+// `box_value` is deliberately NOT imported: after the split described below,
+// every unqualified boxing call in this file is the canonical one, and the
+// four sites that must stay fresh spell `crate::lang_class::box_value` in
+// full so the exception is visible rather than inferred from the argument.
+use crate::lang_class::{box_value_canonical, mirror_class_id, mirror_class_name};
 use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
+// ---------------------------------------------------------------------------
+// WHICH BOXING HELPER THIS FILE USES, AND WHY IT IS TWO
+// ---------------------------------------------------------------------------
+//
+// `box_value` allocates a FRESH wrapper on every call. `box_value_canonical`
+// routes `I J Z B S C` through the registered `X.valueOf` natives — i.e.
+// through the wrapper caches — and falls back to `box_value` for everything
+// else. They are NOT interchangeable: the difference is observable with `==`,
+// and the choice per call site is a MEASUREMENT.
+//
+// The measurement, taken on Microsoft OpenJDK 25.0.3+9 (105 rows, byte
+// identical across three runs and under `-Xint`, so it is not a JIT artefact —
+// scratchpad/f19/ReflBoxOracle.java, tabulated in
+// docs/known-issues/jdk-only/F19-1-*.md §2):
+//
+//   MethodHandle return adaptation (`asType`/`invoke`/`invokeWithArguments`)
+//       mh.asTypeInt / asTypeChar / asTypeBool / asTypeLong / asTypeByte /
+//       asTypeShort = true,  mh.invokeAsObject = true,
+//       mh.invokeWithArgsInt / Char / Long = true          -> CANONICAL
+//   MethodHandle collector element boxing
+//       mhcoll.int / char / bool / long = true, mhvar.int / char = true
+//                                                          -> CANONICAL
+//   VarHandle.get, every shape measured
+//       vh.fieldInt / Char / Bool / Long / Byte / Short = true,
+//       vh.staticInt = true, vh.arrInt / Char / Bool / Long = true,
+//       vh.byteViewInt / byteViewLong = true,
+//       vh.getAndSetInt = true, vh.compareAndExchangeInt = true
+//       ffm.layoutInt / layoutChar / layoutLong / layoutByte = true
+//                                                          -> CANONICAL
+//   float / double, on EVERY one of those paths
+//       mhnc.asTypeFloat = false, vhnc.fieldFloat = false   -> FRESH
+//   any value outside its type's cache bound
+//       mhoob.asTypeInt1000 = false, vhoob.fieldInt1000 = false,
+//       vhoob.staticInt1000 = false, vhoob.arrInt1000 = false,
+//       ffmoob.layoutInt1000 = false, mhcolloob.int1000 = false
+//                                        -> FRESH, and `box_value_canonical`
+//                                           produces that itself: the `valueOf`
+//                                           natives have their own uncached arm
+//
+// Every "FRESH" row above is still `.equals`-equal to the canonical instance
+// (blind.equalsOob / blind.equalsFloat = true), so no equality-shaped
+// assertion can see this in either direction. `regression-suite/src/
+// RJdkReflBox.java` asserts it with `==`, in both directions.
+//
+// Two sites in this file deliberately keep `box_value`:
+//
+//   * the `"F"` / `"D"` arms of the two collector loops. Routing them through
+//     `box_value_canonical` would be behaviour-IDENTICAL (it delegates F and D
+//     straight back), but leaving them spelled `box_value` keeps the measured
+//     asymmetry visible at the site instead of hiding it inside a helper.
+//     `Float`/`Double` have no cache on HotSpot at all: neg.floatValueOf and
+//     neg.doubleValueOf are both `false`.
+//   * `native_mhn_get_member_vm_info`'s vmindex. That `Object[]` slot is
+//     JDK-internal plumbing whose HotSpot counterpart is `create`-boxed, not
+//     `valueOf`-boxed, and no Java-visible identity depends on it. It is the
+//     `Array.get` half of the split and is annotated at the site.
+//
 // ---------------------------------------------------------------------------
 // Hoisted descriptor / class-name string constants
 // ---------------------------------------------------------------------------
@@ -233,6 +294,14 @@ const VH_KIND_BYTE_VIEW_BE: i32 = 4;
 // `(ByteBuffer, byteIndex)` and direct buffers must hit native memory.
 const VH_KIND_BYTE_BUFFER_VIEW_LE: i32 = 5;
 const VH_KIND_BYTE_BUFFER_VIEW_BE: i32 = 6;
+// An FFM LAYOUT VarHandle (`ValueLayout.JAVA_INT.varHandle()`,
+// `layout.varHandle(PathElement...)`), whose coordinates are
+// `(MemorySegment, long[, long])`. Reported by the describe-yourself pair;
+// this kind is never written into a slot, because the handle's meaning lives
+// in `P67_MEMORY_SEGMENT_VH_TABLE` (see `SegmentVhShape`). Deliberately NOT
+// `3`: `phases_late/reflect_invoke.rs` numbers ITS memory-segment kind 3 under
+// a different slot map, and 3 already means `VH_KIND_BYTE_VIEW_LE` here.
+const VH_KIND_MEMORY_SEGMENT_LAYOUT: i32 = 7;
 
 // ---------------------------------------------------------------------------
 // WP4.2 — VarHandle metadata side table
@@ -381,11 +450,54 @@ pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: Object
 }
 
 // ---------------------------------------------------------------------------
+// FFM layout VarHandles (`ValueLayout.JAVA_INT.varHandle()`,
+// `layout.varHandle(PathElement...)`)
+// ---------------------------------------------------------------------------
+//
+// The receiver is a synthetic `java/lang/invoke/VarHandle` whose slots the real
+// class declares as `vform`/`…`, so nothing about what it addresses can be read
+// off the object — this table IS the handle's meaning. It used to hold only the
+// access WIDTH, which was enough for `accessModeType` and for nothing else:
+//
+//   * `varType()`/`coordinateTypes()` refused (`kind 0`) because they fell
+//     through to the generic path, which read slot 0 — `foreign_ffm`'s
+//     endianness flag — as a kind tag;
+//   * `get`/`set` fell through to the INSTANCE-FIELD arm for the same reason
+//     and silently did nothing. Measured on the shipping binary:
+//     `vhInt.set(seg, 0L, 11); (int) vhInt.get(seg, 0L)` answered `0`, and the
+//     cross-check `seg.get(JAVA_INT, 4)` agreed — the write never happened —
+//     where HotSpot answers `11`/`22` (probes/PFfm.java, `RJdkForeign
+//     .layoutVarHandles`);
+//   * an index coordinate (`sequenceElement()`) could not be expressed at all,
+//     so a sequence-element handle addressed offset 0 and `set` took the INDEX
+//     as its value.
+//
+// Width alone also cannot name a carrier: `JAVA_INT` and `JAVA_FLOAT` are both
+// four bytes and must answer `int`/`float`. So the row records the carrier, the
+// byte order, the fixed offset the layout path walked to, and the stride of the
+// one open index the path left behind.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentVhShape {
+    /// Access width in bytes (1, 2, 4 or 8).
+    pub width: i32,
+    /// JVM descriptor byte of the layout's carrier: `b'Z'`, `b'B'`, `b'C'`,
+    /// `b'S'`, `b'I'`, `b'J'`, `b'F'` or `b'D'`.
+    pub carrier: u8,
+    pub little_endian: bool,
+    /// Byte offset the layout path resolved to, added to the caller's own
+    /// offset coordinate.
+    pub base_offset: i64,
+    /// Stride of the trailing `long` index coordinate; `0` means the handle has
+    /// no index coordinate.
+    pub stride: i64,
+}
+
 static P67_MEMORY_SEGMENT_VH_TABLE: std::sync::OnceLock<
-    parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>,
+    parking_lot::Mutex<rustc_hash::FxHashMap<i32, SegmentVhShape>>,
 > = std::sync::OnceLock::new();
 
-fn p67_memory_segment_vh_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+fn p67_memory_segment_vh_table(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, SegmentVhShape>> {
     P67_MEMORY_SEGMENT_VH_TABLE
         .get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -393,21 +505,213 @@ fn p67_memory_segment_vh_table() -> &'static parking_lot::Mutex<rustc_hash::FxHa
 pub(crate) fn register_p67_memory_segment_var_handle(
     ctx: &mut dyn NativeContext,
     vh: ObjectRef,
-    width: i32,
+    shape: SegmentVhShape,
 ) {
     ctx.register_var_handle_root(vh);
     let key = ctx.identity_hash_code(vh);
-    p67_memory_segment_vh_table()
-        .lock()
-        .insert(key, width.clamp(1, 8));
+    let shape = SegmentVhShape {
+        width: shape.width.clamp(1, 8),
+        ..shape
+    };
+    p67_memory_segment_vh_table().lock().insert(key, shape);
+}
+
+pub(crate) fn p67_segment_vh_shape(
+    ctx: &dyn NativeContext,
+    vh: ObjectRef,
+) -> Option<SegmentVhShape> {
+    let key = ctx.identity_hash_code(vh);
+    p67_memory_segment_vh_table().lock().get(&key).copied()
 }
 
 pub(crate) fn p67_memory_segment_var_handle_width(
     ctx: &dyn NativeContext,
     vh: ObjectRef,
 ) -> Option<i32> {
-    let key = ctx.identity_hash_code(vh);
-    p67_memory_segment_vh_table().lock().get(&key).copied()
+    p67_segment_vh_shape(ctx, vh).map(|s| s.width)
+}
+
+/// The JVM descriptor of an FFM layout handle's carrier.
+fn layout_vh_carrier_desc(carrier: u8) -> &'static str {
+    match carrier {
+        b'Z' => DESC_BOOLEAN,
+        b'B' => DESC_BYTE,
+        b'C' => DESC_CHAR,
+        b'S' => DESC_SHORT,
+        b'J' => DESC_LONG,
+        b'F' => DESC_FLOAT,
+        b'D' => DESC_DOUBLE,
+        _ => DESC_INT,
+    }
+}
+
+/// The coordinate descriptors of an FFM layout handle: `(MemorySegment, long)`
+/// plus one more `long` when the layout path left an open index behind.
+fn layout_vh_coordinates(shape: SegmentVhShape) -> Vec<String> {
+    let mut coords = vec![
+        "Ljava/lang/foreign/MemorySegment;".to_string(),
+        DESC_LONG.to_string(),
+    ];
+    if shape.stride > 0 {
+        coords.push(DESC_LONG.to_string());
+    }
+    coords
+}
+
+/// Resolve an FFM layout handle's access into a validated raw address, and say
+/// which argument slot carries the value on a write.
+///
+/// `args` is `[vh, segment, offset, (index,)? (value)?]`. The offset is the
+/// layout path's own `base_offset` plus the caller's offset coordinate plus
+/// `index * stride` when the handle has an index coordinate.
+///
+/// Out of bounds raises `IndexOutOfBoundsException`, which is what the JDK
+/// raises for a segment access past the end — never a zero read or a dropped
+/// write, which is what this path did before it existed.
+fn layout_vh_access(
+    ctx: &mut dyn NativeContext,
+    shape: SegmentVhShape,
+    args: &[Value],
+) -> Result<Option<(usize, usize)>, MethodCallFailed> {
+    let Some(Value::Object(Some(seg))) = args.get(1).copied() else {
+        return Ok(None);
+    };
+    // GC-safety: the scope check runs `Scope.checkValidState()` bytecode, which
+    // can collect and relocate the segment. Pin it across the call and re-read
+    // the (possibly forwarded) reference before touching its fields — and
+    // release the pin BEFORE propagating a closed-scope failure.
+    let seg_pin = ctx.pin_native_root(seg);
+    let checked = crate::phases_late::foreign_ffm::p67_segment_check_scope(ctx, seg);
+    let seg = ctx.read_native_pin(seg_pin, seg);
+    ctx.unpin_native_roots(seg_pin);
+    checked?;
+    let long_at = |i: usize| -> i64 {
+        match args.get(i) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        }
+    };
+    let mut offset = shape.base_offset.saturating_add(long_at(2));
+    let value_index = if shape.stride > 0 {
+        offset = offset.saturating_add(shape.stride.saturating_mul(long_at(3)));
+        4
+    } else {
+        3
+    };
+    let base = crate::panama_libffi::segment_address(ctx, seg);
+    let size = crate::panama_libffi::segment_byte_size(ctx, seg);
+    let width = shape.width.clamp(1, 8) as i64;
+    if base == 0 || offset < 0 || offset.saturating_add(width) > size {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "VarHandle access of {width} bytes at offset {offset} is out of bounds for a \
+                 segment of {size} bytes"
+            )),
+        }
+        .into());
+    }
+    Ok(Some(((base as usize).wrapping_add(offset as usize), value_index)))
+}
+
+/// Read an FFM layout handle's variable out of a segment.
+fn layout_vh_read(shape: SegmentVhShape, addr: usize) -> Value {
+    let le = shape.little_endian;
+    // SAFETY: `addr` was bounds-checked against the segment's own recorded
+    // size by `layout_vh_access`, and the width is the layout's.
+    unsafe {
+        let p = addr as *const u8;
+        let mut raw = [0u8; 8];
+        let w = shape.width.clamp(1, 8) as usize;
+        std::ptr::copy_nonoverlapping(p, raw.as_mut_ptr(), w);
+        let u = |n: usize| -> u64 {
+            let mut v: u64 = 0;
+            for i in 0..n {
+                let b = raw[i] as u64;
+                if le {
+                    v |= b << (8 * i);
+                } else {
+                    v = (v << 8) | b;
+                }
+            }
+            v
+        };
+        match shape.carrier {
+            b'Z' => Value::Int(i32::from(raw[0] != 0)),
+            b'B' => Value::Int(raw[0] as i8 as i32),
+            b'C' => Value::Int(u(2) as u16 as i32),
+            b'S' => Value::Int(u(2) as u16 as i16 as i32),
+            b'J' => Value::Long(u(8) as i64),
+            b'F' => Value::Float(f32::from_bits(u(4) as u32)),
+            b'D' => Value::Double(f64::from_bits(u(8))),
+            _ => Value::Int(u(4) as u32 as i32),
+        }
+    }
+}
+
+/// Write an FFM layout handle's variable into a segment.
+fn layout_vh_write(shape: SegmentVhShape, addr: usize, value: Value) {
+    let w = shape.width.clamp(1, 8) as usize;
+    let raw: u64 = match (shape.carrier, value) {
+        (b'F', Value::Float(f)) => f.to_bits() as u64,
+        (b'F', Value::Int(v)) => (v as f32).to_bits() as u64,
+        (b'D', Value::Double(d)) => d.to_bits(),
+        (b'D', Value::Float(f)) => (f as f64).to_bits(),
+        (_, Value::Long(v)) => v as u64,
+        (_, Value::Int(v)) => v as i64 as u64,
+        (_, Value::Float(f)) => f.to_bits() as u64,
+        (_, Value::Double(d)) => d.to_bits(),
+        _ => 0,
+    };
+    let bytes = if shape.little_endian {
+        raw.to_le_bytes()
+    } else {
+        // Big-endian: the significant bytes are the LAST `w` of the eight.
+        let be = raw.to_be_bytes();
+        let mut out = [0u8; 8];
+        out[..w].copy_from_slice(&be[8 - w..]);
+        out
+    };
+    // SAFETY: bounds-checked by `layout_vh_access`; `w` is the layout width.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, w);
+    }
+}
+
+/// `VarHandle.get` for an FFM layout handle, boxed for the polymorphic call
+/// site.
+fn layout_vh_get(
+    ctx: &mut dyn NativeContext,
+    shape: SegmentVhShape,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((addr, _)) = layout_vh_access(ctx, shape, args)? else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let value = layout_vh_read(shape, addr);
+    // CANONICAL — measured `ffm.layoutInt` / `layoutChar` / `layoutLong` /
+    // `layoutByte` = true. `layout_vh_read` and `layout_vh_carrier_desc` both
+    // switch on `shape.carrier`, so the `Value` variant and the descriptor
+    // always agree here and the helper's variant guard is never the arm taken.
+    Ok(Some(box_value_canonical(
+        ctx,
+        value,
+        layout_vh_carrier_desc(shape.carrier),
+    )))
+}
+
+/// `VarHandle.set` for an FFM layout handle.
+fn layout_vh_set(
+    ctx: &mut dyn NativeContext,
+    shape: SegmentVhShape,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((addr, value_index)) = layout_vh_access(ctx, shape, args)? else {
+        return Ok(None);
+    };
+    let value = args.get(value_index).copied().unwrap_or(Value::Int(0));
+    layout_vh_write(shape, addr, value);
+    Ok(None)
 }
 
 // Descriptor helpers — reconstruct JVM descriptor from MethodType object
@@ -510,6 +814,308 @@ pub(crate) fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String
     Some((params, desc[i + 1..].to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// `MethodHandle.asType` CONVERTIBILITY — the pairwise rule, and the closed
+// table it rests on
+// ---------------------------------------------------------------------------
+//
+// `asType` is the gate every JDK adapter goes through, and it had NO check at
+// all here until 2026-08-17: the native wrote the requested `MethodType` into
+// the receiver's `type` field and handed the receiver back, so a
+// `(String)String` handle happily became a `(int,int)int` one. That is the
+// single missing assertion in `RJdkProxyIface` — `MethodHandleProxies
+// .asInterfaceInstance(Subtractor.class, <(String)String handle>)` returned a
+// live proxy where HotSpot refuses.
+//
+// The rule below is a TRANSCRIPTION of `java.lang.invoke.MethodType.canConvert`
+// (JDK 25 `src.zip`, lines 1078-1128) and `MethodType.isConvertibleTo` (986),
+// checked cell by cell against a 613-row sweep of HotSpot 25.0.3+9-LTS on this
+// host (`scratchpad/g31/AsTypeFamily.java`, `AsTypeExtra.java`; the matrices
+// are printed in full in
+// `docs/known-issues/jdk-only/G31-1-astype-and-the-verifier-that-was-never-asked-20260817.md`).
+//
+// The three things that sweep settled, none of which is guessable:
+//
+//   1. **Reference -> reference is ALWAYS convertible.** `String -> Integer`,
+//      `int[] -> String`, `Void -> Comparable` — every one is accepted, because
+//      `null` is always dynamically valid and the cast is deferred to invoke
+//      time. Only the primitive edges refuse.
+//   2. **`void` is convertible in BOTH directions**, as a return type: to
+//      `void` the value is dropped, from `void` a zero/null is introduced. The
+//      whole `void` row and the whole `void` column of the return matrix are
+//      accepts.
+//   3. **`explicitCastArguments` has DIFFERENT rules and is the trap.** Its
+//      324-cell return matrix and 289-cell parameter matrix are accepts in
+//      EVERY cell; it refuses on arity alone. Applying this predicate there
+//      would refuse 248 pairs HotSpot accepts, so [`register_p65_extras`]'s
+//      body checks arity and nothing else.
+//
+// Everything here is a pure function of descriptor strings so it is unit
+// testable without a VM, which is the only way it could be checked at all in a
+// lane that may not build.
+
+/// The wrapper class descriptor `MethodType.canConvert` boxes a primitive to.
+///
+/// `V` is deliberately absent: `canConvert` short-circuits `void` before it
+/// ever reaches the boxing arm, and `Void` is NOT a wrapper for the purposes of
+/// the reference->primitive arm (MEASURED: `Void` unboxes to no primitive —
+/// every cell of its row is a refusal).
+fn wrapper_desc_for_primitive(prim: &str) -> Option<&'static str> {
+    Some(match prim {
+        "Z" => "Ljava/lang/Boolean;",
+        "B" => "Ljava/lang/Byte;",
+        "C" => "Ljava/lang/Character;",
+        "S" => "Ljava/lang/Short;",
+        "I" => "Ljava/lang/Integer;",
+        "J" => "Ljava/lang/Long;",
+        "F" => "Ljava/lang/Float;",
+        "D" => "Ljava/lang/Double;",
+        _ => return None,
+    })
+}
+
+/// The inverse of [`wrapper_desc_for_primitive`] — `Wrapper.isWrapperType(src)`
+/// plus `Wrapper.forWrapperType(src)` in one lookup, which is exactly how
+/// `canConvert`'s third reference->primitive test uses it.
+fn primitive_desc_for_wrapper(wrapper: &str) -> Option<&'static str> {
+    Some(match wrapper {
+        "Ljava/lang/Boolean;" => "Z",
+        "Ljava/lang/Byte;" => "B",
+        "Ljava/lang/Character;" => "C",
+        "Ljava/lang/Short;" => "S",
+        "Ljava/lang/Integer;" => "I",
+        "Ljava/lang/Long;" => "J",
+        "Ljava/lang/Float;" => "F",
+        "Ljava/lang/Double;" => "D",
+        _ => return None,
+    })
+}
+
+/// JLS 5.1.2 widening primitive conversion, plus identity — `Wrapper
+/// .forPrimitiveType(dst).isConvertibleFrom(sw)`.
+///
+/// `boolean` widens to nothing and nothing widens to it; `char` widens to
+/// `int`/`long`/`float`/`double` but NOT to `short`, and `byte`/`short` do not
+/// widen to `char`. All three asymmetries are in the measured matrix.
+fn primitive_widens_to(from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    let wider: &[&str] = match from {
+        "B" => &["S", "I", "J", "F", "D"],
+        "S" => &["I", "J", "F", "D"],
+        "C" => &["I", "J", "F", "D"],
+        "I" => &["J", "F", "D"],
+        "J" => &["F", "D"],
+        "F" => &["D"],
+        // `Z` and `V` widen to nothing.
+        _ => &[],
+    };
+    wider.contains(&to)
+}
+
+/// `reference.isAssignableFrom(wrapper)` for the eight wrapper classes — the
+/// only assignability question `canConvert` ever asks.
+///
+/// This is a CLOSED table, not an approximation, and that is what makes it
+/// usable without a class-hierarchy walk (`NativeContext` offers `is_subclass`,
+/// which cannot answer for interfaces, and `Comparable`/`Serializable`/
+/// `Constable`/`ConstantDesc` are all interfaces). The wrappers are `final`,
+/// so nothing outside `java.base` can ever be one of their supertypes.
+/// Enumerated by reflection on HotSpot 25.0.3+9 (`scratchpad/g31/Sup.java`)
+/// and cross-checked against the measured conversion matrix:
+///
+/// ```text
+///   Boolean   <: Object Comparable Serializable Constable
+///   Character <: Object Comparable Serializable Constable
+///   Byte      <: Object Comparable Serializable Constable Number
+///   Short     <: Object Comparable Serializable Constable Number
+///   Integer   <: Object Comparable Serializable Constable Number ConstantDesc
+///   Long      <: Object Comparable Serializable Constable Number ConstantDesc
+///   Float     <: Object Comparable Serializable Constable Number ConstantDesc
+///   Double    <: Object Comparable Serializable Constable Number ConstantDesc
+///   Void      <: Object                                                (only)
+/// ```
+///
+/// `ConstantDesc` covering four wrappers and not six is the row that would have
+/// been got wrong by inspection: `Byte` and `Short` are `Constable` but NOT
+/// `ConstantDesc`, and the measured matrix agrees (`ConstantDesc` accepts
+/// `int`/`long`/`float`/`double` and refuses `byte`/`short`/`char`/`boolean`).
+fn reference_accepts_wrapper(reference: &str, wrapper: &str) -> bool {
+    if reference == wrapper {
+        return true;
+    }
+    match reference {
+        "Ljava/lang/Object;" => true,
+        "Ljava/lang/Comparable;" | "Ljava/io/Serializable;" | "Ljava/lang/constant/Constable;" => {
+            primitive_desc_for_wrapper(wrapper).is_some()
+        }
+        "Ljava/lang/Number;" => matches!(
+            wrapper,
+            "Ljava/lang/Byte;"
+                | "Ljava/lang/Short;"
+                | "Ljava/lang/Integer;"
+                | "Ljava/lang/Long;"
+                | "Ljava/lang/Float;"
+                | "Ljava/lang/Double;"
+        ),
+        "Ljava/lang/constant/ConstantDesc;" => matches!(
+            wrapper,
+            "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Float;" | "Ljava/lang/Double;"
+        ),
+        _ => false,
+    }
+}
+
+/// True when a descriptor token names one of the nine primitive types
+/// (`void` included — `canConvert` handles it, so it must reach the arms).
+fn is_primitive_descriptor(tok: &str) -> bool {
+    matches!(tok, "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" | "V")
+}
+
+/// `MethodType.canConvert(src, dst)`, transcribed arm for arm.
+///
+/// Read it against the JDK source rather than against intuition: the third
+/// reference->primitive test (`isWrapperType(src) && dw.isConvertibleFrom(...)`)
+/// is what makes `Byte -> short` and `Character -> int` convertible while
+/// `Number -> char` is not, and dropping it silently narrows 20 accepted cells
+/// into refusals.
+fn mh_can_convert(src: &str, dst: &str) -> bool {
+    // Short-circuits, in the JDK's own order.
+    if src == dst || src == "Ljava/lang/Object;" || dst == "Ljava/lang/Object;" {
+        return true;
+    }
+    if is_primitive_descriptor(src) {
+        // `void` forces to an explicit null or a primitive zero.
+        if src == "V" {
+            return true;
+        }
+        let Some(sw) = wrapper_desc_for_primitive(src) else {
+            return false;
+        };
+        if is_primitive_descriptor(dst) {
+            // P -> P must widen — except to `void`, which accepts every
+            // primitive. The JDK spells that as `Wrapper.VOID
+            // .isConvertibleFrom(sw)`; MEASURED, the whole `void` COLUMN of
+            // the return matrix is accepts, so it is spelled out here rather
+            // than folded into `primitive_widens_to`, where a `V` entry would
+            // wrongly claim `void` is a widening of `int` in both directions.
+            if dst == "V" {
+                return true;
+            }
+            return primitive_widens_to(src, dst);
+        }
+        // P -> R must box and widen.
+        return reference_accepts_wrapper(dst, sw);
+    }
+    if is_primitive_descriptor(dst) {
+        // Any value can be dropped.
+        if dst == "V" {
+            return true;
+        }
+        let Some(dw) = wrapper_desc_for_primitive(dst) else {
+            return false;
+        };
+        // R -> P must be able to unbox from a dynamically chosen type: the
+        // wrapper must be cast-compatible with the source.
+        if reference_accepts_wrapper(src, dw) {
+            return true;
+        }
+        // ... or the source is strongly typed to a wrapper whose primitive
+        // widens to the destination (`Byte -> short`, `Character -> int`).
+        if let Some(sp) = primitive_desc_for_wrapper(src) {
+            return primitive_widens_to(sp, dst);
+        }
+        return false;
+    }
+    // R -> R always works, since null is always valid dynamically.
+    true
+}
+
+/// `MethodType.isConvertibleTo` on two method descriptors — the whole-signature
+/// predicate `asType` gates on.
+///
+/// **The parameter direction is reversed and that is not a typo.** The RETURN
+/// value travels old -> new (the callee produces it, the caller receives it);
+/// each PARAMETER travels new -> old (the caller supplies it, the callee
+/// receives it). Getting this backwards passes the primitive-widening rows and
+/// fails on every narrowing one, which is a diff that looks like an off-by-one
+/// rather than a reversal.
+///
+/// Arity is checked first and exactly: `asType` never adds or drops a
+/// parameter (`asCollector`/`asSpreader`/`bindTo` do), so all five measured
+/// arity rows refuse.
+fn method_type_is_convertible_to(old_desc: &str, new_desc: &str) -> Option<bool> {
+    let (old_params, old_ret) = split_descriptor_params(old_desc)?;
+    let (new_params, new_ret) = split_descriptor_params(new_desc)?;
+    if old_params.len() != new_params.len() {
+        return Some(false);
+    }
+    if !mh_can_convert(&old_ret, &new_ret) {
+        return Some(false);
+    }
+    for (new_p, old_p) in new_params.iter().zip(old_params.iter()) {
+        if !mh_can_convert(new_p, old_p) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// One descriptor token in `Class.getSimpleName()` spelling, which is what
+/// `MethodType.toString()` prints and therefore what the exception message
+/// carries: `[I` -> `int[]`, `Ljava/util/Map$Entry;` -> `Entry`.
+///
+/// MEASURED, so the message can be transcribed rather than composed:
+/// `MethodType.methodType(int[].class, String[].class, Object[][].class)`
+/// prints `(String[],Object[][])int[]`, and a nested class prints its inner
+/// name alone (`(Entry)Inner`).
+fn descriptor_simple_name(tok: &str) -> Option<String> {
+    let dims = tok.bytes().take_while(|b| *b == b'[').count();
+    let base = &tok[dims..];
+    let name = match base {
+        "Z" => "boolean".to_string(),
+        "B" => "byte".to_string(),
+        "C" => "char".to_string(),
+        "S" => "short".to_string(),
+        "I" => "int".to_string(),
+        "J" => "long".to_string(),
+        "F" => "float".to_string(),
+        "D" => "double".to_string(),
+        "V" => "void".to_string(),
+        other => {
+            let inner = other.strip_prefix('L')?.strip_suffix(';')?;
+            if inner.is_empty() {
+                return None;
+            }
+            inner
+                .rsplit(['/', '$'])
+                .next()
+                .filter(|s| !s.is_empty())?
+                .to_string()
+        }
+    };
+    Some(name + &"[]".repeat(dims))
+}
+
+/// A method descriptor in `MethodType.toString()` spelling — `(int,String)void`.
+///
+/// `None` when any token cannot be named, so a caller can decline to compose a
+/// half-rendered message rather than print a signature with a `?` in it.
+fn method_type_display(desc: &str) -> Option<String> {
+    let (params, ret) = split_descriptor_params(desc)?;
+    let mut out = String::from("(");
+    for (i, p) in params.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&descriptor_simple_name(p)?);
+    }
+    out.push(')');
+    out.push_str(&descriptor_simple_name(&ret)?);
+    Some(out)
+}
+
 /// The heap array kind an array whose COMPONENT descriptor is `comp` must have.
 ///
 /// Anything that is not one of the eight primitive tokens — including `[…` and
@@ -555,6 +1161,123 @@ fn widen_primitive_to_descriptor(v: Value, comp: &str) -> Value {
     }
 }
 
+/// Which primitive descriptor should drive the WRAPPER CLASS for one element
+/// of a reference-component collector / varargs array, when the component
+/// itself settles it — `None` when it does not.
+///
+/// # The measurement this is built on, and the diagnosis it corrects
+///
+/// F19-1 §7 N2 states that fixing the collector arms *"needs the target
+/// handle's `MethodType`"*. **MEASURED on OpenJDK 25.0.3+9 (`CollBox.java`,
+/// byte-identical over three runs, under `-Xint`, and under
+/// `-XX:-UseCompressedOops`), that is not where the information is:**
+///
+/// ```text
+/// coll = firstOf(Object[])Object . asCollector(Object[].class, 1)
+/// coll.type()                 = (Object)Object      <-- the MethodType
+/// coll.invoke(aChar)  .getClass() = java.lang.Character
+/// coll.invoke(anInt)  .getClass() = java.lang.Integer
+/// coll.invoke(aBool)  .getClass() = java.lang.Boolean
+/// coll.asType((char)Object).invoke(aChar).getClass() = java.lang.Character
+/// coll.asType((int)Object) .invoke(anInt) .getClass() = java.lang.Integer
+/// ```
+///
+/// The handle's `MethodType` says `Object` for every one of those rows, and
+/// the answers still differ. The wrapper class is chosen by the **call site's
+/// static parameter type** — the descriptor of the signature-polymorphic
+/// `invoke`, or the `asType` adapter's parameter when one is interposed. The
+/// target's `MethodType` is `(Object[])Object` and could not distinguish them
+/// either. So the `Object[]` case is NOT fixable at this arm and is nominated
+/// against `vm/src/vm/vm_exec.rs`, which is where the call-site descriptor
+/// exists (it is already read there as `descriptor`, by
+/// `unbox_poly_return_checked`) and is not passed to the native.
+///
+/// # What IS settled here, and why it is total rather than a heuristic
+///
+/// When the array component is one of the eight wrapper classes, HotSpot
+/// **refuses** every call whose static argument type is not that wrapper's
+/// primitive, so the component pins the answer for every call that runs at
+/// all. MEASURED (`CollBox2.java`):
+///
+/// | collector | from `char` | from `int` | from `long` |
+/// |---|---|---|---|
+/// | `Character[]` | `Character` | `WrongMethodTypeException` | — |
+/// | `Integer[]` | `WrongMethodTypeException` | `Integer` | `WrongMethodTypeException` |
+/// | `Long[]` | — | `WrongMethodTypeException` | `Long` |
+/// | `Boolean[]`/`Byte[]`/`Short[]`/`Float[]` | — | per type | — |
+/// | `Object[]`/`Comparable[]` | `Character` | `Integer` | `Long` |
+///
+/// `Number[]` behaves like `Object[]` for the arms it accepts and refuses the
+/// rest (`Number` from `char` is a `WrongMethodTypeException`), so it is a
+/// `None` here rather than a ninth row — a reference component that is not
+/// itself a wrapper carries no primitive.
+///
+/// The `Value` variant is matched as well as the descriptor, for the same
+/// reason `box_value_canonical` matches it: `native_long_value_of` reads
+/// `Some(Value::Long(v))` and defaults to 0, so a `("Ljava/lang/Long;",
+/// Value::Int(5))` pair routed on the descriptor alone would box **0**. That
+/// pair is not a shape HotSpot accepts anyway (`LongComp.fromInt` throws), so
+/// declining it costs nothing and falling back to the variant keeps today's
+/// answer.
+///
+/// `F`/`D` are returned like the rest; the CALL SITES decide to spell those
+/// two `box_value`, because `Float`/`Double` have no cache on HotSpot
+/// (MEASURED `FloatComp.id` = false, matching `neg.floatValueOf` = false).
+fn collector_element_box_desc(component: &str, v: Value) -> Option<&'static str> {
+    let prim = match component {
+        "Ljava/lang/Character;" => DESC_CHAR,
+        "Ljava/lang/Boolean;" => DESC_BOOLEAN,
+        "Ljava/lang/Byte;" => DESC_BYTE,
+        "Ljava/lang/Short;" => DESC_SHORT,
+        "Ljava/lang/Integer;" => DESC_INT,
+        "Ljava/lang/Long;" => DESC_LONG,
+        "Ljava/lang/Float;" => DESC_FLOAT,
+        "Ljava/lang/Double;" => DESC_DOUBLE,
+        _ => return None,
+    };
+    match (prim, v) {
+        (DESC_CHAR | DESC_BOOLEAN | DESC_BYTE | DESC_SHORT | DESC_INT, Value::Int(_)) => Some(prim),
+        (DESC_LONG, Value::Long(_)) => Some(prim),
+        (DESC_FLOAT, Value::Float(_)) => Some(prim),
+        (DESC_DOUBLE, Value::Double(_)) => Some(prim),
+        _ => None,
+    }
+}
+
+/// Box one element of a reference-component collector / varargs array.
+///
+/// The single implementation of the rule `mh_dispatch`'s `MH_KIND_COLLECT` arm
+/// and `build_varargs_array`'s reference arm both need. It was two copies
+/// before, which is how they came to disagree with each other in the first
+/// place, and the whole of [`collector_element_box_desc`]'s doc comment is the
+/// justification for both.
+fn box_collector_element(ctx: &mut dyn NativeContext, v: Value, component: &str) -> Value {
+    if let Some(desc) = collector_element_box_desc(component, v) {
+        // `F`/`D` stay on `box_value`: HotSpot caches neither, and
+        // `box_value_canonical` would only hand them straight back here. The
+        // spelling is what keeps the measured asymmetry readable at the site.
+        return if desc == DESC_FLOAT || desc == DESC_DOUBLE {
+            crate::lang_class::box_value(ctx, v, desc)
+        } else {
+            crate::lang_class::box_value_canonical(ctx, v, desc)
+        };
+    }
+    // The component does not name a wrapper class (`Object[]` is the ordinary
+    // case), so the only type information left is the runtime `Value` variant.
+    // That is a KNOWN wrong answer for `char`/`boolean`/`byte`/`short`, all of
+    // which travel as `Value::Int` and come out `Integer` — see
+    // [`collector_element_box_desc`] for the measurement and the nomination.
+    // It is a wrong CLASS, not a wrong identity, and caching it does not make
+    // it wronger: the same object graph, one allocation cheaper.
+    match v {
+        Value::Int(_) => crate::lang_class::box_value_canonical(ctx, v, DESC_INT),
+        Value::Long(_) => crate::lang_class::box_value_canonical(ctx, v, DESC_LONG),
+        Value::Float(_) => crate::lang_class::box_value(ctx, v, DESC_FLOAT),
+        Value::Double(_) => crate::lang_class::box_value(ctx, v, DESC_DOUBLE),
+        other => other,
+    }
+}
+
 /// Read a MethodType object's effective JVM descriptor by converting its
 /// `ptypes` (Class[]) and `rtype` (Class) mirrors back to descriptor tokens.
 fn methodtype_to_descriptor(ctx: &mut dyn NativeContext, mt: ObjectRef) -> Option<String> {
@@ -590,6 +1313,100 @@ fn mh_type_descriptor(ctx: &mut dyn NativeContext, mh: ObjectRef) -> Option<Stri
         }
     }
     mh_read_desc(ctx, mh)
+}
+
+/// The `WrongMethodTypeException` `mh.asType(newType)` must raise, or `None`
+/// when the conversion is one HotSpot performs.
+///
+/// Every way of not knowing is an ACCEPT. The check needs four things to hold
+/// before it will refuse — the receiver's `type` field must be a real
+/// `MethodType`, both descriptors must parse, the raw bytecode descriptor must
+/// agree that the conversion is impossible, and both signatures must render —
+/// and if any of them fails this returns `None` and the passthrough proceeds
+/// exactly as it did before. A missing refusal is the state this VM was already
+/// in; a refusal HotSpot does not issue would break working `invokedynamic`
+/// call sites, and there is no ordering of those two errors in which the second
+/// is the better one.
+///
+/// The raw-descriptor step is the one that is not obvious: see the block
+/// comment on the `asType` registration for why this body's own type mutation
+/// makes a second `asType` on the same reference look unconvertible when
+/// HotSpot, which hands out a fresh handle each time, would still be looking at
+/// the original signature.
+///
+/// The message is HotSpot's, transcribed from
+/// `MethodHandle.asTypeUncached` — `"cannot convert " + this + " to " + newType`
+/// where `MethodHandle.toString()` is the literal `MethodHandle` followed
+/// immediately by its `MethodType`, e.g.
+/// `cannot convert MethodHandle(String)String to (int,int)int`. There is no
+/// space after `MethodHandle`, and both signatures use simple type names.
+fn mh_astype_refusal(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    new_type: ObjectRef,
+) -> Option<MethodCallFailed> {
+    // A real `MethodType` receiver only. `mh_type_descriptor` would fall back
+    // to `MH_DESC`, which is the UNADAPTED signature — refusing on it would
+    // refuse adapters that are already legal.
+    let old_desc = match ctx.get_field_by_name(mh, "type") {
+        Value::Object(Some(mt)) => methodtype_to_descriptor(ctx, mt)?,
+        _ => return None,
+    };
+    let new_desc = methodtype_to_descriptor(ctx, new_type)?;
+    if method_type_is_convertible_to(&old_desc, &new_desc)? {
+        return None;
+    }
+    // Our own aliasing, not a conversion HotSpot refuses.
+    if let Some(raw) = mh_read_desc(ctx, mh) {
+        if method_type_is_convertible_to(&raw, &new_desc) == Some(true) {
+            return None;
+        }
+    }
+    let old_shown = method_type_display(&old_desc)?;
+    let new_shown = method_type_display(&new_desc)?;
+    Some(crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/invoke/WrongMethodTypeException",
+        &format!("cannot convert MethodHandle{old_shown} to {new_shown}"),
+    ))
+}
+
+/// The `WrongMethodTypeException`
+/// `MethodHandles.explicitCastArguments(target, newType)` must raise, or `None`.
+///
+/// Same shape and the same "every way of not knowing is an accept" rule as
+/// [`mh_astype_refusal`], and the same reason for the raw-descriptor escape —
+/// but the PREDICATE is different, and deliberately so: parameter count and
+/// nothing else. See the registration's comment for the measurement.
+fn mh_explicit_cast_refusal(
+    ctx: &mut dyn NativeContext,
+    target: ObjectRef,
+    new_type: ObjectRef,
+) -> Option<MethodCallFailed> {
+    let old_desc = match ctx.get_field_by_name(target, "type") {
+        Value::Object(Some(mt)) => methodtype_to_descriptor(ctx, mt)?,
+        _ => return None,
+    };
+    let new_desc = methodtype_to_descriptor(ctx, new_type)?;
+    let (old_params, _) = split_descriptor_params(&old_desc)?;
+    let (new_params, _) = split_descriptor_params(&new_desc)?;
+    if old_params.len() == new_params.len() {
+        return None;
+    }
+    if let Some(raw) = mh_read_desc(ctx, target) {
+        if let Some((raw_params, _)) = split_descriptor_params(&raw) {
+            if raw_params.len() == new_params.len() {
+                return None;
+            }
+        }
+    }
+    let old_shown = method_type_display(&old_desc)?;
+    let new_shown = method_type_display(&new_desc)?;
+    Some(crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/invoke/WrongMethodTypeException",
+        &format!("cannot explicitly cast MethodHandle{old_shown} to {new_shown}"),
+    ))
 }
 
 /// WP2.9 — Robust class-name extraction that survives the descriptor-coercion
@@ -744,6 +1561,195 @@ fn field_descriptor_from_mirror(
 }
 
 // ---------------------------------------------------------------------------
+// `MethodType` interning
+// ---------------------------------------------------------------------------
+//
+// `MethodType` is specified to be INTERNED: `MethodType.methodType(...)`,
+// `fromMethodDescriptorString(...)` and an `ldc CONSTANT_MethodType` must all
+// hand back the *same instance* for the same descriptor, so `==` holds and
+// `MethodHandle` call-site matching stays identity-based (JVMS §5.4.3.5,
+// `java.lang.invoke.MethodType`'s class javadoc).
+//
+// The four `methodType` registrations below are `Bridge` natives that SHADOW
+// the real JDK bytecode — the `--jdk-only` census reports them as
+// `bridge-ran-over-bytecode` — and each one minted a fresh 2-field carrier.
+// So on a real image every `methodType()` result was a NEW object:
+//
+// ```text
+//   probes/PMt.java, --jdk-only, one binary          CratonVM   HotSpot 25
+//     MethodType.methodType(String,String) == itself  false      true
+//     fromMethodDescriptorString == itself            true       true   <- interns
+//     fromMethodDescriptorString == methodType(..)    false      true
+// ```
+//
+// which is the `RJdkProxyIface.ldcMethodType` failure: the `ldc` decoder
+// (`vm/src/runtime/interpreter/constants.rs`) already does the right thing and
+// prefers the real interning factory — the NON-interned side of that `==` was
+// the fixture's right-hand `MethodType.methodType(String.class, String.class)`,
+// i.e. this file.
+//
+// Retiring the four shadows (re-tagging them `SyntheticStub` so `--jdk-only`
+// refuses them, as `native-api/src/retired_shadow.rs` does for JUL) is the
+// structurally right cure and is NOMINATED — it cannot be done here, because
+// four rows moving `Bridge` -> `SyntheticStub` also move three frozen
+// baselines that can only be re-frozen from a Linux/JDK-25 census
+// (`stub_ratchet.rs` runs `SLACK = 0`). What this file can do — in BOTH modes,
+// with no census motion — is stop fabricating and delegate to the JDK's own
+// interning factories.
+
+/// Class name of the interning factory chain's receiver.
+const MT_CLASS: &str = "java/lang/invoke/MethodType";
+/// `MethodType.genericMethodType(int)` — an interned all-`Object` type. Used as
+/// the CHAIN BASE because it takes no strings and no `ClassLoader`: the JDK
+/// answers `genericMethodType(0)` out of its own `objectOnlyTypes` cache, so
+/// there is no descriptor to parse and no class name to resolve.
+const MT_GENERIC: &str = "(I)Ljava/lang/invoke/MethodType;";
+/// `MethodType.changeReturnType(Class)`.
+const MT_CHANGE_RETURN: &str = "(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;";
+/// `MethodType.insertParameterTypes(int, Class...)`. Called with index 0 on the
+/// empty base rather than `appendParameterTypes`, which would route through the
+/// `parameterCount()` shim below for no reason.
+const MT_INSERT_PARAMS: &str = "(I[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;";
+
+/// The real JDK's interned `MethodType` for `rtype`/`ptypes`, or `None` when
+/// the class library does not carry the factory chain (synthetic-JDK builds),
+/// in which case the caller falls back to the 2-field carrier.
+///
+/// **Why this chain and not `fromMethodDescriptorString`.** That factory is
+/// what the `ldc` decoder and `StackFrame.getMethodType()` use, and it interns
+/// — but it takes a *descriptor string plus a `ClassLoader`*, and the caller
+/// here holds `Class` MIRRORS, whose loaders may differ from each other. Going
+/// through a descriptor would re-resolve every parameter by NAME under one
+/// guessed loader, which is both slower and wrong the moment two loaders each
+/// define a class of the same name. `genericMethodType(0)` ->
+/// `insertParameterTypes(0, ptypes)` -> `changeReturnType(rtype)` consumes the
+/// mirrors as they are: no strings, no loader, no name resolution, and every
+/// step lands in `MethodType.makeImpl(..., true)`, i.e. the intern table.
+///
+/// Verified end to end on the SHIPPING binary before the change, by running
+/// that exact sequence from Java (probes/PMt2.java): under `--jdk-only` the
+/// composed type is `==` to `fromMethodDescriptorString`'s for `(String)String`
+/// and `()void`, is stable across calls, and answers `returnType`/
+/// `parameterType(i)` with the identical mirrors — so what is being delegated
+/// to is known to work in this VM, not assumed to.
+///
+/// None of the three methods is registered anywhere in this tree, so invoking
+/// them reaches real bytecode instead of re-entering this file.
+fn method_type_interned_via_jdk(
+    ctx: &mut dyn NativeContext,
+    rtype: ObjectRef,
+    ptypes: Option<ObjectRef>,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if !ctx.method_exists(MT_CLASS, "genericMethodType", MT_GENERIC)
+        || !ctx.method_exists(MT_CLASS, "changeReturnType", MT_CHANGE_RETURN)
+        || !ctx.method_exists(MT_CLASS, "insertParameterTypes", MT_INSERT_PARAMS)
+    {
+        return Ok(None);
+    }
+    // GC-safety: every `invoke*` below can collect and relocate the caller's
+    // mirrors, which are bare `ObjectRef`s in Rust locals. Pin them for the
+    // whole chain and re-read through the handles after each call.
+    let rtype_pin = ctx.pin_native_root(rtype);
+    let ptypes_pin = ptypes.map(|p| ctx.pin_native_root(p));
+    let out = method_type_interned_chain(ctx, rtype, rtype_pin, ptypes, ptypes_pin);
+    ctx.unpin_native_roots(rtype_pin);
+    out
+}
+
+/// The pinned body of [`method_type_interned_via_jdk`].
+///
+/// Failure policy, following the same split
+/// `vm/src/runtime/interpreter/constants.rs` established for the `ldc` path: a
+/// Java-visible exception from `insertParameterTypes` / `changeReturnType` IS
+/// the answer (`void` as a parameter type, a null element, too many argument
+/// slots — HotSpot throws `IllegalArgumentException`/`NullPointerException`
+/// there too), so it propagates rather than being replaced by a fabricated
+/// type. Anything else — a missing return value, an internal error, or a
+/// failure of the BASE call, which validates nothing and cannot be the user's
+/// answer — falls back to the carrier this file has always built.
+fn method_type_interned_chain(
+    ctx: &mut dyn NativeContext,
+    rtype: ObjectRef,
+    rtype_pin: usize,
+    ptypes: Option<ObjectRef>,
+    ptypes_pin: Option<usize>,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let mut mt = match ctx.invoke(MT_CLASS, "genericMethodType", MT_GENERIC, &[Value::Int(0)]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    let mut mt_pin = ctx.pin_native_root(mt);
+    if let (Some(p), Some(p_pin)) = (ptypes, ptypes_pin) {
+        let arr = ctx.read_native_pin(p_pin, p);
+        if ctx.array_length(arr) > 0 {
+            let recv = ctx.read_native_pin(mt_pin, mt);
+            match ctx.invoke_virtual(
+                recv,
+                "insertParameterTypes",
+                MT_INSERT_PARAMS,
+                &[Value::Int(0), Value::Object(Some(arr))],
+            ) {
+                Ok(Some(Value::Object(Some(o)))) => {
+                    mt = o;
+                    mt_pin = ctx.pin_native_root(mt);
+                }
+                Err(e @ MethodCallFailed::ExceptionThrown(_)) => return Err(e),
+                _ => return Ok(None),
+            }
+        }
+    }
+    let recv = ctx.read_native_pin(mt_pin, mt);
+    let rt = ctx.read_native_pin(rtype_pin, rtype);
+    match ctx.invoke_virtual(
+        recv,
+        "changeReturnType",
+        MT_CHANGE_RETURN,
+        &[Value::Object(Some(rt))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => Ok(Some(o)),
+        Err(e @ MethodCallFailed::ExceptionThrown(_)) => Err(e),
+        _ => Ok(None),
+    }
+}
+
+/// One `MethodType` for the four `methodType(...)` overloads: the real JDK's
+/// interned instance when the image has the factory chain, otherwise the
+/// 2-field `(returnType, parameterArray)` carrier this file has always minted,
+/// with its fabricated `MethodTypeForm`.
+///
+/// `ptypes` is consumed as given; `None` (an absent or null parameter array)
+/// becomes a 0-length one on the fallback path, so `parameterCount()` and
+/// `parameterArray()` never meet a null slot.
+fn make_method_type(
+    ctx: &mut dyn NativeContext,
+    rtype: ObjectRef,
+    ptypes: Option<ObjectRef>,
+) -> MethodCallResult {
+    if let Some(interned) = method_type_interned_via_jdk(ctx, rtype, ptypes)? {
+        return Ok(Some(Value::Object(Some(interned))));
+    }
+    // GC-safety: the allocation and the empty-array creation below can each
+    // relocate the caller's mirrors and the carrier itself.
+    let rtype_pin = ctx.pin_native_root(rtype);
+    let ptypes_pin = ptypes.map(|p| ctx.pin_native_root(p));
+    let obj = try_alloc_concurrent_synthetic(ctx, MT_CLASS, 6)?;
+    let obj_pin = ctx.pin_native_root(obj);
+    let rt = ctx.read_native_pin(rtype_pin, rtype);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field(obj, 0, Value::Object(Some(rt)));
+    let params = match (ptypes, ptypes_pin) {
+        (Some(p), Some(pin)) => ctx.read_native_pin(pin, p),
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+    };
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field(obj, 1, Value::Object(Some(params)));
+    populate_method_type_form(ctx, obj)?;
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(rtype_pin);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+// ---------------------------------------------------------------------------
 // java.lang.invoke — MethodHandle, MethodType, MethodHandles (stubs)
 // ---------------------------------------------------------------------------
 pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
@@ -757,12 +1763,11 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
-            let params = args.get(1).copied().unwrap_or(Value::Object(None));
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            ctx.set_field(obj, 1, params);
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            let params = match args.get(1) {
+                Some(Value::Object(p)) => *p,
+                _ => None,
+            };
+            make_method_type(ctx, ret, params)
         },
     );
     r.register(
@@ -771,14 +1776,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            // Empty params — allocate a 0-length Class[] so `parameterCount()`
-            // and the form-builder both see a non-null array.
-            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            ctx.set_field(obj, 1, Value::Object(Some(empty)));
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            make_method_type(ctx, ret, None)
         },
     );
     r.register(
@@ -788,13 +1786,16 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
             let param = obj_arg(args, 1)?;
+            // GC-safety: `new_array` can collect and relocate both mirrors.
+            let ret_pin = ctx.pin_native_root(ret);
+            let param_pin = ctx.pin_native_root(param);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+            let param = ctx.read_native_pin(param_pin, param);
             ctx.set_array_element(arr, 0, Value::Object(Some(param)));
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            let ret = ctx.read_native_pin(ret_pin, ret);
+            let out = make_method_type(ctx, ret, Some(arr));
+            ctx.unpin_native_roots(ret_pin);
+            out
         },
     );
     // methodType(Class rtype, Class ptype0, Class... morePtypes)
@@ -806,24 +1807,35 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             let ret = obj_arg(args, 0)?;
             let ptype0 = obj_arg(args, 1)?;
             // morePtypes may be null or an array
-            let more_len = match args.get(2) {
-                Some(Value::Object(Some(arr))) => ctx.array_length(*arr),
-                _ => 0,
+            let more = match args.get(2) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
             };
+            let more_len = more.map(|a| ctx.array_length(a)).unwrap_or(0);
+            // GC-safety: `new_array` and the element copies can each collect;
+            // pin every reference the loop below still needs afterwards.
+            let ret_pin = ctx.pin_native_root(ret);
+            let ptype0_pin = ctx.pin_native_root(ptype0);
+            let more_pin = more.map(|a| ctx.pin_native_root(a));
             let total = 1 + more_len;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, total);
+            let arr_pin = ctx.pin_native_root(arr);
+            let ptype0 = ctx.read_native_pin(ptype0_pin, ptype0);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, 0, Value::Object(Some(ptype0)));
-            if let Some(Value::Object(Some(more))) = args.get(2) {
+            if let (Some(m), Some(m_pin)) = (more, more_pin) {
                 for i in 0..more_len {
-                    let elem = ctx.get_array_element(*more, i);
+                    let m = ctx.read_native_pin(m_pin, m);
+                    let elem = ctx.get_array_element(m, i);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, 1 + i, elem);
                 }
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            let ret = ctx.read_native_pin(ret_pin, ret);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let out = make_method_type(ctx, ret, Some(arr));
+            ctx.unpin_native_roots(ret_pin);
+            out
         },
     );
     r.register(mt, "returnType", "()Ljava/lang/Class;", |ctx, args| {
@@ -1820,12 +2832,22 @@ fn p67_memory_segment_varhandle_descriptor(
     vh: ObjectRef,
     access_type: i32,
 ) -> Option<String> {
+    // The shape table names the CARRIER, which a width cannot: `JAVA_INT` and
+    // `JAVA_FLOAT` are both four bytes and must type as `int`/`float`. It also
+    // carries the index coordinate a sequence-element path added.
+    if let Some(shape) = p67_segment_vh_shape(ctx, vh) {
+        return Some(vh_access_mode_descriptor(
+            access_type,
+            &layout_vh_coordinates(shape),
+            layout_vh_carrier_desc(shape.carrier),
+        ));
+    }
     let slot_width = if ctx.get_field(vh, 2).as_int() == Some(3) {
         ctx.get_field(vh, 1).as_int()
     } else {
         None
     };
-    if let Some(width) = p67_memory_segment_var_handle_width(ctx, vh).or(slot_width) {
+    if let Some(width) = slot_width {
         let coords = vec![
             "Ljava/lang/foreign/MemorySegment;".to_string(),
             DESC_LONG.to_string(),
@@ -1968,6 +2990,19 @@ fn vh_value_and_coordinate_descriptors(
     ctx: &mut dyn NativeContext,
     vh: ObjectRef,
 ) -> (i32, String, Vec<String>, bool) {
+    // An FFM layout handle describes itself out of the shape table — the
+    // carrier the layout named and `(MemorySegment, long[, long])` — and must
+    // be answered before the generic paths, whose slot reads would take this
+    // receiver's endianness flag for a kind tag (that is the `kind 0` in the
+    // refusal `RJdkForeign.layoutVarHandles` used to raise).
+    if let Some(shape) = p67_segment_vh_shape(ctx, vh) {
+        return (
+            VH_KIND_MEMORY_SEGMENT_LAYOUT,
+            layout_vh_carrier_desc(shape.carrier).to_string(),
+            layout_vh_coordinates(shape),
+            true,
+        );
+    }
     let meta = vh_meta_get(ctx, vh);
     // A real-JDK array handle has no side-table entry and its slots belong to
     // the real class, so the fallbacks below would read `vform` as a kind tag.
@@ -2190,7 +3225,12 @@ fn vh_class_list(ctx: &mut dyn NativeContext, descs: &[String]) -> Option<Value>
 /// types (see [`real_array_var_handle_descriptors`]), and an answer read off
 /// the object is not a fabrication.
 fn vh_meta_is_authoritative(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
-    vh_meta_get(ctx, vh).is_some() || real_array_var_handle_descriptors(ctx, vh).is_some()
+    // The FFM layout table is a third source of truth, and a recorded one: the
+    // carrier comes from the layout the handle was minted from, not from a
+    // guess about the receiver's slots.
+    p67_segment_vh_shape(ctx, vh).is_some()
+        || vh_meta_get(ctx, vh).is_some()
+        || real_array_var_handle_descriptors(ctx, vh).is_some()
 }
 
 fn varhandle_var_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2887,7 +3927,13 @@ fn segment_vh_get(
             })?,
         };
         let raw = if be { seg_swap_bytes(raw, width) } else { raw };
-        Ok(Some(box_value(
+        // CANONICAL — same measurement as `layout_vh_get`: an FFM
+        // `MemorySegment` read handed back through a `VarHandle` is
+        // `X.valueOf`-boxed on HotSpot. `seg_decode_value` and
+        // `seg_shape_desc` switch on the same `SegShape`, so the variant and
+        // the descriptor agree (including `Address`, which is `Value::Long`
+        // and `"J"` in both).
+        Ok(Some(box_value_canonical(
             ctx,
             seg_decode_value(shape, raw),
             seg_shape_desc(shape),
@@ -3047,7 +4093,34 @@ fn vh_box_access_result(
         return Ok(Some(value));
     }
     let desc = vh_access_value_desc(ctx, args);
-    Ok(Some(box_value(ctx, value, &desc)))
+    // Widen BEFORE boxing, exactly as `varhandle_get`'s three field arms and
+    // `Field.get` do. This `let` SHADOWS the binding twelve lines up, after
+    // the `matches!(value, Value::Object(_))` early return has already
+    // excluded references — so the coercion only ever sees a primitive, which
+    // is its contract.
+    let value = crate::lang_class::coerce_reflective_field_value(value, &desc);
+    // CANONICAL — measured `vh.getAndSetInt` = true and
+    // `vh.compareAndExchangeInt` = true: the value a read-modify-write mode
+    // HANDS BACK is `X.valueOf`-boxed on HotSpot, exactly like a plain `get`.
+    //
+    // The variant guard inside `box_value_canonical` matters HERE more than
+    // anywhere else in this file: `desc` comes from `vh_access_value_desc`,
+    // which resolves the VARIABLE's declared descriptor, while `value` came
+    // from whatever the access mode computed. A `("J", Value::Int)` pair is
+    // therefore reachable, and the helper answers it by falling back to
+    // `box_value` — i.e. today's behaviour verbatim, never a cached
+    // `Long.valueOf(0)`. `vh_access_value_desc`'s own `DESC_REF` fallback is
+    // likewise untouched: a reference descriptor is not one of the six arms.
+    //
+    // F19-1 N3 scoped the missing `coerce_reflective_field_value` to
+    // `varhandle_get`'s three field arms. MEASURED (`VhLong.java`),
+    // `vh.getAndSetLong` hands back the old value **5** as a canonical
+    // `Long` — so this funnel is a FOURTH member of that set, not a bystander:
+    // the same `("J", Value::Int(5))` slot reaches it through `getAndSet` and
+    // came out as a `Long` wrapper carrying compact-Int bits. The coercion
+    // above closes it, and it is the member a fix that reads only
+    // `varhandle_get` leaves behind — three of four looks complete.
+    Ok(Some(box_value_canonical(ctx, value, &desc)))
 }
 
 /// VarHandle.get(receiver) → value
@@ -3062,6 +4135,18 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         if let Some(result) = segment_vh_get(ctx, this, args) {
             return result;
         }
+    }
+    // An FFM LAYOUT handle (`ValueLayout.JAVA_INT.varHandle()`,
+    // `layout.varHandle(PathElement...)`) is a synthetic receiver whose meaning
+    // lives only in the shape table, so it must be answered before the slot
+    // reads below — which would take slot 0 (its endianness flag) for a kind
+    // tag and route the access to the instance-field arm, where it silently
+    // did nothing.
+    if let Some(shape) = p67_segment_vh_shape(ctx, this) {
+        // `layout_vh_get`, not `segment_vh_get`: the latter takes the real
+        // `SegmentVarHandle` receiver handled above, this one takes the shape.
+        // The `set` twin twelve lines below already had it right.
+        return layout_vh_get(ctx, shape, args);
     }
     // Round-7 HIGH-2 fix: fetch the side-table meta exactly once and reuse
     // the bound Arc for `kind`/`field_index`/`class_name`/`field_name`/
@@ -3083,7 +4168,10 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         };
         let idx = byte_view_check_index(ctx, arr, index, elem)?;
         let value = byte_view_get(ctx, arr, idx, elem, le);
-        return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
+        // CANONICAL — measured `vh.byteViewInt` = true and `vh.byteViewLong`
+        // = true. `byte_view_get` and `byte_view_desc` switch on the same
+        // `elem`, so variant and descriptor agree.
+        return Ok(Some(box_value_canonical(ctx, value, byte_view_desc(elem))));
     }
     if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
         let bb = match args.get(1) {
@@ -3096,7 +4184,13 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         };
         let idx = byte_buffer_view_check_index(ctx, bb, index, elem)?;
         let value = byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None));
-        return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
+        // CANONICAL — the `ByteBuffer` twin of the `byte[]` view above; same
+        // measurement. Note the `unwrap_or(Value::Object(None))` on the line
+        // before: on a failed read the pair is `(desc, Value::Object(None))`,
+        // which matches none of the six cached arms, so it falls back to
+        // `box_value` and keeps that (pre-existing, separately nominated)
+        // shape byte-for-byte rather than caching a null-carrying wrapper.
+        return Ok(Some(box_value_canonical(ctx, value, byte_view_desc(elem))));
     }
     // C38: Array-element VarHandle call — detected by args[1] being an array
     // and args[2] being an Int. Handles real-JDK VarHandleLongs$Array and the
@@ -3109,7 +4203,14 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         let idx = vh_array_index(ctx, arr, idx)?;
         let desc = array_element_desc(ctx, arr);
         let value = ctx.get_array_element(arr, idx);
-        return Ok(Some(box_value(ctx, value, desc)));
+        // CANONICAL — measured `vh.arrInt` / `arrChar` / `arrBool` / `arrLong`
+        // = true. NOTE the contrast this must not be "unified" with:
+        // `java.lang.reflect.Array.get` on the SAME `int[]` is FRESH on both
+        // VMs (`array.int` = false, and `array.selfid` = false — it is not
+        // even identical to itself). Two reads of one array element, two
+        // different contracts, because `Array.get` is `Reflection::array_get`
+        // -> `create()` while a `VarHandle` gets a `valueOf`-shaped adapter.
+        return Ok(Some(box_value_canonical(ctx, value, desc)));
     }
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
@@ -3138,8 +4239,51 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 None => vh_type_desc(ctx, this),
             };
             if field_idx >= 0 {
-                let val = ctx.get_field(receiver, field_idx as usize);
-                Ok(Some(box_value(ctx, val, &td)))
+                let val = crate::lang_class::coerce_reflective_field_value(
+                    ctx.get_field(receiver, field_idx as usize),
+                    &td,
+                );
+                // CANONICAL — measured `vh.fieldInt` / `fieldChar` /
+                // `fieldBool` / `fieldLong` / `fieldByte` / `fieldShort` =
+                // true, and `vh.fieldBoolTRUE` = true (a `boolean` field read
+                // through a VarHandle IS `Boolean.TRUE`, not a look-alike).
+                //
+                // `ctx.get_field` returns the RAW slot, which for a `long`
+                // field can present as a compact `Value::Int` — which is why
+                // the read is wrapped in `coerce_reflective_field_value`, the
+                // SAME function `Field.get` uses. Without it this arm produced
+                // a `Long` wrapper whose slot 0 held raw compact-`Int` bits: a
+                // wrong ANSWER, not merely a non-canonical one, and one the
+                // helper's variant guard could only downgrade to a fresh box
+                // rather than repair.
+                //
+                // F19-1 §5.5 listed `vh.fieldLong`'s HotSpot verdict as
+                // **unknown**. It is now MEASURED on OpenJDK 25.0.3+9
+                // (`VhLong.java`, identical under `-Xint`), and the direction
+                // is the same as `Field.get`'s — widen FIRST, then box
+                // canonically, not the reverse:
+                //
+                //   vh.fieldLong      = java.lang.Long, value 5,  id true
+                //   vh.fieldLongZero  = value 0,                  id true
+                //   vh.fieldDouble    = java.lang.Double, 1.5,    id FALSE
+                //   vh.getAndSetLong  = old value 5,              id true
+                //   field.long        = value 5,                  id true
+                //
+                // The fix is `coerce_reflective_field_value` at this arm,
+                // at the by-name arm below, at `VH_KIND_STATIC` (whose
+                // `get_static_field` is equally raw), and at
+                // `vh_box_access_result` — which the `getAndSet` row above
+                // puts inside the family rather than beside it. All FOUR are
+                // applied; three of them would have looked like the whole set.
+                // `Double` is NOT an identity row (id false) but IS a value
+                // row: a `double` slot carrying raw bits as a `Value::Long`
+                // must be REINTERPRETED, which is the arm this file's own
+                // `widen_primitive_to_descriptor` would get WRONG — it
+                // converts numerically, so `1.5` comes back as `4.609e18`.
+                // One rule, one implementation, and it is `lang_class`'s;
+                // substituting the local widener here is a silent wrong
+                // answer, not a shortcut.
+                Ok(Some(box_value_canonical(ctx, val, &td)))
             } else {
                 // Resolve by name (reuse the meta Arc we already hold).
                 let (class, field) = match meta.as_deref() {
@@ -3154,9 +4298,22 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                         // Cache for next time
                         ctx.set_field(this, VH_FIELD_INDEX, Value::Int(idx as i32));
                         vh_meta_update_field_index(ctx, this, idx as i32);
-                        let val = ctx.get_field(receiver, idx);
-                        // Reuse already-computed type descriptor.
-                        Ok(Some(box_value(ctx, val, &td)))
+                        // Widened through the SAME function as the
+                        // `field_idx >= 0` arm above: a VarHandle that
+                        // resolved late must not answer differently from one
+                        // that resolved early, in the value any more than in
+                        // the identity.
+                        let val = crate::lang_class::coerce_reflective_field_value(
+                            ctx.get_field(receiver, idx),
+                            &td,
+                        );
+                        // Reuse already-computed type descriptor. CANONICAL,
+                        // for the same measurement as the `field_idx >= 0`
+                        // arm twenty lines up — this is the same read after a
+                        // by-name resolve, and a VarHandle that happened to
+                        // resolve late must not answer with a different
+                        // identity than one that resolved early.
+                        Ok(Some(box_value_canonical(ctx, val, &td)))
                     }
                     None => Ok(Some(Value::Object(None))),
                 }
@@ -3170,7 +4327,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                     vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
                 ),
             };
-            let val = match vh_static_slot(ctx, &class, &field) {
+            let raw = match vh_static_slot(ctx, &class, &field) {
                 Some((cid, sidx)) => ctx.get_static_field(cid, sidx),
                 None => return Ok(Some(Value::Object(None))),
             };
@@ -3178,7 +4335,20 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 Some(m) => vh_type_desc_from_meta(m),
                 None => vh_type_desc(ctx, this),
             };
-            Ok(Some(box_value(ctx, val, &td)))
+            // Widen BEFORE boxing, and therefore after `td` — the read above
+            // is deliberately named `raw`, because that is what
+            // `get_static_field` hands back.
+            let val = crate::lang_class::coerce_reflective_field_value(raw, &td);
+            // CANONICAL — measured `vh.staticInt` = true. The out-of-bound
+            // twin is measured too and is the arm the helper delegates:
+            // `vhoob.staticInt1000` = false.
+            //
+            // `get_static_field` is as raw as `get_field`, so this arm is a
+            // member of the widening set — see the block on the
+            // `VH_KIND_INSTANCE` arm above for the measurement and for why
+            // this file's own `widen_primitive_to_descriptor` is the wrong
+            // function for it.
+            Ok(Some(box_value_canonical(ctx, val, &td)))
         }
         VH_KIND_ARRAY => {
             // args = [vh, array, index]
@@ -3198,7 +4368,12 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // `Int`, i.e. exactly the shape a partial fix would leave behind.
             let value = ctx.get_array_element(arr, idx);
             let desc = array_element_desc(ctx, arr);
-            Ok(Some(box_value(ctx, value, desc)))
+            // CANONICAL, for the same measurement as the `vh_array_call` fast
+            // path above. Switched even though the comment above says this
+            // branch is normally shadowed: an arm that is reachable only in
+            // the shape a partial fix leaves behind is exactly the arm that
+            // must not disagree with its twin.
+            Ok(Some(box_value_canonical(ctx, value, desc)))
         }
         _ => Ok(Some(Value::Object(None))),
     }
@@ -3214,6 +4389,11 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         if let Some(result) = segment_vh_set(ctx, this, args) {
             return result;
         }
+    }
+    // FFM layout handle — see the matching check in `varhandle_get` for what
+    // fell through here before (a silently dropped write).
+    if let Some(shape) = p67_segment_vh_shape(ctx, this) {
+        return layout_vh_set(ctx, shape, args);
     }
     // Round-7 HIGH-2 fix: bind the Arc once and reuse for kind / field_index
     // / class+field lookups instead of re-locking `vh_meta_table` each branch.
@@ -6678,6 +7858,21 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     // strict `explicitCastArgumentsChecks` that rejects synthetic handles whose
     // MethodType doesn't match the JDK form (WrongMethodTypeException). STATIC:
     // args[0]=target MH, args[1]=newType.
+    //
+    // G31 — **ARITY ONLY, and that is the whole finding.** It is tempting to
+    // reuse `asType`'s convertibility predicate here because the two methods
+    // sit beside each other in `MethodHandles` and read alike. MEASURED on
+    // HotSpot 25.0.3+9 over the same 613-cell sweep that produced `asType`'s
+    // matrices: `explicitCastArguments` accepts **every** type pair in both the
+    // return and the parameter position — `String -> boolean`, `double -> char`,
+    // `int[] -> long`, all of them — because it inserts an explicit cast (a
+    // primitive narrowing, an unbox-or-zero, a checked reference cast) instead
+    // of demanding the conversion be lossless. Its only refusal is a parameter
+    // COUNT mismatch. Applying `asType`'s rule here would refuse 248 pairs
+    // HotSpot performs.
+    //
+    // The message is its own, transcribed: `cannot explicitly cast
+    // MethodHandle(int)void to ()void` — "explicitly cast", not "convert".
     r.register(
         "java/lang/invoke/MethodHandles",
         "explicitCastArguments",
@@ -6686,7 +7881,11 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             if let (Some(Value::Object(Some(t))), Some(Value::Object(Some(mt)))) =
                 (args.first(), args.get(1))
             {
-                ctx.set_field_by_name(*t, "type", Value::Object(Some(*mt)));
+                let (t, mt) = (*t, *mt);
+                if let Some(refusal) = mh_explicit_cast_refusal(ctx, t, mt) {
+                    return Err(refusal);
+                }
+                ctx.set_field_by_name(t, "type", Value::Object(Some(mt)));
             }
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
@@ -8441,9 +9640,16 @@ fn box_direct_primitive_return(
     ) {
         return result;
     }
+    // CANONICAL — this is MethodHandle return adaptation, and HotSpot's
+    // `asType` inserts a `valueOf` handle for the primitive->Object step.
+    // Measured: `mh.asTypeInt` / `asTypeChar` / `asTypeBool` / `asTypeLong` /
+    // `asTypeByte` / `asTypeShort` = true, and `mh.invokeAsObject` = true.
+    // `ret_desc` was just narrowed to the eight primitive descriptors, and it
+    // is the DECLARED return type of the target while `v` is what dispatch
+    // produced, so the helper's variant guard is load-bearing here too.
     match result {
         Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
-        Ok(Some(v)) => Ok(Some(box_value(ctx, v, ret_desc))),
+        Ok(Some(v)) => Ok(Some(box_value_canonical(ctx, v, ret_desc))),
         other => other,
     }
 }
@@ -8560,13 +9766,17 @@ pub(crate) fn mh_dispatch(
     mh: cratonvm_types::ObjectRef,
     extra_args: &[Value],
 ) -> MethodCallResult {
-    // A real-JDK guard/invoker adapter can ultimately target a synthetic
-    // foreign downcall. Those compact handles store the function address in
-    // field 0 rather than the MethodHandle metadata slots, so dispatch them
-    // directly before trying to decode the generic MethodHandle layout.
-    if ctx.class_name_arc_of_id(ctx.class_id_of_object(mh)).as_deref()
-        == Some("java/lang/foreign/DowncallHandle")
-    {
+    // A real-JDK guard/invoker adapter can ultimately target a foreign
+    // downcall. Its downcall state lives above the MethodHandle metadata
+    // slots, so dispatch it directly rather than decoding the generic layout.
+    //
+    // This used to test the receiver's class name against
+    // `java/lang/foreign/DowncallHandle` — an invented class no image declares,
+    // which `--jdk-only` therefore refused, killing all of FFM (P1-E). The
+    // carrier is now a real `java/lang/invoke/MethodHandle`, so the question
+    // is no longer "what class is this" but "is this handle's state downcall
+    // state", which is what `is_downcall_handle` answers.
+    if crate::panama::is_downcall_handle(ctx, mh) {
         if crate::nbflags().dbg_mh_dispatch {
             let arg_slots: Vec<Value> = extra_args
                 .iter()
@@ -9272,13 +10482,23 @@ pub(crate) fn mh_dispatch(
                     // `int`s in its `Object[] args` and Groovy's
                     // `args[0].getClass()` (Selector.setGuards) dereferences a
                     // raw int as an object → NPE.
-                    match v {
-                        Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
-                        Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
-                        Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
-                        Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
-                        other => other,
-                    }
+                    //
+                    // CANONICAL for `I`/`J` — measured `mhcoll.int` /
+                    // `mhcoll.long` / `mhvar.int` = true. Out of bound is
+                    // measured and needs no arm of its own:
+                    // `mhcolloob.int1000` = false, which is what the `valueOf`
+                    // native's own uncached path already produces.
+                    //
+                    // The wrapper CLASS comes from `comp` when `comp` settles
+                    // it (`Character[]` -> `Character`, MEASURED, and HotSpot
+                    // refuses every other static argument type for that
+                    // collector) and from the `Value` variant otherwise, which
+                    // is a KNOWN wrong answer for `char`/`boolean`/`byte`/
+                    // `short` in the ordinary `Object[]` case. Both halves,
+                    // the measurement that separates them and the nomination
+                    // that would close the second are on
+                    // `collector_element_box_desc`.
+                    box_collector_element(ctx, v, &comp)
                 } else {
                     // The mirror image, for the same reason: a primitive
                     // collector's element slot is raw, and an argument that
@@ -10293,13 +11513,16 @@ fn build_varargs_array(
             let pin = ctx.pin_native_root(arr);
             let mut arr = arr;
             for (i, v) in vals.iter().enumerate() {
-                let ov = match *v {
-                    Value::Int(_) => crate::lang_class::box_value(ctx, *v, "I"),
-                    Value::Long(_) => crate::lang_class::box_value(ctx, *v, "J"),
-                    Value::Float(_) => crate::lang_class::box_value(ctx, *v, "F"),
-                    Value::Double(_) => crate::lang_class::box_value(ctx, *v, "D"),
-                    other => other,
-                };
+                // The varargs twin of `mh_dispatch`'s collector loop, and now
+                // literally the same function rather than a copy of it — the
+                // two arms disagreeing is the shape that produced this
+                // family's defects. `component` here is the TARGET's trailing
+                // array component, so `vChar(Character...)` settles the
+                // wrapper class the same way `asCollector(Character[], 1)`
+                // does: MEASURED `H.vChar.fromChar` = `java.lang.Character`,
+                // `H.vChar.id` = true, and `H.vLong.fromInt` throws on
+                // HotSpot rather than widening. Measured `mhvar.int` = true.
+                let ov = box_collector_element(ctx, *v, component);
                 arr = ctx.read_native_pin(pin, arr);
                 ctx.set_array_element(arr, i, ov);
             }
@@ -10329,9 +11552,15 @@ fn auto_box_return(
 ) -> MethodCallResult {
     let ret_desc = return_type_desc(desc);
     match ret_desc {
+        // CANONICAL — this is the signature-polymorphic `invoke` /
+        // `invokeWithArguments` return path. Measured
+        // `mh.invokeWithArgsInt` / `Char` / `Long` = true and
+        // `mh.invokeAsObject` = true; `mhnc.asTypeFloat` = false and
+        // `mhoob.asTypeInt1000` = false are the two arms
+        // `box_value_canonical` delegates back to `box_value` itself.
         "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C" => match result {
             Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
-            Ok(Some(val)) => Ok(Some(box_value(ctx, val, ret_desc))),
+            Ok(Some(val)) => Ok(Some(box_value_canonical(ctx, val, ret_desc))),
             other => other,
         },
         "V" => match result {
@@ -10735,29 +11964,79 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // MethodType into the `type` field so subsequent JDK-internal reads of
     // `mh.type()` / `parameterSlotCount` reflect the adapted signature.
     // invoke()/invokeExact handle the actual argument coercions.
+    //
+    // G31: and REFUSE the conversions HotSpot refuses, which this body did not
+    // do at all. See [`mh_can_convert`] for the transcribed rule and the sweep
+    // it was checked against. Two things about the shape of the refusal here:
+    //
+    // **It is gated on both descriptors, and on a REAL `MethodType` receiver.**
+    // The check only runs when the handle's `type` field holds a MethodType
+    // this file can turn back into a descriptor and the requested MethodType
+    // does too. A handle whose type is the `MH_DESC` fallback is left alone:
+    // that descriptor is the raw bytecode signature, not the adapted one, and
+    // refusing on it would refuse conversions HotSpot allows.
+    //
+    // **It never refuses where the divergence is OURS.** HotSpot's `asType`
+    // returns a NEW handle and leaves the receiver's `type()` untouched
+    // (MEASURED: `identity(int).asType((int)long)` answers `(int)long` while
+    // the receiver still answers `(int)int`, and the two are different
+    // objects). This body has always had ONE object, so a second `asType` on
+    // the same reference sees the FIRST one's adapted type where HotSpot would
+    // still see the original. Adding a check on top of that aliasing would
+    // manufacture refusals HotSpot never issues, so a conversion that the raw
+    // `MH_DESC` signature would have allowed is accepted even when the mutated
+    // `type` field forbids it. That is a deliberate UNDER-refusal in exactly
+    // the cases the aliasing creates, and it cannot turn an accept into a
+    // refusal. Collapsing the aliasing (minting a real second handle) is
+    // NOMINATED in G31-1, not done here: it would have to reproduce every
+    // synthetic dispatch slot of an arbitrary handle kind, and this lane could
+    // not build the VM to find out what that breaks.
     r.register(
         mh,
         "asType",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            // Panama downcalls use a compact synthetic layout whose field 0 is
-            // the native function address. Their MethodHandle type is derived
-            // from the FunctionDescriptor, so assigning the inherited real-JDK
-            // type field here would overwrite that address and turn a later
-            // void invokeExact into a silent no-op.
+            // A Panama downcall's dispatch reads its `FunctionDescriptor`, not
+            // its `type` field, so `asType` stays a passthrough for one.
+            //
+            // The refusal this guard used to be written against is gone: it
+            // tested for the invented class `java/lang/foreign/DowncallHandle`
+            // and existed because assigning `type` would have overwritten the
+            // function address that class kept in field 0. The carrier is now a
+            // real `MethodHandle` whose slot 0 IS the real `type` field, so
+            // that write would be correct rather than destructive — but the
+            // passthrough is still right, and cheaper.
             if let Some(Value::Object(Some(this))) = args.first() {
-                if ctx
-                    .class_name_arc_of_id(ctx.class_id_of_object(*this))
-                    .as_deref()
-                    == Some("java/lang/foreign/DowncallHandle")
-                {
+                if crate::panama::is_downcall_handle(ctx, *this) {
                     return Ok(Some(args[0]));
                 }
+            }
+            // `asType(null)`. MEASURED on HotSpot 25.0.3+9, transcribed rather
+            // than composed — it is the helpful-NPE text for the first field
+            // read `asTypeUncached` performs on `newType`:
+            //   java.lang.NullPointerException: Cannot invoke
+            //   "java.lang.invoke.MethodType.form()" because "newType" is null
+            // This body used to hand the receiver straight back for a null
+            // argument, which is the silent-lie shape: a caller asking for an
+            // adaptation it did not describe got an unadapted handle.
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(
+                        "Cannot invoke \"java.lang.invoke.MethodType.form()\" because \
+                         \"newType\" is null"
+                            .to_string(),
+                    ),
+                }
+                .into());
             }
             if let (Some(Value::Object(Some(this))), Some(Value::Object(Some(mt)))) =
                 (args.first(), args.get(1))
             {
-                ctx.set_field_by_name(*this, "type", Value::Object(Some(*mt)));
+                let (this, mt) = (*this, *mt);
+                if let Some(refusal) = mh_astype_refusal(ctx, this, mt) {
+                    return Err(refusal);
+                }
+                ctx.set_field_by_name(this, "type", Value::Object(Some(mt)));
             }
             Ok(Some(args[0]))
         },
@@ -12577,6 +13856,30 @@ pub(crate) fn native_mhn_get_member_vm_info(
     let arr_pin = ctx.pin_native_root(arr);
     let member_name_pin = ctx.pin_native_root(member_name);
     let field_target_pin = field_target.map(|t| (ctx.pin_native_root(t), t));
+    // WIDTH is `J`, not `I`: `MemberName$Factory.resolve`'s assertion casts
+    // slot 0 to `Long`, which is the bug the comment block above records. That
+    // half of this line is settled and must not be reverted to `Value::Int`.
+    //
+    // ALLOCATOR is `box_value`, i.e. FRESH, and NOT the cached sibling every
+    // other boxing site in this file was switched to. That half is a separate,
+    // separately-checked decision and it survives the width fix unchanged:
+    //
+    // This is the one site here whose HotSpot counterpart is not a `valueOf`
+    // adapter. `MethodHandleNatives.getMemberVMInfo` is a VM native that fills
+    // an `Object[]` with `java_lang_boxing_object::create`-shaped values, the
+    // same allocator `Reflection::array_get` uses — and `Array.get` is
+    // measured FRESH on both VMs (`array.int` = false, `array.selfid` = false).
+    // The slot is JDK-internal plumbing that no Java code identity-compares,
+    // so there is no observable to conform to and no reason to put a
+    // per-`reported_index` entry into a process-global cache. (The `Long`
+    // cache is also the narrower of the two — `-128..=127` — so a `vmindex`
+    // outside that window would not be shared anyway.)
+    //
+    // If a later lane "finishes the job" by switching this to the cached
+    // sibling, the thing it will have changed is which of two
+    // indistinguishable objects a JDK internal receives — and the thing it
+    // will have lost is the annotation saying the difference was checked.
+    // Leave it.
     let boxed = crate::lang_class::box_value(ctx, Value::Long(reported_index), "J");
     let arr = ctx.read_native_pin(arr_pin, arr);
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
@@ -12816,6 +14119,255 @@ mod tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
 
+    // -----------------------------------------------------------------------
+    // F29 — the collector element's WRAPPER CLASS
+    //
+    // `collector_element_box_desc` is a pure function of (component
+    // descriptor, `Value` variant), so it is tested as one: no mock, no VM, no
+    // slot table. Every row below is a MEASURED HotSpot 25.0.3+9 observable
+    // from `CollBox.java` / `CollBox2.java`, named in the assertion message so
+    // a future reader can re-run the row rather than re-derive it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_wrapper_typed_component_settles_the_element_class() {
+        // MEASURED: G.CharacterComp.fromChar = java.lang.Character
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", Value::Int(97)),
+            Some("C")
+        );
+        // MEASURED: G.BooleanComp.fromBool / ByteComp / ShortComp / IntegerComp
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Boolean;", Value::Int(1)),
+            Some("Z")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Byte;", Value::Int(3)),
+            Some("B")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Short;", Value::Int(9)),
+            Some("S")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Integer;", Value::Int(7)),
+            Some("I")
+        );
+        // MEASURED: G.LongComp.fromLong = java.lang.Long, G.LongComp.id = true
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Long;", Value::Long(5)),
+            Some("J")
+        );
+        // MEASURED: G.FloatComp.fromFloat = java.lang.Float, and
+        // G.FloatComp.id = FALSE — the class is settled, the identity is not.
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Float;", Value::Float(1.5)),
+            Some("F")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Double;", Value::Double(1.5)),
+            Some("D")
+        );
+    }
+
+    /// The negative control, and it is the important half: an `Object[]`
+    /// collector must NOT be answered from the component, because HotSpot
+    /// answers it from the CALL SITE and this arm cannot see one.
+    /// MEASURED: `coll.type()` = `(Object)Object` while `coll.invoke(aChar)`
+    /// is a `Character` and `coll.invoke(anInt)` an `Integer`.
+    #[test]
+    fn a_non_wrapper_component_settles_nothing() {
+        for comp in [
+            "Ljava/lang/Object;",
+            "Ljava/lang/Number;",
+            "Ljava/lang/Comparable;",
+            "Ljava/lang/String;",
+            "Ljava/io/Serializable;",
+            "[I",
+            "",
+        ] {
+            assert_eq!(
+                collector_element_box_desc(comp, Value::Int(97)),
+                None,
+                "{comp} must fall back to the Value variant, not invent a wrapper"
+            );
+        }
+        // MEASURED: C.componentNumber.fromInt = java.lang.Integer, i.e. the
+        // fallback's answer is already right for `Number[]` from an `int`;
+        // C.componentNumber.fromChar THROWS on HotSpot, so there is no row
+        // this `None` gets wrong.
+    }
+
+    /// The variant guard. `("Ljava/lang/Long;", Value::Int(5))` routed on the
+    /// descriptor alone reaches `native_long_value_of`, which reads
+    /// `Some(Value::Long(v))` and defaults to **0** — an identity fix turned
+    /// into a wrong answer. HotSpot never accepts that pair either
+    /// (MEASURED: `G.LongComp.fromInt` throws `WrongMethodTypeException`), so
+    /// declining costs nothing.
+    #[test]
+    fn the_component_is_not_trusted_against_a_mismatched_value_variant() {
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Long;", Value::Int(5)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Integer;", Value::Long(7)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", Value::Long(97)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Float;", Value::Double(1.5)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Double;", Value::Float(1.5)),
+            None
+        );
+        // A reference element travelling through a wrapper-typed collector —
+        // already boxed by the caller — must be left alone, not re-boxed.
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", Value::Object(None)),
+            None
+        );
+    }
+
+    /// `char` and `int` are the same `Value::Int` and must still separate on
+    /// the component. This is the single row that fails if a later edit
+    /// "simplifies" the helper back to a variant-only match — which is exactly
+    /// the state this lane found.
+    #[test]
+    fn char_and_int_separate_on_the_component_though_the_variant_cannot() {
+        let same_bits = Value::Int(97);
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", same_bits),
+            Some("C")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Integer;", same_bits),
+            Some("I")
+        );
+        assert_ne!(
+            collector_element_box_desc("Ljava/lang/Character;", same_bits),
+            collector_element_box_desc("Ljava/lang/Integer;", same_bits)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F39 — the VarHandle field path's widener
+    //
+    // MEASURED on OpenJDK 25.0.3+9 (`scratchpad/f29/VhLong.java`, identical
+    // under `-Xint`):
+    //
+    //   vh.fieldLong     = java.lang.Long,   value 5,   id true
+    //   vh.getAndSetLong = java.lang.Long,   value 5,   id true
+    //   vh.fieldDouble   = java.lang.Double, value 1.5, id FALSE
+    //
+    // so the direction is `Field.get`'s: widen FIRST, box canonically second.
+    // Both tests below are about the FUNCTION CHOICE, which is the half of
+    // this fix that a behavioural test cannot see — every wrong answer here is
+    // still a `Double` of the right class, and `vh.fieldDouble` is not even an
+    // identity row.
+    // -----------------------------------------------------------------------
+
+    /// The two wideners are NOT interchangeable, and that is the whole reason
+    /// the four arms reach into `lang_class` rather than call the local one
+    /// already in scope. Pure functions on both sides — no mock, no VM, no
+    /// slot table, so nothing here can measure the mock instead of the rule.
+    #[test]
+    fn the_field_widener_reinterprets_where_the_local_one_converts() {
+        // The raw slot of a `double` field holding 1.5, exactly as
+        // `ctx.get_field` hands it back: the IEEE-754 bit pattern, carried in
+        // a `Value::Long`. Decimal, for a reader checking by hand:
+        // 4_609_434_218_613_702_656.
+        let bits = Value::Long(1.5f64.to_bits() as i64);
+
+        // MEASURED: vh.fieldDouble.value = 1.5. The `1.5` here is a literal,
+        // not a restatement of the implementation — this assertion is the one
+        // that fails if the field path is ever "unified" onto the numeric
+        // widener.
+        assert_eq!(
+            crate::lang_class::coerce_reflective_field_value(bits, DESC_DOUBLE),
+            Value::Double(1.5),
+            "the field path must REINTERPRET the slot's bits, not convert them"
+        );
+        // The local one converts NUMERICALLY, which is correct where it is
+        // used (a collector element really is a number being widened) and
+        // catastrophic on a field read: 1.5 comes back as ~4.609e18.
+        assert_eq!(
+            widen_primitive_to_descriptor(bits, DESC_DOUBLE),
+            Value::Double(1.5f64.to_bits() as i64 as f64)
+        );
+        // Same input, same descriptor, two different answers. Anyone
+        // collapsing the two functions has to delete this line to do it.
+        assert_ne!(
+            crate::lang_class::coerce_reflective_field_value(bits, DESC_DOUBLE),
+            widen_primitive_to_descriptor(bits, DESC_DOUBLE)
+        );
+        // The `J` arm — a `long` field holding 5 whose slot presents as a
+        // compact `Value::Int` — is where the two AGREE. It is included so
+        // the `D` row above cannot be read as "the two functions differ
+        // everywhere", which would make the choice look arbitrary rather than
+        // forced.
+        assert_eq!(
+            crate::lang_class::coerce_reflective_field_value(Value::Int(5), DESC_LONG),
+            Value::Long(5)
+        );
+        assert_eq!(
+            widen_primitive_to_descriptor(Value::Int(5), DESC_LONG),
+            Value::Long(5)
+        );
+    }
+
+    /// A SOURCE WITNESS for the call sites, because the set is **four** and
+    /// three of them look like the whole set — F19-1 N3 scoped this fix to
+    /// `varhandle_get`'s three field arms, and `vh_box_access_result` (the RMW
+    /// funnel, measured by `vh.getAndSetLong`) is the fourth. No behavioural
+    /// test in this module can stand in: `MockNativeContext`'s slots are not
+    /// the VM's, and the test above proves the FUNCTION is right whether or
+    /// not anything calls it.
+    ///
+    /// Needles are assembled with `format!` at runtime: spelled as literals
+    /// they would match this test's own source text, since the file being
+    /// searched IS this file. Whitespace is stripped so a rustfmt re-wrap
+    /// cannot break them.
+    #[test]
+    fn all_four_varhandle_read_arms_widen_before_boxing() {
+        let src = include_str!("lang_invoke.rs");
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let widen = format!("crate::lang_class::coerce_reflective_field_{}", "value");
+        for (needle, why) in [
+            (
+                format!("letval={widen}(ctx.get_field(receiver,field_idxasusize),&td,)"),
+                "varhandle_get's VH_KIND_INSTANCE by-index arm no longer \
+                 widens, so a `long` field holding 5 boxes to a `Long` \
+                 carrying compact-Int bits (measured: vh.fieldLong.value = 5)",
+            ),
+            (
+                format!("letval={widen}(ctx.get_field(receiver,idx),&td,)"),
+                "varhandle_get's by-NAME arm no longer widens — the same read \
+                 after a late resolve, which must not answer differently from \
+                 one that resolved early",
+            ),
+            (
+                format!("letval={widen}(raw,&td);"),
+                "VH_KIND_STATIC no longer widens; `get_static_field` is as raw \
+                 as `get_field` and this arm is not a bystander",
+            ),
+            (
+                format!("letvalue={widen}(value,&desc);"),
+                "vh_box_access_result — the RMW funnel — no longer widens. \
+                 This is the arm F19-1 N3 missed: measured, vh.getAndSetLong \
+                 hands back the old value 5 as a canonical Long, so the same \
+                 raw slot reaches this funnel through getAndSet",
+            ),
+        ] {
+            assert!(squashed.contains(&needle), "{why} (`{needle}` is gone)");
+        }
+    }
+
     // MH_KIND_DROP dispatch must trim the dynamic args using the EXACT
     // `pos:count` encoded at construction time (see MH_KIND_RETURN_FILTER's
     // sibling doc comment on `make_drop_arguments_adapter` for the full
@@ -12999,7 +14551,12 @@ mod tests {
     #[test]
     fn auto_box_return_preserves_already_boxed_primitive_result() {
         let mut ctx = MockNativeContext::new();
-        let boxed = match box_value(&mut ctx, Value::Int(0), "Z") {
+        // The FRESH helper on purpose, and spelled in full because this file
+        // no longer imports it. `box_value_canonical("Z", 0)` would hand back
+        // the shared `Boolean.FALSE` instance, which is process-global and
+        // keyed by `vm_identity()` — a fixture this test then writes slot 0 of
+        // would be mutating an object other tests in this binary also hold.
+        let boxed = match crate::lang_class::box_value(&mut ctx, Value::Int(0), "Z") {
             Value::Object(Some(obj)) => obj,
             other => panic!("expected boxed Boolean fixture, got {:?}", other),
         };
@@ -13385,7 +14942,17 @@ mod tests {
     fn p67_memory_segment_varhandle_access_mode_type_uses_segment_and_offset_coordinates() {
         let mut ctx = MockNativeContext::new();
         let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3).unwrap();
-        register_p67_memory_segment_var_handle(&mut ctx, vh, 4);
+        register_p67_memory_segment_var_handle(
+            &mut ctx,
+            vh,
+            SegmentVhShape {
+                width: 4,
+                carrier: b'I',
+                little_endian: true,
+                base_offset: 0,
+                stride: 0,
+            },
+        );
 
         let access_type =
             try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2).unwrap();
@@ -13419,6 +14986,44 @@ mod tests {
         assert_eq!(
             descriptor_from_method_type(&ctx, set_mt),
             "(Ljava/lang/foreign/MemorySegment;JI)V"
+        );
+    }
+
+    /// A `sequenceElement()` path adds a `long` INDEX coordinate, and the
+    /// carrier — not the width — decides the value type: a `JAVA_FLOAT` handle
+    /// is four bytes wide and types as `float`.
+    #[test]
+    fn p67_layout_varhandle_reports_its_index_coordinate_and_carrier() {
+        let mut ctx = MockNativeContext::new();
+        let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3).unwrap();
+        register_p67_memory_segment_var_handle(
+            &mut ctx,
+            vh,
+            SegmentVhShape {
+                width: 4,
+                carrier: b'F',
+                little_endian: true,
+                base_offset: 0,
+                stride: 4,
+            },
+        );
+        let access_type =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2)
+                .unwrap();
+        ctx.set_field(access_type, 1, Value::Int(0));
+        let get_mt = match varhandle_access_mode_type_uncached(
+            &mut ctx,
+            &[Value::Object(Some(vh)), Value::Object(Some(access_type))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(mt)) => mt,
+            other => panic!("expected MethodType, got {other:?}"),
+        };
+        assert_eq!(
+            descriptor_from_method_type(&ctx, get_mt),
+            "(Ljava/lang/foreign/MemorySegment;JJ)F"
         );
     }
 
@@ -13840,6 +15445,256 @@ mod tests {
         assert_eq!(
             lk_member_access_flags(&ctx, mirror, "inherited", false),
             Some(ACC_PUBLIC_U16)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // G31 — `MethodHandle.asType` CONVERTIBILITY
+    //
+    // Every assertion below is a cell of a sweep MEASURED on HotSpot
+    // 25.0.3+9-LTS (`scratchpad/g31/AsTypeFamily.java`, `AsTypeExtra.java`;
+    // 613 + 304 cells). The predicate is a pure function of descriptor
+    // strings, so the whole rule is testable with no mock and no VM — which is
+    // the only reason it could be checked at all by a lane forbidden to build.
+    //
+    // The rows chosen here are the ones a plausible WRONG implementation
+    // passes the rest of the matrix while failing: the two direction traps,
+    // the three primitive asymmetries, the `ConstantDesc` split, and the
+    // reference-to-reference blanket accept.
+    // -----------------------------------------------------------------------
+
+    /// The blanket rule that is easiest to disbelieve: `asType` accepts EVERY
+    /// reference-to-reference pair, however unrelated, because the cast is
+    /// deferred to invoke time and `null` is always dynamically valid.
+    #[test]
+    fn reference_to_reference_is_always_convertible() {
+        // MEASURED: R String -> Integer = ok, R int[] -> String = ok,
+        //           R Void -> Comparable = ok
+        for (a, b) in [
+            ("Ljava/lang/String;", "Ljava/lang/Integer;"),
+            ("[I", "Ljava/lang/String;"),
+            ("Ljava/lang/Void;", "Ljava/lang/Comparable;"),
+            ("Ljava/lang/Runnable;", "[[Ljava/lang/Object;"),
+        ] {
+            assert!(
+                mh_can_convert(a, b),
+                "MEASURED ok on HotSpot: {a} -> {b} must be convertible"
+            );
+        }
+    }
+
+    /// `void` is convertible in BOTH directions as a return type — the value is
+    /// dropped one way, a zero/null introduced the other. The whole `void` row
+    /// and the whole `void` column of the measured return matrix are accepts.
+    #[test]
+    fn void_converts_in_both_directions() {
+        for t in ["Z", "I", "D", "Ljava/lang/String;", "[I"] {
+            assert!(mh_can_convert("V", t), "MEASURED: void -> {t} = ok");
+            assert!(mh_can_convert(t, "V"), "MEASURED: {t} -> void = ok");
+        }
+    }
+
+    /// The three primitive asymmetries. Each of them is a cell an
+    /// "any primitive to any primitive" rule gets wrong.
+    #[test]
+    fn primitive_widening_is_jls_5_1_2_and_not_symmetric() {
+        // MEASURED: R byte -> short = ok, R short -> byte = WrongMethodTypeException
+        assert!(mh_can_convert("B", "S"));
+        assert!(!mh_can_convert("S", "B"));
+        // char does NOT widen to short, and short/byte do NOT widen to char.
+        // MEASURED: R char -> short / R short -> char / R byte -> char all refuse.
+        assert!(!mh_can_convert("C", "S"));
+        assert!(!mh_can_convert("S", "C"));
+        assert!(!mh_can_convert("B", "C"));
+        // ... but char DOES widen to int and up. MEASURED: R char -> int = ok.
+        assert!(mh_can_convert("C", "I"));
+        // boolean widens to nothing and nothing widens to it.
+        // MEASURED: the whole boolean row and column of the primitive block.
+        for t in ["B", "C", "S", "I", "J", "F", "D"] {
+            assert!(!mh_can_convert("Z", t), "MEASURED: boolean -> {t} refuses");
+            assert!(!mh_can_convert(t, "Z"), "MEASURED: {t} -> boolean refuses");
+        }
+    }
+
+    /// The reference-to-primitive arm has THREE tests in the JDK, and the third
+    /// one — unbox from a strongly typed wrapper, then widen — is the one that
+    /// is easy to leave out. Leaving it out turns 20 measured accepts into
+    /// refusals.
+    #[test]
+    fn a_wrapper_source_may_unbox_and_then_widen() {
+        // MEASURED: U Byte -> short/int/long/float/double = Y, Byte -> char = n
+        assert!(mh_can_convert("Ljava/lang/Byte;", "S"));
+        assert!(mh_can_convert("Ljava/lang/Byte;", "D"));
+        assert!(!mh_can_convert("Ljava/lang/Byte;", "C"));
+        // MEASURED: U Character -> int = Y, Character -> short = n
+        assert!(mh_can_convert("Ljava/lang/Character;", "I"));
+        assert!(!mh_can_convert("Ljava/lang/Character;", "S"));
+        // MEASURED: U Double -> double = Y, Double -> float = n (narrowing)
+        assert!(mh_can_convert("Ljava/lang/Double;", "D"));
+        assert!(!mh_can_convert("Ljava/lang/Double;", "F"));
+    }
+
+    /// The supertype table, and the row that inspection gets wrong: `Byte` and
+    /// `Short` are `Constable` but NOT `ConstantDesc`.
+    #[test]
+    fn the_wrapper_supertype_table_matches_the_measured_rows() {
+        // MEASURED: U Number -> byte = Y but Number -> char = n and
+        //           Number -> boolean = n (no Number subclass wraps either)
+        assert!(mh_can_convert("Ljava/lang/Number;", "B"));
+        assert!(!mh_can_convert("Ljava/lang/Number;", "C"));
+        assert!(!mh_can_convert("Ljava/lang/Number;", "Z"));
+        // MEASURED: U ConstantDesc -> int/long/float/double = Y, byte/short = n
+        assert!(mh_can_convert("Ljava/lang/constant/ConstantDesc;", "I"));
+        assert!(!mh_can_convert("Ljava/lang/constant/ConstantDesc;", "B"));
+        // MEASURED: B byte -> Constable = Y but byte -> ConstantDesc = n
+        assert!(mh_can_convert("B", "Ljava/lang/constant/Constable;"));
+        assert!(!mh_can_convert("B", "Ljava/lang/constant/ConstantDesc;"));
+        // MEASURED: U Comparable/Serializable/Constable -> every primitive = Y
+        for r in [
+            "Ljava/lang/Comparable;",
+            "Ljava/io/Serializable;",
+            "Ljava/lang/constant/Constable;",
+        ] {
+            for p in ["Z", "B", "C", "S", "I", "J", "F", "D"] {
+                assert!(mh_can_convert(r, p), "MEASURED: {r} -> {p} = Y");
+            }
+        }
+        // MEASURED: U CharSequence / Cloneable / String / Void -> every
+        // primitive = n. None of them is a supertype of any wrapper.
+        for r in [
+            "Ljava/lang/CharSequence;",
+            "Ljava/lang/Cloneable;",
+            "Ljava/lang/String;",
+            "Ljava/lang/Void;",
+        ] {
+            for p in ["Z", "B", "C", "S", "I", "J", "F", "D"] {
+                assert!(!mh_can_convert(r, p), "MEASURED: {r} -> {p} = n");
+            }
+        }
+    }
+
+    /// The direction trap. The RETURN travels old -> new; each PARAMETER
+    /// travels new -> old. A reversed implementation passes every widening row
+    /// and fails every narrowing one, which reads like an off-by-one.
+    #[test]
+    fn parameters_convert_backwards_and_the_return_forwards() {
+        // A callee that wants a `long` can be fed by a caller offering an
+        // `int`; the reverse is a narrowing and refuses.
+        // MEASURED: A int -> long = ok, A long -> int = WrongMethodTypeException
+        assert_eq!(method_type_is_convertible_to("(J)V", "(I)V"), Some(true));
+        assert_eq!(method_type_is_convertible_to("(I)V", "(J)V"), Some(false));
+        // A callee that returns `int` can satisfy a caller expecting `long`;
+        // the reverse refuses. MEASURED: R int -> long = ok, R long -> int = X.
+        assert_eq!(method_type_is_convertible_to("()I", "()J"), Some(true));
+        assert_eq!(method_type_is_convertible_to("()J", "()I"), Some(false));
+    }
+
+    /// `asType` never adds or drops a parameter. All five measured arity rows
+    /// refuse, in both directions and at every count.
+    #[test]
+    fn arity_must_match_exactly() {
+        // MEASURED: cannot convert MethodHandle(int)void to ()void, and the
+        // four sibling rows of the same family.
+        assert_eq!(method_type_is_convertible_to("(I)V", "()V"), Some(false));
+        assert_eq!(method_type_is_convertible_to("(I)V", "(II)V"), Some(false));
+        assert_eq!(method_type_is_convertible_to("()V", "(I)V"), Some(false));
+        assert_eq!(
+            method_type_is_convertible_to("(ILjava/lang/String;)V", "()V"),
+            Some(false)
+        );
+        assert_eq!(
+            method_type_is_convertible_to("(ILjava/lang/String;)V", "(ILjava/lang/String;J)V"),
+            Some(false)
+        );
+    }
+
+    /// The exact row `RJdkProxyIface`'s `refusals` step is missing, and the two
+    /// neighbours that separate "refuses everything" from "refuses this".
+    #[test]
+    fn the_rjdkproxyiface_row() {
+        // MEASURED: MethodHandleProxies.asInterfaceInstance(Subtractor.class,
+        //   <(String)String>) throws
+        //   WrongMethodTypeException: cannot convert MethodHandle(String)String
+        //   to (int,int)int
+        let target = "(Ljava/lang/String;)Ljava/lang/String;";
+        assert_eq!(method_type_is_convertible_to(target, "(II)I"), Some(false));
+        assert_eq!(
+            format!(
+                "cannot convert MethodHandle{} to {}",
+                method_type_display(target).unwrap(),
+                method_type_display("(II)I").unwrap()
+            ),
+            "cannot convert MethodHandle(String)String to (int,int)int"
+        );
+        // MEASURED: the MATCHING handle is accepted and its proxy invokes.
+        assert_eq!(method_type_is_convertible_to("(II)I", "(II)I"), Some(true));
+        // MEASURED: S subtractor.fromWidening = WrongMethodTypeException —
+        // `(long,long)long` is refused even though int->long widens, because
+        // the RETURN long->int does not.
+        assert_eq!(method_type_is_convertible_to("(JJ)J", "(II)I"), Some(false));
+    }
+
+    /// The message is transcribed from HotSpot, so its rendering is asserted
+    /// character for character. `MethodType.toString()` uses simple names,
+    /// arrays keep their brackets, and a nested class prints its inner name
+    /// alone.
+    #[test]
+    fn method_type_display_matches_hotspots_tostring() {
+        // MEASURED: T arrays = (String[],Object[][])int[]
+        assert_eq!(
+            method_type_display("([Ljava/lang/String;[[Ljava/lang/Object;)[I").as_deref(),
+            Some("(String[],Object[][])int[]")
+        );
+        // MEASURED: T nested = (Entry)Inner
+        assert_eq!(
+            method_type_display("(Ljava/util/Map$Entry;)LAsTypeExtra$Inner;").as_deref(),
+            Some("(Entry)Inner")
+        );
+        // MEASURED: T void = ()void
+        assert_eq!(method_type_display("()V").as_deref(), Some("()void"));
+        // MEASURED: T prims = (boolean,byte,char,short,int,long,float)double
+        assert_eq!(
+            method_type_display("(ZBCSIJF)D").as_deref(),
+            Some("(boolean,byte,char,short,int,long,float)double")
+        );
+        // A descriptor this file cannot name yields `None` rather than a
+        // signature with a hole in it, so `mh_astype_refusal` declines to
+        // compose a half-rendered message.
+        assert_eq!(method_type_display("(L;)V"), None);
+        assert_eq!(method_type_display("not a descriptor"), None);
+    }
+
+    /// The TRAP: `explicitCastArguments` has different rules. Every type pair
+    /// `asType` refuses, it accepts — it refuses on arity alone.
+    #[test]
+    fn explicit_cast_shares_no_type_rule_with_astype() {
+        // MEASURED: X String -> boolean = ok, X double -> char = ok,
+        //           X int[] -> long = ok — all three are asType refusals.
+        for (a, b) in [
+            ("Ljava/lang/String;", "Z"),
+            ("D", "C"),
+            ("[I", "J"),
+            ("Ljava/lang/Void;", "I"),
+        ] {
+            assert!(
+                !mh_can_convert(a, b),
+                "asType MUST refuse {a} -> {b} (MEASURED)"
+            );
+        }
+        // The only thing `explicitCastArguments` checks is the parameter count,
+        // which is why its refusal is expressed on `split_descriptor_params`
+        // and not on `method_type_is_convertible_to`.
+        // MEASURED: Z drop1 = cannot explicitly cast MethodHandle(int)void to ()void
+        let (old_params, _) = split_descriptor_params("(I)V").unwrap();
+        let (new_params, _) = split_descriptor_params("()V").unwrap();
+        assert_ne!(old_params.len(), new_params.len());
+        assert_eq!(
+            format!(
+                "cannot explicitly cast MethodHandle{} to {}",
+                method_type_display("(I)V").unwrap(),
+                method_type_display("()V").unwrap()
+            ),
+            "cannot explicitly cast MethodHandle(int)void to ()void"
         );
     }
 }

@@ -106,7 +106,7 @@ use crate::JitRuntimeHelpers;
 /// `build_helpers`) and consumers (the JIT backends) that disagree on this
 /// number disagree on where the helpers live.
 ///
-/// `4` is the revision of the 63-field, 504-byte table shipped today. The
+/// `5` is the revision of the 64-field, 512-byte table shipped today. The
 /// full history is in [`ABI_REVISIONS`], which a const assertion ties to this
 /// constant, to [`NUM_HELPER_FIELDS`] and to [`JIT_HELPERS_ABI_SIZE`] — so
 /// appending a field without bumping this number no longer compiles.
@@ -681,8 +681,10 @@ helper_fn_slots! {
     // shape as `new_object_cp` and for the same reason; see
     // `JitRuntimeHelpers::ldc_class_cp`.
     HelperFnLdcClassCp, ldc_class_cp, ldc_class_cp_fn, (i64, i64, i64) -> i64;
-    // `(vm_ptr, array_ptr, value_ptr) -> 0 | i64::MIN`. See
-    // `JitRuntimeHelpers::aastore_type_check`.
+    // JVMS §6.5 aastore covariance check ONLY — (vm_ptr, array_ptr, val) ->
+    // `i64::MIN` = refused (ArrayStoreException published) / `0` = proceed.
+    // NOT the store: the caller keeps the inline MOV, the SATB pre-write
+    // barrier and the card mark. See `JitRuntimeHelpers::aastore_type_check`.
     HelperFnAastoreTypeCheck, aastore_type_check, aastore_type_check_fn, (i64, i64, i64) -> i64;
 }
 
@@ -797,6 +799,9 @@ helper_field_table! {
     (monitor_exit,                   Function, false),
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site.
     (ldc_class_cp,                   Function, false),
+    // Required: the x64 `0x53` lowering is inline and calls this for the JVMS
+    // §6.5 covariance check, so a `0` slot would be a reference store with no
+    // check at all — the heap-type-confusion defect the slot exists to close.
     (aastore_type_check,             Function, true),
 }
 
@@ -1304,6 +1309,13 @@ const _: () = {
          a displacement as one silently removes its only sanity check",
     );
     assert!(required == 43, "required-slot count changed");
+    // 13 -> 12 on 2026-08-16, merging `dev`: `aastore_type_check` was promoted
+    // from optional to required, so an optional slot LEFT the set. The check
+    // this guard exists to force -- "does the new optional slot have a zero
+    // check at its emitter call site?" -- has no subject when the count goes
+    // DOWN, and the twelve that remain kept the zero checks they already had.
+    // The runtime test below (`functions - required == 12`) was already on
+    // the new number; this const was the only site still carrying 13.
     assert!(
         optional_fns == 12,
         "the optional-callable count changed — every optional slot MUST have a \

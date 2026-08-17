@@ -155,6 +155,24 @@ const CF_IDENTITY_MAP: u16 = 1 << 10;
 /// those natives are on the hot path for every ordinary HashSet and ArrayList
 /// too (see the `collections-classification-cost` notes above).
 const CF_KEY_SET_VIEW: u16 = 1 << 11;
+/// Exact class is one of the five real JDK classes `Map.values()` returns:
+/// `HashMap$Values`, `LinkedHashMap$LinkedValues`, `TreeMap$Values`,
+/// `Hashtable$ValueCollection`, `ConcurrentHashMap$ValuesView`.
+///
+/// Every one of them holds its source map in a single reference field and
+/// nothing else — so it matches neither the ArrayList layout the `native_al_*`
+/// natives read nor the HashSet layout the `native_hs_*` natives read. Reaching
+/// one of those natives with such a receiver answers EMPTY today (`al_state`'s
+/// layout guard reports `data = None`, which every caller reads as size 0), and
+/// its real bytecode is no better: `HashMap$Values.size()` is
+/// `getfield this$0.size`, a field this VM never writes for an integer-keyed
+/// map (see [`is_values_view_class`] for the measurement). `vc_route` consults
+/// this bit and re-expresses the call over the live source map.
+///
+/// A memoized bit rather than a `class_name_of_id` call for the same reason
+/// [`CF_KEY_SET_VIEW`] is one: the natives that ask are on the hot path for
+/// every ordinary `ArrayList` too.
+const CF_VALUES_VIEW: u16 = 1 << 12;
 
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -312,6 +330,24 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
     // rather than a 17th variant. Paid once per `ClassId`, then cached forever.
     if ctx.class_name_arc_of_id(cid).as_deref() == Some(KSV_CLASS) {
         flags |= CF_KEY_SET_VIEW;
+    }
+    // The five `Map.values()` view classes — same one-name treatment, and the
+    // same `class_name_arc_of_id` the two blocks above already pay for. Exact
+    // class, not ancestry: `AbstractCollection` is the shared superclass of
+    // four of them AND of every foreign collection that legitimately reaches
+    // these natives, so an ancestry test would capture receivers whose backing
+    // this VM does not own. See [`CF_VALUES_VIEW`].
+    if matches!(
+        ctx.class_name_arc_of_id(cid).as_deref(),
+        Some(
+            "java/util/HashMap$Values"
+                | "java/util/LinkedHashMap$LinkedValues"
+                | "java/util/TreeMap$Values"
+                | "java/util/Hashtable$ValueCollection"
+                | "java/util/concurrent/ConcurrentHashMap$ValuesView"
+        )
+    ) {
+        flags |= CF_VALUES_VIEW;
     }
     ClassFacts(flags)
 }
@@ -3526,6 +3562,68 @@ fn display_array_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
 
 /// Unbox a wrapper object (Integer, Long, Boolean, etc.) to its primitive Value.
 /// Returns None if the object is not a recognized JDK wrapper type.
+/// True when a `read_string` decode is a FAITHFUL rendering of the receiver's
+/// UTF-16 code units.
+///
+/// A Rust `str` cannot hold an unpaired surrogate, so the VM's reader
+/// substitutes `U+FFFD` for one. Text containing no `U+FFFD` therefore provably
+/// survived the decode; text containing one may be a genuine `U+FFFD` OR a
+/// mangled surrogate, and no `&str`-level comparison can tell those apart.
+///
+/// This crate cannot read code units — `native-collections` has no dependency
+/// on `native-builtins`, whose `lang_string::read_string_chars` is the
+/// units-preserving reader, and adding a second decoder here would be a second
+/// encoding of one concept. So every place that must decide something about
+/// Java text from a `&str` is gated on this predicate and REFUSES rather than
+/// guesses, handing the decision to the units-exact path instead
+/// (`java_strings_equal` / `java_string_hash_code` / a real `compareTo`
+/// dispatch). The two failure modes it closes were both MEASURED against
+/// HotSpot 25 on 2026-08-17: a `TreeSet` that silently merged two distinct
+/// keys, and a `contains` that answered "found" for a string the collection
+/// never held.
+fn decode_is_faithful(text: &str) -> bool {
+    !text.contains('\u{FFFD}')
+}
+
+/// Compare two DECODED Java strings the way `String.compareTo` compares them —
+/// by UTF-16 code unit — or refuse.
+///
+/// `None` means "this comparison was not made": one of the decodes may have
+/// destroyed an unpaired surrogate (see [`decode_is_faithful`]), and two keys
+/// mangled to the same `U+FFFD` text would compare EQUAL, which is how a
+/// natural-order `TreeSet`/`TreeMap` silently drops one of two distinct
+/// elements. The caller must fall back to dispatching the receiver's own
+/// `compareTo`.
+///
+/// The unit comparison is not the same as `str::cmp`, which orders by code
+/// POINT. They disagree above the BMP: a supplementary character starts with a
+/// surrogate unit in `0xD800..=0xDBFF`, below `U+E000..=U+FFFF`, while its code
+/// point is above them. MEASURED on both VMs 2026-08-17: a `TreeSet` of
+/// `{U+10000, U+E000, U+FFFF}` enumerates `[U+10000, U+E000, U+FFFF]` on
+/// HotSpot; `str::cmp` put `U+10000` last.
+fn compare_decoded_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    if !decode_is_faithful(a) || !decode_is_faithful(b) {
+        return None;
+    }
+    Some(a.encode_utf16().cmp(b.encode_utf16()))
+}
+
+/// Build a fast-mode [`TreeKey`] from a DECODED Java string, or refuse.
+///
+/// Same rule as [`compare_decoded_strings`], for the representation rather than
+/// the comparison: a key whose decode may have lost an unpaired surrogate
+/// cannot be stored faithfully, and two such keys would collapse into ONE
+/// `BTreeMap` entry (MEASURED 2026-08-17: `TreeMap.size()` 1 where HotSpot says
+/// 2, with the survivor's value answered for both keys). Refusing sends the
+/// caller to the array path, which keeps the real `ObjectRef` and runs the
+/// receiver's own units-exact `String.compareTo`.
+fn tree_key_from_decoded_string(text: &str) -> Option<TreeKey> {
+    if !decode_is_faithful(text) {
+        return None;
+    }
+    Some(TreeKey::Str(text.encode_utf16().collect()))
+}
+
 fn unbox_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Value> {
     if let Some(result) = ctx.fast_unbox_primitive_wrapper(obj) {
         return result;
@@ -3604,9 +3702,18 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
             if std::ptr::eq(oa.as_ptr(), ob.as_ptr()) {
                 return true;
             }
-            // String value equality
-            if let (Some(sa), Some(sb)) = (ctx.read_string(*oa), ctx.read_string(*ob)) {
-                return sa == sb;
+            // String value equality, asked of the VM so it compares code units.
+            //
+            // This was `read_string(a) == read_string(b)`, and a Rust `str`
+            // cannot hold an unpaired UTF-16 surrogate: both operands decoded
+            // to `U+FFFD` and compared EQUAL. MEASURED 2026-08-17 against
+            // HotSpot 25 — `list.contains`, `list.indexOf`, `Deque.contains`
+            // and `Map.containsValue` all answered "found" for a string that
+            // differs from the stored one in exactly the way `String.equals`
+            // calls different. A false positive, not a miss, so nothing
+            // downstream had any way to notice.
+            if let Some(equal) = ctx.java_strings_equal(*oa, *ob) {
+                return equal;
             }
             // Enum constants: compare by (declaring class, ordinal) so an
             // enum-keyed List/Set still finds a member when the VM produced a
@@ -3934,6 +4041,11 @@ enum AlLayout {
     /// `java/util/Vector` or a subclass (`java/util/Stack`), which carries its
     /// own `elementData`/`elementCount` slots.
     Vector,
+    /// One of the [`MAP_VIEW_CARRIERS`]. Reads and writes exactly like
+    /// [`AlLayout::ArrayList`] — the difference is the slot triple it is paired
+    /// with, which [`view_carrier_slots`] places above the carrier's own
+    /// declared fields instead of at ArrayList's absolute indices.
+    ViewCarrier,
     /// Exactly `java/lang/Object`. CratonVM's own class-id-0 placeholders land
     /// here; a zero-field bare `Object` is not a list. See
     /// [`is_bare_java_lang_object`], whose test this reproduces.
@@ -3963,7 +4075,10 @@ impl AlLayout {
     /// its slot layout anyway.
     #[inline]
     fn rules_out_wrapper_routes(self) -> bool {
-        matches!(self, AlLayout::ArrayList | AlLayout::Vector)
+        matches!(
+            self,
+            AlLayout::ArrayList | AlLayout::Vector | AlLayout::ViewCarrier
+        )
     }
 
     /// The verdict [`al_is_list_layout`] returns for an object of this class.
@@ -3972,7 +4087,9 @@ impl AlLayout {
     #[inline]
     fn accepts(self, n_fields: usize) -> bool {
         match self {
-            AlLayout::ArrayList | AlLayout::Vector | AlLayout::Lenient => true,
+            AlLayout::ArrayList | AlLayout::Vector | AlLayout::ViewCarrier | AlLayout::Lenient => {
+                true
+            }
             // `!is_bare_java_lang_object`: exact `java/lang/Object` with zero
             // fields is rejected; one that carries fields is a CratonVM
             // placeholder list and stays accepted.
@@ -4002,6 +4119,15 @@ fn al_slots_for_uncached(
             return None;
         }
     }
+    // Same argument as Vector, one family over: a `Map.values()` view carrier
+    // is not an ArrayList either, and using ArrayList's ABSOLUTE slots on one
+    // overwrites a field the carrier really declares. See
+    // [`view_carrier_slots`] for the collision this prevents.
+    if let Some(name) = ctx.class_name_arc_of_id(cid) {
+        if is_map_view_carrier(&name) {
+            return Some((view_carrier_slots(ctx, cid)?, AlLayout::ViewCarrier));
+        }
+    }
     let slots = al_slots_resolved(ctx)?;
     // Refuse to CACHE a verdict until `java/util/ArrayList` itself resolves:
     // the arm below this one is the old predicate's lenient "ArrayList not
@@ -4017,11 +4143,11 @@ fn al_slots_for_uncached(
             None => AlLayout::Lenient,
             Some("") => AlLayout::Lenient,
             Some("java/lang/Object") => AlLayout::BareObject,
-            // A map view carries its state in ArrayList's own resolved slots
-            // under its own class — see `MAP_VIEW_CARRIERS`. Without this arm
-            // the guard below rejects it as a named non-list and every view
-            // reads back EMPTY.
-            Some(n) if is_map_view_carrier(n) => AlLayout::ArrayList,
+            // A map view carrier never reaches here: the early return above
+            // answers `AlLayout::ViewCarrier` for every `MAP_VIEW_CARRIERS`
+            // name, with its own slot triple. (Until 2026-08-17 this arm
+            // answered `AlLayout::ArrayList` and the carrier shared
+            // ArrayList's ABSOLUTE slots — the `LinkedValues` collision.)
             Some(_) => AlLayout::Foreign,
         }
     };
@@ -4079,7 +4205,7 @@ fn is_bare_java_lang_object(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// the same as [`al_is_list_layout`] (that one also admits `Vector`).
 fn al_is_arraylist_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     match al_slots_and_layout_for(ctx, obj).1 {
-        AlLayout::ArrayList | AlLayout::Lenient => true,
+        AlLayout::ArrayList | AlLayout::ViewCarrier | AlLayout::Lenient => true,
         AlLayout::BareObject => !is_bare_java_lang_object(ctx, obj),
         AlLayout::Vector | AlLayout::Foreign => false,
     }
@@ -4299,8 +4425,24 @@ fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
 #[inline]
 fn al_mod_count_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let slot = ctx.resolve_field_index("java/util/AbstractList", "modCount")?;
-    let (data_slot, size_slot, _) = al_slots_for(ctx, this);
+    let ((data_slot, size_slot, _), layout) = al_slots_and_layout_for(ctx, this);
     if slot == data_slot || slot == size_slot || slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    // A `MAP_VIEW_CARRIERS` receiver has NO `modCount` slot of its own. It
+    // extends `AbstractCollection`, not `AbstractList`, so `AbstractList`'s
+    // resolved index (0 in the real-JDK layout) does not name a field of this
+    // object at all — it names the carrier's OWN first declared field:
+    // `HashMap$Values.this$0` / `TreeMap$Values.this$0` /
+    // `ConcurrentHashMap$CollectionView.map`, all REFERENCES, and
+    // `LinkedHashMap$LinkedValues.reversed`, a boolean. Bumping a counter there
+    // is a type-punning store into a declared reference slot — the exact hazard
+    // this function's doc block describes for the synthetic layout, and the
+    // reason CratonVM reported `HashMap$Values.this$0 == null` where HotSpot
+    // reports the backing map (G22-1 N2, MEASURED). Views lose comodification
+    // detection, which is the direction this function already documents as
+    // safe.
+    if layout == AlLayout::ViewCarrier {
         return None;
     }
     Some(slot)
@@ -5014,6 +5156,19 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(b) = unmod_receiver_backing(ctx, this) {
         return native_al_size(ctx, &[Value::Object(Some(b))]);
     }
+    // Two DIFFERENT view shapes reach here, and each needs its own test.
+    //
+    // First: a real `Map.values()` view-class receiver (`java.util.HashMap$Values`
+    // and family, `CF_VALUES_VIEW`). It is not ArrayList-shaped at ALL — it has
+    // no `elementData` — so `al_state` cannot decode it and the class test has
+    // to run first. It counts through its source map. See `vc_route_source_size`.
+    if let Some(r) = vc_route_source_size(ctx, this) {
+        return r;
+    }
+    // Second: an ArrayList-SHAPED carrier that names a source map in the spare
+    // trailing slot of its backing array. `al_state_for_read` reads the one
+    // `al_state` both the marker test and the answer need, and `size_only`
+    // answers from the source instead of rebuilding the carrier to count it.
     let (this, data, size) = match al_state_for_read(ctx, this, true)? {
         AlRead::ViewSize(n) => return Ok(Some(Value::Int(n))),
         AlRead::State(t, d, s) => (t, d, s),
@@ -5039,6 +5194,16 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    // Both view shapes again, in the same order as `native_al_size`, each
+    // reduced to the boolean. Going through the COUNT rather than through
+    // `vc_route` keeps `isEmpty()` free of the carrier allocation on either
+    // path.
+    if let Some(r) = vc_route_source_size(ctx, this) {
+        return Ok(Some(Value::Int(match r? {
+            Some(Value::Int(n)) => i32::from(n == 0),
+            _ => 1,
+        })));
+    }
     let (this, data, size) = match al_state_for_read(ctx, this, true)? {
         AlRead::ViewSize(n) => return Ok(Some(Value::Int(i32::from(n == 0)))),
         AlRead::State(t, d, s) => (t, d, s),
@@ -5092,7 +5257,198 @@ fn altrace_describe(ctx: &mut dyn NativeContext, v: Value) -> String {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Vector's LEGACY index checks.
+//
+// MEASURED 2026-08-13 (scratchpad/orch/V2.java, HotSpot 25.0.3+9-LTS). Two
+// things the shared ArrayList natives get wrong for a Vector receiver:
+//
+//  * the CLASS is ArrayIndexOutOfBoundsException, a SUBCLASS of the
+//    IndexOutOfBoundsException `native_al_get` throws -- so a `catch
+//    (ArrayIndexOutOfBoundsException)` in legacy code never fired;
+//  * the TEXT follows three conventions that cannot be derived from one
+//    another, and the two negative arms actively disagree:
+//
+//      elementAt(i >= size)        "3 >= 3"
+//      elementAt(i < 0)            "Index -1 out of bounds for length 10"
+//      get(i >= size)              "Array index out of range: 3"
+//      get(i < 0)                  "Index -1 out of bounds for length 10"
+//      removeElementAt(i >= size)  "3 >= 3"
+//      removeElementAt(i < 0)      "Array index out of range: -1"
+//
+// The "length" in the negative arms is the BACKING ARRAY's capacity, not the
+// element count: `new Vector<>(100)` with one element reports "length 100".
+// That is `elementData(index)` faulting on the raw array, so it is reproduced
+// from the real array length rather than from `size`.
+fn vec_aioobe(index: i32, message: String) -> MethodCallFailed {
+    RuntimeError::ArrayIndexOutOfBoundsException {
+        index,
+        message: Some(message),
+    }
+    .into()
+}
+
+/// The negative-index arm shared by `elementAt` and `get` (but NOT by
+/// `removeElementAt`, which words it differently).
+fn vec_negative_index(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> MethodCallFailed {
+    let (data, _) = al_state(ctx, this);
+    let cap = data.map_or(0, |d| ctx.array_length(d));
+    vec_aioobe(
+        index,
+        format!("Index {index} out of bounds for length {cap}"),
+    )
+}
+
+fn vec_index_args(args: &[Value]) -> Option<(ObjectRef, i32)> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return None,
+    };
+    Some((this, index))
+}
+
+fn native_vec_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(index, format!("{index} >= {size}")));
+    }
+    native_al_get(ctx, args)
+}
+
+fn native_vec_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    native_al_get(ctx, args)
+}
+
+fn native_vec_remove_element_at_checked(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(None);
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    if index >= size {
+        return Err(vec_aioobe(index, format!("{index} >= {size}")));
+    }
+    native_vec_remove_element_at(ctx, args)
+}
+
+
+// The rest of Vector's index-taking surface. MEASURED 2026-08-13
+// (scratchpad/orch/V3.java). SIX conventions across five methods, and they do
+// not reduce to a rule:
+//
+//   set(i >= size)              "Array index out of range: 3"
+//   set(i < 0)                  "Index -1 out of bounds for length 10"
+//   setElementAt(x, i >= size)  "3 >= 3"
+//   setElementAt(x, i < 0)      "Index -1 out of bounds for length 10"
+//   insertElementAt(x, i > size) "4 > 3"      <- `>`, not `>=`: i == size is LEGAL
+//   insertElementAt(x, i < 0)   "arraycopy: source index -1 out of bounds for object array[10]"
+//   add(i > size) / add(i < 0)  same two as insertElementAt
+//   remove(i >= size)           "Array index out of range: 3"
+//   remove(i < 0)               "Index -1 out of bounds for length 10"
+//
+// NOT converted: `subList`, which keeps the PLAIN IndexOutOfBoundsException
+// ("toIndex = 5") -- measured. A blanket "Vector throws the array subclass"
+// rule would be wrong for exactly that one method.
+fn vec_arraycopy_negative(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> MethodCallFailed {
+    let (data, _) = al_state(ctx, this);
+    let cap = data.map_or(0, |d| ctx.array_length(d));
+    vec_aioobe(
+        index,
+        format!("arraycopy: source index {index} out of bounds for object array[{cap}]"),
+    )
+}
+
+fn native_vec_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    native_al_set(ctx, args)
+}
+
+fn native_vec_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    native_al_remove_at(ctx, args)
+}
+
+fn native_vec_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(None);
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_arraycopy_negative(ctx, this, index));
+    }
+    if index > size {
+        return Err(vec_aioobe(index, format!("{index} > {size}")));
+    }
+    native_al_add_at(ctx, args)
+}
+
 pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `List.get(int)` on a values view is not reachable from correct Java — the
+    // real classes are `AbstractCollection`s and the cast to `List` throws
+    // (`view.castToList=java.lang.ClassCastException`, measured). The guard is
+    // here because this native is registered on `java/util/List` and can be
+    // reached by a synthetic/reflective receiver regardless of what Java could
+    // express, and answering element 0 of an object that has no elements is the
+    // failure this whole family is about.
+    if let Some(r) = vc_route(ctx, args, native_al_get) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -5461,6 +5817,9 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if let Some(r) = ksv_route(ctx, args, native_ksv_contains) {
         return r;
     }
+    if let Some(r) = vc_route(ctx, args, native_al_contains) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -5585,6 +5944,9 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_to_array) {
+        return r;
+    }
+    if let Some(r) = vc_route(ctx, args, native_al_to_array) {
         return r;
     }
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
@@ -5829,6 +6191,9 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if let Some(r) = ksv_route(ctx, args, native_ksv_to_array_typed) {
         return r;
     }
+    if let Some(r) = vc_route(ctx, args, native_al_to_array_typed) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -5886,6 +6251,13 @@ fn native_collection_to_array_generator(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `al_or_collection_elements`' fallback walks the receiver's own
+    // `iterator()`, which for a real view class is the JDK's table-walking
+    // iterator over a table this VM never populates — i.e. silently empty.
+    // Route before that fallback can be taken.
+    if let Some(r) = vc_route(ctx, args, native_collection_to_array_generator) {
+        return r;
+    }
     let generator = args.get(1).copied().unwrap_or(Value::Object(None));
     let elems = al_or_collection_elements(ctx, this)?;
     let size = elems.len();
@@ -5957,6 +6329,12 @@ fn native_collection_to_array_generator(
 
 pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
+        return r;
+    }
+    // A real view class has no element array to iterate. Rebuilding the live
+    // carrier here also preserves write-through `remove()`, because the carrier
+    // it builds is the marker-carrying one `propagate_list_removal` understands.
+    if let Some(r) = vc_route(ctx, args, native_al_iterator) {
         return r;
     }
     let input = match args.first() {
@@ -6174,6 +6552,18 @@ pub fn native_al_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // A `values()` view is LIVE, and this was the one element-reading native
+    // that never said so: `native_al_get`, `native_al_contains`,
+    // `native_al_iterator`, `native_al_for_each` and `native_al_stream` all
+    // open with a resync, and `toString` read the capture-time backing array
+    // straight out of `al_state`. MEASURED on all five map families
+    // (`scratchpad/g22/G22Fam.java`, the `.values.live` row): after
+    // `m.put("d","4"); m.remove("a")` on a three-entry map, `v.size()` answered
+    // the live 3 but `v.toString()` answered the captured `[1, 2, 3]` where HotSpot
+    // answers `[2, 3, 4]`. `resync_values_view` returns `list` unchanged for a
+    // receiver with no view marker, so an ordinary `ArrayList.toString()` pays
+    // one `al_state` it was going to pay anyway.
+    let this = resync_values_view(ctx, this)?;
     let (data, size) = al_state(ctx, this);
     let size = size as usize;
     // Pre-size: "[" + N elements averaging ~16 chars each + (N-1) ", " + "]".
@@ -7934,6 +8324,17 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // A `Map.values()` view is an `AbstractCollection`, which does not override
+    // `hashCode` — so on a real JVM it hashes by IDENTITY, not by content. This
+    // VM's view is an `ArrayList`-shaped carrier, so without this arm the
+    // `AbstractList` 31*acc+e contract below runs on an object whose real class
+    // never had it. See [`al_is_values_view`] for the HotSpot transcript.
+    //
+    // No `resync_values_view` first: an identity hash does not depend on the
+    // contents, and re-collecting them would be a GC point for nothing.
+    if al_is_values_view(ctx, this) {
+        return Ok(Some(Value::Int(ctx.identity_hash_code(this))));
+    }
     let (data, size) = al_state(ctx, this);
     let size = size as usize;
     let mut hash: i32 = 1;
@@ -7987,6 +8388,19 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let other = unwrap_unmod(ctx, other_raw);
     if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
         return Ok(Some(Value::Int(1)));
+    }
+    // A `Map.values()` view is an `AbstractCollection`, which does not override
+    // `equals` — so on a real JVM two distinct views are NEVER equal, however
+    // equal their contents, and a view is never equal to a `List` of the same
+    // elements in either direction. Both identity checks above have already
+    // run, so reaching here with a view on either side means "not the same
+    // object", which is the whole of the answer. See [`al_is_values_view`].
+    //
+    // Order matters: this must sit AFTER the identity checks (so `v.equals(v)`
+    // still answers true, as HotSpot's `selfView.equals=true` records) and
+    // BEFORE `al_state`, so no content is ever compared.
+    if al_is_values_view(ctx, this) || al_is_values_view(ctx, other) {
+        return Ok(Some(Value::Int(0)));
     }
     let (data_a, size_a) = al_state(ctx, this);
     let (data_b, size_b) = al_state(ctx, other);
@@ -8728,12 +9142,16 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> Result<i32, Meth
         Value::Float(x) => Ok(cratonvm_types::jfp::float_hash_code(*x)),
         Value::Double(x) => Ok(cratonvm_types::jfp::double_hash_code(*x)),
         Value::Object(Some(obj)) => {
-            // String hashCode by value (UTF-16 code units, wrapping mul+add).
-            if let Some(s) = ctx.read_string(*obj) {
-                let mut h: i32 = 0;
-                for cu in s.encode_utf16() {
-                    h = h.wrapping_mul(31).wrapping_add(cu as i32);
-                }
+            // String hashCode by value, asked of the VM so it is computed from
+            // the receiver's own UTF-16 storage. Decoding to a Rust `String`
+            // first and re-encoding — what this did — turns every unpaired
+            // surrogate into `U+FFFD` before the multiply-add ever runs, so a
+            // `Map`/`Set` holding such content reported a stable but WRONG
+            // aggregate hash (MEASURED 2026-08-17: `HashMap.hashCode()` 2124877
+            // where HotSpot says 1839336). `map_hash_key`, one screen up,
+            // already asks the same question this way; the two must not answer
+            // differently about the same String.
+            if let Some(h) = ctx.java_string_hash_code(*obj) {
                 return Ok(h);
             }
             // Primitive wrapper types hash by their boxed primitive value.
@@ -10494,6 +10912,22 @@ fn native_map_put_evict(
     if is_unmod_wrapper(ctx, this) {
         return Err(unsupported_op());
     }
+    // The `Hashtable` null axis, VALUE BEFORE KEY. `Hashtable.put` reads:
+    //
+    // ```java
+    // // Make sure the value is not null
+    // if (value == null) { throw new NullPointerException(); }
+    // // Makes sure the key is not already in the hashtable.
+    // Entry<?,?> tab[] = table;
+    // int hash = key.hashCode();
+    // ```
+    //
+    // so `put(null, null)` is message-less (MEASURED), not the helpful-NPE
+    // text — the order is observable and must be preserved. A plain
+    // `Hashtable` receiver never reaches the CHM / LHM / TreeMap redirects
+    // below, so testing here costs nothing on those paths.
+    ht_reject_null_value(ctx, this, args.get(2))?;
+    ht_reject_null_key(ctx, this, args.get(1))?;
     // A `java/util/Map.put` interface native dispatched on a
     // ConcurrentHashMap receiver must use the segmented CHM path — the
     // plain-HashMap bucket code would treat the segments array as buckets.
@@ -10985,6 +11419,13 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE K. `Hashtable.get` is `int hash = key.hashCode();` on its second
+    // line, so a null key never reaches a bucket. `HashMap.get(null)` is legal
+    // and answers null, which is why this is receiver-routed rather than a
+    // guard on the shared body. It also covers `Hashtable.getOrDefault`, whose
+    // JDK body is `V result = get(key);` over this very native, and the
+    // `compute*` natives, which open with a `native_map_get`.
+    ht_reject_null_key(ctx, this, args.get(1))?;
     if is_tree_map_receiver(ctx, this) {
         return native_tm_get(ctx, args);
     }
@@ -11003,6 +11444,30 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// case user code runs. String hash/equality are final, pure operations, so
 /// handling them here avoids that native-call machinery while preserving the
 /// exact Java `HashMap` hash spreading and content-equality contracts.
+///
+/// # Both operations are asked of the VM, not of a decoded `String`
+///
+/// This path used to derive the hash from `read_string(key).encode_utf16()` and
+/// compare node keys as decoded `&str`. A Rust `str` cannot hold an unpaired
+/// UTF-16 surrogate, so that decode substitutes `U+FFFD` — and the two halves
+/// of the resulting divergence are both silent:
+///
+///   * `put` files the entry under [`map_hash_key`], which asks
+///     `java_string_hash_code` and therefore uses the REAL units. `get` looked
+///     in the `U+FFFD` bucket. MEASURED on 2026-08-17: `m.put(k, v)` followed
+///     by `m.get(k)` — the *same object* — answered `null`. A map that accepts
+///     a key and then cannot find it again is the shape that corrupts an
+///     application without ever raising anything;
+///   * two DIFFERENT keys whose only difference is which unpaired surrogate
+///     they carry both decode to `U+FFFD`, so the `&str` comparison called
+///     them equal and the walk would have returned the wrong node.
+///
+/// `java_string_hash_code` and `java_strings_equal` answer from the receiver's
+/// own character storage, so both defects go away together — and the hash here
+/// is now literally the same call `map_hash_key` makes, which is what makes
+/// "`put` and `get` agree" structural rather than coincidental.
+/// `java_string_hash_code` also IS the "is this a `java.lang.String`" gate it
+/// replaces: the VM answers `None` for anything else.
 fn native_hashmap_get_string_fast(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -11011,13 +11476,18 @@ fn native_hashmap_get_string_fast(
     if let Some(value) = ctx.hashmap_string_node_cache_get_object(this, key) {
         return Some(Ok(Some(value)));
     }
-    let key_text = ctx.read_string(key)?;
-    if let Some(value) = ctx.hashmap_string_node_cache_get(this, &key_text) {
-        return Some(Ok(Some(value)));
-    }
-    let mut raw_hash: i32 = 0;
-    for unit in key_text.encode_utf16() {
-        raw_hash = raw_hash.wrapping_mul(31).wrapping_add(unit as i32);
+    let raw_hash = ctx.java_string_hash_code(key)?;
+    // The second memo is indexed by `&str`, so it may only be consulted for a
+    // key whose decoded text is FAITHFUL. A decode containing no `U+FFFD` is
+    // provably exact; one that does may be either a genuine `U+FFFD` or a
+    // mangled surrogate, and those two must never share a memo entry. Skipping
+    // the memo costs a chain walk; sharing it would resurrect the defect above
+    // one layer up.
+    let key_text = ctx.read_string(key).filter(|t| decode_is_faithful(t));
+    if let Some(text) = key_text.as_deref() {
+        if let Some(value) = ctx.hashmap_string_node_cache_get(this, text) {
+            return Some(Ok(Some(value)));
+        }
     }
     let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
     let (buckets, _, cap) = map_state(ctx, this);
@@ -11029,9 +11499,22 @@ fn native_hashmap_get_string_fast(
             return Some(Ok(Some(Value::Object(None))));
         };
         if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
-            if ctx.read_string(node_key).as_deref() == Some(key_text.as_str()) {
-                ctx.hashmap_string_node_cache_put(this, key, &key_text, node);
-                return Some(Ok(Some(get_node_value(ctx, node))));
+            match ctx.java_strings_equal(node_key, key) {
+                Some(true) => {
+                    if let Some(text) = key_text.as_deref() {
+                        ctx.hashmap_string_node_cache_put(this, key, text, node);
+                    }
+                    return Some(Ok(Some(get_node_value(ctx, node))));
+                }
+                Some(false) => {}
+                // A chain node whose key this comparison could not read is a
+                // lookup this fast path did not make. Hand the whole thing back
+                // to the general equality ladder — answering "absent" for a
+                // pair that was never compared is the mistake
+                // `chm-get-misses-stored-key-in-process-RETIRED-20260804.md`
+                // records, and `native_chm_get_string_chain` refuses the same
+                // way.
+                None => return None,
             }
         }
         node_value = ctx.get_field(node, NODE_FIELD_NEXT);
@@ -11336,6 +11819,9 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    // RULE K — `Hashtable.remove(Object)` is `int hash = key.hashCode();` on
+    // its second line, exactly like `get`.
+    ht_reject_null_key(ctx, this, args.get(1))?;
 
     // Keep both arguments rooted from native entry. `HashSet.remove()` is used
     // by ThreadPoolExecutor.processWorkerExit while another thread can drive a
@@ -11630,22 +12116,247 @@ fn native_map_remove_pinned(
 // the receiver routing (LinkedHashMap / TreeMap / ConcurrentHashMap /
 // Hashtable) themselves.
 
-/// `Hashtable` (and `Properties`) reject a null value in all three of these
-/// methods (`Objects.requireNonNull(value)` is the first statement of each);
-/// `HashMap`/`LinkedHashMap` accept null values throughout. One helper so the
-/// three natives below stay a faithful mirror of whichever override the
-/// receiver actually has.
-fn map_kv_reject_null_for_hashtable(
+// ---------------------------------------------------------------------------
+// The `java.util.Hashtable` null axis
+// ---------------------------------------------------------------------------
+//
+// MEASURED on the oracle 2026-08-16 (HotSpot 25.0.3+9-LTS,
+// `scratchpad/g1/{Probe,Probe2}.java`; the full table is in
+// `docs/known-issues/jdk-only/G1-1-...`). `Hashtable`'s rule is TWO rules, and
+// they are not the two `Properties` has:
+//
+//   RULE V (value/function). Every `Hashtable` method that takes a value or a
+//     function opens with `Objects.requireNonNull(...)` — or, in `contains` and
+//     `containsValue`, a literal `throw new NullPointerException()`. The NPE
+//     carries **no message**, and it is checked FIRST, before the key is even
+//     looked at: `put(null, null)`, `remove(null, null)`,
+//     `replace(null, null)`, `replace(null, null, null)` all measure
+//     message-less.
+//
+//   RULE K (key). Once the value check passes, a null key dies on the bucket
+//     walk's own `key.hashCode()`, so HotSpot's helpful-NPE names the local:
+//     `Cannot invoke "Object.hashCode()" because "key" is null`. That is a
+//     TRANSCRIBED string, not a derived one.
+//
+// The one row that generalising would have got wrong: `Hashtable.merge` does
+// **not** `requireNonNull` its value — only its remapping function — so
+// `ht.merge("k", null, f)` computes and returns normally where
+// `HashMap.merge("k", null, f)` throws. (`Hashtable.merge` is not registered
+// natively here, so no code below needs the exception; it is recorded so the
+// next lane does not "fix" it.)
+//
+// `Properties` is a DIFFERENT contract and must not be folded in: its write
+// path delegates to a side `ConcurrentHashMap`, so every refusal is
+// message-less (no `hashCode` text) and `props.remove(k, null)` does not throw
+// at all — it answers `false`. Hence every predicate below distinguishes
+// `is_plain_hashtable_receiver` (Hashtable, Properties EXCLUDED) from
+// `is_hashtable_receiver` (Properties INCLUDED).
+
+/// HotSpot's helpful-NPE text when a `java.util.Hashtable` bucket walk
+/// dereferences a null key. MEASURED, transcribed character for character:
+///
+/// ```text
+/// java.util.Hashtable | get(null) | java.lang.NullPointerException
+///     msg=<<Cannot invoke "Object.hashCode()" because "key" is null>>
+/// ```
+///
+/// The local name is `key` in every `Hashtable` method that produces it, which
+/// is why one constant serves the whole family.
+const HASHTABLE_NULL_KEY_MSG: &str = "Cannot invoke \"Object.hashCode()\" because \"key\" is null";
+
+/// `java.util.Hashtable` or an ordinary subclass, with `java.util.Properties`
+/// EXCLUDED — the receiver test the null axis needs.
+///
+/// It is the same bit `uses_native_hashtable_layout` reads
+/// (`CF_HASHTABLE_LAYOUT`, memoized per `ClassId`), asked for a different
+/// reason: there, "does this receiver keep its entries in the native bucket
+/// array"; here, "does this receiver have `Hashtable`'s null contract rather
+/// than `Properties`' side-`ConcurrentHashMap` one". Both questions have the
+/// same answer for the same reason — `Properties` is the subclass that stops
+/// behaving like `Hashtable` — so they share the flag rather than paying for a
+/// second class walk.
+#[inline]
+fn is_plain_hashtable_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    uses_native_hashtable_layout(ctx, this)
+}
+
+/// RULE K. Refuse an explicitly-passed null key on a plain `Hashtable`
+/// receiver, with the transcribed helpful-NPE text.
+///
+/// `key` is `args.get(n)`, not an `unwrap_or`-flattened `Value`, on purpose:
+/// a MISSING argument is a malformed native call and must not be reported as a
+/// program-level NPE (the same distinction `native_map_merge` draws for its
+/// remapping function).
+fn ht_reject_null_key(
     ctx: &dyn NativeContext,
     this: ObjectRef,
-    value: &Value,
-    method: &str,
+    key: Option<&Value>,
 ) -> Result<(), MethodCallFailed> {
-    if matches!(value, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
+    if matches!(key, Some(Value::Object(None))) && is_plain_hashtable_receiver(ctx, this) {
         return Err(RuntimeError::NullPointerException {
-            message: Some(format!("Hashtable.{method}: null value")),
+            message: Some(HASHTABLE_NULL_KEY_MSG.to_string()),
         }
         .into());
+    }
+    Ok(())
+}
+
+/// RULE V. Refuse an explicitly-passed null value on a plain `Hashtable`
+/// receiver. `Objects.requireNonNull` and `throw new NullPointerException()`
+/// both produce a message-less NPE, and inventing text here is exactly the
+/// defect F41-1 §3 caught twice.
+fn ht_reject_null_value(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    value: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    if matches!(value, Some(Value::Object(None))) && is_plain_hashtable_receiver(ctx, this) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
+    Ok(())
+}
+
+/// Message-less NPE, the shape `Objects.requireNonNull` and
+/// `ConcurrentHashMap`'s explicit `throw new NullPointerException()` share.
+#[inline]
+fn bare_npe() -> MethodCallFailed {
+    RuntimeError::NullPointerException { message: None }.into()
+}
+
+/// RULE F. Refuse an explicitly-passed null **functional argument** — the
+/// `Consumer`, `BiConsumer`, `Function`, `BiFunction`, `UnaryOperator` or
+/// `Predicate` that `forEach` / `replaceAll` / `removeIf` / `compute*` /
+/// `merge` take.
+///
+/// MEASURED on HotSpot 25.0.3+9-LTS, 2026-08-16, and the answer is the one
+/// uniform column this whole sweep produced: **a bare, message-less
+/// `NullPointerException` on every mutable receiver** — `HashMap`,
+/// `LinkedHashMap`, `TreeMap`, `Hashtable`, `Properties`,
+/// `ConcurrentHashMap`, `ConcurrentSkipListMap`, `IdentityHashMap`,
+/// `WeakHashMap`, `ArrayList`, `LinkedList`, `Vector`, `Stack`, `HashSet`,
+/// `LinkedHashSet`, `TreeSet`, `ArrayDeque`, `PriorityQueue`,
+/// `CopyOnWriteArrayList`, `ConcurrentLinkedQueue`, and every `values()` /
+/// `keySet()` / `entrySet()` view of the six map families. Every one of those
+/// methods opens `Objects.requireNonNull(<the function>)`.
+///
+/// Three properties of that rule are load-bearing and none is guessable:
+///
+/// * **It fires on an EMPTY receiver too.** `new HashMap<>().forEach(null)`
+///   throws; the refusal is not a side effect of reaching the first element.
+///   Every body below therefore checks BEFORE it looks at the contents.
+/// * **It fires BEFORE the null-key check.** MEASURED across all six map
+///   receivers: `ht.computeIfAbsent(null, null)` is message-less, while
+///   `ht.computeIfAbsent(null, F)` carries [`HASHTABLE_NULL_KEY_MSG`]. That is
+///   G1-1's RULE V / RULE K ordering, extended to the function argument, and
+///   it is why callers put this call ahead of [`ht_reject_null_key`].
+/// * **It does NOT extend to an immutable receiver, and it does NOT extend to
+///   `sort`.** MEASURED: `List.of("a").removeIf(null)`,
+///   `.replaceAll(null)`, `.sort(null)` and
+///   `Collections.unmodifiableMap(m).replaceAll(null)` all throw
+///   `UnsupportedOperationException`, not NPE — immutability is checked first
+///   — while `List.of("a").forEach(null)` (which mutates nothing) throws the
+///   NPE. And `list.sort(null)` is not a null-argument error at all: a null
+///   `Comparator` MEANS natural ordering and sorts normally
+///   (`ArrayList`, `LinkedList`, `Vector`, `Stack`, `CopyOnWriteArrayList`,
+///   `Arrays.asList`, `subList`, `Collections.sort(l, null)` and
+///   `Arrays.sort(a, null)` were all measured returning `[a, b]`).
+///   So this helper is called from the mutable-receiver bodies only, and never
+///   from a `*_sort_comparator` body — `native_al_sort_comparator` and
+///   `native_collections_sort_comparator` already route a null comparator to
+///   natural ordering and are correct as they stand.
+///
+/// `arg` is `args.get(n)`, NOT an `unwrap_or`-flattened `Value`, for the same
+/// reason [`ht_reject_null_key`] takes it that way: a **missing** argument is a
+/// malformed native call and must keep its existing no-op, while an
+/// **explicitly passed** null is a program-level error the JDK reports. The
+/// bodies below all previously collapsed both cases into "return the empty
+/// answer", which is the fabricated-success shape — the caller is told the
+/// operation succeeded and nothing happened.
+#[inline]
+fn reject_null_functional(arg: Option<&Value>) -> Result<(), MethodCallFailed> {
+    if matches!(arg, Some(Value::Object(None))) {
+        return Err(bare_npe());
+    }
+    Ok(())
+}
+
+/// `remove(Object, Object)`'s receiver-routed null contract.
+///
+/// MEASURED, and the three receivers disagree in three different ways:
+///
+/// | receiver | `remove(null, v)` | `remove(k, null)` | `remove(null, null)` |
+/// |---|---|---|---|
+/// | `HashMap` | `false` | `false` | `false` |
+/// | `Hashtable` | NPE `Cannot invoke "Object.hashCode()"...` | NPE (no msg) | NPE (no msg) |
+/// | `Properties` | NPE (no msg) | **`false`** | NPE (no msg) |
+///
+/// `Hashtable.remove(k,v)` is `Objects.requireNonNull(value)` then the bucket
+/// walk, so the VALUE is checked first. `Properties.remove(k,v)` delegates to
+/// its side `ConcurrentHashMap`, whose `remove(k,v)` is
+/// `if (key == null) throw new NullPointerException(); return value != null && ...`
+/// — the key is checked first and a null value is simply "no match".
+fn map_remove_kv_null_contract(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Option<&Value>,
+    value: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    if is_plain_hashtable_receiver(ctx, this) {
+        ht_reject_null_value(ctx, this, value)?;
+        ht_reject_null_key(ctx, this, key)?;
+    } else if is_hashtable_receiver(ctx, this) {
+        // `Properties`: key only, message-less. Deliberately no value check —
+        // measured `false`, and the previous shared helper threw here.
+        if matches!(key, Some(Value::Object(None))) {
+            return Err(bare_npe());
+        }
+    }
+    Ok(())
+}
+
+/// `replace(K, V)`'s receiver-routed null contract. `Hashtable.replace` is
+/// `Objects.requireNonNull(value)` then the bucket walk;
+/// `Properties.replace` delegates to `ConcurrentHashMap.replace`, which
+/// refuses both, message-less. MEASURED: `ht.replace(null, null)` is
+/// message-less, so the value must be checked BEFORE the key.
+fn map_replace_kv_null_contract(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Option<&Value>,
+    value: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    if is_plain_hashtable_receiver(ctx, this) {
+        ht_reject_null_value(ctx, this, value)?;
+        ht_reject_null_key(ctx, this, key)?;
+    } else if is_hashtable_receiver(ctx, this) {
+        if matches!(value, Some(Value::Object(None))) || matches!(key, Some(Value::Object(None))) {
+            return Err(bare_npe());
+        }
+    }
+    Ok(())
+}
+
+/// `replace(K, V, V)`'s receiver-routed null contract. `Hashtable.replace`
+/// requires BOTH values non-null (old first, then new) before the bucket walk
+/// reaches the key; `Properties` refuses all three message-less. MEASURED.
+fn map_replace3_null_contract(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Option<&Value>,
+    old_value: Option<&Value>,
+    new_value: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    if is_plain_hashtable_receiver(ctx, this) {
+        ht_reject_null_value(ctx, this, old_value)?;
+        ht_reject_null_value(ctx, this, new_value)?;
+        ht_reject_null_key(ctx, this, key)?;
+    } else if is_hashtable_receiver(ctx, this) {
+        if matches!(old_value, Some(Value::Object(None)))
+            || matches!(new_value, Some(Value::Object(None)))
+            || matches!(key, Some(Value::Object(None)))
+        {
+            return Err(bare_npe());
+        }
     }
     Ok(())
 }
@@ -11665,7 +12376,7 @@ fn native_map_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected = args.get(2).copied().unwrap_or(Value::Object(None));
-    map_kv_reject_null_for_hashtable(ctx, this, &expected, "remove")?;
+    map_remove_kv_null_contract(ctx, this, args.get(1), args.get(2))?;
     // GC-safety: `get`/`containsKey`/`remove` each dispatch the key's
     // `hashCode()`/`equals()` — arbitrary Java that can complete a moving young
     // GC — so every receiver/key/value local is re-read from its pin after each
@@ -11716,7 +12427,7 @@ fn native_map_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    map_replace_kv_null_contract(ctx, this, args.get(1), args.get(2))?;
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let new_pin = pin_value(ctx, new_val);
@@ -11765,8 +12476,7 @@ fn native_map_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
-    map_kv_reject_null_for_hashtable(ctx, this, &old_val, "replace")?;
-    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    map_replace3_null_contract(ctx, this, args.get(1), args.get(2), args.get(3))?;
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let old_pin = pin_value(ctx, old_val);
@@ -11843,6 +12553,8 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE K — `Hashtable.containsKey` opens with `key.hashCode()` too.
+    ht_reject_null_key(ctx, this, args.get(1))?;
     if is_tree_map_receiver(ctx, this) {
         return native_tm_contains_key(ctx, args);
     }
@@ -11992,6 +12704,12 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    // RULE V. `Hashtable.containsValue` is `return contains(value);` and
+    // `Hashtable.contains` opens with a literal
+    // `if (value == null) throw new NullPointerException();` — so it refuses
+    // even on an EMPTY table (measured). `HashMap.containsValue(null)` is legal
+    // and answers false.
+    ht_reject_null_value(ctx, this, args.get(1))?;
     if is_chm_receiver(ctx, this) {
         return native_chm_contains_value(ctx, args);
     }
@@ -12152,8 +12870,7 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let sync = wants_synchronized_views(&*ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let (_, val_handles) = pin_value_slice(ctx, &values);
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -12164,6 +12881,7 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(this)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, this);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(this_pin);
@@ -12196,8 +12914,7 @@ pub fn make_live_values_list(
     let sync = wants_synchronized_views(&*ctx, source);
     let source_pin = ctx.pin_native_root(source);
     let (_, val_handles) = pin_value_slice(ctx, values);
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -12208,6 +12925,7 @@ pub fn make_live_values_list(
     let source = ctx.read_native_pin(source_pin, source);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, source);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(source_pin);
@@ -12555,6 +13273,30 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null source map silently no-op'd here. MEASURED on the oracle, and the
+    // message is receiver-routed because the two JDK bodies dereference
+    // different members of it:
+    //
+    // * `HashMap.putAll(m)`   -> `putMapEntries(m, true)` -> `int s = m.size();`
+    //   `Cannot invoke "java.util.Map.size()" because "m" is null`
+    //   (`LinkedHashMap` and `Properties` measure identically)
+    // * `Hashtable.putAll(t)` -> `for (Map.Entry e : t.entrySet())`
+    //   `Cannot invoke "java.util.Map.entrySet()" because "t" is null`
+    //
+    // Both are TRANSCRIBED, including the JDK's own parameter names `m` / `t`.
+    // As everywhere else here, only an explicitly-passed null throws; a
+    // missing argument stays the malformed-call no-op it was.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        let message = if is_plain_hashtable_receiver(ctx, this) {
+            "Cannot invoke \"java.util.Map.entrySet()\" because \"t\" is null"
+        } else {
+            "Cannot invoke \"java.util.Map.size()\" because \"m\" is null"
+        };
+        return Err(RuntimeError::NullPointerException {
+            message: Some(message.to_string()),
+        }
+        .into());
+    }
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -13345,6 +14087,59 @@ fn is_map_view_carrier(name: &str) -> bool {
     MAP_VIEW_CARRIERS.contains(&name)
 }
 
+/// The `(elementData, size, n_fields)` triple a [`MAP_VIEW_CARRIERS`] object
+/// keeps its list state in — placed ABOVE every field the carrier class itself
+/// declares, rather than at `java/util/ArrayList`'s absolute indices.
+///
+/// The comment on `MAP_VIEW_CARRIERS` used to argue that ArrayList's absolute
+/// `elementData`/`size` (slots 1 and 2 in the real-JDK layout, with
+/// `AbstractList.modCount` at 0) sit "past the single `this$0` these classes
+/// declare". Five of the six carriers do declare exactly one field. **The sixth
+/// does not**, and `javap -p` on JDK 25.0.3+9 says so:
+///
+/// ```text
+/// final class java.util.LinkedHashMap$LinkedValues … {
+///   final boolean reversed;              -> slot 0
+///   final java.util.LinkedHashMap this$0; -> slot 1
+/// ```
+///
+/// so `al_set_data` wrote the element buffer straight over `this$0`, and
+/// [`values_view_class_source`] — which resolves `this$0` BY NAME, precisely
+/// because `LinkedValues` puts it at slot 1 — read that buffer back and handed
+/// an `Object[]` to `collect_entries_any` as if it were the source map. MEASURED
+/// consequence before this function existed: `LinkedHashMap$LinkedValues.this$0`
+/// reflected as `[Ljava.lang.Object;[len=11]` where HotSpot reports
+/// `java.util.LinkedHashMap`, `values().size()` answered **0** for a
+/// three-entry map in BOTH policy modes, and every element-touching operation
+/// died with `AbstractMethodError: java/util/Map.isEmpty()Z` under `--jdk-only`
+/// (7 of 7 rows; see `docs/known-issues/jdk-only/G22-1-*` and its G13-1
+/// predecessor).
+///
+/// This is the same move [`al_slots_for_uncached`] already makes for
+/// `java/util/Vector`: a receiver that is not an `ArrayList` does not get
+/// `ArrayList`'s slots. For the five one-field carriers the answer is `(1, 2, 3)`
+/// — bit-identical to what they used before, which is why the measured
+/// `HashMap` / `TreeMap` / `Hashtable` / `ConcurrentHashMap` rows (all clean)
+/// stay exactly as they were. Only `LinkedValues` moves, to `(2, 3, 4)`.
+///
+/// `class_num_total_fields` counts INHERITED fields too, which is required:
+/// `ConcurrentHashMap$ValuesView` declares nothing itself and inherits `map`
+/// from `ConcurrentHashMap$CollectionView`.
+///
+/// `None` (or a zero count) means the carrier class is not linked — a
+/// synthetic-JDK build, or a call that runs before the class resolves. There is
+/// then no declared field to collide with, so the historical ArrayList layout is
+/// the right answer, and it is also the one [`alloc_view_carrier`] allocates
+/// for. `None` propagates all the way out of `al_slots_for_uncached` so the
+/// verdict is NOT cached, for the reason [`al_slots_resolved`] gives.
+fn view_carrier_slots(ctx: &dyn NativeContext, cid: ClassId) -> Option<(usize, usize, usize)> {
+    let declared = ctx.class_num_total_fields(cid);
+    if declared == 0 {
+        return al_slots_resolved(ctx);
+    }
+    Some((declared, declared + 1, declared + 2))
+}
+
 /// The carrier classes a map's SET-shaped view (`keySet()`, `entrySet()`) is
 /// minted under — the [`MAP_VIEW_CARRIERS`] argument, one family over.
 ///
@@ -13552,20 +14347,39 @@ fn values_carrier_for(ctx: &dyn NativeContext, source: ObjectRef) -> &'static st
 /// fail — into a `NoClassDefFoundError`. Degrading to the old carrier costs the
 /// `getClass()` fidelity for that run and nothing else, because every
 /// `native_al_*` path still accepts an ArrayList-classed view.
+///
+/// The field count is derived HERE rather than passed in, and that is the
+/// invariant the `LinkedValues` fix rests on: the number of slots allocated and
+/// the slot indices [`al_slots_for`] later reads must both come from
+/// [`view_carrier_slots`] applied to the SAME `ClassId`. Callers used to hand
+/// in `al_slots(ctx).2` — ArrayList's own count — which is one slot short for a
+/// two-field carrier, so `al_set_size` would silently skip its
+/// out-of-bounds write and the view would report size 0.
 fn alloc_view_carrier(
     ctx: &mut dyn NativeContext,
     carrier: &str,
-    n_fields: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    let fallback = al_slots(ctx).2;
+    let is_carrier = is_map_view_carrier(carrier);
     if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
         if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
-            return Ok(ctx.alloc_object(cid, n_fields));
+            let n = if is_carrier {
+                view_carrier_slots(&*ctx, cid).map_or(fallback, |s| s.2)
+            } else {
+                fallback
+            };
+            return Ok(ctx.alloc_object(cid, n));
         }
     }
     if let Some(cid) = ctx.class_id_by_name(carrier) {
-        return Ok(ctx.alloc_object(cid, n_fields));
+        let n = if is_carrier {
+            view_carrier_slots(&*ctx, cid).map_or(fallback, |s| s.2)
+        } else {
+            fallback
+        };
+        return Ok(ctx.alloc_object(cid, n));
     }
-    try_alloc_synthetic(ctx, "java/util/ArrayList", n_fields)
+    try_alloc_synthetic(ctx, "java/util/ArrayList", fallback)
 }
 
 /// Build a `values()` view: an ArrayList-LAYOUT snapshot, under its own carrier
@@ -13588,8 +14402,7 @@ fn make_view_list_of(
     } else {
         elem_base
     };
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -13600,6 +14413,7 @@ fn make_view_list_of(
     let source = ctx.read_native_pin(source_pin, source);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, source);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, vals.len() as i32);
     ctx.unpin_native_roots(first_pin);
@@ -13970,20 +14784,11 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<Ob
     let source = ctx.read_native_pin(source_pin, source);
     // Determine whether elements are Map.Entry (entrySet) by inspecting the
     // current head element's class — restricted to our synthetic entry classes
-    // so an app value type named `*Entry` is not misread as an entry.
-    let is_entry_view = {
-        let (data, size) = al_state(ctx, list);
-        match data {
-            Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
-                Value::Object(Some(e)) => ctx
-                    .class_name_of_id(ctx.class_id_of_object(e))
-                    .map(|n| is_synthetic_map_entry_class(&n))
-                    .unwrap_or(false),
-                _ => false,
-            },
-            _ => false,
-        }
-    };
+    // so an app value type named `*Entry` is not misread as an entry. Factored
+    // into `al_view_holds_entries` so this reading and `al_is_values_view`'s
+    // cannot drift; the body is unchanged (both are pure field reads, so
+    // hoisting it behind a call introduces no GC point).
+    let is_entry_view = al_view_holds_entries(ctx, list);
     let entries = collect_entries_any(ctx, source)?;
 
     // GC-SAFETY: the entry-view branch below allocates a new `SimpleEntry`
@@ -14072,6 +14877,322 @@ fn view_source_in(ctx: &dyn NativeContext, data: ObjectRef, size: i32) -> Option
         }
     }
     None
+}
+
+/// `true` iff a marker-carrying view list holds `Map.Entry` elements (an
+/// `entrySet()` view) rather than plain values (a `values()` view).
+///
+/// Restricted to our synthetic entry classes so an app value type named
+/// `*Entry` is not misread as an entry — the same test [`resync_values_view`]
+/// applies, factored out so the two callers cannot drift. An EMPTY view answers
+/// `false`: with no head element there is nothing to classify, and every caller
+/// of this predicate wants `values()` to be the default reading.
+fn al_view_holds_entries(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    let (data, size) = al_state(ctx, list);
+    match data {
+        Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
+            Value::Object(Some(e)) => ctx
+                .class_name_of_id(ctx.class_id_of_object(e))
+                .map(|n| is_synthetic_map_entry_class(&n))
+                .unwrap_or(false),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `true` iff `list` is one of this crate's live `Map.values()` views — an
+/// `ArrayList`-shaped carrier with a source-map marker in its trailing capacity
+/// slot ([`values_view_source`]) whose elements are values, not entries.
+///
+/// **Why any native needs to ask.** On a real JVM `Map.values()` returns a
+/// `HashMap$Values` / `LinkedHashMap$LinkedValues` / `TreeMap$Values` /
+/// `Hashtable$ValueCollection`, and every one of those extends
+/// `java.util.AbstractCollection`, which overrides **neither `equals` nor
+/// `hashCode`**. Both therefore come from `java.lang.Object` and are IDENTITY
+/// operations. Measured on HotSpot 25.0.3+9 (probe `ValuesSem`, two `HashMap`s
+/// with identical contents):
+///
+/// ```text
+///   hm.values.class                       java.util.HashMap$Values
+///   equalMaps.values.equals               false      <- content-equal, still not equal
+///   values.hashCode.isIdentity            true
+///   values.equals.arrayListOfSameContent  false
+///   arrayListOfSameContent.equals.values  false
+///   empty.values.equals.emptyList         false      <- not even when both are empty
+///   equalMaps.keySet.equals               true       <- contrast: AbstractSet DOES override
+/// ```
+///
+/// This VM hands back a `java/util/ArrayList` instead (`native_map_values`,
+/// `native_chm_values`, `make_live_values_list`), so without this predicate
+/// `native_al_equals`/`native_al_hash_code` answer `AbstractList`'s
+/// CONTENT-based contract on an object whose real class has no such contract.
+/// The divergence is silent and it runs in the wrong direction: two unrelated
+/// maps' value collections compare EQUAL, and a `values()` view compares equal
+/// to an ordinary `ArrayList` of the same elements — so a `Set<Collection<..>>`
+/// or a `Map` keyed on a view collapses distinct entries into one.
+///
+/// The `keySet()`/`entrySet()` views are deliberately NOT covered: their real
+/// classes extend `AbstractSet`, which DOES override both, so the content-based
+/// answer is the correct one there. That is why the entry discriminator is part
+/// of this predicate and not an afterthought.
+/// The second disjunct covers a receiver whose class is ALREADY one of the five
+/// real view classes ([`is_values_view_class`]). For such an object the answer
+/// is the same and the reason is stronger — its real superclass genuinely is
+/// `AbstractCollection`, so identity is not an emulation but the actual
+/// contract. Keeping both readings behind one predicate is what stops the
+/// `ArrayList`-shaped carrier and the real class from drifting apart while the
+/// two shapes coexist.
+fn al_is_values_view(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    if is_values_view_class(ctx, list) {
+        return true;
+    }
+    values_view_source(ctx, list).is_some() && !al_view_holds_entries(ctx, list)
+}
+
+/// `true` iff `obj`'s runtime class is one of the five real JDK classes that
+/// `Map.values()` returns. See [`CF_VALUES_VIEW`].
+///
+/// **Why these receivers need rerouting rather than their own bytecode.**
+/// Measured on HotSpot 25.0.3+9 (`javap -p -c java.util.HashMap$Values`), the
+/// real body of `size()` is three instructions:
+///
+/// ```text
+///   0: aload_0
+///   1: getfield  #7   // Field this$0:Ljava/util/HashMap;
+///   4: getfield  #19  // Field java/util/HashMap.size:I
+///   7: ireturn
+/// ```
+///
+/// — a RAW read of the source map's `size` field. In this VM an integer-keyed
+/// `HashMap`'s entries live in the `hm_int_fast_shards` overlay:
+/// `try_hm_int_fast_put` inserts into the Rust shard and returns without ever
+/// calling `set_map_size`, and it only engages when `map_state` already reports
+/// size 0. `native_map_size` reads `hm_int_fast_len` BEFORE `map_state`, so the
+/// two owners never reconcile and the heap `size` slot stays 0 for the object's
+/// whole life. Real `HashMap$Values.size()` would therefore answer **0** on a
+/// non-empty map. `Hashtable$ValueCollection.size()` is the same shape
+/// (`getfield this$0.count`).
+///
+/// Not every method is like that, and the difference decides which ones need a
+/// native at all — `TreeMap$Values.size()` is `invokevirtual TreeMap.size()`
+/// and `HashMap$Values.clear()` is `invokevirtual HashMap.clear()`, both of
+/// which reach registered natives and are correct as bytecode. The per-class
+/// split is tabulated in `docs/known-issues/jdk-only/C13-1-*`.
+#[inline]
+fn is_values_view_class(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    receiver_facts(ctx, obj).has(CF_VALUES_VIEW)
+}
+
+/// `true` iff `view` is a [`MAP_VIEW_CARRIERS`] object THIS crate minted —
+/// i.e. one that already carries its elements in its own
+/// [`view_carrier_slots`] `elementData` slot and its source map in the element
+/// buffer's trailing capacity slot ([`values_view_source`]).
+///
+/// Such a receiver must NOT be re-expressed by [`vc_route`], for two reasons.
+/// The decisive one is termination: `vc_route` calls back into the SAME native
+/// entry point that reached it, over a carrier of the same class built by
+/// `make_view_list_of`, and that carrier would satisfy `vc_route`'s own test
+/// again — an unbounded recursion. It stayed latent only because nothing ever
+/// populated `this$0`, so [`values_view_class_source`] answered `None` and the
+/// route was inert; [`store_view_carrier_backref`] populates it, so the guard
+/// has to be explicit rather than accidental. The second reason is that the
+/// reroute would be pure waste: the direct decode is already live (every
+/// element-reading native opens with `resync_values_view`) and already writes
+/// removals through.
+///
+/// `vc_route` therefore keeps exactly the receivers it was written for: a view
+/// object that arrived from somewhere other than this crate's own minting.
+#[inline]
+fn is_own_view_carrier(ctx: &dyn NativeContext, view: ObjectRef) -> bool {
+    values_view_source(ctx, view).is_some()
+}
+
+/// Store the backing map in a [`MAP_VIEW_CARRIERS`] object's OWN declared
+/// enclosing-instance field — `this$0` on the five inner classes, `map` on
+/// `ConcurrentHashMap$ValuesView` (inherited from `CollectionView`) — the way
+/// the JDK's own constructors do.
+///
+/// MEASURED before this existed (`scratchpad/g22/G22Slot.java`, run with
+/// `--add-opens java.base/java.util=ALL-UNNAMED`, on both VMs): HotSpot reports
+/// `HashMap$Values.this$0 -> java.util.HashMap`, `TreeMap$Values.this$0 ->
+/// java.util.TreeMap` and `ConcurrentHashMap$ValuesView.map ->
+/// java.util.concurrent.ConcurrentHashMap`; CratonVM reported `null` for all
+/// three. Nothing had ever written those fields — the source map lived only in
+/// the element buffer's trailing capacity slot ([`values_view_source`]), which
+/// no reflective reader can see. G22-1 N2 / G13-1 N2.
+///
+/// Two guards, both structural rather than defensive:
+///
+/// * only a [`AlLayout::ViewCarrier`] receiver is written at all, so this can
+///   never touch an ordinary `ArrayList`;
+/// * only a slot strictly BELOW the receiver's `elementData` slot is written,
+///   which is exactly the range [`view_carrier_slots`] reserves for the
+///   carrier's own declared fields. This function therefore cannot re-create
+///   the collision it was added alongside, even if a future carrier's layout
+///   changes underneath it.
+fn store_view_carrier_backref(ctx: &mut dyn NativeContext, list: ObjectRef, source: ObjectRef) {
+    let ((data_slot, _, _), layout) = al_slots_and_layout_for(ctx, list);
+    if layout != AlLayout::ViewCarrier {
+        return;
+    }
+    let cid = ctx.class_id_of_object(list);
+    for name in ["this$0", "map"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, name) {
+            if slot < data_slot {
+                ctx.set_field(list, slot, Value::Object(Some(source)));
+                return;
+            }
+        }
+    }
+}
+
+/// The source map a real view-class object was built over.
+///
+/// Resolved BY NAME, never by slot, and the reason is
+/// `LinkedHashMap$LinkedValues` — it is the one member of the family with TWO
+/// fields, and `javap -p` declares them in this order:
+///
+/// ```text
+/// final class java.util.LinkedHashMap$LinkedValues extends
+///         java.util.AbstractCollection<V> implements java.util.SequencedCollection<V> {
+///   final boolean reversed;
+///   final java.util.LinkedHashMap this$0;
+/// ```
+///
+/// so its `this$0` is slot **1**, not slot 0. A hard-coded slot 0 would read
+/// the `reversed` boolean as an object reference — a wrong-typed read of
+/// exactly the kind `al_state`'s layout guard exists to prevent. The CHM member
+/// needs the second name: `ConcurrentHashMap$ValuesView` declares no map field
+/// itself and inherits `map` from `ConcurrentHashMap$CollectionView`, which
+/// `resolve_field_index_by_class_id` finds by walking the chain (the same walk
+/// that finds `Properties`' inherited `count` in [`map_size_slot`]).
+fn values_view_class_source(ctx: &dyn NativeContext, view: ObjectRef) -> Option<ObjectRef> {
+    let cid = ctx.class_id_of_object(view);
+    let nf = ctx.object_num_fields(view);
+    for name in ["this$0", "map"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, name) {
+            if slot < nf {
+                if let Value::Object(Some(m)) = ctx.get_field(view, slot) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Reroute a real `Map.values()` view-class receiver that arrived at one of the
+/// generic `ArrayList`-shaped natives, by re-expressing the call over a live
+/// `ArrayList`-shaped view of the same source map.
+///
+/// The twin of [`ksv_route`], and it exists for the same reason: a receiver
+/// that matches neither layout the generic natives read must not be decoded as
+/// though it did. It differs in one deliberate way — `ksv_route` hands off to a
+/// hand-written `native_ksv_*` implementation per method, whereas this one
+/// rebuilds the marker-carrying carrier that `native_map_values` already
+/// produces and then calls the SAME `imp`. That reuse is the point: liveness,
+/// write-through removal and the entry/value discriminator are all already
+/// implemented and measured on that path (`values_view_source` /
+/// `resync_values_view` / `propagate_list_removal`), so a view-class receiver
+/// gets the behaviour this VM already ships rather than a second
+/// implementation of it that can drift.
+///
+/// Two consequences worth stating rather than discovering:
+///
+/// * the iterator handed back is an iterator over the rebuilt carrier, so its
+///   `remove()` writes through to the source exactly as `values().iterator()`
+///   does today;
+/// * a `reversed` `LinkedValues` iterates FORWARD here. The `reversed` bit is
+///   read by nothing in this crate yet. That is a fidelity gap, not a crash,
+///   and it is unreachable until `native_lhm_values` returns the real class.
+///
+/// Errors are returned, never flattened to "empty". `collect_entries_any` can
+/// refuse (a `hashCode()` on an element can throw), and this crate has already
+/// paid once for a helper that mapped a refusal onto `Vec::new()` — see
+/// `collection_elements_generic`'s own doc.
+fn vc_route(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    imp: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if !is_values_view_class(ctx, this) {
+        return None;
+    }
+    if is_own_view_carrier(ctx, this) {
+        return None;
+    }
+    let source = values_view_class_source(ctx, this)?;
+    // GC-safety, and the pins go up FIRST — before `collect_entries_any`, not
+    // between it and `make_view_list_of`. Two distinct hazards:
+    //
+    //  * `collect_entries_any` re-enters Java (a TreeMap comparator, an
+    //    element's `hashCode`, a `Properties` entrySet rebuild), so it can move
+    //    `source` and every remaining argument before it returns. Pinning after
+    //    it would pin an address that is already stale — the "Family 1"
+    //    stale-ObjectRef shape this crate has paid for repeatedly (see
+    //    `remove_source_entry_by_value` immediately below).
+    //  * `make_view_list_of` then allocates the carrier AND its backing array.
+    //
+    // `vals` needs no pin of its own: `make_view_list_of` pins the slice it is
+    // handed as its very first act, before it allocates, and nothing between
+    // this `collect` and that call touches the Java heap.
+    let source_pin = ctx.pin_native_root(source);
+    let tail: Vec<Value> = args[1..].to_vec();
+    let (_, tail_handles) = pin_value_slice(ctx, &tail);
+    let entries = match collect_entries_any(ctx, source) {
+        Ok(e) => e,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Some(Err(e));
+        }
+    };
+    let vals: Vec<Value> = entries.into_iter().map(|(_, v)| v).collect();
+    let source = ctx.read_native_pin(source_pin, source);
+    // The carrier comes from the SOURCE map, not from `this`: this function
+    // rebuilds the carrier `native_map_values` would have produced for that
+    // map, and `this` is the view we are re-routing. Every other
+    // `make_view_list_of` call site derives it the same way. (The parameter and
+    // this call site arrived on opposite sides of the 2026-08-16 `dev` merge,
+    // which is why git produced a clean 3-argument call to a 4-argument fn.)
+    let carrier = values_carrier_for(&*ctx, source);
+    let list = match make_view_list_of(ctx, source, &vals, carrier) {
+        Ok(l) => l,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Some(Err(e));
+        }
+    };
+    let mut call_args: Vec<Value> = Vec::with_capacity(args.len());
+    call_args.push(Value::Object(Some(list)));
+    for (i, v) in tail.iter().enumerate() {
+        call_args.push(read_pinned_elem(ctx, tail_handles[i], *v));
+    }
+    let r = imp(ctx, &call_args);
+    ctx.unpin_native_roots(source_pin);
+    Some(r)
+}
+
+/// `vc_route`'s cheap arm for the two size questions.
+///
+/// `size()` and `isEmpty()` do not need the elements, so rebuilding the carrier
+/// for them would be an allocation (and a GC point) purely to count. Ask the
+/// source map instead — `native_map_size` already dispatches the TreeMap / CHM
+/// / integer-overlay families correctly, which is exactly the set of answers a
+/// view over that map must agree with.
+fn vc_route_source_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<MethodCallResult> {
+    if !is_values_view_class(ctx, this) {
+        return None;
+    }
+    if is_own_view_carrier(ctx, this) {
+        return None;
+    }
+    let source = values_view_class_source(ctx, this)?;
+    Some(native_map_size(ctx, &[Value::Object(Some(source))]))
 }
 
 /// Delete the first entry of `source` whose value equals `value` (identity
@@ -17876,7 +18997,16 @@ fn native_collections_unmodifiable_list(
 // ===========================================================================
 
 fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, and deliberately AHEAD of both routes. MEASURED: a null action
+    // throws on a `values()` / `keySet()` / `entrySet()` view exactly as it
+    // does on a plain list, and on an EMPTY one, so nothing is gained by
+    // rebuilding a carrier first — and `vc_route` re-enters this same body,
+    // where the check would fire anyway. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
+        return r;
+    }
+    if let Some(r) = vc_route(ctx, args, native_al_for_each) {
         return r;
     }
     let this = match args.first() {
@@ -17989,6 +19119,9 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // RULE F. MEASURED bare NPE on every map receiver INCLUDING an empty one,
+    // so the check precedes the entry walk. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -18029,6 +19162,8 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of the route — see the note in `native_al_for_each`.
+    reject_null_functional(args.get(1))?;
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
         return r;
     }
@@ -18704,6 +19839,12 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE F. MEASURED on `ArrayList`, `Vector`, `Stack`, `LinkedList`,
+    // `HashSet`, `TreeSet`, `ArrayDeque` and the map views, empty or not.
+    // NOTE this body serves MUTABLE receivers only — an immutable one answers
+    // `UnsupportedOperationException` instead, and is not registered here.
+    // See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let predicate = match args.get(1) {
         Some(Value::Object(Some(p))) => *p,
         _ => return Ok(Some(Value::Int(0))),
@@ -18789,6 +19930,10 @@ fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. `replaceAll` takes a `UnaryOperator`;
+    // `sort` takes a `Comparator` and a null one is NOT an error there — see
+    // `reject_null_functional`'s third bullet and `native_al_sort_comparator`.
+    reject_null_functional(args.get(1))?;
     let operator = match args.get(1) {
         Some(Value::Object(Some(op))) => *op,
         _ => return Ok(None),
@@ -18843,6 +19988,9 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key: MEASURED `computeIfAbsent(null, null)` is
+    // message-less on all six map receivers. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -18911,6 +20059,8 @@ fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let bi_function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -18983,6 +20133,10 @@ fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. MEASURED: this fires even when the key is
+    // ABSENT (`computeIfPresent("zz", null)` throws), so it cannot be folded
+    // into the present-branch. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let bi_function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -19155,6 +20309,8 @@ fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let bi_function = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(None),
@@ -22776,6 +23932,9 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_stream) {
+        return r;
+    }
+    if let Some(r) = vc_route(ctx, args, native_al_stream) {
         return r;
     }
     let this = match args.first() {
@@ -32151,11 +33310,28 @@ fn double_compare(a: f64, b: f64) -> i32 {
 fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodCallResult {
     match (a, b) {
         (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
-            // Try string comparison first
+            // Try string comparison first.
+            //
+            // By UTF-16 code UNIT, which is what `String.compareTo` compares —
+            // NOT `String::cmp`, which compares code points. The two disagree
+            // above the BMP: a supplementary character begins with a surrogate
+            // unit below `U+E000`, so Java sorts it BEFORE `U+E000..=U+FFFF`
+            // and Rust sorts it after (MEASURED both VMs, `G55Ord.java`; see
+            // `TreeKey`).
+            //
+            // And a decode that produced `U+FFFD` may have destroyed an
+            // unpaired surrogate, in which case this comparison is not ours to
+            // make: fall through to the real `Comparable.compareTo` dispatch at
+            // the bottom, which runs the receiver's own units-exact
+            // `String.compareTo`. Two keys mangled to the same `U+FFFD` text
+            // would otherwise compare EQUAL and a natural-order
+            // `TreeSet`/`TreeMap` would silently drop one of them.
             let sa = ctx.read_string(*ra);
             let sb = ctx.read_string(*rb);
-            if let (Some(sa), Some(sb)) = (sa, sb) {
-                return Ok(Some(Value::Int(sa.cmp(&sb) as i32)));
+            if let (Some(sa), Some(sb)) = (&sa, &sb) {
+                if let Some(ord) = compare_decoded_strings(sa, sb) {
+                    return Ok(Some(Value::Int(ord as i32)));
+                }
             }
             // Try as primitive wrapper: unbox BOTH receivers and compare the
             // boxed primitives. CRITICAL — gate on `unbox_wrapper` (a SINGLE
@@ -34037,6 +35213,64 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "clear", "()V", native_ll_clear);
     registry.register(c, "peek", "()Ljava/lang/Object;", native_ll_peek);
     registry.register(c, "poll", "()Ljava/lang/Object;", native_ll_poll);
+    // ---- the four `LinkedList` methods real bytecode was still MUTATING ----
+    //
+    // `ll_get` reads the overlay FIRST and only falls back to the real
+    // `first`/`last`/`size` on a MISS (see its overlay-MISS arm). `ll_set`
+    // mirrors overlay -> heap, but nothing mirrors heap -> overlay, and
+    // `<init>` seeds the overlay for every natively constructed list — so once
+    // a `LinkedList` exists, ANY real-bytecode write to `size`/`first`/`last`
+    // is invisible to every native reader, permanently. `native_ll_iterator`
+    // records the resulting reproducer (`NullPointerException: Cannot read
+    // field "item"` in real `LinkedList$ListItr.previous`) and concludes
+    // "keep the natives the single writer". These four registrations are the
+    // rest of that conclusion: without them the class still has four public
+    // entry points that run real mutating bytecode.
+    //
+    // Verified against `javap -p -c java.util.LinkedList` (JDK 25.0.3+9), which
+    // is what makes this a list of four and not a guess:
+    //
+    //   pollFirst()  `getfield first` then `invokevirtual unlinkFirst` — real
+    //                `unlinkFirst` writes `first`, `size` and `modCount`. The
+    //                `java/util/Deque` interface bridge does NOT cover it
+    //                (`register_queue_deque_interface_natives` registers
+    //                `peekFirst`/`peekLast` but no `pollFirst`/`pollLast`), and
+    //                an interface row would not win anyway: `LinkedList`
+    //                declares the method itself.
+    //   pollLast()   same shape through `unlinkLast`.
+    //   addAll(I,C)  links the new nodes inline, writing `first`/`last`/`size`.
+    //                Its no-index sibling `addAll(C)` was already registered
+    //                (`native_ll_add_all`, in the bulk-op registrar) — this is
+    //                the half of the pair that was missed.
+    //   descendingIterator()  does NOT go through the registered
+    //                `listIterator(I)`: its bytecode is
+    //                `new LinkedList$ListItr; dup; …; invokevirtual size;
+    //                 invokespecial ListItr.<init>(LinkedList;I)`, i.e. it
+    //                constructs the real node-live `ListItr` DIRECTLY, so
+    //                `remove()` calls real `LinkedList.unlink`. This is the
+    //                exact path `native_ll_iterator`'s comment names as the
+    //                measured reproducer, and it was the one door left open.
+    //
+    // The remaining unregistered `LinkedList` methods were checked and are
+    // benign: `remove()`, `element()`, `offerFirst`, `offerLast`, `push`, `pop`
+    // are one-line `invokevirtual`s onto methods registered above; `peekFirst`,
+    // `peekLast`, `indexOf`, `lastIndexOf` only READ the mirrored heap chain;
+    // `clone()` writes only the fresh clone's own fields before populating it
+    // through the native `add`.
+    registry.register(c, "pollFirst", "()Ljava/lang/Object;", native_ll_poll_first);
+    registry.register(c, "pollLast", "()Ljava/lang/Object;", native_ll_poll_last);
+    registry.register(
+        c,
+        "addAll",
+        "(ILjava/util/Collection;)Z",
+        native_ll_add_all_at,
+    );
+    registry.register(
+        c,
+        "descendingIterator",
+        "()Ljava/util/Iterator;",
+        native_ll_descending_iterator,
+    );
     registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
     // LinkedList.toArray(T[]) — typed overload. Without this the JDK's
@@ -35794,6 +37028,8 @@ fn native_ll_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let predicate = match args.get(1) {
         Some(Value::Object(Some(p))) => *p,
         _ => return Ok(Some(Value::Int(0))),
@@ -35897,6 +37133,181 @@ fn native_ll_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         return Ok(Some(Value::Object(None)));
     }
     Ok(Some(ll_unlink_first(ctx, this)))
+}
+
+/// `LinkedList.pollFirst()` — real bytecode is `first == null ? null :
+/// unlinkFirst(first)`, i.e. exactly `poll()`'s body. Registered separately
+/// because a native on `poll` does not intercept `pollFirst`, and the real
+/// `unlinkFirst` is a second writer on `size`/`first` that `ll_get`'s
+/// overlay-first read can never see. See the registrar note.
+fn native_ll_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_ll_poll(ctx, args)
+}
+
+/// `LinkedList.pollLast()` — `last == null ? null : unlinkLast(last)`. The
+/// mirror image of [`native_ll_poll_first`]; `removeLast()` differs only in
+/// throwing `NoSuchElementException` on empty where this answers `null`.
+fn native_ll_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if ll_size(ctx, this) == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    Ok(Some(ll_unlink_last(ctx, this)))
+}
+
+/// `LinkedList.addAll(int index, Collection c)` — the indexed half of the
+/// `addAll` pair whose no-index sibling is [`native_ll_add_all`].
+///
+/// Bounds are checked BEFORE the first link, as the JDK does
+/// (`checkPositionIndex` precedes `c.toArray()`), so a bad index cannot leave a
+/// half-inserted list. `collect_collection_elements_or_real` is the same
+/// accessor `native_ll_add_all` uses, so a foreign (non-native-backed) source
+/// collection is read through its own bytecode rather than reported empty.
+fn native_ll_add_all_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let coll = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = ll_size(ctx, this);
+    if index < 0 || index > size {
+        return Err(ll_out_of_bounds(index, size));
+    }
+    // Family-1 fix (cce0079), copied from `native_ll_add_all`: every link
+    // allocates a node, so an earlier iteration's GC leaves `this` and every
+    // later `elems` slot stale. Pin and refresh per iteration. The insertion
+    // point walk (`ll_node_at`) must also be redone per element, because the
+    // node that was at `at` moves one position along after each insert.
+    //
+    // The pin is taken BEFORE the element collection, not after: reading a
+    // foreign source collection runs its own bytecode, which is a GC point that
+    // can relocate `this`.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = match collect_collection_elements_or_real(ctx, coll) {
+        Ok(e) => e,
+        Err(err) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(err);
+        }
+    };
+    if elems.is_empty() {
+        ctx.unpin_native_roots(this_pin);
+        return Ok(Some(Value::Int(0)));
+    }
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    // The loop's first act is a `read_native_pin`, so this binding is only a
+    // carrier — do not pre-refresh it, or the assignment reads as dead.
+    let mut this = this;
+    let mut at = index;
+    let mut failed: Option<MethodCallFailed> = None;
+    for (i, e) in elems.iter().enumerate() {
+        this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], *e);
+        let step = if at >= ll_size(ctx, this) {
+            ll_link_last(ctx, this, e)
+        } else {
+            match ll_node_at(ctx, this, at) {
+                Some(succ) => ll_link_before(ctx, this, e, succ),
+                None => ll_link_last(ctx, this, e),
+            }
+        };
+        if let Err(err) = step {
+            failed = Some(err);
+            break;
+        }
+        at += 1;
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(Some(Value::Int(1))),
+    }
+}
+
+/// `LinkedList.descendingIterator()` — a REVERSED snapshot iterator.
+///
+/// Real `descendingIterator()` does not delegate to the registered
+/// `listIterator(int)`: it `new`s a `java/util/LinkedList$ListItr` and calls its
+/// constructor directly, so the returned iterator is node-live and its
+/// `remove()` runs real `LinkedList.unlink` — a second writer on `size`,
+/// `first` and `last` that `ll_get` never observes. That is the measured
+/// reproducer `native_ll_iterator`'s comment records, and until this
+/// registration existed it was reachable from plain Java with no reflection.
+///
+/// The snapshot is reversed in place before it is handed to
+/// `real_snapshot_iterator`, which builds a REAL `java/util/Arrays$ArrayItr`
+/// over it — so `hasNext`/`next` are real JDK bytecode over real fields, and
+/// only `remove()` is routed back through the natives.
+///
+/// Residual, stated because `SnapshotItrRoute::LinkedList`'s own doc states it:
+/// that route removes the FIRST occurrence of the returned element rather than
+/// unlinking the exact node, so on a list holding DUPLICATES a
+/// `descendingIterator().remove()` deletes the wrong one of the equal pair. The
+/// alternative it replaces deleted the right node and then corrupted `size` for
+/// the rest of the list's life, so this is the smaller residual, not the
+/// absence of one.
+fn native_ll_descending_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // GC-safety: mirrors `native_ll_iterator`'s refusal arm — `ll_snapshot_array`
+    // allocates, so `this` is pinned across it and re-read before it is recorded
+    // as the iterator's backing. `snap` is pinned too, because the fallback arm
+    // below has to hand it on AFTER an allocation attempt.
+    let this_pin = ctx.pin_native_root(this);
+    let snap = ll_snapshot_array(ctx, this);
+    let snap_pin = ctx.pin_native_root(snap);
+    let n = ctx.array_length(snap);
+    // Reverse in place. Pure array reads/writes: no allocation, so no GC point
+    // separates the two ends of a swap.
+    if n > 1 {
+        let mut lo = 0usize;
+        let mut hi = n - 1;
+        while lo < hi {
+            let a = ctx.get_array_element(snap, lo);
+            let b = ctx.get_array_element(snap, hi);
+            ctx.set_array_element(snap, lo, b);
+            ctx.set_array_element(snap, hi, a);
+            lo += 1;
+            hi -= 1;
+        }
+    }
+    let this = ctx.read_native_pin(this_pin, this);
+    let snap_cur = ctx.read_native_pin(snap_pin, snap);
+    match real_snapshot_iterator(ctx, snap_cur, n, Some((this, SnapshotItrRoute::LinkedList))) {
+        Ok(v) => {
+            ctx.unpin_native_roots(this_pin);
+            Ok(v)
+        }
+        // Only reachable in an image with no real `java/util/Arrays$ArrayItr`,
+        // i.e. a `synthetic-jdk` build — where there is no real `LinkedList`
+        // bytecode for this method to have been shadowing in the first place.
+        // Fall back to the crate's historical snapshot shape rather than
+        // propagating a refusal that names a class the strict mode was never
+        // asked about. `remove()` is `UnsupportedOperationException` on that
+        // shape, which is what every other synthetic-jdk snapshot iterator
+        // already answers; the real-JDK arm above is the one that carries the
+        // `SnapshotItrRoute::LinkedList` write-back.
+        Err(_) => {
+            let snap_cur = ctx.read_native_pin(snap_pin, snap);
+            ctx.unpin_native_roots(this_pin);
+            make_fabricated_iterator_from_array(ctx, snap_cur, n)
+        }
+    }
 }
 
 fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -36770,6 +38181,8 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -37735,6 +39148,8 @@ fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let consumer = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -38743,6 +40158,9 @@ fn native_ad_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. MEASURED on `ArrayDeque` and
+    // `PriorityQueue` alike. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let consumer = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -39318,13 +40736,13 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "<init>", "(I)V", native_al_init_capacity);
     r.register(c, "size", "()I", native_al_size);
     r.register(c, "isEmpty", "()Z", native_al_is_empty);
-    r.register(c, "get", "(I)Ljava/lang/Object;", native_al_get);
-    r.register(c, "elementAt", "(I)Ljava/lang/Object;", native_al_get);
+    r.register(c, "get", "(I)Ljava/lang/Object;", native_vec_get);
+    r.register(c, "elementAt", "(I)Ljava/lang/Object;", native_vec_element_at);
     r.register(
         c,
         "set",
         "(ILjava/lang/Object;)Ljava/lang/Object;",
-        native_al_set,
+        native_vec_set,
     );
     r.register(
         c,
@@ -39339,14 +40757,14 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)V",
         native_vec_add_element,
     );
-    r.register(c, "add", "(ILjava/lang/Object;)V", native_al_add_at);
+    r.register(c, "add", "(ILjava/lang/Object;)V", native_vec_add_at);
     r.register(
         c,
         "insertElementAt",
         "(Ljava/lang/Object;I)V",
         native_vec_insert_element_at,
     );
-    r.register(c, "remove", "(I)Ljava/lang/Object;", native_al_remove_at);
+    r.register(c, "remove", "(I)Ljava/lang/Object;", native_vec_remove_at);
     r.register(c, "remove", "(Ljava/lang/Object;)Z", native_al_remove_obj);
     r.register(
         c,
@@ -39354,7 +40772,7 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         native_al_remove_obj,
     );
-    r.register(c, "removeElementAt", "(I)V", native_vec_remove_element_at);
+    r.register(c, "removeElementAt", "(I)V", native_vec_remove_element_at_checked);
     r.register(c, "removeAllElements", "()V", native_al_clear);
     r.register(c, "clear", "()V", native_al_clear);
     r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
@@ -39398,13 +40816,20 @@ fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let idx = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
     let (data, size) = al_state(ctx, this);
-    if idx >= size as usize {
-        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32).into());
+    // MEASURED 2026-08-13 (scratchpad/orch/V3.java): setElementAt words its
+    // two arms like elementAt, NOT like set -- "3 >= 3" past the end and the
+    // backing-array capacity text for a negative index.
+    if idx < 0 {
+        return Err(vec_negative_index(ctx, this, idx));
     }
+    if idx >= size {
+        return Err(vec_aioobe(idx, format!("{idx} >= {size}")));
+    }
+    let idx = idx as usize;
     if let Some(buf) = data {
         ctx.set_array_element(buf, idx, elem);
     }
@@ -39427,8 +40852,10 @@ fn native_vec_insert_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
-    // Repack args as [this, idx, elem] to match add(int, Object) signature
-    native_al_add_at(ctx, &[Value::Object(Some(this)), Value::Int(idx), elem])
+    // insertElementAt shares add's two arms ("4 > 3", and arraycopy text for
+    // a negative index) -- measured, and `i == size` is legal for both.
+    // Repack as add(int, Object) and route through the CHECKED Vector form:
+    native_vec_add_at(ctx, &[Value::Object(Some(this)), Value::Int(idx), elem])
 }
 
 fn native_vec_remove_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -39445,7 +40872,8 @@ fn native_vec_first_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if size == 0 {
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Vector is empty".to_string(),
+                // MEASURED: HotSpot throws with NO message here.
+                message: String::new(),
             }
             .into(),
         );
@@ -39463,7 +40891,8 @@ fn native_vec_last_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if size == 0 {
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Vector is empty".to_string(),
+                // MEASURED: HotSpot throws with NO message here.
+                message: String::new(),
             }
             .into(),
         );
@@ -41128,9 +42557,20 @@ const TM_DEFAULT_CAPACITY: usize = 16; // initial entry slots (array len = 32)
 /// (ClassCastException Integer→Character on `Locale.forLanguageTag`). The
 /// per-variant in-memory representation matches each wrapper's natural
 /// `compareTo`: `Char` is unsigned (u16), `Byte`/`Short` are signed.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `Str` holds UTF-16 code UNITS, not a Rust `String`, because
+/// `String.compareTo` compares code units and `String`'s `Ord` compares code
+/// POINTS. Those disagree above the BMP: a supplementary character starts with
+/// a surrogate unit in `0xD800..=0xDBFF`, which is BELOW `U+E000..=U+FFFF`,
+/// where its code point is above them. MEASURED on both VMs 2026-08-17
+/// (`scratchpad/g55/G55Ord.java`): a `TreeSet` of
+/// `{U+10000, U+E000, U+FFFF}` enumerates `[U+10000, U+E000, U+FFFF]` on
+/// HotSpot and enumerated `[U+E000, U+FFFF, U+10000]` here — `firstKey()` and
+/// `lastKey()` both wrong, for ordinary emoji/CJK-ext keys with no surrogate
+/// exotica involved. `Vec<u16>`'s lexicographic `Ord` IS `String.compareTo`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TreeKey {
-    Str(String),
+    Str(Vec<u16>),
     I32(i32),
     I64(i64),
     Char(u16),
@@ -41148,9 +42588,22 @@ fn tree_key_from_value(ctx: &dyn NativeContext, v: &Value) -> Option<TreeKey> {
         Value::Int(i) => Some(TreeKey::I32(*i)),
         Value::Long(l) => Some(TreeKey::I64(*l)),
         Value::Object(Some(o)) => {
-            // String fast path
+            // String fast path.
+            //
+            // `read_string` is the only String reader this crate has, and it
+            // substitutes `U+FFFD` for an unpaired surrogate — so a key that
+            // carries one cannot be represented here faithfully, and two keys
+            // that differ only in WHICH one they carry would collapse into a
+            // single tree entry (MEASURED 2026-08-17: `TreeMap.size()` 1 where
+            // HotSpot says 2, with the survivor's value answered for both
+            // keys). A decode containing no `U+FFFD` is provably exact; one
+            // that does is REFUSED, and the caller falls back to the array
+            // path, which keeps the real `ObjectRef` and runs the receiver's
+            // own units-exact `String.compareTo`. That is slower and correct,
+            // which is the right trade for content this representation cannot
+            // hold.
             if let Some(s) = ctx.read_string(*o) {
-                return Some(TreeKey::Str(s));
+                return tree_key_from_decoded_string(&s);
             }
             // Boxed primitive wrappers: field 0 holds the value. The wrapper
             // CLASS selects the variant so the key reboxes to its original
@@ -42284,7 +43737,13 @@ fn tree_key_to_value(ctx: &mut dyn NativeContext, k: &TreeKey) -> Value {
             .unwrap_or(Value::Object(None))
     };
     match k {
-        TreeKey::Str(s) => Value::Object(Some(ctx.create_string(s))),
+        // `tree_key_from_value` refuses any String whose decode was lossy, so
+        // every `Str` here re-encodes to exactly the text it came from and
+        // `from_utf16_lossy` is lossless in practice for these units.
+        TreeKey::Str(units) => {
+            let text = String::from_utf16_lossy(units);
+            Value::Object(Some(ctx.create_string(&text)))
+        }
         TreeKey::I32(i) => box_via(
             ctx,
             "java/lang/Integer",
@@ -45296,6 +46755,11 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, and deliberately AHEAD of `tm_sync_native_state`: the JDK's
+    // `Objects.requireNonNull(action)` is `forEach`'s first statement, so a
+    // null action must win over anything the sync could raise (it re-enters a
+    // user `Comparator`). See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     tm_sync_native_state(ctx, this)?;
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
@@ -45805,6 +47269,11 @@ fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. MEASURED: `TreeMap.computeIfAbsent(null, null)`
+    // and `(null, F)` are BOTH message-less here — unlike `Hashtable`, whose
+    // key arm carries text — so the ordering is unobservable for this receiver
+    // and the check is placed first for consistency with the family.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let mapper = match args.get(2) {
         Some(Value::Object(Some(r))) => *r,
@@ -45865,6 +47334,13 @@ fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F. MEASURED `TreeMap.merge(k, v, null)` -> bare NPE, present or
+    // absent key. The null-VALUE arm (`merge(k, null, f)`, also a bare NPE on
+    // `TreeMap`) is NOT added here: `native_map_merge` refuses it for the
+    // `HashMap` family, but `Hashtable.merge(k, null, f)` SUCCEEDS on the
+    // oracle (G1-1 §5), so the value rule is per-receiver and this lane does
+    // not widen it from one row. See `reject_null_functional`.
+    reject_null_functional(args.get(3))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let remap_fn = match args.get(3) {
@@ -46668,6 +48144,9 @@ fn ts_remove_element(
 }
 
 fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of `resync_ts_view` for the same reason `native_tm_for_each`
+    // puts it ahead of `tm_sync_native_state`. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -48946,12 +50425,63 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
 
 // --- ConcurrentHashMap segmented native functions (Phase 86.2) ---
 
+/// `ConcurrentHashMap`'s null-key refusal on the LOOKUP path — `get`,
+/// `getOrDefault`, `containsKey`, `remove(Object)`.
+///
+/// MEASURED on the oracle 2026-08-16. None of these has an explicit null test:
+/// each opens with `int h = spread(key.hashCode());`, so HotSpot's helpful-NPE
+/// names the parameter and the text is TRANSCRIBED, not derived:
+///
+/// ```text
+/// j.u.c.ConcurrentHashMap | get(null)          | java.lang.NullPointerException
+///     msg=<<Cannot invoke "Object.hashCode()" because "key" is null>>
+/// j.u.c.ConcurrentHashMap | getOrDefault(null,d) | ... same
+/// j.u.c.ConcurrentHashMap | containsKey(null)  | ... same
+/// j.u.c.ConcurrentHashMap | remove(null)       | ... same
+/// ```
+///
+/// The string that used to be here — `"ConcurrentHashMap does not permit null
+/// keys"` — appears nowhere in the JDK. It was a FABRICATION of the same kind
+/// F41-1 §3 found twice in the `Properties` axis: right exception KIND,
+/// invented text, invisible to any assertion that checks only the type.
+///
+/// This is NOT the message for the WRITE path. `put` / `putIfAbsent` /
+/// `replace` / `merge` / `compute*` and `remove(Object,Object)` all reach an
+/// explicit `throw new NullPointerException()` (`putVal`'s
+/// `if (key == null || value == null)`, `remove(k,v)`'s
+/// `if (key == null)`), which carries NO message — see `chm_bare_npe_on_null`.
 fn chm_reject_null_key(key: &Value) -> Result<(), MethodCallFailed> {
     if matches!(key, Value::Object(None)) {
         return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys".to_string()),
+            // Same text `java.util.Hashtable` produces for the same reason: the
+            // dereferenced local is named `key` in both.
+            message: Some(HASHTABLE_NULL_KEY_MSG.to_string()),
         }
         .into());
+    }
+    Ok(())
+}
+
+/// `ConcurrentHashMap`'s WRITE-path null refusal. `putVal` opens with
+///
+/// ```text
+///  0: aload_1        // key
+///  1: ifnull    8
+///  4: aload_2        // value
+///  5: ifnonnull 16
+///  8: new       #162  // class java/lang/NullPointerException
+/// 12: invokespecial  // NullPointerException."<init>":()V
+/// 15: athrow
+/// ```
+///
+/// (`javap -p -c java.util.concurrent.ConcurrentHashMap`, JDK 25.0.3+9). The
+/// no-arg constructor means **no message at all** — MEASURED:
+/// `put(null,v)`, `put(k,null)`, `putIfAbsent` both ways and
+/// `remove(null,null)` every one reads `msg=<NO-MESSAGE>`.
+#[inline]
+fn chm_bare_npe_on_null(key: &Value, value: &Value) -> Result<(), MethodCallFailed> {
+    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+        return Err(bare_npe());
     }
     Ok(())
 }
@@ -49557,13 +51087,10 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): ConcurrentHashMap.put rejects null keys and null values per JDK spec.
-    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
-        }
-        .into());
-    }
+    // C24 (HIGH): ConcurrentHashMap.put rejects null keys and null values per
+    // JDK spec — `putVal`'s opening `if (key == null || value == null) throw
+    // new NullPointerException();`. Message-less: see `chm_bare_npe_on_null`.
+    chm_bare_npe_on_null(&key, &value)?;
     // GC-safety: `chm_key_hash` invokes arbitrary `hashCode()` bytecode and
     // `acquire_gc_safe`'s contended wait can span a completed moving GC, so
     // every raw local captured above must be pinned and re-read before use.
@@ -49629,13 +51156,9 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key/value.
-    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
-        }
-        .into());
-    }
+    // C24 (HIGH): JDK rejects null key/value. `putIfAbsent` is
+    // `putVal(key, value, true)`, i.e. the same message-less refusal as `put`.
+    chm_bare_npe_on_null(&key, &value)?;
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
@@ -49856,14 +51379,10 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key and null mappingFunction.
+    // C24 (HIGH): JDK rejects null key and null mappingFunction. MEASURED
+    // message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.computeIfAbsent: null key or mappingFunction".to_string(),
-            ),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -49905,12 +51424,10 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key and null remappingFunction.
+    // C24 (HIGH): JDK rejects null key and null remappingFunction. MEASURED
+    // message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.compute: null key or remappingFunction".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -49942,13 +51459,9 @@ fn native_chm_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
     // JDK ConcurrentHashMap rejects null key and null remappingFunction.
+    // MEASURED message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.computeIfPresent: null key or remappingFunction".to_string(),
-            ),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -50001,16 +51514,12 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let func = args.get(3).copied().unwrap_or(Value::Object(None));
     // C24 (HIGH): JDK rejects null key, null value, and null remappingFunction.
+    // MEASURED message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None))
         || matches!(value, Value::Object(None))
         || matches!(func, Value::Object(None))
     {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.merge: null key, value, or remappingFunction".to_string(),
-            ),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -50136,6 +51645,11 @@ fn native_chm_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F. Without this the null function reached `native_map_replace_all`
+    // once per segment, which returned its own silent no-op — so an empty CHM
+    // and a populated one both answered "done". MEASURED bare NPE for both.
+    // See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let func = args.get(1).copied().unwrap_or(Value::Object(None));
     let _resize_flag = ChmResizeLockGuard::enter();
     // GC-safety: pinned-slice iteration — each per-segment lock wait is
@@ -50169,6 +51683,10 @@ fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F. G1-1 gave the CHM write path `chm_bare_npe_on_null` but did not
+    // reach `forEach`/`replaceAll`, which take no key or value to test.
+    // MEASURED bare NPE, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let action = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -50259,12 +51777,7 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     } else {
         elem_base
     };
-    let n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(
-        ctx,
-        "java/util/concurrent/ConcurrentHashMap$ValuesView",
-        n_fields,
-    )?;
+    let list = alloc_view_carrier(ctx, "java/util/concurrent/ConcurrentHashMap$ValuesView")?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let arr = alloc_ref_array(ctx, cap);
@@ -50275,6 +51788,7 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_array_element(arr, cap - 1, Value::Object(Some(this)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, this);
     al_set_data(ctx, list, arr);
     al_set_size(ctx, list, vals.len() as i32);
     ctx.unpin_native_roots(first_pin);
@@ -50512,7 +52026,15 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    chm_reject_null_key(&key)?;
+    // WRITE path, so the explicit refusal, not the helpful-NPE one:
+    // `ConcurrentHashMap.remove(Object,Object)` opens with
+    // `if (key == null) throw new NullPointerException();` and then answers
+    // `false` for a null value rather than throwing. MEASURED:
+    // `remove(null,v)` and `remove(null,null)` are `<NO-MESSAGE>`,
+    // `remove(k,null)` is `OK -> false`.
+    if matches!(key, Value::Object(None)) {
+        return Err(bare_npe());
+    }
     // GC-safety: pin across hashCode()/equals() dispatch and the
     // GC-pausable segment-lock wait — see `native_chm_put`.
     let this_pin = ctx.pin_native_root(this);
@@ -50559,13 +52081,9 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key/value.
-    if matches!(key, Value::Object(None)) || matches!(new_val, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.replace: null key or value".to_string()),
-        }
-        .into());
-    }
+    // C24 (HIGH): JDK rejects null key/value. MEASURED message-less on the
+    // oracle — see `chm_bare_npe_on_null`.
+    chm_bare_npe_on_null(&key, &new_val)?;
     // GC-safety: pin across hashCode() dispatch, the GC-pausable segment-lock
     // wait, and the GC-capable put (the returned `current` must be the
     // relocated address, not the pre-put one) — see `native_chm_put`.
@@ -50613,15 +52131,13 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key/old/new.
+    // C24 (HIGH): JDK rejects null key/old/new. MEASURED message-less on the
+    // oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None))
         || matches!(old_val, Value::Object(None))
         || matches!(new_val, Value::Object(None))
     {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.replace(k,old,new): nulls not permitted".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     // GC-safety: pin across hashCode()/equals() dispatch and the
     // GC-pausable segment-lock wait — see `native_chm_put`.
@@ -50669,6 +52185,11 @@ fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F on argument **2**, not 1: this is
+    // `forEach(long parallelismThreshold, BiConsumer)`, whose first parameter
+    // is a `long`. Confirming which argument is the function before copying the
+    // guard is the point — the sibling `native_chm_for_each` checks arg 1.
+    reject_null_functional(args.get(2))?;
     let action = match args.get(2) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -50879,11 +52400,13 @@ fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     let mapped = args.get(1).copied().unwrap_or(Value::Object(None));
+    // MEASURED 2026-08-16: `keySet(null)` is `msg=<NO-MESSAGE>`. The JDK body
+    // opens `0: aload_1 / 1: ifnonnull 12 / 4: new NullPointerException /
+    // 8: invokespecial <init>()V / 11: athrow` — the no-arg constructor again.
+    // `"ConcurrentHashMap.keySet(null)"` was the tenth fabricated string in
+    // this family; see G1-1.
     if matches!(mapped, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.keySet(null)".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let view = make_key_set_view(ctx, this, mapped)?;
     Ok(Some(Value::Object(Some(view))))
@@ -51495,6 +53018,11 @@ fn native_ksv_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F. MEASURED on `ConcurrentHashMap.keySet()`, empty or not. Also
+    // reached via `ksv_route` from `native_al_for_each` / `native_hs_for_each`,
+    // which already check — the duplicate is idempotent and keeps this body
+    // correct when it is entered directly by its own registration.
+    reject_null_functional(args.get(1))?;
     let action = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -51711,6 +53239,8 @@ fn native_ksv_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let pred = match args.get(1) {
         Some(Value::Object(Some(p))) => *p,
         _ => return Ok(Some(Value::Int(0))),
@@ -51848,6 +53378,70 @@ fn register_chm_key_set_view_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// A real `java.util.Enumeration` over `array`, or `None` when this image
+/// cannot build one.
+///
+/// The `Enumeration` form of `real_snapshot_iterator` (spelled without an
+/// intra-doc link because that helper is private and this item is not), and the
+/// same rule in its strongest form: prefer a class the JDK BUILDS ITSELF over one whose
+/// fields we fill. The snapshot is already an `Object[]`,
+/// `java.util.Arrays$ArrayList` is the JDK's own fixed-size list over exactly
+/// that shape, and `Collections.enumeration(Collection)` turns one into a real
+/// `Enumeration` — real bytecode the whole way, so nothing here has to know
+/// what the resulting anonymous class is CALLED (it is `java.util.Collections$3`
+/// on JDK 25, and an anonymous class's number must not be written down).
+///
+/// Deliberately a duplicate of `native-builtins`' `classloader::
+/// real_snapshot_enumeration`, not a call to it: `native-builtins` depends on
+/// this crate, so the dependency cannot run the other way. This is the copy the
+/// crate that owns `cratonvm/internal/SnapshotEnumeration` can reach; it is
+/// `pub` so the `native-builtins` copies can converge on it later.
+///
+/// `hasMoreElements`/`nextElement` on the result are real JDK bytecode: neither
+/// name is in `vm_exec`'s `check_override` chain, and the anonymous class
+/// declares both concretely, so the interface-level
+/// `java/util/Enumeration.hasMoreElements` native registered by
+/// `register_collections_natives` never intercepts it (that native is reachable
+/// only through the C25 *abstract*-method arm).
+pub fn real_snapshot_enumeration(
+    ctx: &mut dyn NativeContext,
+    array: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let list = match ctx.new_object_initialized(
+        "java/util/Arrays$ArrayList",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(array))],
+    )? {
+        Some(Value::Object(Some(list))) => list,
+        _ => return Ok(None),
+    };
+    match ctx.invoke(
+        "java/util/Collections",
+        "enumeration",
+        "(Ljava/util/Collection;)Ljava/util/Enumeration;",
+        &[Value::Object(Some(list))],
+    )? {
+        Some(Value::Object(Some(enm))) => Ok(Some(enm)),
+        _ => Ok(None),
+    }
+}
+
+/// The snapshot enumeration over `elems`: the fabricated
+/// `cratonvm/internal/SnapshotEnumeration` in `Compatible` mode, and a real
+/// `java.util.Enumeration` when `--jdk-only` refuses that fabrication.
+///
+/// WHY A FALLBACK AND NOT A DROPPED SHADOW. The two callers that reach strict
+/// mode are `ConcurrentHashMap.keys()`/`elements()`, and a natively-backed CHM
+/// keeps its entries in a SEGMENTED layout that never populates `table` — the
+/// same reason `native_chm_reduce_values` and `native_chm_search_keys` are
+/// registered right beside them. Real `ConcurrentHashMap.keys()` bytecode
+/// builds a `KeyIterator` over `table`, so deleting these natives would answer
+/// an EMPTY enumeration over a populated map, which is strictly worse than the
+/// refusal it replaced. Only the CARRIER was fabricated, so only the carrier is
+/// replaced.
+///
+/// `Compatible` mode is byte-for-byte what it was: the fallback is reached only
+/// from the refusal arm, which only strict mode takes.
 fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
     let arr = alloc_ref_array(ctx, elems.len());
@@ -51857,18 +53451,322 @@ fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> Re
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
         ctx.set_array_element(arr, i, val);
     }
-    let en = try_alloc_synthetic(ctx, "cratonvm/internal/SnapshotEnumeration", 2)?;
-    let en_pin = ctx.pin_native_root(en);
-    let arr = ctx.read_native_pin(arr_pin, arr);
-    let en = ctx.read_native_pin(en_pin, en);
-    ctx.set_field(en, 0, Value::Object(Some(arr)));
-    ctx.set_field(en, 1, Value::Int(0));
-    ctx.unpin_native_roots(if elem_base == usize::MAX {
+    // Unwind to this base on EVERY path. The old `?` on the allocation leaked
+    // both pin sets on the refusal it is now the whole point of handling.
+    let unpin_base = if elem_base == usize::MAX {
         arr_pin
     } else {
         elem_base
-    });
-    Ok(en)
+    };
+    let out = match try_alloc_synthetic(ctx, "cratonvm/internal/SnapshotEnumeration", 2) {
+        Ok(en) => {
+            let en_pin = ctx.pin_native_root(en);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let en = ctx.read_native_pin(en_pin, en);
+            ctx.set_field(en, 0, Value::Object(Some(arr)));
+            ctx.set_field(en, 1, Value::Int(0));
+            Ok(en)
+        }
+        Err(refusal) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            match real_snapshot_enumeration(ctx, arr) {
+                Ok(Some(en)) => Ok(en),
+                // Nothing real to stand in — an image with no
+                // `Arrays$ArrayList` — so the refusal stands rather than
+                // silently becoming a fabrication again.
+                Ok(None) => Err(refusal),
+                Err(err) => Err(err),
+            }
+        }
+    };
+    ctx.unpin_native_roots(unpin_base);
+    out
+}
+
+/// The real JDK bin-node class a `ConcurrentHashMap.table` is an array of.
+const CHM_NODE_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$Node";
+/// The JDK's own dual `Enumeration`/`Iterator` carriers.
+const CHM_KEY_ITER_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$KeyIterator";
+const CHM_VALUE_ITER_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$ValueIterator";
+/// `BaseIterator(Node<K,V>[] tab, int size, int index, int limit, ConcurrentHashMap<K,V> map)`
+/// — both carriers inherit this shape verbatim, so one descriptor serves both.
+const CHM_ITER_INIT_DESC: &str = concat!(
+    "([Ljava/util/concurrent/ConcurrentHashMap$Node;III",
+    "Ljava/util/concurrent/ConcurrentHashMap;)V"
+);
+
+/// Resolve a REAL image class, never a fabrication.
+///
+/// `ensure_class_initialized` fabricates a stand-in rather than failing, so an
+/// `Ok` from it is not evidence the image has the class (the recurring
+/// `ensure-class-initialized-fabricates-instead-of-failing` shape). Both the
+/// name the id resolves BACK to and the synthetic-stub predicate are checked,
+/// and either mismatch is reported as "not available" so the caller falls back
+/// rather than building a carrier out of a stub.
+fn chm_real_class(ctx: &mut dyn NativeContext, name: &str) -> Option<ClassId> {
+    if ctx.is_class_synthetic_stub(name) {
+        return None;
+    }
+    if let Some(cid) = ctx.class_id_by_name(name) {
+        return Some(cid);
+    }
+    let cid = ctx.ensure_class_initialized(name).ok()?;
+    if ctx.class_name_of_id(cid).as_deref() == Some(name) {
+        Some(cid)
+    } else {
+        None
+    }
+}
+
+/// Materialise the segmented store into a REAL `ConcurrentHashMap$Node[]` and
+/// publish it in the receiver's real `table` field, returning the array.
+///
+/// # Why this exists
+///
+/// `Hashtable`'s precedent is the whole argument: its bucket array lives in the
+/// receiver's own `table` field, and java.base's own `Hashtable$Enumerator`
+/// walks it correctly even though the NODES are ours. CHM was the opposite —
+/// measured on this binary, `--jdk-only`, JDK 25.0.3+9, for an empty map, a
+/// 6-entry map and a 200-entry map alike:
+///
+/// ```text
+///                        HotSpot 25                    CratonVM --jdk-only
+///   table                len=16 used=6 $Node           null
+///   baseCount / sizeCtl  6 / 12                        0 / 0
+///   slot 0 (AbstractMap.keySet)  null                  Object[4] of segments
+///   keys()               $KeyIterator (dual)           Collections$3 (NOT an Iterator)
+/// ```
+///
+/// so `keys()`/`elements()` could not hand back the JDK's dual
+/// `Enumeration`+`Iterator` carrier: there was nothing for a `KeyIterator` to
+/// walk. That is `RJdkEnumerations`' `carriersAreTheJdksOwnDualInterface\
+/// Enumerators` vector.
+///
+/// The feasibility question was settled by measurement BEFORE this was written
+/// (`probes/ChmDrive.java`): a `Node[]` built by hand at the Java level, handed
+/// to java.base's own `KeyIterator`/`ValueIterator`, iterates CORRECTLY on
+/// CratonVM `--jdk-only` — both faces, one shared cursor, the right multiset.
+/// `Traverser.advance()`, `tabAt()`'s `U.getReferenceAcquire` and its checkcast
+/// to `$Node` all run. So the shape is walkable; only the field was missing.
+///
+/// # What this is and is NOT
+///
+/// It is a **refresh-on-read mirror**, not a move of the authority. The
+/// segmented store rooted at slot 0 remains the one writable copy; every
+/// mutator (`put`/`remove`/`compute*`/…) is unchanged and never runs this. The
+/// mirror is rebuilt from scratch on each `keys()`/`elements()`, so `table` is
+/// exactly as fresh as the most recent iteration and can never drift silently
+/// behind the store the way a build-once cache would.
+///
+/// **Concurrency.** This adds no new sharing and takes no segment lock. It
+/// reads the segments exactly as `chm_collect_all_keys` already does, so it
+/// inherits that walk's existing weak consistency, and it publishes a private,
+/// freshly-allocated array that no other thread can reach until the store to
+/// `table` makes it visible. A concurrent mutation during or after the walk is
+/// not reflected in an iterator already handed out — which is precisely what
+/// `ConcurrentHashMap`'s spec permits of its weakly-consistent iterators
+/// ("may or may not reflect" post-construction modifications). Two threads
+/// calling `keys()` at once each build their own array; the last store to
+/// `table` wins, and both iterators still hold their own. What this does NOT
+/// give is atomicity of the snapshot against a concurrent writer — no more and
+/// no less than the snapshot enumeration it replaces.
+///
+/// **It does not unblock retiring the CHM shadows.** Retirement needs `table`
+/// to be the AUTHORITY that real `putVal`/`get` bytecode CASes into, which a
+/// mirror is not. See `W7-96-chm-table-never-populated.md`.
+///
+/// # Why the fallback is total
+///
+/// Any surprise — no real `$Node` in the image, an over-large table, a
+/// primitive in a slot a real `$Node` declares as a reference (which
+/// descriptor coercion would silently turn into a DIFFERENT value on store) —
+/// returns `None` and the caller keeps today's snapshot carrier verbatim. A
+/// partially-materialised `table` would be a populated-looking lie, which is
+/// the one outcome worse than the null it replaces.
+fn chm_publish_real_table(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    // `this` is pinned for the WHOLE body and every early exit unwinds through
+    // the single `unpin_native_roots` below, so the many `return None` arms
+    // inside cannot leak a pin. The array and key/value pins taken later are
+    // all above this handle and are released by the same call.
+    let this_pin = ctx.pin_native_root(this);
+    let out = chm_publish_real_table_pinned(ctx, this, this_pin);
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+/// [`chm_publish_real_table`]'s body, with `this` already pinned as `this_pin`
+/// and the unpin left to the caller.
+fn chm_publish_real_table_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_pin: usize,
+) -> Option<ObjectRef> {
+    // Class resolution can LOAD a class, which allocates, so this runs before
+    // anything raw is read off `this` and `this` is re-read straight after.
+    let node_cid = chm_real_class(ctx, CHM_NODE_CLASS)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let node_width = ctx.class_num_total_fields(node_cid).max(NODE_NUM_FIELDS);
+    let table_slot = receiver_table_slot(ctx, this)?;
+
+    // Snapshot the segmented store. `get_field`/`get_array_element`/
+    // `array_length` never allocate, so there is no GC point in this walk and
+    // the raw refs it collects are still live when it ends. Allocation starts
+    // below, behind pins.
+    let mut entries: Vec<(i32, Value, Value)> = Vec::new();
+    for seg in chm_all_segments(ctx, this) {
+        let (buckets, _size, cap) = map_state(ctx, seg);
+        if let Some(b) = buckets {
+            for i in 0..(cap as usize) {
+                let mut node_val = ctx.get_array_element(b, i);
+                while let Value::Object(Some(node)) = node_val {
+                    // The JDK's `spread()` masks with `HASH_BITS`, and
+                    // `Traverser.advance()` reads `e.hash < 0` as "this bin
+                    // head is a Forwarding/Tree/Reservation node, not a
+                    // mapping". A negative hash here would make java.base
+                    // treat our plain node as a control node and walk off it.
+                    let hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                        Value::Int(h) => h & 0x7fff_ffff,
+                        _ => return None,
+                    };
+                    let key = get_node_key(ctx, node);
+                    let value = get_node_value(ctx, node);
+                    // A value that IS the segment object is an in-flight
+                    // `computeIfAbsent` reservation, not a mapping — invisible
+                    // to iteration, exactly as the JDK's ReservationNode is.
+                    // See `chm_collect_all_entries`.
+                    let reserved = matches!(value, Value::Object(Some(v))
+                        if std::ptr::eq(v.as_ptr(), seg.as_ptr()));
+                    if !reserved {
+                        // A real `$Node` declares `key` and `val` as
+                        // references. A primitive stored into one would be
+                        // descriptor-coerced on the way in and read back as a
+                        // different value, so abandon rather than publish it.
+                        if !matches!(key, Value::Object(Some(_)))
+                            || !matches!(value, Value::Object(Some(_)))
+                        {
+                            return None;
+                        }
+                        entries.push((hash, key, value));
+                    }
+                    node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+                }
+            }
+        }
+    }
+
+    // HotSpot's own sizing, so the published table matches it bin-for-bin:
+    // start at DEFAULT_CAPACITY and double while the count exceeds the 0.75
+    // load factor. Measured against HotSpot: 6 entries -> 16, 200 -> 512.
+    let n = entries.len();
+    let mut cap = 16usize;
+    while n > cap - (cap >> 2) {
+        if cap > (1usize << 29) {
+            return None;
+        }
+        cap <<= 1;
+    }
+
+    // GC discipline: every collected key/value must be pinned before the first
+    // allocation and re-read after each one. `this` is already pinned by the
+    // caller, whose handle is the base that unwinds this whole batch.
+    let flat: Vec<Value> = entries.iter().flat_map(|(_, k, v)| [*k, *v]).collect();
+    let (_flat_base, flat_pins) = pin_value_slice(ctx, &flat);
+    let table = ctx.try_new_ref_array(node_cid, cap)?;
+    let table_pin = ctx.pin_native_root(table);
+
+    for (i, (hash, _, _)) in entries.iter().enumerate() {
+        // The only GC point in the loop. Everything raw is stale after it.
+        let node = ctx.alloc_object(node_cid, node_width);
+        let table = ctx.read_native_pin(table_pin, table);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        // Read the current bin head straight out of the array rather than
+        // carrying it across the allocation above.
+        let idx = (*hash as usize) & (cap - 1);
+        let head = ctx.get_array_element(table, idx);
+        ctx.set_field(node, NODE_FIELD_HASH, Value::Int(*hash));
+        ctx.set_field(node, NODE_FIELD_KEY, key);
+        ctx.set_field(node, NODE_FIELD_VALUE, value);
+        ctx.set_field(node, NODE_FIELD_NEXT, head);
+        ctx.set_array_element(table, idx, Value::Object(Some(node)));
+    }
+
+    let this = ctx.read_native_pin(this_pin, this);
+    let table = ctx.read_native_pin(table_pin, table);
+    // The bookkeeping HotSpot carries alongside the array. `baseCount` is a
+    // `long` and `sizeCtl` the 0.75 threshold; both are resolved by NAME, so a
+    // receiver that does not declare them (a subclass with a shadowing layout)
+    // simply gets the array and no bookkeeping rather than a stray store.
+    ctx.set_field(this, table_slot, Value::Object(Some(table)));
+    let cid = ctx.class_id_of_object(this);
+    let width = ctx.object_num_fields(this);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, "baseCount") {
+        if slot < width {
+            ctx.set_field(this, slot, Value::Long(n as i64));
+        }
+    }
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, "sizeCtl") {
+        if slot < width {
+            ctx.set_field(this, slot, Value::Int((cap - (cap >> 2)) as i32));
+        }
+    }
+    Some(table)
+}
+
+/// Build java.base's OWN `KeyIterator`/`ValueIterator` over a freshly
+/// materialised `table` — the dual `Enumeration`+`Iterator` carrier that
+/// `ConcurrentHashMap.keys()`/`elements()` are specified to return.
+///
+/// `Ok(None)` means "this image cannot supply the real carrier", and the
+/// caller keeps the snapshot enumeration it has always returned. Errors from
+/// the constructor propagate rather than being swallowed, so a Java exception
+/// raised inside `<init>` is not left pending behind a silent fallback.
+fn chm_real_dual_iterator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    values: bool,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let itr_class = if values {
+        CHM_VALUE_ITER_CLASS
+    } else {
+        CHM_KEY_ITER_CLASS
+    };
+    // Pinned before the class lookup, not after: resolving a class can load it,
+    // and loading allocates.
+    let this_pin = ctx.pin_native_root(this);
+    let out = (|| -> Result<Option<ObjectRef>, MethodCallFailed> {
+        if chm_real_class(ctx, itr_class).is_none() {
+            return Ok(None);
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let table = match chm_publish_real_table(ctx, this) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let table_pin = ctx.pin_native_root(table);
+        let n = ctx.array_length(table) as i32;
+        let this = ctx.read_native_pin(this_pin, this);
+        let table = ctx.read_native_pin(table_pin, table);
+        // `keys()` is `new KeyIterator<>(t, f, 0, f, this)` with `f =
+        // t.length`, against `Traverser(tab, size, index, limit)`.
+        let built = ctx.new_object_initialized(
+            itr_class,
+            CHM_ITER_INIT_DESC,
+            &[
+                Value::Object(Some(table)),
+                Value::Int(n),
+                Value::Int(0),
+                Value::Int(n),
+                Value::Object(Some(this)),
+            ],
+        )?;
+        Ok(match built {
+            Some(Value::Object(Some(it))) => Some(it),
+            _ => None,
+        })
+    })();
+    ctx.unpin_native_roots(this_pin);
+    out
 }
 
 fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -51881,6 +53779,15 @@ fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             )?))))
         }
     };
+    // `chm_real_dual_iterator` allocates, so the caller's `this` is stale on
+    // the fallback path unless it is pinned across the attempt.
+    let this_pin = ctx.pin_native_root(this);
+    let built = chm_real_dual_iterator(ctx, this, true);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if let Some(it) = built? {
+        return Ok(Some(Value::Object(Some(it))));
+    }
     let vals = chm_collect_all_values(ctx, this);
     Ok(Some(Value::Object(Some(make_snapshot_enumeration(
         ctx, &vals,
@@ -51897,6 +53804,14 @@ fn native_chm_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             )?))))
         }
     };
+    // See `native_chm_elements` for the pin.
+    let this_pin = ctx.pin_native_root(this);
+    let built = chm_real_dual_iterator(ctx, this, false);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if let Some(it) = built? {
+        return Ok(Some(Value::Object(Some(it))));
+    }
     let keys = chm_collect_all_keys(ctx, this);
     Ok(Some(Value::Object(Some(make_snapshot_enumeration(
         ctx, &keys,
@@ -52317,8 +54232,10 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     // `Hashtable` (and `Properties`, which overrides them again) declare their
     // own bucket-walking `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)`.
     // Same gap, same fix — see `register_map_conditional_mutators`. The null
-    // rejection those overrides open with is honoured by
-    // `map_kv_reject_null_for_hashtable`.
+    // rejections those overrides open with are honoured by
+    // `map_remove_kv_null_contract` / `map_replace_kv_null_contract` /
+    // `map_replace3_null_contract`, which route `Hashtable` and `Properties`
+    // differently because the JDK does.
     register_map_conditional_mutators(registry, ht);
     register_map_conditional_mutators(registry, p);
     // Note: `keys()` / `elements()` are registered by
@@ -55346,16 +57263,32 @@ fn native_collections_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // MEASURED 2026-08-13 (scratchpad/orch/Exp.java): out-of-range is
+    // IndexOutOfBoundsException with the JDK's ArrayList text. Two defects
+    // here: there was NO bounds check at all, and `*v as usize` turned a
+    // NEGATIVE index into a huge one, so `swap(l, -1, 0)` was silently
+    // accepted rather than refused. Bound against the list SIZE, not the
+    // backing array capacity -- an ArrayList over-allocates, so the array
+    // length would admit indices past the end.
     let i = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => return Ok(None),
     };
     let j = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => return Ok(None),
     };
-    let (data, _) = al_state(ctx, list);
+    let (data, size) = al_state(ctx, list);
+    for idx in [i, j] {
+        if idx < 0 || idx >= size {
+            return Err(RuntimeError::IndexOutOfBoundsException {
+                message: Some(format!("Index {idx} out of bounds for length {size}")),
+            }
+            .into());
+        }
+    }
     if let Some(d) = data {
+        let (i, j) = (i as usize, j as usize);
         let a = ctx.get_array_element(d, i);
         let b = ctx.get_array_element(d, j);
         ctx.set_array_element(d, i, b);
@@ -55455,6 +57388,17 @@ fn native_collections_n_copies(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
+    // MEASURED 2026-08-13 (scratchpad/orch/Two.java): a negative length is
+    // IllegalArgumentException with the count in the text, NOT a clamp. The
+    // `n.max(0)` below turned nCopies(-1, x) into an empty list -- a plausible
+    // answer, so nothing downstream could notice. The check precedes both
+    // allocations and the pins: an early return between pin and unpin leaks.
+    if n < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("List length = {n}").into(),
+        }
+        .into());
+    }
     let __al_n_fields = al_slots(ctx).2;
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // two allocations can move `val` and the freshly allocated `list`.
@@ -58829,12 +60773,24 @@ fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
     this
 }
 
+/// MEASURED on the oracle 2026-08-16, alongside its `java.util.PriorityQueue`
+/// twin:
+///
+/// ```text
+/// java.util.PriorityQueue    | offer(null) | java.lang.NullPointerException msg=<NO-MESSAGE>
+/// j.u.c.PriorityBlockingQueue| offer(null) | java.lang.NullPointerException msg=<NO-MESSAGE>
+/// ```
+///
+/// Both `offer` bodies are `if (e == null) throw new NullPointerException();`
+/// compiled to the no-arg constructor (`javap -p -c java.util.PriorityQueue`),
+/// so there is no text to carry. `"PriorityBlockingQueue does not permit null
+/// elements"` was a FABRICATION — the javadoc sentence, not the message — and
+/// `thrownDetail` prints a message when there is one, so it was itself the
+/// divergence. `ad_refuse_null`, the `ArrayDeque`/`PriorityQueue` sibling, had
+/// already got this right and says so in its own doc comment.
 fn pbq_reject_null_element(elem: Value) -> Result<(), MethodCallFailed> {
     if matches!(elem, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("PriorityBlockingQueue does not permit null elements".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     Ok(())
 }
@@ -61259,7 +63215,7 @@ pub fn __test_tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
 #[doc(hidden)]
 pub fn __test_tm_fast_put_str(ctx: &dyn NativeContext, this: ObjectRef, key: &str, value: Value) {
     tm_fast_with(ctx, this, |bt| {
-        bt.insert(TreeKey::Str(key.to_string()), value);
+        bt.insert(TreeKey::Str(key.encode_utf16().collect()), value);
     });
 }
 /// Fast-mode TreeMap side-table read shim. Mirror of
@@ -61267,7 +63223,7 @@ pub fn __test_tm_fast_put_str(ctx: &dyn NativeContext, this: ObjectRef, key: &st
 #[doc(hidden)]
 pub fn __test_tm_fast_get_str(ctx: &dyn NativeContext, this: ObjectRef, key: &str) -> Value {
     tm_fast_with(ctx, this, |bt| {
-        bt.get(&TreeKey::Str(key.to_string()))
+        bt.get(&TreeKey::Str(key.encode_utf16().collect()))
             .copied()
             .unwrap_or(Value::Object(None))
     })
@@ -61399,6 +63355,152 @@ mod tests {
         assert_eq!(super::al_slots_and_layout_for(&ctx, s).1, super::AlLayout::Foreign);
         assert!(!super::al_is_list_layout(&ctx, s));
         assert!(!super::al_is_arraylist_layout(&ctx, s));
+    }
+
+    // --- G22-1 N1/N2: the map-view carrier slot collision ------------------
+    //
+    // MEASURED before this fix (`scratchpad/g22/G22Slot.java`, both VMs,
+    // `--add-opens java.base/java.util=ALL-UNNAMED`):
+    //
+    //     LinkedHashMap$LinkedValues.this$0  HotSpot: java.util.LinkedHashMap
+    //                                       CratonVM: [Ljava.lang.Object;[len=11]
+    //
+    // `LinkedValues` is the ONE carrier of the six that declares two fields
+    // (`reversed` @0, `this$0` @1), so ArrayList's absolute `elementData` slot
+    // 1 landed on `this$0` and `values_view_class_source` read the element
+    // buffer back as the source map.
+
+    /// The mock layout that reproduces the real-JDK one: `AbstractList
+    /// .modCount` @0, `ArrayList.elementData` @1, `ArrayList.size` @2.
+    fn carrier_ctx() -> (lbq_blocking_tests::MockCtx, ClassId, ClassId, ClassId) {
+        let ctx = lbq_blocking_tests::MockCtx::new(11);
+        let al = ClassId::new(4101);
+        let hm_values = ClassId::new(4102);
+        let linked_values = ClassId::new(4103);
+        ctx.define_class(al, "java/util/ArrayList");
+        ctx.define_class(hm_values, "java/util/HashMap$Values");
+        ctx.define_class(linked_values, "java/util/LinkedHashMap$LinkedValues");
+        ctx.define_field(al, "elementData", 1);
+        ctx.define_field(al, "size", 2);
+        // One declared field, `this$0` @0 — five of the six carriers.
+        ctx.define_total_fields(hm_values, 1);
+        ctx.define_field(hm_values, "this$0", 0);
+        // Two declared fields, `reversed` @0 and `this$0` @1 — the sixth.
+        ctx.define_total_fields(linked_values, 2);
+        ctx.define_field(linked_values, "reversed", 0);
+        ctx.define_field(linked_values, "this$0", 1);
+        (ctx, al, hm_values, linked_values)
+    }
+
+    /// The whole fix in one assertion: `LinkedValues`' list slots must clear
+    /// its two declared fields, and the five one-field carriers must keep the
+    /// layout they already had — the measured `HashMap` / `TreeMap` /
+    /// `Hashtable` / `ConcurrentHashMap` rows were all CLEAN and must not move.
+    #[test]
+    fn view_carrier_slots_clear_the_carriers_own_declared_fields() {
+        let (ctx, al, hm_values, linked_values) = carrier_ctx();
+
+        // The reference: a real ArrayList is untouched.
+        assert_eq!(super::al_slots_for_uncached(&ctx, al).unwrap().0, (1, 2, 3));
+
+        // One declared field: identical to ArrayList's absolute slots, which
+        // is why this family never diverged.
+        assert_eq!(
+            super::view_carrier_slots(&ctx, hm_values),
+            Some((1, 2, 3)),
+            "a one-field carrier keeps ArrayList's own slots"
+        );
+        // Two declared fields: elementData must NOT land on `this$0` @1.
+        assert_eq!(
+            super::view_carrier_slots(&ctx, linked_values),
+            Some((2, 3, 4)),
+            "LinkedValues declares reversed@0 and this$0@1; the list state              starts above both"
+        );
+        let (slots, layout) = super::al_slots_for_uncached(&ctx, linked_values).unwrap();
+        assert_eq!(slots, (2, 3, 4));
+        assert_eq!(layout, super::AlLayout::ViewCarrier);
+        assert_ne!(
+            slots.0,
+            super::al_slots_resolved(&ctx).unwrap().0,
+            "the collision is exactly elementData == this$0's slot"
+        );
+    }
+
+    /// A carrier still reads and writes like an ArrayList everywhere else —
+    /// `accepts`, the ArrayList-layout question, and the wrapper-route
+    /// shortcut. A `ViewCarrier` that answered `Foreign` to any of these would
+    /// make every values view read back EMPTY.
+    #[test]
+    fn view_carrier_behaves_as_a_list_everywhere_but_its_slots() {
+        let (ctx, _al, hm_values, linked_values) = carrier_ctx();
+        let hv = ctx.alloc_object_of(hm_values, 3);
+        let lv = ctx.alloc_object_of(linked_values, 4);
+        assert!(super::al_is_list_layout(&ctx, hv));
+        assert!(super::al_is_list_layout(&ctx, lv));
+        assert!(super::al_is_arraylist_layout(&ctx, hv));
+        assert!(super::al_is_arraylist_layout(&ctx, lv));
+        assert!(super::AlLayout::ViewCarrier.rules_out_wrapper_routes());
+        assert!(super::AlLayout::ViewCarrier.accepts(4));
+    }
+
+    /// `AbstractList.modCount` resolves to slot 0, which on a carrier is the
+    /// carrier's OWN first declared field — `this$0`, a REFERENCE. Bumping a
+    /// counter there is a type-punning store; it is why `HashMap$Values
+    /// .this$0` reflected as `null`. A carrier must report no modCount slot.
+    #[test]
+    fn a_view_carrier_has_no_mod_count_slot() {
+        let (ctx, al, hm_values, linked_values) = carrier_ctx();
+        let abstract_list = ClassId::new(4104);
+        ctx.define_class(abstract_list, "java/util/AbstractList");
+        ctx.define_field(abstract_list, "modCount", 0);
+
+        let list = ctx.alloc_object_of(al, 3);
+        assert_eq!(
+            super::al_mod_count_slot(&ctx, list),
+            Some(0),
+            "an ordinary ArrayList keeps its comodification counter"
+        );
+        let hv = ctx.alloc_object_of(hm_values, 3);
+        let lv = ctx.alloc_object_of(linked_values, 4);
+        assert_eq!(super::al_mod_count_slot(&ctx, hv), None);
+        assert_eq!(super::al_mod_count_slot(&ctx, lv), None);
+    }
+
+    /// `store_view_carrier_backref` writes the carrier's own `this$0`/`map`
+    /// and can never reach the list slots — the collision it repairs.
+    #[test]
+    fn the_backref_lands_on_this_dollar_zero_and_nowhere_else() {
+        let (ctx, al, hm_values, linked_values) = carrier_ctx();
+        let mut ctx = ctx;
+        let source = ctx.alloc_object_of(al, 3);
+
+        let hv = ctx.alloc_object_of(hm_values, 3);
+        super::store_view_carrier_backref(&mut ctx, hv, source);
+        assert_eq!(ctx.get_field(hv, 0), Value::Object(Some(source)));
+
+        let lv = ctx.alloc_object_of(linked_values, 4);
+        super::store_view_carrier_backref(&mut ctx, lv, source);
+        assert_eq!(
+            ctx.get_field(lv, 1),
+            Value::Object(Some(source)),
+            "LinkedValues' this$0 is slot 1, not slot 0"
+        );
+        assert_eq!(
+            ctx.get_field(lv, 0),
+            Value::Int(0),
+            "`reversed` @0 must be left alone"
+        );
+        assert_eq!(
+            ctx.get_field(lv, 2),
+            Value::Int(0),
+            "the elementData slot must be left alone"
+        );
+
+        // An ordinary ArrayList is never touched, whatever it declares.
+        let plain = ctx.alloc_object_of(al, 3);
+        super::store_view_carrier_backref(&mut ctx, plain, source);
+        assert_eq!(ctx.get_field(plain, 0), Value::Int(0));
+        assert_eq!(ctx.get_field(plain, 1), Value::Int(0));
     }
 
     #[test]
@@ -62296,45 +64398,98 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // `values_equal` — call the PRODUCTION function, not a copy of its `match`.
+    //
+    // These four tests used to build a `Value` literal and then assert a
+    // `matches!` pattern against that same literal two lines later, e.g.
+    // `matches!((&Value::Int(42), &Value::Int(42)), (Value::Int(x), Value::Int(y)) if x == y)`.
+    // That is a tautology over constants: `values_equal` was never on the call
+    // path, so rewriting its body to `return true` — or deleting it outright —
+    // left all four green. None of these cases needs any heap state, so a bare
+    // `MockCtx` (no classes, no objects) is enough to reach the real function:
+    // the wrapper-class guard at the top of `values_equal` only fires for
+    // `Object(Some(_))` on both sides, and `normalize_for_compare` passes raw
+    // primitives and `Object(None)` through without touching the context.
+    // -----------------------------------------------------------------------
+
     #[test]
     fn values_equal_null_null() {
-        // Two null objects should be equal (tested via the public helper)
-        let a = Value::Object(None);
-        let b = Value::Object(None);
-        // We cannot call values_equal without a NativeContext, but we can
-        // check the pattern match logic directly.
-        assert!(matches!(
-            (&a, &b),
-            (Value::Object(None), Value::Object(None))
-        ));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // Java `null.equals`-free contract: `List.of(a).contains(null)` finds a
+        // stored null, and a null map value matches a null probe.
+        assert!(
+            values_equal(&ctx, &Value::Object(None), &Value::Object(None)),
+            "two null references must compare equal"
+        );
+        // A null must NOT match anything else, or `contains(null)` reports true
+        // for a list holding only real elements.
+        assert!(
+            !values_equal(&ctx, &Value::Object(None), &Value::Int(0)),
+            "null must not equal Int(0)"
+        );
+        assert!(
+            !values_equal(&ctx, &Value::Int(0), &Value::Object(None)),
+            "Int(0) must not equal null (symmetry)"
+        );
     }
 
     #[test]
     fn values_equal_ints() {
-        let a = Value::Int(42);
-        let b = Value::Int(42);
-        let c = Value::Int(99);
-        // Direct pattern checks matching values_equal logic
-        assert!(matches!((&a, &b), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!((&a, &c), (Value::Int(x), Value::Int(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(&ctx, &Value::Int(42), &Value::Int(42)));
+        assert!(!values_equal(&ctx, &Value::Int(42), &Value::Int(99)));
+        // Boundaries: a truncating or unsigned comparison would collapse these.
+        assert!(values_equal(&ctx, &Value::Int(i32::MIN), &Value::Int(i32::MIN)));
+        assert!(!values_equal(&ctx, &Value::Int(i32::MIN), &Value::Int(i32::MAX)));
+        assert!(!values_equal(&ctx, &Value::Int(0), &Value::Int(-1)));
     }
 
     #[test]
     fn values_equal_long() {
-        let a = Value::Long(123456789);
-        let b = Value::Long(123456789);
-        let c = Value::Long(0);
-        assert!(matches!((&a, &b), (Value::Long(x), Value::Long(y)) if x == y));
-        assert!(!matches!((&a, &c), (Value::Long(x), Value::Long(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(
+            &ctx,
+            &Value::Long(123_456_789),
+            &Value::Long(123_456_789)
+        ));
+        assert!(!values_equal(&ctx, &Value::Long(123_456_789), &Value::Long(0)));
+        // A 32-bit-narrowing comparison would call these two equal.
+        assert!(!values_equal(
+            &ctx,
+            &Value::Long(1),
+            &Value::Long((1_i64 << 32) | 1)
+        ));
+        assert!(values_equal(&ctx, &Value::Long(i64::MIN), &Value::Long(i64::MIN)));
+        assert!(!values_equal(&ctx, &Value::Long(i64::MIN), &Value::Long(i64::MAX)));
     }
 
     #[test]
     fn values_equal_mixed_types() {
-        let int_val = Value::Int(42);
-        let long_val = Value::Long(42);
-        // Different types should not match
-        assert!(!matches!((&int_val, &long_val), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!((&int_val, &long_val), (Value::Long(x), Value::Long(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // The OLD body asserted that an Int and a Long "should not match".
+        // That is not what `values_equal` promises and not what it does: a RAW
+        // `Value::Int`/`Value::Long` is a VM-level representation choice with no
+        // Java wrapper class behind it, so the cross-type numeric arms are
+        // deliberately in force (see the comment on the wrapper-class guard).
+        // `values_equal_rejects_cross_wrapper_boxes` covers the BOXED case,
+        // which is the one that must answer false.
+        assert!(
+            values_equal(&ctx, &Value::Int(42), &Value::Long(42)),
+            "raw Int(42) and raw Long(42) are the same VM value"
+        );
+        assert!(
+            values_equal(&ctx, &Value::Long(42), &Value::Int(42)),
+            "cross-type numeric comparison is symmetric"
+        );
+        // Sign extension, not zero extension: Int(-1) is Long(-1), not
+        // Long(0xFFFF_FFFF).
+        assert!(values_equal(&ctx, &Value::Int(-1), &Value::Long(-1)));
+        assert!(!values_equal(&ctx, &Value::Int(-1), &Value::Long(0xFFFF_FFFF)));
+        // Different values of different types stay unequal.
+        assert!(!values_equal(&ctx, &Value::Int(42), &Value::Long(43)));
+        // A numeric value never equals a reference.
+        assert!(!values_equal(&ctx, &Value::Int(0), &Value::Object(None)));
     }
 
     #[test]
@@ -62889,41 +65044,103 @@ mod tests {
     // values_equal edge cases
     // -----------------------------------------------------------------------
 
+    // Same species as the four repaired above: each of these used to assert a
+    // `matches!` pattern against a `Value` literal built in the line before it,
+    // so `values_equal` was never called. They now go through the production
+    // function; the cases below are the ones the four above do NOT cover.
+
     #[test]
     fn values_equal_int_boundaries() {
-        let min = Value::Int(i32::MIN);
-        let max = Value::Int(i32::MAX);
-        let min2 = Value::Int(i32::MIN);
-        assert!(matches!((&min, &min2), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!((&min, &max), (Value::Int(x), Value::Int(y)) if x == y));
-    }
-
-    #[test]
-    fn values_equal_long_boundaries() {
-        let min = Value::Long(i64::MIN);
-        let max = Value::Long(i64::MAX);
-        let min2 = Value::Long(i64::MIN);
-        assert!(matches!((&min, &min2), (Value::Long(x), Value::Long(y)) if x == y));
-        assert!(!matches!((&min, &max), (Value::Long(x), Value::Long(y)) if x == y));
-    }
-
-    #[test]
-    fn values_equal_null_vs_some() {
-        let null = Value::Object(None);
-        let int = Value::Int(0);
-        // Null and Int should never match in the values_equal logic
-        assert!(!matches!((&null, &int), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!(
-            (&null, &int),
-            (Value::Object(None), Value::Object(None))
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // i32::MIN is the value `-x == x` fixed point; a comparison written as
+        // `a.abs() == b.abs()` or via a widening-to-u32 cast would confuse the
+        // two extremes.
+        assert!(values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Int(i32::MIN)
+        ));
+        assert!(!values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Int(i32::MAX)
+        ));
+        // i32::MIN widened to i64 is NOT 0x8000_0000.
+        assert!(values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Long(i32::MIN as i64)
+        ));
+        assert!(!values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Long(0x8000_0000)
         ));
     }
 
     #[test]
+    fn values_equal_long_boundaries() {
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(
+            &ctx,
+            &Value::Long(i64::MIN),
+            &Value::Long(i64::MIN)
+        ));
+        assert!(!values_equal(
+            &ctx,
+            &Value::Long(i64::MIN),
+            &Value::Long(i64::MAX)
+        ));
+        // A Long outside int range never equals an Int, however it is narrowed:
+        // `i64::MAX as i32` is -1, so an `as i32` comparison would say true.
+        assert!(!values_equal(&ctx, &Value::Long(i64::MAX), &Value::Int(-1)));
+        assert!(!values_equal(&ctx, &Value::Long(i64::MIN), &Value::Int(0)));
+    }
+
+    #[test]
+    fn values_equal_null_vs_some() {
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // A null reference matches no primitive, in either order — otherwise
+        // `list.contains(null)` answers true for a list of boxed zeroes.
+        for other in [
+            Value::Int(0),
+            Value::Long(0),
+            Value::Float(0.0),
+            Value::Double(0.0),
+        ] {
+            assert!(
+                !values_equal(&ctx, &Value::Object(None), &other),
+                "null must not equal {other:?}"
+            );
+            assert!(
+                !values_equal(&ctx, &other, &Value::Object(None)),
+                "{other:?} must not equal null (symmetry)"
+            );
+        }
+    }
+
+    #[test]
     fn values_equal_zero_int() {
-        let a = Value::Int(0);
-        let b = Value::Int(0);
-        assert!(matches!((&a, &b), (Value::Int(x), Value::Int(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(&ctx, &Value::Int(0), &Value::Int(0)));
+        // Java `Float.equals`/`Double.equals` use bit patterns: +0.0 and -0.0
+        // are DISTINCT, and NaN equals itself. A plain `==` inverts both.
+        assert!(!values_equal(
+            &ctx,
+            &Value::Double(0.0),
+            &Value::Double(-0.0)
+        ));
+        assert!(!values_equal(&ctx, &Value::Float(0.0), &Value::Float(-0.0)));
+        assert!(values_equal(
+            &ctx,
+            &Value::Double(f64::NAN),
+            &Value::Double(f64::NAN)
+        ));
+        assert!(values_equal(
+            &ctx,
+            &Value::Float(f32::NAN),
+            &Value::Float(f32::NAN)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -63226,6 +65443,12 @@ mod tests {
             /// declared a field for is exactly a fabricated stub, whose slots
             /// are `_f0.._fN`.
             field_indices: HashMap<(ClassId, String), usize>,
+            /// Modelled `class -> total instance field count (inherited
+            /// included)`, so a `MockCtx` can answer `class_num_total_fields`.
+            /// Empty by default, which reproduces the trait's `0` default —
+            /// i.e. "class not loaded", the answer `view_carrier_slots` treats
+            /// as "no declared field to collide with".
+            total_fields: HashMap<ClassId, usize>,
             /// Distinct per `Shared`, so two `MockCtx`s in one process are two
             /// different "VMs".
             ///
@@ -63240,6 +65463,14 @@ mod tests {
             vm_id: usize,
             next_ptr: usize,
             monitors: HashMap<usize, Arc<ObjMonitor>>,
+            /// Modelled `java.lang.String` content, as UTF-16 code UNITS.
+            ///
+            /// Empty by default, which reproduces the previous always-`None`
+            /// `read_string` stub: an object nothing called `define_string` for
+            /// is simply not a String. Units rather than `String` because the
+            /// whole point of the tests that use it is content a Rust `str`
+            /// cannot hold.
+            strings: HashMap<usize, Vec<u16>>,
         }
 
         impl Shared {
@@ -63253,9 +65484,11 @@ mod tests {
                     class_names: HashMap::new(),
                     superclasses: HashMap::new(),
                     field_indices: HashMap::new(),
+                    total_fields: HashMap::new(),
                     vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     next_ptr: 8,
                     monitors: HashMap::new(),
+                    strings: HashMap::new(),
                 }
             }
 
@@ -63325,6 +65558,27 @@ mod tests {
                     .insert(class_id, name.to_string());
             }
 
+            /// Allocate a modelled `java.lang.String` holding exactly `units`.
+            ///
+            /// The units are the point: a test that builds its fixture from a
+            /// Rust `&str` cannot express an unpaired surrogate at all, and a
+            /// test that then reads it back through `read_string` PASSES ON THE
+            /// BROKEN CODE, because `U+FFFD == U+FFFD`.
+            pub(super) fn define_string(&self, units: &[u16]) -> ObjectRef {
+                let cid = ClassId::new(9_001);
+                self.define_class(cid, "java/lang/String");
+                let mut s = self.shared.lock().unwrap();
+                // Two fields, so `unbox_wrapper`'s one-field probe cannot
+                // mistake a String for a boxed primitive.
+                let obj = s.alloc_entry(HeapEntry::Object {
+                    fields: vec![Value::Int(0); 2],
+                });
+                let ptr = obj.as_ptr() as usize;
+                s.object_classes.insert(ptr, cid);
+                s.strings.insert(ptr, units.to_vec());
+                obj
+            }
+
             /// Record `child extends parent`, so `superclass_of` walks.
             pub(super) fn define_superclass(&self, child: ClassId, parent: ClassId) {
                 self.shared
@@ -63345,6 +65599,14 @@ mod tests {
                     .unwrap()
                     .field_indices
                     .insert((class_id, name.to_string()), index);
+            }
+
+            /// Declare `class_id`'s TOTAL instance field count, inherited
+            /// fields included — what `NativeClassAccess::class_num_total_fields`
+            /// reports for a loaded class. Without this the mock answers the
+            /// trait default of `0`, which means "not loaded".
+            pub(super) fn define_total_fields(&self, class_id: ClassId, n: usize) {
+                self.shared.lock().unwrap().total_fields.insert(class_id, n);
             }
 
             /// Allocate an object of `class_id` with `num_fields` slots.
@@ -63373,6 +65635,19 @@ mod tests {
         }
 
         impl cratonvm_native_api::NativeClassAccess for MockCtx {
+            /// Report the TOTAL instance field count a test declared with
+            /// `define_total_fields`. `0` — the trait's own default — means
+            /// "class not loaded", which is exactly what an undeclared class
+            /// is here, so every pre-existing test is unchanged.
+            fn class_num_total_fields(&self, class_id: ClassId) -> usize {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .total_fields
+                    .get(&class_id)
+                    .copied()
+                    .unwrap_or(0)
+            }
             // --- default stubs for everything else ---------------------
             fn load_class(&mut self, _n: &str) -> MethodCallResult {
                 Ok(None)
@@ -63682,8 +65957,34 @@ mod tests {
                 let mut s = self.shared.lock().unwrap();
                 s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
             }
-            fn read_string(&self, _o: ObjectRef) -> Option<String> {
-                None
+            /// LOSSY, exactly as the VM's reader is: an unpaired surrogate
+            /// comes back as `U+FFFD` rather than refusing. That fidelity is
+            /// what lets a test demonstrate the mangling the units-exact
+            /// primitives below avoid.
+            fn read_string(&self, o: ObjectRef) -> Option<String> {
+                let s = self.shared.lock().unwrap();
+                let units = s.strings.get(&(o.as_ptr() as usize))?;
+                Some(String::from_utf16_lossy(units))
+            }
+            /// Answered from the modelled UNITS, as the VM answers it from the
+            /// receiver's own character storage.
+            fn java_string_hash_code(&self, o: ObjectRef) -> Option<i32> {
+                let s = self.shared.lock().unwrap();
+                let units = s.strings.get(&(o.as_ptr() as usize))?;
+                Some(
+                    units
+                        .iter()
+                        .fold(0i32, |h, &u| h.wrapping_mul(31).wrapping_add(u as i32)),
+                )
+            }
+            /// `None` means "not compared" — an operand is not a String — which
+            /// is the contract every caller in this file relies on to fall back
+            /// rather than answer "not equal".
+            fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
+                let s = self.shared.lock().unwrap();
+                let ua = s.strings.get(&(a.as_ptr() as usize))?;
+                let ub = s.strings.get(&(b.as_ptr() as usize))?;
+                Some(ua == ub)
             }
             fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
@@ -63864,6 +66165,244 @@ mod tests {
             fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
                 None
             }
+        }
+
+        // ------------------------------------------------------------------
+        // G55-1 — the key the map could not find again.
+        //
+        // MEASURED against Adoptium 25.0.3+9-hotspot on 2026-08-17
+        // (`scratchpad/g55/G55Probe.java`, 158 rows; `G55Fp.java`; `G55Ord.java`).
+        // A Rust `str` cannot hold an unpaired UTF-16 surrogate, so every
+        // `read_string`-derived hash or comparison in this file silently
+        // rewrote one to `U+FFFD`. Three consequences, all measured:
+        //
+        //   * `HashMap.get` / `Hashtable.get` returned `null` for the SAME
+        //     `String` object the map was just given — `put` filed it under
+        //     `map_hash_key` (units), `get` looked in the `U+FFFD` bucket;
+        //   * `List.contains` / `indexOf`, `Deque.contains` and
+        //     `Map.containsValue` answered "found" for a string that differs
+        //     from the stored one exactly where `String.equals` says different;
+        //   * `Map.hashCode()` / `Set.hashCode()` came out stable and wrong.
+        //
+        // Every assertion below is written in UTF-16 UNITS. Written through
+        // `read_string` they all PASS ON THE BROKEN CODE, because two mangled
+        // strings are equal to each other — which is precisely how this class
+        // of defect survives review.
+        // ------------------------------------------------------------------
+
+        const HI: u16 = 0xD800; // unpaired high surrogate
+        const LO: u16 = 0xDC00; // unpaired low surrogate
+
+        fn java_hash(units: &[u16]) -> i32 {
+            units
+                .iter()
+                .fold(0i32, |h, &u| h.wrapping_mul(31).wrapping_add(u as i32))
+        }
+
+        fn spread(raw: i32) -> i32 {
+            raw ^ ((raw as u32) >> 16) as i32
+        }
+
+        /// The bucket half of the silent miss. `put` hashes through
+        /// `map_hash_key`; the `get` fast path used to hash the DECODED text.
+        /// Pin that both are the receiver's own units, so the two cannot drift
+        /// apart again — and that the number is genuinely different from the
+        /// `U+FFFD` one, or the test would prove nothing.
+        #[test]
+        fn a_lone_surrogate_key_hashes_by_its_units_not_by_a_replacement_char() {
+            let mut ctx = MockCtx::new(1);
+            let key = ctx.define_string(&[b'k' as u16, HI]);
+
+            let units_hash = java_hash(&[b'k' as u16, HI]);
+            let mangled_hash = java_hash(&[b'k' as u16, 0xFFFD]);
+            assert_ne!(
+                units_hash, mangled_hash,
+                "fixture check: the two hashes must differ or nothing below is a test"
+            );
+
+            assert_eq!(ctx.java_string_hash_code(key), Some(units_hash));
+            assert_eq!(
+                map_hash_key(&mut ctx, key).unwrap(),
+                spread(units_hash),
+                "the bucket `put` files this key under"
+            );
+            assert_eq!(
+                element_hash_code(&mut ctx, &Value::Object(Some(key))).unwrap(),
+                units_hash,
+                "the raw hash the Map/Set hashCode contracts aggregate"
+            );
+        }
+
+        /// The equality half. Two keys that differ only in WHICH unpaired
+        /// surrogate they carry are different keys — and their decoded text is
+        /// identical, which is why a `&str` comparison called them equal.
+        #[test]
+        fn two_different_lone_surrogates_are_not_the_same_key_or_the_same_value() {
+            let mut ctx = MockCtx::new(1);
+            let high = ctx.define_string(&[b'a' as u16, HI, b'b' as u16]);
+            let low = ctx.define_string(&[b'a' as u16, LO, b'b' as u16]);
+
+            assert_eq!(
+                ctx.read_string(high),
+                ctx.read_string(low),
+                "fixture check: the DECODED forms are equal — this is the trap"
+            );
+
+            assert!(
+                !map_keys_equal(&mut ctx, high, low).unwrap(),
+                "HashMap must keep two distinct surrogate keys apart"
+            );
+            assert!(
+                !values_equal(&ctx, &Value::Object(Some(high)), &Value::Object(Some(low))),
+                "List.contains / Deque.contains / Map.containsValue must not \
+                 report a match for a value the collection does not hold"
+            );
+            assert_ne!(
+                map_hash_key(&mut ctx, high).unwrap(),
+                map_hash_key(&mut ctx, low).unwrap()
+            );
+        }
+
+        /// The other direction, so the test above cannot be satisfied by a
+        /// comparison that always answers "not equal": two DISTINCT objects
+        /// with the same units are still the same key and the same value.
+        #[test]
+        fn two_equal_lone_surrogate_strings_are_still_equal() {
+            let mut ctx = MockCtx::new(1);
+            let a = ctx.define_string(&[b'a' as u16, LO, b'b' as u16]);
+            let b = ctx.define_string(&[b'a' as u16, LO, b'b' as u16]);
+            assert_ne!(a.as_ptr(), b.as_ptr(), "fixture check: two objects");
+            assert!(map_keys_equal(&mut ctx, a, b).unwrap());
+            assert!(values_equal(
+                &ctx,
+                &Value::Object(Some(a)),
+                &Value::Object(Some(b))
+            ));
+            assert_eq!(
+                map_hash_key(&mut ctx, a).unwrap(),
+                map_hash_key(&mut ctx, b).unwrap()
+            );
+        }
+
+        /// `java_strings_equal` answering `None` means "not compared", and a
+        /// caller must fall through rather than conclude "not equal". A String
+        /// against a non-String must still reach the rest of the ladder.
+        #[test]
+        fn a_string_compared_against_a_non_string_falls_through_rather_than_deciding() {
+            let mut ctx = MockCtx::new(1);
+            let text = ctx.define_string(&[b'1' as u16]);
+            let not_a_string = ctx.alloc_object(ClassId::new(7001), 2);
+            assert_eq!(ctx.java_strings_equal(text, not_a_string), None);
+            assert!(!values_equal(
+                &ctx,
+                &Value::Object(Some(text)),
+                &Value::Object(Some(not_a_string))
+            ));
+        }
+
+        /// The fast-mode TreeMap key. A decode that may have lost a surrogate
+        /// is REFUSED, so the caller keeps the real object and the receiver's
+        /// own `compareTo` decides — rather than two distinct keys collapsing
+        /// into one `BTreeMap` entry.
+        #[test]
+        fn tree_key_refuses_a_string_whose_decode_may_have_lost_a_surrogate() {
+            let ctx = MockCtx::new(1);
+            let lone = ctx.define_string(&[HI]);
+            assert!(
+                tree_key_from_value(&ctx, &Value::Object(Some(lone))).is_none(),
+                "an unrepresentable key must fall back to the compareTo path, \
+                 not be stored under its U+FFFD rendering"
+            );
+            // A well-formed supplementary character is representable and IS
+            // taken — refusing everything would be a different defect.
+            let supplementary = ctx.define_string(&[0xD800, 0xDC00]);
+            assert_eq!(
+                tree_key_from_value(&ctx, &Value::Object(Some(supplementary))),
+                Some(TreeKey::Str(vec![0xD800, 0xDC00]))
+            );
+        }
+
+        /// `String.compareTo` is by code UNIT. `str::cmp` is by code POINT, and
+        /// the two disagree above the BMP — which is an ordinary emoji/CJK-ext
+        /// key, not surrogate exotica. MEASURED on both VMs: HotSpot enumerates
+        /// `[U+10000, U+E000, U+FFFF]`; this crate used to enumerate
+        /// `[U+E000, U+FFFF, U+10000]`.
+        #[test]
+        fn tree_keys_order_by_code_unit_where_a_rust_string_orders_by_code_point() {
+            let supplementary = TreeKey::Str("\u{10000}".encode_utf16().collect());
+            let e000 = TreeKey::Str(vec![0xE000]);
+            let ffff = TreeKey::Str(vec![0xFFFF]);
+            let mut bt = std::collections::BTreeMap::new();
+            bt.insert(ffff.clone(), 3);
+            bt.insert(e000.clone(), 2);
+            bt.insert(supplementary.clone(), 1);
+            let order: Vec<i32> = bt.values().copied().collect();
+            assert_eq!(
+                order,
+                vec![1, 2, 3],
+                "the supplementary key sorts FIRST, as HotSpot orders it"
+            );
+            assert!(
+                "\u{10000}".to_string() > "\u{FFFF}".to_string(),
+                "...and a Rust String would have sorted it LAST"
+            );
+        }
+
+        /// Two lone surrogates are two tree keys, not one.
+        #[test]
+        fn tree_keys_keep_two_lone_surrogates_apart() {
+            let mut bt = std::collections::BTreeMap::new();
+            bt.insert(TreeKey::Str(vec![HI]), "high");
+            bt.insert(TreeKey::Str(vec![LO]), "low");
+            assert_eq!(bt.len(), 2);
+            assert_eq!(bt.get(&TreeKey::Str(vec![HI])), Some(&"high"));
+            assert_eq!(bt.get(&TreeKey::Str(vec![LO])), Some(&"low"));
+        }
+
+        /// The two extracted rules, directly. One predicate, two callers — a
+        /// second spelling of "was this decode faithful" is how the two would
+        /// drift.
+        #[test]
+        fn the_faithful_decode_rule_gates_both_the_key_and_the_comparison() {
+            assert!(decode_is_faithful("plain"));
+            assert!(
+                decode_is_faithful("\u{1F600}"),
+                "a well-formed pair is fine"
+            );
+            assert!(!decode_is_faithful("a\u{FFFD}b"));
+
+            assert_eq!(tree_key_from_decoded_string("a\u{FFFD}b"), None);
+            assert_eq!(
+                tree_key_from_decoded_string("ab"),
+                Some(TreeKey::Str(vec![b'a' as u16, b'b' as u16]))
+            );
+
+            assert_eq!(compare_decoded_strings("a\u{FFFD}", "b"), None);
+            assert_eq!(compare_decoded_strings("b", "a\u{FFFD}"), None);
+            assert_eq!(
+                compare_decoded_strings("\u{10000}", "\u{FFFF}"),
+                Some(std::cmp::Ordering::Less),
+                "code-unit order, not code-point order"
+            );
+            assert_eq!(
+                compare_decoded_strings("a", "a"),
+                Some(std::cmp::Ordering::Equal)
+            );
+        }
+
+        /// The array-path comparator, end to end through `natural_compare`.
+        #[test]
+        fn natural_compare_puts_a_supplementary_string_before_u_ffff() {
+            let mut ctx = MockCtx::new(1);
+            let supplementary = ctx.define_string(&[0xD800, 0xDC00]);
+            let ffff = ctx.define_string(&[0xFFFF]);
+            let got = natural_compare(
+                &mut ctx,
+                &Value::Object(Some(supplementary)),
+                &Value::Object(Some(ffff)),
+            )
+            .unwrap();
+            assert_eq!(got, Some(Value::Int(-1)));
         }
 
         #[test]
@@ -65418,5 +67957,237 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RULE F — the null functional argument.
+    //
+    // G8 lane, 2026-08-16. The oracle rows these pin are in
+    // `docs/known-issues/jdk-only/G8-1-...md` §2 and were MEASURED on HotSpot
+    // 25.0.3+9-LTS. Nothing here has been observed on a CratonVM binary.
+    // -----------------------------------------------------------------------
+
+    /// True when `r` is the message-less NPE every one of these methods raises.
+    /// A message would be as wrong as no throw at all: `getMessage()` is `null`
+    /// on the oracle, printed distinctly from `""` in the probe on purpose.
+    fn is_bare_npe(r: &MethodCallResult) -> bool {
+        matches!(
+            r,
+            Err(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::NullPointerException { message: None },
+                )
+            ))
+        )
+    }
+
+    /// The helper's own truth table, with no VM in the way.
+    ///
+    /// The middle row is the one that matters and the one a "just check for
+    /// null" rewrite loses: a MISSING argument is a malformed native call, not
+    /// a program-level NPE, and must keep the body's existing no-op.
+    #[test]
+    fn reject_null_functional_separates_a_missing_arg_from_an_explicit_null() {
+        assert!(
+            reject_null_functional(None).is_ok(),
+            "a MISSING argument is a dispatch defect, not a Java-visible NPE"
+        );
+        assert!(
+            reject_null_functional(Some(&Value::Int(0))).is_ok(),
+            "a non-reference argument is not this helper's business"
+        );
+        // Never dereferenced — the helper only inspects the discriminant. Same
+        // fabricated-address idiom the `dense_int_entries_tests` module uses.
+        let some_fn = Some(unsafe { ObjectRef::from_raw(0x1000 as *mut u8) });
+        assert!(
+            reject_null_functional(Some(&Value::Object(some_fn))).is_ok(),
+            "a real function object must pass"
+        );
+        let refused = reject_null_functional(Some(&Value::Object(None)));
+        assert!(
+            matches!(
+                refused,
+                Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::NullPointerException { message: None },
+                    )
+                ))
+            ),
+            "an explicitly passed null must be the MESSAGE-LESS NPE, got {refused:?}"
+        );
+    }
+
+    /// Every body on the axis, with an explicitly null function, must throw.
+    ///
+    /// This is the fabricated-success direction: before this lane each of these
+    /// returned `Ok` — the empty answer for its return type — so the caller was
+    /// told the operation had succeeded and nothing had happened. The argument
+    /// INDEX is carried per row rather than assumed, because it is not uniform:
+    /// `native_chm_for_each_parallel` takes `(long, BiConsumer)` so its
+    /// function is argument 2, and `native_tm_merge`'s is argument 3.
+    #[test]
+    fn every_null_function_body_refuses_an_explicit_null() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/HashMap");
+        let this = ctx.alloc_object(ClassId::new(0), 8);
+        let recv = Value::Object(Some(this));
+        let nul = Value::Object(None);
+        let key = Value::Int(1);
+
+        type Body = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+        let cases: Vec<(&str, Body, Vec<Value>)> = vec![
+            ("native_map_for_each", native_map_for_each, vec![recv, nul]),
+            (
+                "native_map_replace_all",
+                native_map_replace_all,
+                vec![recv, nul],
+            ),
+            (
+                "native_map_compute_if_absent",
+                native_map_compute_if_absent,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_map_compute",
+                native_map_compute,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_map_compute_if_present",
+                native_map_compute_if_present,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_lhm_compute_if_absent",
+                native_lhm_compute_if_absent,
+                vec![recv, key, nul],
+            ),
+            ("native_lhm_for_each", native_lhm_for_each, vec![recv, nul]),
+            ("native_tm_for_each", native_tm_for_each, vec![recv, nul]),
+            (
+                "native_tm_compute_if_absent",
+                native_tm_compute_if_absent,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_tm_merge",
+                native_tm_merge,
+                vec![recv, key, key, nul],
+            ),
+            ("native_al_for_each", native_al_for_each, vec![recv, nul]),
+            ("native_al_remove_if", native_al_remove_if, vec![recv, nul]),
+            (
+                "native_al_replace_all",
+                native_al_replace_all,
+                vec![recv, nul],
+            ),
+            ("native_ll_remove_if", native_ll_remove_if, vec![recv, nul]),
+            ("native_hs_for_each", native_hs_for_each, vec![recv, nul]),
+            ("native_ts_for_each", native_ts_for_each, vec![recv, nul]),
+            ("native_ad_for_each", native_ad_for_each, vec![recv, nul]),
+            ("native_ksv_for_each", native_ksv_for_each, vec![recv, nul]),
+            (
+                "native_ksv_remove_if",
+                native_ksv_remove_if,
+                vec![recv, nul],
+            ),
+            ("native_chm_for_each", native_chm_for_each, vec![recv, nul]),
+            (
+                "native_chm_replace_all",
+                native_chm_replace_all,
+                vec![recv, nul],
+            ),
+            (
+                "native_chm_for_each_parallel",
+                native_chm_for_each_parallel,
+                vec![recv, Value::Long(1), nul],
+            ),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            22,
+            "the sweep is the point: a body added to the axis without a row here \
+             is a body that can silently go back to answering success"
+        );
+
+        for (name, body, args) in cases {
+            let r = body(&mut ctx, &args);
+            assert!(
+                is_bare_npe(&r),
+                "{name}: an explicitly null function must raise a MESSAGE-LESS \
+                 NullPointerException (MEASURED on all six map receivers and \
+                 every collection receiver, empty or not), got {r:?}"
+            );
+        }
+    }
+
+    /// The over-set direction, and the reason the helper takes `Option<&Value>`.
+    ///
+    /// A native invoked with the functional argument MISSING is a dispatch
+    /// defect inside this VM. Reporting it as a Java `NullPointerException`
+    /// would put a VM bug into an application's catch block wearing the costume
+    /// of a program error. Each of these calls is short by one argument and
+    /// must keep the body's pre-existing no-op.
+    #[test]
+    fn a_missing_functional_argument_is_not_reported_as_a_java_npe() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/HashMap");
+        let this = ctx.alloc_object(ClassId::new(0), 8);
+        let recv = Value::Object(Some(this));
+
+        type Body = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+        let cases: Vec<(&str, Body, Vec<Value>)> = vec![
+            ("native_map_for_each", native_map_for_each, vec![recv]),
+            ("native_map_replace_all", native_map_replace_all, vec![recv]),
+            ("native_al_remove_if", native_al_remove_if, vec![recv]),
+            ("native_al_replace_all", native_al_replace_all, vec![recv]),
+            ("native_ll_remove_if", native_ll_remove_if, vec![recv]),
+            ("native_ksv_remove_if", native_ksv_remove_if, vec![recv]),
+        ];
+
+        for (name, body, args) in cases {
+            let r = body(&mut ctx, &args);
+            assert!(
+                !is_bare_npe(&r),
+                "{name}: a MISSING argument is a malformed native call and must \
+                 not be reported to Java as an NPE, got {r:?}"
+            );
+        }
+    }
+
+    /// The trap this axis sets, pinned so a later sweep cannot walk into it.
+    ///
+    /// `sort` takes a `Comparator`, and a null `Comparator` is NOT a null
+    /// functional argument — it MEANS natural ordering. MEASURED returning
+    /// `[a, b]` on `ArrayList`, `LinkedList`, `Vector`, `Stack`,
+    /// `CopyOnWriteArrayList`, `Arrays.asList`, `subList`,
+    /// `Collections.sort(l, null)` and `Arrays.sort(a, null)`. A blanket
+    /// "refuse every null function argument" rule — exactly the generalisation
+    /// HANDOFF-20260814 §5 warns against — would turn nine working paths into
+    /// throws.
+    #[test]
+    fn a_null_comparator_means_natural_ordering_and_is_never_refused() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/ArrayList");
+        let this = ctx.alloc_object(ClassId::new(0), 8);
+        let args = [Value::Object(Some(this)), Value::Object(None)];
+
+        let r = native_al_sort_comparator(&mut ctx, &args);
+        assert!(
+            !is_bare_npe(&r),
+            "List.sort(null) sorts by natural ordering on the oracle; refusing \
+             it would be a fabricated failure, got {r:?}"
+        );
+
+        let r = native_collections_sort_comparator(&mut ctx, &args);
+        assert!(
+            !is_bare_npe(&r),
+            "Collections.sort(l, null) sorts by natural ordering on the oracle, \
+             got {r:?}"
+        );
     }
 }

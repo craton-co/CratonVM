@@ -1201,6 +1201,45 @@ fn loader_name_and_id(loader: cratonvm_types::ClassLoaderId) -> Option<&'static 
     }
 }
 
+/// Which class `klass_origin` has to resolve to answer for a display name.
+///
+/// The three descriptor shapes need three different actions and must not be
+/// collapsed. `interpreter::constants::array_component_class_name` is the
+/// existing helper for the same parse, but it is `pub(super)` to the
+/// interpreter module *and* answers `None` for both "not an array" and
+/// "primitive-component array" — the exact distinction that decides whether
+/// this function does a lookup at all — so it cannot serve here.
+#[derive(Debug, PartialEq, Eq)]
+enum OriginLookup<'a> {
+    /// Not an array: resolve this name itself.
+    Plain(&'a str),
+    /// Reference-component array: resolve the *bottom* component's name.
+    Component(&'a str),
+    /// Primitive-component array at any depth (`[I`, `[[J`): java.base and the
+    /// bootstrap loader, with no lookup.
+    PrimitiveArray,
+}
+
+/// Parse a cast-message operand into the lookup `klass_origin` must perform.
+///
+/// `display_name` is HotSpot's `external_name()` spelling — dotted, arrays left
+/// in JVMS descriptor form (`[I`, `[Ljava.lang.String;`, `[[LCastProbe;`), NOT
+/// the JEP 358 source form (`int[]`). Measured on Temurin 25.0.3.9; see the
+/// transcript in `klass_origin`.
+fn origin_lookup(display_name: &str) -> OriginLookup<'_> {
+    let dims = display_name.bytes().take_while(|b| *b == b'[').count();
+    match display_name[dims..].strip_prefix('L') {
+        // `[Ljava.lang.String;` -> `java.lang.String`. Stripping *all* leading
+        // `[` first is deliberate: HotSpot walks to the bottom klass, so
+        // `[[Ljava.lang.String;` and `[Ljava.lang.String;` give the same clause.
+        Some(component) if dims > 0 => OriginLookup::Component(component.trim_end_matches(';')),
+        // Not an array, but the name happens to start with `L` (`Long`).
+        Some(_) => OriginLookup::Plain(display_name),
+        None if dims > 0 => OriginLookup::PrimitiveArray,
+        None => OriginLookup::Plain(display_name),
+    }
+}
+
 /// Resolve a class *display* name (dotted, possibly an array descriptor) to the
 /// module/loader pair HotSpot names it by.
 ///
@@ -1218,42 +1257,54 @@ fn loader_name_and_id(loader: cratonvm_types::ClassLoaderId) -> Option<&'static 
 /// deliberate choice rather than a convenience, so it is one here.
 fn klass_origin(shared: &SharedVm, thread: &JvmThread, display_name: &str) -> Option<KlassOrigin> {
     let cm = shared.classes.class_manager.read();
-    let class_id = cm.find_unique_class_by_name(display_name).or_else(|| {
+
+    // Parse the descriptor BEFORE looking anything up. The previous shape
+    // opened with `find_unique_class_by_name(display_name)` — a lookup of the
+    // *array class itself* — and only then parsed the `[` prefix, which made
+    // the whole array arm reachable only when something else had already put
+    // that exact array class in the definition index. Measured (W7-37 §B8,
+    // §B11.1): four of six cast shapes with an array operand dropped back to
+    // the bare `X cannot be cast to Y` form, and the two that did not were the
+    // shapes whose own probe happened to allocate the array type it was asking
+    // about — which is how this row was recorded as fixed twice.
+    //
+    // HotSpot reads module and loader off the *bottom* klass
+    // (`Klass::class_in_module_of_loader` walks `ObjArrayKlass::bottom_klass`,
+    // and `ArrayKlass::class_loader_data()` is the component's CLD, per JVMS
+    // §5.3.3 step 2: "the Java Virtual Machine marks C to have the defining
+    // loader of the component type as its defining loader"). So resolve the
+    // component and answer from it — no array class needs to exist anywhere.
+    //
+    // Measured on Temurin 25.0.3.9 (`CastMsgs` probe, docs/known-issues/
+    // jdk-only/W8-C4-1-array-cast-klass-origin.md §1):
+    //   [LCastProbe; is in unnamed module of loader 'app'
+    //   [Ljava.lang.String; is in module java.base of loader 'bootstrap'
+    //   [[I and java.lang.String are in module java.base of loader 'bootstrap'
+    // i.e. the array's clause is the *component's* module and loader verbatim,
+    // and a primitive-component array — at any depth, since `[[I` is an
+    // objArrayKlass whose bottom klass is the typeArrayKlass `[I` and so takes
+    // HotSpot's "klass is an array of primitives, module is java.base" arm — is
+    // java.base / bootstrap with no lookup at all.
+    let lookup_name = match origin_lookup(display_name) {
+        OriginLookup::Plain(name) | OriginLookup::Component(name) => name,
+        OriginLookup::PrimitiveArray => {
+            return Some(KlassOrigin {
+                module: Some("java.base".to_string()),
+                loader: "'bootstrap'",
+                loader_id: cratonvm_types::ClassLoaderId::Bootstrap,
+            })
+        }
+    };
+
+    let class_id = cm.find_unique_class_by_name(lookup_name).or_else(|| {
         let frame_class = thread.frames.last()?.class_id;
-        cm.find_class_by_name_for_class(display_name, frame_class)
+        cm.find_class_by_name_for_class(lookup_name, frame_class)
     })?;
     let class = cm.get_class(class_id)?;
     let loader_id = class.loader_id;
     let loader = loader_name_and_id(loader_id)?;
-
-    // HotSpot reads the module off the array's *bottom* klass
-    // (`Klass::class_in_module_of_loader` walks `ObjArrayKlass::bottom_klass`)
-    // and hard-codes java.base for a primitive-component array — which is why
-    // `int[].class.getModule().getName()` measures as `java.base` on both VMs.
-    let name = class.name.to_string();
-    let dims = name.bytes().take_while(|b| *b == b'[').count();
-    if dims == 0 {
-        return Some(KlassOrigin {
-            module: class.module_name.clone(),
-            loader,
-            loader_id,
-        });
-    }
-    let module = match name[dims..].strip_prefix('L') {
-        // Reference-component array: the component carries the module.
-        Some(component) => {
-            let component = component.trim_end_matches(';');
-            let component_id = cm
-                .find_unique_class_by_name(component)
-                .or_else(|| cm.find_class_by_name_for_class(component, class_id))?;
-            cm.get_class(component_id)?.module_name.clone()
-        }
-        // Primitive-component array — java.base, per HotSpot's own comment
-        // ("klass is an array of primitives, module is java.base").
-        None => Some("java.base".to_string()),
-    };
     Some(KlassOrigin {
-        module,
+        module: class.module_name.clone(),
         loader,
         loader_id,
     })
@@ -2530,6 +2581,98 @@ mod tests {
 
     fn test_vm() -> Vm {
         Vm::new(VmConfig::default())
+    }
+
+    // -----------------------------------------------------------------------
+    // `klass_origin`'s descriptor parse (W7-37 §B8.1 / §B11.1)
+    // -----------------------------------------------------------------------
+
+    /// The operand spellings are HotSpot's, taken verbatim from a Temurin
+    /// 25.0.3.9 run of the `CastMsgs` probe (see
+    /// `docs/known-issues/jdk-only/W8-C4-1-array-cast-klass-origin.md`
+    /// §1). They are *dotted descriptors*, not JEP 358 source form: HotSpot
+    /// prints `class [I cannot be cast to class [Ljava.lang.String;`, never
+    /// `int[]` / `String[]`, for a cast refusal.
+    ///
+    /// The bug this pins: `klass_origin` used to look the *array class* up in
+    /// the definition index and only parse the `[` prefix afterwards, so the
+    /// array arm ran only when something unrelated had already defined that
+    /// exact array class — non-deterministically, per program. Parsing first
+    /// removes the dependence on incidental index state, and this test is the
+    /// part of that which needs no VM.
+    #[test]
+    fn origin_lookup_resolves_the_bottom_component_not_the_array() {
+        // Plain classes resolve themselves — including one whose name starts
+        // with the descriptor tag `L`, which a naive `strip_prefix('L')` eats.
+        assert_eq!(
+            origin_lookup("java.lang.String"),
+            OriginLookup::Plain("java.lang.String")
+        );
+        assert_eq!(origin_lookup("Long"), OriginLookup::Plain("Long"));
+        assert_eq!(
+            origin_lookup("CastProbe"),
+            OriginLookup::Plain("CastProbe"),
+            "a default-package application class has no separator at all"
+        );
+
+        // Reference arrays resolve the BOTTOM component, at every depth: HotSpot
+        // walks `ObjArrayKlass::bottom_klass`, so `[[Ljava.lang.String;` and
+        // `[Ljava.lang.String;` print the same module/loader clause.
+        assert_eq!(
+            origin_lookup("[Ljava.lang.String;"),
+            OriginLookup::Component("java.lang.String")
+        );
+        assert_eq!(
+            origin_lookup("[[Ljava.lang.String;"),
+            OriginLookup::Component("java.lang.String")
+        );
+        assert_eq!(
+            origin_lookup("[LCastProbe;"),
+            OriginLookup::Component("CastProbe"),
+            "measured: `[LCastProbe; is in unnamed module of loader 'app'` — an \
+             array takes the COMPONENT's defining loader (JVMS §5.3.3 step 2), \
+             so the component is the class that has to be resolved"
+        );
+
+        // Primitive arrays need no lookup at any depth. `[[I` is an
+        // objArrayKlass whose bottom klass is the typeArrayKlass `[I`, and
+        // HotSpot's `else` arm hard-codes java.base for it — measured:
+        // `([[I and java.lang.String are in module java.base of loader
+        // 'bootstrap')`.
+        for name in ["[I", "[[I", "[J", "[[[D", "[Z"] {
+            assert_eq!(
+                origin_lookup(name),
+                OriginLookup::PrimitiveArray,
+                "{name} must answer java.base/bootstrap without a lookup"
+            );
+        }
+    }
+
+    /// `split_cast_operands` has to leave an already-rewritten message alone,
+    /// or the funnel would nest parentheticals every time a message passed
+    /// through it twice. Array operands are the case worth pinning because
+    /// they contain `;` and `[` and nothing else in the splitter looks at
+    /// those.
+    #[test]
+    fn split_cast_operands_handles_array_descriptors_and_is_idempotent() {
+        assert_eq!(
+            split_cast_operands("class [I cannot be cast to class [Ljava.lang.String;"),
+            Some(("[I", "[Ljava.lang.String;"))
+        );
+        assert_eq!(
+            split_cast_operands("[I cannot be cast to [Ljava.lang.String;"),
+            Some(("[I", "[Ljava.lang.String;")),
+            "the bare pre-rewrite wording must split too — that is the shape \
+             the interpreter's checkcast raise site produces"
+        );
+        assert_eq!(
+            split_cast_operands(
+                "class [I cannot be cast to class [Ljava.lang.String; ([I and \
+                 [Ljava.lang.String; are in module java.base of loader 'bootstrap')"
+            ),
+            None,
+            "an already-rewritten message must NOT split again"
+        );
     }
 
     // -----------------------------------------------------------------------

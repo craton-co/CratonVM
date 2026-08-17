@@ -271,6 +271,14 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     // a negative magnitude for 12 of 6000 sampled pairs where HotSpot returns a
     // positive one. Note the direction: here the STRICT class is the looser of
     // the two, which is why sharing looked safe.
+    //
+    // MEASURED 2026-08-13 on 25.0.3+9-LTS, the two-line demonstration:
+    //
+    //   StrictMath.copySign(1.0, -NaN) = 3ff0000000000000  (+1.0)
+    //   Math.copySign(1.0, -NaN)       = bff0000000000000  (-1.0)
+    //
+    // `Math`'s answer already matched, so only the strict form was wrong, and
+    // only for NaN — `copySign(1.0, -0.0)` is -1.0 in BOTH and must stay.
     if strict {
         registry.register(class, "copySign", "(DD)D", native_strict_copy_sign_double);
         registry.register(class, "copySign", "(FF)F", native_strict_copy_sign_float);
@@ -789,7 +797,12 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/String",
         "codePoints",
         "()Ljava/util/stream/IntStream;",
-        native_string_code_points,
+        // NOT "same as chars" — that was true only for the BMP, which is what
+        // the old comment said and why this went unnoticed. `chars()` yields
+        // UTF-16 code UNITS, so a supplementary character arrives as its two
+        // surrogates; `codePoints()` must pair them back into one code point.
+        // docs/known-issues/jdk-only/W7-95a-string-code-point-family.md
+        crate::lang_string::native_string_code_points,
     );
     registry.register(
         "java/lang/String",
@@ -1210,33 +1223,46 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "(C)Ljava/lang/String;",
         native_character_static_to_string,
     );
-    // Java 21: Character emoji detection methods
+    // Java 21: Character emoji detection methods.
+    //
+    // W7-95(C1). All five bodies used to be hand-written coarse ranges with
+    // comments like "basic emoji ranges" — whole blocks approximated rather
+    // than the property enumerated. Measured against HotSpot 25 over every code
+    // point `0..=0x10FFFF`, they were wrong on **2,746**:
+    //
+    //     isEmoji              1282 wrong  (1265 false positives, 17 misses)
+    //     isEmojiPresentation  1416 wrong  (1350 false positives, 66 misses)
+    //     isEmojiModifierBase    17 wrong  (all misses)
+    //     isEmojiComponent       31 wrong  (30 misses, 1 false positive)
+    //     isEmojiModifier         0 wrong  <- the one that was a real range
+    //
+    // The two the census had already caught (`isEmojiPresentation(U+2764)`
+    // true-for-false, `isEmojiComponent(U+1F1E6)` false-for-true) were not
+    // corner cases: `0x2600..=0x27BF` as "emoji presentation" claims 448 code
+    // points of which HotSpot agrees on 25. The tables below are the JDK's own
+    // answers; `isEmojiModifier` keeps a table too, so a future Unicode bump
+    // regenerates all five the same way instead of five different ways.
     registry.register("java/lang/Character", "isEmoji", "(I)Z", |_ctx, args| {
         let cp = match args.first() {
             Some(Value::Int(v)) => *v as u32,
             _ => 0,
         };
-        // Basic emoji ranges: emoticons, transport, misc symbols, dingbats, regional indicators
-        let is_emoji = matches!(cp,
-            0x231A..=0x231B | 0x23E9..=0x23F3 | 0x23F8..=0x23FA |
-            0x25AA..=0x25AB | 0x25B6 | 0x25C0 | 0x25FB..=0x25FE |
-            0x2600..=0x27BF | 0x2934..=0x2935 | 0x2B05..=0x2B07 |
-            0x2B1B..=0x2B1C | 0x2B50 | 0x2B55 | 0x3030 | 0x303D |
-            0x3297 | 0x3299 | 0x1F004 | 0x1F0CF |
-            0x1F170..=0x1F171 | 0x1F17E..=0x1F17F | 0x1F18E |
-            0x1F191..=0x1F19A | 0x1F1E0..=0x1F1FF |
-            0x1F200..=0x1F251 | 0x1F300..=0x1F9FF |
-            0x1FA00..=0x1FA6F | 0x1FA70..=0x1FAFF |
-            0x200D | 0xFE0F | 0x20E3 |
-            0x0023 | 0x002A | 0x0030..=0x0039
-        );
+        let is_emoji = in_code_point_runs(JAVA_EMOJI_RUNS, cp);
         Ok(Some(Value::Int(if is_emoji { 1 } else { 0 })))
     });
-    registry.register("java/lang/Character", "isEmojiPresentation", "(I)Z", |_ctx, args| {
-        let cp = match args.first() { Some(Value::Int(v)) => *v as u32, _ => 0 };
-        let is_ep = matches!(cp, 0x1F300..=0x1F9FF | 0x1FA00..=0x1FAFF | 0x2600..=0x26FF | 0x2700..=0x27BF);
-        Ok(Some(Value::Int(if is_ep { 1 } else { 0 })))
-    });
+    registry.register(
+        "java/lang/Character",
+        "isEmojiPresentation",
+        "(I)Z",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let is_ep = in_code_point_runs(JAVA_EMOJI_PRESENTATION_RUNS, cp);
+            Ok(Some(Value::Int(if is_ep { 1 } else { 0 })))
+        },
+    );
     registry.register(
         "java/lang/Character",
         "isEmojiModifier",
@@ -1246,23 +1272,23 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v as u32,
                 _ => 0,
             };
-            let is_em = (0x1F3FB..=0x1F3FF).contains(&cp);
+            let is_em = in_code_point_runs(JAVA_EMOJI_MODIFIER_RUNS, cp);
             Ok(Some(Value::Int(if is_em { 1 } else { 0 })))
         },
     );
-    registry.register("java/lang/Character", "isEmojiModifierBase", "(I)Z", |_ctx, args| {
-        let cp = match args.first() { Some(Value::Int(v)) => *v as u32, _ => 0 };
-        let is_emb = matches!(cp, 0x261D | 0x26F9 | 0x270A..=0x270D | 0x1F385 | 0x1F3C2..=0x1F3C4 |
-            0x1F3C7 | 0x1F3CA..=0x1F3CC | 0x1F442..=0x1F443 | 0x1F446..=0x1F450 |
-            0x1F466..=0x1F478 | 0x1F47C | 0x1F481..=0x1F483 | 0x1F485..=0x1F487 |
-            0x1F4AA | 0x1F574..=0x1F575 | 0x1F57A | 0x1F590 | 0x1F595..=0x1F596 |
-            0x1F645..=0x1F647 | 0x1F64B..=0x1F64F | 0x1F6A3 | 0x1F6B4..=0x1F6B6 |
-            0x1F6C0 | 0x1F6CC | 0x1F90F | 0x1F918..=0x1F91F | 0x1F926 |
-            0x1F930..=0x1F939 | 0x1F93D..=0x1F93E | 0x1F9B5..=0x1F9B6 | 0x1F9B8..=0x1F9B9 |
-            0x1F9BB | 0x1F9CD..=0x1F9CF | 0x1F9D1..=0x1F9DD
-        );
-        Ok(Some(Value::Int(if is_emb { 1 } else { 0 })))
-    });
+    registry.register(
+        "java/lang/Character",
+        "isEmojiModifierBase",
+        "(I)Z",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let is_emb = in_code_point_runs(JAVA_EMOJI_MODIFIER_BASE_RUNS, cp);
+            Ok(Some(Value::Int(if is_emb { 1 } else { 0 })))
+        },
+    );
     registry.register(
         "java/lang/Character",
         "isEmojiComponent",
@@ -1272,8 +1298,7 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v as u32,
                 _ => 0,
             };
-            let is_ec = matches!(cp, 0x200D | 0xFE0E..=0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF |
-            0xE0020..=0xE007F | 0x0023 | 0x002A | 0x0030..=0x0039);
+            let is_ec = in_code_point_runs(JAVA_EMOJI_COMPONENT_RUNS, cp);
             Ok(Some(Value::Int(if is_ec { 1 } else { 0 })))
         },
     );
@@ -1714,6 +1739,50 @@ pub(crate) fn java_min_float(a: f32, b: f32) -> f32 {
     } else {
         b
     }
+}
+
+// --- W7-94: how wide the min/max rule actually is, and why nothing saw it ---
+//
+// Measured 2026-08-12 against HotSpot 25.0.3+9, same host, same class file,
+// before the four helpers above existed:
+//
+//                             HotSpot   CratonVM (before)
+//     Math.min(1.0, NaN)      NaN       1.0
+//     Math.max(1.0, NaN)      NaN       1.0
+//     Math.min(-0.0, 0.0)     -0.0      0.0
+//     Math.min(1.0f, NaNf)    NaN       1.0
+//     StrictMath.min(1.0,NaN) NaN       1.0
+//
+// while `min(II)I` and `min(JJ)J` were correct — the pass/fail boundary is per
+// DESCRIPTOR, below the granularity any census reports.
+//
+// `register_math_natives` is called for BOTH `java/lang/Math` and
+// `java/lang/StrictMath`, so four bodies were eight wrong triples, and
+// `Float.min`/`max` inherit these with no registration of their own.
+// `Double.min`/`max` do NOT — they carry their own bodies in `phases_early`,
+// which is why that file calls the two aliases below.
+//
+// Why nothing caught it: the enclosing registrar opens with
+// `set_category(NativeKind::Intrinsic)`, and `Intrinsic` is exempt from shadow
+// retirement AND is not the census's `native-shadows-bytecode` kind — so a
+// `--jdk-only-report` run of a program calling `Math.min` four times yields
+// ZERO `java/lang/Math` rows. The correct tree already existed in-tree as
+// `phases_late::streams::p56_java_math_min`, whose doc comment describes this
+// exact trap, with one caller: the positive half fixed, the twin left.
+
+/// `java.lang.Math.max(double,double)` under the name `phases_early`'s
+/// `Double.max` body already calls. One rule, one implementation — see
+/// [`java_max_double`], which this forwards to verbatim.
+#[inline(always)]
+pub(crate) fn java_math_max_f64(a: f64, b: f64) -> f64 {
+    java_max_double(a, b)
+}
+
+/// `java.lang.Math.min(double,double)` — the mirror of [`java_math_max_f64`],
+/// forwarding to [`java_min_double`].
+#[inline(always)]
+pub(crate) fn java_math_min_f64(a: f64, b: f64) -> f64 {
+    java_min_double(a, b)
 }
 
 /// Raw bits of `-0.0`, matching `Math`'s own `negativeZeroDoubleBits`.
@@ -2667,7 +2736,9 @@ pub(crate) fn native_strict_copy_sign_double(
     Ok(Some(Value::Double(mag.copysign(sign))))
 }
 
-/// `StrictMath.copySign(float, float)` — see the double overload.
+/// `StrictMath.copySign(float, float)` — see the double overload. Both widths
+/// were wrong: a family fix that took only the `double` form would have left
+/// the `(FF)F` row red.
 #[inline]
 pub(crate) fn native_strict_copy_sign_float(
     _ctx: &mut dyn NativeContext,
@@ -2801,10 +2872,20 @@ pub(crate) fn native_math_ulp_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // `Math.ulp` switches on the exponent and returns `Math.abs(d)` for the
-    // NaN/infinity case — one arm covering both. For a NaN that means the
-    // argument with its sign bit cleared and its payload intact, which is why
-    // `ulp(0xffc8ae0a)` is `0x7fc8ae0a` on HotSpot and was `0x7fc00000` here.
+    // W7-95(C1). `Math.ulp` switches on the exponent and returns `Math.abs(d)`
+    // for the whole `MAX_EXPONENT + 1` case — NaN and both infinities under one
+    // arm. For a NaN that means the argument with its sign bit cleared and its
+    // payload INTACT, not the canonical quiet NaN `f64::NAN` would have
+    // produced. Measured on HotSpot 25:
+    //
+    //   Math.ulp(0x7ff0000000000001) = 0x7ff0000000000001   (payload kept)
+    //   Math.ulp(0xfff8000000000000) = 0x7ff8000000000000   (sign cleared)
+    //   Math.ulp(0xffc8ae0a)         = 0x7fc8ae0a           (float width; was
+    //                                                        0x7fc00000 here)
+    //
+    // Only "is NaN" is specified, so the payload half is fidelity rather than a
+    // contract — but `v.abs()` is both the JDK's own expression and strictly
+    // closer to it, so there is no reason to write anything else.
     let result = if v.is_nan() || v.is_infinite() {
         v.abs()
     } else {
@@ -2832,7 +2913,15 @@ pub(crate) fn native_math_ulp_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    // See `native_math_ulp_double`: one `Math.abs` arm covers NaN and infinity.
+    // See `native_math_ulp_double`: one `Math.abs` arm covers NaN and both
+    // infinities, and it keeps a NaN payload.
+    //
+    // EXHAUSTIVELY VERIFIED, this width: all 4,294,967,296 `float` bit patterns
+    // were run through this algorithm and through `Math.ulp` on HotSpot 25 and
+    // compared as `floatToRawIntBits`. Every non-NaN pattern — 4,278,190,082 of
+    // them — already matched; the 16,777,212 that did not were exactly the
+    // non-canonical NaNs this change fixes. There is no residual defect at this
+    // width: do not "fix" it again.
     let result = if v.is_nan() || v.is_infinite() {
         v.abs()
     } else {
@@ -2858,6 +2947,21 @@ pub(crate) fn native_math_get_exponent_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    // The JDK is ONE expression with no special cases (Math.java):
+    //
+    //     ((int)((doubleToRawLongBits(d) & EXP_BIT_MASK) >> 52)) - 1023
+    //
+    // so a SUBNORMAL reports the same -1023 as zero: `getExponent` returns the
+    // unbiased exponent FIELD, not the value's mathematical exponent. The
+    // hand-written branches here computed the latter for subnormals --
+    // MEASURED 2026-08-13 (scratchpad/orch/Exp.java):
+    // `getExponent(Double.MIN_VALUE)` was -1074 where HotSpot answers -1023.
+    // The float form has no native at all and runs the real JDK bytecode,
+    // which is why it was already right; this one had a hand-rolled twin.
+    // Every other case the branches enumerated (zero, NaN, Infinity,
+    // MIN_NORMAL, 1.0) falls out of the same subtraction, verified against the
+    // oracle -- so they were not merely redundant, they were the only reason
+    // the wrong branch looked plausible.
     let bits = v.to_bits();
     let biased = ((bits >> 52) & 0x7FF) as i32;
     let result = if biased == 0x7FF {
@@ -2973,11 +3077,134 @@ pub(crate) fn alloc_wrapper(
 type ScopedValueCache<const N: usize> =
     std::collections::HashMap<usize, [Option<cratonvm_types::ObjectRef>; N]>;
 
-static INTEGER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+/// The one cache in this file whose upper bound is **configurable**, so its
+/// backing store cannot be a `[Option<ObjectRef>; N]` like the other five.
+///
+/// See [`integer_cache_bound`] for the rule and the measurement. The `Vec` is
+/// sized once, at bound-resolution time, and never resized afterwards — so an
+/// index computed against the latched bound is always in range.
+type ScopedIntegerCache = std::collections::HashMap<usize, Vec<Option<cratonvm_types::ObjectRef>>>;
+
+static INTEGER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedIntegerCache>> =
     std::sync::OnceLock::new();
 
-fn integer_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+fn integer_cache() -> &'static parking_lot::Mutex<ScopedIntegerCache> {
     INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `IntegerCache.low` — `-128`, and NOT configurable. `jdk25src/java.base/
+/// java/lang/Integer.java`: `static final int low = -128;` is a literal with
+/// no property behind it, and only `high` reads one.
+const INTEGER_CACHE_LOW: i32 = -128;
+
+/// The property `IntegerCache.<clinit>` reads. HotSpot reads it through
+/// `jdk.internal.misc.VM.getSavedProperty`, not `System.getProperty` — which
+/// is why `System.getProperty("java.lang.Integer.IntegerCache.high")` answers
+/// **`null`** on HotSpot even in a run where the cache really was widened
+/// (MEASURED: `prop.System=null` under `-Djava.lang.Integer.IntegerCache
+/// .high=1000` *and* under `-XX:AutoBoxCacheMax=1000`, while `int.1000`
+/// answered `true` in both). CratonVM has no saved-property split; `-D` lands
+/// in `shared.system_properties`, which is what `get_system_property` reads,
+/// and it is populated from `VmConfig` before any bytecode runs.
+const INTEGER_CACHE_HIGH_PROPERTY: &str = "java.lang.Integer.IntegerCache.high";
+
+/// The resolved `IntegerCache.high` for one VM, latched on first use.
+///
+/// VM-scoped rather than a process-global `OnceLock`: a `OnceLock` latches the
+/// FIRST VM's answer for the lifetime of the process, and this crate's Rust
+/// tests build several independent VMs in one binary.
+static INTEGER_CACHE_HIGH: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, i32>>,
+> = std::sync::OnceLock::new();
+
+fn integer_cache_high() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, i32>> {
+    INTEGER_CACHE_HIGH.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `IntegerCache.high`'s value from a raw property string, or `None` to keep
+/// the default.
+///
+/// Transliterated from `jdk25src/java.base/java/lang/Integer.java`:
+///
+/// ```text
+/// h = Math.max(parseInt(v), 127);
+/// h = Math.min(h, Integer.MAX_VALUE - (-low) - 1);
+/// ... catch (NumberFormatException nfe) { /* ignore it */ }
+/// ```
+///
+/// Three rules, each of which has its own measured row and none of which is
+/// guessable from the other two (all on OpenJDK 25.0.3+9, `CacheHigh.java`):
+///
+/// * `=1000` widens to `-128..=1000`: `int.1000` true, `int.1001` false.
+/// * `=50` does **not** narrow: `Math.max(.., 127)` floors it, and `int.128`
+///   stays false while `int.127` stays true. A reader who implemented only
+///   "high = parsed" would make a *narrowing* configuration observable, which
+///   HotSpot never does.
+/// * `=abc` is ignored, not fatal: `int.128` false, the run completes.
+///
+/// The parse is [`java_parse_signed`], not `str::parse` — the property is read
+/// by `Integer.parseInt`, whose grammar accepts a leading `+` and rejects
+/// surrounding whitespace, and this file already owns that grammar.
+fn parse_integer_cache_high(raw: &str) -> Option<i32> {
+    match java_parse_signed(raw, 10, i32::MIN as i64, i32::MAX as i64) {
+        JavaIntParse::Ok(v) => {
+            // `Math.max(parsed, 127)` then `Math.min(h, MAX_VALUE - 128 - 1)`.
+            let h = (v as i32).max(127);
+            Some(h.min(i32::MAX - (-INTEGER_CACHE_LOW) - 1))
+        }
+        // `NumberFormatException` on both arms — `Integer.parseInt` raises it
+        // for a malformed string AND for a well-formed out-of-int-range one,
+        // and `IntegerCache`'s `catch` swallows both identically.
+        JavaIntParse::Malformed | JavaIntParse::OutOfRange => None,
+    }
+}
+
+/// The `IntegerCache.high` in force for this VM, resolving and latching it on
+/// the first call.
+///
+/// Latching on first use is HotSpot's own timing, not an approximation of it:
+/// `IntegerCache.high` is a `static final` assigned in `IntegerCache
+/// .<clinit>`, which runs at the first autobox in the VM's life and never
+/// again. A later `System.setProperty` does not move HotSpot's bound and does
+/// not move this one.
+///
+/// **Lock order is memo → cache, and only here.** Every other reader takes
+/// `integer_cache()` alone; nothing takes the cache lock and then this memo,
+/// so the pair cannot deadlock.
+///
+/// The `try_reserve_exact` is not defensive padding. `high` is permitted up to
+/// `Integer.MAX_VALUE - 129`, i.e. a backing store of ~17 GB; HotSpot answers
+/// that configuration with an `OutOfMemoryError` from `new Integer[...]`, but
+/// a `vec![None; len]` here would **abort the process**, which is strictly
+/// worse than any Java outcome. On a refusal the bound falls back to the JDK
+/// default rather than to something in between, so the VM stays in a state the
+/// oracle can also produce.
+fn integer_cache_bound(ctx: &mut dyn NativeContext) -> i32 {
+    let scope = ctx.vm_identity();
+    if let Some(high) = integer_cache_high().lock().get(&scope).copied() {
+        return high;
+    }
+    let mut high = 127i32;
+    if let Some(raw) = ctx.get_system_property(INTEGER_CACHE_HIGH_PROPERTY) {
+        if let Some(parsed) = parse_integer_cache_high(&raw) {
+            high = parsed;
+        }
+    }
+    let mut entries: Vec<Option<cratonvm_types::ObjectRef>> = Vec::new();
+    let len = (high as i64 - INTEGER_CACHE_LOW as i64 + 1) as usize;
+    if entries.try_reserve_exact(len).is_err() {
+        high = 127;
+        entries = vec![None; 256];
+    } else {
+        entries.resize(len, None);
+    }
+    let mut memo = integer_cache_high().lock();
+    if let Some(existing) = memo.get(&scope).copied() {
+        return existing;
+    }
+    integer_cache().lock().entry(scope).or_insert(entries);
+    memo.insert(scope, high);
+    high
 }
 
 static BOOLEAN_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<2>>> =
@@ -2998,39 +3225,161 @@ fn long_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
     LONG_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
+// ---------------------------------------------------------------------------
+// The three caches the family was MISSING, and why their bounds all differ.
+//
+// The boxing caches are NOT one rule applied eight times. Each bound below was
+// read out of `jdk25src/java.base/java/lang/*.java` and then MEASURED against
+// Microsoft OpenJDK 25.0.3+9 (`BoxOracle`, every code unit / every byte / the
+// whole short range walked, not sampled):
+//
+//   Character  `if (c <= 127) return CharacterCache.cache[c];`  -> 0..=127.
+//              First non-identical code unit measured on HotSpot: 128.
+//   Byte       `return ByteCache.cache[b + 128];` — UNCONDITIONAL. Every one
+//              of the 256 byte values is canonical; `Byte.valueOf` has no
+//              fresh-allocation arm at all. Measured: all 256 identical.
+//   Short      `if (sAsInt >= -128 && sAsInt <= 127)` -> -128..=127, measured
+//              by walking Short.MIN_VALUE..Short.MAX_VALUE (exactly that range
+//              came back identical).
+//
+// And the members that are deliberately NOT here:
+//
+//   Integer    -128..=IntegerCache.high (127 by default) — already correct in
+//              `native_integer_value_of`; NOT widened here.
+//   Long       -128..=127 — already correct in `native_long_value_of`.
+//   Boolean    exactly two, and they must be the `Boolean.TRUE`/`FALSE` STATIC
+//              FIELDS, not privately minted twins (see the long comment on
+//              `native_boolean_value_of`).
+//   Float      no cache. `Float.valueOf(0f) == Float.valueOf(0f)` is FALSE on
+//   Double     HotSpot, measured. Adding a cache for these would be a
+//              regression, not a completion of the family — the asymmetry is
+//              the specification.
+// ---------------------------------------------------------------------------
+
+/// `CharacterCache` for `Character.valueOf(char)`. 128 slots indexed by the
+/// code unit itself — there is no offset because the low bound is zero.
+static CHARACTER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<128>>> =
+    std::sync::OnceLock::new();
+
+fn character_cache() -> &'static parking_lot::Mutex<ScopedValueCache<128>> {
+    CHARACTER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `ByteCache` for `Byte.valueOf(byte)`. 256 slots indexed by `b + 128`, and
+/// unlike every other cache in this file it covers the type's ENTIRE domain.
+static BYTE_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+    std::sync::OnceLock::new();
+
+fn byte_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+    BYTE_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `ShortCache` for `Short.valueOf(short)`. 256 slots indexed by `s + 128`,
+/// covering -128..=127 out of a 65,536-value domain.
+static SHORT_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+    std::sync::OnceLock::new();
+
+fn short_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+    SHORT_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The canonical-instance dance, once, for the caches added above.
+///
+/// Returns the cached wrapper for `idx`, allocating and installing it on the
+/// first call. The lock is DROPPED across `alloc_wrapper` (which can run
+/// `<clinit>` and can GC), so the post-allocation re-check under the lock is
+/// load-bearing: two threads that miss together must still agree on which
+/// instance is canonical, or `==` breaks for exactly the values the JLS says
+/// it must hold for. The loser's allocation is unreachable and collectible.
+fn cached_wrapper_box<const N: usize>(
+    ctx: &mut dyn NativeContext,
+    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+    idx: usize,
+    class_name: &'static str,
+    value: Value,
+) -> cratonvm_types::ObjectRef {
+    let scope = ctx.vm_identity();
+    if let Some(cached) = {
+        let c = cache.lock();
+        c.get(&scope).and_then(|entries| entries[idx])
+    } {
+        return cached;
+    }
+    let obj = alloc_wrapper(ctx, class_name);
+    ctx.set_field(obj, 0, value);
+    // `alloc_wrapper` falls back to `ClassId(0)` when the wrapper class cannot
+    // be initialised — which can only happen in a bootstrap window, but these
+    // caches are process-global and never invalidated, so installing one of
+    // those would latch a wrong-classed instance as THE canonical box for the
+    // rest of the VM's life. Decline to cache instead: the caller still gets a
+    // usable object, and the value simply goes uncached until the class is
+    // real, which is the pre-fix behaviour rather than a new failure.
+    if ctx.class_id_of_object(obj).as_u32() == 0 {
+        return obj;
+    }
+    let mut guard = cache.lock();
+    let entries = guard.entry(scope).or_insert([None; N]);
+    if let Some(existing) = entries[idx] {
+        return existing;
+    }
+    entries[idx] = Some(obj);
+    obj
+}
+
+/// Report one cache's live entries for `vm_identity` to the GC.
+///
+/// Factored out when the family grew from three caches to six. The per-cache
+/// copy-pasted block is precisely how a new cache gets added to the root scan
+/// and forgotten in the remap below (or the reverse): a cache that is rooted
+/// but not re-pointed is a use-after-move that only appears after a compacting
+/// collection, and the canonical instances are by construction long-lived
+/// enough to be moved.
+/// The generic is `AsRef<[Option<ObjectRef>]>`, not `const N: usize`, so that
+/// the ONE scan covers both backing shapes: the five fixed-bound caches'
+/// `[Option<ObjectRef>; N]` and `INTEGER_CACHE`'s `Vec` (whose length depends
+/// on `IntegerCache.high`). Both `[T; N]` and `Vec<T>` satisfy it, so the six
+/// call sites below are unchanged and no cache can acquire a second, separate
+/// hook — which is the failure this function was factored out to prevent.
+fn scan_one_cache<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
+    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+    vm_identity: usize,
+    out: &mut Vec<cratonvm_types::ObjectRef>,
+) {
+    let cache = cache.lock();
+    if let Some(entries) = cache.get(&vm_identity) {
+        for slot in entries.as_ref().iter().flatten() {
+            out.push(*slot);
+        }
+    }
+}
+
+/// Remap one cache's entries for `vm_identity` through the GC pointer map.
+fn update_one_cache<C: AsMut<[Option<cratonvm_types::ObjectRef>]>>(
+    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+    vm_identity: usize,
+    pointer_map: &cratonvm_types::PointerMap,
+) {
+    let mut cache = cache.lock();
+    if let Some(entries) = cache.get_mut(&vm_identity) {
+        for obj_ref in entries.as_mut().iter_mut().flatten() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+}
+
 /// GC root scan hook — called from `vm/src/memory/roots.rs::collect_roots`.
 /// Reports cached wrapper ObjectRefs for the active VM so the GC keeps them live.
 pub fn gc_scan_value_of_cache_roots(vm_identity: usize, out: &mut Vec<cratonvm_types::ObjectRef>) {
-    {
-        let cache = integer_cache().lock();
-        if let Some(entries) = cache.get(&vm_identity) {
-            for slot in entries.iter() {
-                if let Some(o) = slot {
-                    out.push(*o);
-                }
-            }
-        }
-    }
-    {
-        let cache = boolean_cache().lock();
-        if let Some(entries) = cache.get(&vm_identity) {
-            for slot in entries.iter() {
-                if let Some(o) = slot {
-                    out.push(*o);
-                }
-            }
-        }
-    }
-    {
-        let cache = long_cache().lock();
-        if let Some(entries) = cache.get(&vm_identity) {
-            for slot in entries.iter() {
-                if let Some(o) = slot {
-                    out.push(*o);
-                }
-            }
-        }
-    }
+    scan_one_cache(integer_cache(), vm_identity, out);
+    scan_one_cache(boolean_cache(), vm_identity, out);
+    scan_one_cache(long_cache(), vm_identity, out);
+    scan_one_cache(character_cache(), vm_identity, out);
+    scan_one_cache(byte_cache(), vm_identity, out);
+    scan_one_cache(short_cache(), vm_identity, out);
 }
 
 /// GC post-compaction hook — called from `vm/src/memory/gc.rs::update_all_roots`.
@@ -3039,50 +3388,94 @@ pub fn gc_update_value_of_cache_refs(vm_identity: usize, pointer_map: &cratonvm_
     if pointer_map.is_empty() {
         return;
     }
-    {
-        let mut cache = integer_cache().lock();
-        if let Some(entries) = cache.get_mut(&vm_identity) {
-            for slot in entries.iter_mut() {
-                if let Some(obj_ref) = slot {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                        *obj_ref =
-                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-            }
-        }
+    update_one_cache(integer_cache(), vm_identity, pointer_map);
+    update_one_cache(boolean_cache(), vm_identity, pointer_map);
+    update_one_cache(long_cache(), vm_identity, pointer_map);
+    update_one_cache(character_cache(), vm_identity, pointer_map);
+    update_one_cache(byte_cache(), vm_identity, pointer_map);
+    update_one_cache(short_cache(), vm_identity, pointer_map);
+}
+
+/// The canonical wrapper for `(desc, v)` **if one is already cached**, without
+/// allocating, initialising a class, or populating anything.
+///
+/// This exists for exactly one caller shape: code on the `&SharedVm` side of
+/// the native boundary — `vm/src/vm/vm_exec.rs`'s proxy argument boxing — which
+/// has no `&mut dyn NativeContext` and therefore cannot call
+/// `native_integer_value_of` and friends at all. HotSpot answers those paths
+/// canonically (MEASURED, F19-1 §2: `proxy.int`/`char`/`bool`/`long`/`byte`/
+/// `short` all `true`), and today they allocate. Rather than mint a second
+/// `IntegerCache` over there, this reads the SIX caches that already exist here
+/// and are already wired into `gc_scan_value_of_cache_roots` /
+/// `gc_update_value_of_cache_refs` as one `VmRootSource { scan, remap }` pair.
+///
+/// **Read-only is a correctness requirement, not a performance one.**
+/// Populating a cache needs `alloc_wrapper`, which needs
+/// `ensure_class_initialized`, which runs `<clinit>` — and a proxy invocation
+/// is not a legal place to trigger class initialisation. So a miss is `None`
+/// and the caller keeps its existing allocation. A `None` must never be turned
+/// into a `null` argument; that is the defect recorded above
+/// `lang_class::create_method_object`.
+///
+/// **The `Value` variant is matched as well as the descriptor, and that is the
+/// load-bearing half.** A `long` slot can legitimately present as a compact
+/// `Value::Int` — the shape `native_wrapper_long_value` exists to widen. A
+/// descriptor-only match would answer `("J", Value::Int(5))` with the cached
+/// `Long.valueOf(0)`: an identity fix converted into a **wrong answer**, which
+/// is worse than the defect it fixes. Every mismatched pair falls through to
+/// `None`, i.e. to today's fresh box carrying the right value.
+///
+/// `"Z"` is deliberately absent, and it is the one arm a reader would expect
+/// and must not add. `Boolean.valueOf` returns the live `Boolean.TRUE`/`FALSE`
+/// **static fields**, not a privately minted twin (see
+/// [`native_boolean_value_of`]); `BOOLEAN_CACHE` is only its bootstrap
+/// fallback, so an entry in it is not guaranteed to be the instance the rest
+/// of the VM calls canonical. `vm_exec.rs` resolves the statics directly
+/// (`proxy_canonical_boolean`) and needs nothing from here. `"F"`/`"D"` are
+/// absent because HotSpot caches neither (`neg.floatValueOf` = false);
+/// "completing the family to eight" is a regression, not a completion.
+pub fn canonical_wrapper_if_cached(
+    vm_identity: usize,
+    desc: &str,
+    v: Value,
+) -> Option<cratonvm_types::ObjectRef> {
+    fn read<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
+        cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+        vm_identity: usize,
+        idx: usize,
+    ) -> Option<cratonvm_types::ObjectRef> {
+        let guard = cache.lock();
+        guard
+            .get(&vm_identity)
+            .and_then(|entries| entries.as_ref().get(idx).copied().flatten())
     }
-    {
-        let mut cache = boolean_cache().lock();
-        if let Some(entries) = cache.get_mut(&vm_identity) {
-            for slot in entries.iter_mut() {
-                if let Some(obj_ref) = slot {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                        *obj_ref =
-                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-            }
+    match (desc, v) {
+        // `IntegerCache`'s upper bound is configurable, so the bound is not
+        // checked here at all: the backing store's LENGTH is the bound, and
+        // `read`'s `get(idx)` is exactly that test. Reading the latched bound
+        // instead would need the memo, and a VM that has not boxed an `int`
+        // yet has neither — which is a miss either way.
+        ("I", Value::Int(x)) if x >= INTEGER_CACHE_LOW => {
+            read(integer_cache(), vm_identity, (x - INTEGER_CACHE_LOW) as usize)
         }
-    }
-    {
-        let mut cache = long_cache().lock();
-        if let Some(entries) = cache.get_mut(&vm_identity) {
-            for slot in entries.iter_mut() {
-                if let Some(obj_ref) = slot {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                        *obj_ref =
-                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-            }
+        ("J", Value::Long(x)) if (-128..=127).contains(&x) => {
+            read(long_cache(), vm_identity, (x + 128) as usize)
         }
+        // `CharacterCache` has no negative half: `if (c <= 127)` indexes by
+        // the code unit itself, so the offset the other three use is absent.
+        ("C", Value::Int(x)) if (0..=127).contains(&x) => {
+            read(character_cache(), vm_identity, x as usize)
+        }
+        // `ByteCache` is unconditional over all 256 byte values, but a raw
+        // `Value::Int` in a `B` slot can carry anything, so the range test
+        // stays — it is a domain check here, not a cache-bound check.
+        ("B", Value::Int(x)) if (-128..=127).contains(&x) => {
+            read(byte_cache(), vm_identity, (x + 128) as usize)
+        }
+        ("S", Value::Int(x)) if (-128..=127).contains(&x) => {
+            read(short_cache(), vm_identity, (x + 128) as usize)
+        }
+        _ => None,
     }
 }
 
@@ -3094,13 +3487,24 @@ pub(crate) fn native_integer_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if (-128..=127).contains(&val) {
-        let idx = (val + 128) as usize;
+    // `high` is `IntegerCache.high`, which is CONFIGURABLE — see
+    // [`integer_cache_bound`]. `low` is not. This is the only member of the
+    // family whose bound is not a literal, and widening it must not drag the
+    // others: MEASURED under `-Djava.lang.Integer.IntegerCache.high=1000`,
+    // `int.1000` is `true` while `long.128`, `short.128` and `char.128` are
+    // all still `false`.
+    let high = integer_cache_bound(ctx);
+    if (INTEGER_CACHE_LOW..=high).contains(&val) {
+        let idx = (val - INTEGER_CACHE_LOW) as usize;
         let scope = ctx.vm_identity();
         // Fast path: lock, read, drop lock before any heap allocation.
+        // `entries.get(idx)` rather than `entries[idx]`: the bound is latched
+        // per VM and the store is sized to it, so a miss here is impossible —
+        // but an indexing panic inside a native is a VM abort, and a `None`
+        // is an extra allocation.
         if let Some(cached) = {
             let c = integer_cache().lock();
-            c.get(&scope).and_then(|entries| entries[idx])
+            c.get(&scope).and_then(|entries| entries.get(idx).copied().flatten())
         } {
             return Ok(Some(Value::Object(Some(cached))));
         }
@@ -3111,11 +3515,15 @@ pub(crate) fn native_integer_value_of(
         // (the loser allocation is collectible — but the race is rare and
         // it preserves the JLS identity invariant).
         let mut cache = integer_cache().lock();
-        let entries = cache.entry(scope).or_insert([None; 256]);
-        if let Some(existing) = entries[idx] {
-            return Ok(Some(Value::Object(Some(existing))));
+        let entries = cache
+            .entry(scope)
+            .or_insert_with(|| vec![None; (high as i64 - INTEGER_CACHE_LOW as i64 + 1) as usize]);
+        if let Some(slot) = entries.get_mut(idx) {
+            if let Some(existing) = *slot {
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+            *slot = Some(obj);
         }
-        entries[idx] = Some(obj);
         return Ok(Some(Value::Object(Some(obj))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Integer");
@@ -3159,27 +3567,247 @@ pub(crate) fn native_wrapper_int_value(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Java's integer grammar
+//
+// `str::parse` is NOT `Integer.parseInt`. The two differ in BOTH directions,
+// and every difference is a silently wrong answer rather than an error:
+//
+//   * Rust's parser rejects the non-ASCII decimal digits `Character.digit`
+//     accepts. Measured on JDK 25:
+//     `Integer.parseInt("\u{661}\u{662}") == 12` (ARABIC-INDIC ONE TWO).
+//   * A `.trim()` in front of the parse invents an acceptance Java does not
+//     have. `Integer.parseInt("  1")`, `("1 ")`, `("1\n")` all throw
+//     `NumberFormatException` on a real JDK; we answered 1. The `.trim()` is
+//     `Double.parseDouble`'s contract — whose grammar really does skip
+//     `[\x00-\x20]*` on both ends — borrowed onto the integer one, where it
+//     does not belong.
+//
+// Both directions matter for input validation: code that calls `parseInt` in
+// a `try` to reject junk was getting junk accepted.
+// ---------------------------------------------------------------------------
+
+/// The non-ASCII runs of `Character.digit`, generated from JDK 25 itself by
+/// walking every code point and recording each maximal run over which
+/// `Character.digit(cp, 36)` increases by one. Entries are
+/// `(first, last, value_at_first)`.
+///
+/// BMP only, deliberately. `Integer.parseInt` walks the string with `charAt`
+/// and calls the `char` overload of `Character.digit`, so a SUPPLEMENTARY
+/// decimal digit arrives as a surrogate pair and matches nothing. Measured on
+/// JDK 25: `Integer.parseInt(new String(Character.toChars(0x104A0)))` throws
+/// even though `Character.digit(0x104A0, 10) == 0`. Adding the supplementary
+/// runs here would make us MORE permissive than Java, not less.
+const JAVA_DIGIT_RUNS: &[(u32, u32, u32)] = &[
+    (0x0660, 0x0669, 0),
+    (0x06F0, 0x06F9, 0),
+    (0x07C0, 0x07C9, 0),
+    (0x0966, 0x096F, 0),
+    (0x09E6, 0x09EF, 0),
+    (0x0A66, 0x0A6F, 0),
+    (0x0AE6, 0x0AEF, 0),
+    (0x0B66, 0x0B6F, 0),
+    (0x0BE6, 0x0BEF, 0),
+    (0x0C66, 0x0C6F, 0),
+    (0x0CE6, 0x0CEF, 0),
+    (0x0D66, 0x0D6F, 0),
+    (0x0DE6, 0x0DEF, 0),
+    (0x0E50, 0x0E59, 0),
+    (0x0ED0, 0x0ED9, 0),
+    (0x0F20, 0x0F29, 0),
+    (0x1040, 0x1049, 0),
+    (0x1090, 0x1099, 0),
+    (0x17E0, 0x17E9, 0),
+    (0x1810, 0x1819, 0),
+    (0x1946, 0x194F, 0),
+    (0x19D0, 0x19D9, 0),
+    (0x1A80, 0x1A89, 0),
+    (0x1A90, 0x1A99, 0),
+    (0x1B50, 0x1B59, 0),
+    (0x1BB0, 0x1BB9, 0),
+    (0x1C40, 0x1C49, 0),
+    (0x1C50, 0x1C59, 0),
+    (0xA620, 0xA629, 0),
+    (0xA8D0, 0xA8D9, 0),
+    (0xA900, 0xA909, 0),
+    (0xA9D0, 0xA9D9, 0),
+    (0xA9F0, 0xA9F9, 0),
+    (0xAA50, 0xAA59, 0),
+    (0xABF0, 0xABF9, 0),
+    (0xFF10, 0xFF19, 0),
+    (0xFF21, 0xFF3A, 10),
+    (0xFF41, 0xFF5A, 10),
+];
+
+/// `Character.digit(char, radix)` — the `char` overload, which is the one the
+/// `parse*` family calls.
+///
+/// This is NOT `char::to_digit`: that handles only ASCII `0-9A-Za-z` and, for
+/// a radix above 36, PANICS. This returns `None` instead of panicking and
+/// covers the Unicode decimal runs above.
+fn java_char_digit(c: char, radix: u32) -> Option<u32> {
+    let cp = c as u32;
+    // Fast path: the ASCII runs, which is all any hot call site ever sees.
+    let v = if cp.wrapping_sub('0' as u32) < 10 {
+        cp - '0' as u32
+    } else if cp.wrapping_sub('a' as u32) < 26 {
+        cp - 'a' as u32 + 10
+    } else if cp.wrapping_sub('A' as u32) < 26 {
+        cp - 'A' as u32 + 10
+    } else if cp < JAVA_DIGIT_RUNS[0].0 {
+        return None;
+    } else {
+        let mut found = None;
+        for &(first, last, base) in JAVA_DIGIT_RUNS {
+            if (first..=last).contains(&cp) {
+                found = Some(base + (cp - first));
+                break;
+            }
+        }
+        found?
+    };
+    if v < radix {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Outcome of a Java integer parse, split because the JDK raises two DIFFERENT
+/// `NumberFormatException` detail messages and only `Byte`/`Short` use the
+/// second one.
+pub(crate) enum JavaIntParse {
+    Ok(i64),
+    /// Not a well-formed `Signopt Digit+` in this radix.
+    Malformed,
+    /// Well-formed, but outside `[min, max]`.
+    OutOfRange,
+}
+
+/// The `Integer.parseInt` / `Long.parseLong` grammar:
+///
+/// ```text
+/// Signopt Digit+
+/// ```
+///
+/// where `Digit` is anything `Character.digit(c, radix)` accepts. No
+/// whitespace is permitted anywhere — not leading, not trailing, not either.
+///
+/// Accumulation is in `i128` against a signed magnitude limit, so
+/// `MIN_VALUE` (whose magnitude is one larger than `MAX_VALUE`'s) parses
+/// exactly and nothing can overflow: once the accumulator passes the limit we
+/// stop accumulating but KEEP SCANNING, because a later non-digit still makes
+/// the whole string malformed rather than out-of-range.
+pub(crate) fn java_parse_signed(text: &str, radix: u32, min: i64, max: i64) -> JavaIntParse {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return JavaIntParse::Malformed; // ""
+    };
+    let (neg, mut pending) = match first {
+        '+' => (false, None),
+        '-' => (true, None),
+        c => (false, Some(c)),
+    };
+    let limit: i128 = if neg { -(min as i128) } else { max as i128 };
+    let mut acc: i128 = 0;
+    let mut digits = 0usize;
+    let mut over = false;
+    loop {
+        let c = match pending.take() {
+            Some(c) => c,
+            None => match chars.next() {
+                Some(c) => c,
+                None => break,
+            },
+        };
+        let Some(d) = java_char_digit(c, radix) else {
+            return JavaIntParse::Malformed;
+        };
+        digits += 1;
+        if !over {
+            acc = acc * radix as i128 + d as i128;
+            if acc > limit {
+                over = true;
+            }
+        }
+    }
+    if digits == 0 {
+        return JavaIntParse::Malformed; // "+", "-"
+    }
+    if over {
+        return JavaIntParse::OutOfRange;
+    }
+    let signed: i128 = if neg { -acc } else { acc };
+    JavaIntParse::Ok(signed as i64)
+}
+
+/// The JDK's `NumberFormatException.forInputString` detail message. The
+/// ` under radix N` tail is present for every radix except 10.
+fn java_nfe_for_input(text: &str, radix: u32) -> cratonvm_types::error::MethodCallFailed {
+    let message = if radix == 10 {
+        format!("For input string: \"{text}\"")
+    } else {
+        format!("For input string: \"{text}\" under radix {radix}")
+    };
+    cratonvm_types::error::RuntimeError::NumberFormatException { message }.into()
+}
+
+/// The JDK's `Byte.parseByte` / `Short.parseShort` out-of-range message, which
+/// is NOT the `forInputString` one.
+fn java_nfe_out_of_range(text: &str, radix: u32) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::NumberFormatException {
+        message: format!("Value out of range. Value:\"{text}\" Radix:{radix}"),
+    }
+    .into()
+}
+
+/// Read argument 0 as a non-null `String`, raising the JDK's
+/// `NumberFormatException("Cannot parse null string")` for a null receiver —
+/// which is what the integer family throws. (The FLOATING-point family throws
+/// `NullPointerException` instead; see `read_string_arg_npe`.)
+fn read_string_arg_nfe(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(obj))) => Ok(ctx.read_string(*obj).unwrap_or_default()),
+        _ => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
+            message: "Cannot parse null string".to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Shared body for the whole signed `parse*(String[, int])` family.
+///
+/// `range_message` selects which of the JDK's two detail messages an
+/// out-of-range value gets: `Integer`/`Long` report `forInputString`,
+/// `Byte`/`Short` report `Value out of range`.
+fn java_parse_into(
+    text: &str,
+    radix: u32,
+    min: i64,
+    max: i64,
+    range_message: bool,
+) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
+    match java_parse_signed(text, radix, min, max) {
+        JavaIntParse::Ok(v) => Ok(v),
+        JavaIntParse::Malformed => Err(java_nfe_for_input(text, radix)),
+        JavaIntParse::OutOfRange => Err(if range_message {
+            java_nfe_out_of_range(text, radix)
+        } else {
+            java_nfe_for_input(text, radix)
+        }),
+    }
+}
+
 pub(crate) fn native_integer_parse_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i32>() {
-        Ok(v) => Ok(Some(Value::Int(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_into(&text, 10, i32::MIN as i64, i32::MAX as i64, false)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 /// Validate a `parse*(String, int)` radix the way the JDK's `Integer.parseInt`
@@ -3226,73 +3854,48 @@ pub(crate) fn native_integer_parse_int_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i32::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Int(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_into(&text, radix, i32::MIN as i64, i32::MAX as i64, false)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 // --- Byte.parseByte ---
+
+/// `Byte.parseByte` / `Short.parseShort` are two-step in the JDK: they call
+/// `Integer.parseInt` and THEN range-check. That ordering is observable in the
+/// detail message — a value outside `int` reports `forInputString`, while one
+/// that fits an `int` but not the narrower type reports `Value out of range`.
+fn java_parse_narrow(
+    text: &str,
+    radix: u32,
+    min: i64,
+    max: i64,
+) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
+    let v = java_parse_into(text, radix, i32::MIN as i64, i32::MAX as i64, false)?;
+    if !(min..=max).contains(&v) {
+        return Err(java_nfe_out_of_range(text, radix));
+    }
+    Ok(v)
+}
 
 pub(crate) fn native_byte_parse_byte(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i8>() {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_narrow(&text, 10, i8::MIN as i64, i8::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 pub(crate) fn native_byte_parse_byte_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i8::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_narrow(&text, radix, i8::MIN as i64, i8::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 // --- Short.parseShort ---
@@ -3301,47 +3904,19 @@ pub(crate) fn native_short_parse_short(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i16>() {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_narrow(&text, 10, i16::MIN as i64, i16::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 pub(crate) fn native_short_parse_short_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i16::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_narrow(&text, radix, i16::MIN as i64, i16::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 pub(crate) fn native_integer_to_hex_string(
@@ -3492,23 +4067,9 @@ pub(crate) fn native_long_parse_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i64>() {
-        Ok(v) => Ok(Some(Value::Long(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_into(&text, 10, i64::MIN, i64::MAX, false)?;
+    Ok(Some(Value::Long(v)))
 }
 
 pub(crate) fn native_long_nlz(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3619,8 +4180,402 @@ pub(crate) fn native_boolean_value_of(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+// ---------------------------------------------------------------------------
+// W7-95(C1) / W7-98 — java.lang.Character's tables are JAVA's, not Rust's.
+//
+// Every table below was GENERATED by walking `0..=0x10FFFF` on Microsoft
+// OpenJDK 25.0.3+9 and recording the maximal runs over which the JDK's own
+// answer holds, exactly as `JAVA_DIGIT_RUNS` above was. None of them is copied
+// from Unicode data files, so none of them can be a transcription of the wrong
+// Unicode version: the provenance is the oracle the differential is run
+// against.
+//
+// The reason this cannot be delegated to a Rust `char` method is that Java's
+// predicates are deliberately NOT Unicode's:
+//
+//   * `char::is_alphabetic` is the Unicode **Alphabetic** property, which is
+//     `L* u Nl u Other_Alphabetic`. `Character.isLetter` is exactly the five
+//     `L*` categories. Measured on JDK 25: 949 BMP and 1,731 total code points
+//     are Alphabetic and not letters — and the census measured **957** BMP
+//     disagreements against the shipping binary, so Rust's Alphabetic table
+//     and JDK 25's differ by eight code points on top of the definitional gap.
+//     Deriving `isLetter` as `is_alphabetic() && !delta` would therefore have
+//     left a residual that nothing in this tree can name. The direct table
+//     leaves none.
+//   * Rust has no emoji predicates at all; the five that were here were
+//     hand-written coarse ranges, and they were wrong on 2,746 code points.
+// ---------------------------------------------------------------------------
+
+/// Is `cp` inside one of a sorted, non-overlapping list of inclusive ranges?
+fn in_code_point_runs(runs: &[(u32, u32)], cp: u32) -> bool {
+    runs.binary_search_by(|&(lo, hi)| {
+        if hi < cp {
+            std::cmp::Ordering::Less
+        } else if lo > cp {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    })
+    .is_ok()
+}
+
+/// The value a `(first, last, value_at_first)` run assigns to `cp`, where the
+/// value increases by one across the run.
+fn value_in_runs(runs: &[(u32, u32, i32)], cp: u32) -> Option<i32> {
+    runs.binary_search_by(|&(lo, hi, _)| {
+        if hi < cp {
+            std::cmp::Ordering::Less
+        } else if lo > cp {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    })
+    .ok()
+    .map(|i| {
+        let (lo, _, base) = runs[i];
+        base + (cp - lo) as i32
+    })
+}
+
+/// `Character.isLetter` - the five `L*` general categories, over EVERY plane.
+/// 677 runs, 141028 code points.
+#[rustfmt::skip]
+const JAVA_LETTER_RUNS: &[(u32, u32)] = &[
+    (0x0041, 0x005A), (0x0061, 0x007A), (0x00AA, 0x00AA), (0x00B5, 0x00B5), (0x00BA, 0x00BA),
+    (0x00C0, 0x00D6), (0x00D8, 0x00F6), (0x00F8, 0x02C1), (0x02C6, 0x02D1), (0x02E0, 0x02E4),
+    (0x02EC, 0x02EC), (0x02EE, 0x02EE), (0x0370, 0x0374), (0x0376, 0x0377), (0x037A, 0x037D),
+    (0x037F, 0x037F), (0x0386, 0x0386), (0x0388, 0x038A), (0x038C, 0x038C), (0x038E, 0x03A1),
+    (0x03A3, 0x03F5), (0x03F7, 0x0481), (0x048A, 0x052F), (0x0531, 0x0556), (0x0559, 0x0559),
+    (0x0560, 0x0588), (0x05D0, 0x05EA), (0x05EF, 0x05F2), (0x0620, 0x064A), (0x066E, 0x066F),
+    (0x0671, 0x06D3), (0x06D5, 0x06D5), (0x06E5, 0x06E6), (0x06EE, 0x06EF), (0x06FA, 0x06FC),
+    (0x06FF, 0x06FF), (0x0710, 0x0710), (0x0712, 0x072F), (0x074D, 0x07A5), (0x07B1, 0x07B1),
+    (0x07CA, 0x07EA), (0x07F4, 0x07F5), (0x07FA, 0x07FA), (0x0800, 0x0815), (0x081A, 0x081A),
+    (0x0824, 0x0824), (0x0828, 0x0828), (0x0840, 0x0858), (0x0860, 0x086A), (0x0870, 0x0887),
+    (0x0889, 0x088E), (0x08A0, 0x08C9), (0x0904, 0x0939), (0x093D, 0x093D), (0x0950, 0x0950),
+    (0x0958, 0x0961), (0x0971, 0x0980), (0x0985, 0x098C), (0x098F, 0x0990), (0x0993, 0x09A8),
+    (0x09AA, 0x09B0), (0x09B2, 0x09B2), (0x09B6, 0x09B9), (0x09BD, 0x09BD), (0x09CE, 0x09CE),
+    (0x09DC, 0x09DD), (0x09DF, 0x09E1), (0x09F0, 0x09F1), (0x09FC, 0x09FC), (0x0A05, 0x0A0A),
+    (0x0A0F, 0x0A10), (0x0A13, 0x0A28), (0x0A2A, 0x0A30), (0x0A32, 0x0A33), (0x0A35, 0x0A36),
+    (0x0A38, 0x0A39), (0x0A59, 0x0A5C), (0x0A5E, 0x0A5E), (0x0A72, 0x0A74), (0x0A85, 0x0A8D),
+    (0x0A8F, 0x0A91), (0x0A93, 0x0AA8), (0x0AAA, 0x0AB0), (0x0AB2, 0x0AB3), (0x0AB5, 0x0AB9),
+    (0x0ABD, 0x0ABD), (0x0AD0, 0x0AD0), (0x0AE0, 0x0AE1), (0x0AF9, 0x0AF9), (0x0B05, 0x0B0C),
+    (0x0B0F, 0x0B10), (0x0B13, 0x0B28), (0x0B2A, 0x0B30), (0x0B32, 0x0B33), (0x0B35, 0x0B39),
+    (0x0B3D, 0x0B3D), (0x0B5C, 0x0B5D), (0x0B5F, 0x0B61), (0x0B71, 0x0B71), (0x0B83, 0x0B83),
+    (0x0B85, 0x0B8A), (0x0B8E, 0x0B90), (0x0B92, 0x0B95), (0x0B99, 0x0B9A), (0x0B9C, 0x0B9C),
+    (0x0B9E, 0x0B9F), (0x0BA3, 0x0BA4), (0x0BA8, 0x0BAA), (0x0BAE, 0x0BB9), (0x0BD0, 0x0BD0),
+    (0x0C05, 0x0C0C), (0x0C0E, 0x0C10), (0x0C12, 0x0C28), (0x0C2A, 0x0C39), (0x0C3D, 0x0C3D),
+    (0x0C58, 0x0C5A), (0x0C5D, 0x0C5D), (0x0C60, 0x0C61), (0x0C80, 0x0C80), (0x0C85, 0x0C8C),
+    (0x0C8E, 0x0C90), (0x0C92, 0x0CA8), (0x0CAA, 0x0CB3), (0x0CB5, 0x0CB9), (0x0CBD, 0x0CBD),
+    (0x0CDD, 0x0CDE), (0x0CE0, 0x0CE1), (0x0CF1, 0x0CF2), (0x0D04, 0x0D0C), (0x0D0E, 0x0D10),
+    (0x0D12, 0x0D3A), (0x0D3D, 0x0D3D), (0x0D4E, 0x0D4E), (0x0D54, 0x0D56), (0x0D5F, 0x0D61),
+    (0x0D7A, 0x0D7F), (0x0D85, 0x0D96), (0x0D9A, 0x0DB1), (0x0DB3, 0x0DBB), (0x0DBD, 0x0DBD),
+    (0x0DC0, 0x0DC6), (0x0E01, 0x0E30), (0x0E32, 0x0E33), (0x0E40, 0x0E46), (0x0E81, 0x0E82),
+    (0x0E84, 0x0E84), (0x0E86, 0x0E8A), (0x0E8C, 0x0EA3), (0x0EA5, 0x0EA5), (0x0EA7, 0x0EB0),
+    (0x0EB2, 0x0EB3), (0x0EBD, 0x0EBD), (0x0EC0, 0x0EC4), (0x0EC6, 0x0EC6), (0x0EDC, 0x0EDF),
+    (0x0F00, 0x0F00), (0x0F40, 0x0F47), (0x0F49, 0x0F6C), (0x0F88, 0x0F8C), (0x1000, 0x102A),
+    (0x103F, 0x103F), (0x1050, 0x1055), (0x105A, 0x105D), (0x1061, 0x1061), (0x1065, 0x1066),
+    (0x106E, 0x1070), (0x1075, 0x1081), (0x108E, 0x108E), (0x10A0, 0x10C5), (0x10C7, 0x10C7),
+    (0x10CD, 0x10CD), (0x10D0, 0x10FA), (0x10FC, 0x1248), (0x124A, 0x124D), (0x1250, 0x1256),
+    (0x1258, 0x1258), (0x125A, 0x125D), (0x1260, 0x1288), (0x128A, 0x128D), (0x1290, 0x12B0),
+    (0x12B2, 0x12B5), (0x12B8, 0x12BE), (0x12C0, 0x12C0), (0x12C2, 0x12C5), (0x12C8, 0x12D6),
+    (0x12D8, 0x1310), (0x1312, 0x1315), (0x1318, 0x135A), (0x1380, 0x138F), (0x13A0, 0x13F5),
+    (0x13F8, 0x13FD), (0x1401, 0x166C), (0x166F, 0x167F), (0x1681, 0x169A), (0x16A0, 0x16EA),
+    (0x16F1, 0x16F8), (0x1700, 0x1711), (0x171F, 0x1731), (0x1740, 0x1751), (0x1760, 0x176C),
+    (0x176E, 0x1770), (0x1780, 0x17B3), (0x17D7, 0x17D7), (0x17DC, 0x17DC), (0x1820, 0x1878),
+    (0x1880, 0x1884), (0x1887, 0x18A8), (0x18AA, 0x18AA), (0x18B0, 0x18F5), (0x1900, 0x191E),
+    (0x1950, 0x196D), (0x1970, 0x1974), (0x1980, 0x19AB), (0x19B0, 0x19C9), (0x1A00, 0x1A16),
+    (0x1A20, 0x1A54), (0x1AA7, 0x1AA7), (0x1B05, 0x1B33), (0x1B45, 0x1B4C), (0x1B83, 0x1BA0),
+    (0x1BAE, 0x1BAF), (0x1BBA, 0x1BE5), (0x1C00, 0x1C23), (0x1C4D, 0x1C4F), (0x1C5A, 0x1C7D),
+    (0x1C80, 0x1C8A), (0x1C90, 0x1CBA), (0x1CBD, 0x1CBF), (0x1CE9, 0x1CEC), (0x1CEE, 0x1CF3),
+    (0x1CF5, 0x1CF6), (0x1CFA, 0x1CFA), (0x1D00, 0x1DBF), (0x1E00, 0x1F15), (0x1F18, 0x1F1D),
+    (0x1F20, 0x1F45), (0x1F48, 0x1F4D), (0x1F50, 0x1F57), (0x1F59, 0x1F59), (0x1F5B, 0x1F5B),
+    (0x1F5D, 0x1F5D), (0x1F5F, 0x1F7D), (0x1F80, 0x1FB4), (0x1FB6, 0x1FBC), (0x1FBE, 0x1FBE),
+    (0x1FC2, 0x1FC4), (0x1FC6, 0x1FCC), (0x1FD0, 0x1FD3), (0x1FD6, 0x1FDB), (0x1FE0, 0x1FEC),
+    (0x1FF2, 0x1FF4), (0x1FF6, 0x1FFC), (0x2071, 0x2071), (0x207F, 0x207F), (0x2090, 0x209C),
+    (0x2102, 0x2102), (0x2107, 0x2107), (0x210A, 0x2113), (0x2115, 0x2115), (0x2119, 0x211D),
+    (0x2124, 0x2124), (0x2126, 0x2126), (0x2128, 0x2128), (0x212A, 0x212D), (0x212F, 0x2139),
+    (0x213C, 0x213F), (0x2145, 0x2149), (0x214E, 0x214E), (0x2183, 0x2184), (0x2C00, 0x2CE4),
+    (0x2CEB, 0x2CEE), (0x2CF2, 0x2CF3), (0x2D00, 0x2D25), (0x2D27, 0x2D27), (0x2D2D, 0x2D2D),
+    (0x2D30, 0x2D67), (0x2D6F, 0x2D6F), (0x2D80, 0x2D96), (0x2DA0, 0x2DA6), (0x2DA8, 0x2DAE),
+    (0x2DB0, 0x2DB6), (0x2DB8, 0x2DBE), (0x2DC0, 0x2DC6), (0x2DC8, 0x2DCE), (0x2DD0, 0x2DD6),
+    (0x2DD8, 0x2DDE), (0x2E2F, 0x2E2F), (0x3005, 0x3006), (0x3031, 0x3035), (0x303B, 0x303C),
+    (0x3041, 0x3096), (0x309D, 0x309F), (0x30A1, 0x30FA), (0x30FC, 0x30FF), (0x3105, 0x312F),
+    (0x3131, 0x318E), (0x31A0, 0x31BF), (0x31F0, 0x31FF), (0x3400, 0x4DBF), (0x4E00, 0xA48C),
+    (0xA4D0, 0xA4FD), (0xA500, 0xA60C), (0xA610, 0xA61F), (0xA62A, 0xA62B), (0xA640, 0xA66E),
+    (0xA67F, 0xA69D), (0xA6A0, 0xA6E5), (0xA717, 0xA71F), (0xA722, 0xA788), (0xA78B, 0xA7CD),
+    (0xA7D0, 0xA7D1), (0xA7D3, 0xA7D3), (0xA7D5, 0xA7DC), (0xA7F2, 0xA801), (0xA803, 0xA805),
+    (0xA807, 0xA80A), (0xA80C, 0xA822), (0xA840, 0xA873), (0xA882, 0xA8B3), (0xA8F2, 0xA8F7),
+    (0xA8FB, 0xA8FB), (0xA8FD, 0xA8FE), (0xA90A, 0xA925), (0xA930, 0xA946), (0xA960, 0xA97C),
+    (0xA984, 0xA9B2), (0xA9CF, 0xA9CF), (0xA9E0, 0xA9E4), (0xA9E6, 0xA9EF), (0xA9FA, 0xA9FE),
+    (0xAA00, 0xAA28), (0xAA40, 0xAA42), (0xAA44, 0xAA4B), (0xAA60, 0xAA76), (0xAA7A, 0xAA7A),
+    (0xAA7E, 0xAAAF), (0xAAB1, 0xAAB1), (0xAAB5, 0xAAB6), (0xAAB9, 0xAABD), (0xAAC0, 0xAAC0),
+    (0xAAC2, 0xAAC2), (0xAADB, 0xAADD), (0xAAE0, 0xAAEA), (0xAAF2, 0xAAF4), (0xAB01, 0xAB06),
+    (0xAB09, 0xAB0E), (0xAB11, 0xAB16), (0xAB20, 0xAB26), (0xAB28, 0xAB2E), (0xAB30, 0xAB5A),
+    (0xAB5C, 0xAB69), (0xAB70, 0xABE2), (0xAC00, 0xD7A3), (0xD7B0, 0xD7C6), (0xD7CB, 0xD7FB),
+    (0xF900, 0xFA6D), (0xFA70, 0xFAD9), (0xFB00, 0xFB06), (0xFB13, 0xFB17), (0xFB1D, 0xFB1D),
+    (0xFB1F, 0xFB28), (0xFB2A, 0xFB36), (0xFB38, 0xFB3C), (0xFB3E, 0xFB3E), (0xFB40, 0xFB41),
+    (0xFB43, 0xFB44), (0xFB46, 0xFBB1), (0xFBD3, 0xFD3D), (0xFD50, 0xFD8F), (0xFD92, 0xFDC7),
+    (0xFDF0, 0xFDFB), (0xFE70, 0xFE74), (0xFE76, 0xFEFC), (0xFF21, 0xFF3A), (0xFF41, 0xFF5A),
+    (0xFF66, 0xFFBE), (0xFFC2, 0xFFC7), (0xFFCA, 0xFFCF), (0xFFD2, 0xFFD7), (0xFFDA, 0xFFDC),
+    (0x10000, 0x1000B), (0x1000D, 0x10026), (0x10028, 0x1003A), (0x1003C, 0x1003D),
+    (0x1003F, 0x1004D), (0x10050, 0x1005D), (0x10080, 0x100FA), (0x10280, 0x1029C),
+    (0x102A0, 0x102D0), (0x10300, 0x1031F), (0x1032D, 0x10340), (0x10342, 0x10349),
+    (0x10350, 0x10375), (0x10380, 0x1039D), (0x103A0, 0x103C3), (0x103C8, 0x103CF),
+    (0x10400, 0x1049D), (0x104B0, 0x104D3), (0x104D8, 0x104FB), (0x10500, 0x10527),
+    (0x10530, 0x10563), (0x10570, 0x1057A), (0x1057C, 0x1058A), (0x1058C, 0x10592),
+    (0x10594, 0x10595), (0x10597, 0x105A1), (0x105A3, 0x105B1), (0x105B3, 0x105B9),
+    (0x105BB, 0x105BC), (0x105C0, 0x105F3), (0x10600, 0x10736), (0x10740, 0x10755),
+    (0x10760, 0x10767), (0x10780, 0x10785), (0x10787, 0x107B0), (0x107B2, 0x107BA),
+    (0x10800, 0x10805), (0x10808, 0x10808), (0x1080A, 0x10835), (0x10837, 0x10838),
+    (0x1083C, 0x1083C), (0x1083F, 0x10855), (0x10860, 0x10876), (0x10880, 0x1089E),
+    (0x108E0, 0x108F2), (0x108F4, 0x108F5), (0x10900, 0x10915), (0x10920, 0x10939),
+    (0x10980, 0x109B7), (0x109BE, 0x109BF), (0x10A00, 0x10A00), (0x10A10, 0x10A13),
+    (0x10A15, 0x10A17), (0x10A19, 0x10A35), (0x10A60, 0x10A7C), (0x10A80, 0x10A9C),
+    (0x10AC0, 0x10AC7), (0x10AC9, 0x10AE4), (0x10B00, 0x10B35), (0x10B40, 0x10B55),
+    (0x10B60, 0x10B72), (0x10B80, 0x10B91), (0x10C00, 0x10C48), (0x10C80, 0x10CB2),
+    (0x10CC0, 0x10CF2), (0x10D00, 0x10D23), (0x10D4A, 0x10D65), (0x10D6F, 0x10D85),
+    (0x10E80, 0x10EA9), (0x10EB0, 0x10EB1), (0x10EC2, 0x10EC4), (0x10F00, 0x10F1C),
+    (0x10F27, 0x10F27), (0x10F30, 0x10F45), (0x10F70, 0x10F81), (0x10FB0, 0x10FC4),
+    (0x10FE0, 0x10FF6), (0x11003, 0x11037), (0x11071, 0x11072), (0x11075, 0x11075),
+    (0x11083, 0x110AF), (0x110D0, 0x110E8), (0x11103, 0x11126), (0x11144, 0x11144),
+    (0x11147, 0x11147), (0x11150, 0x11172), (0x11176, 0x11176), (0x11183, 0x111B2),
+    (0x111C1, 0x111C4), (0x111DA, 0x111DA), (0x111DC, 0x111DC), (0x11200, 0x11211),
+    (0x11213, 0x1122B), (0x1123F, 0x11240), (0x11280, 0x11286), (0x11288, 0x11288),
+    (0x1128A, 0x1128D), (0x1128F, 0x1129D), (0x1129F, 0x112A8), (0x112B0, 0x112DE),
+    (0x11305, 0x1130C), (0x1130F, 0x11310), (0x11313, 0x11328), (0x1132A, 0x11330),
+    (0x11332, 0x11333), (0x11335, 0x11339), (0x1133D, 0x1133D), (0x11350, 0x11350),
+    (0x1135D, 0x11361), (0x11380, 0x11389), (0x1138B, 0x1138B), (0x1138E, 0x1138E),
+    (0x11390, 0x113B5), (0x113B7, 0x113B7), (0x113D1, 0x113D1), (0x113D3, 0x113D3),
+    (0x11400, 0x11434), (0x11447, 0x1144A), (0x1145F, 0x11461), (0x11480, 0x114AF),
+    (0x114C4, 0x114C5), (0x114C7, 0x114C7), (0x11580, 0x115AE), (0x115D8, 0x115DB),
+    (0x11600, 0x1162F), (0x11644, 0x11644), (0x11680, 0x116AA), (0x116B8, 0x116B8),
+    (0x11700, 0x1171A), (0x11740, 0x11746), (0x11800, 0x1182B), (0x118A0, 0x118DF),
+    (0x118FF, 0x11906), (0x11909, 0x11909), (0x1190C, 0x11913), (0x11915, 0x11916),
+    (0x11918, 0x1192F), (0x1193F, 0x1193F), (0x11941, 0x11941), (0x119A0, 0x119A7),
+    (0x119AA, 0x119D0), (0x119E1, 0x119E1), (0x119E3, 0x119E3), (0x11A00, 0x11A00),
+    (0x11A0B, 0x11A32), (0x11A3A, 0x11A3A), (0x11A50, 0x11A50), (0x11A5C, 0x11A89),
+    (0x11A9D, 0x11A9D), (0x11AB0, 0x11AF8), (0x11BC0, 0x11BE0), (0x11C00, 0x11C08),
+    (0x11C0A, 0x11C2E), (0x11C40, 0x11C40), (0x11C72, 0x11C8F), (0x11D00, 0x11D06),
+    (0x11D08, 0x11D09), (0x11D0B, 0x11D30), (0x11D46, 0x11D46), (0x11D60, 0x11D65),
+    (0x11D67, 0x11D68), (0x11D6A, 0x11D89), (0x11D98, 0x11D98), (0x11EE0, 0x11EF2),
+    (0x11F02, 0x11F02), (0x11F04, 0x11F10), (0x11F12, 0x11F33), (0x11FB0, 0x11FB0),
+    (0x12000, 0x12399), (0x12480, 0x12543), (0x12F90, 0x12FF0), (0x13000, 0x1342F),
+    (0x13441, 0x13446), (0x13460, 0x143FA), (0x14400, 0x14646), (0x16100, 0x1611D),
+    (0x16800, 0x16A38), (0x16A40, 0x16A5E), (0x16A70, 0x16ABE), (0x16AD0, 0x16AED),
+    (0x16B00, 0x16B2F), (0x16B40, 0x16B43), (0x16B63, 0x16B77), (0x16B7D, 0x16B8F),
+    (0x16D40, 0x16D6C), (0x16E40, 0x16E7F), (0x16F00, 0x16F4A), (0x16F50, 0x16F50),
+    (0x16F93, 0x16F9F), (0x16FE0, 0x16FE1), (0x16FE3, 0x16FE3), (0x17000, 0x187F7),
+    (0x18800, 0x18CD5), (0x18CFF, 0x18D08), (0x1AFF0, 0x1AFF3), (0x1AFF5, 0x1AFFB),
+    (0x1AFFD, 0x1AFFE), (0x1B000, 0x1B122), (0x1B132, 0x1B132), (0x1B150, 0x1B152),
+    (0x1B155, 0x1B155), (0x1B164, 0x1B167), (0x1B170, 0x1B2FB), (0x1BC00, 0x1BC6A),
+    (0x1BC70, 0x1BC7C), (0x1BC80, 0x1BC88), (0x1BC90, 0x1BC99), (0x1D400, 0x1D454),
+    (0x1D456, 0x1D49C), (0x1D49E, 0x1D49F), (0x1D4A2, 0x1D4A2), (0x1D4A5, 0x1D4A6),
+    (0x1D4A9, 0x1D4AC), (0x1D4AE, 0x1D4B9), (0x1D4BB, 0x1D4BB), (0x1D4BD, 0x1D4C3),
+    (0x1D4C5, 0x1D505), (0x1D507, 0x1D50A), (0x1D50D, 0x1D514), (0x1D516, 0x1D51C),
+    (0x1D51E, 0x1D539), (0x1D53B, 0x1D53E), (0x1D540, 0x1D544), (0x1D546, 0x1D546),
+    (0x1D54A, 0x1D550), (0x1D552, 0x1D6A5), (0x1D6A8, 0x1D6C0), (0x1D6C2, 0x1D6DA),
+    (0x1D6DC, 0x1D6FA), (0x1D6FC, 0x1D714), (0x1D716, 0x1D734), (0x1D736, 0x1D74E),
+    (0x1D750, 0x1D76E), (0x1D770, 0x1D788), (0x1D78A, 0x1D7A8), (0x1D7AA, 0x1D7C2),
+    (0x1D7C4, 0x1D7CB), (0x1DF00, 0x1DF1E), (0x1DF25, 0x1DF2A), (0x1E030, 0x1E06D),
+    (0x1E100, 0x1E12C), (0x1E137, 0x1E13D), (0x1E14E, 0x1E14E), (0x1E290, 0x1E2AD),
+    (0x1E2C0, 0x1E2EB), (0x1E4D0, 0x1E4EB), (0x1E5D0, 0x1E5ED), (0x1E5F0, 0x1E5F0),
+    (0x1E7E0, 0x1E7E6), (0x1E7E8, 0x1E7EB), (0x1E7ED, 0x1E7EE), (0x1E7F0, 0x1E7FE),
+    (0x1E800, 0x1E8C4), (0x1E900, 0x1E943), (0x1E94B, 0x1E94B), (0x1EE00, 0x1EE03),
+    (0x1EE05, 0x1EE1F), (0x1EE21, 0x1EE22), (0x1EE24, 0x1EE24), (0x1EE27, 0x1EE27),
+    (0x1EE29, 0x1EE32), (0x1EE34, 0x1EE37), (0x1EE39, 0x1EE39), (0x1EE3B, 0x1EE3B),
+    (0x1EE42, 0x1EE42), (0x1EE47, 0x1EE47), (0x1EE49, 0x1EE49), (0x1EE4B, 0x1EE4B),
+    (0x1EE4D, 0x1EE4F), (0x1EE51, 0x1EE52), (0x1EE54, 0x1EE54), (0x1EE57, 0x1EE57),
+    (0x1EE59, 0x1EE59), (0x1EE5B, 0x1EE5B), (0x1EE5D, 0x1EE5D), (0x1EE5F, 0x1EE5F),
+    (0x1EE61, 0x1EE62), (0x1EE64, 0x1EE64), (0x1EE67, 0x1EE6A), (0x1EE6C, 0x1EE72),
+    (0x1EE74, 0x1EE77), (0x1EE79, 0x1EE7C), (0x1EE7E, 0x1EE7E), (0x1EE80, 0x1EE89),
+    (0x1EE8B, 0x1EE9B), (0x1EEA1, 0x1EEA3), (0x1EEA5, 0x1EEA9), (0x1EEAB, 0x1EEBB),
+    (0x20000, 0x2A6DF), (0x2A700, 0x2B739), (0x2B740, 0x2B81D), (0x2B820, 0x2CEA1),
+    (0x2CEB0, 0x2EBE0), (0x2EBF0, 0x2EE5D), (0x2F800, 0x2FA1D), (0x30000, 0x3134A),
+    (0x31350, 0x323AF),
+];
+
+/// `Character.isEmoji`. 150 runs, 1431 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_RUNS: &[(u32, u32)] = &[
+    (0x0023, 0x0023), (0x002A, 0x002A), (0x0030, 0x0039), (0x00A9, 0x00A9), (0x00AE, 0x00AE),
+    (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139), (0x2194, 0x2199),
+    (0x21A9, 0x21AA), (0x231A, 0x231B), (0x2328, 0x2328), (0x23CF, 0x23CF), (0x23E9, 0x23F3),
+    (0x23F8, 0x23FA), (0x24C2, 0x24C2), (0x25AA, 0x25AB), (0x25B6, 0x25B6), (0x25C0, 0x25C0),
+    (0x25FB, 0x25FE), (0x2600, 0x2604), (0x260E, 0x260E), (0x2611, 0x2611), (0x2614, 0x2615),
+    (0x2618, 0x2618), (0x261D, 0x261D), (0x2620, 0x2620), (0x2622, 0x2623), (0x2626, 0x2626),
+    (0x262A, 0x262A), (0x262E, 0x262F), (0x2638, 0x263A), (0x2640, 0x2640), (0x2642, 0x2642),
+    (0x2648, 0x2653), (0x265F, 0x2660), (0x2663, 0x2663), (0x2665, 0x2666), (0x2668, 0x2668),
+    (0x267B, 0x267B), (0x267E, 0x267F), (0x2692, 0x2697), (0x2699, 0x2699), (0x269B, 0x269C),
+    (0x26A0, 0x26A1), (0x26A7, 0x26A7), (0x26AA, 0x26AB), (0x26B0, 0x26B1), (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5), (0x26C8, 0x26C8), (0x26CE, 0x26CF), (0x26D1, 0x26D1), (0x26D3, 0x26D4),
+    (0x26E9, 0x26EA), (0x26F0, 0x26F5), (0x26F7, 0x26FA), (0x26FD, 0x26FD), (0x2702, 0x2702),
+    (0x2705, 0x2705), (0x2708, 0x270D), (0x270F, 0x270F), (0x2712, 0x2712), (0x2714, 0x2714),
+    (0x2716, 0x2716), (0x271D, 0x271D), (0x2721, 0x2721), (0x2728, 0x2728), (0x2733, 0x2734),
+    (0x2744, 0x2744), (0x2747, 0x2747), (0x274C, 0x274C), (0x274E, 0x274E), (0x2753, 0x2755),
+    (0x2757, 0x2757), (0x2763, 0x2764), (0x2795, 0x2797), (0x27A1, 0x27A1), (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF), (0x2934, 0x2935), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55), (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297), (0x3299, 0x3299),
+    (0x1F004, 0x1F004), (0x1F0CF, 0x1F0CF), (0x1F170, 0x1F171), (0x1F17E, 0x1F17F),
+    (0x1F18E, 0x1F18E), (0x1F191, 0x1F19A), (0x1F1E6, 0x1F1FF), (0x1F201, 0x1F202),
+    (0x1F21A, 0x1F21A), (0x1F22F, 0x1F22F), (0x1F232, 0x1F23A), (0x1F250, 0x1F251),
+    (0x1F300, 0x1F321), (0x1F324, 0x1F393), (0x1F396, 0x1F397), (0x1F399, 0x1F39B),
+    (0x1F39E, 0x1F3F0), (0x1F3F3, 0x1F3F5), (0x1F3F7, 0x1F4FD), (0x1F4FF, 0x1F53D),
+    (0x1F549, 0x1F54E), (0x1F550, 0x1F567), (0x1F56F, 0x1F570), (0x1F573, 0x1F57A),
+    (0x1F587, 0x1F587), (0x1F58A, 0x1F58D), (0x1F590, 0x1F590), (0x1F595, 0x1F596),
+    (0x1F5A4, 0x1F5A5), (0x1F5A8, 0x1F5A8), (0x1F5B1, 0x1F5B2), (0x1F5BC, 0x1F5BC),
+    (0x1F5C2, 0x1F5C4), (0x1F5D1, 0x1F5D3), (0x1F5DC, 0x1F5DE), (0x1F5E1, 0x1F5E1),
+    (0x1F5E3, 0x1F5E3), (0x1F5E8, 0x1F5E8), (0x1F5EF, 0x1F5EF), (0x1F5F3, 0x1F5F3),
+    (0x1F5FA, 0x1F64F), (0x1F680, 0x1F6C5), (0x1F6CB, 0x1F6D2), (0x1F6D5, 0x1F6D7),
+    (0x1F6DC, 0x1F6E5), (0x1F6E9, 0x1F6E9), (0x1F6EB, 0x1F6EC), (0x1F6F0, 0x1F6F0),
+    (0x1F6F3, 0x1F6FC), (0x1F7E0, 0x1F7EB), (0x1F7F0, 0x1F7F0), (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945), (0x1F947, 0x1F9FF), (0x1FA70, 0x1FA7C), (0x1FA80, 0x1FA89),
+    (0x1FA8F, 0x1FAC6), (0x1FACE, 0x1FADC), (0x1FADF, 0x1FAE9), (0x1FAF0, 0x1FAF8),
+];
+
+/// `Character.isEmojiPresentation`. 80 runs, 1212 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_PRESENTATION_RUNS: &[(u32, u32)] = &[
+    (0x231A, 0x231B), (0x23E9, 0x23EC), (0x23F0, 0x23F0), (0x23F3, 0x23F3), (0x25FD, 0x25FE),
+    (0x2614, 0x2615), (0x2648, 0x2653), (0x267F, 0x267F), (0x2693, 0x2693), (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB), (0x26BD, 0x26BE), (0x26C4, 0x26C5), (0x26CE, 0x26CE), (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA), (0x26F2, 0x26F3), (0x26F5, 0x26F5), (0x26FA, 0x26FA), (0x26FD, 0x26FD),
+    (0x2705, 0x2705), (0x270A, 0x270B), (0x2728, 0x2728), (0x274C, 0x274C), (0x274E, 0x274E),
+    (0x2753, 0x2755), (0x2757, 0x2757), (0x2795, 0x2797), (0x27B0, 0x27B0), (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55), (0x1F004, 0x1F004),
+    (0x1F0CF, 0x1F0CF), (0x1F18E, 0x1F18E), (0x1F191, 0x1F19A), (0x1F1E6, 0x1F1FF),
+    (0x1F201, 0x1F201), (0x1F21A, 0x1F21A), (0x1F22F, 0x1F22F), (0x1F232, 0x1F236),
+    (0x1F238, 0x1F23A), (0x1F250, 0x1F251), (0x1F300, 0x1F320), (0x1F32D, 0x1F335),
+    (0x1F337, 0x1F37C), (0x1F37E, 0x1F393), (0x1F3A0, 0x1F3CA), (0x1F3CF, 0x1F3D3),
+    (0x1F3E0, 0x1F3F0), (0x1F3F4, 0x1F3F4), (0x1F3F8, 0x1F43E), (0x1F440, 0x1F440),
+    (0x1F442, 0x1F4FC), (0x1F4FF, 0x1F53D), (0x1F54B, 0x1F54E), (0x1F550, 0x1F567),
+    (0x1F57A, 0x1F57A), (0x1F595, 0x1F596), (0x1F5A4, 0x1F5A4), (0x1F5FB, 0x1F64F),
+    (0x1F680, 0x1F6C5), (0x1F6CC, 0x1F6CC), (0x1F6D0, 0x1F6D2), (0x1F6D5, 0x1F6D7),
+    (0x1F6DC, 0x1F6DF), (0x1F6EB, 0x1F6EC), (0x1F6F4, 0x1F6FC), (0x1F7E0, 0x1F7EB),
+    (0x1F7F0, 0x1F7F0), (0x1F90C, 0x1F93A), (0x1F93C, 0x1F945), (0x1F947, 0x1F9FF),
+    (0x1FA70, 0x1FA7C), (0x1FA80, 0x1FA89), (0x1FA8F, 0x1FAC6), (0x1FACE, 0x1FADC),
+    (0x1FADF, 0x1FAE9), (0x1FAF0, 0x1FAF8),
+];
+
+/// `Character.isEmojiModifier`. 1 run, 5 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_MODIFIER_RUNS: &[(u32, u32)] = &[(0x1F3FB, 0x1F3FF)];
+
+/// `Character.isEmojiModifierBase`. 40 runs, 134 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_MODIFIER_BASE_RUNS: &[(u32, u32)] = &[
+    (0x261D, 0x261D), (0x26F9, 0x26F9), (0x270A, 0x270D), (0x1F385, 0x1F385),
+    (0x1F3C2, 0x1F3C4), (0x1F3C7, 0x1F3C7), (0x1F3CA, 0x1F3CC), (0x1F442, 0x1F443),
+    (0x1F446, 0x1F450), (0x1F466, 0x1F478), (0x1F47C, 0x1F47C), (0x1F481, 0x1F483),
+    (0x1F485, 0x1F487), (0x1F48F, 0x1F48F), (0x1F491, 0x1F491), (0x1F4AA, 0x1F4AA),
+    (0x1F574, 0x1F575), (0x1F57A, 0x1F57A), (0x1F590, 0x1F590), (0x1F595, 0x1F596),
+    (0x1F645, 0x1F647), (0x1F64B, 0x1F64F), (0x1F6A3, 0x1F6A3), (0x1F6B4, 0x1F6B6),
+    (0x1F6C0, 0x1F6C0), (0x1F6CC, 0x1F6CC), (0x1F90C, 0x1F90C), (0x1F90F, 0x1F90F),
+    (0x1F918, 0x1F91F), (0x1F926, 0x1F926), (0x1F930, 0x1F939), (0x1F93C, 0x1F93E),
+    (0x1F977, 0x1F977), (0x1F9B5, 0x1F9B6), (0x1F9B8, 0x1F9B9), (0x1F9BB, 0x1F9BB),
+    (0x1F9CD, 0x1F9CF), (0x1F9D1, 0x1F9DD), (0x1FAC3, 0x1FAC5), (0x1FAF0, 0x1FAF8),
+];
+
+/// `Character.isEmojiComponent`. 10 runs, 146 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_COMPONENT_RUNS: &[(u32, u32)] = &[
+    (0x0023, 0x0023), (0x002A, 0x002A), (0x0030, 0x0039), (0x200D, 0x200D), (0x20E3, 0x20E3),
+    (0xFE0F, 0xFE0F), (0x1F1E6, 0x1F1FF), (0x1F3FB, 0x1F3FF), (0x1F9B0, 0x1F9B3),
+    (0xE0020, 0xE007F),
+];
+
+/// The SUPPLEMENTARY decimal digits, which `JAVA_DIGIT_RUNS` deliberately omits.
+///
+/// The two tables serve different callers and must not be merged.
+/// `JAVA_DIGIT_RUNS` backs `Integer.parseInt` and `Character.digit(char, int)`,
+/// which walk UTF-16 code UNITS — a supplementary digit reaches them as a lone
+/// surrogate and correctly matches nothing (measured on JDK 25:
+/// `Integer.parseInt(new String(Character.toChars(0x104A0)))` throws even though
+/// `Character.digit(0x104A0, 10) == 0`). This table backs only the code-POINT
+/// overloads, where the JDK really does answer for them.
+/// 39 runs, 390 code points.
+#[rustfmt::skip]
+const JAVA_SUPPLEMENTARY_DIGIT_RUNS: &[(u32, u32)] = &[
+    (0x104A0, 0x104A9), (0x10D30, 0x10D39), (0x10D40, 0x10D49), (0x11066, 0x1106F),
+    (0x110F0, 0x110F9), (0x11136, 0x1113F), (0x111D0, 0x111D9), (0x112F0, 0x112F9),
+    (0x11450, 0x11459), (0x114D0, 0x114D9), (0x11650, 0x11659), (0x116C0, 0x116C9),
+    (0x116D0, 0x116D9), (0x116DA, 0x116E3), (0x11730, 0x11739), (0x118E0, 0x118E9),
+    (0x11950, 0x11959), (0x11BF0, 0x11BF9), (0x11C50, 0x11C59), (0x11D50, 0x11D59),
+    (0x11DA0, 0x11DA9), (0x11F50, 0x11F59), (0x16130, 0x16139), (0x16A60, 0x16A69),
+    (0x16AC0, 0x16AC9), (0x16B50, 0x16B59), (0x16D70, 0x16D79), (0x1CCF0, 0x1CCF9),
+    (0x1D7CE, 0x1D7D7), (0x1D7D8, 0x1D7E1), (0x1D7E2, 0x1D7EB), (0x1D7EC, 0x1D7F5),
+    (0x1D7F6, 0x1D7FF), (0x1E140, 0x1E149), (0x1E2F0, 0x1E2F9), (0x1E4F0, 0x1E4F9),
+    (0x1E5F1, 0x1E5FA), (0x1E950, 0x1E959), (0x1FBF0, 0x1FBF9),
+];
+
+/// `Character.getNumericValue(char)`, BMP only because only `(C)I` is
+/// registered. 123 runs; every value increases by one across its run.
+#[rustfmt::skip]
+const JAVA_NUMERIC_VALUE_RUNS: &[(u32, u32, i32)] = &[
+    (0x0030, 0x0039, 0), (0x0041, 0x005A, 10), (0x0061, 0x007A, 10), (0x00B2, 0x00B3, 2),
+    (0x00B9, 0x00B9, 1), (0x0660, 0x0669, 0), (0x06F0, 0x06F9, 0), (0x07C0, 0x07C9, 0),
+    (0x0966, 0x096F, 0), (0x09E6, 0x09EF, 0), (0x09F9, 0x09F9, 16), (0x0A66, 0x0A6F, 0),
+    (0x0AE6, 0x0AEF, 0), (0x0B66, 0x0B6F, 0), (0x0BE6, 0x0BF0, 0), (0x0BF1, 0x0BF1, 100),
+    (0x0BF2, 0x0BF2, 1000), (0x0C66, 0x0C6F, 0), (0x0C78, 0x0C7B, 0), (0x0C7C, 0x0C7E, 1),
+    (0x0CE6, 0x0CEF, 0), (0x0D66, 0x0D70, 0), (0x0D71, 0x0D71, 100), (0x0D72, 0x0D72, 1000),
+    (0x0DE6, 0x0DEF, 0), (0x0E50, 0x0E59, 0), (0x0ED0, 0x0ED9, 0), (0x0F20, 0x0F29, 0),
+    (0x1040, 0x1049, 0), (0x1090, 0x1099, 0), (0x1369, 0x1372, 1), (0x1373, 0x1373, 20),
+    (0x1374, 0x1374, 30), (0x1375, 0x1375, 40), (0x1376, 0x1376, 50), (0x1377, 0x1377, 60),
+    (0x1378, 0x1378, 70), (0x1379, 0x1379, 80), (0x137A, 0x137A, 90), (0x137B, 0x137B, 100),
+    (0x137C, 0x137C, 10000), (0x16EE, 0x16F0, 17), (0x17E0, 0x17E9, 0), (0x17F0, 0x17F9, 0),
+    (0x1810, 0x1819, 0), (0x1946, 0x194F, 0), (0x19D0, 0x19D9, 0), (0x19DA, 0x19DA, 1),
+    (0x1A80, 0x1A89, 0), (0x1A90, 0x1A99, 0), (0x1B50, 0x1B59, 0), (0x1BB0, 0x1BB9, 0),
+    (0x1C40, 0x1C49, 0), (0x1C50, 0x1C59, 0), (0x2070, 0x2070, 0), (0x2074, 0x2079, 4),
+    (0x2080, 0x2089, 0), (0x215F, 0x215F, 1), (0x2160, 0x216B, 1), (0x216C, 0x216C, 50),
+    (0x216D, 0x216D, 100), (0x216E, 0x216E, 500), (0x216F, 0x216F, 1000), (0x2170, 0x217B, 1),
+    (0x217C, 0x217C, 50), (0x217D, 0x217D, 100), (0x217E, 0x217E, 500),
+    (0x217F, 0x217F, 1000), (0x2180, 0x2180, 1000), (0x2181, 0x2181, 5000),
+    (0x2182, 0x2182, 10000), (0x2185, 0x2185, 6), (0x2186, 0x2186, 50),
+    (0x2187, 0x2187, 50000), (0x2188, 0x2188, 100000), (0x2189, 0x2189, 0),
+    (0x2460, 0x2473, 1), (0x2474, 0x2487, 1), (0x2488, 0x249B, 1), (0x24EA, 0x24EA, 0),
+    (0x24EB, 0x24F4, 11), (0x24F5, 0x24FE, 1), (0x24FF, 0x24FF, 0), (0x2776, 0x277F, 1),
+    (0x2780, 0x2789, 1), (0x278A, 0x2793, 1), (0x3007, 0x3007, 0), (0x3021, 0x3029, 1),
+    (0x3038, 0x3038, 10), (0x3039, 0x3039, 20), (0x303A, 0x303A, 30), (0x3192, 0x3195, 1),
+    (0x3220, 0x3229, 1), (0x3248, 0x3248, 10), (0x3249, 0x3249, 20), (0x324A, 0x324A, 30),
+    (0x324B, 0x324B, 40), (0x324C, 0x324C, 50), (0x324D, 0x324D, 60), (0x324E, 0x324E, 70),
+    (0x324F, 0x324F, 80), (0x3251, 0x325F, 21), (0x3280, 0x3289, 1), (0x32B1, 0x32BF, 36),
+    (0xA620, 0xA629, 0), (0xA6E6, 0xA6EE, 1), (0xA6EF, 0xA6EF, 0), (0xA8D0, 0xA8D9, 0),
+    (0xA900, 0xA909, 0), (0xA9D0, 0xA9D9, 0), (0xA9F0, 0xA9F9, 0), (0xAA50, 0xAA59, 0),
+    (0xABF0, 0xABF9, 0), (0xF96B, 0xF96B, 3), (0xF973, 0xF973, 10), (0xF978, 0xF978, 2),
+    (0xF9B2, 0xF9B2, 0), (0xF9D1, 0xF9D1, 6), (0xF9D3, 0xF9D3, 6), (0xF9FD, 0xF9FD, 10),
+    (0xFF10, 0xFF19, 0), (0xFF21, 0xFF3A, 10), (0xFF41, 0xFF5A, 10),
+];
+
+/// The `-2` sentinel `getNumericValue` returns for a code point whose numeric
+/// value exists but is not a non-negative integer (`U+00BD` VULGAR FRACTION ONE
+/// HALF). 9 runs, 59 code points.
+#[rustfmt::skip]
+const JAVA_NUMERIC_VALUE_NEG2_RUNS: &[(u32, u32)] = &[
+    (0x00BC, 0x00BE), (0x09F4, 0x09F8), (0x0B72, 0x0B77), (0x0D58, 0x0D5E), (0x0D73, 0x0D78),
+    (0x0F2A, 0x0F33), (0x2150, 0x215E), (0x2CFD, 0x2CFD), (0xA830, 0xA835),
+];
+
 // --- Character ---
 
+/// `Character.valueOf(char)` — JLS §5.1.7 makes the 0..127 instances CANONICAL.
+///
+/// The previous body allocated unconditionally, so
+/// `Character.valueOf('a') == Character.valueOf('a')` was **false** on this VM
+/// and **true** on HotSpot 25 — and because `javac` compiles `Character c = 'a'`
+/// to exactly this call, so was `a == b` for two autoboxed ASCII chars. The
+/// defect is visible to any Java code that keys on wrapper identity, not just
+/// to a conformance probe.
+///
+/// The bound is `c <= 127`, transcribed from
+/// `jdk25src/java.base/java/lang/Character.java`:
+/// `if (c <= 127) { return CharacterCache.cache[(int)c]; } return new Character(c);`
+/// It is NOT -128..127: `char` is unsigned, so the cache has no negative half
+/// and no `+ 128` offset. Measured on HotSpot 25.0.3+9 by walking every code
+/// unit — the first one for which `valueOf(c) != valueOf(c)` is **128**, and
+/// U+0080, U+00FF and U+FFFF are all fresh objects there. This VM must
+/// reproduce the fresh half too, so the range check has no "when in doubt,
+/// cache" arm.
 pub(crate) fn native_character_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3629,11 +4584,46 @@ pub(crate) fn native_character_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if (0..=127).contains(&val) {
+        let obj = cached_wrapper_box(
+            ctx,
+            character_cache(),
+            val as usize,
+            "java/lang/Character",
+            Value::Int(val),
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Character");
     ctx.set_field(obj, 0, Value::Int(val));
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `Character.isDigit` — Unicode general category `Nd`, not `is_ascii_digit`.
+///
+/// W7-98(a). The old body answered ASCII-only, so every non-ASCII decimal digit
+/// answered `false` where HotSpot answers `true`: measured over the whole BMP
+/// against HotSpot 25, **360 of 65,536** code points disagreed (ARABIC-INDIC
+/// `U+0660..U+0669`, EXTENDED ARABIC-INDIC `U+06F0..`, DEVANAGARI `U+0966..`,
+/// FULLWIDTH `U+FF10..`, and 34 more runs).
+///
+/// [`java_char_digit`] is the fix and it was **already in this file** — a table
+/// of the non-ASCII digit runs generated from JDK 25 itself by walking every
+/// code point (see `JAVA_DIGIT_RUNS`) — but it had exactly ONE caller,
+/// `java_parse_signed`. So `Integer.parseInt("٦٦")` answered 66 while
+/// `Character.isDigit('٦')` answered false, in the same VM, from the same
+/// module. Verified over all 65,536 BMP code points:
+/// `java_char_digit(c, 10).is_some()` reproduces `Character.isDigit(char)` with
+/// **zero** mismatches.
+///
+/// W7-95(C1) closes the residual the previous fix left open. This triple is
+/// registered for `(I)Z` as well, and `JAVA_DIGIT_RUNS` is BMP-only by design
+/// (see its doc comment), so every SUPPLEMENTARY decimal digit — `U+1D7CE`
+/// MATHEMATICAL BOLD DIGIT ZERO and the 389 others — answered `false` where
+/// HotSpot answers `true`. [`JAVA_SUPPLEMENTARY_DIGIT_RUNS`] is the second half,
+/// and it is consulted ONLY here, never from the parse family: the two overloads
+/// genuinely have different answers and merging the tables would make
+/// `Integer.parseInt` more permissive than the JDK.
 pub(crate) fn native_character_is_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3642,10 +4632,34 @@ pub(crate) fn native_character_is_digit(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_ascii_digit());
+    let result = java_is_digit_code_point(ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `Character.isDigit(int)` — the BMP table plus the supplementary one.
+fn java_is_digit_code_point(cp: u32) -> bool {
+    char::from_u32(cp).is_some_and(|c| java_char_digit(c, 10).is_some())
+        || in_code_point_runs(JAVA_SUPPLEMENTARY_DIGIT_RUNS, cp)
+}
+
+/// `Character.isLetter` — the five `L*` categories, from a JDK-25-generated
+/// table.
+///
+/// W7-98(a) carried this as KNOWN WRONG on the grounds that Rust's std exposes
+/// no `Nl` and no `Other_Alphabetic`, so `is_alphabetic` (the Unicode
+/// **Alphabetic** property, `L* u Nl u Other_Alphabetic`) could not be narrowed
+/// exactly. That is true of any *derivation* from Rust's tables and W7-95(C1)
+/// stops trying to derive one.
+///
+/// The delta is enumerable from the oracle: `Character.isAlphabetic` on JDK 25
+/// IS the Alphabetic property, so `isAlphabetic && !isLetter` names the whole
+/// difference — **949** BMP and **1,731** total code points, all in the same
+/// direction. But the census measured **957** BMP disagreements against the
+/// shipping binary, and 957 != 949: Rust's Alphabetic table and JDK 25's differ
+/// by eight further code points that nothing on this side can enumerate. So
+/// subtracting the delta would have left a residual with no name.
+/// [`JAVA_LETTER_RUNS`] is the JDK's own answer, 677 runs over every plane, and
+/// leaves none.
 pub(crate) fn native_character_is_letter(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3654,10 +4668,49 @@ pub(crate) fn native_character_is_letter(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_alphabetic());
+    let result = in_code_point_runs(JAVA_LETTER_RUNS, ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `Character.isWhitespace` — the JAVADOC rule, not `char::is_whitespace`.
+///
+/// W7-98(a). These are two different predicates and the difference is not an
+/// approximation, it is the point of the method:
+///
+/// * Rust's `char::is_whitespace` is the Unicode **White_Space** property,
+///   which is `Zs ∪ Zl ∪ Zp ∪ {U+0009..U+000D, U+0085}`.
+/// * Java's `isWhitespace` is "a Unicode space character (`Zs`/`Zl`/`Zp`) that
+///   is **not** a non-breaking space (`U+00A0`, `U+2007`, `U+202F`), **or** one
+///   of `U+0009..U+000D`, `U+001C..U+001F`".
+///
+/// So the two disagree on eight code points, measured against HotSpot 25:
+/// `U+0085` NEL, `U+00A0` NBSP, `U+2007` FIGURE SPACE and `U+202F` NARROW NBSP
+/// answered `true` here and `false` on HotSpot (a non-breaking space is
+/// excluded precisely *because* it must not be treated as a break
+/// opportunity); the C0 file/group/record/unit separators `U+001C..U+001F`
+/// answered `false` here and `true` on HotSpot. `String.isBlank`/`strip`
+/// inherit every one of them — `" x".strip()` (`U+2007`) lost a character.
+///
+/// The derivation below is exact rather than a table: subtracting
+/// `U+0009..U+000D` and `U+0085` from White_Space leaves exactly `Zs ∪ Zl ∪ Zp`
+/// = Java's `isSpaceChar`, and the rest is the javadoc sentence transcribed.
+/// The three excluded code points are the javadoc's own list, not a sample.
+///
+/// A surrogate is `Cs`, never whitespace, and falls out `false` — which is what
+/// HotSpot answers.
+///
+/// W7-95(C1) replaced the derivation with the enumeration. The derivation was
+/// CORRECT — `White_Space \ {U+0009..U+000D, U+0085}` really is `Zs u Zl u Zp`,
+/// and the rest was the javadoc sentence — but it read three separate facts off
+/// Rust's Unicode tables to produce an answer that is, in total, **25 code
+/// points**. Enumerating them from JDK 25 is smaller, faster, provably exact,
+/// and unlike the derivation it cannot silently change when the toolchain's
+/// Unicode version moves. Measured on HotSpot 25 over `0..=0x10FFFF`:
+/// `isWhitespace` is true for exactly `U+0009..U+000D`, `U+001C..U+0020`,
+/// `U+1680`, `U+2000..U+2006`, `U+2008..U+200A`, `U+2028..U+2029`, `U+205F`,
+/// `U+3000` — note the two holes, `U+2007` FIGURE SPACE and `U+00A0`/`U+202F`,
+/// which are excluded precisely because a non-breaking space must not be
+/// treated as a break opportunity.
 pub(crate) fn native_character_is_whitespace(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3666,10 +4719,334 @@ pub(crate) fn native_character_is_whitespace(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_whitespace());
+    let result = matches!(
+        ch,
+        0x0009..=0x000D
+            | 0x001C..=0x0020
+            | 0x1680
+            | 0x2000..=0x2006
+            | 0x2008..=0x200A
+            | 0x2028..=0x2029
+            | 0x205F
+            | 0x3000
+    );
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `Character.isUpperCase` / `isLowerCase` — the Unicode **Uppercase** and
+/// **Lowercase** properties, ENUMERATED from JDK 25 instead of read off the
+/// Rust toolchain's Unicode database.
+///
+/// The two properties are the same predicate on both sides
+/// (`Lu u Other_Uppercase` / `Ll u Other_Lowercase`), so unlike `isLetter`
+/// these were never a definitional mismatch — and W7-95(C1) took the BMP to
+/// zero divergences by pinning six code points of toolchain-vs-JDK Unicode
+/// version skew. What that sweep could not see is the **supplementary
+/// planes**: it ran `0..=0xFFFF` and stopped. `0x10000..=0x10FFFF` holds 804
+/// uppercase and 927 lowercase code points on JDK 25 — DESERET, OSAGE,
+/// VITHKUQI, LATIN EXTENDED-F, OLD HUNGARIAN, GARAY, WARANG CITI,
+/// MEDEFAIDRIN, MATHEMATICAL ALPHANUMERIC SYMBOLS, LATIN EXTENDED-G,
+/// CYRILLIC EXTENDED-D, ADLAM, ENCLOSED ALPHANUMERIC SUPPLEMENT — and nothing
+/// had ever compared one of them against HotSpot. GARAY (`U+10D50..U+10D85`)
+/// is a Unicode 16.0 addition, i.e. precisely the kind of block where two
+/// independently-versioned Unicode databases part company first, and the skew
+/// the BMP sweep did find (`U+A7CE/A7CF/A7D2/A7D4/A7F1`, `U+0295`) proves the
+/// two databases here are not the same version.
+///
+/// E7 stops deriving rather than extend the pin list into 16 more planes. A
+/// `char::is_uppercase` answer is only ever as current as the compiler that
+/// built this crate, and nothing in the build asserts which Unicode version
+/// that is; a run table produced by executing `Character.isUpperCase` on
+/// OpenJDK 25.0.3+9 over all 1,114,112 code points is JDK 25's answer by
+/// construction, in every plane, and a toolchain bump cannot move it. The six
+/// pinned entries and `JAVA_UNASSIGNED_ON_JDK25` are gone with the derivation
+/// they patched — the table subsumes them.
+///
+/// Same `(first, last)` encoding and same [`in_code_point_runs`] lookup as
+/// [`JAVA_LETTER_RUNS`]. 656 runs, 1,978 code points.
+#[rustfmt::skip]
+const JAVA_UPPERCASE_RUNS: &[(u32, u32)] = &[
+    (0x0041, 0x005A), (0x00C0, 0x00D6), (0x00D8, 0x00DE), (0x0100, 0x0100), (0x0102, 0x0102),
+    (0x0104, 0x0104), (0x0106, 0x0106), (0x0108, 0x0108), (0x010A, 0x010A), (0x010C, 0x010C),
+    (0x010E, 0x010E), (0x0110, 0x0110), (0x0112, 0x0112), (0x0114, 0x0114), (0x0116, 0x0116),
+    (0x0118, 0x0118), (0x011A, 0x011A), (0x011C, 0x011C), (0x011E, 0x011E), (0x0120, 0x0120),
+    (0x0122, 0x0122), (0x0124, 0x0124), (0x0126, 0x0126), (0x0128, 0x0128), (0x012A, 0x012A),
+    (0x012C, 0x012C), (0x012E, 0x012E), (0x0130, 0x0130), (0x0132, 0x0132), (0x0134, 0x0134),
+    (0x0136, 0x0136), (0x0139, 0x0139), (0x013B, 0x013B), (0x013D, 0x013D), (0x013F, 0x013F),
+    (0x0141, 0x0141), (0x0143, 0x0143), (0x0145, 0x0145), (0x0147, 0x0147), (0x014A, 0x014A),
+    (0x014C, 0x014C), (0x014E, 0x014E), (0x0150, 0x0150), (0x0152, 0x0152), (0x0154, 0x0154),
+    (0x0156, 0x0156), (0x0158, 0x0158), (0x015A, 0x015A), (0x015C, 0x015C), (0x015E, 0x015E),
+    (0x0160, 0x0160), (0x0162, 0x0162), (0x0164, 0x0164), (0x0166, 0x0166), (0x0168, 0x0168),
+    (0x016A, 0x016A), (0x016C, 0x016C), (0x016E, 0x016E), (0x0170, 0x0170), (0x0172, 0x0172),
+    (0x0174, 0x0174), (0x0176, 0x0176), (0x0178, 0x0179), (0x017B, 0x017B), (0x017D, 0x017D),
+    (0x0181, 0x0182), (0x0184, 0x0184), (0x0186, 0x0187), (0x0189, 0x018B), (0x018E, 0x0191),
+    (0x0193, 0x0194), (0x0196, 0x0198), (0x019C, 0x019D), (0x019F, 0x01A0), (0x01A2, 0x01A2),
+    (0x01A4, 0x01A4), (0x01A6, 0x01A7), (0x01A9, 0x01A9), (0x01AC, 0x01AC), (0x01AE, 0x01AF),
+    (0x01B1, 0x01B3), (0x01B5, 0x01B5), (0x01B7, 0x01B8), (0x01BC, 0x01BC), (0x01C4, 0x01C4),
+    (0x01C7, 0x01C7), (0x01CA, 0x01CA), (0x01CD, 0x01CD), (0x01CF, 0x01CF), (0x01D1, 0x01D1),
+    (0x01D3, 0x01D3), (0x01D5, 0x01D5), (0x01D7, 0x01D7), (0x01D9, 0x01D9), (0x01DB, 0x01DB),
+    (0x01DE, 0x01DE), (0x01E0, 0x01E0), (0x01E2, 0x01E2), (0x01E4, 0x01E4), (0x01E6, 0x01E6),
+    (0x01E8, 0x01E8), (0x01EA, 0x01EA), (0x01EC, 0x01EC), (0x01EE, 0x01EE), (0x01F1, 0x01F1),
+    (0x01F4, 0x01F4), (0x01F6, 0x01F8), (0x01FA, 0x01FA), (0x01FC, 0x01FC), (0x01FE, 0x01FE),
+    (0x0200, 0x0200), (0x0202, 0x0202), (0x0204, 0x0204), (0x0206, 0x0206), (0x0208, 0x0208),
+    (0x020A, 0x020A), (0x020C, 0x020C), (0x020E, 0x020E), (0x0210, 0x0210), (0x0212, 0x0212),
+    (0x0214, 0x0214), (0x0216, 0x0216), (0x0218, 0x0218), (0x021A, 0x021A), (0x021C, 0x021C),
+    (0x021E, 0x021E), (0x0220, 0x0220), (0x0222, 0x0222), (0x0224, 0x0224), (0x0226, 0x0226),
+    (0x0228, 0x0228), (0x022A, 0x022A), (0x022C, 0x022C), (0x022E, 0x022E), (0x0230, 0x0230),
+    (0x0232, 0x0232), (0x023A, 0x023B), (0x023D, 0x023E), (0x0241, 0x0241), (0x0243, 0x0246),
+    (0x0248, 0x0248), (0x024A, 0x024A), (0x024C, 0x024C), (0x024E, 0x024E), (0x0370, 0x0370),
+    (0x0372, 0x0372), (0x0376, 0x0376), (0x037F, 0x037F), (0x0386, 0x0386), (0x0388, 0x038A),
+    (0x038C, 0x038C), (0x038E, 0x038F), (0x0391, 0x03A1), (0x03A3, 0x03AB), (0x03CF, 0x03CF),
+    (0x03D2, 0x03D4), (0x03D8, 0x03D8), (0x03DA, 0x03DA), (0x03DC, 0x03DC), (0x03DE, 0x03DE),
+    (0x03E0, 0x03E0), (0x03E2, 0x03E2), (0x03E4, 0x03E4), (0x03E6, 0x03E6), (0x03E8, 0x03E8),
+    (0x03EA, 0x03EA), (0x03EC, 0x03EC), (0x03EE, 0x03EE), (0x03F4, 0x03F4), (0x03F7, 0x03F7),
+    (0x03F9, 0x03FA), (0x03FD, 0x042F), (0x0460, 0x0460), (0x0462, 0x0462), (0x0464, 0x0464),
+    (0x0466, 0x0466), (0x0468, 0x0468), (0x046A, 0x046A), (0x046C, 0x046C), (0x046E, 0x046E),
+    (0x0470, 0x0470), (0x0472, 0x0472), (0x0474, 0x0474), (0x0476, 0x0476), (0x0478, 0x0478),
+    (0x047A, 0x047A), (0x047C, 0x047C), (0x047E, 0x047E), (0x0480, 0x0480), (0x048A, 0x048A),
+    (0x048C, 0x048C), (0x048E, 0x048E), (0x0490, 0x0490), (0x0492, 0x0492), (0x0494, 0x0494),
+    (0x0496, 0x0496), (0x0498, 0x0498), (0x049A, 0x049A), (0x049C, 0x049C), (0x049E, 0x049E),
+    (0x04A0, 0x04A0), (0x04A2, 0x04A2), (0x04A4, 0x04A4), (0x04A6, 0x04A6), (0x04A8, 0x04A8),
+    (0x04AA, 0x04AA), (0x04AC, 0x04AC), (0x04AE, 0x04AE), (0x04B0, 0x04B0), (0x04B2, 0x04B2),
+    (0x04B4, 0x04B4), (0x04B6, 0x04B6), (0x04B8, 0x04B8), (0x04BA, 0x04BA), (0x04BC, 0x04BC),
+    (0x04BE, 0x04BE), (0x04C0, 0x04C1), (0x04C3, 0x04C3), (0x04C5, 0x04C5), (0x04C7, 0x04C7),
+    (0x04C9, 0x04C9), (0x04CB, 0x04CB), (0x04CD, 0x04CD), (0x04D0, 0x04D0), (0x04D2, 0x04D2),
+    (0x04D4, 0x04D4), (0x04D6, 0x04D6), (0x04D8, 0x04D8), (0x04DA, 0x04DA), (0x04DC, 0x04DC),
+    (0x04DE, 0x04DE), (0x04E0, 0x04E0), (0x04E2, 0x04E2), (0x04E4, 0x04E4), (0x04E6, 0x04E6),
+    (0x04E8, 0x04E8), (0x04EA, 0x04EA), (0x04EC, 0x04EC), (0x04EE, 0x04EE), (0x04F0, 0x04F0),
+    (0x04F2, 0x04F2), (0x04F4, 0x04F4), (0x04F6, 0x04F6), (0x04F8, 0x04F8), (0x04FA, 0x04FA),
+    (0x04FC, 0x04FC), (0x04FE, 0x04FE), (0x0500, 0x0500), (0x0502, 0x0502), (0x0504, 0x0504),
+    (0x0506, 0x0506), (0x0508, 0x0508), (0x050A, 0x050A), (0x050C, 0x050C), (0x050E, 0x050E),
+    (0x0510, 0x0510), (0x0512, 0x0512), (0x0514, 0x0514), (0x0516, 0x0516), (0x0518, 0x0518),
+    (0x051A, 0x051A), (0x051C, 0x051C), (0x051E, 0x051E), (0x0520, 0x0520), (0x0522, 0x0522),
+    (0x0524, 0x0524), (0x0526, 0x0526), (0x0528, 0x0528), (0x052A, 0x052A), (0x052C, 0x052C),
+    (0x052E, 0x052E), (0x0531, 0x0556), (0x10A0, 0x10C5), (0x10C7, 0x10C7), (0x10CD, 0x10CD),
+    (0x13A0, 0x13F5), (0x1C89, 0x1C89), (0x1C90, 0x1CBA), (0x1CBD, 0x1CBF), (0x1E00, 0x1E00),
+    (0x1E02, 0x1E02), (0x1E04, 0x1E04), (0x1E06, 0x1E06), (0x1E08, 0x1E08), (0x1E0A, 0x1E0A),
+    (0x1E0C, 0x1E0C), (0x1E0E, 0x1E0E), (0x1E10, 0x1E10), (0x1E12, 0x1E12), (0x1E14, 0x1E14),
+    (0x1E16, 0x1E16), (0x1E18, 0x1E18), (0x1E1A, 0x1E1A), (0x1E1C, 0x1E1C), (0x1E1E, 0x1E1E),
+    (0x1E20, 0x1E20), (0x1E22, 0x1E22), (0x1E24, 0x1E24), (0x1E26, 0x1E26), (0x1E28, 0x1E28),
+    (0x1E2A, 0x1E2A), (0x1E2C, 0x1E2C), (0x1E2E, 0x1E2E), (0x1E30, 0x1E30), (0x1E32, 0x1E32),
+    (0x1E34, 0x1E34), (0x1E36, 0x1E36), (0x1E38, 0x1E38), (0x1E3A, 0x1E3A), (0x1E3C, 0x1E3C),
+    (0x1E3E, 0x1E3E), (0x1E40, 0x1E40), (0x1E42, 0x1E42), (0x1E44, 0x1E44), (0x1E46, 0x1E46),
+    (0x1E48, 0x1E48), (0x1E4A, 0x1E4A), (0x1E4C, 0x1E4C), (0x1E4E, 0x1E4E), (0x1E50, 0x1E50),
+    (0x1E52, 0x1E52), (0x1E54, 0x1E54), (0x1E56, 0x1E56), (0x1E58, 0x1E58), (0x1E5A, 0x1E5A),
+    (0x1E5C, 0x1E5C), (0x1E5E, 0x1E5E), (0x1E60, 0x1E60), (0x1E62, 0x1E62), (0x1E64, 0x1E64),
+    (0x1E66, 0x1E66), (0x1E68, 0x1E68), (0x1E6A, 0x1E6A), (0x1E6C, 0x1E6C), (0x1E6E, 0x1E6E),
+    (0x1E70, 0x1E70), (0x1E72, 0x1E72), (0x1E74, 0x1E74), (0x1E76, 0x1E76), (0x1E78, 0x1E78),
+    (0x1E7A, 0x1E7A), (0x1E7C, 0x1E7C), (0x1E7E, 0x1E7E), (0x1E80, 0x1E80), (0x1E82, 0x1E82),
+    (0x1E84, 0x1E84), (0x1E86, 0x1E86), (0x1E88, 0x1E88), (0x1E8A, 0x1E8A), (0x1E8C, 0x1E8C),
+    (0x1E8E, 0x1E8E), (0x1E90, 0x1E90), (0x1E92, 0x1E92), (0x1E94, 0x1E94), (0x1E9E, 0x1E9E),
+    (0x1EA0, 0x1EA0), (0x1EA2, 0x1EA2), (0x1EA4, 0x1EA4), (0x1EA6, 0x1EA6), (0x1EA8, 0x1EA8),
+    (0x1EAA, 0x1EAA), (0x1EAC, 0x1EAC), (0x1EAE, 0x1EAE), (0x1EB0, 0x1EB0), (0x1EB2, 0x1EB2),
+    (0x1EB4, 0x1EB4), (0x1EB6, 0x1EB6), (0x1EB8, 0x1EB8), (0x1EBA, 0x1EBA), (0x1EBC, 0x1EBC),
+    (0x1EBE, 0x1EBE), (0x1EC0, 0x1EC0), (0x1EC2, 0x1EC2), (0x1EC4, 0x1EC4), (0x1EC6, 0x1EC6),
+    (0x1EC8, 0x1EC8), (0x1ECA, 0x1ECA), (0x1ECC, 0x1ECC), (0x1ECE, 0x1ECE), (0x1ED0, 0x1ED0),
+    (0x1ED2, 0x1ED2), (0x1ED4, 0x1ED4), (0x1ED6, 0x1ED6), (0x1ED8, 0x1ED8), (0x1EDA, 0x1EDA),
+    (0x1EDC, 0x1EDC), (0x1EDE, 0x1EDE), (0x1EE0, 0x1EE0), (0x1EE2, 0x1EE2), (0x1EE4, 0x1EE4),
+    (0x1EE6, 0x1EE6), (0x1EE8, 0x1EE8), (0x1EEA, 0x1EEA), (0x1EEC, 0x1EEC), (0x1EEE, 0x1EEE),
+    (0x1EF0, 0x1EF0), (0x1EF2, 0x1EF2), (0x1EF4, 0x1EF4), (0x1EF6, 0x1EF6), (0x1EF8, 0x1EF8),
+    (0x1EFA, 0x1EFA), (0x1EFC, 0x1EFC), (0x1EFE, 0x1EFE), (0x1F08, 0x1F0F), (0x1F18, 0x1F1D),
+    (0x1F28, 0x1F2F), (0x1F38, 0x1F3F), (0x1F48, 0x1F4D), (0x1F59, 0x1F59), (0x1F5B, 0x1F5B),
+    (0x1F5D, 0x1F5D), (0x1F5F, 0x1F5F), (0x1F68, 0x1F6F), (0x1FB8, 0x1FBB), (0x1FC8, 0x1FCB),
+    (0x1FD8, 0x1FDB), (0x1FE8, 0x1FEC), (0x1FF8, 0x1FFB), (0x2102, 0x2102), (0x2107, 0x2107),
+    (0x210B, 0x210D), (0x2110, 0x2112), (0x2115, 0x2115), (0x2119, 0x211D), (0x2124, 0x2124),
+    (0x2126, 0x2126), (0x2128, 0x2128), (0x212A, 0x212D), (0x2130, 0x2133), (0x213E, 0x213F),
+    (0x2145, 0x2145), (0x2160, 0x216F), (0x2183, 0x2183), (0x24B6, 0x24CF), (0x2C00, 0x2C2F),
+    (0x2C60, 0x2C60), (0x2C62, 0x2C64), (0x2C67, 0x2C67), (0x2C69, 0x2C69), (0x2C6B, 0x2C6B),
+    (0x2C6D, 0x2C70), (0x2C72, 0x2C72), (0x2C75, 0x2C75), (0x2C7E, 0x2C80), (0x2C82, 0x2C82),
+    (0x2C84, 0x2C84), (0x2C86, 0x2C86), (0x2C88, 0x2C88), (0x2C8A, 0x2C8A), (0x2C8C, 0x2C8C),
+    (0x2C8E, 0x2C8E), (0x2C90, 0x2C90), (0x2C92, 0x2C92), (0x2C94, 0x2C94), (0x2C96, 0x2C96),
+    (0x2C98, 0x2C98), (0x2C9A, 0x2C9A), (0x2C9C, 0x2C9C), (0x2C9E, 0x2C9E), (0x2CA0, 0x2CA0),
+    (0x2CA2, 0x2CA2), (0x2CA4, 0x2CA4), (0x2CA6, 0x2CA6), (0x2CA8, 0x2CA8), (0x2CAA, 0x2CAA),
+    (0x2CAC, 0x2CAC), (0x2CAE, 0x2CAE), (0x2CB0, 0x2CB0), (0x2CB2, 0x2CB2), (0x2CB4, 0x2CB4),
+    (0x2CB6, 0x2CB6), (0x2CB8, 0x2CB8), (0x2CBA, 0x2CBA), (0x2CBC, 0x2CBC), (0x2CBE, 0x2CBE),
+    (0x2CC0, 0x2CC0), (0x2CC2, 0x2CC2), (0x2CC4, 0x2CC4), (0x2CC6, 0x2CC6), (0x2CC8, 0x2CC8),
+    (0x2CCA, 0x2CCA), (0x2CCC, 0x2CCC), (0x2CCE, 0x2CCE), (0x2CD0, 0x2CD0), (0x2CD2, 0x2CD2),
+    (0x2CD4, 0x2CD4), (0x2CD6, 0x2CD6), (0x2CD8, 0x2CD8), (0x2CDA, 0x2CDA), (0x2CDC, 0x2CDC),
+    (0x2CDE, 0x2CDE), (0x2CE0, 0x2CE0), (0x2CE2, 0x2CE2), (0x2CEB, 0x2CEB), (0x2CED, 0x2CED),
+    (0x2CF2, 0x2CF2), (0xA640, 0xA640), (0xA642, 0xA642), (0xA644, 0xA644), (0xA646, 0xA646),
+    (0xA648, 0xA648), (0xA64A, 0xA64A), (0xA64C, 0xA64C), (0xA64E, 0xA64E), (0xA650, 0xA650),
+    (0xA652, 0xA652), (0xA654, 0xA654), (0xA656, 0xA656), (0xA658, 0xA658), (0xA65A, 0xA65A),
+    (0xA65C, 0xA65C), (0xA65E, 0xA65E), (0xA660, 0xA660), (0xA662, 0xA662), (0xA664, 0xA664),
+    (0xA666, 0xA666), (0xA668, 0xA668), (0xA66A, 0xA66A), (0xA66C, 0xA66C), (0xA680, 0xA680),
+    (0xA682, 0xA682), (0xA684, 0xA684), (0xA686, 0xA686), (0xA688, 0xA688), (0xA68A, 0xA68A),
+    (0xA68C, 0xA68C), (0xA68E, 0xA68E), (0xA690, 0xA690), (0xA692, 0xA692), (0xA694, 0xA694),
+    (0xA696, 0xA696), (0xA698, 0xA698), (0xA69A, 0xA69A), (0xA722, 0xA722), (0xA724, 0xA724),
+    (0xA726, 0xA726), (0xA728, 0xA728), (0xA72A, 0xA72A), (0xA72C, 0xA72C), (0xA72E, 0xA72E),
+    (0xA732, 0xA732), (0xA734, 0xA734), (0xA736, 0xA736), (0xA738, 0xA738), (0xA73A, 0xA73A),
+    (0xA73C, 0xA73C), (0xA73E, 0xA73E), (0xA740, 0xA740), (0xA742, 0xA742), (0xA744, 0xA744),
+    (0xA746, 0xA746), (0xA748, 0xA748), (0xA74A, 0xA74A), (0xA74C, 0xA74C), (0xA74E, 0xA74E),
+    (0xA750, 0xA750), (0xA752, 0xA752), (0xA754, 0xA754), (0xA756, 0xA756), (0xA758, 0xA758),
+    (0xA75A, 0xA75A), (0xA75C, 0xA75C), (0xA75E, 0xA75E), (0xA760, 0xA760), (0xA762, 0xA762),
+    (0xA764, 0xA764), (0xA766, 0xA766), (0xA768, 0xA768), (0xA76A, 0xA76A), (0xA76C, 0xA76C),
+    (0xA76E, 0xA76E), (0xA779, 0xA779), (0xA77B, 0xA77B), (0xA77D, 0xA77E), (0xA780, 0xA780),
+    (0xA782, 0xA782), (0xA784, 0xA784), (0xA786, 0xA786), (0xA78B, 0xA78B), (0xA78D, 0xA78D),
+    (0xA790, 0xA790), (0xA792, 0xA792), (0xA796, 0xA796), (0xA798, 0xA798), (0xA79A, 0xA79A),
+    (0xA79C, 0xA79C), (0xA79E, 0xA79E), (0xA7A0, 0xA7A0), (0xA7A2, 0xA7A2), (0xA7A4, 0xA7A4),
+    (0xA7A6, 0xA7A6), (0xA7A8, 0xA7A8), (0xA7AA, 0xA7AE), (0xA7B0, 0xA7B4), (0xA7B6, 0xA7B6),
+    (0xA7B8, 0xA7B8), (0xA7BA, 0xA7BA), (0xA7BC, 0xA7BC), (0xA7BE, 0xA7BE), (0xA7C0, 0xA7C0),
+    (0xA7C2, 0xA7C2), (0xA7C4, 0xA7C7), (0xA7C9, 0xA7C9), (0xA7CB, 0xA7CC), (0xA7D0, 0xA7D0),
+    (0xA7D6, 0xA7D6), (0xA7D8, 0xA7D8), (0xA7DA, 0xA7DA), (0xA7DC, 0xA7DC), (0xA7F5, 0xA7F5),
+    (0xFF21, 0xFF3A), (0x10400, 0x10427), (0x104B0, 0x104D3), (0x10570, 0x1057A), (0x1057C, 0x1058A),
+    (0x1058C, 0x10592), (0x10594, 0x10595), (0x10C80, 0x10CB2), (0x10D50, 0x10D65), (0x118A0, 0x118BF),
+    (0x16E40, 0x16E5F), (0x1D400, 0x1D419), (0x1D434, 0x1D44D), (0x1D468, 0x1D481), (0x1D49C, 0x1D49C),
+    (0x1D49E, 0x1D49F), (0x1D4A2, 0x1D4A2), (0x1D4A5, 0x1D4A6), (0x1D4A9, 0x1D4AC), (0x1D4AE, 0x1D4B5),
+    (0x1D4D0, 0x1D4E9), (0x1D504, 0x1D505), (0x1D507, 0x1D50A), (0x1D50D, 0x1D514), (0x1D516, 0x1D51C),
+    (0x1D538, 0x1D539), (0x1D53B, 0x1D53E), (0x1D540, 0x1D544), (0x1D546, 0x1D546), (0x1D54A, 0x1D550),
+    (0x1D56C, 0x1D585), (0x1D5A0, 0x1D5B9), (0x1D5D4, 0x1D5ED), (0x1D608, 0x1D621), (0x1D63C, 0x1D655),
+    (0x1D670, 0x1D689), (0x1D6A8, 0x1D6C0), (0x1D6E2, 0x1D6FA), (0x1D71C, 0x1D734), (0x1D756, 0x1D76E),
+    (0x1D790, 0x1D7A8), (0x1D7CA, 0x1D7CA), (0x1E900, 0x1E921), (0x1F130, 0x1F149), (0x1F150, 0x1F169),
+    (0x1F170, 0x1F189),
+];
+
+/// `Character.isLowerCase`. See [`JAVA_UPPERCASE_RUNS`] — same provenance,
+/// same sweep, same encoding. 675 runs, 2,569 code points.
+#[rustfmt::skip]
+const JAVA_LOWERCASE_RUNS: &[(u32, u32)] = &[
+    (0x0061, 0x007A), (0x00AA, 0x00AA), (0x00B5, 0x00B5), (0x00BA, 0x00BA), (0x00DF, 0x00F6),
+    (0x00F8, 0x00FF), (0x0101, 0x0101), (0x0103, 0x0103), (0x0105, 0x0105), (0x0107, 0x0107),
+    (0x0109, 0x0109), (0x010B, 0x010B), (0x010D, 0x010D), (0x010F, 0x010F), (0x0111, 0x0111),
+    (0x0113, 0x0113), (0x0115, 0x0115), (0x0117, 0x0117), (0x0119, 0x0119), (0x011B, 0x011B),
+    (0x011D, 0x011D), (0x011F, 0x011F), (0x0121, 0x0121), (0x0123, 0x0123), (0x0125, 0x0125),
+    (0x0127, 0x0127), (0x0129, 0x0129), (0x012B, 0x012B), (0x012D, 0x012D), (0x012F, 0x012F),
+    (0x0131, 0x0131), (0x0133, 0x0133), (0x0135, 0x0135), (0x0137, 0x0138), (0x013A, 0x013A),
+    (0x013C, 0x013C), (0x013E, 0x013E), (0x0140, 0x0140), (0x0142, 0x0142), (0x0144, 0x0144),
+    (0x0146, 0x0146), (0x0148, 0x0149), (0x014B, 0x014B), (0x014D, 0x014D), (0x014F, 0x014F),
+    (0x0151, 0x0151), (0x0153, 0x0153), (0x0155, 0x0155), (0x0157, 0x0157), (0x0159, 0x0159),
+    (0x015B, 0x015B), (0x015D, 0x015D), (0x015F, 0x015F), (0x0161, 0x0161), (0x0163, 0x0163),
+    (0x0165, 0x0165), (0x0167, 0x0167), (0x0169, 0x0169), (0x016B, 0x016B), (0x016D, 0x016D),
+    (0x016F, 0x016F), (0x0171, 0x0171), (0x0173, 0x0173), (0x0175, 0x0175), (0x0177, 0x0177),
+    (0x017A, 0x017A), (0x017C, 0x017C), (0x017E, 0x0180), (0x0183, 0x0183), (0x0185, 0x0185),
+    (0x0188, 0x0188), (0x018C, 0x018D), (0x0192, 0x0192), (0x0195, 0x0195), (0x0199, 0x019B),
+    (0x019E, 0x019E), (0x01A1, 0x01A1), (0x01A3, 0x01A3), (0x01A5, 0x01A5), (0x01A8, 0x01A8),
+    (0x01AA, 0x01AB), (0x01AD, 0x01AD), (0x01B0, 0x01B0), (0x01B4, 0x01B4), (0x01B6, 0x01B6),
+    (0x01B9, 0x01BA), (0x01BD, 0x01BF), (0x01C6, 0x01C6), (0x01C9, 0x01C9), (0x01CC, 0x01CC),
+    (0x01CE, 0x01CE), (0x01D0, 0x01D0), (0x01D2, 0x01D2), (0x01D4, 0x01D4), (0x01D6, 0x01D6),
+    (0x01D8, 0x01D8), (0x01DA, 0x01DA), (0x01DC, 0x01DD), (0x01DF, 0x01DF), (0x01E1, 0x01E1),
+    (0x01E3, 0x01E3), (0x01E5, 0x01E5), (0x01E7, 0x01E7), (0x01E9, 0x01E9), (0x01EB, 0x01EB),
+    (0x01ED, 0x01ED), (0x01EF, 0x01F0), (0x01F3, 0x01F3), (0x01F5, 0x01F5), (0x01F9, 0x01F9),
+    (0x01FB, 0x01FB), (0x01FD, 0x01FD), (0x01FF, 0x01FF), (0x0201, 0x0201), (0x0203, 0x0203),
+    (0x0205, 0x0205), (0x0207, 0x0207), (0x0209, 0x0209), (0x020B, 0x020B), (0x020D, 0x020D),
+    (0x020F, 0x020F), (0x0211, 0x0211), (0x0213, 0x0213), (0x0215, 0x0215), (0x0217, 0x0217),
+    (0x0219, 0x0219), (0x021B, 0x021B), (0x021D, 0x021D), (0x021F, 0x021F), (0x0221, 0x0221),
+    (0x0223, 0x0223), (0x0225, 0x0225), (0x0227, 0x0227), (0x0229, 0x0229), (0x022B, 0x022B),
+    (0x022D, 0x022D), (0x022F, 0x022F), (0x0231, 0x0231), (0x0233, 0x0239), (0x023C, 0x023C),
+    (0x023F, 0x0240), (0x0242, 0x0242), (0x0247, 0x0247), (0x0249, 0x0249), (0x024B, 0x024B),
+    (0x024D, 0x024D), (0x024F, 0x0293), (0x0295, 0x02B8), (0x02C0, 0x02C1), (0x02E0, 0x02E4),
+    (0x0345, 0x0345), (0x0371, 0x0371), (0x0373, 0x0373), (0x0377, 0x0377), (0x037A, 0x037D),
+    (0x0390, 0x0390), (0x03AC, 0x03CE), (0x03D0, 0x03D1), (0x03D5, 0x03D7), (0x03D9, 0x03D9),
+    (0x03DB, 0x03DB), (0x03DD, 0x03DD), (0x03DF, 0x03DF), (0x03E1, 0x03E1), (0x03E3, 0x03E3),
+    (0x03E5, 0x03E5), (0x03E7, 0x03E7), (0x03E9, 0x03E9), (0x03EB, 0x03EB), (0x03ED, 0x03ED),
+    (0x03EF, 0x03F3), (0x03F5, 0x03F5), (0x03F8, 0x03F8), (0x03FB, 0x03FC), (0x0430, 0x045F),
+    (0x0461, 0x0461), (0x0463, 0x0463), (0x0465, 0x0465), (0x0467, 0x0467), (0x0469, 0x0469),
+    (0x046B, 0x046B), (0x046D, 0x046D), (0x046F, 0x046F), (0x0471, 0x0471), (0x0473, 0x0473),
+    (0x0475, 0x0475), (0x0477, 0x0477), (0x0479, 0x0479), (0x047B, 0x047B), (0x047D, 0x047D),
+    (0x047F, 0x047F), (0x0481, 0x0481), (0x048B, 0x048B), (0x048D, 0x048D), (0x048F, 0x048F),
+    (0x0491, 0x0491), (0x0493, 0x0493), (0x0495, 0x0495), (0x0497, 0x0497), (0x0499, 0x0499),
+    (0x049B, 0x049B), (0x049D, 0x049D), (0x049F, 0x049F), (0x04A1, 0x04A1), (0x04A3, 0x04A3),
+    (0x04A5, 0x04A5), (0x04A7, 0x04A7), (0x04A9, 0x04A9), (0x04AB, 0x04AB), (0x04AD, 0x04AD),
+    (0x04AF, 0x04AF), (0x04B1, 0x04B1), (0x04B3, 0x04B3), (0x04B5, 0x04B5), (0x04B7, 0x04B7),
+    (0x04B9, 0x04B9), (0x04BB, 0x04BB), (0x04BD, 0x04BD), (0x04BF, 0x04BF), (0x04C2, 0x04C2),
+    (0x04C4, 0x04C4), (0x04C6, 0x04C6), (0x04C8, 0x04C8), (0x04CA, 0x04CA), (0x04CC, 0x04CC),
+    (0x04CE, 0x04CF), (0x04D1, 0x04D1), (0x04D3, 0x04D3), (0x04D5, 0x04D5), (0x04D7, 0x04D7),
+    (0x04D9, 0x04D9), (0x04DB, 0x04DB), (0x04DD, 0x04DD), (0x04DF, 0x04DF), (0x04E1, 0x04E1),
+    (0x04E3, 0x04E3), (0x04E5, 0x04E5), (0x04E7, 0x04E7), (0x04E9, 0x04E9), (0x04EB, 0x04EB),
+    (0x04ED, 0x04ED), (0x04EF, 0x04EF), (0x04F1, 0x04F1), (0x04F3, 0x04F3), (0x04F5, 0x04F5),
+    (0x04F7, 0x04F7), (0x04F9, 0x04F9), (0x04FB, 0x04FB), (0x04FD, 0x04FD), (0x04FF, 0x04FF),
+    (0x0501, 0x0501), (0x0503, 0x0503), (0x0505, 0x0505), (0x0507, 0x0507), (0x0509, 0x0509),
+    (0x050B, 0x050B), (0x050D, 0x050D), (0x050F, 0x050F), (0x0511, 0x0511), (0x0513, 0x0513),
+    (0x0515, 0x0515), (0x0517, 0x0517), (0x0519, 0x0519), (0x051B, 0x051B), (0x051D, 0x051D),
+    (0x051F, 0x051F), (0x0521, 0x0521), (0x0523, 0x0523), (0x0525, 0x0525), (0x0527, 0x0527),
+    (0x0529, 0x0529), (0x052B, 0x052B), (0x052D, 0x052D), (0x052F, 0x052F), (0x0560, 0x0588),
+    (0x10D0, 0x10FA), (0x10FC, 0x10FF), (0x13F8, 0x13FD), (0x1C80, 0x1C88), (0x1C8A, 0x1C8A),
+    (0x1D00, 0x1DBF), (0x1E01, 0x1E01), (0x1E03, 0x1E03), (0x1E05, 0x1E05), (0x1E07, 0x1E07),
+    (0x1E09, 0x1E09), (0x1E0B, 0x1E0B), (0x1E0D, 0x1E0D), (0x1E0F, 0x1E0F), (0x1E11, 0x1E11),
+    (0x1E13, 0x1E13), (0x1E15, 0x1E15), (0x1E17, 0x1E17), (0x1E19, 0x1E19), (0x1E1B, 0x1E1B),
+    (0x1E1D, 0x1E1D), (0x1E1F, 0x1E1F), (0x1E21, 0x1E21), (0x1E23, 0x1E23), (0x1E25, 0x1E25),
+    (0x1E27, 0x1E27), (0x1E29, 0x1E29), (0x1E2B, 0x1E2B), (0x1E2D, 0x1E2D), (0x1E2F, 0x1E2F),
+    (0x1E31, 0x1E31), (0x1E33, 0x1E33), (0x1E35, 0x1E35), (0x1E37, 0x1E37), (0x1E39, 0x1E39),
+    (0x1E3B, 0x1E3B), (0x1E3D, 0x1E3D), (0x1E3F, 0x1E3F), (0x1E41, 0x1E41), (0x1E43, 0x1E43),
+    (0x1E45, 0x1E45), (0x1E47, 0x1E47), (0x1E49, 0x1E49), (0x1E4B, 0x1E4B), (0x1E4D, 0x1E4D),
+    (0x1E4F, 0x1E4F), (0x1E51, 0x1E51), (0x1E53, 0x1E53), (0x1E55, 0x1E55), (0x1E57, 0x1E57),
+    (0x1E59, 0x1E59), (0x1E5B, 0x1E5B), (0x1E5D, 0x1E5D), (0x1E5F, 0x1E5F), (0x1E61, 0x1E61),
+    (0x1E63, 0x1E63), (0x1E65, 0x1E65), (0x1E67, 0x1E67), (0x1E69, 0x1E69), (0x1E6B, 0x1E6B),
+    (0x1E6D, 0x1E6D), (0x1E6F, 0x1E6F), (0x1E71, 0x1E71), (0x1E73, 0x1E73), (0x1E75, 0x1E75),
+    (0x1E77, 0x1E77), (0x1E79, 0x1E79), (0x1E7B, 0x1E7B), (0x1E7D, 0x1E7D), (0x1E7F, 0x1E7F),
+    (0x1E81, 0x1E81), (0x1E83, 0x1E83), (0x1E85, 0x1E85), (0x1E87, 0x1E87), (0x1E89, 0x1E89),
+    (0x1E8B, 0x1E8B), (0x1E8D, 0x1E8D), (0x1E8F, 0x1E8F), (0x1E91, 0x1E91), (0x1E93, 0x1E93),
+    (0x1E95, 0x1E9D), (0x1E9F, 0x1E9F), (0x1EA1, 0x1EA1), (0x1EA3, 0x1EA3), (0x1EA5, 0x1EA5),
+    (0x1EA7, 0x1EA7), (0x1EA9, 0x1EA9), (0x1EAB, 0x1EAB), (0x1EAD, 0x1EAD), (0x1EAF, 0x1EAF),
+    (0x1EB1, 0x1EB1), (0x1EB3, 0x1EB3), (0x1EB5, 0x1EB5), (0x1EB7, 0x1EB7), (0x1EB9, 0x1EB9),
+    (0x1EBB, 0x1EBB), (0x1EBD, 0x1EBD), (0x1EBF, 0x1EBF), (0x1EC1, 0x1EC1), (0x1EC3, 0x1EC3),
+    (0x1EC5, 0x1EC5), (0x1EC7, 0x1EC7), (0x1EC9, 0x1EC9), (0x1ECB, 0x1ECB), (0x1ECD, 0x1ECD),
+    (0x1ECF, 0x1ECF), (0x1ED1, 0x1ED1), (0x1ED3, 0x1ED3), (0x1ED5, 0x1ED5), (0x1ED7, 0x1ED7),
+    (0x1ED9, 0x1ED9), (0x1EDB, 0x1EDB), (0x1EDD, 0x1EDD), (0x1EDF, 0x1EDF), (0x1EE1, 0x1EE1),
+    (0x1EE3, 0x1EE3), (0x1EE5, 0x1EE5), (0x1EE7, 0x1EE7), (0x1EE9, 0x1EE9), (0x1EEB, 0x1EEB),
+    (0x1EED, 0x1EED), (0x1EEF, 0x1EEF), (0x1EF1, 0x1EF1), (0x1EF3, 0x1EF3), (0x1EF5, 0x1EF5),
+    (0x1EF7, 0x1EF7), (0x1EF9, 0x1EF9), (0x1EFB, 0x1EFB), (0x1EFD, 0x1EFD), (0x1EFF, 0x1F07),
+    (0x1F10, 0x1F15), (0x1F20, 0x1F27), (0x1F30, 0x1F37), (0x1F40, 0x1F45), (0x1F50, 0x1F57),
+    (0x1F60, 0x1F67), (0x1F70, 0x1F7D), (0x1F80, 0x1F87), (0x1F90, 0x1F97), (0x1FA0, 0x1FA7),
+    (0x1FB0, 0x1FB4), (0x1FB6, 0x1FB7), (0x1FBE, 0x1FBE), (0x1FC2, 0x1FC4), (0x1FC6, 0x1FC7),
+    (0x1FD0, 0x1FD3), (0x1FD6, 0x1FD7), (0x1FE0, 0x1FE7), (0x1FF2, 0x1FF4), (0x1FF6, 0x1FF7),
+    (0x2071, 0x2071), (0x207F, 0x207F), (0x2090, 0x209C), (0x210A, 0x210A), (0x210E, 0x210F),
+    (0x2113, 0x2113), (0x212F, 0x212F), (0x2134, 0x2134), (0x2139, 0x2139), (0x213C, 0x213D),
+    (0x2146, 0x2149), (0x214E, 0x214E), (0x2170, 0x217F), (0x2184, 0x2184), (0x24D0, 0x24E9),
+    (0x2C30, 0x2C5F), (0x2C61, 0x2C61), (0x2C65, 0x2C66), (0x2C68, 0x2C68), (0x2C6A, 0x2C6A),
+    (0x2C6C, 0x2C6C), (0x2C71, 0x2C71), (0x2C73, 0x2C74), (0x2C76, 0x2C7D), (0x2C81, 0x2C81),
+    (0x2C83, 0x2C83), (0x2C85, 0x2C85), (0x2C87, 0x2C87), (0x2C89, 0x2C89), (0x2C8B, 0x2C8B),
+    (0x2C8D, 0x2C8D), (0x2C8F, 0x2C8F), (0x2C91, 0x2C91), (0x2C93, 0x2C93), (0x2C95, 0x2C95),
+    (0x2C97, 0x2C97), (0x2C99, 0x2C99), (0x2C9B, 0x2C9B), (0x2C9D, 0x2C9D), (0x2C9F, 0x2C9F),
+    (0x2CA1, 0x2CA1), (0x2CA3, 0x2CA3), (0x2CA5, 0x2CA5), (0x2CA7, 0x2CA7), (0x2CA9, 0x2CA9),
+    (0x2CAB, 0x2CAB), (0x2CAD, 0x2CAD), (0x2CAF, 0x2CAF), (0x2CB1, 0x2CB1), (0x2CB3, 0x2CB3),
+    (0x2CB5, 0x2CB5), (0x2CB7, 0x2CB7), (0x2CB9, 0x2CB9), (0x2CBB, 0x2CBB), (0x2CBD, 0x2CBD),
+    (0x2CBF, 0x2CBF), (0x2CC1, 0x2CC1), (0x2CC3, 0x2CC3), (0x2CC5, 0x2CC5), (0x2CC7, 0x2CC7),
+    (0x2CC9, 0x2CC9), (0x2CCB, 0x2CCB), (0x2CCD, 0x2CCD), (0x2CCF, 0x2CCF), (0x2CD1, 0x2CD1),
+    (0x2CD3, 0x2CD3), (0x2CD5, 0x2CD5), (0x2CD7, 0x2CD7), (0x2CD9, 0x2CD9), (0x2CDB, 0x2CDB),
+    (0x2CDD, 0x2CDD), (0x2CDF, 0x2CDF), (0x2CE1, 0x2CE1), (0x2CE3, 0x2CE4), (0x2CEC, 0x2CEC),
+    (0x2CEE, 0x2CEE), (0x2CF3, 0x2CF3), (0x2D00, 0x2D25), (0x2D27, 0x2D27), (0x2D2D, 0x2D2D),
+    (0xA641, 0xA641), (0xA643, 0xA643), (0xA645, 0xA645), (0xA647, 0xA647), (0xA649, 0xA649),
+    (0xA64B, 0xA64B), (0xA64D, 0xA64D), (0xA64F, 0xA64F), (0xA651, 0xA651), (0xA653, 0xA653),
+    (0xA655, 0xA655), (0xA657, 0xA657), (0xA659, 0xA659), (0xA65B, 0xA65B), (0xA65D, 0xA65D),
+    (0xA65F, 0xA65F), (0xA661, 0xA661), (0xA663, 0xA663), (0xA665, 0xA665), (0xA667, 0xA667),
+    (0xA669, 0xA669), (0xA66B, 0xA66B), (0xA66D, 0xA66D), (0xA681, 0xA681), (0xA683, 0xA683),
+    (0xA685, 0xA685), (0xA687, 0xA687), (0xA689, 0xA689), (0xA68B, 0xA68B), (0xA68D, 0xA68D),
+    (0xA68F, 0xA68F), (0xA691, 0xA691), (0xA693, 0xA693), (0xA695, 0xA695), (0xA697, 0xA697),
+    (0xA699, 0xA699), (0xA69B, 0xA69D), (0xA723, 0xA723), (0xA725, 0xA725), (0xA727, 0xA727),
+    (0xA729, 0xA729), (0xA72B, 0xA72B), (0xA72D, 0xA72D), (0xA72F, 0xA731), (0xA733, 0xA733),
+    (0xA735, 0xA735), (0xA737, 0xA737), (0xA739, 0xA739), (0xA73B, 0xA73B), (0xA73D, 0xA73D),
+    (0xA73F, 0xA73F), (0xA741, 0xA741), (0xA743, 0xA743), (0xA745, 0xA745), (0xA747, 0xA747),
+    (0xA749, 0xA749), (0xA74B, 0xA74B), (0xA74D, 0xA74D), (0xA74F, 0xA74F), (0xA751, 0xA751),
+    (0xA753, 0xA753), (0xA755, 0xA755), (0xA757, 0xA757), (0xA759, 0xA759), (0xA75B, 0xA75B),
+    (0xA75D, 0xA75D), (0xA75F, 0xA75F), (0xA761, 0xA761), (0xA763, 0xA763), (0xA765, 0xA765),
+    (0xA767, 0xA767), (0xA769, 0xA769), (0xA76B, 0xA76B), (0xA76D, 0xA76D), (0xA76F, 0xA778),
+    (0xA77A, 0xA77A), (0xA77C, 0xA77C), (0xA77F, 0xA77F), (0xA781, 0xA781), (0xA783, 0xA783),
+    (0xA785, 0xA785), (0xA787, 0xA787), (0xA78C, 0xA78C), (0xA78E, 0xA78E), (0xA791, 0xA791),
+    (0xA793, 0xA795), (0xA797, 0xA797), (0xA799, 0xA799), (0xA79B, 0xA79B), (0xA79D, 0xA79D),
+    (0xA79F, 0xA79F), (0xA7A1, 0xA7A1), (0xA7A3, 0xA7A3), (0xA7A5, 0xA7A5), (0xA7A7, 0xA7A7),
+    (0xA7A9, 0xA7A9), (0xA7AF, 0xA7AF), (0xA7B5, 0xA7B5), (0xA7B7, 0xA7B7), (0xA7B9, 0xA7B9),
+    (0xA7BB, 0xA7BB), (0xA7BD, 0xA7BD), (0xA7BF, 0xA7BF), (0xA7C1, 0xA7C1), (0xA7C3, 0xA7C3),
+    (0xA7C8, 0xA7C8), (0xA7CA, 0xA7CA), (0xA7CD, 0xA7CD), (0xA7D1, 0xA7D1), (0xA7D3, 0xA7D3),
+    (0xA7D5, 0xA7D5), (0xA7D7, 0xA7D7), (0xA7D9, 0xA7D9), (0xA7DB, 0xA7DB), (0xA7F2, 0xA7F4),
+    (0xA7F6, 0xA7F6), (0xA7F8, 0xA7FA), (0xAB30, 0xAB5A), (0xAB5C, 0xAB69), (0xAB70, 0xABBF),
+    (0xFB00, 0xFB06), (0xFB13, 0xFB17), (0xFF41, 0xFF5A), (0x10428, 0x1044F), (0x104D8, 0x104FB),
+    (0x10597, 0x105A1), (0x105A3, 0x105B1), (0x105B3, 0x105B9), (0x105BB, 0x105BC), (0x10780, 0x10780),
+    (0x10783, 0x10785), (0x10787, 0x107B0), (0x107B2, 0x107BA), (0x10CC0, 0x10CF2), (0x10D70, 0x10D85),
+    (0x118C0, 0x118DF), (0x16E60, 0x16E7F), (0x1D41A, 0x1D433), (0x1D44E, 0x1D454), (0x1D456, 0x1D467),
+    (0x1D482, 0x1D49B), (0x1D4B6, 0x1D4B9), (0x1D4BB, 0x1D4BB), (0x1D4BD, 0x1D4C3), (0x1D4C5, 0x1D4CF),
+    (0x1D4EA, 0x1D503), (0x1D51E, 0x1D537), (0x1D552, 0x1D56B), (0x1D586, 0x1D59F), (0x1D5BA, 0x1D5D3),
+    (0x1D5EE, 0x1D607), (0x1D622, 0x1D63B), (0x1D656, 0x1D66F), (0x1D68A, 0x1D6A5), (0x1D6C2, 0x1D6DA),
+    (0x1D6DC, 0x1D6E1), (0x1D6FC, 0x1D714), (0x1D716, 0x1D71B), (0x1D736, 0x1D74E), (0x1D750, 0x1D755),
+    (0x1D770, 0x1D788), (0x1D78A, 0x1D78F), (0x1D7AA, 0x1D7C2), (0x1D7C4, 0x1D7C9), (0x1D7CB, 0x1D7CB),
+    (0x1DF00, 0x1DF09), (0x1DF0B, 0x1DF1E), (0x1DF25, 0x1DF2A), (0x1E030, 0x1E06D), (0x1E922, 0x1E943),
+];
+
+/// A negative `int` reaching these two is NOT the [`native_character_char_count`]
+/// hazard. `Character.isUpperCase(-1)` is `false` on HotSpot 25 (measured), a
+/// negative widened by `as u32` lands far above `0x10FFFF`, and the binary
+/// search therefore misses — the unsigned cast and the JDK agree here. The
+/// JDK's `Character` methods do NOT share one out-of-range convention; each
+/// one's was read off HotSpot separately.
 pub(crate) fn native_character_is_upper_case(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3678,7 +5055,7 @@ pub(crate) fn native_character_is_upper_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_uppercase());
+    let result = in_code_point_runs(JAVA_UPPERCASE_RUNS, ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -3690,10 +5067,253 @@ pub(crate) fn native_character_is_lower_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_lowercase());
+    let result = in_code_point_runs(JAVA_LOWERCASE_RUNS, ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `Character.toUpperCase` / `toLowerCase` — the SIMPLE case mappings,
+/// ENUMERATED from JDK 25 over every plane.
+///
+/// This replaces a derivation that read three separate facts off Rust's
+/// Unicode tables and then corrected them from two override lists:
+///
+/// * `char::to_uppercase` yields the Unicode **full** mapping
+///   (`SpecialCasing.txt`), an iterator; Java wants the **simple** mapping
+///   (`UnicodeData.txt` field 12), one code point or none. W7-98(b) recovered
+///   most of that with an arity rule (take the mapping only if it is exactly
+///   one `char`), which is right for `U+00DF`/`U+FB00..`/`U+0149` and wrong
+///   for the 27-member ypogegrammeni family, whose SIMPLE mapping exists
+///   (`U+1FB3` -> `U+1FBC`) but which no Rust std API exposes.
+/// * `char::to_lowercase` needed the opposite rule — `.next()`, because
+///   `U+0130`'s two-char full lowercase begins with its simple one.
+/// * Both needed the Latin Extended-D version-skew pins.
+///
+/// So the old body was a Rust answer plus 33 hand-maintained corrections, and
+/// the corrections were derived from a BMP-only sweep. The supplementary
+/// planes carry 282 mapped code points in each direction (DESERET, OSAGE,
+/// VITHKUQI, LATIN EXTENDED-F/G, OLD HUNGARIAN, GARAY, WARANG CITI,
+/// MEDEFAIDRIN, CYRILLIC EXTENDED-D, ADLAM) that no census had ever looked at,
+/// and there is no correction list for them because nobody measured one.
+///
+/// A table generated by executing `Character.toUpperCase(int)` /
+/// `toLowerCase(int)` on OpenJDK 25.0.3+9 for all 1,114,112 code points needs
+/// no correction list, needs no arity rule, and cannot drift when the
+/// toolchain's Unicode version moves. It also makes the two overloads' shared
+/// helper total: every input that is not in a run maps to ITSELF, which is
+/// what Java specifies for a lone surrogate, for an unassigned code point, and
+/// for `0x110000` alike.
+///
+/// **Encoding.** `(first, last, stride, delta)`: the code points
+/// `first, first+stride, first+2*stride, ...` up to `last` each map to
+/// themselves plus `delta`; every other code point inside the span, and every
+/// code point outside every span, maps to itself. `stride` is what makes the
+/// table small — Latin Extended-A is 200-odd alternating case PAIRS
+/// (`U+0100`/`U+0101`, `U+0102`/`U+0103`, ...) and one `stride == 2` run
+/// covers each block of them. Without it the same content needs 690 and 674
+/// plain runs instead of 205 and 187.
+///
+/// The runs are sorted and disjoint, so [`mapped_in_stride_runs`] binary
+/// searches them. 205 runs, 1,477 mapped code points.
+#[rustfmt::skip]
+const JAVA_TO_UPPER_RUNS: &[(u32, u32, u32, i32)] = &[
+    (0x0061, 0x007A, 1, -32), (0x00B5, 0x00B5, 1, 743), (0x00E0, 0x00F6, 1, -32),
+    (0x00F8, 0x00FE, 1, -32), (0x00FF, 0x00FF, 1, 121), (0x0101, 0x012F, 2, -1),
+    (0x0131, 0x0131, 1, -232), (0x0133, 0x0137, 2, -1), (0x013A, 0x0148, 2, -1),
+    (0x014B, 0x0177, 2, -1), (0x017A, 0x017E, 2, -1), (0x017F, 0x017F, 1, -300),
+    (0x0180, 0x0180, 1, 195), (0x0183, 0x0185, 2, -1), (0x0188, 0x0188, 1, -1),
+    (0x018C, 0x018C, 1, -1), (0x0192, 0x0192, 1, -1), (0x0195, 0x0195, 1, 97),
+    (0x0199, 0x0199, 1, -1), (0x019A, 0x019A, 1, 163), (0x019B, 0x019B, 1, 42561),
+    (0x019E, 0x019E, 1, 130), (0x01A1, 0x01A5, 2, -1), (0x01A8, 0x01A8, 1, -1),
+    (0x01AD, 0x01AD, 1, -1), (0x01B0, 0x01B0, 1, -1), (0x01B4, 0x01B6, 2, -1),
+    (0x01B9, 0x01B9, 1, -1), (0x01BD, 0x01BD, 1, -1), (0x01BF, 0x01BF, 1, 56),
+    (0x01C5, 0x01C5, 1, -1), (0x01C6, 0x01C6, 1, -2), (0x01C8, 0x01C8, 1, -1),
+    (0x01C9, 0x01C9, 1, -2), (0x01CB, 0x01CB, 1, -1), (0x01CC, 0x01CC, 1, -2),
+    (0x01CE, 0x01DC, 2, -1), (0x01DD, 0x01DD, 1, -79), (0x01DF, 0x01EF, 2, -1),
+    (0x01F2, 0x01F2, 1, -1), (0x01F3, 0x01F3, 1, -2), (0x01F5, 0x01F5, 1, -1),
+    (0x01F9, 0x021F, 2, -1), (0x0223, 0x0233, 2, -1), (0x023C, 0x023C, 1, -1),
+    (0x023F, 0x0240, 1, 10815), (0x0242, 0x0242, 1, -1), (0x0247, 0x024F, 2, -1),
+    (0x0250, 0x0250, 1, 10783), (0x0251, 0x0251, 1, 10780), (0x0252, 0x0252, 1, 10782),
+    (0x0253, 0x0253, 1, -210), (0x0254, 0x0254, 1, -206), (0x0256, 0x0257, 1, -205),
+    (0x0259, 0x0259, 1, -202), (0x025B, 0x025B, 1, -203), (0x025C, 0x025C, 1, 42319),
+    (0x0260, 0x0260, 1, -205), (0x0261, 0x0261, 1, 42315), (0x0263, 0x0263, 1, -207),
+    (0x0264, 0x0264, 1, 42343), (0x0265, 0x0265, 1, 42280), (0x0266, 0x0266, 1, 42308),
+    (0x0268, 0x0268, 1, -209), (0x0269, 0x0269, 1, -211), (0x026A, 0x026A, 1, 42308),
+    (0x026B, 0x026B, 1, 10743), (0x026C, 0x026C, 1, 42305), (0x026F, 0x026F, 1, -211),
+    (0x0271, 0x0271, 1, 10749), (0x0272, 0x0272, 1, -213), (0x0275, 0x0275, 1, -214),
+    (0x027D, 0x027D, 1, 10727), (0x0280, 0x0280, 1, -218), (0x0282, 0x0282, 1, 42307),
+    (0x0283, 0x0283, 1, -218), (0x0287, 0x0287, 1, 42282), (0x0288, 0x0288, 1, -218),
+    (0x0289, 0x0289, 1, -69), (0x028A, 0x028B, 1, -217), (0x028C, 0x028C, 1, -71),
+    (0x0292, 0x0292, 1, -219), (0x029D, 0x029D, 1, 42261), (0x029E, 0x029E, 1, 42258),
+    (0x0345, 0x0345, 1, 84), (0x0371, 0x0373, 2, -1), (0x0377, 0x0377, 1, -1),
+    (0x037B, 0x037D, 1, 130), (0x03AC, 0x03AC, 1, -38), (0x03AD, 0x03AF, 1, -37),
+    (0x03B1, 0x03C1, 1, -32), (0x03C2, 0x03C2, 1, -31), (0x03C3, 0x03CB, 1, -32),
+    (0x03CC, 0x03CC, 1, -64), (0x03CD, 0x03CE, 1, -63), (0x03D0, 0x03D0, 1, -62),
+    (0x03D1, 0x03D1, 1, -57), (0x03D5, 0x03D5, 1, -47), (0x03D6, 0x03D6, 1, -54),
+    (0x03D7, 0x03D7, 1, -8), (0x03D9, 0x03EF, 2, -1), (0x03F0, 0x03F0, 1, -86),
+    (0x03F1, 0x03F1, 1, -80), (0x03F2, 0x03F2, 1, 7), (0x03F3, 0x03F3, 1, -116),
+    (0x03F5, 0x03F5, 1, -96), (0x03F8, 0x03F8, 1, -1), (0x03FB, 0x03FB, 1, -1),
+    (0x0430, 0x044F, 1, -32), (0x0450, 0x045F, 1, -80), (0x0461, 0x0481, 2, -1),
+    (0x048B, 0x04BF, 2, -1), (0x04C2, 0x04CE, 2, -1), (0x04CF, 0x04CF, 1, -15),
+    (0x04D1, 0x052F, 2, -1), (0x0561, 0x0586, 1, -48), (0x10D0, 0x10FA, 1, 3008),
+    (0x10FD, 0x10FF, 1, 3008), (0x13F8, 0x13FD, 1, -8), (0x1C80, 0x1C80, 1, -6254),
+    (0x1C81, 0x1C81, 1, -6253), (0x1C82, 0x1C82, 1, -6244), (0x1C83, 0x1C84, 1, -6242),
+    (0x1C85, 0x1C85, 1, -6243), (0x1C86, 0x1C86, 1, -6236), (0x1C87, 0x1C87, 1, -6181),
+    (0x1C88, 0x1C88, 1, 35266), (0x1C8A, 0x1C8A, 1, -1), (0x1D79, 0x1D79, 1, 35332),
+    (0x1D7D, 0x1D7D, 1, 3814), (0x1D8E, 0x1D8E, 1, 35384), (0x1E01, 0x1E95, 2, -1),
+    (0x1E9B, 0x1E9B, 1, -59), (0x1EA1, 0x1EFF, 2, -1), (0x1F00, 0x1F07, 1, 8),
+    (0x1F10, 0x1F15, 1, 8), (0x1F20, 0x1F27, 1, 8), (0x1F30, 0x1F37, 1, 8),
+    (0x1F40, 0x1F45, 1, 8), (0x1F51, 0x1F57, 2, 8), (0x1F60, 0x1F67, 1, 8),
+    (0x1F70, 0x1F71, 1, 74), (0x1F72, 0x1F75, 1, 86), (0x1F76, 0x1F77, 1, 100),
+    (0x1F78, 0x1F79, 1, 128), (0x1F7A, 0x1F7B, 1, 112), (0x1F7C, 0x1F7D, 1, 126),
+    (0x1F80, 0x1F87, 1, 8), (0x1F90, 0x1F97, 1, 8), (0x1FA0, 0x1FA7, 1, 8),
+    (0x1FB0, 0x1FB1, 1, 8), (0x1FB3, 0x1FB3, 1, 9), (0x1FBE, 0x1FBE, 1, -7205),
+    (0x1FC3, 0x1FC3, 1, 9), (0x1FD0, 0x1FD1, 1, 8), (0x1FE0, 0x1FE1, 1, 8),
+    (0x1FE5, 0x1FE5, 1, 7), (0x1FF3, 0x1FF3, 1, 9), (0x214E, 0x214E, 1, -28),
+    (0x2170, 0x217F, 1, -16), (0x2184, 0x2184, 1, -1), (0x24D0, 0x24E9, 1, -26),
+    (0x2C30, 0x2C5F, 1, -48), (0x2C61, 0x2C61, 1, -1), (0x2C65, 0x2C65, 1, -10795),
+    (0x2C66, 0x2C66, 1, -10792), (0x2C68, 0x2C6C, 2, -1), (0x2C73, 0x2C73, 1, -1),
+    (0x2C76, 0x2C76, 1, -1), (0x2C81, 0x2CE3, 2, -1), (0x2CEC, 0x2CEE, 2, -1),
+    (0x2CF3, 0x2CF3, 1, -1), (0x2D00, 0x2D25, 1, -7264), (0x2D27, 0x2D27, 1, -7264),
+    (0x2D2D, 0x2D2D, 1, -7264), (0xA641, 0xA66D, 2, -1), (0xA681, 0xA69B, 2, -1),
+    (0xA723, 0xA72F, 2, -1), (0xA733, 0xA76F, 2, -1), (0xA77A, 0xA77C, 2, -1),
+    (0xA77F, 0xA787, 2, -1), (0xA78C, 0xA78C, 1, -1), (0xA791, 0xA793, 2, -1),
+    (0xA794, 0xA794, 1, 48), (0xA797, 0xA7A9, 2, -1), (0xA7B5, 0xA7C3, 2, -1),
+    (0xA7C8, 0xA7CA, 2, -1), (0xA7CD, 0xA7CD, 1, -1), (0xA7D1, 0xA7D1, 1, -1),
+    (0xA7D7, 0xA7DB, 2, -1), (0xA7F6, 0xA7F6, 1, -1), (0xAB53, 0xAB53, 1, -928),
+    (0xAB70, 0xABBF, 1, -38864), (0xFF41, 0xFF5A, 1, -32), (0x10428, 0x1044F, 1, -40),
+    (0x104D8, 0x104FB, 1, -40), (0x10597, 0x105A1, 1, -39), (0x105A3, 0x105B1, 1, -39),
+    (0x105B3, 0x105B9, 1, -39), (0x105BB, 0x105BC, 1, -39), (0x10CC0, 0x10CF2, 1, -64),
+    (0x10D70, 0x10D85, 1, -32), (0x118C0, 0x118DF, 1, -32), (0x16E60, 0x16E7F, 1, -32),
+    (0x1E922, 0x1E943, 1, -34),
+];
+
+/// `Character.toLowerCase`. See [`JAVA_TO_UPPER_RUNS`] for the encoding and
+/// the provenance. 187 runs, 1,460 mapped code points.
+#[rustfmt::skip]
+const JAVA_TO_LOWER_RUNS: &[(u32, u32, u32, i32)] = &[
+    (0x0041, 0x005A, 1, 32), (0x00C0, 0x00D6, 1, 32), (0x00D8, 0x00DE, 1, 32),
+    (0x0100, 0x012E, 2, 1), (0x0130, 0x0130, 1, -199), (0x0132, 0x0136, 2, 1),
+    (0x0139, 0x0147, 2, 1), (0x014A, 0x0176, 2, 1), (0x0178, 0x0178, 1, -121),
+    (0x0179, 0x017D, 2, 1), (0x0181, 0x0181, 1, 210), (0x0182, 0x0184, 2, 1),
+    (0x0186, 0x0186, 1, 206), (0x0187, 0x0187, 1, 1), (0x0189, 0x018A, 1, 205),
+    (0x018B, 0x018B, 1, 1), (0x018E, 0x018E, 1, 79), (0x018F, 0x018F, 1, 202),
+    (0x0190, 0x0190, 1, 203), (0x0191, 0x0191, 1, 1), (0x0193, 0x0193, 1, 205),
+    (0x0194, 0x0194, 1, 207), (0x0196, 0x0196, 1, 211), (0x0197, 0x0197, 1, 209),
+    (0x0198, 0x0198, 1, 1), (0x019C, 0x019C, 1, 211), (0x019D, 0x019D, 1, 213),
+    (0x019F, 0x019F, 1, 214), (0x01A0, 0x01A4, 2, 1), (0x01A6, 0x01A6, 1, 218),
+    (0x01A7, 0x01A7, 1, 1), (0x01A9, 0x01A9, 1, 218), (0x01AC, 0x01AC, 1, 1),
+    (0x01AE, 0x01AE, 1, 218), (0x01AF, 0x01AF, 1, 1), (0x01B1, 0x01B2, 1, 217),
+    (0x01B3, 0x01B5, 2, 1), (0x01B7, 0x01B7, 1, 219), (0x01B8, 0x01B8, 1, 1),
+    (0x01BC, 0x01BC, 1, 1), (0x01C4, 0x01C4, 1, 2), (0x01C5, 0x01C5, 1, 1),
+    (0x01C7, 0x01C7, 1, 2), (0x01C8, 0x01C8, 1, 1), (0x01CA, 0x01CA, 1, 2),
+    (0x01CB, 0x01DB, 2, 1), (0x01DE, 0x01EE, 2, 1), (0x01F1, 0x01F1, 1, 2),
+    (0x01F2, 0x01F4, 2, 1), (0x01F6, 0x01F6, 1, -97), (0x01F7, 0x01F7, 1, -56),
+    (0x01F8, 0x021E, 2, 1), (0x0220, 0x0220, 1, -130), (0x0222, 0x0232, 2, 1),
+    (0x023A, 0x023A, 1, 10795), (0x023B, 0x023B, 1, 1), (0x023D, 0x023D, 1, -163),
+    (0x023E, 0x023E, 1, 10792), (0x0241, 0x0241, 1, 1), (0x0243, 0x0243, 1, -195),
+    (0x0244, 0x0244, 1, 69), (0x0245, 0x0245, 1, 71), (0x0246, 0x024E, 2, 1),
+    (0x0370, 0x0372, 2, 1), (0x0376, 0x0376, 1, 1), (0x037F, 0x037F, 1, 116),
+    (0x0386, 0x0386, 1, 38), (0x0388, 0x038A, 1, 37), (0x038C, 0x038C, 1, 64),
+    (0x038E, 0x038F, 1, 63), (0x0391, 0x03A1, 1, 32), (0x03A3, 0x03AB, 1, 32),
+    (0x03CF, 0x03CF, 1, 8), (0x03D8, 0x03EE, 2, 1), (0x03F4, 0x03F4, 1, -60),
+    (0x03F7, 0x03F7, 1, 1), (0x03F9, 0x03F9, 1, -7), (0x03FA, 0x03FA, 1, 1),
+    (0x03FD, 0x03FF, 1, -130), (0x0400, 0x040F, 1, 80), (0x0410, 0x042F, 1, 32),
+    (0x0460, 0x0480, 2, 1), (0x048A, 0x04BE, 2, 1), (0x04C0, 0x04C0, 1, 15),
+    (0x04C1, 0x04CD, 2, 1), (0x04D0, 0x052E, 2, 1), (0x0531, 0x0556, 1, 48),
+    (0x10A0, 0x10C5, 1, 7264), (0x10C7, 0x10C7, 1, 7264), (0x10CD, 0x10CD, 1, 7264),
+    (0x13A0, 0x13EF, 1, 38864), (0x13F0, 0x13F5, 1, 8), (0x1C89, 0x1C89, 1, 1),
+    (0x1C90, 0x1CBA, 1, -3008), (0x1CBD, 0x1CBF, 1, -3008), (0x1E00, 0x1E94, 2, 1),
+    (0x1E9E, 0x1E9E, 1, -7615), (0x1EA0, 0x1EFE, 2, 1), (0x1F08, 0x1F0F, 1, -8),
+    (0x1F18, 0x1F1D, 1, -8), (0x1F28, 0x1F2F, 1, -8), (0x1F38, 0x1F3F, 1, -8),
+    (0x1F48, 0x1F4D, 1, -8), (0x1F59, 0x1F5F, 2, -8), (0x1F68, 0x1F6F, 1, -8),
+    (0x1F88, 0x1F8F, 1, -8), (0x1F98, 0x1F9F, 1, -8), (0x1FA8, 0x1FAF, 1, -8),
+    (0x1FB8, 0x1FB9, 1, -8), (0x1FBA, 0x1FBB, 1, -74), (0x1FBC, 0x1FBC, 1, -9),
+    (0x1FC8, 0x1FCB, 1, -86), (0x1FCC, 0x1FCC, 1, -9), (0x1FD8, 0x1FD9, 1, -8),
+    (0x1FDA, 0x1FDB, 1, -100), (0x1FE8, 0x1FE9, 1, -8), (0x1FEA, 0x1FEB, 1, -112),
+    (0x1FEC, 0x1FEC, 1, -7), (0x1FF8, 0x1FF9, 1, -128), (0x1FFA, 0x1FFB, 1, -126),
+    (0x1FFC, 0x1FFC, 1, -9), (0x2126, 0x2126, 1, -7517), (0x212A, 0x212A, 1, -8383),
+    (0x212B, 0x212B, 1, -8262), (0x2132, 0x2132, 1, 28), (0x2160, 0x216F, 1, 16),
+    (0x2183, 0x2183, 1, 1), (0x24B6, 0x24CF, 1, 26), (0x2C00, 0x2C2F, 1, 48),
+    (0x2C60, 0x2C60, 1, 1), (0x2C62, 0x2C62, 1, -10743), (0x2C63, 0x2C63, 1, -3814),
+    (0x2C64, 0x2C64, 1, -10727), (0x2C67, 0x2C6B, 2, 1), (0x2C6D, 0x2C6D, 1, -10780),
+    (0x2C6E, 0x2C6E, 1, -10749), (0x2C6F, 0x2C6F, 1, -10783), (0x2C70, 0x2C70, 1, -10782),
+    (0x2C72, 0x2C72, 1, 1), (0x2C75, 0x2C75, 1, 1), (0x2C7E, 0x2C7F, 1, -10815),
+    (0x2C80, 0x2CE2, 2, 1), (0x2CEB, 0x2CED, 2, 1), (0x2CF2, 0x2CF2, 1, 1),
+    (0xA640, 0xA66C, 2, 1), (0xA680, 0xA69A, 2, 1), (0xA722, 0xA72E, 2, 1),
+    (0xA732, 0xA76E, 2, 1), (0xA779, 0xA77B, 2, 1), (0xA77D, 0xA77D, 1, -35332),
+    (0xA77E, 0xA786, 2, 1), (0xA78B, 0xA78B, 1, 1), (0xA78D, 0xA78D, 1, -42280),
+    (0xA790, 0xA792, 2, 1), (0xA796, 0xA7A8, 2, 1), (0xA7AA, 0xA7AA, 1, -42308),
+    (0xA7AB, 0xA7AB, 1, -42319), (0xA7AC, 0xA7AC, 1, -42315), (0xA7AD, 0xA7AD, 1, -42305),
+    (0xA7AE, 0xA7AE, 1, -42308), (0xA7B0, 0xA7B0, 1, -42258), (0xA7B1, 0xA7B1, 1, -42282),
+    (0xA7B2, 0xA7B2, 1, -42261), (0xA7B3, 0xA7B3, 1, 928), (0xA7B4, 0xA7C2, 2, 1),
+    (0xA7C4, 0xA7C4, 1, -48), (0xA7C5, 0xA7C5, 1, -42307), (0xA7C6, 0xA7C6, 1, -35384),
+    (0xA7C7, 0xA7C9, 2, 1), (0xA7CB, 0xA7CB, 1, -42343), (0xA7CC, 0xA7CC, 1, 1),
+    (0xA7D0, 0xA7D0, 1, 1), (0xA7D6, 0xA7DA, 2, 1), (0xA7DC, 0xA7DC, 1, -42561),
+    (0xA7F5, 0xA7F5, 1, 1), (0xFF21, 0xFF3A, 1, 32), (0x10400, 0x10427, 1, 40),
+    (0x104B0, 0x104D3, 1, 40), (0x10570, 0x1057A, 1, 39), (0x1057C, 0x1058A, 1, 39),
+    (0x1058C, 0x10592, 1, 39), (0x10594, 0x10595, 1, 39), (0x10C80, 0x10CB2, 1, 64),
+    (0x10D50, 0x10D65, 1, 32), (0x118A0, 0x118BF, 1, 32), (0x16E40, 0x16E5F, 1, 32),
+    (0x1E900, 0x1E921, 1, 34),
+];
+
+/// Apply a `(first, last, stride, delta)` case-mapping table to one code
+/// point. Anything the table does not name maps to itself — which is Java's
+/// answer for every unmapped code point, including a lone surrogate and
+/// including an `int` outside `0..=0x10FFFF`.
+#[inline]
+fn mapped_in_stride_runs(runs: &[(u32, u32, u32, i32)], cp: u32) -> u32 {
+    let found = runs.binary_search_by(|&(lo, hi, _, _)| {
+        if hi < cp {
+            std::cmp::Ordering::Less
+        } else if lo > cp {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    match found {
+        Ok(i) => {
+            let (lo, _, stride, delta) = runs[i];
+            if (cp - lo) % stride == 0 {
+                // `checked_` rather than a cast: no reachable input overflows,
+                // and an unreachable one must not panic. A Rust panic is not a
+                // Java throwable — it takes the VM down from ordinary
+                // application bytecode.
+                cp.checked_add_signed(delta).unwrap_or(cp)
+            } else {
+                cp
+            }
+        }
+        Err(_) => cp,
+    }
+}
+
+/// Shared by `toUpperCase(C)C`/`(I)I` and `toLowerCase(C)C`/`(I)I`, so the
+/// overloads cannot drift: the JDK bytecode for `(C)C` is literally
+/// `(char) toUpperCase((int) c)`, and a divergence between the two is a defect
+/// by construction.
+#[inline]
+fn character_case_map(ch: u32, upper: bool) -> u32 {
+    mapped_in_stride_runs(
+        if upper {
+            JAVA_TO_UPPER_RUNS
+        } else {
+            JAVA_TO_LOWER_RUNS
+        },
+        ch,
+    )
+}
+
+/// `Character.toUpperCase(char)`.
+///
+/// W7-98(c) is preserved by construction rather than by a guard: a lone
+/// surrogate is a legal `char` and must survive a case mapping unchanged, and
+/// `U+D800..U+DFFF` appear in no run of [`JAVA_TO_UPPER_RUNS`], so the lookup
+/// returns the input. The body this replaced went through `char::from_u32`,
+/// which answers `None` for a surrogate, and finished `.unwrap_or('\0')` —
+/// `Character.toUpperCase('\uD800')` answered `U+0000` where HotSpot 25
+/// answers `'\uD800'`, i.e. silent data corruption of any UTF-16 pair split on
+/// a chunk boundary. There is no longer a `char` in this path to fail on.
 pub(crate) fn native_character_to_upper_case(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3702,10 +5322,7 @@ pub(crate) fn native_character_to_upper_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch)
-        .and_then(|c| c.to_uppercase().next())
-        .unwrap_or('\0') as u32;
-    Ok(Some(Value::Int(result as i32)))
+    Ok(Some(Value::Int(character_case_map(ch, true) as i32)))
 }
 
 pub(crate) fn native_character_to_lower_case(
@@ -3716,16 +5333,15 @@ pub(crate) fn native_character_to_lower_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch)
-        .and_then(|c| c.to_lowercase().next())
-        .unwrap_or('\0') as u32;
-    Ok(Some(Value::Int(result as i32)))
+    Ok(Some(Value::Int(character_case_map(ch, false) as i32)))
 }
 
-/// `Character.toLowerCase(int)` — code-point variant. Fall-through to the
-/// same Rust `char::to_lowercase` for valid scalar values; pass invalid /
-/// out-of-range code points back unchanged (matching JDK behaviour for
-/// non-character integers).
+/// `Character.toLowerCase(int)` — code-point variant. Shares
+/// [`character_case_map`] with the `(C)C` form so the two cannot drift: the
+/// JDK bytecode for `(C)C` is literally `toLowerCase((int) c)` narrowed back to
+/// a `char`, so a divergence between the two overloads is a defect by
+/// construction. Invalid / out-of-range code points (including a lone
+/// surrogate) pass back unchanged.
 pub(crate) fn native_character_to_lower_case_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3734,17 +5350,33 @@ pub(crate) fn native_character_to_lower_case_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let result = char::from_u32(cp as u32)
-        .and_then(|c| c.to_lowercase().next())
-        .map(|c| c as u32 as i32)
-        .unwrap_or(cp);
-    Ok(Some(Value::Int(result)))
+    if !(0..=0x10FFFF).contains(&cp) {
+        return Ok(Some(Value::Int(cp)));
+    }
+    Ok(Some(Value::Int(character_case_map(cp as u32, false) as i32)))
 }
 
 /// `Character.toUpperCase(int)` — code-point variant, mirror of
-/// `toLowerCase(I)I` to keep the JIT-bypass symmetric (the same compile
-/// path that miscompiles the lowercase chain miscompiles the uppercase
-/// chain — register both pre-emptively).
+/// `toLowerCase(I)I`.
+///
+/// Shares [`character_case_map`] with the `(C)C` form, so both overloads read
+/// the same table. History, because the shape of the two old defects is worth
+/// keeping: W7-98(b) fixed eleven code points whose Unicode FULL uppercase is
+/// multi-char and whose Java answer is therefore "unchanged" (`U+00DF`,
+/// `U+FB00..U+FB05`, `U+0149`, `U+01F0`, `U+0390`, `U+03B0`, `U+1E96`,
+/// `U+1F50`) with an arity rule, and W7-95(C1) then had to except the 27
+/// ypogegrammeni code points the arity rule refuses but Java maps
+/// (`U+1FB3` -> `U+1FBC`). E7 measured that arity rule against every
+/// supplementary code point: **0** further refusals above the BMP, so the rule
+/// was not hiding a second residual up there — but it, both override lists and
+/// the Rust lookup underneath them are gone anyway, replaced by
+/// [`JAVA_TO_UPPER_RUNS`].
+///
+/// The `0..=0x10FFFF` guard below is now redundant with the table (an
+/// out-of-range `int` is in no run and maps to itself) and is kept because it
+/// states the contract at the boundary the JDK states it at: measured on
+/// OpenJDK 25.0.3+9, `toUpperCase(0x110000)` and `toUpperCase(Integer.MIN_VALUE)`
+/// both return their input.
 pub(crate) fn native_character_to_upper_case_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3753,13 +5385,27 @@ pub(crate) fn native_character_to_upper_case_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let result = char::from_u32(cp as u32)
-        .and_then(|c| c.to_uppercase().next())
-        .map(|c| c as u32 as i32)
-        .unwrap_or(cp);
-    Ok(Some(Value::Int(result)))
+    if !(0..=0x10FFFF).contains(&cp) {
+        return Ok(Some(Value::Int(cp)));
+    }
+    Ok(Some(Value::Int(character_case_map(cp as u32, true) as i32)))
 }
 
+/// `Character.isLetterOrDigit` — literally `isLetter(c) || isDigit(c)`, which
+/// is the JDK's own one-line definition.
+///
+/// W7-98(a). The old body used `char::is_alphanumeric`, which is
+/// `Alphabetic ∪ N*` — so on top of [`native_character_is_letter`]'s `Nl` and
+/// `Other_Alphabetic` error it independently added `No`: `U+00B2` SUPERSCRIPT
+/// TWO and `U+00BD` VULGAR FRACTION ONE HALF answered `true` where Java answers
+/// `false`. Measured over the whole BMP against HotSpot 25, that was **1,257 of
+/// 65,536** wrong.
+///
+/// Composing the two predicates the way the JDK does dropped it to **957** —
+/// exactly [`native_character_is_letter`]'s count, i.e. this method contributed
+/// NO error of its own. W7-95(C1) then took `isLetter` and `isDigit` to zero, so
+/// this one follows to zero with no further change than keeping the composition
+/// honest.
 pub(crate) fn native_character_is_letter_or_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3768,7 +5414,7 @@ pub(crate) fn native_character_is_letter_or_digit(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_alphanumeric());
+    let result = in_code_point_runs(JAVA_LETTER_RUNS, ch) || java_is_digit_code_point(ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -4067,12 +5713,17 @@ pub(crate) fn native_character_instance_to_string(
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = match ctx.get_field(this, 0) {
-        Value::Int(v) => v as u32,
+        Value::Int(v) => v,
         _ => 0,
     };
-    let ch = char::from_u32(val).unwrap_or('\0');
-    let s = ctx.create_string(&ch.to_string());
-    Ok(Some(Value::Object(Some(s))))
+    // Delegate to the static twin rather than repeating its body. `char` cannot
+    // represent an unpaired surrogate, so the `char::from_u32(val).unwrap_or('\0')`
+    // that used to live here answered U+0000 for every one of D800..=DFFF —
+    // MEASURED 2026-08-13: `Character.valueOf('\uD800').toString().charAt(0)` was
+    // 0 where HotSpot gives 55296, while the STATIC `Character.toString(char)` and
+    // `String.valueOf(char)` were both already correct. The static twin has
+    // handled this since it was written; this one never called it.
+    native_character_static_to_string(ctx, &[Value::Int(val)])
 }
 
 // hashCode for Int-stored wrappers (Integer, Byte, Short, Character)
@@ -4352,6 +6003,14 @@ pub(crate) fn native_wrapper_double_equals(
 /// `char::to_digit`, which PANICS for a radix above 36 — so `Character.digit`
 /// with a negative radix (which became a huge `u32`) or any radix > 36 aborted
 /// the VM from ordinary Java code.
+/// `Character.digit(char, int)`.
+///
+/// W7-98(a). `char::to_digit` is ASCII-only, so this answered `-1` for every
+/// non-ASCII decimal digit: **360 of 65,536** BMP code points disagreed with
+/// HotSpot 25. Route it through [`java_char_digit`] — the JDK-25-generated run
+/// table that was already in this file and had only one caller — which
+/// reproduces `Character.digit(char, 10)` over the entire BMP with **zero**
+/// mismatches.
 pub(crate) fn native_character_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4368,7 +6027,7 @@ pub(crate) fn native_character_digit(
         return Ok(Some(Value::Int(-1)));
     }
     let result = char::from_u32(ch)
-        .and_then(|c| c.to_digit(radix as u32))
+        .and_then(|c| java_char_digit(c, radix as u32))
         .map(|d| d as i32)
         .unwrap_or(-1);
     Ok(Some(Value::Int(result)))
@@ -4403,6 +6062,29 @@ pub(crate) fn native_character_for_digit(
     Ok(Some(Value::Int(result)))
 }
 
+/// `Character.getNumericValue(char)`.
+///
+/// W7-98(a). PARTIAL FIX, and the residual is stated rather than hidden.
+///
+/// The old body used `char::to_digit(36)`, which is ASCII-only: **784 of
+/// 65,536** BMP code points disagreed with HotSpot 25. Routing through
+/// [`java_char_digit`] picks up every non-ASCII `Nd` run and takes that to
+/// **372**.
+///
+/// W7-95(C1) closes the 372. They were the part `JAVA_DIGIT_RUNS` does not
+/// model, because `Character.digit` does not either — and reusing the digit
+/// table for a *numeric value* was the category error:
+///
+/// * `Nl`/`No` numeric values — `U+2160` ROMAN NUMERAL ONE is `1`, `U+00B2`
+///   SUPERSCRIPT TWO is `2`; `Character.digit` says `-1` for both, correctly,
+///   because they are not digits in any radix.
+/// * the `-2` sentinel Java returns for a code point whose numeric value is not
+///   a non-negative integer (`U+00BD` VULGAR FRACTION ONE HALF), which the
+///   digit table has no way to express at all.
+///
+/// [`JAVA_NUMERIC_VALUE_RUNS`] + [`JAVA_NUMERIC_VALUE_NEG2_RUNS`] are the JDK's
+/// own answer, generated by walking the BMP on JDK 25. BMP is the whole domain:
+/// only `(C)I` is registered, so no argument can exceed `U+FFFF`.
 pub(crate) fn native_character_get_numeric_value(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4411,22 +6093,49 @@ pub(crate) fn native_character_get_numeric_value(
         Some(Value::Int(v)) => *v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let result = char::from_u32(ch)
-        .and_then(|c| c.to_digit(36))
-        .map(|d| d as i32)
-        .unwrap_or(-1);
+    let result = match value_in_runs(JAVA_NUMERIC_VALUE_RUNS, ch) {
+        Some(v) => v,
+        None if in_code_point_runs(JAVA_NUMERIC_VALUE_NEG2_RUNS, ch) => -2,
+        None => -1,
+    };
     Ok(Some(Value::Int(result)))
 }
 
+/// `Character.charCount(int)` — the ONE member of this family whose compare is
+/// **signed**.
+///
+/// The javadoc is one line and has no error case: `codePoint >=
+/// MIN_SUPPLEMENTARY_CODE_POINT ? 2 : 1`. There is no range validation, no
+/// throw, and no "invalid code point" answer — `charCount(-1)` is `1` and
+/// `charCount(Integer.MAX_VALUE)` is `2`. Measured on OpenJDK 25.0.3+9 over
+/// `MIN_VALUE, -2147483647, -65536, -2, -1, 0, 0xFFFF, 0x10000, 0x10FFFF,
+/// 0x110000, 0x7FFFFFFF`: every negative answers `1`, everything from
+/// `0x10000` up answers `2`.
+///
+/// The old body read the argument as `*v as u32` and compared `cp > 0xFFFF`.
+/// That cast is where the sign went: `-1` widens to `0xFFFF_FFFF`, which is
+/// above `MIN_SUPPLEMENTARY`, so **every** negative `int` answered `2` where
+/// HotSpot answers `1`. It is a wrong answer, not a panic — this method cannot
+/// panic and never could.
+///
+/// **This is not a family-wide rule, and it must not be applied as one.** The
+/// neighbours' unsigned casts are their JDK contracts, not copies of this bug:
+/// [`native_character_is_bmp_code_point`] is `(codePoint >>> 16) == 0` in the
+/// JDK — an UNSIGNED shift, correctly `false` for a negative — and
+/// `isValidCodePoint` is likewise unsigned in the JDK
+/// (`(plane << 16) < (MAX_CODE_POINT + 1)` over `codePoint >>> 16`). Rewriting
+/// those two "the same way" would turn two correct members into regressions.
+/// Each contract in this family was read off HotSpot separately; the transcript
+/// is in `docs/known-issues/jdk-only/E7-1-character-int-code-point-contracts.md`.
 pub(crate) fn native_character_char_count(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let cp = match args.first() {
-        Some(Value::Int(v)) => *v as u32,
+        Some(Value::Int(v)) => *v,
         _ => return Ok(Some(Value::Int(1))),
     };
-    Ok(Some(Value::Int(if cp > 0xFFFF { 2 } else { 1 })))
+    Ok(Some(Value::Int(if cp >= 0x10000 { 2 } else { 1 })))
 }
 
 pub(crate) fn native_character_is_high_surrogate(
@@ -4459,6 +6168,21 @@ pub(crate) fn native_character_is_low_surrogate(
     })))
 }
 
+/// `Character.isBmpCodePoint(int)`. **The `as u32` here is CORRECT and is the
+/// JDK's own arithmetic — do not "fix" it to match
+/// [`native_character_char_count`].**
+///
+/// The JDK body is `(codePoint >>> 16) == 0`: an unsigned shift, so every
+/// negative `int` has a nonzero high half and answers `false`. Widening to
+/// `u32` and testing `cp <= 0xFFFF` is the same predicate over the same 2^32
+/// inputs. Measured on OpenJDK 25.0.3+9: `false` for `MIN_VALUE`, `-65536`,
+/// `-1`, `0x110000` and `0x7FFFFFFF`; `true` for `0..=0xFFFF` including every
+/// lone surrogate.
+///
+/// `Character.toChars`/`toString(int)` are NOT registered here — they run JDK
+/// bytecode — and both reach their `IllegalArgumentException` through this
+/// predicate and `isValidCodePoint`. A signed rewrite of this body would make
+/// `Character.toChars(-1)` return `new char[]{(char) 0xFFFF}` instead of throwing.
 pub(crate) fn native_character_is_bmp_code_point(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4470,6 +6194,12 @@ pub(crate) fn native_character_is_bmp_code_point(
     Ok(Some(Value::Int(if cp <= 0xFFFF { 1 } else { 0 })))
 }
 
+/// `Character.isValidCodePoint(int)`. The JDK writes this unsigned too
+/// (`(codePoint >>> 16) < ((MAX_CODE_POINT + 1) >>> 16)`); the signed
+/// `0..=0x10FFFF` below is the same predicate over all 2^32 inputs, because a
+/// negative's unsigned high half is at least `0x8000`. Measured on OpenJDK
+/// 25.0.3+9: `false` for `MIN_VALUE`, `-1`, `0x110000`, `0x7FFFFFFF`; `true`
+/// for `0`, `0xD800`, `0xFFFF`, `0x10000`, `0x10FFFF`.
 pub(crate) fn native_character_is_valid_code_point(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4502,6 +6232,21 @@ pub(crate) fn native_character_is_iso_control(
     )))
 }
 
+/// `Character.toString(char)`.
+///
+/// W7-98(c). A lone surrogate is a legal `char` but is NOT a Unicode scalar
+/// value, so it cannot round-trip through Rust's `char`/`str`: the old body's
+/// `char::from_u32(ch).unwrap_or('\0')` turned `U+D800` into `U+0000`, and even
+/// without that `unwrap_or`, `ctx.create_string(&str)` has no way to express
+/// one. Measured against HotSpot 25 on `U+D800/U+DBFF/U+DC00/U+DFFF`:
+/// `Character.toString(c).charAt(0)` answered `0` here and the input there.
+///
+/// `String.valueOf(char)` is NOT native-registered (verified by
+/// `--dump-native-registry`), so this is a plain call into real JDK bytecode
+/// with no native re-entry — and it is measured correct on this VM for every
+/// lone surrogate. The Rust path stays as a fallback for the synthetic class
+/// library, where that bytecode does not exist; it is still exact for every
+/// scalar value, which is every input except the 2,048 surrogates.
 pub(crate) fn native_character_static_to_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4510,9 +6255,28 @@ pub(crate) fn native_character_static_to_string(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let c = char::from_u32(ch).unwrap_or('\0');
-    let s = ctx.create_string(&c.to_string());
-    Ok(Some(Value::Object(Some(s))))
+    match char::from_u32(ch) {
+        Some(c) => {
+            let s = ctx.create_string(&c.to_string());
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => {
+            // Surrogate: hand it to the real `String.valueOf(char)`, which
+            // stores UTF-16 code units and preserves it.
+            if let Ok(Some(v @ Value::Object(Some(_)))) = ctx.invoke(
+                "java/lang/String",
+                "valueOf",
+                "(C)Ljava/lang/String;",
+                &[Value::Int(ch as i32)],
+            ) {
+                return Ok(Some(v));
+            }
+            // No real class library: keep the historical answer rather than
+            // failing the call.
+            let s = ctx.create_string("\u{0}");
+            Ok(Some(Value::Object(Some(s))))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4643,24 +6407,10 @@ pub(crate) fn native_long_parse_long_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i64::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Long(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_into(&text, radix, i64::MIN, i64::MAX, false)?;
+    Ok(Some(Value::Long(v)))
 }
 
 /// `Long.toString(long, int)` — THIS is the body that runs; same
@@ -4805,69 +6555,400 @@ pub(crate) fn native_double_is_infinite(
 
 // --- Float/Double parsing and utilities (Phase 8 Part 7) ---
 
-fn strip_java_float_type_suffix(s: &str) -> &str {
-    let Some(&suffix) = s.as_bytes().last() else {
-        return s;
+// ---------------------------------------------------------------------------
+// Java's floating-point grammar
+//
+// `str::parse::<f64>` is NOT `Double.parseDouble`, and again it differs in
+// both directions:
+//
+//   * Rust accepts `nan` / `inf` / `infinity` CASE-INSENSITIVELY. Java accepts
+//     only the exact spellings `NaN` and `Infinity`; `Double.parseDouble("inf")`
+//     throws on a real JDK. We were answering +Infinity — a wrong VALUE, not
+//     just a missing exception, for any input-validation path.
+//   * Rust REJECTS Java's hex significand, `0x1p3` == 8.0.
+//   * Rust's `str::trim` strips Unicode whitespace; the Java grammar's
+//     `[\x00-\x20]*` does not. `Double.parseDouble("\u{a0}1.0")` throws on a
+//     real JDK; we answered 1.0.
+//
+// The grammar implemented here is the regex published in the
+// `Double.valueOf(String)` javadoc, transcribed rather than approximated:
+//
+// ```text
+// [\x00-\x20]* [+-]? ( NaN | Infinity |
+//     ( ( Digits (\.)? Digits? Exp? )
+//     | ( \. Digits Exp? )
+//     | ( ( 0[xX] HexDigits (\.)? | 0[xX] HexDigits? \. HexDigits ) [pP] [+-]? Digits )
+//     ) [fFdD]? ) [\x00-\x20]*
+// ```
+//
+// `Digits` is `\p{Digit}`, which WITHOUT `UNICODE_CHARACTER_CLASS` is ASCII
+// `[0-9]` only — so unlike `Integer.parseInt`, the floating-point grammar does
+// NOT accept Unicode decimal digits. Measured on JDK 25:
+// `Double.parseDouble("\u{661}\u{662}")` throws while
+// `Integer.parseInt("\u{661}\u{662}")` returns 12. The two grammars really do
+// disagree, and copying one onto the other is how this drifted.
+// ---------------------------------------------------------------------------
+
+/// `String.trim()` semantics: strip chars `<= '\u{20}'`, which is exactly the
+/// grammar's `[\x00-\x20]*`. Deliberately NOT `str::trim`, which also strips
+/// NBSP and the rest of Unicode `White_Space`.
+fn java_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c <= '\u{20}')
+}
+
+/// The shared front half of `Double.parseDouble` / `Float.parseFloat`: trim,
+/// sign, the two literal words, and the optional `FloatTypeSuffix`.
+enum JavaFloatHead<'a> {
+    /// One of the two words. `nan` is true for `NaN`, else `Infinity`.
+    Word { nan: bool, neg: bool },
+    /// A numeric body with its sign, suffix already removed.
+    Body { body: &'a str, neg: bool },
+    Malformed,
+}
+
+fn java_float_head(s: &str) -> JavaFloatHead<'_> {
+    let t = java_trim(s);
+    if t.is_empty() {
+        return JavaFloatHead::Malformed;
+    }
+    // `t` is non-empty and the sign is ASCII, so slicing at 1 is on a char
+    // boundary.
+    let (neg, rest) = match t.as_bytes()[0] {
+        b'+' => (false, &t[1..]),
+        b'-' => (true, &t[1..]),
+        _ => (false, t),
     };
-    if !matches!(suffix, b'd' | b'D' | b'f' | b'F') {
-        return s;
+    if rest == "NaN" {
+        return JavaFloatHead::Word { nan: true, neg };
+    }
+    if rest == "Infinity" {
+        return JavaFloatHead::Word { nan: false, neg };
+    }
+    if rest.is_empty() {
+        return JavaFloatHead::Malformed;
+    }
+    let body = match rest.as_bytes()[rest.len() - 1] {
+        b'f' | b'F' | b'd' | b'D' => &rest[..rest.len() - 1],
+        _ => rest,
+    };
+    if body.is_empty() {
+        return JavaFloatHead::Malformed;
+    }
+    JavaFloatHead::Body { body, neg }
+}
+
+/// `Digits (\.)? Digits? Exp?` | `\. Digits Exp?` — the decimal alternatives.
+///
+/// Only a validator: everything it accepts is also accepted by Rust's
+/// `f64`/`f32` `from_str`, whose grammar is a strict superset over the decimal
+/// forms and which is correctly rounded, so the actual conversion is delegated.
+/// The point of the check is to reject what Rust would otherwise ACCEPT.
+fn java_decimal_grammar_ok(b: &str) -> bool {
+    let s = b.as_bytes();
+    let n = s.len();
+    let mut i = 0;
+    let mut int_digits = 0;
+    while i < n && s[i].is_ascii_digit() {
+        i += 1;
+        int_digits += 1;
+    }
+    let mut frac_digits = 0;
+    if i < n && s[i] == b'.' {
+        i += 1;
+        while i < n && s[i].is_ascii_digit() {
+            i += 1;
+            frac_digits += 1;
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return false;
+    }
+    if i < n {
+        if s[i] != b'e' && s[i] != b'E' {
+            return false;
+        }
+        i += 1;
+        if i < n && (s[i] == b'+' || s[i] == b'-') {
+            i += 1;
+        }
+        let mut exp_digits = 0;
+        while i < n && s[i].is_ascii_digit() {
+            i += 1;
+            exp_digits += 1;
+        }
+        if exp_digits == 0 {
+            return false;
+        }
+    }
+    i == n
+}
+
+/// `HexDigits (\.)?` | `HexDigits? \. HexDigits`, then a MANDATORY
+/// `[pP] [+-]? Digits`. `b` is the body with the leading `0x`/`0X` removed.
+///
+/// Returns the significand hex digits, how many of them follow the point, and
+/// the binary exponent.
+fn java_hex_grammar(b: &str) -> Option<(Vec<u8>, usize, i64)> {
+    let s = b.as_bytes();
+    let n = s.len();
+    let mut i = 0;
+    let mut digits: Vec<u8> = Vec::new();
+    while i < n {
+        let Some(d) = (s[i] as char).to_digit(16) else {
+            break;
+        };
+        digits.push(d as u8);
+        i += 1;
+    }
+    let int_n = digits.len();
+    let mut frac_n = 0usize;
+    if i < n && s[i] == b'.' {
+        i += 1;
+        while i < n {
+            let Some(d) = (s[i] as char).to_digit(16) else {
+                break;
+            };
+            digits.push(d as u8);
+            frac_n += 1;
+            i += 1;
+        }
+    }
+    if int_n == 0 && frac_n == 0 {
+        return None;
+    }
+    // The binary exponent is not optional in this alternative.
+    if i >= n || (s[i] != b'p' && s[i] != b'P') {
+        return None;
+    }
+    i += 1;
+    let mut exp_neg = false;
+    if i < n && (s[i] == b'+' || s[i] == b'-') {
+        exp_neg = s[i] == b'-';
+        i += 1;
+    }
+    let mut exp_digits = 0;
+    let mut pexp: i64 = 0;
+    while i < n && s[i].is_ascii_digit() {
+        // Saturate rather than overflow: any exponent past this is far beyond
+        // the range where the result is not already 0 or Infinity.
+        if pexp < 1_000_000 {
+            pexp = pexp * 10 + (s[i] - b'0') as i64;
+        }
+        i += 1;
+        exp_digits += 1;
+    }
+    if exp_digits == 0 || i != n {
+        return None;
+    }
+    Some((digits, frac_n, if exp_neg { -pexp } else { pexp }))
+}
+
+/// Round `m * 2^exp2` — with `sticky` recording that nonzero bits were already
+/// dropped off the bottom of `m` — to the nearest IEEE-754 binary value of the
+/// given width, ties to even, and return the raw bit pattern of its MAGNITUDE
+/// (the caller ORs in the sign).
+///
+/// `prec` is the significand width in bits (53 for `double`, 24 for `float`)
+/// and `emax` the maximum normal exponent (1023 / 127), from which the bias
+/// and the minimum normal exponent `1 - emax` follow.
+///
+/// SHIFT INVARIANT — read before touching the early returns. This is the one
+/// place in this file where a Java-supplied string drives a shift COUNT
+/// (`Double.parseDouble("0x…p…")` reaches here with a caller-chosen binary
+/// exponent), and Rust panics — aborting the VM — on a shift at or above the
+/// integer width. Three guards interlock to keep every shift in range:
+///
+///   * `e > emax + 1` and `e < qmin - 2` bound `e`, hence bound `shift` to
+///     roughly `nb`;
+///   * `shift > nb` returns early, so `shift <= nb <= 128`;
+///   * the `sh >= 128` arms below handle the single surviving `shift == 128`
+///     case, where `m >> 128` would panic.
+///
+/// Together these also keep `-shift` under `prec` on the left-shift arm.
+/// Loosening any one of them can reintroduce a shift-overflow abort reachable
+/// from ordinary bytecode.
+fn round_binary(m: u128, sticky: bool, exp2: i64, prec: u32, emax: i64) -> u64 {
+    let inf_bits = ((2 * emax + 1) as u64) << (prec - 1);
+    if m == 0 {
+        return 0;
+    }
+    let nb = (128 - m.leading_zeros()) as i64; // bit length of m
+    let e = exp2 + nb - 1; // value == 1.f * 2^e, exactly
+    let emin = 1 - emax; // minimum NORMAL exponent
+    let qmin = emin - (prec as i64 - 1); // subnormal quantum (-1074 / -149)
+
+    // These bounds also keep `shift` within the integer width. `e == qmin - 1`
+    // and `e == qmin - 2` must stay in the general path: the first can still
+    // round up to MIN_VALUE and the second is where the exact tie lands.
+    if e > emax + 1 {
+        return inf_bits;
+    }
+    if e < qmin - 2 {
+        return 0;
     }
 
-    let numeric = &s[..s.len() - 1];
-    let has_digit = numeric.bytes().any(|b| b.is_ascii_digit());
-    let suffix_follows_number = matches!(
-        numeric.as_bytes().last().copied(),
-        Some(b'0'..=b'9') | Some(b'.')
-    );
-    if has_digit && suffix_follows_number {
-        numeric
+    // Quantum of the result significand: in the normal range it tracks `e`; in
+    // the subnormal range it is pinned at `qmin`.
+    let q = if e >= emin {
+        e - (prec as i64 - 1)
     } else {
-        s
+        qmin
+    };
+    let shift = q - exp2; // bits of m to drop
+    if shift > nb {
+        return 0; // strictly below half
+    }
+
+    let (mut s, round_up) = if shift > 0 {
+        let sh = shift as u32;
+        let trunc = if sh >= 128 { 0 } else { m >> sh };
+        let low = if sh >= 128 { m } else { m & ((1u128 << sh) - 1) };
+        let half = 1u128 << (sh - 1);
+        let up = match low.cmp(&half) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // Exactly half: any bit already shifted out breaks the tie
+            // upward, otherwise round to even.
+            std::cmp::Ordering::Equal => sticky || (trunc & 1 == 1),
+        };
+        (trunc, up)
+    } else {
+        (m << ((-shift) as u32), false)
+    };
+    if round_up {
+        s += 1;
+    }
+    if s == 0 {
+        return 0;
+    }
+
+    if q == qmin {
+        // Subnormal encoding. A carry that took `s` up to exactly 2^(prec-1)
+        // IS the MIN_NORMAL bit pattern — the subnormal/normal boundary is
+        // seamless in IEEE-754, so there is nothing to renormalize.
+        return s as u64;
+    }
+    let mut e = e;
+    if 128 - s.leading_zeros() > prec {
+        s >>= 1;
+        e += 1;
+    }
+    if e > emax {
+        return inf_bits;
+    }
+    (((e + emax) as u64) << (prec - 1)) | ((s as u64) & ((1u64 << (prec - 1)) - 1))
+}
+
+/// Convert a parsed hex significand to raw bits at the requested width.
+///
+/// `value == M * 2^(pexp - 4*frac_n)` where `M` is the significand digits read
+/// as one integer. `M` is accumulated into a `u128`; once it is full the
+/// remaining digits only contribute to the binary exponent and to a sticky
+/// bit, which is all the rounding needs.
+fn java_hex_float_bits(digits: &[u8], frac_n: usize, pexp: i64, prec: u32, emax: i64) -> u64 {
+    let mut m: u128 = 0;
+    let mut extra: i64 = 0;
+    let mut sticky = false;
+    let mut started = false;
+    for &d in digits {
+        if !started && d == 0 {
+            continue; // leading zeros carry no information
+        }
+        started = true;
+        if m.leading_zeros() >= 4 {
+            m = (m << 4) | d as u128;
+        } else {
+            extra += 4;
+            sticky |= d != 0;
+        }
+    }
+    if !started {
+        return 0; // a significand of all zeros is zero at any exponent
+    }
+    let exp2 = pexp - 4 * frac_n as i64 + extra;
+    round_binary(m, sticky, exp2, prec, emax)
+}
+
+fn java_nfe_float(s: &str) -> cratonvm_types::error::RuntimeError {
+    cratonvm_types::error::RuntimeError::NumberFormatException {
+        message: format!("For input string: \"{s}\""),
+    }
+}
+
+/// Read argument 0 as a non-null `String` for the FLOATING-point parse family.
+///
+/// `Double.parseDouble(null)` and `Float.parseFloat(null)` throw
+/// `NullPointerException`, not `NumberFormatException` — they reach
+/// `String.length()`/`charAt` on the null before any grammar check. The
+/// INTEGER family is the other way round and throws
+/// `NumberFormatException("Cannot parse null string")`; see
+/// `read_string_arg_nfe`. Measured on JDK 25, both ways.
+fn read_string_arg_npe(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(obj))) => Ok(ctx.read_string(*obj).unwrap_or_default()),
+        _ => Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        ),
     }
 }
 
 fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeError> {
-    let trimmed = s.trim();
-    let numeric = strip_java_float_type_suffix(trimmed);
-    match numeric {
-        "NaN" => Ok(f32::NAN),
-        "Infinity" | "+Infinity" => Ok(f32::INFINITY),
-        "-Infinity" => Ok(f32::NEG_INFINITY),
-        _ => numeric.parse::<f32>().map_err(|_| {
-            cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: format!("For input string: \"{s}\""),
-            }
-        }),
-    }
+    let (body, neg) = match java_float_head(s) {
+        JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
+        JavaFloatHead::Word { nan: true, .. } => return Ok(f32::NAN),
+        JavaFloatHead::Word { nan: false, neg } => {
+            return Ok(if neg { f32::NEG_INFINITY } else { f32::INFINITY })
+        }
+        JavaFloatHead::Body { body, neg } => (body, neg),
+    };
+    let is_hex = body.len() > 1
+        && body.as_bytes()[0] == b'0'
+        && (body.as_bytes()[1] == b'x' || body.as_bytes()[1] == b'X');
+    let v = if is_hex {
+        let (digits, frac_n, pexp) = java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
+        f32::from_bits(java_hex_float_bits(&digits, frac_n, pexp, 24, 127) as u32)
+    } else {
+        if !java_decimal_grammar_ok(body) {
+            return Err(java_nfe_float(s));
+        }
+        // Parsed at float width directly, NOT via `f64` — narrowing a double
+        // would round twice and can land on the wrong float.
+        body.parse::<f32>().map_err(|_| java_nfe_float(s))?
+    };
+    Ok(if neg { -v } else { v })
 }
 
 fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeError> {
-    let trimmed = s.trim();
-    let numeric = strip_java_float_type_suffix(trimmed);
-    match numeric {
-        "NaN" => Ok(f64::NAN),
-        "Infinity" | "+Infinity" => Ok(f64::INFINITY),
-        "-Infinity" => Ok(f64::NEG_INFINITY),
-        _ => numeric.parse::<f64>().map_err(|_| {
-            cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: format!("For input string: \"{s}\""),
-            }
-        }),
-    }
+    let (body, neg) = match java_float_head(s) {
+        JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
+        JavaFloatHead::Word { nan: true, .. } => return Ok(f64::NAN),
+        JavaFloatHead::Word { nan: false, neg } => {
+            return Ok(if neg { f64::NEG_INFINITY } else { f64::INFINITY })
+        }
+        JavaFloatHead::Body { body, neg } => (body, neg),
+    };
+    let is_hex = body.len() > 1
+        && body.as_bytes()[0] == b'0'
+        && (body.as_bytes()[1] == b'x' || body.as_bytes()[1] == b'X');
+    let v = if is_hex {
+        let (digits, frac_n, pexp) = java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
+        f64::from_bits(java_hex_float_bits(&digits, frac_n, pexp, 53, 1023))
+    } else {
+        if !java_decimal_grammar_ok(body) {
+            return Err(java_nfe_float(s));
+        }
+        body.parse::<f64>().map_err(|_| java_nfe_float(s))?
+    };
+    Ok(if neg { -v } else { v })
 }
 pub(crate) fn native_float_parse_float(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_float_string(&s)?;
     Ok(Some(Value::Float(val)))
 }
@@ -4876,15 +6957,7 @@ pub(crate) fn native_double_parse_double(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_double_string(&s)?;
     Ok(Some(Value::Double(val)))
 }
@@ -4893,15 +6966,7 @@ pub(crate) fn native_float_value_of_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_float_string(&s)?;
     let obj = alloc_wrapper(ctx, "java/lang/Float");
     ctx.set_field(obj, 0, Value::Float(val));
@@ -4912,15 +6977,7 @@ pub(crate) fn native_double_value_of_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_double_string(&s)?;
     let obj = alloc_wrapper(ctx, "java/lang/Double");
     ctx.set_field(obj, 0, Value::Double(val));
@@ -5017,6 +7074,19 @@ pub(crate) fn native_double_compare(
 
 // --- Byte ---
 
+/// `Byte.valueOf(byte)` — the ONE member of the family with no uncached arm.
+///
+/// `jdk25src/java.base/java/lang/Byte.java` is
+/// `return ByteCache.cache[(int)b + 128];` with no range test, because the
+/// cache's 256 slots already cover every `byte`. Measured on HotSpot 25.0.3+9:
+/// `Byte.valueOf(b) == Byte.valueOf(b)` for all 256 values including
+/// `Byte.MIN_VALUE`. The previous body allocated every time, so all 256 were
+/// wrong here.
+///
+/// The range guard below is not a semantic bound (there is none) — it is an
+/// index guard. The descriptor is `(B)`, so a well-formed call always lands in
+/// the cache; a malformed one falls back to the old fresh-allocation behaviour
+/// instead of indexing off the end of the array.
 pub(crate) fn native_byte_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5025,6 +7095,16 @@ pub(crate) fn native_byte_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if (-128..=127).contains(&val) {
+        let obj = cached_wrapper_box(
+            ctx,
+            byte_cache(),
+            (val + 128) as usize,
+            "java/lang/Byte",
+            Value::Int(val),
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Byte");
     ctx.set_field(obj, 0, Value::Int(val));
     Ok(Some(Value::Object(Some(obj))))
@@ -5032,6 +7112,15 @@ pub(crate) fn native_byte_value_of(
 
 // --- Short ---
 
+/// `Short.valueOf(short)` — cached over -128..=127 only, out of 65,536 values.
+///
+/// `jdk25src/java.base/java/lang/Short.java`:
+/// `if (sAsInt >= -128 && sAsInt <= 127) return ShortCache.cache[sAsInt + 128];`
+/// Same numeric bound as `Integer`/`Long`, a DIFFERENT bound from `Byte`
+/// (which has no bound) and from `Character` (which has no negative half).
+/// Measured on HotSpot 25.0.3+9 by walking `Short.MIN_VALUE..=Short.MAX_VALUE`:
+/// the identical range came back as exactly -128..127, and `valueOf((short)128)`
+/// / `valueOf((short)-129)` are fresh objects.
 pub(crate) fn native_short_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5040,6 +7129,16 @@ pub(crate) fn native_short_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if (-128..=127).contains(&val) {
+        let obj = cached_wrapper_box(
+            ctx,
+            short_cache(),
+            (val + 128) as usize,
+            "java/lang/Short",
+            Value::Int(val),
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Short");
     ctx.set_field(obj, 0, Value::Int(val));
     Ok(Some(Value::Object(Some(obj))))
@@ -5699,6 +7798,378 @@ mod tests {
         let o = ctx.alloc_object(cratonvm_types::ClassId::new(cid), 1);
         ctx.set_field(o, 0, v);
         o
+    }
+
+    // -----------------------------------------------------------------------
+    // JLS §5.1.7 boxing caches. Every bound below was measured on Microsoft
+    // OpenJDK 25.0.3+9 before it was written here; see the comment block above
+    // `CHARACTER_CACHE` for the transcript.
+    //
+    // The caches are process-global and keyed by `vm_identity()`, whose mock
+    // default is 0 and therefore SHARED by every other test in this suite.
+    // Each test below claims its own identity so its entries — which dangle
+    // once its mock heap drops — can never be handed to another test.
+    // -----------------------------------------------------------------------
+
+    fn ref_of(v: Option<Value>) -> cratonvm_types::ObjectRef {
+        match v {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a boxed object, got {other:?}"),
+        }
+    }
+
+    fn box_char(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        c: u32,
+    ) -> cratonvm_types::ObjectRef {
+        ref_of(native_character_value_of(ctx, &[Value::Int(c as i32)]).unwrap())
+    }
+
+    #[test]
+    fn character_value_of_is_canonical_through_127_and_fresh_from_128_up() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5101);
+
+        // The row RJdkIntrinsics2 --only=charcls asserts, and the boundary.
+        for c in [0u32, 'a' as u32, 126, 127] {
+            assert_eq!(
+                box_char(&mut ctx, c),
+                box_char(&mut ctx, c),
+                "Character.valueOf({c}) must be the CANONICAL instance — identity, not equality"
+            );
+        }
+
+        // The other half of the contract. HotSpot's first non-identical code
+        // unit is 128; a cache that "rounds up" to 256 or to the whole BMP
+        // fails here, and no equality-shaped assertion would notice.
+        for c in [128u32, 255, 0x0400, 0xFFFF] {
+            assert_ne!(
+                box_char(&mut ctx, c),
+                box_char(&mut ctx, c),
+                "Character.valueOf({c}) is above the cache and must be a FRESH object"
+            );
+        }
+
+        // The cached instance still carries its value — a canonical box that
+        // returns the wrong char would pass every identity row above.
+        let a = box_char(&mut ctx, 'a' as u32);
+        assert_eq!(ctx.get_field(a, 0), Value::Int('a' as i32));
+    }
+
+    #[test]
+    fn byte_value_of_is_canonical_for_all_256_values() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5102);
+        for b in -128..=127i32 {
+            let x = ref_of(native_byte_value_of(&mut ctx, &[Value::Int(b)]).unwrap());
+            let y = ref_of(native_byte_value_of(&mut ctx, &[Value::Int(b)]).unwrap());
+            assert_eq!(
+                x, y,
+                "Byte.valueOf({b}) must be canonical — ByteCache has no uncached arm"
+            );
+            assert_eq!(ctx.get_field(x, 0), Value::Int(b));
+        }
+    }
+
+    #[test]
+    fn short_value_of_caches_minus_128_to_127_and_nothing_outside_it() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5103);
+        for s in [-128i32, -1, 0, 127] {
+            let x = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            let y = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            assert_eq!(x, y, "Short.valueOf({s}) must be canonical");
+        }
+        for s in [-32768i32, -129, 128, 32767] {
+            let x = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            let y = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            assert_ne!(
+                x, y,
+                "Short.valueOf({s}) is outside the cache and must be fresh"
+            );
+        }
+    }
+
+    #[test]
+    fn float_and_double_value_of_must_not_be_canonical() {
+        // NEGATIVE CONTROL, and the reason the fix above is three caches and
+        // not eight. Float and Double cache NOTHING; measured on HotSpot 25,
+        // `Float.valueOf(0f) == Float.valueOf(0f)` is FALSE. Making the family
+        // "consistent" here would be a regression.
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5104);
+        for f in [0.0f32, 1.0, -1.0] {
+            let x = ref_of(native_float_value_of(&mut ctx, &[Value::Float(f)]).unwrap());
+            let y = ref_of(native_float_value_of(&mut ctx, &[Value::Float(f)]).unwrap());
+            assert_ne!(x, y, "Float.valueOf({f}) must NOT be cached");
+        }
+        for d in [0.0f64, 1.0, -1.0] {
+            let x = ref_of(native_double_value_of(&mut ctx, &[Value::Double(d)]).unwrap());
+            let y = ref_of(native_double_value_of(&mut ctx, &[Value::Double(d)]).unwrap());
+            assert_ne!(x, y, "Double.valueOf({d}) must NOT be cached");
+        }
+    }
+
+    #[test]
+    fn a_cached_character_is_both_reported_as_a_root_and_remapped_after_a_move() {
+        // The pairing test. A cache that is scanned but not remapped survives
+        // a non-moving collector and hands out a dangling reference after a
+        // compacting one, which is why both hooks are asserted from one body.
+        let mut ctx = mock_ctx();
+        let vm = 0x5105usize;
+        ctx.set_vm_identity(vm);
+
+        let before = box_char(&mut ctx, 'q' as u32);
+        let mut roots: Vec<cratonvm_types::ObjectRef> = Vec::new();
+        gc_scan_value_of_cache_roots(vm, &mut roots);
+        assert!(
+            roots.contains(&before),
+            "the cached Character was not reported to the GC — it would be swept"
+        );
+
+        // A real second allocation stands in for the post-compaction address.
+        let moved = ctx.alloc_object(cratonvm_types::ClassId::new(1), 1);
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(before.as_ptr() as usize, moved.as_ptr() as usize);
+        gc_update_value_of_cache_refs(vm, &map);
+
+        assert_eq!(
+            box_char(&mut ctx, 'q' as u32),
+            moved,
+            "the cache still points at the pre-move address — remap hook missed CHARACTER_CACHE"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F29 — `IntegerCache.high` is configurable, and `canonical_wrapper_if_cached`
+    // -----------------------------------------------------------------------
+
+    fn box_int(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        v: i32,
+    ) -> cratonvm_types::ObjectRef {
+        ref_of(native_integer_value_of(ctx, &[Value::Int(v)]).unwrap())
+    }
+
+    /// The parse rule, as a PURE function — no mock, no VM, no cache.
+    ///
+    /// Each row is one of the three independent clauses in `IntegerCache
+    /// .<clinit>`, and each was MEASURED on OpenJDK 25.0.3+9 (`CacheHigh.java`)
+    /// before it was written here.
+    #[test]
+    fn integer_cache_high_follows_the_jdks_three_clauses() {
+        // MEASURED `-D...high=1000`: int.1000 true, int.1001 false.
+        assert_eq!(parse_integer_cache_high("1000"), Some(1000));
+        // MEASURED `-D...high=50`: int.128 STILL false. `Math.max(v, 127)`
+        // means the property can only widen, never narrow. Drop the `.max`
+        // and this row is the one that fails.
+        assert_eq!(parse_integer_cache_high("50"), Some(127));
+        assert_eq!(parse_integer_cache_high("-9"), Some(127));
+        // MEASURED `-D...high=abc`: ignored, and the run completes.
+        assert_eq!(parse_integer_cache_high("abc"), None);
+        assert_eq!(parse_integer_cache_high(""), None);
+        // `Integer.parseInt`'s grammar, not `str::parse`'s: a leading `+` is
+        // legal, surrounding whitespace is not.
+        assert_eq!(parse_integer_cache_high("+300"), Some(300));
+        assert_eq!(parse_integer_cache_high(" 300"), None);
+        assert_eq!(parse_integer_cache_high("300 "), None);
+        // A well-formed value wider than an `int` raises NumberFormatException
+        // in the JDK too, and the `catch` swallows it identically.
+        assert_eq!(parse_integer_cache_high("99999999999"), None);
+        // `Math.min(h, Integer.MAX_VALUE - (-low) - 1)`.
+        assert_eq!(
+            parse_integer_cache_high(&i32::MAX.to_string()),
+            Some(i32::MAX - 129)
+        );
+    }
+
+    /// The property must actually reach the cache, and must not drag the other
+    /// five bounds with it.
+    #[test]
+    fn the_integer_cache_widens_on_the_property_and_nothing_else_moves() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f29);
+        ctx.set_system_property("java.lang.Integer.IntegerCache.high", "1000");
+
+        // MEASURED on HotSpot with the same property: int.128/200/999/1000
+        // true, int.1001 false, int.-128 true, int.-129 false.
+        assert_eq!(box_int(&mut ctx, 128), box_int(&mut ctx, 128));
+        assert_eq!(box_int(&mut ctx, 1000), box_int(&mut ctx, 1000));
+        assert_eq!(box_int(&mut ctx, -128), box_int(&mut ctx, -128));
+        assert_ne!(box_int(&mut ctx, 1001), box_int(&mut ctx, 1001));
+        assert_ne!(box_int(&mut ctx, -129), box_int(&mut ctx, -129));
+
+        // The five that MEASURED `false` at 128 in the very same HotSpot run.
+        // This is the mutation guard for a "consistency" edit that routes the
+        // bound through the whole family.
+        assert_ne!(
+            ref_of(native_long_value_of(&mut ctx, &[Value::Long(128)]).unwrap()),
+            ref_of(native_long_value_of(&mut ctx, &[Value::Long(128)]).unwrap())
+        );
+        assert_ne!(
+            ref_of(native_short_value_of(&mut ctx, &[Value::Int(128)]).unwrap()),
+            ref_of(native_short_value_of(&mut ctx, &[Value::Int(128)]).unwrap())
+        );
+        assert_ne!(box_char(&mut ctx, 128), box_char(&mut ctx, 128));
+    }
+
+    /// A VM with no property set keeps the JDK default, and the widened VM
+    /// next door does not leak into it. The caches are process-global; only
+    /// `vm_identity` separates them.
+    #[test]
+    fn the_integer_cache_bound_is_per_vm_not_per_process() {
+        let mut wide = mock_ctx();
+        wide.set_vm_identity(0x5f2a);
+        wide.set_system_property("java.lang.Integer.IntegerCache.high", "500");
+        assert_eq!(box_int(&mut wide, 300), box_int(&mut wide, 300));
+
+        let mut plain = mock_ctx();
+        plain.set_vm_identity(0x5f2b);
+        assert_ne!(
+            box_int(&mut plain, 300),
+            box_int(&mut plain, 300),
+            "a second VM inherited the first VM's bound — the memo is not VM-scoped"
+        );
+        assert_eq!(box_int(&mut plain, 127), box_int(&mut plain, 127));
+    }
+
+    /// The widened region must be REPORTED and REMAPPED, not just allocated.
+    /// A bound that grows past a hook that still walks 256 slots is a
+    /// use-after-move that only a compacting collection reveals.
+    #[test]
+    fn the_widened_integer_region_is_both_scanned_and_remapped() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f2cusize;
+        ctx.set_vm_identity(vm);
+        ctx.set_system_property("java.lang.Integer.IntegerCache.high", "1000");
+
+        let before = box_int(&mut ctx, 900);
+        let mut roots: Vec<cratonvm_types::ObjectRef> = Vec::new();
+        gc_scan_value_of_cache_roots(vm, &mut roots);
+        assert!(
+            roots.contains(&before),
+            "the widened region is not reported as a root — it would be swept"
+        );
+
+        let moved = ctx.alloc_object(cratonvm_types::ClassId::new(1), 1);
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(before.as_ptr() as usize, moved.as_ptr() as usize);
+        gc_update_value_of_cache_refs(vm, &map);
+        assert_eq!(
+            box_int(&mut ctx, 900),
+            moved,
+            "the widened region was not remapped — the scan and remap sets disagree"
+        );
+    }
+
+    /// `canonical_wrapper_if_cached` reads, and only reads.
+    #[test]
+    fn canonical_wrapper_if_cached_never_populates_and_agrees_when_it_hits() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f2dusize;
+        ctx.set_vm_identity(vm);
+
+        // Cold: nothing has boxed anything in this VM, so every probe misses.
+        // A helper that populated on demand would return `Some` here — and
+        // would have had to run `<clinit>` to do it.
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(7)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(97)), None);
+
+        // Warm: the answer is the SAME OBJECT the native itself returns, not
+        // a private twin that merely behaves the same.
+        let i7 = box_int(&mut ctx, 7);
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(7)), Some(i7));
+        let ca = box_char(&mut ctx, 97);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(97)), Some(ca));
+        let j5 = ref_of(native_long_value_of(&mut ctx, &[Value::Long(5)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(5)), Some(j5));
+        let b3 = ref_of(native_byte_value_of(&mut ctx, &[Value::Int(3)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "B", Value::Int(3)), Some(b3));
+        let s9 = ref_of(native_short_value_of(&mut ctx, &[Value::Int(9)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "S", Value::Int(9)), Some(s9));
+
+        // The probe itself must not have installed anything: another VM
+        // identity still misses for the same values.
+        assert_eq!(
+            canonical_wrapper_if_cached(0x5f2e, "I", Value::Int(7)),
+            None
+        );
+    }
+
+    /// The guard that turns an identity fix into a wrong answer if it is
+    /// dropped: a `long` slot presenting as a compact `Value::Int`.
+    #[test]
+    fn canonical_wrapper_if_cached_matches_the_variant_not_only_the_descriptor() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f2fusize;
+        ctx.set_vm_identity(vm);
+        // Populate `Long.valueOf(0)` so the wrong answer is AVAILABLE to be
+        // returned. Without this the test passes for the wrong reason.
+        let zero = ref_of(native_long_value_of(&mut ctx, &[Value::Long(0)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(0)), Some(zero));
+
+        // `("J", Value::Int(5))` must MISS. A descriptor-only match indexes
+        // slot 5 + 128 of LONG_CACHE — or worse, defaults the payload to 0 and
+        // hands back `zero` for a field holding 5.
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Int(5)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Int(0)), None);
+        // The mirror: an `int`-descriptor slot carrying a `Long`.
+        let _ = box_int(&mut ctx, 5);
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Long(5)), None);
+    }
+
+    /// The four descriptors this helper must NOT answer, each for its own
+    /// measured reason.
+    #[test]
+    fn canonical_wrapper_if_cached_declines_z_f_d_and_the_out_of_bound_arms() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f30usize;
+        ctx.set_vm_identity(vm);
+        let _ = native_boolean_value_of(&mut ctx, &[Value::Int(1)]);
+        let _ = box_int(&mut ctx, 7);
+
+        // `Z`: the canonical Boolean is the live `Boolean.TRUE` static field,
+        // which this signature cannot reach. `vm_exec.rs` resolves it itself.
+        assert_eq!(canonical_wrapper_if_cached(vm, "Z", Value::Int(1)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "Z", Value::Int(0)), None);
+        // `F`/`D`: HotSpot caches neither. MEASURED `neg.floatValueOf` = false.
+        assert_eq!(canonical_wrapper_if_cached(vm, "F", Value::Float(0.0)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "D", Value::Double(0.0)), None);
+        // Out of bound, per type. MEASURED `fieldoob.*` = false throughout.
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(-129)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(128)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(-1)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "S", Value::Int(128)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(128)), None);
+        // A reference descriptor and a null are misses, not panics.
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "Ljava/lang/Integer;", Value::Int(7)),
+            None
+        );
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Object(None)), None);
+    }
+
+    /// The configurable bound and the read-only probe must agree: a value
+    /// inside a WIDENED `IntegerCache` is reachable through the probe too.
+    /// This is the row that fails if the probe hard-codes `-128..=127`.
+    #[test]
+    fn canonical_wrapper_if_cached_follows_the_configured_integer_bound() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f31usize;
+        ctx.set_vm_identity(vm);
+        ctx.set_system_property("java.lang.Integer.IntegerCache.high", "1000");
+        let i900 = box_int(&mut ctx, 900);
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "I", Value::Int(900)),
+            Some(i900)
+        );
+        // Still bounded: 1001 is outside the configured high and the store is
+        // sized to the bound, so this is a miss rather than an index panic.
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(1001)), None);
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "I", Value::Int(i32::MAX)),
+            None
+        );
     }
 
     #[test]

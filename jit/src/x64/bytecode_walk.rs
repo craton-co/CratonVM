@@ -1761,31 +1761,86 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // aastore — store reference to Object[] array (inline store + barrier-only call)
+                // aastore — store a reference into a reference array.
                 //
-                // R20 / HIGH-5 (see docs/PRESENTATION.md): replace the full `jit_aastore`
-                // helper call with an inline `MOV QWORD [array + index*8 + HEADER_SIZE], val`
-                // followed by a CALL to the much-cheaper `write_barrier` helper. The barrier
-                // helper short-circuits when `val == 0` (null), so we don't need an inline
-                // null check. Array layout is compact 8-byte pointers (matches the already-
-                // inlined `aaload` path).
+                // Lowered INLINE (null check, bounds check, covariance check,
+                // SATB pre-write barrier, store, card mark). The single
+                // call-out is `jit_aastore_type_check` (vm/src/jit/helpers.rs),
+                // because answering the JVMS §6.5 covariance question needs the
+                // class manager. The complete-opcode helper `jit_aastore` is
+                // NOT reached from here.
                 //
-                // ArrayStoreException: enforced here by calling
-                // `jit_aastore_type_check` before the store (see below).
+                // ## Why the covariance check is emitted at all
                 //
                 // This note used to read "the current `jit_aastore` helper does
-                // NOT enforce the ASE check … no regression". That premise was
-                // true when written, and was falsified when the check landed in
-                // `jit_aastore` — silently, because this path had already
-                // stopped calling that helper and a premise in a comment is not
-                // a compile-time link. For the ~day it stood, a JIT-compiled
-                // `aastore` performed the store and raised nothing:
-                // `RExceptions` reads `cold=[java.lang.Integer] hot=[no-throw]`
+                // NOT enforce the ASE check (the interpreter does it via
+                // `set_array_element`). This inline path matches the helper's
+                // behavior exactly — no regression." That premise was TRUE when
+                // R20 / HIGH-5 (docs/PRESENTATION.md) replaced the helper call
+                // with the inline store, and was FALSIFIED later — silently —
+                // when the JVMS §aastore covariance check landed inside
+                // `jit_aastore`, because this path had already stopped calling
+                // that helper and a premise stated in a comment is not a
+                // compile-time link. From that moment the compiled tier
+                // performed every reference array store unconditionally while
+                // the interpreter refused the illegal ones, and nothing failed
+                // to build.
+                //
+                // The consequence is not a wrong answer, it is heap type
+                // confusion: `Object[] a = new String[1]; a[0] = anInteger;`
+                // leaves an `Integer` inside a `String[]`, so a later
+                // `aaload`-and-use reads a `String`-typed reference to an
+                // `Integer` with no cast to catch it. Under a precise GC that
+                // is a memory-safety-relevant corruption, not an etiquette
+                // problem — and it is TIER-DEPENDENT: correct for the first
+                // ~500 executions and wrong once the method tiers up.
+                // `RExceptions` read `cold=[java.lang.Integer] hot=[no-throw]`
                 // at i≈500, i.e. the tier-parity assertion caught it the moment
-                // the method tiered up. The claim that an inline ASE check
-                // "needs type-narrowing infrastructure" is also not so: type
-                // narrowing is what would let a check be ELIDED, not what makes
-                // one correct.
+                // the method tiered up. See
+                // docs/known-issues/jdk-only/W7-38-jit-aastore-never-called-its-own-check.md.
+                //
+                // The claim that an inline ASE check "needs type-narrowing
+                // infrastructure" is also not so: type narrowing is what would
+                // let a check be ELIDED, not what makes one correct. And the
+                // rule now lives in exactly ONE body — `aastore_store_is_refused`
+                // in vm/src/jit/helpers.rs, shared by `jit_aastore_type_check`
+                // and `jit_aastore` — so the inline lowering and the full helper
+                // can never again enforce different rules.
+                //
+                // ## Ordering — JVMS §6.5 is NPE → AIOOBE → ASE
+                //
+                // Not stylistic. Putting the covariance check ahead of the
+                // bounds check reproduces the exact divergence
+                // `RArrayStoreTiers` s15 caught in the interpreter fast path:
+                // ASE reported for a past-the-end index.
+                //
+                // `flush_scratch_registers` first: it rewrites every
+                // register-resident (`Scratch`/`Xmm`) stack slot to a frame
+                // slot, so every `load_slot_to_reg` below reads from memory and
+                // cannot clobber another's source register regardless of ABI
+                // (`ARG_REGS` is RCX/RDX/R8/R9 on Windows, RDI/RSI/RDX/RCX on
+                // SysV).
+                //
+                // A helper call clobbers the caller-saved registers, so
+                // `array_slot` / `index_slot` / `val_slot` are RE-LOADED after
+                // the check and again after the SATB barrier. Hoisting those
+                // loads above either call is silently wrong.
+                //
+                // 0x53 is a one-byte opcode, so
+                // `emit_post_invoke_exception_check` keeps THIS pc as the throw
+                // pc, which is what the handler `[start_pc, end_pc)` range test
+                // needs (see the note at that function).
+                //
+                // ## Why this arm must force the dispatch-aware entry
+                //
+                // `jit_aastore_type_check` builds its `ArrayStoreException`
+                // through `jit_thread_mut()`, which only the dispatch-aware
+                // entry sets (`vm/src/runtime/interpreter/jit_bridge.rs` — the
+                // `!compiled.has_dispatch` arm skips `set_jit_thread`). Without
+                // it the check fails open (its documented last resort) and the
+                // illegal store proceeds. `emitted_aastore_throw` below is what
+                // forces that entry; `x64/driver.rs` reads it alongside
+                // `emitted_checkcast_throw`, for the same reason.
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
@@ -1794,7 +1849,9 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
+                    // Records a null-check stub.
                     self.emit_null_check_array_store_at(code, pc);
+                    // AIOOBE. Records a bounds-check stub.
                     self.emit_bounds_check(pc);
                     // JVMS §aastore covariance check, BEFORE anything mutates:
                     // on a refusal no element may be written and no barrier may
@@ -1823,6 +1880,11 @@ impl Compiler {
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.aastore_type_check);
                     self.emit_oop_map_for_safepoint();
+                    // `b'V'` is the OPCODE's return descriptor, which is what
+                    // this parameter documents; it selects the plain
+                    // `CMP RAX, i64::MIN; JE bail`, correct because the helper
+                    // returns only `0` or the sentinel — RAX here is a defined
+                    // value, not the undefined RAX a `-> ()` helper leaves.
                     self.emit_post_invoke_exception_check(b'V');
                     self.emitted_aastore_throw = true;
                     {
