@@ -191,9 +191,87 @@ a mis-transcribed rotate still round-trips against itself perfectly.
 
 ## Results
 
-*Pending the verification run: the invocation census proving the native actually
-served the calls, BouncyCastle's own `SHA256DigestTest`/`HMacTest`, the four LMS
-suite classes against HotSpot, and the interleaved kernel A/B.*
+### First: `HSSTests` was never hanging, and it passes on the UNMODIFIED binary
+
+With the JIT on and no budget cap, the **baseline** binary — no fix, plain `dev`
+— runs it to completion:
+
+```
+org.bouncycastle.pqc.crypto.lms.HSSTests  rc=0  2062s   OK (13 tests)
+```
+
+That alone retires the `HANG` label. The class was filed as hanging because the
+sweep runs `--nojit` against a 3000 s cap, and `--nojit` is ~46x slower than the
+default on this workload.
+
+### The intrinsic engaged, and it is the native that served the calls
+
+A flat A/B cannot tell "did not help" from "never ran", so the census was taken
+first (`--dump-native-registry`):
+
+```
+org/bouncycastle/crypto/digests/SHA256Digest.processBlock()V
+    kind=intrinsic  invocations=14000
+```
+
+14 000 is exactly right: 7 000 digests x 2 compression blocks each.
+
+### Correctness
+
+| check | result |
+|---|---|
+| kernel unit tests, 4 published FIPS 180-4 vectors | pass |
+| BouncyCastle's own `SHA256DigestTest` (includes the `Memoable` copy/reset state) | **`SHA-256: Okay`** |
+| `LMSKeyGenTests` / `LMSTests` / `PublicKeyParseTests` / `TypeTests` | pass, **test counts identical to HotSpot** (1 / 7 / 7 / 1) |
+| `HSSTests`, both arms | `OK (13 tests)` |
+
+None of these is a `started=0` green: every count was diffed against HotSpot's
+own run of the same class.
+
+### Throughput
+
+| workload | HotSpot | CVM base +JIT | CVM +fix | gain |
+|---|---|---|---|---|
+| `HSSTests` (the whole class) | 15.9 s | **2062 s** | **1047 s** | **1.97x** |
+| `LMSTests` | 0.77 s | 61 s | 33 s | 1.85x |
+| `LMSKeyGenTests` | 0.39 s | 6 s | 5 s | — |
+| SHA-256 kernel, 3 interleaved rounds | 0.65–1.17 us | 49.5 / 54.7 / 61.7 us | 19.1 / 22.2 / 30.0 us | 1.82x / 2.23x / 3.23x |
+
+The host is shared, so treat wall clock as orders of magnitude; the interleaved
+kernel rounds and the identical-binary `HSSTests` pair are the controlled
+comparisons.
+
+### Re-profiled after the fix
+
+| | before | after |
+|---|---|---|
+| `[JIT]` compiled code | 47.0% | **12.3%** |
+| `sha256_process_block` (the actual SHA-256 maths) | — | **3.38%** |
+| `getfield` helper chain | ~31% | ~30% |
+| native-call dispatch | ~9% | ~23% |
+
+The crypto is now essentially free. What is left is the `getfield` helper — its
+own page — and native-call dispatch, which rose in *share* because the
+denominator shrank, not in absolute cost.
+
+### One thing the microbench could not see
+
+On the real suite (but not on the kernel probe, which never reaches them),
+`jit-method-stats` reports four methods that never compile, all with the same
+refusal:
+
+```
+hot_but_stuck_in_interpreter=4 (ineligible-by-policy=1, compile-failures=3)
+  884  HSSSignature.getInstance    reason=rbc6-handler-reads-unsafe-local(pc=115,op=0xbb)
+  820  HSS.rangeTestKeys           reason=rbc6-handler-reads-unsafe-local(pc=16,op=0xbb)
+  692  LMOtsSignature.getInstance  reason=rbc6-handler-reads-unsafe-local(pc=121,op=0xbb)
+  628  LMSSignature.getInstance    reason=rbc6-handler-reads-unsafe-local(pc=152,op=0xbb)
+```
+
+These are ASN.1 parsers reached once per signature. At 628–884 invocations
+inside a 1047 s run dominated by millions of hash blocks they cannot be
+material, so they are recorded rather than chased — but the verdict comes from
+the invocation counts, not from the microbench's `hot_but_stuck=0`.
 
 ## What is NOT claimed
 
