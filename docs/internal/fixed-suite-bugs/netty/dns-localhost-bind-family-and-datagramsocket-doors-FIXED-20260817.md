@@ -211,6 +211,52 @@ something needs them to collide.** Changing one end's family is not a local
 change — it is a change to every "is this port taken" question the process can
 ask.
 
+## Residual 4: my own fallback swallowed the error the test was looking for
+
+With both ends dual-stack, `testAddressAlreadyInUse` changed failure a second
+time — and the new cause was a bug introduced by the fix for residual 2.
+
+`open_udp_dual_stack_socket` was written as
+
+```rust
+let v6 = (|| { /* create + set_only_v6 + bind */ })();
+match v6 { Ok(s) => Ok(s), Err(_) => bind_v4_wildcard(port) }
+```
+
+The fallback is meant for one condition: this host has no usable IPv6 stack.
+Written that way it also caught a failing **bind**. So a genuine `EADDRINUSE`
+on `[::]:P` was swallowed, the socket silently bound `0.0.0.0:P` instead —
+which Windows permits alongside a dual-stack v6 holder — and
+`DatagramChannel.bind(addressAlreadyInUse)` **succeeded**, reporting a
+different address family than it had been asked for.
+
+Measured directly (`probes/BindClash.java`, both VMs, same host):
+
+| | HotSpot 25 | CratonVM, before | after |
+|---|---|---|---|
+| `channel.bind(taken)` | `BindException` | **SUCCEEDED → `/0.0.0.0:P`** | `BindException` |
+| `channel.bind(taken)` + `SO_REUSEADDR` | `BindException` | `IOException: … os error 10013` | `BindException` |
+| `new DatagramSocket(takenPort)` | `BindException` | **SUCCEEDED → `/0.0.0.0:P`** | `BindException` |
+
+The fallback is now scoped to the capability probe — socket creation and
+`set_only_v6` — and the bind's result is authoritative.
+
+The second row is a separate half: an unavailable address must be
+`java.net.BindException`, and callers test it by **type**
+(`assertInstanceOf(BindException.class, cause.getCause())`). A flat
+`IOException` carrying the OS text satisfies nothing, and on Windows that text
+is localised, so a message match could not substitute either. Windows also
+reports the clash two ways — `WSAEADDRINUSE` normally, `WSAEACCES` when the
+caller set `SO_REUSEADDR` against an exclusively-held port — and HotSpot maps
+both to `BindException`. So do the `DatagramChannel` and `DatagramSocket` bind
+paths now.
+
+**The lesson is the general one about fallbacks.** `Err(_) => try_something_else`
+around an operation that has its own legitimate failures converts those
+failures into wrong answers. Scope the catch to the condition it is for. This
+one turned "the port is taken" — the exact fact the test existed to observe —
+into a successful bind on a different family.
+
 ## What this retires
 
 The 08-13 page's live hypothesis — that `native_dc_bind` /
