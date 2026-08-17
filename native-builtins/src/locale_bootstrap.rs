@@ -66,16 +66,23 @@ impl LocaleCategory {
 /// [`gc_scan_locale_roots`], which must scan every slot or a moving young
 /// collection reclaims the one it missed while this cache keeps handing back
 /// the stale `ObjectRef`.
-fn cached_locale(category: LocaleCategory) -> &'static Mutex<Option<ObjectRef>> {
-    static BASE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    static DISPLAY: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    static FORMAT: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — six acquisition sites, all
+/// single statements over an `Option<ObjectRef>` (a `Copy` read, or a whole-slot
+/// assignment). The GC scan's `if let` body only pushes into a `Vec` and its
+/// guard drops before the neighbouring `synthetic_locale_data` lock is taken;
+/// the remap holds the guard across pure `PointerMap` arithmetic. The
+/// `getDefault` fast path's `if let` body is a bare `return`, so the allocation
+/// that follows it runs with no guard held.
+fn cached_locale(category: LocaleCategory) -> &'static cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>> {
+    static BASE: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> = OnceLock::new();
+    static DISPLAY: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> = OnceLock::new();
+    static FORMAT: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> = OnceLock::new();
     let cell = match category {
         LocaleCategory::Base => &BASE,
         LocaleCategory::Display => &DISPLAY,
         LocaleCategory::Format => &FORMAT,
     };
-    cell.get_or_init(|| Mutex::new(None))
+    cell.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(None, cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Every cache slot, for the whole-cache operations (GC scan/remap and

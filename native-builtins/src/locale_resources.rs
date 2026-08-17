@@ -444,11 +444,15 @@ type CldrTable = std::sync::Arc<std::collections::BTreeMap<String, CldrValue>>;
 /// `(simple-name, language, country)` → the merged table, or `None` when not a
 /// single candidate class loaded. The `None` is cached too: a miss costs a
 /// `find_resource` probe per candidate and there is no point repeating it.
-fn cldr_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>> {
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two acquisition sites, both in
+/// `cldr_table_for`: the hit check, whose innermost body is a bare `return`,
+/// and the store. The `ctx.find_resource` probing that builds the table runs
+/// between them, after the read guard has been dropped.
+fn cldr_cache() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>> {
     static INSTANCE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>>,
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>>,
     > = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    INSTANCE.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The two packages that hold a `LocaleData` base name's CLDR classes: the
