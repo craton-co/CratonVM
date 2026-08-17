@@ -1346,6 +1346,77 @@ turns a young mark into a full mark plus overhead.
 
 ---
 
+## 3e. C5's `perf record`, and the largest cost in the marker is not in the marker
+
+The step §3c asked for, taken 2026-08-17 on `BigLive 4000 250`, `-Xmx1500m`,
+`CRATONVM_ZGC_RELOCATE=0`, `perf record -g --call-graph dwarf`, **with the
+zero-worker serial arm recorded too** — a profile with no control names whatever
+is biggest rather than whatever is *different*.
+
+| symbol | 0 workers (serial) | 1 worker |
+|---|---:|---:|
+| `native_collections::gc_overlay_roots_for_collection` | **12.14%** | **12.78%** |
+| `external_roots::external_roots_for_owner` | **16.50%** | 7.52% |
+| `ZHeapMarkBridge::try_mark` | — | 7.14% |
+| `ZMarkWorker::drain::{closure#0}` | — | 4.89% |
+| kernel, on the mark threads | — | ~6.8% |
+
+**Between them 20–29% of samples on both arms.** `external_roots_for_owner` is
+the caller and `gc_overlay_roots_for_collection` the callee, split differently by
+the inliner on each arm — so read the pair, not either number. This is called
+**once per marked object**, from `ZgcRealHeap::visit_refs` and from
+`collect_garbage`'s serial loop alike, and it takes a `std::sync::Mutex` and
+hashes the owner address every time.
+
+**It is the fourth instance of the pattern §4's item 1 lists three of**, and it
+survived that cleanup for a structural reason worth keeping: the other three were
+found by reading `gc/`, and this one lives in **another crate**, reached through a
+provider indirection. Reading `gc/` could not have found it.
+
+### The obvious fix is inert, and it was measured before being believed
+
+An empty-index latch — the fix the other three got — was built, and it **does not
+work here**: the profile still showed the symbol at 5–14% with the latch in. The
+premise is false. `widened_obj_key` calls `register_overlay_owner_key` on **every**
+native-backed collection operation, and the JDK bootstrap alone performs enough of
+them that `overlay_owner_keys` is non-empty from startup onwards. "This heap has
+no native collections" is not a state a real run is ever in.
+
+Not merged, deliberately. An optimisation that is on and inert reads exactly like
+a missing one, and shipping it would have made the 20–29% look addressed.
+
+### What would work
+
+The question asked per object is *"is this address an overlay owner?"*, over a set
+that is non-empty but that **almost no object belongs to** — which is precisely
+the shape the skip-set filter already solves in `zgc.rs`
+(`mark_ref_skip_bloom`, `Z_SKIP_BLOOM_WORDS`, two bits per member, no false
+negatives possible). A Bloom filter over owner addresses answers nearly every
+object with two relaxed loads and no lock, and falls through to the mutex only on
+a hit. The precedent, the sizing and the correctness argument are all already in
+this tree.
+
+### And the C5 gap itself is still open
+
+`try_mark` (7.14%), the worker `drain` closure (4.89%) and ~6.8% of kernel time on
+the mark threads exist only on the parallel arm — the marker's structure, not
+contention, which is what §3c concluded from timings and this confirms from a
+profile. The overlay cost above is **not** the C5 gap: it is paid equally by both
+arms. Fixing it makes every ZGC collection faster and leaves parallel-vs-serial
+exactly where it was.
+
+### A note on the measurement itself
+
+The wall-clock A/B of the two binaries is **not reported here, because it is not
+usable**. The host went from load 1.8 to load 18 mid-run (another session started
+a benchmark and two `rustc`), and the arms were ordered old-then-new in every rep,
+so drift and order are confounded with the change. `perf record --call-graph
+dwarf` also inflated a 2.2 s run to 13–36 s, which is the overhead and not the
+binary. The profile shares above are used instead precisely because a **symbol
+share is structural**: it cannot be moved by the neighbour benchmark.
+
+---
+
 ## 4. Sequencing, and what to do first
 
 ```
