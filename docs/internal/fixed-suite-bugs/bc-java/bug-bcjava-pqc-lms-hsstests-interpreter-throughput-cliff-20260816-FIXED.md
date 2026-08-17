@@ -260,6 +260,21 @@ org/bouncycastle/crypto/digests/SHA256Digest.processBlock()V
 None of these is a `started=0` green: every count was diffed against HotSpot's
 own run of the same class.
 
+### Regression: `SHA256Digest` is used all over BouncyCastle, so the sweep is wider than LMS
+
+`processBlock` now serves HMAC, signatures, PKIX, CMS and the provider tests
+too, so the check is whether anything *else* moved. Base vs fix, same host:
+
+| suite | base | +fix | outcome |
+|---|---|---|---|
+| `crypto.test.AllTests` | 1407 s | **707 s** | `Tests run: 21, Failures: 1, Errors: 14` on **both**, and the 15 failing test names diff **identical** |
+| `jce.provider.test.AllTests` | 2 s | 2 s | identical on both (a harness artefact — the class exposes no JUnit suite, same as `crypto.test.RegressionTest`) |
+
+`crypto.test.AllTests`'s 15 residuals are pre-existing and unrelated: fourteen
+are `HPKETestVectors` failing `CryptoServiceConstraintsException: service does
+not provide 192 bits of security only 128`. They fail identically without the
+intrinsic. **Same behaviour, 1.99x the speed.**
+
 ### Throughput
 
 | workload | HotSpot | CVM base +JIT | CVM +fix | gain |
