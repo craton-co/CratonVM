@@ -1,10 +1,16 @@
 # netty OpenSSL key material: the opaque-key gap, and what is left of it
 
-**Status:** OPEN, and down to **one** named defect (section B) plus section D's
-intermittent stall. Sections A (`KEY_VALUES_MISMATCH`), C (`SslContextBuilder`
-accepting an invalid cipher) and **all of A′** are fixed — A′'s last half, the
-OPENSSL **client** path, closed 2026-08-17 on
-`fix/netty-nio-pcap-tls-residuals-20260817`; see §A′ below for the mechanism.
+**Status:** OPEN on **section D alone** — every named defect on this page is
+fixed. Sections A (`KEY_VALUES_MISMATCH`) and C (`SslContextBuilder` accepting an
+invalid cipher) closed earlier; **A′** closed 2026-08-17 on
+`fix/netty-nio-pcap-tls-residuals-20260817` (an EKU read as an eligibility filter,
+see §A′); **B** closed 2026-08-17 on
+`fix/netty-tls-verifier-time-trust-20260817` (the TrustManager verdict now reaches
+rustls INSIDE certificate verification, see §B). What is left is section D's
+intermittent stall in `ParameterizedSslHandlerTest`, which this page already
+records as not attributable to any VM change on the branch that found it, plus one
+LATENCY residual noted under §B: `testHandshakeFailureOnlyFireExceptionOnce` needs
+7-19 s against its own `@Timeout(10000)` where HotSpot needs 4-7 s, on both arms.
 
 Measured on Azure host 2 (Linux x86_64, JDK 25), one class per process,
 `-XX:+UseG1GC`, with `netty-tcnative-boringssl-static` on the classpath for
@@ -16,7 +22,7 @@ rather than reading it as a TLS defect.
 | `JdkSslEngineTest` | 707 / 821, 48 failed | 755 / 821, 0 failed ✅ | — | 755, 0 failed |
 | `JdkDelegatingPrivateKeyMethodTest` | 1 / 27 | 10 / 27 | **27 / 27** ✅ | 27 / 27 |
 | `OpenSslPrivateKeyMethodTest` | 24 / 24 | 24 / 24 | 24 / 24 | 3 / 24 |
-| `SslHandlerTest` | 47 / 54 | 48 / 54 | **52 ok + 1 aborted + 1 failed** | 53 ok + 1 aborted |
+| `SslHandlerTest` | 47 / 54 | 48 / 54 | **53 ok + 1 aborted** (Linux); see §B for the Windows read | 53 ok + 1 aborted |
 | `SslContextBuilderTest` | 21 / 21 | 21 / 21 ✅ | 21 / 21 ✅ | 21 / 21 |
 | `ParameterizedSslHandlerTest` | never finished, or hangs | 61–63 / 63; still stalls intermittently, quiet host or not | not re-measured | 63 / 63 |
 
@@ -409,6 +415,23 @@ HotSpot.
   regression, and not something this change touches.
   `testHandshakeFailureCipherMissmatchTLSv13OpenSsl` ABORTS on all three arms
   (its `assumeFalse(OpenSsl.isBoringSSL())`).
+
+  **Regression check**, one class per process, control vs fix on the same host:
+
+  | class | control | fix |
+  |---|---|---|
+  | `SslContextBuilderTest` | 21 / 21 | 21 / 21 |
+  | `JdkDelegatingPrivateKeyMethodTest` | 27 / 27 | 27 / 27 |
+  | `ParameterizedSslHandlerTest` | 61 / 63 (params 1, 5) | **62 / 63** (param 4) |
+
+  `ParameterizedSslHandlerTest`'s failures on both arms are in the OPENSSL /
+  OPENSSL_REFCNT family section D is about, and which parameterisation fails moves
+  between runs — the fix arm happens to be one better, which is not a claim, just
+  the number.
+
+  `JdkSslEngineTest` (821 tests) is **not measurable on this Windows box**: it
+  exceeds 900 s on both arms (HotSpot does it in 180 s), so it was run on the Azure
+  host instead, where it completes.
 
   **What this does NOT cover.** Only the CLIENT's `checkServerTrusted` moved into
   verification, because that is what `verify_server_cert` is. A SERVER engine's
