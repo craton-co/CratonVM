@@ -91,6 +91,15 @@ property is not the property.
 
 ### And one shortcut that was never priced
 
+> **Landed independently.** While this branch was building, dev landed
+> `c37663409`, which found the same shortcut from the other two commons-math
+> numeric filings and fixed it better: rather than removing the path it keeps
+> the four exponents where repeated multiplication rounds exactly once
+> ({0, 1, 2, -1}, each 0/1040 against the oracle). The merge takes dev's body.
+> The census below is this branch's independent measurement of the same defect;
+> the two agree on the direction and on the cause.
+
+
 `native_math_pow` also carried an integer-exponent fast path: `b.fract() == 0 &&
 |b| < 64` went to `powi`, i.e. repeated multiplication, plus a reciprocal for
 negative exponents. `probes/PowIntExpProbe.java` puts 400 bases against every
@@ -123,8 +132,9 @@ see the interpreter-throughput doc.)
 
 ## What is deliberately NOT fixed
 
-**13 rows of the 41,195 remain**, all one-ulp: `Math.log10(π)`, `Math.sin(±2.5)`,
-and 10 `Math.pow` rows. These are the documented libm-vs-intrinsic residual —
+**11 rows of the 41,195 remain** (13 before merging dev's restricted
+integer-exponent path, which recovers two `pow` rows exactly), all one-ulp:
+`Math.log10(π)`, `Math.sin(±2.5)`, and 8 `Math.pow` rows. These are the documented libm-vs-intrinsic residual —
 `lang_math.rs` explains at length why the functions HotSpot intrinsifies
 (`_dsin`, `_dlog10`, `_dpow`, …) keep libm as the closer of the two available
 backings, since HotSpot's own answers come from Intel LIBM assembly that matches
@@ -148,7 +158,8 @@ original doc said so.
 
 * `AccurateMathStrictComparisonTest`: **69/69 pass** under CratonVM, and HotSpot
   reports the same 69 found — checked side by side on the same classpath.
-* `probes/MathSurfaceSweep`: 764 → **13** divergent rows, all documented above.
+* `probes/MathSurfaceSweep`: 764 → **11** divergent rows, identical under
+  `--nojit` and with the JIT on, all documented above.
 * `probes/PowIntExpProbe`: 36,964 → **188** divergent rows.
 * 14 new unit tests in `lang_math.rs`, every expectation a raw bit pattern
   recorded from the oracle rather than reasoned from the javadoc. `cargo test -p

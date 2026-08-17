@@ -11,11 +11,19 @@ Both classes **pass**, in every mode, and the JIT-mode cost of each fell by
 
 | class | HotSpot | CVM `--nojit` | CVM +JIT, as filed | CVM +JIT, now |
 |---|---|---|---|---|
-| `AccurateMathTest` (70 tests) | 26s | 2997s | 194s | **74s** |
-| `PSquarePercentileTest` (47 tests) | 6s | 3445s | 1000s | **389s** |
+| `AccurateMathTest` (70 tests) | 26s | 2997s | 194s | **74–137s** |
+| `PSquarePercentileTest` (47 tests) | 6s | 3445s | 1000s | **389–504s** |
 
-All six arms report the same test count as HotSpot (70 and 47) with zero
-failures, so none of these is a `started=0` green.
+Every arm reports the same test count as HotSpot (70 and 47) with zero failures,
+so none of these is a `started=0` green.
+
+**On the ranges.** This is a shared host — other sessions build and run VMs on
+it — so end-to-end wall clock moves with contention: the same binary and class
+measured 74s and 137s in two runs hours apart. The controlled number is the
+interleaved phase A/B further down (2.66x, 3844 vs 3849 ms across rounds), and
+the load-independent one is `hot_but_stuck_in_interpreter`, which is **0** for
+both classes where it was 2 and 1. Treat the table as orders of magnitude, not
+as a benchmark.
 
 ## First: the HANG classification was wrong, and the doc suspected as much
 
@@ -126,7 +134,7 @@ owned the cost fell by 2.66x — interleaved, two rounds, same host:
 ## What is NOT claimed
 
 **This does not close the interpreter-vs-HotSpot gap, and was never going to.**
-`PSquarePercentileTest` is still 65x HotSpot and `AccurateMathTest` 2.8x. What
+`PSquarePercentileTest` is still ~65-85x HotSpot and `AccurateMathTest` ~3-5x. What
 changed is that the hot methods now *compile at all*; what remains is the
 ordinary cost of this JIT against C2 on call-dense numeric code, which is a
 separate and much larger subject.
@@ -139,9 +147,9 @@ one the original doc reached, below.
 
 The original doc's practical recommendation stands and is now quantified:
 **these classes were never hanging, and the harness was measuring `--nojit`.**
-With the JIT on, `AccurateMathTest` finishes in 74s — inside even the original
-180s cap — and `PSquarePercentileTest` in 389s, which needs a raised per-class
-budget but nothing like the 30-minute one. A timeout-bounded sweep that runs
+With the JIT on, `AccurateMathTest` finishes in 74-137s — inside even the
+original 180s cap — and `PSquarePercentileTest` in 389-504s, which needs a
+raised per-class budget but nothing like the 30-minute one. A timeout-bounded sweep that runs
 `--nojit` should either drop the forced-interpreter flag or price its classes
 against interpreter cost, not against HotSpot's.
 
