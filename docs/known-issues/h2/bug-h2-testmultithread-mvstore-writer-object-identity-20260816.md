@@ -41,6 +41,8 @@ what landed there.
 | a thread running Java while censused as blocked | `CRATONVM_DBG_BLOCKED_ACCESS=warn`: 0 violations |
 | a live frame slot left naming a vacated address | 0, once the ledger stopped counting re-issued addresses — the 8-per-run the first version of that instrument reported were fresh allocations in the vacated span |
 | a stale reference being STORED into a frame local | `set_local` detector: 0 hits across every reproduced failure |
+| a stale reference being PUSHED on the operand stack | push detector (both `Value` and compact paths): 0 hits |
+| a field read through a stale RECEIVER | `get_field` receiver detector: 0 hits |
 
 ### The stale-reference hunt (2026-08-17, second pass)
 
@@ -86,10 +88,101 @@ producer out of several.
 binary, 15 on the fixed one) against roughly a third of runs corrupt with
 relocation on, under identical GC stress.
 
-**Next step:** the same ledger, applied at the two consumption points the
-barrier does not sit on — a `checkcast`'s operand, and a `getfield` whose
-RECEIVER is stale (which makes every field it reads garbage). `set_local`
-already reports zero, so the remaining producer is not writing into frames.
+### Third pass: where the remaining producer is NOT
+
+The two consumption points the barrier does not sit on were instrumented — the
+operand-stack push (both the `Value` and the compact path) and the field-read
+RECEIVER — and both report **zero** across every reproduced failure, alongside
+`set_local`'s zero. So at the moment of the failure there is no reference to a
+vacated-and-not-yet-reissued address anywhere in play.
+
+That is not the absence of a defect; it is the instrument going quiet exactly
+when the damage becomes visible. The exact ledger drops an address the instant
+the allocator re-issues it (which is what makes it exact), and the failure only
+becomes *observable* after re-issue: until then the stale holder reads the
+zeroed corpse, and afterwards it reads a valid object of the wrong class. The
+`checkcast` reporter, which consults the collector's own relocation history
+rather than the ledger, still says what it always said:
+
+```
+receiver names an address the ZGC slide VACATED ... target_still_live=true
+…and this is where that address stood in the OWNING thread's own GC
+   bookkeeping. in_published_snapshot=false — the snapshot the collector marks
+   this thread from did not contain a slot the thread's frames hold: a root
+   COLLECTION gap, not a mark or sweep one.
+```
+
+**The one lever that moves it:** `CRATONVM_NO_LOCAL_LIVENESS=1` — the kill
+switch for the per-bci local-liveness root filter. Interleaved ABBA with the
+detectors armed on both arms:
+
+| arm | runs | corrupt |
+|---|---|---|
+| A — per-bci liveness ON (default) | 12 | **5** |
+| B — `CRATONVM_NO_LOCAL_LIVENESS=1` | 8 | **0** |
+
+**Read that as masking, not as the culprit.** The filter's contract is
+per-instruction bytecode liveness, and the slot it was caught dropping —
+`MVPrimaryIndex.lockRow pc=22 local[2]`, traced by recording every address the
+filter withholds and looking the failing receiver up in it — is the `Row`
+parameter at the method's `areturn`, which is genuinely dead: nothing reads it
+again. What the filter changes is how quickly a dead object's address becomes
+**re-issuable**, and re-issue is what turns a latent stale holder into a
+`ClassCastException`. Retaining every dead local hides the defect by keeping the
+address occupied by the right object.
+
+### Fourth pass: the root inventory is clean, and one near-miss
+
+Two more instruments, and a fix that was nearly landed on an artifact.
+
+* **The two in-pause frame verifiers were reading a forwarding word ZGC never
+  writes.** `ARRIVE-STALE` and `WAKE-STALE` asked `debug_forwarded_target`, so
+  both reported zero on the default collector whatever the truth was. Each now
+  uses the record it already holds — this collection's `pointer_map` at the
+  arrival site, the accumulated `fixup` chain at the wake site. These are the
+  only EXACT places to ask: the remap has just run and no mutator on the thread
+  has resumed, so a slot holding a map key is unambiguously one the remap did
+  not reach. **Result: 0 across 23 runs**, once slide DESTINATIONS are excluded
+  (before that exclusion it "found" 80-168 a run, every one a slot legitimately
+  holding the survivor that slid INTO a vacated address).
+* **`CRATONVM_DBG_ROOT_REMAP_AUDIT=1`** re-runs the root scan at the end of
+  `update_all_roots` and looks for an address this collection moved. The scan
+  inventory (`roots.rs`) and the remap inventory (`native_roots.rs`) are two
+  different lists, and a source in the first but not the second is exactly this
+  defect's shape. `collect_roots` is now labelled by section, so a hit names
+  which of its forty sections produced the root. **Result: 0.**
+
+**The near-miss, recorded because it nearly shipped.** Placed BEFORE the
+blocked-thread fold, the audit reported 387-407 un-remapped roots a run, every
+one from section 11, "Root snapshot (for cross-thread GC scanning)" — which
+reads exactly like "the fold skips non-blocked threads, so their published
+snapshots are never rewritten". A fix for that was written, and then the control
+(`CRATONVM_NO_UNBLOCKED_SNAPSHOT_REMAP=1`, one binary, audit at the END) reported
+**0 with the fix and 0 without it**: every stale snapshot entry belonged to a
+BLOCKED thread and the existing fold already handled it. The 387 were an artifact
+of where the audit ran, not a finding. The change was reverted and the reasoning
+left in `fold_pointer_map_into_blocked_audited` for whoever measures the
+excluded-thread race for real.
+
+### Where the reference must therefore be
+
+Heap slots (slide verifier), frame locals and stacks (both heal sites, exact
+predicates), and the entire scanned root inventory are each verified complete at
+the end of the pause. So the holder is none of them: it is a raw `ObjectRef` in
+VM-side state that is **neither scanned nor remapped** — a native's Rust local
+across a callback, or a side table in neither inventory. That is the same class
+the barrier backtraces caught twice already (`apps_h2`,
+`properties_sidetable`), and the `load_and_forward` instrument from the second
+pass is the one that names them, one at a time, as each is fixed.
+
+**Next step:** the ledger has to survive re-issue to catch the USE. Keep the
+full vacated history and disambiguate with the identity hash minted into the
+object at slide time (`VmHeap::identity_hash_code` already provides one, and the
+reference processor's stamp shows the pattern): a holder whose address now
+carries a different identity than the one recorded for it at the move is stale,
+whether or not the space has been handed out again. That is the one instrument
+that can name the holder after re-issue, which is where every current one goes
+blind.
 
 ## The three reference-machinery defects fixed on the way
 

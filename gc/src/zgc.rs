@@ -2192,6 +2192,49 @@ impl ZObjectStartsSnapshot {
         }
     }
 
+    /// Every base at or above `floor`, ASCENDING, without materialising a
+    /// `Vec`.
+    ///
+    /// # Why a floor makes a young sweep O(young)
+    ///
+    /// The bitmap is one bit per 8 arena bytes indexed from `self.base`, so a
+    /// lower bound on the ADDRESS is a lower bound on the WORD index — the scan
+    /// simply starts later. A young cycle can therefore skip the whole
+    /// old-generation prefix at no cost, which is the one thing that removes the
+    /// O(registry) sweep the 2026-08-17 Phase G measurement identified as the
+    /// pause (182 ms of a 309 ms mean, unchanged by the generation split because
+    /// the sweep walked every registered object regardless).
+    ///
+    /// `extra` (the large-object region above the grid) is filtered
+    /// individually: it is a small set and it is not address-ordered.
+    #[inline]
+    fn for_each_base_from(&self, floor: usize, mut f: impl FnMut(usize)) {
+        // FLOOR division, both times. Rounding the bit index UP would skip the
+        // word containing `floor` whenever the bit index landed on a word
+        // boundary from below, and the only thing that makes that unreachable
+        // today is that object starts are 8-aligned. Starting one word early
+        // costs one word of scan and cannot be wrong; the `addr >= floor` test
+        // inside the loop is what makes the bound exact.
+        let first_word = (floor.saturating_sub(self.base) / 8) / 64;
+        for (w, &word) in self.words.iter().enumerate().skip(first_word) {
+            let mut word = word;
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                word &= word - 1;
+                let addr = self.base + ((w * 64 + b) << 3);
+                // The first word can straddle the floor.
+                if addr >= floor {
+                    f(addr);
+                }
+            }
+        }
+        for addr in self.extra.iter() {
+            if *addr >= floor {
+                f(*addr);
+            }
+        }
+    }
+
     /// How many bases the snapshot holds, counted rather than collected.
     fn base_count(&self) -> usize {
         self.words
@@ -2732,6 +2775,135 @@ pub struct ZgcRealHeap {
     /// The cost of being wrong is one cycle, and it is self-correcting. The cost
     /// of the stricter rule was the whole feature.
     gen_force_major_next: AtomicBool,
+    /// The arena's low cursor at the end of the last WHOLE-HEAP collection.
+    /// `0` means no boundary has been established yet.
+    ///
+    /// # The nursery this defines, and why it is an address and not an age
+    ///
+    /// Phase G splits the generations by object age, which is what decides how
+    /// much a young cycle has to TRACE. It does nothing about how much a young
+    /// cycle has to SWEEP, and the 2026-08-17 measurement found the sweep was
+    /// the pause: 182 ms of a 309 ms mean, identical with the split on, because
+    /// the sweep walks every registered object whatever the split says.
+    ///
+    /// The sweep can only be bounded by ADDRESS, because the registry is a
+    /// bitmap over the arena and a range of addresses is a range of words.
+    /// Everything allocated since the last whole-heap collection lies at or above
+    /// its final cursor, so `[gen_young_floor, cursor)` is a nursery in the
+    /// ordinary bump-allocator sense — and a young cycle sweeps only that.
+    ///
+    /// # What it costs, stated
+    ///
+    /// The free list hands out space BELOW the floor, so an object allocated
+    /// into a hole left by a previous sweep is inside the old region and a young
+    /// cycle will not reclaim it until the next major. That is over-retention,
+    /// never unsoundness: such an object is still pre-marked and still swept by
+    /// a major. The real young space G2 describes is what removes that, and it
+    /// needs the page allocator.
+    ///
+    /// Invalidated by a relocation that moved anything — a slide rewrites the
+    /// low region wholesale, so the floor no longer separates anything. The
+    /// collection that does so arms [`Self::gen_force_major_next`].
+    gen_young_floor: AtomicUsize,
+    /// Live bytes below [`Self::gen_young_floor`], as of the last whole-heap
+    /// collection.
+    ///
+    /// A young cycle's sweep does not visit those objects, so it cannot count
+    /// them — and `allocated` (which drives `gc_rearm` and the collection
+    /// threshold) has to keep meaning "live bytes in this heap" or the trigger
+    /// mis-fires in whichever direction the omission points. Carried forward
+    /// instead of recomputed, which is the whole point.
+    gen_old_live_bytes: AtomicUsize,
+    /// Bytes of fresh allocation that fill the nursery, precomputed from
+    /// [`zgc_gen_nursery_percent`] so the allocation path never divides.
+    gen_nursery_bytes: AtomicUsize,
+    /// `allocated` as of the end of the last collection — the nursery's zero.
+    ///
+    /// `allocated - gen_nursery_watermark` is bytes allocated since, which on a
+    /// bump-first heap (G2c) is the nursery's size. Exact, O(1), and it needs no
+    /// counter of its own: `allocated` is already incremented on the allocation
+    /// path for the live-bytes trigger, and already read by `needs_gc`.
+    gen_nursery_watermark: AtomicUsize,
+    /// Did the nursery-size clause of `needs_gc` fire? Consumed by the
+    /// collection it asked for.
+    ///
+    /// A latch and not a `fetch_add`, because `needs_gc` is POLLED on the
+    /// allocation path: the condition stays true from the moment it is reached
+    /// until the collection actually runs, so counting on each observation would
+    /// report allocations, not collections.
+    gen_nursery_triggered: AtomicBool,
+    /// Young collections the nursery-size trigger asked for.
+    ///
+    /// The engagement counter for G2d: this at zero on a generational run means
+    /// every collection still came from the whole-heap trigger, so young cycles
+    /// are as rare as full collections were and the nursery is unbounded in
+    /// practice. That was the state before 2026-08-17.
+    gen_nursery_triggers: AtomicUsize,
+    /// Zero only a dead object's header on a young sweep — see
+    /// [`zgc_gen_header_zero`]. Per heap so a test can A/B it without deciding
+    /// the question for every other test in the binary.
+    gen_header_zero_only: AtomicBool,
+    /// Hand the free list one span per run of adjacent dead objects on a young
+    /// sweep — see [`zgc_gen_dead_runs`]. Per heap for the same reason.
+    gen_dead_runs_enabled: AtomicBool,
+    /// Bytes a young sweep did NOT memset because it zeroed headers only.
+    ///
+    /// The engagement counter for [`zgc_gen_header_zero`]: zero here with
+    /// `young_cycles` above zero means every dead object was still being memset
+    /// in full, i.e. the switch is on and inert. It is reported as *bytes* and
+    /// not as a count because bytes are the cost — the whole point is that this
+    /// term was O(reclaimed volume) rather than O(objects).
+    gen_zero_bytes_skipped: AtomicUsize,
+    /// Free-list spans a young sweep handed over, and dead objects they covered.
+    ///
+    /// The engagement pair for [`zgc_gen_dead_runs`]: `runs == objects` means no
+    /// two dead objects were ever adjacent, so the merge is on and buying
+    /// nothing. One number cannot say that — a small `runs` is equally
+    /// consistent with a cycle that found little garbage — which is why both are
+    /// kept.
+    gen_dead_runs: AtomicUsize,
+    /// Dead objects the runs in [`Self::gen_dead_runs`] covered.
+    gen_dead_objects: AtomicUsize,
+    /// The most the nursery has ever been over budget when a collection
+    /// finally ran, in bytes.
+    ///
+    /// # Why this is a gauge and not a bug
+    ///
+    /// [`zgc_gen_nursery_percent`] is a TRIGGER: `needs_gc` answers `true` and
+    /// the mutator keeps allocating until the VM reaches a safepoint and decides
+    /// to collect. So the nursery passes its budget by however much is allocated
+    /// in that window, and G2's open list has carried "a hard ceiling rather than
+    /// a trigger" ever since — with no number, which is the same as no priority.
+    ///
+    /// **A ceiling is not implementable where this trigger lives.** Refusing the
+    /// allocation would turn a servable request into an `OutOfMemoryError`, and
+    /// collecting on the spot needs a safepoint the allocation path cannot take.
+    /// A real ceiling therefore needs an allocation-site safepoint poll, which is
+    /// a VM-wide change and not a collector one. This measures what that change
+    /// would be worth: an overshoot that is a few percent of the budget prices
+    /// the item at nothing, and one that is a multiple of it prices it high.
+    ///
+    /// Reported beside the budget it is measured against, because "17 MB over" is
+    /// meaningless without it.
+    gen_nursery_overshoot_max: AtomicUsize,
+    /// Survivors a relocating cycle promoted by moving them below the nursery
+    /// floor, cumulative.
+    ///
+    /// The engagement counter for G2's promotion: a run with `compaction_cycles`
+    /// greater than zero and this at zero is one where the slide ran and the
+    /// nursery was not re-established behind it, which is the state before
+    /// 2026-08-17 (the floor was dropped and the next cycle forced to be a
+    /// major).
+    gen_promotions_by_slide: AtomicUsize,
+    /// Registered objects a young cycle's sweep did NOT visit, cumulative.
+    ///
+    /// The engagement counter for the nursery floor, and it exists because the
+    /// floor is exactly the kind of feature that can be on and inert: if
+    /// `gen_young_floor` never advances past 0, `for_each_base_from(0, ..)` is the
+    /// unbounded loop and every test still passes. A run with `young_cycles > 0`
+    /// and `sweep_skipped = 0` swept the whole registry on every young cycle,
+    /// which is the state the 2026-08-17 measurement was in.
+    gen_sweep_skipped: AtomicUsize,
     /// Has any object been promoted yet? The card barrier's gate.
     ///
     /// # Why a flag and not a lock
@@ -3110,7 +3282,7 @@ impl ZgcRealHeap {
         // and `alloc_raw` is the single allocation chokepoint.
         let arena_base = arena.base_ptr() as usize;
         let arena_end = arena_base.saturating_add(arena.capacity());
-        Self {
+        let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(
                 cratonvm_types::FIRST_LAYOUT_DOMAIN,
             ),
@@ -3177,10 +3349,28 @@ impl ZgcRealHeap {
             remembered: remembered::ZRememberedSetTable::new(),
             old_page_ids: Mutex::new(Vec::new()),
             relocation_enabled: AtomicBool::new(Self::relocation_requested_by_default()),
+            // NOTE: the arena's `prefer_bump` is seeded to match at the end of
+            // `with_capacity` -- it cannot be set here because the arena is being
+            // moved into this literal. `set_generational_enabled` keeps the two in
+            // step from then on.
             generational_enabled: AtomicBool::new(zgc_generational_enabled()),
             gen_promotion_age: std::sync::atomic::AtomicU32::new(zgc_gen_promotion_age()),
             gen_minors_per_major: AtomicUsize::new(zgc_gen_minors_per_major()),
             gen_force_major_next: AtomicBool::new(false),
+            gen_nursery_bytes: AtomicUsize::new(cap / 100 * zgc_gen_nursery_percent()),
+            gen_nursery_watermark: AtomicUsize::new(0),
+            gen_nursery_triggered: AtomicBool::new(false),
+            gen_nursery_triggers: AtomicUsize::new(0),
+            gen_nursery_overshoot_max: AtomicUsize::new(0),
+            gen_header_zero_only: AtomicBool::new(zgc_gen_header_zero()),
+            gen_dead_runs_enabled: AtomicBool::new(zgc_gen_dead_runs()),
+            gen_zero_bytes_skipped: AtomicUsize::new(0),
+            gen_dead_runs: AtomicUsize::new(0),
+            gen_dead_objects: AtomicUsize::new(0),
+            gen_promotions_by_slide: AtomicUsize::new(0),
+            gen_sweep_skipped: AtomicUsize::new(0),
+            gen_young_floor: AtomicUsize::new(0),
+            gen_old_live_bytes: AtomicUsize::new(0),
             has_old_objects: AtomicBool::new(false),
             young_cycles: AtomicUsize::new(0),
             minors_since_major: AtomicUsize::new(0),
@@ -3208,7 +3398,15 @@ impl ZgcRealHeap {
             // grepping `ZgcRealHeap {` across the workspace.
             tlabs: ZArenaTlabRegistry::for_capacity(cap),
             tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
+        };
+        // G2c: seed the arena's allocation policy to match the mode the flag just
+        // chose. `set_generational_enabled` keeps them in step afterwards; doing
+        // it here rather than inside the literal is only because the arena is
+        // being moved into it.
+        if heap.generational_enabled.load(Ordering::Relaxed) {
+            heap.arena.lock().set_prefer_bump(true);
         }
+        heap
     }
 
     // =====================================================================
@@ -4031,11 +4229,12 @@ impl ZgcRealHeap {
             // `ZMarkContext::is_in_heap` applies to every child pointer.
             return;
         }
-        // Bucket by address so concurrent mutators spread across the ingress
-        // rather than contending on one mutex. `ZMarkIngress::push` masks this
-        // into its bucket count, so any well-distributed key works; the
-        // address shifted past the object-alignment zeros is the cheapest one
-        // available here.
+        // Bucket by THREAD, not by address -- see `satb_ingress_slot`. Any
+        // well-distributed key is correct here (`drain_into` empties every
+        // bucket, so the choice is pure performance), and a per-thread key is the
+        // one that actually separates mutators: an address key collides whenever
+        // two threads store into the same region, and makes each thread cycle
+        // through all 16 locks instead of reusing one.
         // THE HANDOFF COUNT COMES OUT OF THE BUCKET'S OWN LOCK.
         //
         // This was `self.mark_ingress_pushes.fetch_add(1, Relaxed)` -- a
@@ -4052,7 +4251,7 @@ impl ZgcRealHeap {
         // spread over them, handoffs are correspondingly rarer per bucket and
         // about as frequent overall. `Z_SATB_HANDOFF_INTERVAL` is divided by the
         // bucket count for that reason; see its own note.
-        let n = self.mark_ingress.push(old_addr >> 3, old_addr as u64);
+        let n = self.mark_ingress.push(satb_ingress_slot(), old_addr as u64);
         if n % Z_SATB_HANDOFF_PER_BUCKET == 0 {
             self.hand_satb_batch_to_the_marker();
         }
@@ -4905,6 +5104,26 @@ impl ZgcRealHeap {
     /// them differently.
     pub fn set_generational_enabled(&self, on: bool) {
         self.generational_enabled.store(on, Ordering::Relaxed);
+        // ---- G2c: THE NURSERY HAS TO BE WHERE ALLOCATION GOES -------------
+        //
+        // `Arena::alloc` serves the free list before the bump cursor, and that is
+        // the right default -- after a sweep that could not move survivors, hole
+        // reuse is the only thing keeping the arena from ratcheting. It is the
+        // wrong default for a nursery: a young cycle's sweep is bounded below by
+        // `gen_young_floor`, so an object the free list places BELOW the floor is
+        // in the old region and no young cycle reclaims it. It waits for a major,
+        // which is precisely the cost G2a had to document.
+        //
+        // Bump-first closes that. It is a preference and not a wall -- see
+        // `Arena::prefer_bump` -- so it cannot turn a servable allocation into an
+        // OutOfMemoryError, only change which space serves it; and the holes below
+        // the floor are recovered by the same slide that promotes the nursery's
+        // survivors out.
+        //
+        // Set here rather than in the constructor so the flag and the arena
+        // cannot disagree: every path that turns the mode on or off, including a
+        // test, goes through this one method.
+        self.arena.lock().set_prefer_bump(on);
         if !on {
             self.reset_generational_state();
         }
@@ -4959,6 +5178,80 @@ impl ZgcRealHeap {
             self.gen_remembered_roots.load(Ordering::Relaxed),
             self.gen_promotions.load(Ordering::Relaxed),
             self.gen_recards_after_relocation.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The nursery's counters -- `(sweep_skipped, young_floor, old_live_bytes)`.
+    ///
+    /// `sweep_skipped` is the engagement counter: see the field. Zero with
+    /// `young_cycles > 0` means the floor never moved and every young cycle swept
+    /// the whole registry.
+    pub fn nursery_stats(&self) -> (usize, usize, usize) {
+        (
+            self.gen_sweep_skipped.load(Ordering::Relaxed),
+            self.gen_young_floor.load(Ordering::Relaxed),
+            self.gen_old_live_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Survivors promoted by a slide -- G2's engagement counter. See
+    /// [`Self::gen_promotions_by_slide`].
+    /// Zero only a dead object's header on a young sweep — see
+    /// [`zgc_gen_header_zero`]. Seeded from `CRATONVM_ZGC_GEN_HEADER_ZERO`.
+    pub fn set_gen_header_zero_only(&self, on: bool) {
+        self.gen_header_zero_only.store(on, Ordering::Relaxed);
+    }
+
+    /// Merge adjacent dead spans on a young sweep — see [`zgc_gen_dead_runs`].
+    /// Seeded from `CRATONVM_ZGC_GEN_DEAD_RUNS`.
+    pub fn set_gen_dead_runs_enabled(&self, on: bool) {
+        self.gen_dead_runs_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// `(bytes_not_memset, free_list_runs, dead_objects_those_runs_covered)` —
+    /// the engagement counters for the two young-sweep cost reductions.
+    ///
+    /// Read them the way their fields say: `bytes_not_memset == 0` with
+    /// `young_cycles > 0` means the header-only zeroing is inert, and
+    /// `runs == objects` means the run merge is.
+    pub fn gen_sweep_cost_stats(&self) -> (usize, usize, usize) {
+        (
+            self.gen_zero_bytes_skipped.load(Ordering::Relaxed),
+            self.gen_dead_runs.load(Ordering::Relaxed),
+            self.gen_dead_objects.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn promotions_by_slide(&self) -> usize {
+        self.gen_promotions_by_slide.load(Ordering::Relaxed)
+    }
+
+    /// `(collections the nursery trigger asked for, the nursery budget in bytes)`
+    /// -- G2d's engagement counter. Zero triggers on a generational run means
+    /// every collection still came from the whole-heap predicate, so young cycles
+    /// are as rare as full collections were.
+    /// Size the nursery directly, in bytes — see [`zgc_gen_nursery_percent`] for
+    /// the percentage this is normally derived from, and `0` to disable the
+    /// trigger.
+    ///
+    /// Per heap for the reason `set_relocation_enabled` is: the percentage is
+    /// process-wide and latched on first read, so a test that set it would decide
+    /// the question for every other test in the binary.
+    pub fn set_gen_nursery_bytes(&self, bytes: usize) {
+        self.gen_nursery_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The worst the nursery has been over its budget when a collection ran —
+    /// see [`Self::gen_nursery_overshoot_max`]. Read against the budget on
+    /// [`Self::nursery_trigger_stats`]; alone it says nothing.
+    pub fn nursery_overshoot_max(&self) -> usize {
+        self.gen_nursery_overshoot_max.load(Ordering::Relaxed)
+    }
+
+    pub fn nursery_trigger_stats(&self) -> (usize, usize) {
+        (
+            self.gen_nursery_triggers.load(Ordering::Relaxed),
+            self.gen_nursery_bytes.load(Ordering::Relaxed),
         )
     }
 
@@ -5876,6 +6169,23 @@ impl ZgcRealHeap {
             for (from, to) in &pairs {
                 reloc.insert(*from, *to);
             }
+        }
+        // `CRATONVM_DBG_VACATED_FRAMES`: the same pairs with the class each
+        // object has at its DESTINATION, kept for the whole run so a use of the
+        // vacated address can still be judged after the allocator has handed
+        // the space out again. See `gc_quiescence::MOVED_HISTORY`.
+        if crate::gc_quiescence::vacated_frames_enabled() {
+            let classed: Vec<(usize, usize, u32)> = pairs
+                .iter()
+                .map(|(from, to)| {
+                    (
+                        *from,
+                        *to,
+                        self.header_ref(*to as *mut u8).class_id.as_u32(),
+                    )
+                })
+                .collect();
+            crate::gc_quiescence::record_moved_history(&classed);
         }
 
         if unwalkable > 0 {
@@ -8513,6 +8823,42 @@ const Z_SATB_HANDOFF_PER_BUCKET: usize =
         1
     };
 
+/// A stable per-thread ingress slot, so SATB pushes distribute by THREAD.
+///
+/// # Why not by address, which is what this used
+///
+/// `ZMarkIngress` buckets its queues across [`mark::Z_MARK_INGRESS_BUCKETS`]
+/// mutexes so mutators publishing SATB work land on different locks. The key was
+/// `old_addr >> 3`, which distributes over the HEAP -- so two threads storing
+/// into the same region collide, and every thread visits all 16 buckets in turn
+/// and takes 16 cold locks instead of one warm one. Distributing by *thread*
+/// gives each mutator its own bucket, which is what "per-thread mark buffers"
+/// (C4) is actually asking for.
+///
+/// # Why this is a `usize` and not the buffer itself
+///
+/// C4's stated shape is a per-thread [`mark::ZMarkMutatorBuffer`], which removes
+/// the lock entirely. It also introduces a lifetime hazard this does not: a
+/// detached buffer dropped non-empty leaves objects **marked and unscanned**, and
+/// the mark bit is what dedups them, so nothing will ever scan them again — a
+/// use-after-free at thread exit. Getting that right needs the buffer's `Drop` to
+/// flush into a heap that may already be gone, i.e. a `Weak` upgrade and a
+/// registration protocol.
+///
+/// A thread-local holding one `usize` has no `Drop`, cannot outlive anything, and
+/// captures the distribution half of the benefit. The buffer remains open work.
+///
+/// Values are handed out by a process-wide counter and never reused, which is
+/// fine: only `slot & mask` is consulted, so the counter wrapping would merely
+/// re-collide and never be wrong.
+fn satb_ingress_slot() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static SLOT: usize = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    SLOT.with(|s| *s)
+}
+
 /// Words in the skip-set Bloom filter -- see
 /// [`ZgcRealHeap::mark_ref_skip_bloom`]. 512 words is 32768 bits and 4 KiB per
 /// heap; with 1000 `Reference` objects and two bits each the false-positive rate
@@ -8581,6 +8927,44 @@ fn zgc_gen_promotion_age() -> u32 {
     })
 }
 
+/// `CRATONVM_ZGC_GEN_NURSERY_PERCENT` -- the nursery's size as a percentage of
+/// heap capacity. Default 10; `0` is the kill switch and restores the
+/// whole-heap-only trigger.
+///
+/// # Why a young cycle needs a trigger of its own
+///
+/// `needs_gc`'s two clauses are both about the WHOLE HEAP -- live bytes against
+/// `gc_threshold`, and allocatable space via `headroom_low`. Neither asks whether
+/// enough has been allocated *since the last collection* to be worth a young
+/// cycle, so before this a young cycle happened only when a full collection would
+/// have. Young cycles were therefore exactly as rare as the collections they were
+/// meant to replace: the 2026-08-17 measurement recorded **six** in a 600-round
+/// run, and a generational split that runs six times cannot pay for the barrier
+/// it costs on every store.
+///
+/// # Why 10 and not `Z_DEFAULT_YOUNG_FRACTION`'s 25
+///
+/// `generation::Z_DEFAULT_YOUNG_FRACTION` is 0.25 and describes a young
+/// generation's share of a heap it *owns* -- a sized space that survivors are
+/// evacuated out of. This nursery is not that: it is the tail of one arena, it is
+/// reclaimed by a bounded sweep rather than by a cursor reset, and its cost is
+/// proportional to the objects in it. A smaller budget therefore buys the thing
+/// this trigger is for (frequent, cheap young cycles) where 25% would give six
+/// large ones on a 1.2 GB heap -- which is what the measurement already showed.
+/// Revisit when a young cycle reclaims by resetting a cursor.
+fn zgc_gen_nursery_percent() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_GEN_NURSERY_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(p) => p.min(100),
+            None => 10,
+        }
+    })
+}
+
 /// `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` -- young cycles allowed between
 /// whole-heap ones. Default [`generation::Z_DEFAULT_MINORS_PER_MAJOR`] (8).
 ///
@@ -8601,6 +8985,96 @@ fn zgc_gen_minors_per_major() -> usize {
         {
             Some(n) => n,
             None => generation::Z_DEFAULT_MINORS_PER_MAJOR as usize,
+        }
+    })
+}
+
+/// `CRATONVM_ZGC_GEN_HEADER_ZERO` -- on a young sweep, zero a dead object's
+/// **header** rather than its whole body. **Default on**; `0`/`off`/`false`/`no`
+/// restores the whole-body memset byte for byte.
+///
+/// # Why the body zeroing was never buying anything
+///
+/// The sweep's own comment gives the reason for zeroing: "so a later scan can't
+/// see a stale header". That reason is satisfied entirely by the header --
+/// `HEADER_SIZE` is 16 bytes and an `ObjectHeader` is exactly those 16, so a
+/// zeroed header is `class_id=0, num_slots=0`, which is the identical
+/// "well-formed ALL-ZERO object" a reader of a vacated span sees today (see
+/// `corpse_ledger`). **The body is only reachable THROUGH the header**: every
+/// field read sizes the object from `num_slots`, every extent walk sizes it from
+/// `alloc_size(header)`, and every membership test goes through the registry the
+/// sweep has just removed the base from. Nothing can reach past a zeroed header
+/// to find the bytes this stops writing.
+///
+/// The other candidate reason -- "a reused block may contain stale bytes" -- is
+/// already handled at the other end, and unconditionally: `alloc_raw` memsets
+/// every allocation it hands out, and `tlab_refill` memsets a whole chunk. So
+/// the sweep's body zeroing is *redundant* with the allocator's, and a dead
+/// object was being memset twice: once when it died, once when its span was
+/// handed out again.
+///
+/// # Why it is worth removing
+///
+/// It is a memset of the **entire reclaimed volume**, inside the pause, on every
+/// cycle. §3b of `zgc-concurrent-and-generational-plan-20260813.md` measured
+/// `sweep` at 182 ms of a 309 ms mean pause and found the generation split did
+/// not move it; a young cycle that reclaims 900 MB spends that pause writing 900
+/// MB of zeroes at memory bandwidth whatever the split says. This is the part of
+/// "reclaim by resetting a cursor" that needs no page allocator.
+///
+/// # Scoped to a young cycle on purpose
+///
+/// A whole-heap cycle is byte-for-byte unchanged, so no default run moves. That
+/// is not a claim that the argument above is weaker for a major -- it is not --
+/// only that this lands during a gauntlet sweep, and the arm being measured is
+/// the one that is already opt-in. Promoting it is one condition, with its own
+/// measurement.
+fn zgc_gen_header_zero() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_GEN_HEADER_ZERO") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            }
+            None => true,
+        }
+    })
+}
+
+/// `CRATONVM_ZGC_GEN_DEAD_RUNS` -- on a young sweep, hand the free list one span
+/// per **run** of adjacent dead objects rather than one per object. **Default
+/// on**; `0`/`off`/`false`/`no` restores the per-object calls.
+///
+/// # Why this is free
+///
+/// The sweep walks the object-start bitmap ASCENDING -- which is already a
+/// correctness requirement, because the coalescer only sees adjacent dead spans
+/// as adjacent when they arrive in order. So the merge is a comparison against
+/// the previous span's end, and objects die in runs, so the runs are long.
+///
+/// # Why the result is identical
+///
+/// `coalesce_free_list` already merges exactly these spans into exactly these
+/// maximal runs a few statements later; this only does it before the entries
+/// exist rather than after. The tier a span routes to differs on the way in (a
+/// merged run is large where its members were small), and the coalescer
+/// normalises that too -- it rebuilds the list from `low_blocks_sorted`, so the
+/// post-coalesce state is the same set of spans in the same tiers either way.
+/// `an_arena_coalesces_pre_merged_runs_to_the_same_shape` asserts that rather
+/// than assuming it.
+///
+/// What it removes is the churn: 4.8M `push_block_routed` calls and a
+/// 4.8M-element sort inside the pause, replaced by a few thousand of each.
+fn zgc_gen_dead_runs() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_GEN_DEAD_RUNS") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            }
+            None => true,
         }
     })
 }
@@ -10065,8 +10539,9 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
             return;
         }
         // The count comes back from the bucket's own lock; there is no shared
-        // counter on this path either. See `satb_pre_barrier_slow`.
-        let _ = self.mark_ingress.push(absolute >> 3, absolute as u64);
+        // counter on this path either, and the key is per-thread for the same
+        // reason. See `satb_pre_barrier_slow` and `satb_ingress_slot`.
+        let _ = self.mark_ingress.push(satb_ingress_slot(), absolute as u64);
     }
 
     fn stats(&self) -> &barrier::ZBarrierStats {
@@ -10929,8 +11404,48 @@ impl GarbageCollector for ZgcRealHeap {
         //
         // Both keep the `gc_rearm` floor, so neither can fire a cycle per
         // allocation against a live set parked above the threshold.
-        a >= self.gc_rearm.load(Ordering::Relaxed)
+        if a >= self.gc_rearm.load(Ordering::Relaxed)
             && (a >= self.gc_threshold || self.headroom_low.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+
+        // ---- G2d: THE NURSERY IS FULL ------------------------------------
+        //
+        // Both clauses above are about the WHOLE HEAP: `gc_threshold` is live
+        // bytes and `headroom_low` is allocatable space. Neither ever asks "has
+        // enough been allocated since the last collection to be worth a young
+        // cycle?", so before this a young cycle happened only when a full
+        // collection would have — i.e. young cycles were exactly as rare as the
+        // collections they were meant to replace, and the generational split had
+        // no opportunity to pay for itself. The 2026-08-17 measurement saw six
+        // young cycles in a 600-round run for that reason.
+        //
+        // `allocated - watermark` is the nursery's size: `allocated` is already
+        // incremented on the allocation path and already loaded above, so this
+        // costs two relaxed loads and two compares on the miss.
+        //
+        // # Why this cannot storm, without consulting `gc_rearm`
+        //
+        // It deliberately does NOT go through the `gc_rearm` floor, because that
+        // floor is a quarter of remaining headroom and is therefore much larger
+        // than a nursery budget — ANDing them would make this clause
+        // unreachable. It does not need the floor: the watermark is reset at the
+        // end of every collection, so firing requires `budget` bytes of genuinely
+        // NEW allocation each time. A live set parked above the threshold cannot
+        // re-trigger it, which is the one thing `gc_rearm` exists to prevent.
+        if !self.generational_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let budget = self.gen_nursery_bytes.load(Ordering::Relaxed);
+        if budget == 0 {
+            return false; // the kill switch, see `zgc_gen_nursery_percent`
+        }
+        if a.saturating_sub(self.gen_nursery_watermark.load(Ordering::Relaxed)) >= budget {
+            self.gen_nursery_triggered.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     fn collect_garbage(
@@ -11059,6 +11574,16 @@ impl GarbageCollector for ZgcRealHeap {
         // the `minors_per_major` budget on cycles that saved nothing.
         let young_cycle =
             gen_on && !force_major && self.has_old_objects.load(Ordering::Relaxed);
+        // THE SWEEP FLOOR. On a young cycle the sweep visits only
+        // `[gen_young_floor, cursor)` -- see that field for why bounding the
+        // sweep by ADDRESS is the only way to bound it at all. `0` on a
+        // whole-heap cycle, and `for_each_base_from(0, ..)` is no bound, so both
+        // paths are one loop.
+        let sweep_floor = if young_cycle {
+            self.gen_young_floor.load(Ordering::Relaxed)
+        } else {
+            0
+        };
 
         // Clear all mark bits first (objects may carry a stale bit from a
         // prior cycle's survivors).
@@ -11449,14 +11974,56 @@ impl GarbageCollector for ZgcRealHeap {
         let mut unsizable = 0usize;
         // Survivors this sweep promoted out of the young generation.
         let mut gen_promoted = 0usize;
+        // Bases this sweep actually visited, for the nursery's engagement
+        // counter -- see `gen_sweep_skipped`.
+        let mut swept = 0usize;
+        // ---- G2e/G2f: THE TWO PER-DEAD-OBJECT COSTS -----------------------
+        //
+        // §3b measured `sweep` at 182 ms of a 309 ms mean pause and found the
+        // generation split did not move it. It did not, because a bounded sweep
+        // still pays both of these for every dead object it does visit, and both
+        // are the reason a young cycle costs what a major costs:
+        //
+        //  * a memset of the object's WHOLE BODY -- O(reclaimed volume), i.e. a
+        //    900 MB memset on a cycle that reclaims 900 MB, inside the pause;
+        //  * a `push_block_routed` per object, and then a sort over all of them
+        //    in `coalesce_free_list`.
+        //
+        // Both are removed below. `zgc_gen_header_zero` and `zgc_gen_dead_runs`
+        // carry the arguments; both are read here once rather than per object,
+        // and both are ANDed with `young_cycle` so a whole-heap sweep is
+        // byte-for-byte what it was.
+        let zero_header_only = young_cycle && self.gen_header_zero_only.load(Ordering::Relaxed);
+        let merge_dead_runs = young_cycle && self.gen_dead_runs_enabled.load(Ordering::Relaxed);
+        // The run being accumulated, ARENA-RELATIVE, and the two engagement
+        // counters. `None` between runs and after a flush.
+        let mut dead_run: Option<(usize, usize)> = None;
+        let mut dead_runs = 0usize;
+        let mut dead_in_runs = 0usize;
+        let mut zero_bytes_skipped = 0usize;
         {
             let mut arena = self.arena.lock();
             let arena_base = arena.base_ptr() as usize;
+            // WHERE THE LARGE-OBJECT END BEGINS. `Arena::add_free_block` routes
+            // a span by its offset and bounds a LOW span by the low cursor, so a
+            // run must never grow across this line: it would be pushed onto the
+            // low tier while covering high-region bytes, and the arena would
+            // serve the same memory from the free list and the high cursor both.
+            // The two ends share one middle, so this is reachable rather than
+            // hypothetical.
+            let high_floor = arena.high_cursor();
             // ASCENDING, which the coalescer below depends on: adjacent dead
-            // objects hand adjacent spans to `add_free_block`. `for_each_base`
-            // preserves `bases()`'s order exactly -- the bitmap scan IS the
-            // ascending order.
-            registered.for_each_base(|base| {
+            // objects hand adjacent spans to `add_free_block`. The bitmap scan IS
+            // the ascending order.
+            //
+            // FROM `sweep_floor`: on a young cycle everything below it is old, was
+            // pre-marked above, and is retained without being visited -- which is
+            // what makes a young sweep O(young) rather than O(registry). The
+            // 2026-08-17 measurement put that sweep at 182 ms of a 309 ms mean
+            // pause, unchanged by the generation split, because it walked every
+            // registered object whatever the split said.
+            registered.for_each_base_from(sweep_floor, |base| {
+                swept += 1;
                 let header = self.header_mut(base as *mut u8);
                 // A header this collector cannot size must not be swept. The
                 // dead arm below `write_bytes`es `size` bytes and hands the
@@ -11490,18 +12057,79 @@ impl GarbageCollector for ZgcRealHeap {
                         gen_promoted += 1;
                     }
                 } else {
-                    // Dead: zero the bytes (so a later scan can't see a stale
-                    // header) and return the span to the arena free list.
+                    // Dead: zero it (so a later scan can't see a stale header)
+                    // and return the span to the arena free list.
+                    //
+                    // THE HEADER IS THE WHOLE REASON -- see
+                    // `zgc_gen_header_zero`. `HEADER_SIZE` is the entire
+                    // `ObjectHeader`, so this leaves `class_id=0, num_slots=0`,
+                    // which is the identical corpse a reader of a vacated span
+                    // met before; and the body is only reachable through that
+                    // header, which is why the bytes below it need not be
+                    // touched. `.min(size)` is belt-and-braces: no allocation is
+                    // shorter than its header, and a `write_bytes` past the end
+                    // of one would be exactly the bug `alloc_size` refuses
+                    // above.
+                    //
                     // SAFETY: `base` is a registered allocation of `size`
-                    // bytes inside the arena.
-                    unsafe { std::ptr::write_bytes(base as *mut u8, 0, size) };
+                    // bytes inside the arena, and both arms write at most
+                    // `size` of them.
+                    let zero = if zero_header_only {
+                        let n = HEADER_SIZE.min(size);
+                        zero_bytes_skipped += size - n;
+                        n
+                    } else {
+                        size
+                    };
+                    unsafe { std::ptr::write_bytes(base as *mut u8, 0, zero) };
                     if base >= arena_base {
-                        arena.add_free_block(base - arena_base, size);
+                        let off = base - arena_base;
+                        // A large object never joins a run -- see `high_floor`.
+                        let mergeable =
+                            merge_dead_runs && off < high_floor && off + size <= high_floor;
+                        if mergeable {
+                            // ONE SPAN PER RUN. The walk is ascending, so a dead
+                            // object adjacent to the previous one extends it;
+                            // anything else flushes and starts a new run. See
+                            // `zgc_gen_dead_runs` for why the post-coalesce
+                            // result is the same either way.
+                            dead_in_runs += 1;
+                            match dead_run {
+                                Some((ro, rl)) if ro + rl == off => {
+                                    dead_run = Some((ro, rl + size));
+                                }
+                                Some((ro, rl)) => {
+                                    arena.add_free_block(ro, rl);
+                                    dead_runs += 1;
+                                    dead_run = Some((off, size));
+                                }
+                                None => dead_run = Some((off, size)),
+                            }
+                        } else {
+                            // FLUSH FIRST. The coalescer only sees adjacent
+                            // spans as adjacent because they arrive in ascending
+                            // order; adding this one ahead of the run below it
+                            // would break that ordering for the rest of the
+                            // cycle.
+                            if let Some((ro, rl)) = dead_run.take() {
+                                arena.add_free_block(ro, rl);
+                                dead_runs += 1;
+                            }
+                            arena.add_free_block(off, size);
+                        }
                     }
                     bytes_freed += size;
                     dead.push(base);
                 }
             });
+            // The last run has no successor to flush it. Missing this leaks the
+            // topmost run of garbage in every young cycle -- and it would not
+            // show up as a leak, because the cursor retraction below cannot
+            // reclaim a span that is not on the list.
+            if let Some((ro, rl)) = dead_run.take() {
+                arena.add_free_block(ro, rl);
+                dead_runs += 1;
+            }
 
             // Coalesce the free list into maximal spans — same rationale as
             // gen_heap's post-sweep coalescer. The loop above returns ONE
@@ -11578,6 +12206,37 @@ impl GarbageCollector for ZgcRealHeap {
         }
 
         // ---- PHASE G bookkeeping, after the sweep and before the log -----
+        //
+        // THE LIVE FIGURE HAS TO INCLUDE WHAT THE SWEEP DID NOT VISIT. A young
+        // cycle's `bytes_copied` counts only survivors at or above the floor, and
+        // `allocated` drives both `gc_rearm` and the collection threshold: left
+        // uncorrected the heap would read as nearly empty after every young
+        // cycle, and the trigger would stop firing until an allocation failed.
+        //
+        // `objects_copied` is deliberately NOT corrected: it is reported as
+        // "survivors this cycle examined", and a young cycle examined only the
+        // nursery.
+        let mut live_bytes = bytes_copied;
+        if young_cycle {
+            live_bytes = live_bytes
+                .saturating_add(self.gen_old_live_bytes.load(Ordering::Relaxed));
+            self.gen_sweep_skipped.fetch_add(
+                registered_count.saturating_sub(swept),
+                Ordering::Relaxed,
+            );
+        }
+        // The engagement counters for the two cost reductions, published
+        // whether or not this cycle was young -- so a run whose young cycles all
+        // ended up as majors reports zeroes rather than nothing.
+        if zero_bytes_skipped != 0 {
+            self.gen_zero_bytes_skipped
+                .fetch_add(zero_bytes_skipped, Ordering::Relaxed);
+        }
+        if dead_in_runs != 0 {
+            self.gen_dead_runs.fetch_add(dead_runs, Ordering::Relaxed);
+            self.gen_dead_objects
+                .fetch_add(dead_in_runs, Ordering::Relaxed);
+        }
         if gen_promoted != 0 {
             self.gen_promotions
                 .fetch_add(gen_promoted, Ordering::Relaxed);
@@ -11586,6 +12245,24 @@ impl GarbageCollector for ZgcRealHeap {
             // this bit set finds a table that already names the objects it has
             // to name.
             self.has_old_objects.store(true, Ordering::Relaxed);
+        }
+        if self.gen_nursery_triggered.swap(false, Ordering::Relaxed) {
+            self.gen_nursery_triggers.fetch_add(1, Ordering::Relaxed);
+            // HOW FAR PAST THE BUDGET THE NURSERY GOT. Measured from
+            // `self.allocated` -- which this collection has NOT reset yet, the
+            // reset being ~60 lines below -- against the same watermark and
+            // budget the trigger compared, which is likewise still the old one.
+            // Nobody allocates during the stop-the-world, so this is exactly the
+            // figure `needs_gc` last saw. See `gen_nursery_overshoot_max` for why this is a gauge
+            // on an open item rather than a defect.
+            let budget = self.gen_nursery_bytes.load(Ordering::Relaxed);
+            let grew = self
+                .allocated
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.gen_nursery_watermark.load(Ordering::Relaxed));
+            let over = grew.saturating_sub(budget);
+            self.gen_nursery_overshoot_max
+                .fetch_max(over, Ordering::Relaxed);
         }
         if young_cycle {
             self.young_cycles.fetch_add(1, Ordering::Relaxed);
@@ -11607,6 +12284,19 @@ impl GarbageCollector for ZgcRealHeap {
             // "young cycles since the whole heap was last examined", and any
             // full trace is such a time.
             self.minors_since_major.store(0, Ordering::Relaxed);
+            // AND THIS IS WHERE THE NURSERY BOUNDARY MOVES. A whole-heap cycle
+            // has just swept everything, so every survivor below the cursor is
+            // genuinely old and the bytes it just counted are the old live set.
+            // Read with the arena lock, after the sweep and both cursor
+            // retractions, so it is the cursor a mutator will actually allocate
+            // against.
+            let cursor = {
+                let arena = self.arena.lock();
+                arena.base_ptr() as usize + arena.used_low_for_compaction()
+            };
+            self.gen_young_floor.store(cursor, Ordering::Relaxed);
+            self.gen_old_live_bytes
+                .store(bytes_copied, Ordering::Relaxed);
         }
 
         if unsizable != 0 {
@@ -11634,7 +12324,13 @@ impl GarbageCollector for ZgcRealHeap {
         // Memory hygiene for the forwarding table, on the same pass that
         // decided which addresses are live. See `prune_relocations`.
         self.prune_relocations();
-        self.allocated.store(bytes_copied, Ordering::Relaxed);
+        self.allocated.store(live_bytes, Ordering::Relaxed);
+        // THE NURSERY'S ZERO. Reset on every collection, young or full, and from
+        // the same figure `allocated` was just given -- so "bytes allocated since
+        // the last collection" is exact rather than an estimate, and the trigger
+        // above cannot storm.
+        self.gen_nursery_watermark
+            .store(live_bytes, Ordering::Relaxed);
         // Re-arm the trigger: require at least a quarter of the remaining
         // headroom (min 64 KiB) of NEW allocation before the next
         // threshold-triggered collection, so a live set parked above the
@@ -11642,9 +12338,9 @@ impl GarbageCollector for ZgcRealHeap {
         // allocation (see `gc_rearm`). Allocation-failure GCs are driven by
         // the fallible alloc paths and ignore this gate.
         let cap = self.heap_capacity();
-        let headroom = cap.saturating_sub(bytes_copied);
+        let headroom = cap.saturating_sub(live_bytes);
         self.gc_rearm.store(
-            bytes_copied.saturating_add((headroom / 4).max(64 * 1024)),
+            live_bytes.saturating_add((headroom / 4).max(64 * 1024)),
             Ordering::Relaxed,
         );
         // Lower the allocatable-space latch: the sweep above has just
@@ -11707,12 +12403,17 @@ impl GarbageCollector for ZgcRealHeap {
         // callsite. Adopting the metrics module is a larger step — it has to be
         // fed from every phase, not just here — so this line stays standalone
         // until then; replace it wholesale at that point.
-        // THE SWEEP HAS JUST MADE EVERY MARK BIT CLEAR. It visited every
-        // registered object: survivors had `GC_FLAG_MARKED` cleared, corpses
-        // were zeroed, and the object it refuses to size had the bit cleared
-        // too. That is what lets the next mark start skip a full registry walk
-        // -- see `conc_bits_known_clear`.
-        self.conc_bits_known_clear.store(true, Ordering::Release);
+        // THE SWEEP HAS JUST MADE EVERY MARK BIT CLEAR -- but only on a cycle
+        // whose sweep was UNBOUNDED. A young cycle skips everything below
+        // `sweep_floor`, and those objects were pre-marked above, so their bits
+        // are still SET. Claiming otherwise would let the next mark start skip
+        // its clearing walk and hand the sweep a mark set carrying a previous
+        // cycle's bits, which retains whatever the old generation reached.
+        //
+        // See `conc_bits_known_clear`; the debug build walks anyway and
+        // `debug_assert`s this rather than trusting it.
+        self.conc_bits_known_clear
+            .store(sweep_floor == 0, Ordering::Release);
 
         let sweep_us = clock.lap();
         if let Some(started) = gc_started {
@@ -11736,7 +12437,9 @@ impl GarbageCollector for ZgcRealHeap {
             // retained WITHOUT tracing -- the work it did not do -- and
             // `major/+N` the objects it promoted.
             let gen = if young_cycle {
-                format!("young/{gen_old_retained}")
+                // `swept/registered` is the nursery: how much of the registry the
+                // sweep actually walked. Equal numbers mean the floor is inert.
+                format!("young/{gen_old_retained} swept={swept}/{registered_count}")
             } else if gen_on {
                 format!("major/+{gen_promoted}")
             } else {
@@ -11808,6 +12511,61 @@ impl GarbageCollector for ZgcRealHeap {
                 // the headers and are unaffected by the slide; only a card whose
                 // object moved has been invalidated in the direction that loses
                 // an edge.
+                if gen_on {
+                    // ---- G2: THE SLIDE **IS** THE PROMOTION ---------------
+                    //
+                    // The first version of this dropped the floor and forced the
+                    // next cycle to be a major, on the reasoning that a slide
+                    // rewrites the low region so an address no longer says which
+                    // generation an object is in. That is backwards: a slide
+                    // rewrites the low region into exactly the shape a nursery
+                    // wants.
+                    //
+                    // `compact_low_to` packs survivors from the first selected
+                    // page upward and then drops the cursor to the end of the
+                    // compacted region, so afterwards **every live object is
+                    // below the cursor** -- the ones on unselected dense pages
+                    // never moved and are below it too. Setting the floor there
+                    // makes every survivor old and leaves the nursery EMPTY, so
+                    // the next young cycle sweeps only what has been allocated
+                    // since. That is a young space reclaimed by moving its
+                    // survivors out, which is what G2 is.
+                    //
+                    // # And it carries NO floating garbage
+                    //
+                    // The registry at this point holds live objects only -- the
+                    // sweep pruned the dead a few statements ago -- so declaring
+                    // everything below the cursor old retains nothing that is
+                    // not reachable. Compare the ordinary (non-relocating) floor
+                    // advance, which happens at the end of a whole-heap cycle and
+                    // has the same property for the same reason.
+                    //
+                    // # Why this needs no JIT load barrier
+                    //
+                    // Because the move is at a SAFEPOINT and the collector
+                    // rewrites every slot itself. `zgc_relocation_permitted`
+                    // already decided this configuration is allowed --  stage (a)
+                    // of `zgc-jit-load-barrier.md` landed 2026-08-13 and
+                    // `zgc_codegen_honours_read_barrier()` is true -- and
+                    // `relocate_stw` refuses anyway while a JIT frame is on a
+                    // stack. Promotion inherits both. A load barrier is what
+                    // CONCURRENT relocation needs, not this.
+                    let post_slide = {
+                        let arena = self.arena.lock();
+                        arena.base_ptr() as usize + arena.used_low_for_compaction()
+                    };
+                    self.gen_young_floor.store(post_slide, Ordering::Relaxed);
+                    self.gen_old_live_bytes
+                        .store(bytes_copied, Ordering::Relaxed);
+                    self.gen_promotions_by_slide
+                        .fetch_add(moved, Ordering::Relaxed);
+                    tracing::debug!(
+                        target: "zgc",
+                        moved,
+                        floor = post_slide,
+                        "zgc G2: the slide promoted its survivors; nursery empty"
+                    );
+                }
                 if gen_on && self.has_old_objects.load(Ordering::Relaxed) {
                     let carded = self.recard_relocated_old_objects(&map, promo_age);
                     tracing::debug!(
@@ -14490,6 +15248,41 @@ pub(crate) mod tests {
         );
     }
 
+    /// **The SATB ingress slot must be STABLE within a thread and DIFFERENT
+    /// between threads.**
+    ///
+    /// Both halves, because each alone is the property being wrong. If it varied
+    /// within a thread, that thread would cycle through all 16 bucket locks
+    /// instead of reusing one warm one — worse than the address key it replaced.
+    /// If it were the same across threads, every mutator would contend on one
+    /// mutex and the bucketing would be decorative, which is exactly the inert
+    /// state this change exists to leave.
+    #[test]
+    fn the_satb_ingress_slot_is_per_thread_and_stable() {
+        let mine = satb_ingress_slot();
+        assert_eq!(mine, satb_ingress_slot(), "stable within a thread");
+        assert_eq!(mine, satb_ingress_slot(), "and on a third call");
+
+        let others: Vec<usize> = (0..4)
+            .map(|_| std::thread::spawn(satb_ingress_slot))
+            .map(|h| h.join().expect("slot thread"))
+            .collect();
+        for (i, o) in others.iter().enumerate() {
+            assert_ne!(
+                *o, mine,
+                "thread {i} must not share this thread's slot, or every mutator                  contends on one bucket mutex and the striping is decorative"
+            );
+        }
+        let mut sorted = others.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            others.len(),
+            "and the threads must not share slots with each other: {others:?}"
+        );
+    }
+
     // -- C4: the SATB handoff, off the shared counter -----------------------
 
     /// **The SATB ingress must still hand off in batches once the count came out
@@ -14695,6 +15488,266 @@ pub(crate) mod tests {
         // SAFETY: the caller took `addr` out of an `ObjectRef` in the same test,
         // and relocation is off in `gen_heap_for_test`, so it is still a base.
         unsafe { ObjectRef::from_raw(addr as *mut u8) }
+    }
+
+    /// Promote one object so `has_old_objects` is armed and the NEXT collection
+    /// is a young cycle, and return it re-rooted.
+    ///
+    /// Every test below needs this and none of them is about it: a young cycle
+    /// only happens once something has been promoted, so a fixture that skips
+    /// this measures a whole-heap sweep and passes for the wrong reason.
+    fn gen_promote_one(heap: &ZgcRealHeap) -> ObjectRef {
+        let keeper = heap.alloc_object(ClassId::new(1), 1);
+        let mut roots = [keeper];
+        let _ = gen_collect(heap, &mut roots);
+        let keeper = roots[0];
+        assert!(
+            heap.header_ref(keeper.as_ptr()).gc_age() >= 1,
+            "the keeper must be old, or the next collection is not a young cycle"
+        );
+        keeper
+    }
+
+    /// Read the first 16 bytes of an object's BODY — the two words after the
+    /// header. Raw, because the point is what the sweep did to the memory and
+    /// not what the field API would make of it.
+    fn gen_body_words(addr: usize) -> (u64, u64) {
+        // SAFETY: `addr` is an allocation of at least `HEADER_SIZE + 16` bytes
+        // (the caller allocated two slots), inside the arena, which outlives the
+        // test.
+        unsafe {
+            (
+                std::ptr::read_unaligned((addr + HEADER_SIZE) as *const u64),
+                std::ptr::read_unaligned((addr + HEADER_SIZE + 8) as *const u64),
+            )
+        }
+    }
+
+    /// **A young sweep zeroes a dead object's HEADER and leaves its body.**
+    ///
+    /// # Why zeroing the header is the whole of the property
+    ///
+    /// The sweep's own comment gives the reason for zeroing: "so a later scan
+    /// can't see a stale header". `HEADER_SIZE` is the entire `ObjectHeader`
+    /// (`class_id`, `shape`, `mark_word` — 4 + 4 + 8), and `ARRAY_DATA_OFFSET ==
+    /// HEADER_SIZE`, so an array's length lives in `shape` and not in a body
+    /// prefix. Zeroing those 16 bytes therefore produces exactly the
+    /// `class_id=0, num_slots=0` corpse a reader of a vacated span met before —
+    /// and since every route to the body sizes the object from that header, no
+    /// reader can reach the bytes this stops writing.
+    ///
+    /// What it removes is a memset of the whole reclaimed volume, inside the
+    /// pause, on every cycle. See `zgc_gen_header_zero`.
+    ///
+    /// Asserted on the BODY and not on a counter, because a counter would pass
+    /// against a sweep that skipped the memset *and* the header.
+    #[test]
+    fn a_young_sweep_zeroes_a_dead_objects_header_and_leaves_its_body() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let keeper = gen_promote_one(&heap);
+
+        // A doomed object in the nursery, with a body nothing can mistake for
+        // zero.
+        let doomed = heap.alloc_object(ClassId::new(2), 2);
+        let doomed_addr = doomed.as_ptr() as usize;
+        heap.set_field(doomed, 0, Value::Long(0x5A5A_5A5A_5A5A_5A5A));
+        heap.set_field(doomed, 1, Value::Long(0x3C3C_3C3C_3C3C_3C3C));
+        let before = gen_body_words(doomed_addr);
+        assert_ne!(
+            before,
+            (0, 0),
+            "the fixture must write a NONZERO body, or the assertion below \
+             cannot fail and this test proves nothing"
+        );
+
+        let mut roots = [keeper];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(
+            heap.generational_stats().0,
+            1,
+            "that must have been a YOUNG cycle -- a whole-heap sweep is \
+             deliberately left byte-for-byte alone, so this test would be \
+             asserting about the wrong arm"
+        );
+        assert!(
+            heap.is_object_address(doomed_addr).is_none(),
+            "the doomed object must actually have been swept"
+        );
+
+        // The header is gone.
+        assert_eq!(
+            heap.header_ref(doomed_addr as *mut u8).class_id.as_u32(),
+            0,
+            "the header must be zeroed -- that is the property the body zeroing \
+             was standing in for"
+        );
+        // The body is not.
+        assert_eq!(
+            gen_body_words(doomed_addr),
+            before,
+            "the body must be untouched: it is unreachable behind a zeroed \
+             header, and writing it is a memset of the whole reclaimed volume"
+        );
+        let (skipped, _, _) = heap.gen_sweep_cost_stats();
+        assert!(
+            skipped >= 16,
+            "and the bytes NOT memset must be counted, or 'this is engaged' is \
+             an inference: got {skipped}"
+        );
+    }
+
+    /// The other direction, which is what makes the test above mean something:
+    /// with the switch off the body IS zeroed, so the fixture really does place
+    /// a dead object where a young sweep reaches it.
+    ///
+    /// Without this arm, an object the sweep never visited at all would pass the
+    /// test above -- its body would be "untouched" for the wrong reason.
+    #[test]
+    fn the_kill_switch_restores_the_whole_body_memset() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        heap.set_gen_header_zero_only(false);
+        let keeper = gen_promote_one(&heap);
+
+        let doomed = heap.alloc_object(ClassId::new(2), 2);
+        let doomed_addr = doomed.as_ptr() as usize;
+        heap.set_field(doomed, 0, Value::Long(0x5A5A_5A5A_5A5A_5A5A));
+        heap.set_field(doomed, 1, Value::Long(0x3C3C_3C3C_3C3C_3C3C));
+        assert_ne!(gen_body_words(doomed_addr), (0, 0), "fixture");
+
+        let mut roots = [keeper];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "must be a young cycle");
+        assert_eq!(
+            gen_body_words(doomed_addr),
+            (0, 0),
+            "with CRATONVM_ZGC_GEN_HEADER_ZERO=0 the whole body must be memset \
+             again -- if this fails, the sweep is not reaching this object and \
+             the test above is vacuous"
+        );
+        let (skipped, _, _) = heap.gen_sweep_cost_stats();
+        assert_eq!(
+            skipped, 0,
+            "and nothing may be reported as skipped when nothing was"
+        );
+    }
+
+    /// **A young sweep hands the free list one span per RUN of adjacent dead
+    /// objects, and loses none of them.**
+    ///
+    /// Two claims, and they need different instruments:
+    ///
+    /// * *compression* — `runs` strictly below `objects` says adjacent dead
+    ///   objects were merged. One number could not: a small `runs` is equally
+    ///   consistent with a cycle that found almost no garbage, which is why
+    ///   `gen_dead_runs` keeps both.
+    /// * *nothing is lost* — every byte the sweep freed has to be either on the
+    ///   free list or below a retracted cursor. That is the accounting identity
+    ///   an unflushed final run breaks, and it breaks it SILENTLY: the span is
+    ///   simply never mentioned again, and no assertion in the collector fires.
+    #[test]
+    fn a_young_sweep_hands_the_free_list_one_span_per_run_of_dead_objects() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let keeper = gen_promote_one(&heap);
+
+        // A run of adjacent doomed objects. Bump-first allocation (G2c) is on
+        // because generational mode is, so consecutive allocations are adjacent.
+        for _ in 0..64 {
+            let _ = heap.alloc_object(ClassId::new(3), 2);
+        }
+        let cursor_before = { self_used(&heap) };
+
+        let mut roots = [keeper];
+        let r = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "must be a young cycle");
+
+        let (_, runs, objects) = heap.gen_sweep_cost_stats();
+        assert!(
+            objects >= 64,
+            "the fixture must give the sweep at least its 64 dead objects: {objects}"
+        );
+        assert!(
+            runs >= 1 && runs < objects,
+            "adjacent dead objects must collapse into fewer spans than objects: \
+             {runs} runs for {objects} objects"
+        );
+
+        // NOTHING IS LOST. Freed bytes end up on the free list, or in un-bumped
+        // space when `retract_cursor_into_free_tail` takes the top span back.
+        let cursor_after = self_used(&heap);
+        let retracted = cursor_before.saturating_sub(cursor_after);
+        let on_list = heap.arena.lock().free_list_bytes();
+        assert!(
+            on_list + retracted >= r.stats.bytes_freed,
+            "every freed byte must be on the free list ({on_list}) or below a \
+             retracted cursor ({retracted}), and {} were freed -- a run the \
+             sweep forgot to flush disappears with no assertion anywhere",
+            r.stats.bytes_freed
+        );
+    }
+
+    /// The arena's cursor, for the accounting identity above.
+    fn self_used(heap: &ZgcRealHeap) -> usize {
+        heap.arena.lock().used()
+    }
+
+    /// **The nursery's overshoot is measured, so "a hard ceiling" can be priced
+    /// instead of carried.**
+    ///
+    /// `zgc_gen_nursery_percent` is a trigger: `needs_gc` says yes and the
+    /// mutator keeps allocating until the VM reaches a safepoint. G2's open list
+    /// has carried "a hard ceiling rather than a trigger" ever since, with no
+    /// number — and no number is the same as no priority.
+    ///
+    /// A ceiling is not implementable where the trigger lives (refusing the
+    /// allocation makes a servable request an `OutOfMemoryError`; collecting on
+    /// the spot needs a safepoint the allocation path cannot take), so this
+    /// measures what an allocation-site safepoint poll would be worth rather than
+    /// pretending the collector can decide it.
+    ///
+    /// Asserted against the BUDGET and not just as "greater than zero": an
+    /// overshoot means nothing without the figure it is an overshoot of.
+    #[test]
+    fn the_nursery_overshoot_is_measured_against_its_budget() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let keeper = gen_promote_one(&heap);
+        // After the promoting collection, which resets the watermark.
+        const BUDGET: usize = 64 * 1024;
+        heap.set_gen_nursery_bytes(BUDGET);
+        assert_eq!(
+            heap.nursery_overshoot_max(),
+            0,
+            "nothing has overshot yet, and a gauge that starts nonzero measures \
+             its own initialisation"
+        );
+
+        // Well past the budget, and far below anything the whole-heap clauses
+        // would fire on -- otherwise `needs_gc` returns early and the nursery
+        // latch is never armed, which would make this test pass for the wrong
+        // reason.
+        for _ in 0..4096 {
+            let _ = heap.alloc_object(ClassId::new(4), 2);
+        }
+        assert!(
+            heap.needs_gc(),
+            "the nursery must be over budget -- this is what arms the latch"
+        );
+
+        let mut roots = [keeper];
+        let _ = gen_collect(&heap, &mut roots);
+        let (fired, budget) = heap.nursery_trigger_stats();
+        assert_eq!(fired, 1, "the trigger must have been the reason");
+        assert_eq!(budget, BUDGET, "and it must report the budget it used");
+        let over = heap.nursery_overshoot_max();
+        assert!(
+            over > 0,
+            "the nursery was allocated well past {BUDGET} bytes, so the \
+             overshoot cannot be zero -- got {over}"
+        );
+        assert!(
+            over < heap.heap_capacity(),
+            "and it must be a plausible figure rather than an underflowed \
+             subtraction: {over}"
+        );
     }
 
     /// **THE EXIT CRITERION: an object reachable only through an
@@ -15100,6 +16153,549 @@ pub(crate) mod tests {
             Ok(Value::Object(Some(gen_ref(young_addr)))),
             "and the array still names it"
         );
+    }
+
+    /// **A young cycle's sweep must SKIP the old region, and the heap must not
+    /// then read as empty.**
+    ///
+    /// # What this is for
+    ///
+    /// The 2026-08-17 Phase G measurement found the generation split working
+    /// (4.8M objects skipped per young cycle) and the pause unchanged, because
+    /// `sweep` was 182 ms of a 309 ms mean and walked **every registered object
+    /// whatever the split said**. The sweep can only be bounded by ADDRESS, so a
+    /// young cycle now sweeps `[gen_young_floor, cursor)` — the nursery in the
+    /// ordinary bump-allocator sense.
+    ///
+    /// Four things have to hold at once, and each alone is satisfiable by
+    /// something broken:
+    ///
+    /// 1. the sweep really skips (`sweep_skipped > 0`) — without this the feature
+    ///    is on and inert, which is the state the measurement was in;
+    /// 2. young garbage above the floor is still reclaimed — a sweep that skips
+    ///    everything is trivially fast and useless;
+    /// 3. `allocated_bytes()` still reports the WHOLE live set — the sweep counts
+    ///    only what it visited, so an uncorrected figure makes the heap look
+    ///    nearly empty and the collection trigger stops firing;
+    /// 4. `conc_bits_known_clear` must be FALSE afterwards — objects below the
+    ///    floor keep the mark bit the pre-mark pass set, so the next mark start
+    ///    must not skip its clearing walk.
+    #[test]
+    fn a_young_cycle_sweeps_only_the_nursery_and_still_reports_the_live_set() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        // An old generation with real bytes in it, so the floor has something to
+        // be above and `old_live_bytes` is not zero.
+        let (head, chain, _g) = conc_build_graph(&heap, 3_000, 0);
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+
+        let (skipped_before, floor, old_live) = heap.nursery_stats();
+        assert_eq!(skipped_before, 0, "no young cycle has run yet");
+        assert!(
+            floor > 0,
+            "a whole-heap cycle must publish the nursery floor, or every young \
+             cycle sweeps the whole registry and the feature is inert"
+        );
+        assert!(
+            old_live > 0,
+            "and the old live bytes it carries forward, or `allocated` collapses"
+        );
+
+        // Fresh young garbage, all above the floor.
+        let junk: Vec<usize> = (0..4_000)
+            .map(|_| heap.alloc_object(ClassId::new(43), 2).as_ptr() as usize)
+            .collect();
+        assert!(
+            junk.iter().all(|a| *a >= floor),
+            "bump allocation after a collection lands above the floor"
+        );
+
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that was a minor");
+
+        // (1) IT REALLY SKIPPED.
+        let (skipped, _, _) = heap.nursery_stats();
+        assert!(
+            skipped >= 3_000,
+            "the sweep must have skipped the old generation: skipped={skipped}, \
+             and the chain alone is 3000 objects"
+        );
+
+        // (2) AND STILL RECLAIMED THE NURSERY.
+        assert!(
+            junk.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "young garbage above the floor must still be freed -- a sweep that \
+             skips everything is fast and useless"
+        );
+
+        // (3) THE LIVE FIGURE SURVIVED THE BOUNDED SWEEP.
+        assert!(
+            heap.allocated_bytes() >= old_live,
+            "a young cycle reports only what it swept, so the old live bytes have \
+             to be carried forward: allocated={} old_live={old_live}. Without this \
+             the heap reads as nearly empty and the trigger stops firing",
+            heap.allocated_bytes()
+        );
+
+        // (4) THE MARK-BIT LATCH MUST BE DOWN.
+        assert!(
+            !heap.conc_bits_known_clear.load(Ordering::Acquire),
+            "objects below the floor keep the mark bit the pre-mark set, so the \
+             next mark start MUST do its clearing walk"
+        );
+
+        // And the old generation is intact and walkable.
+        assert_eq!(conc_walk_chain(&heap, roots[0]), chain);
+    }
+
+    /// **A dead object BELOW the floor is retained until a major, and a major
+    /// gets it.**
+    ///
+    /// This is the nursery's documented cost, asserted rather than assumed: the
+    /// free list hands out space below the floor, so an object allocated into a
+    /// hole is inside the old region and a young cycle will not reclaim it. That
+    /// is over-retention, never unsoundness — and the second half of the test is
+    /// what makes it a bounded cost rather than a leak.
+    #[test]
+    fn a_dead_object_below_the_nursery_floor_waits_for_a_major() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        heap.set_gen_minors_per_major(2);
+        let holder = heap.alloc_object(ClassId::new(80), 2);
+        let doomed = heap.alloc_object(ClassId::new(81), 1);
+        let doomed_addr = doomed.as_ptr() as usize;
+        heap.set_field(holder, 1, Value::Object(Some(doomed)));
+
+        // Collection 1 is whole-heap: it promotes both and publishes a floor
+        // above them.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let holder = roots[0];
+        let (_, floor, _) = heap.nursery_stats();
+        assert!(doomed_addr < floor, "the fixture is below the floor");
+
+        // Drop the reference. `doomed` is now garbage in the old region.
+        heap.set_field(holder, 1, Value::Object(None));
+
+        // A young cycle cannot see it.
+        for _ in 0..300 {
+            let _ = heap.alloc_object(ClassId::new(90), 2);
+        }
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "a minor");
+        assert!(
+            heap.is_object_address(doomed_addr).is_some(),
+            "a young cycle does not sweep below the floor, so this survives -- \
+             that is the cost, and it is over-retention, not unsoundness"
+        );
+
+        // The ceiling forces a major, and the major reclaims it.
+        for _ in 0..300 {
+            let _ = heap.alloc_object(ClassId::new(90), 2);
+        }
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let mut roots = [roots[0]];
+        let _ = gen_collect(&heap, &mut roots);
+        assert!(
+            heap.is_object_address(doomed_addr).is_none(),
+            "and a whole-heap cycle must get it, or the cost is a LEAK"
+        );
+    }
+
+    /// **A bounded scan must report EXACTLY the bases at or above the floor.**
+    ///
+    /// The floor is turned into a starting WORD index, and the word containing it
+    /// straddles: it holds bases both below and above the floor. Off by one word
+    /// in one direction silently drops objects from the sweep — they are neither
+    /// freed nor unmarked — and in the other direction it sweeps below the floor,
+    /// which is merely slow. So the assertion is set EQUALITY against a filter of
+    /// the unbounded reader, at floors chosen to land mid-word.
+    #[test]
+    fn a_bounded_scan_reports_exactly_the_bases_above_the_floor() {
+        let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        for i in 0..3_000u32 {
+            let _ = heap.alloc_object(ClassId::new(1 + (i % 5)), (i % 4) as usize);
+        }
+        let _big = heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 2 * 1024 * 1024);
+        let snap = heap.registry.snapshot();
+        let all = snap.bases();
+        assert!(all.len() > 2_500, "fixture registered: {}", all.len());
+
+        // Floors at every 8-byte step across a whole word's worth of the bitmap,
+        // plus the extremes, so a straddling first word is actually exercised.
+        let mid = all[all.len() / 2];
+        let mut floors: Vec<usize> = vec![0, heap.arena_base, usize::MAX / 2];
+        for k in 0..80 {
+            floors.push(mid.saturating_sub(k * 8));
+            floors.push(mid + k * 8);
+        }
+        for floor in floors {
+            let mut got: Vec<usize> = Vec::new();
+            snap.for_each_base_from(floor, |b| got.push(b));
+            let mut want: Vec<usize> = all.iter().copied().filter(|b| *b >= floor).collect();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(
+                got, want,
+                "floor {floor:#x}: a bounded scan must equal the filtered                  unbounded one -- dropping a base means the sweep neither frees                  nor unmarks it"
+            );
+        }
+    }
+
+    /// **A floor left ABOVE the cursor must not wedge the collector.**
+    ///
+    /// `retract_cursor_into_free_tail` can drop the bump cursor below the floor a
+    /// previous whole-heap cycle published, and nothing stops it: the tail was
+    /// wholly free, so retracting is right. The floor is then above everything and
+    /// a young sweep visits NOTHING.
+    ///
+    /// That has to be survivable rather than a stall, and the mechanism is already
+    /// there: a young cycle that reclaimed nothing arms `gen_force_major_next`,
+    /// and the whole-heap cycle that follows recomputes the floor from a full
+    /// sweep. This test forces the state directly rather than waiting for a
+    /// retraction to produce it, because the point is that the recovery works, not
+    /// how the state arises.
+    #[test]
+    fn a_nursery_floor_above_the_cursor_recovers_through_a_major() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (head, chain, _g) = conc_build_graph(&heap, 400, 0);
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        assert!(heap.has_old_objects.load(Ordering::Relaxed));
+
+        // Force the pathological state: a floor beyond any live address.
+        heap.gen_young_floor.store(usize::MAX / 2, Ordering::Relaxed);
+        let junk: Vec<usize> = (0..300)
+            .map(|_| heap.alloc_object(ClassId::new(43), 2).as_ptr() as usize)
+            .collect();
+
+        // The young cycle sweeps nothing and must arm the escalation latch.
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "still counted as a minor");
+        assert!(
+            heap.gen_force_major_next.load(Ordering::Relaxed),
+            "a young cycle that reclaimed nothing must escalate, or a floor above              the cursor stalls collection until an allocation fails"
+        );
+
+        // The forced major recomputes the floor and reclaims the junk.
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let (_, floor, _) = heap.nursery_stats();
+        assert!(
+            floor < usize::MAX / 2 && floor > heap.arena_base,
+            "the major must republish a sane floor, got {floor:#x}"
+        );
+        assert!(
+            junk.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "and reclaim what the wedged young cycles could not see"
+        );
+        assert_eq!(conc_walk_chain(&heap, roots[0]), chain);
+    }
+
+    /// **G2: the slide promotes its survivors, leaves the nursery EMPTY, and does
+    /// NOT force the next cycle to be a major.**
+    ///
+    /// # What changed and why the old behaviour was backwards
+    ///
+    /// The first version of the nursery threw the floor away after a relocation,
+    /// on the reasoning that a slide rewrites the low region so an address no
+    /// longer says which generation an object is in. That is backwards: a slide
+    /// rewrites the low region into exactly the shape a nursery wants.
+    /// `compact_low_to` packs survivors and drops the cursor to the end of the
+    /// compacted region, so afterwards **every live object is below the cursor**
+    /// — the ones on unselected dense pages never moved and are below it too.
+    ///
+    /// Putting the floor there is promotion by copy, which is what G2 is, and it
+    /// carries **no floating garbage**: the registry at that point holds live
+    /// objects only, because the sweep pruned the dead a few statements earlier.
+    ///
+    /// # The three assertions, and what each would otherwise hide
+    ///
+    /// `promotions_by_slide > 0` is the engagement counter — without it a slide
+    /// that ran while the nursery was left dropped looks identical. The floor
+    /// being above every live base is the property that makes the nursery empty.
+    /// And `gen_force_major_next` staying **clear** is the behavioural change: if
+    /// it were still set, every relocating cycle would be followed by a
+    /// whole-heap one and the generational split would be off half the time.
+    #[test]
+    fn a_slide_promotes_its_survivors_and_leaves_the_nursery_empty() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                let heap = ZgcRealHeap::new_shared(8 * 1024 * 1024);
+                heap.set_tlab_enabled(false);
+                heap.set_generational_enabled(true);
+                heap.set_gen_promotion_age(1);
+                heap.set_gen_minors_per_major(1_000);
+                assert!(
+                    heap.relocation_requested(),
+                    "the override must reach the heap or this test proves nothing"
+                );
+
+                // Garbage below, so the selector has profitable pages and the
+                // survivors have somewhere to slide down into.
+                for _ in 0..4_000 {
+                    heap.alloc_object(ClassId::new(1), 4);
+                }
+                let parent = heap.alloc_object(ClassId::new(2), 1);
+                let child = heap.alloc_object(ClassId::new(2), 0);
+                heap.set_field(parent, 0, Value::Object(Some(child)));
+
+                let mut roots = [parent];
+                // SAFETY: these unit tests run the heap single-threaded.
+                let stw = unsafe { StopTheWorldToken::new() };
+                let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+                if result.pointer_map.is_empty() {
+                    // The selector declined. Say so rather than pass quietly: a
+                    // test that silently measured "nothing moved" would be
+                    // vacuous, and the assertions below are all about a move.
+                    assert_eq!(
+                        heap.promotions_by_slide(),
+                        0,
+                        "nothing moved, so nothing can have been promoted by a slide"
+                    );
+                    return;
+                }
+
+                // (1) IT PROMOTED.
+                assert!(
+                    heap.promotions_by_slide() > 0,
+                    "a slide that moved objects must have promoted them -- this \
+                     counter at zero with a non-empty pointer map is the old \
+                     behaviour, where the floor was dropped instead"
+                );
+
+                // (2) THE NURSERY IS EMPTY: the floor is above every live base.
+                let (_, floor, old_live) = heap.nursery_stats();
+                let live: Vec<usize> = heap.registry.snapshot().bases();
+                assert!(!live.is_empty(), "the graph survived");
+                let above = live.iter().filter(|b| **b >= floor).count();
+                assert_eq!(
+                    above, 0,
+                    "{above} of {} live objects are at or above the floor {floor:#x}; \
+                     a slide packs every survivor below the cursor, so the nursery \
+                     must be empty",
+                    live.len()
+                );
+                assert!(old_live > 0, "and the old live bytes were published");
+
+                // (3) THE NEXT CYCLE IS NOT FORCED TO BE A MAJOR.
+                assert!(
+                    !heap.gen_force_major_next.load(Ordering::Relaxed),
+                    "a relocating cycle must no longer force a whole-heap cycle \
+                     behind it, or the split is off every other collection"
+                );
+
+                // And the graph is intact through the move.
+                match heap.get_field(roots[0], 0) {
+                    Value::Object(Some(c)) => assert!(
+                        heap.registry.contains(c.as_ptr() as usize),
+                        "the child reference must name a live, registered object"
+                    ),
+                    other => panic!("the parent's reference was lost: {other:?}"),
+                }
+
+                // Fresh allocation lands in the nursery, and a young cycle
+                // reclaims it without touching what the slide promoted.
+                let junk: Vec<usize> = (0..500)
+                    .map(|_| heap.alloc_object(ClassId::new(43), 2).as_ptr() as usize)
+                    .collect();
+                assert!(
+                    junk.iter().all(|a| *a >= floor),
+                    "allocation after the slide must land above the floor"
+                );
+                let mut roots2 = [roots[0]];
+                let _ = heap.collect_garbage(&stw, &mut roots2, &NoMonitors);
+                assert!(
+                    junk.iter().all(|a| heap.is_object_address(*a).is_none()),
+                    "the nursery's garbage must still be reclaimed"
+                );
+                assert!(
+                    heap.registry.contains(roots2[0].as_ptr() as usize),
+                    "and the promoted graph survives"
+                );
+            },
+        );
+    }
+
+    /// **G2c: with the nursery on, allocation after a collection lands ABOVE the
+    /// floor even when there are holes below it.**
+    ///
+    /// This is the gap G2a had to document as a cost: the free list hands out
+    /// space below the floor, so an object placed in a hole is in the old region
+    /// and no young cycle reclaims it. Bump-first closes it, and the assertion is
+    /// by ADDRESS against the floor — "the objects were reclaimed" would pass
+    /// either way once a major ran.
+    ///
+    /// The paired assertion is that the mode is what turns it on: the same
+    /// fixture with generational mode OFF must put objects in the holes, or this
+    /// test is measuring the allocator's mood rather than the policy.
+    #[test]
+    fn with_the_nursery_on_allocation_lands_above_the_floor() {
+        // ---- generational ON: bump-first, so nothing lands in a hole -------
+        let heap = gen_heap_for_test(16 * 1024 * 1024);
+        assert!(
+            heap.arena.lock().prefer_bump(),
+            "turning the mode on must reach the arena, or the nursery is only              wherever the cursor happened to be"
+        );
+        // Garbage first, so the sweep leaves holes low down.
+        let doomed: Vec<usize> = (0..2_000)
+            .map(|_| heap.alloc_object(ClassId::new(43), 3).as_ptr() as usize)
+            .collect();
+        let keep = heap.alloc_object(ClassId::new(2), 1);
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        let keep = roots[0];
+        assert!(
+            doomed.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "the fixture must have left holes"
+        );
+        let (_, floor, _) = heap.nursery_stats();
+        assert!(floor > heap.arena_base, "a floor was published");
+
+        let fresh: Vec<usize> = (0..500)
+            .map(|_| heap.alloc_object(ClassId::new(44), 3).as_ptr() as usize)
+            .collect();
+        let below = fresh.iter().filter(|a| **a < floor).count();
+        assert_eq!(
+            below, 0,
+            "{below} of 500 fresh objects landed BELOW the floor {floor:#x} -- each              one is in the old region and waits for a major"
+        );
+
+        // And a young cycle reclaims them, which is the point of putting them there.
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that was a minor");
+        assert!(
+            fresh.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "and a young cycle must reclaim what it placed in the nursery"
+        );
+
+        // ---- generational OFF: the default policy reuses the holes --------
+        let plain = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        plain.set_tlab_enabled(false);
+        plain.set_relocation_enabled(false);
+        plain.set_generational_enabled(false);
+        assert!(
+            !plain.arena.lock().prefer_bump(),
+            "the default policy must be unchanged with the mode off"
+        );
+        let doomed2: Vec<usize> = (0..2_000)
+            .map(|_| plain.alloc_object(ClassId::new(43), 3).as_ptr() as usize)
+            .collect();
+        let keep2 = plain.alloc_object(ClassId::new(2), 1);
+        let mut roots2 = [keep2];
+        let _ = gen_collect(&plain, &mut roots2);
+        let low_water = *doomed2.iter().min().expect("non-empty");
+        let high_water = *doomed2.iter().max().expect("non-empty");
+        let reused = (0..200)
+            .map(|_| plain.alloc_object(ClassId::new(44), 3).as_ptr() as usize)
+            .filter(|a| *a >= low_water && *a <= high_water)
+            .count();
+        assert!(
+            reused > 0,
+            "with the mode OFF the allocator must reuse the swept holes -- if it              does not, the ON assertion above proves nothing about the policy"
+        );
+    }
+
+    /// **G2d: the nursery-size trigger must ASK for collections the whole-heap
+    /// predicate would not, and must not storm.**
+    ///
+    /// # The state this leaves
+    ///
+    /// `needs_gc`'s two clauses are both about the whole heap — live bytes, and
+    /// allocatable space. Neither asks whether enough has been allocated since the
+    /// last collection to be worth a young cycle, so before this a young cycle
+    /// happened only when a full collection would have. The 2026-08-17
+    /// measurement recorded six young cycles in a 600-round run for exactly that
+    /// reason, and a split that runs six times cannot pay for a barrier on every
+    /// store.
+    ///
+    /// # Three assertions, and the third is the one that could bite
+    ///
+    /// It fires when the nursery fills; it does NOT fire when the mode is off (or
+    /// the budget is 0, the kill switch); and **it does not storm** — the
+    /// watermark is reset by every collection, so firing again requires a fresh
+    /// budget's worth of allocation. That is why the clause deliberately bypasses
+    /// `gc_rearm`: that floor is a quarter of remaining headroom and would make
+    /// the clause unreachable, so the anti-storm property has to come from the
+    /// watermark instead and is worth pinning.
+    #[test]
+    fn the_nursery_size_trigger_asks_for_a_collection_and_does_not_storm() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (_, budget) = heap.nursery_trigger_stats();
+        assert!(budget > 0, "the default budget must be non-zero: {budget}");
+        assert!(
+            budget < heap.heap_capacity(),
+            "and smaller than the heap, or it can never be reached before the              whole-heap trigger"
+        );
+
+        // A fresh heap is below every threshold, so nothing asks yet.
+        assert!(
+            !heap.needs_gc(),
+            "an empty heap must not want a collection"
+        );
+
+        // (1) FILL THE NURSERY. Allocate past the budget without making the live
+        // set large enough for the whole-heap clauses.
+        let mut allocated = 0usize;
+        while allocated < budget + 64 * 1024 {
+            let o = heap.alloc_object(ClassId::new(43), 4);
+            allocated += alloc_footprint(&heap, o);
+        }
+        assert!(
+            heap.allocated_bytes() < heap.gc_threshold,
+            "the fixture must stay below the live-bytes threshold, or this test              cannot tell the nursery clause from the old ones: allocated={}              threshold={}",
+            heap.allocated_bytes(),
+            heap.gc_threshold
+        );
+        assert!(
+            heap.needs_gc(),
+            "the nursery is over budget, so a collection must be wanted"
+        );
+
+        // (2) THE COLLECTION CONSUMES THE TRIGGER AND IT IS COUNTED.
+        let keep = heap.alloc_object(ClassId::new(2), 1);
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        let (fired, _) = heap.nursery_trigger_stats();
+        assert_eq!(
+            fired, 1,
+            "the collection must record which trigger asked for it -- zero here              means every collection still comes from the whole-heap predicate"
+        );
+
+        // (3) IT MUST NOT STORM. Immediately after a collection the nursery is
+        // empty, so nothing is wanted until a fresh budget accumulates.
+        assert!(
+            !heap.needs_gc(),
+            "the watermark is reset by the collection, so the trigger must be              disarmed -- this clause bypasses `gc_rearm`, so the anti-storm              property comes from here and nowhere else"
+        );
+
+        // And the mode being off disarms it entirely.
+        let plain = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        plain.set_tlab_enabled(false);
+        plain.set_generational_enabled(false);
+        let mut n = 0usize;
+        while n < budget + 64 * 1024 {
+            let o = plain.alloc_object(ClassId::new(43), 4);
+            n += alloc_footprint(&plain, o);
+        }
+        assert!(
+            !plain.needs_gc(),
+            "with generational mode off the nursery clause must not fire, or this              changes every default run"
+        );
+    }
+
+    /// The allocated footprint of `o`, for a test that counts bytes.
+    fn alloc_footprint(heap: &ZgcRealHeap, o: ObjectRef) -> usize {
+        ZgcRealHeap::alloc_size(heap.header_ref(o.as_ptr())).unwrap_or(64)
     }
 
     /// **A card whose target is OLD is dropped, and the target survives

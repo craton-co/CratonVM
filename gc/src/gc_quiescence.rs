@@ -1882,7 +1882,8 @@ type VacatedLedger = (
     rustc_hash::FxHashSet<usize>,
 );
 
-static VACATED_ADDRS: parking_lot::Mutex<Option<VacatedLedger>> = parking_lot::Mutex::new(None);
+static VACATED_ADDRS: parking_lot::RwLock<Option<VacatedLedger>> =
+    parking_lot::RwLock::new(None);
 
 /// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
 pub fn vacated_frames_enabled() -> bool {
@@ -1911,7 +1912,7 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
         return;
     }
     let to: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
-    let mut g = VACATED_ADDRS.lock();
+    let mut g = VACATED_ADDRS.write();
     let (from, dests) = g.get_or_insert_with(Default::default);
     // ACCUMULATE across collections rather than replace. A stale reference is
     // not necessarily consumed before the next cycle, and a ledger that only
@@ -1936,6 +1937,175 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     *dests = to;
 }
 
+/// `vacated address -> (where the object went, its class there)`, kept for the
+/// whole run.
+///
+/// # Why a SECOND ledger, and why this one keeps history
+///
+/// The exact ledger above is exact precisely because [`note_allocated`] drops
+/// an address the instant it is re-issued — and that is why every use-site
+/// detector built on it reports ZERO on a failing run. A stale holder is
+/// INVISIBLE until re-issue (until then it reads the zeroed corpse and nothing
+/// looks wrong) and the exact ledger has forgotten the address by the time the
+/// damage becomes visible. The two windows do not overlap.
+///
+/// This one keeps the history, and uses the CLASS as the discriminator: if the
+/// object now at the address is not the class of the object that moved away,
+/// the holder is naming the wrong object. Equal classes are declined rather
+/// than guessed — a same-class re-issue is real but indistinguishable here, and
+/// guessing is what made the first vacated-frames instrument manufacture eight
+/// findings a run.
+///
+/// Bounded and flag-gated: one entry per relocated object is far too much to
+/// carry on a production run.
+static MOVED_HISTORY: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, (usize, u32)>>> =
+    parking_lot::RwLock::new(None);
+
+const MOVED_HISTORY_MAX: usize = 2_000_000;
+
+/// Record one slide's `from -> (to, class at to)` pairs.
+pub fn record_moved_history(pairs: &[(usize, usize, u32)]) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    let mut g = MOVED_HISTORY.write();
+    let map = g.get_or_insert_with(Default::default);
+    if map.len() + pairs.len() > MOVED_HISTORY_MAX {
+        map.clear();
+    }
+    for (from, to, class_at_to) in pairs {
+        map.insert(*from, (*to, *class_at_to));
+    }
+}
+
+/// Is `addr` a reference to an object the collector moved away, whose space has
+/// since been handed out to an object of a DIFFERENT class?
+///
+/// Returns `(moved_to, class_at_moved_to, class_at_addr)`. Reads the class id
+/// straight out of the header at `addr` — it is at offset 0 by the layout
+/// contract every JIT type guard also relies on — so this is callable from any
+/// site that has a reference and no heap handle.
+pub fn stale_use_verdict(addr: usize) -> Option<(usize, u32, u32)> {
+    if !vacated_frames_enabled() || addr == 0 || addr % 8 != 0 {
+        return None;
+    }
+    let (to, class_at_to) = {
+        let g = MOVED_HISTORY.read();
+        *g.as_ref()?.get(&addr)?
+    };
+    // SAFETY: `addr` is an address a live reference names and the caller is
+    // about to use it as an object; the first four header bytes are mapped
+    // managed memory whatever they contain.
+    let here = unsafe { std::ptr::read_unaligned(addr as *const u32) };
+    (here != class_at_to).then_some((to, class_at_to, here))
+}
+
+/// Report a USE of such a reference, with the Rust caller chain — the one thing
+/// every other instrument in this family has been unable to say.
+#[cold]
+pub fn report_stale_use(
+    addr: usize,
+    moved_to: usize,
+    class_at_moved_to: u32,
+    class_at_addr: u32,
+    site: &'static str,
+) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        moved_to = format!("{moved_to:#x}"),
+        class_at_moved_to,
+        class_at_addr,
+        site,
+        backtrace = %std::backtrace::Backtrace::force_capture(),
+        "a STALE reference is being USED: the collector moved this object to `moved_to`, the          allocator has since re-issued the address, and the object now there is of a different          class. The backtrace names the VM code still holding it."
+    );
+}
+
+/// [`stale_use_verdict`] + [`report_stale_use`], for a use site that only wants
+/// one call.
+#[inline(always)]
+pub fn check_stale_use(addr: usize, site: &'static str) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    if let Some((to, cto, chere)) = stale_use_verdict(addr) {
+        report_stale_use(addr, to, cto, chere, site);
+    }
+}
+
+/// Addresses the per-bci local-liveness filter kept OUT of a root snapshot,
+/// with the frame that held them.
+///
+/// `CRATONVM_DBG_VACATED_FRAMES` only. The filter's contract is that a slot it
+/// reports dead can never be read again under bytecode semantics — so if an
+/// address it dropped later turns up as a failing receiver, the analysis was
+/// wrong about that slot, and this names the method and the slot to look at.
+/// Bounded; oldest entries are simply overwritten.
+static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, String>>> =
+    parking_lot::RwLock::new(None);
+
+const LIVENESS_FILTERED_MAX: usize = 8192;
+
+/// Record that `addr` was in `where_` and the liveness filter dropped it.
+pub fn note_liveness_filtered(addr: usize, where_: impl FnOnce() -> String) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    let mut g = LIVENESS_FILTERED.write();
+    let map = g.get_or_insert_with(Default::default);
+    if map.len() >= LIVENESS_FILTERED_MAX {
+        map.clear();
+    }
+    map.insert(addr, where_());
+}
+
+/// Was `addr` dropped from a root snapshot by the liveness filter, and where?
+pub fn liveness_filtered_at(addr: usize) -> Option<String> {
+    if !vacated_frames_enabled() {
+        return None;
+    }
+    LIVENESS_FILTERED.read().as_ref()?.get(&addr).cloned()
+}
+
+/// Report a heap access whose RECEIVER is an address this collector moved an
+/// object away from, with the Rust caller chain.
+///
+/// A stale receiver is worse than a stale value: every field read off it
+/// returns whatever now occupies the memory, which is a perfectly valid object
+/// of an unrelated class. The value that reaches the operand stack therefore
+/// looks clean to every other instrument, and only the `checkcast` one
+/// instruction later disagrees.
+#[inline(always)]
+pub fn report_vacated_receiver(addr: usize, site: &'static str) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    if let Some(moved_to) = was_vacated(addr) {
+        report_vacated_receiver_cold(addr, moved_to, site);
+    }
+}
+
+#[cold]
+fn report_vacated_receiver_cold(addr: usize, moved_to: usize, site: &'static str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 12 {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        moved_to = format!("{moved_to:#x}"),
+        site,
+        backtrace = %std::backtrace::Backtrace::force_capture(),
+        "a heap access RECEIVER is an address the collector moved an object away from —          every field read through it returns whatever now occupies that memory. The          backtrace names the VM code holding it."
+    );
+}
+
 /// Forget every address in `addrs` — the allocator has re-issued it, so a
 /// reference to it is no longer evidence of anything. Called from the
 /// allocation paths; a no-op unless the ledger is armed.
@@ -1943,7 +2113,7 @@ pub fn note_allocated(addrs: &[usize]) {
     if !vacated_frames_enabled() {
         return;
     }
-    let mut g = VACATED_ADDRS.lock();
+    let mut g = VACATED_ADDRS.write();
     let Some((from, _to)) = g.as_mut() else {
         return;
     };
@@ -1965,7 +2135,7 @@ pub fn was_vacated(addr: usize) -> Option<usize> {
     if !vacated_frames_enabled() {
         return None;
     }
-    let g = VACATED_ADDRS.lock();
+    let g = VACATED_ADDRS.read();
     let (from, dests) = g.as_ref()?;
     if dests.contains(&addr) {
         return None;

@@ -27,8 +27,10 @@ use super::*;
 /// The Java method computes `x mod m` — via `BigInteger.valueOf(m)`,
 /// `BigInteger.mod`, then `intValue()` — for ten ~32-bit moduli, each a
 /// product of consecutive small primes, and tests the remainder against every
-/// prime in the group. With `org/bouncycastle/*` JIT-banned this runs
-/// interpreted: ~10 BigInteger allocations + 10 limb-division calls per
+/// prime in the group. (The `org/bouncycastle/*` JIT ban this was written under
+/// is long gone — no ban list names the package today — but the allocation cost
+/// below is what motivates the intrinsic and does not depend on it.)
+/// ~10 BigInteger allocations + 10 limb-division calls per
 /// candidate, over hundreds of candidates per RSA prime, which dominates
 /// `RSAKeyPairGenerator.chooseRandomPrime` (see `RSATest.test_CVE_2017_15361`,
 /// the documented RSA non-finish — `comparison-handoff/
@@ -8494,6 +8496,173 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
     );
 
     r.set_category(__prev_cat);
+}
+
+/// The eight chaining words `H1..H8`, in order, plus the two remaining fields
+/// `processBlock` touches.
+const BC_SHA256_STATE_FIELDS: [&str; 8] = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"];
+
+/// Resolved heap slot indices for one `SHA256Digest` class: `(H1..H8, X, xOff)`.
+#[derive(Clone, Copy)]
+struct BcSha256Slots {
+    h: [usize; 8],
+    x: usize,
+    x_off: usize,
+}
+
+/// Slot cache, keyed by the receiver's `ClassId`.
+///
+/// `get_field_by_name` takes the class-manager read lock and walks the class
+/// hierarchy by name on every call; `processBlock` touches ten fields and is
+/// called once per 64-byte block, so paying that eighteen times per block would
+/// cost more than the bytecode this native replaces. The indices are a property
+/// of the class layout, so they are resolved once and reused.
+///
+/// Keyed on `ClassId` rather than cached unconditionally because the same class
+/// name can be loaded by two class loaders (two `ClassId`s, two layouts); a
+/// mismatch simply re-resolves rather than reading the wrong slots.
+static BC_SHA256_SLOTS: std::sync::RwLock<Option<(u32, BcSha256Slots)>> =
+    std::sync::RwLock::new(None);
+
+fn bc_sha256_slots(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<BcSha256Slots, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(this);
+    let key = class_id.as_u32();
+    if let Ok(guard) = BC_SHA256_SLOTS.read() {
+        if let Some((cached_key, slots)) = *guard {
+            if cached_key == key {
+                return Ok(slots);
+            }
+        }
+    }
+    let bad = |what: &str| -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: format!("SHA256Digest: cannot resolve field {what}"),
+        }
+        .into()
+    };
+    // `declared_fields` reports fields declared BY this class with an absolute
+    // heap slot index; H1..H8, X and xOff are all declared on `SHA256Digest`
+    // itself, so no super-class walk is needed.
+    let fields = ctx.declared_fields(class_id);
+    let index_of = |name: &str| -> Option<usize> {
+        fields
+            .iter()
+            .find(|f| f.name == name && !f.is_static)
+            .map(|f| f.slot_index)
+    };
+    let mut h = [0usize; 8];
+    for (slot, name) in h.iter_mut().zip(BC_SHA256_STATE_FIELDS) {
+        *slot = index_of(name).ok_or_else(|| bad(name))?;
+    }
+    let slots = BcSha256Slots {
+        h,
+        x: index_of("X").ok_or_else(|| bad("X"))?,
+        x_off: index_of("xOff").ok_or_else(|| bad("xOff"))?,
+    };
+    if let Ok(mut guard) = BC_SHA256_SLOTS.write() {
+        *guard = Some((key, slots));
+    }
+    Ok(slots)
+}
+
+/// Native `org.bouncycastle.crypto.digests.SHA256Digest.processBlock()`.
+///
+/// # Why this one and not `MessageDigest`
+///
+/// BouncyCastle's LMS/HSS (`pqc.crypto.lms`) builds `new SHA256Digest()`
+/// directly — see that package's `DigestUtil.createDigest` — so this VM's
+/// native JCA SHA-256 is on a path the workload never takes, and HotSpot has no
+/// intrinsic for BouncyCastle's class either. Both VMs run the round schedule as
+/// real bytecode; measurement put CratonVM at ~37x HotSpot on that kernel with
+/// the JIT fully engaged and nothing stuck in the interpreter. This replaces the
+/// one leaf that owns the cost.
+///
+/// # Why `processBlock` is the right seam
+///
+/// It is a `protected` leaf with no arguments and no calls out: every input is a
+/// field of the receiver (`H1..H8`, `X`), and the kernel reproduces its exact
+/// post-state including the expanded schedule left in `X[16..64]` and the
+/// cleared `X[0..16]`. Buffering, padding, length encoding, `reset`, `copy` and
+/// `getEncodedState` all stay real bytecode.
+///
+/// `SHA256Digest` has no subclasses in BouncyCastle, so the superclass walk in
+/// `intercept_force_registered_native` cannot divert some other digest's
+/// `processBlock` here. Tagged `Intrinsic`, not a stub: it computes the method's
+/// exact result rather than standing in for it.
+pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
+    // `register_with_kind` rather than the ambient `set_category` the older BC
+    // registrars around this one use: it records `kind_stated`, so the census
+    // can tell "somebody adjudicated this as an Intrinsic" from "this inherited
+    // whatever category was ambient at the registration site".
+    r.register_with_kind(
+        "org/bouncycastle/crypto/digests/SHA256Digest",
+        "processBlock",
+        "()V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let slots = bc_sha256_slots(ctx, this)?;
+
+            let mut state = [0u32; 8];
+            for (slot, index) in state.iter_mut().zip(slots.h) {
+                match ctx.get_field(this, index) {
+                    Value::Int(v) => *slot = v as u32,
+                    _ => {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "SHA256Digest: malformed chaining word".into(),
+                        }
+                        .into())
+                    }
+                }
+            }
+
+            let x_arr = match ctx.get_field(this, slots.x) {
+                Value::Object(Some(o)) => o,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "SHA256Digest: missing X".into(),
+                    }
+                    .into())
+                }
+            };
+
+            // One bulk read of all 64 words rather than 64 `get_array_element`
+            // round trips — the per-element path costs a virtual dispatch plus a
+            // `Value` box per word, which is most of what this native exists to
+            // remove. Only `X[0..16]` is live input; the tail is read so the
+            // single bulk write-back below can restore the whole array. A short
+            // read means `X` is not the 64-word `int[]` the class declares.
+            let mut words = [0i32; 64];
+            if ctx.read_int_array_into(x_arr, 0, &mut words) != 64 {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "SHA256Digest: X is not a 64-word int[]".into(),
+                }
+                .into());
+            }
+            let mut x = [0u32; 64];
+            for (dst, src) in x.iter_mut().zip(words.iter()) {
+                *dst = *src as u32;
+            }
+
+            cratonvm_native_builtins_crypto::bc_digest::sha256_process_block(&mut state, &mut x);
+
+            for (word, index) in state.iter().zip(slots.h) {
+                ctx.set_field(this, index, Value::Int(*word as i32));
+            }
+            for (dst, src) in words.iter_mut().zip(x.iter()) {
+                *dst = *src as i32;
+            }
+            ctx.write_int_array_from(x_arr, 0, &words);
+            // BouncyCastle's `xOff = 0`, which `processWord` reads to decide
+            // when the next block is full. Omitting it would leave the digest
+            // permanently mid-block.
+            ctx.set_field(this, slots.x_off, Value::Int(0));
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
 }
 
 pub(crate) const BC_KECCAK_ROUND_CONSTANTS: [u64; 24] = [

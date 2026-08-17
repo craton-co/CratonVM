@@ -1871,6 +1871,76 @@ impl BigUint {
         if m.is_one() {
             return Self::zero();
         }
+        match crate::montgomery::Montgomery::new(&m.limbs) {
+            // Odd modulus — every RSA/DSA/DH modulus in practice.
+            Some(mont) => self.modpow_montgomery(exp, m, &mont),
+            // Even (or degenerate) modulus: no Montgomery form, keep dividing.
+            None => self.modpow_dividing(exp, m),
+        }
+    }
+
+    /// The ladder above with Montgomery products instead of a Knuth-D division
+    /// per step — retires
+    /// `perf/biginteger-modpow-has-no-montgomery-reduction-20260817` on the
+    /// native RSA path.
+    ///
+    /// The **ladder shape is preserved deliberately**: one multiply and one
+    /// square per exponent bit, with only the *operands* selected by the bit,
+    /// and no windowed precomputation table. A window would be faster still,
+    /// and `bigint::BigInt::modpow` does use one — that routine serves
+    /// `java.math.BigInteger.modPow`, where HotSpot's own implementation is
+    /// windowed Montgomery, so matching it is the compatible choice. Here the
+    /// caller is this crate's RSA/DSA private-key path with a known-secret
+    /// exponent, and a window indexes its table with secret exponent bits, so
+    /// this routine does not take that trade. It does not thereby become
+    /// constant-time — see the VULN(2) note on `modpow` for what this routine
+    /// does and does not promise.
+    fn modpow_montgomery(
+        &self,
+        exp: &BigUint,
+        m: &BigUint,
+        mont: &crate::montgomery::Montgomery,
+    ) -> BigUint {
+        let n = mont.limbs();
+        // Widen to exactly `n` limbs. `BigUint` does not guarantee a trimmed
+        // representation (`is_zero` explicitly tolerates all-zero limbs), and a
+        // value carrying trailing zeros would be *truncated* by a bare resize,
+        // so trim first.
+        let pad = |mut v: Vec<u32>| -> Vec<u32> {
+            while v.last() == Some(&0) {
+                v.pop();
+            }
+            debug_assert!(v.len() <= n, "operand wider than the modulus");
+            v.resize(n, 0);
+            v
+        };
+        // R mod m and R^2 mod m, where R = 2^(32n). Two divisions, once,
+        // instead of one per exponent bit.
+        let r1 = pad(Self::pow2(32 * n).modulo(m).limbs);
+        let r2 = pad(Self::pow2(64 * n).modulo(m).limbs);
+
+        let mut acc = r1; // 1, in Montgomery form
+        let mut base = mont.mul(&pad(self.modulo(m).limbs), &r2);
+        for i in (0..exp.bit_length()).rev() {
+            if exp.bit(i) {
+                acc = mont.mul(&acc, &base);
+                base = mont.mul(&base, &base);
+            } else {
+                base = mont.mul(&acc, &base);
+                acc = mont.mul(&acc, &acc);
+            }
+        }
+        let mut out = BigUint {
+            limbs: mont.from_mont(&acc),
+        };
+        out.normalize();
+        out
+    }
+
+    /// Division-based ladder — the fallback for an even modulus, which has no
+    /// Montgomery form. Byte-for-byte the routine `modpow` was before the
+    /// Montgomery split, so the even case is unchanged.
+    fn modpow_dividing(&self, exp: &BigUint, m: &BigUint) -> BigUint {
         let mut r0 = BigUint::one();
         let mut r1 = self.modulo(m);
         let bits = exp.bit_length();
@@ -1884,6 +1954,13 @@ impl BigUint {
             }
         }
         r0
+    }
+
+    /// `2^k` as a magnitude.
+    fn pow2(k: usize) -> BigUint {
+        let mut limbs = vec![0u32; k / 32];
+        limbs.push(1u32 << (k % 32));
+        BigUint { limbs }
     }
 
     /// Extended GCD. Returns (gcd, x, y) such that a*x + b*y = gcd.
@@ -7204,6 +7281,154 @@ mod tests {
         assert_eq!(hex(&ct), "530f8afbc74536b9a963b4f1c4cb738b");
     }
 
+    /// Attribution probe for the RSA private-key operation, kept because
+    /// `perf/biginteger-modpow-has-no-montgomery-reduction-20260817` was closed
+    /// on the strength of it: after Montgomery, the secret-exponent modpow is
+    /// no longer the whole cost of a signature, and anyone tempted to make
+    /// modpow faster again should re-run this first and check that modpow is
+    /// still what they are paying for.
+    ///
+    /// `cargo test --release -p cratonvm-native-builtins --lib -- --ignored \
+    ///     rsa_sign_cost_attribution --nocapture`
+    #[test]
+    #[ignore = "timing probe, not an assertion; run explicitly with --nocapture"]
+    fn rsa_sign_cost_attribution() {
+        use std::time::Instant;
+        let (_pk, sk) = Rsa::generate_keypair(2048);
+        let msg = b"the floor under every certificate test";
+
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = Rsa::sign_sha256(&sk, msg);
+        }
+        let whole = t.elapsed();
+
+        let m = BigUint::from_bytes_be(&Sha256::digest(msg));
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = m.modpow(&sk.d, &sk.n);
+        }
+        let secret_modpow = t.elapsed();
+
+        let r = rsa_random_coprime(&sk.n).expect("blinding factor");
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = r.modinv(&sk.n);
+        }
+        let modinv = t.elapsed();
+
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = r.modpow(&sk.e, &sk.n);
+        }
+        let public_modpow = t.elapsed();
+
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = rsa_random_coprime(&sk.n);
+        }
+        let draw = t.elapsed();
+
+        println!("--- RSA-2048 sign_sha256, x10 ---");
+        println!("  whole signature      {whole:>12.2?}");
+        println!("  secret-exponent modpow {secret_modpow:>10.2?}");
+        println!("  r.modinv(n)          {modinv:>12.2?}");
+        println!("  r^e mod n            {public_modpow:>12.2?}");
+        println!("  draw blinding factor {draw:>12.2?}");
+    }
+
+    /// `BigUint::modpow` splits on the parity of the modulus: odd takes the
+    /// Montgomery ladder, even keeps dividing. The two arms must be
+    /// indistinguishable — this drives them against each other over odd moduli
+    /// of every limb width, and both against a `u128` oracle on small operands
+    /// where an exact answer can be computed independently.
+    ///
+    /// The doc this retires
+    /// (`perf/biginteger-modpow-has-no-montgomery-reduction-20260817`) names the
+    /// failure mode precisely: a subtly wrong modPow yields plausible-looking
+    /// wrong signatures that still round-trip. Checking the Montgomery arm only
+    /// against itself would not catch that; checking it against the routine it
+    /// replaced does.
+    #[test]
+    fn modpow_montgomery_matches_the_dividing_ladder() {
+        fn xorshift(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        // Small operands against an exact u128 oracle.
+        for m in [3u64, 5, 7, 255, 65537, 4294967295, 4294967291] {
+            for base in [0u64, 1, 2, 3, m - 1, m, m + 1, 123456789] {
+                for e in [0u64, 1, 2, 3, 17, 65537, 4294967296] {
+                    let got = BigUint::from_u64(base)
+                        .modpow(&BigUint::from_u64(e), &BigUint::from_u64(m));
+                    let mut want: u128 = 1;
+                    let mut b = (base % m) as u128;
+                    let mut k = e;
+                    while k > 0 {
+                        if k & 1 == 1 {
+                            want = want * b % m as u128;
+                        }
+                        b = b * b % m as u128;
+                        k >>= 1;
+                    }
+                    assert_eq!(
+                        got.to_bytes_be(),
+                        BigUint::from_u64(want as u64).to_bytes_be(),
+                        "{base}^{e} mod {m}"
+                    );
+                }
+            }
+        }
+
+        // Wide operands: Montgomery arm vs the dividing arm it replaced.
+        let mut state = 0x51ed_c0de_0817_2026u64;
+        for limbs in 1..=8usize {
+            for _ in 0..12 {
+                let mut m = BigUint {
+                    limbs: (0..limbs).map(|_| xorshift(&mut state) as u32).collect(),
+                };
+                m.limbs[0] |= 1; // odd
+                m.limbs[limbs - 1] |= 1 << 31; // full width
+                let base = BigUint {
+                    limbs: (0..limbs).map(|_| xorshift(&mut state) as u32).collect(),
+                };
+                for ebits in [1usize, 7, 32, 33, 64, 127, 256] {
+                    let ewords = ebits.div_ceil(32);
+                    let mut e = BigUint {
+                        limbs: (0..ewords).map(|_| xorshift(&mut state) as u32).collect(),
+                    };
+                    let top = (ebits - 1) % 32;
+                    e.limbs[ewords - 1] &= (1u32 << top) | ((1u32 << top) - 1);
+                    e.limbs[ewords - 1] |= 1u32 << top;
+                    assert_eq!(
+                        base.modpow(&e, &m).limbs,
+                        base.modpow_dividing(&e, &m).limbs,
+                        "montgomery vs dividing, {limbs} limbs, {ebits}-bit exponent"
+                    );
+                }
+                // Degenerate bases and exponents.
+                let zero = BigUint::zero();
+                assert_eq!(base.modpow(&zero, &m).limbs, vec![1], "x^0 == 1");
+                assert_eq!(zero.modpow(&BigUint::from_u64(5), &m).limbs, Vec::<u32>::new());
+                assert_eq!(base.modpow(&BigUint::one(), &m).limbs, base.modulo(&m).limbs);
+                // An even modulus must still take the dividing arm and agree
+                // with itself.
+                let m_even = m.add(&BigUint::one());
+                let e = BigUint::from_u64(65537);
+                assert_eq!(
+                    base.modpow(&e, &m_even).limbs,
+                    base.modpow_dividing(&e, &m_even).limbs,
+                    "even modulus falls back"
+                );
+            }
+        }
+    }
+
     // RF.6: RSA key generation produces a functional sign/verify pair.
     #[test]
     fn rf6_rsa_keypair_roundtrip() {
@@ -7341,7 +7566,22 @@ mod tests {
             RsaCipherPadding::OaepSha1,
             RsaCipherPadding::OaepSha256,
         ] {
-            let ct = rsa_cipher_encrypt(&n, &e, pad, b"payload").expect("encrypt");
+            // Re-roll until the ciphertext's leading byte is non-zero.
+            // `rsa_cipher_encrypt` emits exactly `k` bytes via
+            // `to_bytes_be_padded`, so a ciphertext below 2^(8(k-1)) — about 1
+            // in 128 for this modulus — carries a leading zero, and the
+            // "shorter than the modulus" row below then hands `decrypt` the
+            // SAME integer, which decrypts correctly and fails an assertion
+            // that is about length, not about padding. Measured at 3/60 runs
+            // before this loop, on both this tree and dev. Encryption is
+            // randomized (PKCS#1 type 2 / OAEP seed), so re-rolling is free and
+            // terminates immediately.
+            let ct = loop {
+                let c = rsa_cipher_encrypt(&n, &e, pad, b"payload").expect("encrypt");
+                if c[0] != 0 {
+                    break c;
+                }
+            };
 
             // The WRONG PRIVATE KEY and a CORRUPTED CIPHERTEXT are padding
             // failures. This is the row the regression suite sampled.

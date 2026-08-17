@@ -1401,6 +1401,10 @@ impl Frame {
             // nothing has been allocated into since.
             if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
                 if let Value::Object(Some(o)) = value {
+                    cratonvm_gc::gc_quiescence::check_stale_use(
+                        o.as_ptr() as usize,
+                        "frame local store",
+                    );
                     if let Some(moved_to) =
                         cratonvm_gc::gc_quiescence::was_vacated(o.as_ptr() as usize)
                     {
@@ -1875,6 +1879,28 @@ impl Frame {
         };
         for (i, cv) in self.locals.iter().enumerate() {
             if i < 64 && live_mask & (1u64 << i) == 0 {
+                // `CRATONVM_DBG_VACATED_FRAMES`: remember what the filter
+                // dropped. Its contract is that this slot can never be read
+                // again; if the address turns up later as a failing receiver,
+                // that contract was broken for this exact method and slot.
+                if cratonvm_gc::gc_quiescence::vacated_frames_enabled()
+                    && self.local_kinds[i] != LKIND_LONG
+                    && self.local_kinds[i] != LKIND_DOUBLE
+                {
+                    if cv.is_object() {
+                        if let Some(ptr) = cv.as_object_ptr() {
+                            cratonvm_gc::gc_quiescence::note_liveness_filtered(ptr as usize, || {
+                                format!(
+                                    "{}.{} pc={} local[{}]",
+                                    self.class_name(),
+                                    self.method_name(),
+                                    self.pc,
+                                    i
+                                )
+                            });
+                        }
+                    }
+                }
                 continue;
             }
             // A primitive `long` / `double` is never a heap reference — not

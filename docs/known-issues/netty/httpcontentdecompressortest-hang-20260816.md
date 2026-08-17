@@ -115,6 +115,92 @@ at ~260 ns is the same story with fewer rungs.
 **A single-byte `put` already costs ~260-280 ns** — one native call, one stored
 byte. That per-call floor, multiplied by the rung count above, is the finding.
 
+## Two of the four rungs are FIXED (2026-08-17); the class is still over
+
+`Preconditions.checkIndex` and `Reference.reachabilityFence` are now bound to
+thin `*_DIRECT_FN` helpers (`jit_preconditions_check_index_direct`,
+`jit_reachability_fence_direct`) instead of going through the generic native
+funnel. Measured on `probes/HotNativeRungRate.java`, same host, HotSpot 25 for
+scale:
+
+Measured as a SAME-BINARY A/B on the kill switch
+(`CRATONVM_JIT='-census-direct-helpers'`, default on), which is the only form
+of this comparison that is trustworthy — see "A cross-binary A/B is not an A/B"
+below:
+
+| rung | HotSpot | helpers off | helpers on | ratio |
+|---|---|---|---|---|
+| `Objects.checkIndex` (-> `Preconditions.checkIndex`) | 0.27 ns | 143.58 ns | **23.71 ns** | **6.1x** |
+| `Reference.reachabilityFence` | 0.28 ns | 150.73 ns | **23.51 ns** | **6.4x** |
+
+The invocation census confirms it is the bind and not the timing:
+`Preconditions.checkIndex` 4 000 000 -> **1 174** invocations,
+`Reference.reachabilityFence` 3 200 000 -> **163 090**; and the bind counter
+goes `checkIndex=2 reachabilityFence=2` to `0 0` with the switch.
+
+### A cross-binary A/B is not an A/B
+
+The first numbers taken for this section were 352 ns and 361 ns "before", giving
+18x and 19x. They were measured against the binary in the main worktree, which
+was **a day older than the branch** — so they carried every unrelated change
+that landed on `dev` in between, and they overstate the effect by ~2.5x. The
+same mistake showed up much more loudly on CratonBench, where that pairing
+reported ~13-19% "regressions" on `arithmetic` and `fib` — phases that contain
+no `checkIndex` and no `reachabilityFence` call at all, so the binds cannot
+have caused them.
+
+The kill switch was added for exactly this reason: one binary, one gate. The
+6.1x/6.4x above are that measurement.
+
+**THREE doors, and only the third one mattered for the fence.** Wiring the
+single-pass ladder and the IR path left the counter at
+`Preconditions.checkIndex=2 Reference.reachabilityFence=0` while the fence's
+cost sat unchanged at 142 ns. `checkIndex` had landed anyway because it is
+reached through `Objects.checkIndex`, a JDK method the method-entry door
+compiles, so the bind happened inside the callee; `reachabilityFence` has no
+such intermediary and a hot loop calls it directly — and a hot loop's body is
+compiled by the **OSR door** in
+`vm/src/runtime/interpreter/jit_bridge.rs::compile_osr_artifact`, which runs its
+own callee-binding loop rather than `jit::try_compile`'s ladder. Only after
+wiring that third door did the fence move 142 -> 18.88 ns.
+`CRATONVM_DBG=jit-method-stats` now prints
+`JIT thin direct-helper binds: ...` unconditionally, including at zero, so this
+is a counter question rather than a timing question.
+
+**CratonBench is unaffected, and the census says so without the clock.** With
+the helpers on, CratonBench binds **zero** sites
+(`Preconditions.checkIndex=0 Reference.reachabilityFence=0`) and neither native
+is invoked in either arm — it has no call sites for them. Every phase's checksum
+is identical across HotSpot, helpers-off and helpers-on. That matters because
+the host's own spread on a FIXED configuration reached 74% on `arithmetic`
+(7526 ms against 13088 ms, same binary, same flags), which is larger than any
+per-phase effect a timing A/B could have claimed. On a loaded host the bind
+counter and the invocation census answer "did this touch the workload" and the
+clock does not.
+
+**End to end, this did not retire the page.** Interleaved, two rounds,
+`NettyZipBombPhases gzip 32`: compress 21389/15653 ms before against
+18508/16580 ms after — inside the noise. `ByteBuffer` accessors improved
+roughly 1.5-2.4x (direct `putLong` ~1400 -> ~1000 ns, heap `put(byte)` ~283 ->
+~114 ns), which is what removing 2 rungs of ~6 predicts, and not enough.
+
+**The census head has moved, and names the remaining work:**
+
+| invocations (800 000 ops) | native |
+|---:|---|
+| 2 400 000 | `java/nio/DirectByteBuffer.session()Ljdk/internal/foreign/MemorySessionImpl;` |
+| 1 600 000 | `jdk/internal/misc/ScopedMemoryAccess.putLongUnaligned(...)` |
+| 800 000 | `ScopedMemoryAccess.getLongUnaligned` / `putIntUnaligned` |
+| 800 000 | `java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;` |
+
+`session()` is the new number one and is `Ok(Some(Value::Object(None)))` — it
+returns the constant `null` — but it is an **`invokevirtual`**, so it cannot use
+the `invoke_kind == 3` bind these two used; it needs the guarded-virtual direct
+call (`JitDirectCall::guard_class_id`) or a receiver-typed variant.
+`ScopedMemoryAccess.*Unaligned` is the actual store and must stay a native, but
+one native per accessor is the floor, and a thin helper would price it at ~15 ns
+rather than ~160.
+
 ## What was ruled out, with the measurement that ruled it out
 
 * **Per-byte storage re-resolution in `servlet.rs`.** `s2_bb_write8` /

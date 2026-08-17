@@ -8981,7 +8981,7 @@ fn resolve_native_site(
     // reached with a `ReentrantLock$NonfairSync` receiver, two levels down —
     // and `invoke_or_native` has a specific rule for that walk which has to be
     // reproduced, not approximated. See `resolve_native_owner_for_receiver`.
-    let Some((owner_class, id)) = resolve_native_owner_for_receiver(
+    let Some((owner_class, id, poly_descriptor)) = resolve_native_owner_for_receiver(
         vm,
         &lookup_class,
         receiver_class_id,
@@ -8990,6 +8990,13 @@ fn resolve_native_site(
     ) else {
         return site_refusal::note(4);
     };
+    // A signature-polymorphic entry was resolved under the REGISTRATION
+    // descriptor, not the site's own, so every downstream question about the
+    // registration (`--jdk-only` admission, and the `Debug`/census identity)
+    // has to be asked with that one. `info.descriptor` stays the authority for
+    // argument decode and for the return unboxing, which are call-site
+    // properties.
+    let registered_descriptor: &str = poly_descriptor.unwrap_or(info.descriptor);
     // `Thread.currentThread()` is served from the thread mirror instead of the
     // registered body — see `LeafNativeKind::ThreadCurrentThread` — so it is
     // recognised here rather than claimed at registration. Everything else
@@ -9028,7 +9035,7 @@ fn resolve_native_site(
         vm,
         &owner_class,
         info.method_name,
-        info.descriptor,
+        registered_descriptor,
         callback,
         Some(id),
     ) else {
@@ -9040,6 +9047,7 @@ fn resolve_native_site(
         callback,
         native_id,
         receiver_class_id: guard,
+        poly: poly_descriptor.is_some(),
     })
 }
 
@@ -9083,6 +9091,32 @@ fn resolve_native_site(
 /// the name is used only for the registry lookups, which are name-keyed by
 /// construction.
 ///
+/// # Rule 4 — the signature-polymorphic tail
+///
+/// Rules 1-3 all look the native up under the CALL SITE's descriptor. A
+/// `VarHandle` accessor never has one: `VH.get(holder)` is emitted as
+/// `invokevirtual java/lang/invoke/VarHandle.get:(LHolder;)I`, while the
+/// native is registered under `([Ljava/lang/Object;)Ljava/lang/Object;`. So
+/// every one of those sites used to end here as refusal reason 4 ("no native
+/// for the triple") and pay `invoke_or_native`'s full cascade on every call —
+/// which is what made `VarHandle.get` cost **2.03 µs** against a 3 ns plain
+/// field read, and, through `AbstractByteBuf.ensureAccessible()` ->
+/// `RefCnt.isLiveNonVolatile` -> `VH.get`, made every netty `ByteBuf`
+/// accessor cost ~2.6 µs. See
+/// `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
+///
+/// [`vm_exec::invoke_on_class_shared_inner`] already handles the shape, in the
+/// `None` arm of its hierarchy resolution — i.e. exactly where rules 1-3
+/// arrive with nothing. This reproduces that arm's lookup order (base class
+/// first, then the exact receiver class) using the same shared descriptor
+/// list, and reports `poly = true` so the dispatch side runs
+/// `unbox_poly_return_checked` rather than `coerce_native_return`: the erased
+/// `Object` return has to be unboxed against the call site's own descriptor.
+///
+/// `MethodHandle.invoke`/`invokeExact`/`invokeBasic` do NOT reach here —
+/// `site_name_is_special_cased` refuses them one level up, and this path
+/// deliberately does not widen that.
+///
 /// Cold: fill time only.
 fn resolve_native_owner_for_receiver(
     vm: &SharedVm,
@@ -9090,10 +9124,10 @@ fn resolve_native_owner_for_receiver(
     receiver_class_id: Option<ClassId>,
     info: &JitInvokeInfo,
     walk_supers: bool,
-) -> Option<(String, cratonvm_native_api::NativeMethodId)> {
+) -> Option<(String, cratonvm_native_api::NativeMethodId, Option<&'static str>)> {
     let registry = &vm.natives.native_methods;
     if let Some(id) = registry.resolve_id(dispatch_class, info.method_name, info.descriptor) {
-        return Some((dispatch_class.to_string(), id));
+        return Some((dispatch_class.to_string(), id, None));
     }
     if !walk_supers {
         // `invoke_or_native` looks the native up on `effective_class` and
@@ -9131,12 +9165,45 @@ fn resolve_native_owner_for_receiver(
         {
             // Rule 3: bytecode here ends the walk, and only a native declared
             // on THIS parent may override it.
-            return parent_native.map(|id| (parent.name.to_string(), id));
+            return parent_native.map(|id| (parent.name.to_string(), id, None));
         }
         if let Some(id) = parent_native {
-            return Some((parent.name.to_string(), id));
+            return Some((parent.name.to_string(), id, None));
         }
         cid = parent_id;
+    }
+    drop(cm);
+    // Rule 4 — the signature-polymorphic tail (see this function's doc).
+    resolve_signature_polymorphic_native_site(vm, dispatch_class, info)
+}
+
+/// Resolve a `VarHandle` access-mode call site to the erased native the
+/// registry actually holds, mirroring `invoke_on_class_shared_inner`'s
+/// signature-polymorphic arm: base class first, then the exact receiver class.
+///
+/// `None` for anything that is not a `VarHandle` receiver carrying a
+/// polymorphic method name, which keeps every other site on the behaviour it
+/// had. `prefers_exact_signature_polymorphic_receiver` names only
+/// `java/lang/foreign/DowncallHandle`, a `MethodHandle` receiver, so the
+/// exact-first ordering that predicate selects cannot apply here.
+fn resolve_signature_polymorphic_native_site(
+    vm: &SharedVm,
+    dispatch_class: &str,
+    info: &JitInvokeInfo,
+) -> Option<(String, cratonvm_native_api::NativeMethodId, Option<&'static str>)> {
+    if !crate::vm::vm_exec::is_var_handle_signature_polymorphic_receiver(dispatch_class)
+        || !crate::vm::vm_exec::is_signature_polymorphic_method_name(info.method_name)
+    {
+        return None;
+    }
+    let registry = &vm.natives.native_methods;
+    const BASE: &str = "java/lang/invoke/VarHandle";
+    for owner in [BASE, dispatch_class] {
+        for poly_desc in crate::vm::vm_exec::SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS {
+            if let Some(id) = registry.resolve_id(owner, info.method_name, poly_desc) {
+                return Some((owner.to_string(), id, Some(poly_desc)));
+            }
+        }
     }
     None
 }
@@ -9295,6 +9362,17 @@ struct NativeSiteCache {
     /// so a site that goes polymorphic falls out to the generic dispatcher
     /// rather than calling the wrong body.
     receiver_class_id: Option<u32>,
+    /// The entry was resolved through rule 4 — a signature-polymorphic
+    /// `VarHandle` access mode, whose native is registered with an erased
+    /// `Object[]`/`Object` signature that has nothing to do with the call
+    /// site's own descriptor.
+    ///
+    /// The dispatch side must then unbox the erased result against the CALL
+    /// SITE descriptor (`unbox_poly_return_checked`), exactly as
+    /// `invoke_on_class_shared_inner` does. `coerce_native_return` — what
+    /// every other entry uses — would hand a boxed `Integer` back into an
+    /// `int` return slot.
+    poly: bool,
 }
 
 // Thread-local map from [`JitSiteKey`] -> cached JIT entry.
@@ -10877,6 +10955,18 @@ unsafe fn try_jit_site_cached_native_dispatch(
         thread.native_pending_return = Some(obj);
         return Some(obj.as_ptr() as i64);
     }
+    // `VarHandle` read modes on an ordinary instance field are a field load
+    // wearing a native's clothes. Serving them here rather than through the
+    // funnel is what takes `VarHandle.get` off the boxing round trip — see
+    // `try_varhandle_instance_field_read`.
+    if entry.poly {
+        if let Some(bits) = try_varhandle_instance_field_read(vm, info, args_slice, thread) {
+            SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            VARHANDLE_FIELD_READ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            count_jit_native_dispatch(vm, entry.native_id);
+            return Some(bits);
+        }
+    }
     // `JitDecodedArgs::new()` and not `with_capacity(args_slice.len())`: the
     // latter is an outlined call whose ~144-byte return the caller has to
     // materialise, and it measured 10.3 ns for a zero-argument decode that has
@@ -10901,6 +10991,24 @@ unsafe fn try_jit_site_cached_native_dispatch(
         crate::vm::safe_native_call_prevalidated_objects(vm, thread, entry.callback, &values)
     };
     let result = match called {
+        // A signature-polymorphic native returns the erased `Object` the
+        // registration promises, so it needs the call site's own descriptor
+        // applied — including the `WrongMethodTypeException` rule
+        // `unbox_poly_return_checked` owns. That call can itself fail (it
+        // raises the exception), so it is folded into the same error arm the
+        // native's own failure takes.
+        Ok(value) if entry.poly => {
+            match crate::vm::unbox_poly_return_checked(
+                vm,
+                thread,
+                value,
+                info.descriptor,
+                info.method_name,
+            ) {
+                Ok(unboxed) => crate::vm::coerce_native_return(unboxed, info.descriptor),
+                Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+            }
+        }
         Ok(value) => crate::vm::coerce_native_return(value, info.descriptor),
         Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
     };
@@ -10912,6 +11020,112 @@ unsafe fn try_jit_site_cached_native_dispatch(
         Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
         Some(Value::Object(None)) | None => 0,
         Some(_) => 0,
+    })
+}
+
+/// `VarHandle` instance-field READS served as a direct field load, reported by
+/// `CRATONVM_DBG=intrinsic-stats`. Zero here with a non-zero site-cached count
+/// means every VarHandle site refused the plan — which is a different problem
+/// from "no VarHandle site was reached", and only a counter separates them.
+static VARHANDLE_FIELD_READ_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `VarHandle` reads served as a direct field load from compiled code.
+pub fn varhandle_field_read_hit_count() -> u64 {
+    VARHANDLE_FIELD_READ_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Serve a signature-polymorphic `VarHandle` READ mode as what it actually is
+/// — one field load — instead of a native call.
+///
+/// The funnel route for `VH.get(receiver)` is: build a `NativeContextImpl`,
+/// record a thread transition, run `varhandle_get`'s access-shape cascade,
+/// **allocate a wrapper object** for the erased `Object` return, then unbox it
+/// again against the call site's descriptor and throw the wrapper away. That
+/// round trip is ~40% of a `VarHandle.get`, and netty pays it twice per
+/// `ByteBuf.writeByte` through `ensureAccessible()` -> `RefCnt.isLiveNonVolatile`.
+///
+/// # What it refuses, and why each refusal matters
+///
+/// * **Anything but a read mode.** `set`/CAS/`getAndAdd` mutate, and the
+///   write-side semantics (`safeConstructPutInt`, the ordered stores) live in
+///   the native.
+/// * **Any handle the side table does not describe as a resolved instance
+///   field** — `varhandle_instance_field_plan` answers `None` for static,
+///   array-element, byte-array/ByteBuffer-view and `SegmentVarHandle`
+///   handles, and for one whose slot is still unresolved (the native resolves
+///   and memoises it, so the second call qualifies).
+/// * **A boxed primitive reaching a reference return, or the reverse.** That
+///   is precisely the shape `unbox_poly_return_checked`'s W6-1 rule turns
+///   into a `WrongMethodTypeException`; declining hands it back to the funnel
+///   rather than reimplementing the rule here.
+///
+/// Every refusal is a fall-through to the existing dispatch, so the worst
+/// case is the cost that was already being paid.
+unsafe fn try_varhandle_instance_field_read(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    thread: &mut JvmThread,
+) -> Option<i64> {
+    if !matches!(
+        info.method_name,
+        "get" | "getVolatile" | "getOpaque" | "getAcquire"
+    ) {
+        return None;
+    }
+    // [VarHandle, receiver] and nothing else: a coordinate-carrying access
+    // (array index, byte offset) is not an instance-field read.
+    if args_slice.len() != 2 {
+        return None;
+    }
+    let vh_raw = args_slice[0] as u64;
+    let recv_raw = args_slice[1] as u64;
+    if vh_raw == 0 || recv_raw == 0 {
+        return None;
+    }
+    let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
+    let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
+    // The GC-stable key `vh_meta_get` files the handle under. Mirrors
+    // `NativeContextImpl::identity_hash_code`, including the displaced-hash
+    // consultation a thin-locked or inflated header needs.
+    let heap = &vm.mem.heap;
+    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
+        heap.next_identity_hash()
+    });
+    let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
+    // Reference/primitive agreement between the variable and the call site.
+    // `info.return_type` is the site's own descriptor return, which is what
+    // the funnel would have unboxed against.
+    let site_ret = info.return_type;
+    let site_is_ref = matches!(site_ret, b'L' | b'[');
+    let plan_is_ref = plan.value_desc == b'L';
+    if site_is_ref != plan_is_ref || (!site_is_ref && site_ret != plan.value_desc) {
+        return None;
+    }
+    // Same read `NativeContextImpl::get_field` performs, minus the class-id
+    // and descriptor-cache round trip: the declared descriptor is already on
+    // the plan, straight from the handle's own metadata.
+    let receiver = heap.load_and_forward(receiver);
+    let value = heap.get_field_as(receiver, plan.field_index as usize, plan.value_desc);
+    Some(match value {
+        Value::Int(v) => v as i64,
+        Value::Long(v) => v,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Double(d) => d.to_bits() as i64,
+        Value::Object(Some(obj)) => {
+            // Object-return handoff root, same contract as every other JIT
+            // native fast path (see `jit_integer_value_of_direct`): the
+            // reference is live only in a register until the caller stores
+            // it, so it has to be reachable across that window.
+            thread.native_pending_return = Some(obj);
+            obj.as_ptr() as i64
+        }
+        Value::Object(None) => 0,
+        // A slot whose storage tag disagrees with the declared descriptor is
+        // exactly what `get_field_as` exists to normalise; anything still
+        // unexpected here goes back to the funnel rather than being guessed at.
+        _ => return None,
     })
 }
 
@@ -11227,6 +11441,99 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
         args.as_ptr() as i64,
         1,
     )
+}
+
+/// Synthetic call-site info for [`jit_preconditions_check_index_direct`]'s
+/// cold arm — the out-of-range case, which must throw exactly what the
+/// registered native throws.
+static PRECONDITIONS_CHECK_INDEX_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "jdk/internal/util/Preconditions",
+    method_name: "checkIndex",
+    descriptor: "(IILjava/util/function/BiFunction;)I",
+    num_jit_args: 3,
+    return_type: b'I',
+    invoke_kind: 3,
+    declaring_class_id: 0,
+};
+
+/// Thin direct-call target for JIT `invokestatic
+/// jdk/internal/util/Preconditions.checkIndex(int,int,BiFunction)` sites
+/// (registered into `cratonvm_jit::PRECONDITIONS_CHECK_INDEX_DIRECT_FN` by
+/// `build_helpers`, recognised in `jit::try_compile`'s ladder and the IR path).
+///
+/// **Why this one.** `--dump-native-registry`'s invocation census on
+/// `probes/NioAccessorRate.java` put it at the TOP of the list — 4 000 000
+/// calls for 800 000 `ByteBuffer` accessor operations, ~2.5 per accessor,
+/// ahead of the store itself. `Objects.checkIndex` sits under every
+/// `java.nio.Buffer` absolute accessor, every `String` index check and every
+/// `List` bounds check, and it is a compare and a branch: paying the ~160 ns
+/// generic native funnel for it is the single largest rung under
+/// `HttpContentDecompressorTest.testZipBomb`
+/// (docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md).
+///
+/// Fast path: `0 <= index < length` returns `index`, with no funnel, no
+/// argument buffer, no `safe_native_call` wrapper. **Everything else — an
+/// out-of-range index, a negative length, anything that must throw — falls
+/// through to the generic dispatcher**, so the exception's class, message and
+/// the `BiFunction` formatter selection stay byte-for-byte what the registered
+/// native produces. That matters here more than usual: `throw_out_of_bounds`
+/// reads `Preconditions`' three static formatters to tell
+/// `StringIndexOutOfBoundsException` from `IndexOutOfBoundsException`, and
+/// reimplementing that choice in the fast path is exactly how the wrong-class
+/// bug the module comment warns about comes back.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_preconditions_check_index_direct(
+    vm_ptr: i64,
+    index: i64,
+    length: i64,
+    formatter: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    let i = index as i32;
+    let n = length as i32;
+    if i >= 0 && n >= 0 && i < n {
+        return i as i64;
+    }
+    // Throwing case (and any shape this fast path declines to judge): the
+    // generic dispatcher runs the registered native, formatter and all.
+    let args = [index, length, formatter];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &PRECONDITIONS_CHECK_INDEX_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        3,
+    )
+}
+
+/// Thin direct-call target for JIT `invokestatic
+/// java/lang/ref/Reference.reachabilityFence(Object)` sites (registered into
+/// `cratonvm_jit::REACHABILITY_FENCE_DIRECT_FN` by `build_helpers`).
+///
+/// Second on the same census — 3 200 000 calls, ~2 per `ByteBuffer` accessor —
+/// and its registered body is `black_box(args.first()); Ok(None)`, i.e. it does
+/// nothing but be opaque. Paying ~160 ns of generic native funnel for that is
+/// pure loss.
+///
+/// **Deliberately still a CALL, not an elision.** HotSpot intrinsifies
+/// `reachabilityFence` to no instructions at all, but it can afford to: its
+/// compiler models the fence as a liveness constraint, so the referent stays in
+/// the oop map without any code. This JIT has no such model, and the ONE thing
+/// the method exists for is keeping the argument reachable across a region
+/// where the compiler would otherwise consider it dead. Emitting nothing would
+/// silently delete that guarantee, and the failure — an object collected while
+/// a native still holds its address — is unreproducible and catastrophic.
+/// Passing the reference to an opaque `extern "C"` function keeps it live in
+/// the argument register and on the conservative scan, exactly as the
+/// registered native did, while removing the funnel. ~160 ns becomes the cost
+/// of a direct `CALL`.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_reachability_fence_direct(_vm_ptr: i64, referent: i64) {
+    crate::jit::conservative_roots::note_jit_boundary();
+    // The whole contract: be opaque about `referent` so nothing upstream may
+    // conclude it is dead. `black_box` is what the registered native used.
+    let _ = std::hint::black_box(referent);
 }
 
 /// Synthetic call-site info for [`jit_thread_current_thread_direct`]'s
@@ -16755,6 +17062,12 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_thread_current_thread_direct_fn(
             jit_thread_current_thread_direct as *const () as usize,
         );
+        cratonvm_jit::set_preconditions_check_index_direct_fn(
+            jit_preconditions_check_index_direct as *const () as usize,
+        );
+        cratonvm_jit::set_reachability_fence_direct_fn(
+            jit_reachability_fence_direct as *const () as usize,
+        );
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
@@ -17421,6 +17734,11 @@ mod jit_native_dispatch_profile {
                         callback: cb,
                         native_id: None,
                         receiver_class_id: Some(0),
+                        // These rungs price the ORDINARY native dispatch. A
+                        // signature-polymorphic entry takes a different tail
+                        // (`try_varhandle_instance_field_read`), so setting
+                        // this would make the numbers about something else.
+                        poly: false,
                     }),
                 ),
             );
