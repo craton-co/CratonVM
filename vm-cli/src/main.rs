@@ -2850,13 +2850,32 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
             // reported alongside it rather than folded in — they are different
             // units (distinct methods versus events) and adding them would
             // produce a number that means nothing.
-            Ok((violations, compatibility_classes)) => eprintln!(
-                "[cratonvm] wrote {} JDK-only report to {} ({violations} violation(s), \
-                 {compatibility_classes} compatibility class(es), {} refusal event(s))",
-                mode.as_str(),
-                absolute_dump_path(path),
-                shared.jdk_only_refusal_counts().total(),
-            ),
+            Ok((violations, compatibility_classes)) => {
+                eprintln!(
+                    "[cratonvm] wrote {} JDK-only report to {} ({violations} violation(s), \
+                     {compatibility_classes} compatibility class(es), {} refusal event(s))",
+                    mode.as_str(),
+                    absolute_dump_path(path),
+                    shared.jdk_only_refusal_counts().total(),
+                );
+                // The line above is the one number most readers stop at, and
+                // `{violations}` is a floor whenever the observation sink filled
+                // up. Saying so HERE, and not only in the file's
+                // `observation_sink` object, is the difference between a caveat a
+                // reader has to go looking for and one they cannot miss: the
+                // whole failure mode is that a truncated list reads as a
+                // complete one.
+                if cratonvm_vm::vm::jdk_only_native_shadow_sink_saturated() {
+                    eprintln!(
+                        "[cratonvm] warning: the JDK-only observation sink SATURATED at {} \
+                         distinct rows — the shadow rows in violations[] are a FLOOR, not the \
+                         population, and refusals.interpreter_shadow_unenforced stopped \
+                         advancing when it filled. Narrow the workload to read the list as \
+                         exhaustive.",
+                        cratonvm_vm::vm::jdk_only_native_shadow_cap(),
+                    );
+                }
+            }
             Err(e) => eprintln!(
                 "[cratonvm] warning: could not write JDK-only report: {}",
                 describe_dump_failure(path, &e)

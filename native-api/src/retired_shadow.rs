@@ -384,6 +384,102 @@
 //! wider prefix admits sixty more families to a binary search without changing
 //! any of their answers.
 //!
+//! # `ArrayList.get` / `size` — retired 2026-08-17, and why the hold was wrong
+//!
+//! G60-1 §5 N1 nominated these two on the grounds that the table "records no
+//! reason" for holding them while retiring five of their siblings. The table did
+//! record one, in `the_held_collection_families_are_not_retired` and in the §3.2
+//! paragraph above: `Map.values()` is answered as a `java/util/ArrayList` with
+//! its source map stashed in a trailing capacity slot, so `size`/`get`/
+//! `iterator`/`toArray` ARE the view's implementation and retiring them freezes
+//! every view at its creation time —
+//! `vm/src/runtime/interpreter/native_override.rs`'s
+//! `force_native_over_real_jdk_bytecode` still says exactly that, and cites H2
+//! `TestAlter.testAlterTableDropIdentityColumn`.
+//!
+//! **Two things are wrong with that as a reason to hold a STRICT-mode
+//! retirement, and one of them is structural.**
+//!
+//! *The structural one.* A retirement re-tags a registration `SyntheticStub`,
+//! and a `SyntheticStub` registers and dispatches normally in `Compatible`. So
+//! this table cannot change Compatible behaviour at all, and the H2 measurement
+//! it cited is a Compatible-mode observation by necessity: `TestAlter` is a JDBC
+//! test, `java.sql` is unloadable under `--jdk-only` today
+//! (APP-READINESS-20260812.md §0, family A), so that vector cannot reach strict
+//! mode to be broken by it. The hold imported a hazard from the one mode this
+//! file provably does not touch.
+//!
+//! *The measured one.* No map family answers `values()` with a
+//! `java/util/ArrayList` on this tree, in either mode. MEASURED on
+//! `0010e134d` + this change, JDK 25.0.4+7 on Azure linux, four arms — HotSpot,
+//! `--real-jdk`, `--jdk-only`, and `--jdk-only` with these two entries present
+//! (probes/JdkOnlyValuesViewProbe.java, `carrier.*` lines). All eleven carriers
+//! agree with HotSpot in all four arms:
+//!
+//! ```text
+//!   HashMap.values()            java.util.HashMap$Values
+//!   ConcurrentHashMap.values()  java.util.concurrent.ConcurrentHashMap$ValuesView
+//!   TreeMap.values()            java.util.TreeMap$Values
+//!   LinkedHashMap / Hashtable / Properties / EnumMap / IdentityHashMap /
+//!   WeakHashMap / values() through the java.util.Map interface door
+//!                               all the real JDK view class
+//! ```
+//!
+//! Those are every receiver `native_map_values` is registered on
+//! (`native-collections/src/lib.rs` ×3, `native-builtins/src/phases_early.rs`
+//! ×3, plus the `java/util/Map` interface door), so this is the complete set and
+//! not a sample. `values` is not on the force-native list, so real bytecode
+//! answers it and the stashed-source-map carrier is unreachable through it.
+//!
+//! **The acceptance measurement, and note what instrument it needed.**
+//! `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/ArrayList` — the dial the
+//! 2026-08-12 wave was accepted with — turns this probe RED:
+//! `values().iterator()` after a `put` throws `ConcurrentModificationException`
+//! from real `ArrayList$Itr.checkForComodification`. That is the dial yielding
+//! `iterator()` as well, because it cannot go finer than a class name, and it is
+//! exactly the "read arm A as an UPPER BOUND" warning in §3.5 above coming due.
+//! The per-triple instrument is this table, so the trial was built with these two
+//! entries and nothing else: 42 checks, byte-identical to HotSpot, including
+//! H2's own shape — a `ConcurrentHashMap.values()` captured before any entry
+//! exists, read back with `size()` as the FIRST view method called after the
+//! mutation, which is the one ordering that can tell a retired native from a live
+//! one.
+//!
+//! `iterator()`, `toArray()`, `isEmpty()` and `contains()` are NOT retired here
+//! and the `iterator()` result above is why: the dial says at least one of them
+//! is load-bearing, and separating which needs its own per-triple trial.
+//!
+//! # `Properties.getProperty` — asked, MEASURED, and NOT retired
+//!
+//! G60-1 §5 N2 asked whether this native is needed at all, and offered the
+//! hypothesis that it backs `System.getProperties()` interop. It does, and this
+//! is the mechanism. JDK 9 moved `Properties`' storage to a
+//! `ConcurrentHashMap` field named `map`, and JDK 25's `getProperty` reads it
+//! directly (`Properties.java:1145`). The `Properties` object
+//! `System.getProperties()` returns here is VM-built and never gets that field,
+//! so with the two overloads retired:
+//!
+//! ```text
+//!   new Properties() + setProperty/load/put/remove/defaults   36 checks, HotSpot-identical
+//!   System.getProperties().getProperty("java.home")           NullPointerException:
+//!       Cannot invoke "java.util.concurrent.ConcurrentHashMap.get(Object)"
+//!       because "this.map" is null      at java/util/Properties.getProperty
+//! ```
+//!
+//! (probes/JdkOnlyPropsShadowProbe.java, trial build with both overloads in this
+//! table.) So the answer to N2 is: the real bytecode IS correct on every axis
+//! G55-1 fixed by hand — every ordinary `new Properties()` line above is
+//! HotSpot-identical, because the real constructor initialises `map` — and it is
+//! still not retirable, because one receiver in the VM is built without running
+//! that constructor. **The precondition for retiring these two is that the
+//! native which builds the system `Properties` initialise the real `map` field**
+//! (or construct through the real constructor); it is not a property of
+//! `getProperty` at all.
+//!
+//! Recording it here rather than fixing it: that native is on the boot path in
+//! BOTH modes, and this file's rule is that a class's state has to become real
+//! before its shadow can be retired. This is that precondition, named.
+//!
 //! # Why this is applied centrally
 //!
 //! Same reason as [`crate::no_image_receiver`]: the property is a MEASUREMENT
@@ -430,8 +526,28 @@ static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
     ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
     ("java/util/ArrayList", "clear", "()V"),
+    // `get` and `size`, retired 2026-08-17 — the two rows G60-1 §5 N1 asked
+    // about. They were held in the 2026-08-12 wave because `Map.values()` was
+    // answered as an `ArrayList` with its source map stashed in a trailing
+    // capacity slot, making these two the view's implementation. **That is no
+    // longer what happens, and the hold also imported a Compatible-mode hazard
+    // into a strict-only decision.** See the G60-1 section of this module's
+    // docs for the four arms and the eleven carrier classes.
+    ("java/util/ArrayList", "get", "(I)Ljava/lang/Object;"),
+    ("java/util/ArrayList", "size", "()I"),
     ("java/util/Arrays$ArrayList", "iterator", "()Ljava/util/Iterator;"),
     ("java/util/Collections", "synchronizedMap", "(Ljava/util/Map;)Ljava/util/Map;"),
+    // NOT here, and MEASURED not to be retirable: `java/util/Properties`'s two
+    // `getProperty` overloads, G60-1 §5 N2. Real JDK 25 `getProperty` reads
+    // `this.map`, the `ConcurrentHashMap` field added in JDK 9 — and the
+    // `Properties` object `System.getProperties()` hands back is VM-built and
+    // never has it, so retiring the reader turns
+    // `System.getProperties().getProperty("java.home")` into
+    // `NullPointerException: Cannot invoke "java.util.concurrent.ConcurrentHashMap.get(Object)"
+    // because "this.map" is null` at `Properties.java:1145`. Every ordinary
+    // `new Properties()` path is fine — the real constructor initialises `map` —
+    // so the native is load-bearing for exactly one receiver, which is the
+    // question N2 asked. See this module's G60-1 section.
     ("java/util/logging/FileHandler", "<init>", "()V"),
     ("java/util/logging/FileHandler", "<init>", "(Ljava/lang/String;)V"),
     ("java/util/logging/FileHandler", "close", "()V"),
@@ -619,12 +735,12 @@ mod tests {
     fn the_table_is_not_empty() {
         assert!(
             RETIRED_SHADOW_TRIPLES.len() >= 80,
-            "expected 88 java.util.logging triples + 7 java.util collections = 95, got {}",
+            "expected 88 java.util.logging triples + 9 java.util collections = 97, got {}",
             RETIRED_SHADOW_TRIPLES.len()
         );
     }
 
-    /// The seven `java/util` collections triples are retired — and the eight
+    /// The `java/util` collections triples are retired — and the eight
     /// registrations they cover are `<init>(I)V` twice, which this table
     /// expresses as ONE entry because it retires TRIPLES.
     #[test]
@@ -670,10 +786,12 @@ mod tests {
             ("java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
             ("java/util/HashSet", "iterator", "()Ljava/util/Iterator;"),
             ("java/util/LinkedList", "add", "(Ljava/lang/Object;)Z"),
-            // Entangled with `Map.values()`: these ArrayList methods are the
-            // implementation of the values view, and retiring them freezes it.
-            ("java/util/ArrayList", "size", "()I"),
-            ("java/util/ArrayList", "get", "(I)Ljava/lang/Object;"),
+            // `size` and `get` came OFF this list on 2026-08-17 — see
+            // `the_two_rows_g60_1_asked_about`. `iterator` stays, and the
+            // measurement that separates them is in the module docs: with the
+            // whole class dialled to yield, `values().iterator()` after a `put`
+            // throws `ConcurrentModificationException` from real
+            // `ArrayList$Itr.checkForComodification`.
             ("java/util/ArrayList", "iterator", "()Ljava/util/Iterator;"),
             ("java/util/ArrayList$Itr", "next", "()Ljava/lang/Object;"),
             // Load-bearing FOR the retirements above.
@@ -702,6 +820,55 @@ mod tests {
             assert!(
                 triple_is_retired_shadow("java/util/logging/LogRecord", m, d),
                 "the source pair retires as a set; {m}{d} is missing"
+            );
+        }
+    }
+
+    /// G60-1 §5's two `java/util/ArrayList` nominations, and the boundary next
+    /// to them.
+    ///
+    /// The pair is retired; `iterator` is not, and that split is the finding
+    /// rather than an oversight. With the whole class dialled to yield,
+    /// `Map.values().iterator()` after a `put` throws
+    /// `ConcurrentModificationException` out of real
+    /// `ArrayList$Itr.checkForComodification`, while `size()`/`get()` retired on
+    /// their own are byte-identical to HotSpot across 42 checks. A later wave
+    /// that reaches for `iterator` needs its own per-triple trial and must not
+    /// read this test as permission.
+    #[test]
+    fn the_two_rows_g60_1_asked_about() {
+        assert!(triple_is_retired_shadow(
+            "java/util/ArrayList",
+            "get",
+            "(I)Ljava/lang/Object;"
+        ));
+        assert!(triple_is_retired_shadow("java/util/ArrayList", "size", "()I"));
+        assert!(!triple_is_retired_shadow(
+            "java/util/ArrayList",
+            "iterator",
+            "()Ljava/util/Iterator;"
+        ));
+    }
+
+    /// `Properties.getProperty` stays a `Bridge`, and the reason is a receiver
+    /// rather than the method.
+    ///
+    /// Not a restatement of the table's absence: this is the guard against a
+    /// later wave adding these two because "the real bytecode is String-keyed
+    /// JDK code and correct by construction" — which is TRUE, and still breaks
+    /// `System.getProperties().getProperty(...)`, because the object that call
+    /// runs on is built by a native that never initialises the real `map` field
+    /// JDK 25's `getProperty` reads. Retire them in the same change that makes
+    /// that receiver real, or not at all. Module docs carry the transcript.
+    #[test]
+    fn properties_get_property_is_held_for_the_system_receiver() {
+        for d in [
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        ] {
+            assert!(
+                !triple_is_retired_shadow("java/util/Properties", "getProperty", d),
+                "retiring getProperty{d} NPEs System.getProperties(); see the module docs"
             );
         }
     }

@@ -5618,9 +5618,39 @@ impl SharedVm {
     ///     "jit_direct_native_binds": 0, "jit_inline_cache_natives": 0,
     ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0,
     ///     "interpreter_shadow_unenforced": 0
+    ///   },
+    ///   "observation_sink": {
+    ///     "recorded": 81, "cap": 256, "saturated": false
     ///   }
     /// }
     /// ```
+    ///
+    /// # `observation_sink` — is `violations[]` the population, or a floor?
+    ///
+    /// Additive, and here is why it is not decoration. The §7 shadow rows in
+    /// `violations[]` come out of a bounded, deduplicated sink
+    /// ([`crate::vm::jdk_only_native_shadow_cap`], 256 distinct rows by default,
+    /// shared by both recorders), and until this object existed a TRUNCATED list
+    /// was identical in shape to a complete one. Every reader who took the list
+    /// as the population was reading a floor with nothing in the file to say
+    /// so — `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
+    /// §4 had to instruct its readers to count the rows by hand and compare them
+    /// against a constant compiled into the VM, which is not a check anyone
+    /// performs twice.
+    ///
+    /// `cap` is emitted rather than assumed for the same reason: it is an
+    /// operator override (`CRATONVM_NATIVE_SHADOW_SINK_CAP`), so a reader comparing
+    /// `recorded` against a hard-coded 256 would be comparing against the wrong
+    /// number on exactly the runs that raised it.
+    ///
+    /// `saturated` is **not** `recorded == cap`: a run whose last distinct
+    /// observation is the 256th fills the sink exactly and drops nothing. See
+    /// [`crate::vm::jdk_only_native_shadow_sink_saturated`].
+    ///
+    /// `saturated: true` also condemns a COUNTER, not just a list:
+    /// `refusals.interpreter_shadow_unenforced` stops advancing once the sink is
+    /// full, because the hierarchy walk that discovers a shadow is skipped when
+    /// the sink can no longer learn one.
     ///
     /// The **only** report writer: `--jdk-only-report` calls this. `verbose` is
     /// `--explain-jdk-only`; **false redacts and is the default**, applied
@@ -5923,6 +5953,31 @@ impl SharedVm {
         out.push_str(&format!(
             "    \"interpreter_shadow_unenforced\": {}\n",
             refusals.interpreter_shadow_unenforced
+        ));
+        // A SIBLING object, not three more `counts` keys. `counts` is a closed
+        // set of seven and these are not counts of anything that happened —
+        // they are the observation sink's capacity state, and what they do is
+        // qualify `violations[]` and `refusals.interpreter_shadow_unenforced`
+        // rather than join them.
+        //
+        // Written unconditionally, including in `Compatible` where the sink is
+        // never touched and this reads `recorded: 0, saturated: false`. An
+        // object present only when it had something to report would make its
+        // ABSENCE ambiguous between "nothing was dropped" and "this binary does
+        // not answer the question" — the same class of mistake that omitting the
+        // class buckets, rather than zeroing them, exists to avoid above.
+        out.push_str("  },\n  \"observation_sink\": {\n");
+        out.push_str(&format!(
+            "    \"recorded\": {},\n",
+            crate::vm::jdk_only_native_shadow_sink_len()
+        ));
+        out.push_str(&format!(
+            "    \"cap\": {},\n",
+            crate::vm::jdk_only_native_shadow_cap()
+        ));
+        out.push_str(&format!(
+            "    \"saturated\": {}\n",
+            crate::vm::jdk_only_native_shadow_sink_saturated()
         ));
         out.push_str("  }\n}\n");
 

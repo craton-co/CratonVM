@@ -395,10 +395,80 @@ static JDK_ONLY_NATIVE_SHADOW_UNENFORCED: std::sync::atomic::AtomicU64 =
 /// [`cratonvm_native_api::NativeKind`] spelling — the kind is always `Bridge`
 /// here, and what the row has to say is that this one DISPATCHED in front of
 /// real bytes. Same convention as the JIT's `"jit-thin-direct-helper"`.
-pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str = "bridge-ran-over-bytecode";
+///
+/// **Now an alias**, not a definition. The tag is the discriminator between the
+/// two opposite outcomes a `NativeShadowsBytecode` row can carry, and `types` is
+/// the crate that writes those rows' `summary`, `reason` and JSON — so `types`
+/// owns the spelling and both sides cannot drift. See
+/// [`cratonvm_types::error::NATIVE_SHADOW_RAN_TAG`], which records what the split
+/// spelling cost the first time somebody read the report without it.
+pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str =
+    cratonvm_types::error::NATIVE_SHADOW_RAN_TAG;
 
-/// Maximum number of distinct structured observations retained.
+/// Maximum number of distinct structured observations retained, by default.
+///
+/// Read through [`jdk_only_native_shadow_cap`], never directly: an operator can
+/// raise it, and a site that reads this constant would report the default while
+/// the sink obeyed something else.
 pub const JDK_ONLY_NATIVE_SHADOW_CAP: usize = 256;
+
+/// Ceiling on the operator override below. 65,536 distinct triples is more than
+/// twice the whole registry, so it cannot be reached by a real workload — it is
+/// there so a mistyped value cannot turn a diagnostic sink into a memory leak.
+const JDK_ONLY_NATIVE_SHADOW_CAP_MAX: usize = 65_536;
+
+/// The cap this process is actually using.
+///
+/// # Why this is an override and not a bigger constant
+///
+/// 256 is right for the workload the sink was designed against — a probe or a
+/// regression vector, where the population fits and the list is the answer. It
+/// is **not enough for an application**, and that is measured rather than
+/// argued: embedded Tomcat booting, serving one GET and one 404, and shutting
+/// down under `--jdk-only` saturates it, with 188 distinct `native-won` triples
+/// recorded before the sink stopped learning — against 58 for the reflection
+/// vector G60-1 §1 counted. So the record's §5 N3 ("run this report against an
+/// application, not a vector") cannot be *completed* at 256: the answer arrives
+/// truncated, and narrowing the workload until it fits is the opposite of what
+/// N3 asks for.
+///
+/// Raising the default instead was the alternative and is worse. The cap bounds
+/// a process-global `Vec` that every strict dispatch can push to, on a VM whose
+/// contract §2 forbids new process globals for compatibility state and whose
+/// existing two are already logged as violations to remove. A default nobody
+/// asked for that costs every strict run more memory is a change to the shipping
+/// configuration; an override is a change to the instrument.
+///
+/// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, a
+/// non-numeric value, or anything above
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP_MAX`] leaves the default in place — a
+/// diagnostic must never be the thing that fails, and a cap of zero would
+/// silently report an empty population as a complete one, which is the exact
+/// failure this whole area exists to remove.
+///
+/// **The filter is deliberately NOT resized with it.**
+/// [`JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS`] stays 512, so above that the filter
+/// stops absorbing most repeats and each new triple costs one extra mutex
+/// acquisition on a cold path. That is a throughput cost on a census run, paid
+/// only by a run that asked for a bigger sink, and `Vec::contains` keeps the
+/// buffer correct regardless — the filter's own doc says correctness never
+/// depends on it.
+pub fn jdk_only_native_shadow_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        // `runtime_var`, not `std::env::var`: the flag is DECLARED
+        // (`flag_groups::INVENTORY`, `CRATONVM_DBG=native-shadow-sink-cap`), and a
+        // declared name read through bare `getenv` comes from a different source
+        // than the latched snapshot every other knob is served from ---
+        // `types/tests/flag_declaration_guard.rs` documents that split, and it is
+        // the reason an undeclared read site is a defect rather than untidiness.
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0 && *n <= JDK_ONLY_NATIVE_SHADOW_CAP_MAX)
+            .unwrap_or(JDK_ONLY_NATIVE_SHADOW_CAP)
+    })
+}
 
 /// Slots in the lock-free "already recorded" filter. A power of two so the
 /// index is a mask, and larger than the cap so a saturated buffer still
@@ -471,6 +541,44 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// counters never describe the same event twice.
 pub fn jdk_only_native_shadow_unenforced() -> u64 {
     JDK_ONLY_NATIVE_SHADOW_UNENFORCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Did the bounded observation sink SATURATE -- i.e. was at least one distinct
+/// observation dropped for want of room?
+///
+/// The one question `--jdk-only-report`'s violation list could not answer about
+/// itself. `violations[]` is one row per distinct triple, capped at
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP`], and a truncated list is identical in SHAPE to
+/// a complete one -- so a reader who took the list as the population got a floor
+/// and could not tell. G60-1 §4 states the hazard exactly: *a saturated buffer
+/// looks exactly like a complete one from the JSON*.
+///
+/// **Not `recorded.len() == CAP`.** That test is wrong in the one place it
+/// matters: a run whose last distinct observation is the 256th fills the buffer
+/// exactly and drops nothing, and would be reported truncated. The flag below is
+/// set by [`offer_native_shadow_observation`] only when an offer arrives and
+/// finds no room, so it means "something WAS dropped", which is the fact a
+/// reader needs. Reading it costs one relaxed load and is never hot.
+///
+/// Once it is true the sink teaches nothing further and
+/// [`jdk_only_shadow_already_observed`] answers `true` for every triple, which
+/// is also what freezes [`jdk_only_native_shadow_unenforced`] -- so this flag is
+/// simultaneously the "the list is a floor" and the "the counter is a floor"
+/// signal. Both facts, one bit.
+pub fn jdk_only_native_shadow_sink_saturated() -> bool {
+    JDK_ONLY_NATIVE_SHADOW_FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many distinct observations the sink is holding right now.
+///
+/// The denominator for [`jdk_only_native_shadow_sink_saturated`], and cheaper
+/// than [`jdk_only_native_shadow_observations`] for a caller that only wants the
+/// count: it clones nothing. Both recorders share this one sink -- the
+/// bytecode-won rows and the `bridge-ran-over-bytecode` rows -- so this is the
+/// number to compare against [`JDK_ONLY_NATIVE_SHADOW_CAP`], not the count of
+/// either kind on its own.
+pub fn jdk_only_native_shadow_sink_len() -> usize {
+    jdk_only_native_shadows().lock().len()
 }
 
 /// Has this triple already been offered to the observation buffer?
@@ -560,7 +668,7 @@ fn offer_native_shadow_observation(
         native_kind: kind_tag,
     };
     let mut recorded = jdk_only_native_shadows().lock();
-    if recorded.len() >= JDK_ONLY_NATIVE_SHADOW_CAP {
+    if recorded.len() >= jdk_only_native_shadow_cap() {
         JDK_ONLY_NATIVE_SHADOW_FULL.store(true, Ordering::Relaxed);
         return;
     }

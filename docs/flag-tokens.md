@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-447 tokens.
+448 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -249,6 +249,7 @@ export inherited from a parent shell.
 | `irslot` | `CRATONVM_DBG_IRSLOT` |
 | `isinstance` | `CRATONVM_DBG_ISINSTANCE` |
 | `jar` | `CRATONVM_DBG_JAR` |
+| `native-shadow-sink-cap` | `CRATONVM_NATIVE_SHADOW_SINK_CAP` |
 | `jetty` | `CRATONVM_DBG_JETTY` |
 | `jetty2` | `CRATONVM_DBG_JETTY2` |
 | `jit-alloc` | `CRATONVM_DBG_JIT_ALLOC` |
