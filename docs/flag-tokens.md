@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-450 tokens.
+451 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -105,6 +105,7 @@ export inherited from a parent shell.
 | `bd-debug` | `CRATONVM_BD_DEBUG` |
 | `blocked-access` | `CRATONVM_DBG_BLOCKED_ACCESS` |
 | `blockgc` | `CRATONVM_DBG_BLOCKGC` |
+| `root-remap-audit` | `CRATONVM_DBG_ROOT_REMAP_AUDIT` |
 | `bufunder` | `CRATONVM_DBG_BUFUNDER` |
 | `bug03` | `CRATONVM_DBG_BUG03` |
 | `bytecode-dump` | `CRATONVM_DBG_BYTECODE_DUMP` |
@@ -703,7 +704,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-52 tokens.
+54 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -756,6 +757,8 @@ export inherited from a parent shell.
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
+| `zgc-gen-header-zero` | `CRATONVM_ZGC_GEN_HEADER_ZERO` |
+| `zgc-gen-dead-runs` | `CRATONVM_ZGC_GEN_DEAD_RUNS` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |

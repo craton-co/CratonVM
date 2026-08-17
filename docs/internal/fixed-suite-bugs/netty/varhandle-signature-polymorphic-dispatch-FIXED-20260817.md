@@ -179,7 +179,7 @@ is *not* in this table: it sits at the ordinary native-dispatch floor
 Class-level, whole suite classes, same host, `-Xmx 1500m`, no per-method cap so
 the class completes rather than being clipped. **Read the CPU column**: this box
 carried unrelated load of 8-35 throughout and its wall clock is worth ±20% at
-best (`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` §6). Every
+best (`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` §6). Every
 class passes exactly what it passed before.
 
 | class | tests | before wall / CPU | after wall / CPU | ratio (CPU) |
@@ -209,10 +209,16 @@ observed spread, not a choice.
 The three pages this came out of describe classes that exceed the netty suite's
 **180 s per-class wall cap**. This fix moves every one of them a long way and
 takes none of them under that cap. Their residual is the ordinary
-native-dispatch floor — ~150-200 ns per registered native call from compiled
-code — which is the subject of `performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`
-and whose own conclusion, unchanged, is that restructuring `invoke_or_native`
-cannot be justified by a lever too small to measure after it lands.
+native-dispatch floor — ~150-210 ns per registered native call from compiled
+code, of which `MessageDigest.update(byte)` is the clean specimen at
+~170-210 ns against HotSpot's 6.4 ns, before and after this change.
+
+That floor is `docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md`,
+**reopened on 2026-08-17 for exactly this reason**: it had been retired as "a
+characterisation, not an open defect", and it is now the named cause of live
+suite failures. Its own conclusion about its §2 lever 2 — that
+one-lookup-per-invoke is worth ~1.5% of CPU on a box whose measurement floor is
+~5%, and so is not worth building — is unchanged and not disputed here.
 
 That page's §3 warning is worth restating beside this record, because this fix
 is the counter-example it did not have: **a percentage in a flat profile of
@@ -245,5 +251,5 @@ new direct path, so the test provably exercises what it covers.
 
 * `fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md` — the eleven `codec.compression` classes this was found from.
 * `fixed-suite-bugs/netty/adaptivebytebufallocator-searchprocessor-180s-wall-20260816.md` — the four `io.netty.buffer` classes, and the throughput ceiling this fix partly explains and partly does not.
-* `performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` — the residual, and the measurement hygiene this record follows.
+* `docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` — the residual, and the measurement hygiene this record follows.
 * `performance/netty-per-call-throughput-20260813.md` — the earlier measurement record whose "826 M calls at a few hundred ns each" arithmetic was right about the *count* and wrong about the *cause* for the `VarHandle` share of it.

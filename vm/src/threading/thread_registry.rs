@@ -2435,6 +2435,26 @@ impl ThreadRegistry {
                 .in_blocked_region
                 .load(Ordering::Acquire)
             {
+                // NOT blocked: the fixup chain and `slot_origins` below are
+                // blocked-region machinery and do not apply.
+                //
+                // A snapshot remap was tried here on 2026-08-17 — on the theory
+                // that a thread censused as blocked and then leaving the region
+                // is skipped by this fold AND not waited for by the pause, so
+                // its stale snapshot is what the next collection marks from.
+                // The theory is sound and the change is a no-op:
+                // `CRATONVM_DBG_ROOT_REMAP_AUDIT=1`, which re-runs the root scan
+                // at the END of `update_all_roots` and looks for an address this
+                // collection moved (excluding slide destinations), reports ZERO
+                // with the remap and ZERO without it, on the workload that
+                // reproduces the H2 MVStore-writer residual. Every stale
+                // snapshot entry it did find was on a BLOCKED thread and was
+                // already handled below.
+                //
+                // Left unwritten deliberately: an unmeasured behaviour change
+                // in the root set is exactly what this file's history is made
+                // of. If the excluded-thread race is ever observed, the audit
+                // above is how to see it and this is where the fix goes.
                 continue;
             }
             let mut fixup = entry.gc_block_state.fixup.lock();

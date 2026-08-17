@@ -1401,6 +1401,10 @@ impl Frame {
             // nothing has been allocated into since.
             if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
                 if let Value::Object(Some(o)) = value {
+                    cratonvm_gc::gc_quiescence::check_stale_use(
+                        o.as_ptr() as usize,
+                        "frame local store",
+                    );
                     if let Some(moved_to) =
                         cratonvm_gc::gc_quiescence::was_vacated(o.as_ptr() as usize)
                     {
