@@ -9362,12 +9362,42 @@ impl G1Collector {
     // below could read/write that flat range directly; `humongous_copy` is
     // retained so the existing field/array accessor call sites are unchanged.
 
+    /// Could an object of `total_object_size` bytes possibly be humongous?
+    ///
+    /// Lock-free, and exact in the direction that matters. `alloc_in_region`
+    /// routes a request to `alloc_humongous_locked` iff
+    /// `size > region_size / 2`, and `refill_tlab` refuses to carve a chunk
+    /// above the same bound — so anything at or below it was allocated inside
+    /// ONE region, and its [`Self::humongous_span`] is necessarily `None`.
+    ///
+    /// Answering `false` therefore licenses skipping the `regions` lock
+    /// altogether, which is the entire point of this predicate. Every accessor
+    /// on this collector — `get_field`, `set_field`, `get_array_element`,
+    /// `set_array_element` — took that one global mutex on EVERY call, and the
+    /// only thing it protected was the `region_type` read inside
+    /// `humongous_span`. So a `putfield` on one thread serialized against a
+    /// `getfield` on every other, and an `int[]` store paid for a humongous
+    /// check that could not possibly apply to it. Measured with a
+    /// constant-total-work store loop (`BarrierProbe primstore` — an `int[]`
+    /// store, no GC barrier of any kind): **768 ms on one thread, 3172 ms on
+    /// eight**, against ZGC flat at ~790/850 ms.
+    ///
+    /// Only the SIZE is consulted, never the object's address, so this is safe
+    /// to call before any region state is stable.
+    #[inline]
+    fn may_be_humongous(&self, total_object_size: usize) -> bool {
+        total_object_size > self.config.region_size / 2
+    }
+
     /// If `obj`'s start address names a `HumongousStart` region, return the
     /// start region index and the total payload byte count (object size minus
     /// the single ObjectHeader). Returns `None` for ordinary (non-humongous)
     /// objects, whose access uses the plain flat-offset path.
     ///
     /// Takes the already-held `regions` slice to avoid re-locking.
+    ///
+    /// Gate every call on [`Self::may_be_humongous`] — it answers the same
+    /// question for the common case without the lock this one needs.
     fn humongous_span(
         &self,
         regions: &[G1Region],
@@ -9757,7 +9787,12 @@ impl G1Collector {
         // C2 (round-12 gc): humongous objects are region-fragmented; translate
         // the flat payload offset to the owning continuation region's buffer so
         // the read can never escape the object's backing memory.
-        {
+        //
+        // `may_be_humongous` first, so an ordinary object's field read never
+        // touches the `regions` lock. This block used to take it
+        // unconditionally, making every `getfield` on this collector contend
+        // with every other thread's field access — see `may_be_humongous`.
+        if self.may_be_humongous(total_size) {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u64; 2];
@@ -10079,7 +10114,37 @@ impl GarbageCollector for G1Collector {
 
         // C2 (round-12 gc): route humongous stores through the region-aware
         // translation so the write can never escape the object's memory.
-        let stored = {
+        //
+        // The flat arm is hoisted into a closure so it can run WITHOUT the
+        // `regions` lock: `may_be_humongous` settles the question by size, and
+        // an ordinary object's field write has no business serializing against
+        // every other thread's field access. See `may_be_humongous`.
+        //
+        // SAFETY (both call sites): `index < num_slots`, so the slot is
+        // in-bounds of the object's single-region backing store.
+        //
+        // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::write::<Value>`
+        // -- see the matching note on `get_field`'s read side above. The
+        // atomic write is what makes the lock-free path safe against a
+        // concurrent plain `get_field_raw` on the same slot; the lock never
+        // provided that ordering anyway, because the read side took it
+        // separately.
+        let flat_store = || {
+            let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+            if let Some((_, storage)) = compact {
+                unsafe {
+                    cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
+                };
+            } else {
+                unsafe {
+                    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
+                }
+            }
+            true
+        };
+        let stored = if !self.may_be_humongous(total_size) {
+            flat_store()
+        } else {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u64; 2];
@@ -10107,23 +10172,10 @@ impl GarbageCollector for G1Collector {
                     true,
                 )
             } else {
-                // SAFETY: `index < num_slots`, so the slot is in-bounds of the
-                // object's single-region backing store.
-                //
-                // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare
-                // `ptr::write::<Value>` -- see the matching note on
-                // `get_field`'s read side above.
-                let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-                if let Some((_, storage)) = compact {
-                    unsafe {
-                        cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
-                    };
-                } else {
-                    unsafe {
-                        cratonvm_types::write_value_atomic(ptr as *mut Value, value);
-                    }
-                }
-                true
+                // `may_be_humongous` said "maybe" on size alone and the region
+                // type says otherwise — an ordinary object that happens to be
+                // large. Same flat store, just reached with the lock held.
+                flat_store()
             }
         };
 
@@ -10197,12 +10249,25 @@ impl GarbageCollector for G1Collector {
         // translates to the owning continuation region. Either way the read is
         // bounds-confined to the object's own backing memory.
         let mut raw = [0u8; 8]; // largest element is 8 bytes (long/double/ref)
-        {
+        // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
+        // total so the humongous span / payload bound is exact.
+        let total_size =
+            ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+        // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)` is
+        // inside the array's single-region payload.
+        let flat_read = |raw: &mut [u8; 8]| {
+            let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(slot_ptr, raw.as_mut_ptr(), elem_size);
+            }
+        };
+        // `may_be_humongous` first: an ordinary array's element read must not
+        // take the `regions` lock, which this block used to do on every call —
+        // see `may_be_humongous` for what that cost.
+        if !self.may_be_humongous(total_size) {
+            flat_read(&mut raw);
+        } else {
             let regions = self.regions.lock();
-            // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
-            // total so the humongous span / payload bound is exact.
-            let total_size =
-                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 if !self.humongous_copy(
                     &regions,
@@ -10216,12 +10281,7 @@ impl GarbageCollector for G1Collector {
                     return Err(index as i32);
                 }
             } else {
-                // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)`
-                // is inside the array's single-region payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(slot_ptr, raw.as_mut_ptr(), elem_size);
-                }
+                flat_read(&mut raw);
             }
         }
         let value = array_element_from_bytes(element_type, &raw);
@@ -10289,13 +10349,34 @@ impl GarbageCollector for G1Collector {
         // weak-reference PROTOCOL writes never log an edge as a mark root.
         // `satb_pre_barrier` touches only TLS + the SATB shards (never the
         // `regions` lock), so calling it here cannot deadlock.
-        let stored = {
+        //
+        // …but only when the lock buys something. Two things can want it: a
+        // humongous span (settled by SIZE alone — see `may_be_humongous`) and
+        // the SATB read-then-store pair above. When marking is idle there is no
+        // SATB read, so an ordinary array store was taking the one global
+        // regions mutex purely to ask a question whose answer its own `len`
+        // already determined. That is what made an `int[]` store convoy: 768 ms
+        // on one thread against 3172 ms on eight for the same total work
+        // (`BarrierProbe primstore`), with ZGC flat.
+        let total_size =
+            ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+        let needs_satb_read =
+            is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed();
+        // SAFETY: `index < len` so the slot is inside the array payload.
+        let flat_store = || {
+            let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), slot_ptr, elem_size);
+            }
+            true
+        };
+        let stored = if !needs_satb_read && !self.may_be_humongous(total_size) {
+            flat_store()
+        } else {
             let regions = self.regions.lock();
-            let total_size =
-                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             let span = self.humongous_span(&regions, obj, total_size);
 
-            if is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
+            if needs_satb_read {
                 let mut old_raw = [0u8; 8];
                 let read_ok = match span {
                     Some((start, total_payload)) => self.humongous_copy(
@@ -10340,12 +10421,7 @@ impl GarbageCollector for G1Collector {
                     true,
                 )
             } else {
-                // SAFETY: `index < len` so the slot is inside the array payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(raw.as_ptr(), slot_ptr, elem_size);
-                }
-                true
+                flat_store()
             }
         };
         if !stored {
@@ -12437,6 +12513,79 @@ mod tests {
         // OOB index is rejected, not a wild write.
         assert!(gc.set_array_element(arr, n, Value::Int(1)).is_err());
         assert!(gc.get_array_element(arr, n).is_err());
+    }
+
+    /// `may_be_humongous` is what licenses every accessor to skip the `regions`
+    /// lock, so it must never answer `false` for an object the allocator
+    /// actually placed in a `HumongousStart` region. If it ever does, that
+    /// object's field/element access takes the FLAT path and reads or writes
+    /// the wrong memory — silently.
+    ///
+    /// This pins the predicate against the allocator's own admission rule
+    /// rather than against a hardcoded size, which is the only way the two can
+    /// be kept in agreement as `region_size` or the humongous threshold move.
+    #[test]
+    fn may_be_humongous_covers_everything_the_allocator_made_humongous() {
+        let gc = make_collector();
+        let region_size = gc.config.region_size;
+        // Walk element counts across the humongous threshold from well below to
+        // well above, including the exact boundary, and check the predicate
+        // against the region classification the allocator chose.
+        let per_elem = crate::heap::element_byte_size(ArrayElementType::Int);
+        let boundary_elems = (region_size / 2).saturating_sub(ARRAY_DATA_OFFSET) / per_elem;
+        for delta in [
+            -(boundary_elems as isize) / 2,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            boundary_elems as isize,
+        ] {
+            let n = ((boundary_elems as isize) + delta).max(1) as usize;
+            let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+            let total = ARRAY_DATA_OFFSET
+                + crate::heap::array_data_size(n, ArrayElementType::Int).unwrap();
+            let really_humongous = gc.is_humongous(arr);
+            assert!(
+                !really_humongous || gc.may_be_humongous(total),
+                "n={n} total={total} region_size={region_size}: the allocator made this \
+                 humongous but may_be_humongous said no, so every accessor would take \
+                 the flat path over a region-spanning object"
+            );
+            // And it must still round-trip through the accessors, whichever
+            // path the predicate routed it down.
+            for &i in &[0usize, n / 2, n - 1] {
+                gc.set_array_element(arr, i, Value::Int(i as i32 ^ 0x1234))
+                    .unwrap();
+                assert_eq!(
+                    gc.get_array_element(arr, i).unwrap().as_int(),
+                    Some(i as i32 ^ 0x1234),
+                    "n={n} index={i} did not round-trip"
+                );
+            }
+        }
+    }
+
+    /// The same agreement for an ORDINARY object's field slots: a plain object
+    /// is never humongous, so `set_field`/`get_field` must round-trip on the
+    /// lock-free path.
+    #[test]
+    fn an_ordinary_object_field_round_trips_without_the_regions_lock() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(0), 8);
+        assert!(!gc.is_humongous(obj));
+        let total = object_total_size(gc.get_header(obj));
+        assert!(
+            !gc.may_be_humongous(total),
+            "an 8-field object must take the lock-free accessor path"
+        );
+        for i in 0..8usize {
+            gc.set_field(obj, i, Value::Int(i as i32 * 31));
+        }
+        for i in 0..8usize {
+            assert_eq!(gc.get_field(obj, i).as_int(), Some(i as i32 * 31));
+        }
     }
 
     // G1 SIGSEGV regression (CpuOnlyBench / gpu-bench-cpu): a humongous array
