@@ -107,10 +107,34 @@
 //! against exactly this trade. It is being reversed because a gate that cannot
 //! see a swap is not measuring the thing it names.
 //!
-//! **It has still never been run.** `cargo` was unavailable in the lane that
-//! wrote this, as it was in the lane before. [`DRIFT_TRIPLES`] says where its
-//! numbers came from and how to tell a transliteration disagreement from a real
-//! regression on the first run.
+//! # 2026-08-17: it has now been compiled and run
+//!
+//! Four consecutive lanes recorded "`cargo` was not available, this file has
+//! never been compiled" as their single largest caveat. It was never a `cargo`
+//! problem. This file and `registrar_reachability.rs` depend on nothing but
+//! `std`, so
+//!
+//! ```text
+//! CARGO_MANIFEST_DIR=<abs path to native-builtins> \
+//!   rustc --edition 2021 --test -O -o drift_gate.exe tests/registrar_drift.rs
+//! ./drift_gate.exe --test-threads=1 --nocapture
+//! ```
+//!
+//! builds and runs the whole gate in about a second, with no workspace build
+//! and no feature resolution. That is how the G54-1 lane checked every number
+//! below. **It compiled clean on the first attempt** — none of the risks the
+//! G41-1 record listed (the match-ergonomic destructuring in `retake`,
+//! `baseline_by_pass`'s `entry(pass).or_default()`, the `&&String` bind in the
+//! M12 filter) was real.
+//!
+//! What the first run found was not a compile error but a *fourth* independent
+//! confirmation of the numbers: the Rust resolver produced 1,232 drifting
+//! triples and 1,368 pairs, matching the arithmetic G50-1 predicted, and
+//! `retake`'s regenerated table differed from the hand-edited one by exactly
+//! the `register_byte_array_output_stream` entry and nothing else.
+//!
+//! [`DRIFT_TRIPLES`] says where the numbers came from and how to tell a
+//! resolver disagreement from a real regression on a future run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -212,12 +236,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// source of truth: if the table is edited by hand and this is not re-taken,
 /// `the_baseline_is_well_formed` fails. Both are regenerated together by the
 /// printer in `retake`.
-const BASELINE_TOTAL_DRIFT: usize = 1_244;
+const BASELINE_TOTAL_DRIFT: usize = 1_232;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1_380;
+const BASELINE_TOTAL_PAIRS: usize = 1_368;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -264,7 +288,10 @@ const RESOLVER_WITNESSES: &[(&str, &str, &str, &str)] = &[
         "java/io/ByteArrayOutputStream",
         "toByteArray",
         "()[B",
-        "a `let cls = \"...\"` binding read out of the enclosing fn",
+        "a `let <name> = \"...\"` binding read out of the enclosing fn. Until 2026-08-17 this \
+         witnessed serialization.rs's `let cls = \"...\";`; that pass is deleted, so it now \
+         witnesses native-io's `let baos = \"java/io/ByteArrayOutputStream\";` block. Same \
+         resolution path, same assertion — presence in the census, drifting or not",
     ),
     (
         "java/util/concurrent/atomic/AtomicBoolean",
@@ -294,15 +321,6 @@ const RESOLVER_WITNESSES: &[(&str, &str, &str, &str)] = &[
 /// Where a row says MEASURED, the claim is from `--dump-native-registry` in both
 /// modes, not from reading source.
 const MUST_DRIFT: &[(&str, &str, &str, &str)] = &[
-    (
-        "java/io/ByteArrayOutputStream",
-        "close",
-        "()V",
-        "serialization.rs registers a no-op; native-io's native_baos_close dispatches \
-         BaosEvent::Close and runs process_pipe_output_close. MEASURED: the shipping body \
-         owns the slot in BOTH modes (kind=bridge, owns_slot=true, \
-         native-io/src/lib.rs:6897), so dropping the synthetic-only no-op costs nothing",
-    ),
     (
         "java/time/Instant",
         "getEpochSecond",
@@ -343,7 +361,33 @@ const MUST_DRIFT: &[(&str, &str, &str, &str)] = &[
 /// moment the resolver loses the triple -- the "confident, vacuous zero" F34-1
 /// §2.1 recorded twice.
 ///
-/// # Provenance of these 24
+/// # Provenance of the 12 `java/io/ByteArrayOutputStream` rows
+///
+/// `serialization.rs::register_byte_array_output_stream` bound all 12 to a
+/// two-slot synthetic layout, with `flush`/`close` as `|_ctx, _args| Ok(None)`
+/// no-ops. The G50-1 lane deleted the registrations and the five helpers they
+/// exclusively owned (245 lines) after a two-mode registry dump:
+/// `native-io/src/lib.rs` owns **13** `ByteArrayOutputStream` rows — a strict
+/// superset of these 12, the extra being `write([B)V` — with `kind = bridge`,
+/// `owns_slot = true` and `overwrote = null`, identically in compatible mode
+/// and under `--jdk-only`, and **zero** registry rows in either mode name
+/// `serialization.rs`. Five of the 13 carried non-zero `invocations` on an
+/// `RSerial` run, which is positive proof the native-io bodies are the ones
+/// that answer.
+///
+/// The deleted `close`/`flush` no-ops were the live half: `native_baos_close`
+/// dispatches `BaosEvent::Close` and runs `process_pipe_output_close`, and
+/// `native_baos_flush` dispatches `BaosEvent::Flush` and then
+/// `ctx.fd_table().flush(fd)` — the machinery behind a `Process`'s stdin pipe,
+/// which this VM models as a `ByteArrayOutputStream`.
+///
+/// These 12 are also the reason `registrar_reachability.rs` now carries
+/// [`the_two_gates_agree_on_the_synthetic_only_population`]'s counterpart: that
+/// file recorded this family as `0/12 triples also registered by a shipping
+/// pass` while this one recorded 12/12, and the dump agreed with this one. See
+/// `docs/known-issues/jdk-only/G54-1-…-20260817.md` §2.
+///
+/// # Provenance of the 24 navigation rows
 ///
 /// `register_p62_navigable_expansion`
 /// (`native-builtins/src/phases_late/collections.rs`) bound all 24 to local
@@ -361,6 +405,30 @@ const MUST_DRIFT: &[(&str, &str, &str, &str)] = &[
 /// both modes -- including the `NavigableMap`/`NavigableSet` *interface* rows,
 /// which are the ones §5's trap is actually about.
 const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
+    ("java/io/ByteArrayOutputStream", "<init>", "()V"),
+    ("java/io/ByteArrayOutputStream", "<init>", "(I)V"),
+    ("java/io/ByteArrayOutputStream", "close", "()V"),
+    ("java/io/ByteArrayOutputStream", "flush", "()V"),
+    ("java/io/ByteArrayOutputStream", "reset", "()V"),
+    ("java/io/ByteArrayOutputStream", "size", "()I"),
+    ("java/io/ByteArrayOutputStream", "toByteArray", "()[B"),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "(Ljava/nio/charset/Charset;)Ljava/lang/String;",
+    ),
+    ("java/io/ByteArrayOutputStream", "write", "(I)V"),
+    ("java/io/ByteArrayOutputStream", "write", "([BII)V"),
     (
         "java/util/NavigableMap",
         "ceilingEntry",
@@ -523,11 +591,27 @@ const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
 /// present in a real `--dump-native-registry` -- the first time any number in
 /// this family has been checked against a running VM.
 ///
-/// **It has still never been produced by the Rust code in this file.** If the
-/// first `cargo test` is red on `no_new_mode_drift`, read the printed table
-/// before assuming a regression: a disagreement of a few rows is this
-/// transliteration, not a defect in the tree. A disagreement of hundreds is the
-/// scanner, and `the_drift_scanner_is_not_vacuous` should be read first.
+/// **On 2026-08-17 this table WAS produced by the Rust code in this file**, and
+/// the transliteration's numbers survived contact with it. Compiled with
+/// `rustc --edition 2021 --test` (see the module header) against the tree at
+/// `107efe18a`, the scanner reported 1,232 drifting triples over 110 passes and
+/// 1,368 `(pass, triple)` pairs, and `retake`'s regenerated table was
+/// byte-identical to the table above. Three sources now agree — the Python
+/// port, the arithmetic in the G50-1 record, and this file's own scanner.
+///
+/// The tree does move underneath it: at that commit the scan saw 849 passes and
+/// 34,197 `fn` defs where G41-1's port saw 843 and 34,059, and 512
+/// shipping-reachable passes where it saw 507. **None of that moved the drift
+/// set**, which is the useful observation: the census is far more stable than
+/// its inputs.
+///
+/// If a future run is red on `no_new_mode_drift`, read the printed table before
+/// assuming a regression: a handful of rows is the resolver, and re-taking is
+/// one paste. A disagreement of hundreds is not, and
+/// `the_drift_scanner_is_not_vacuous` should be read first. If
+/// `the_two_gates_agree_on_the_synthetic_only_population` is red at the same
+/// time, read THAT first — a shifted population moves every number here, and it
+/// is what happened to `registrar_reachability.rs` on 2026-08-17.
 ///
 /// A pass absent from this table has an allowance of ZERO triples -- so a pass
 /// that starts drifting fails even though nothing else about it changed.
@@ -613,23 +697,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/net/http/HttpRequest$BodyPublishers", "noBody", "()Ljava/net/http/HttpRequest$BodyPublisher;"),
             ("java/net/http/HttpRequest$BodyPublishers", "ofByteArray", "([B)Ljava/net/http/HttpRequest$BodyPublisher;"),
             ("java/net/http/HttpRequest$BodyPublishers", "ofString", "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;"),
-        ],
-    ),
-    (
-        "register_byte_array_output_stream",
-        &[
-            ("java/io/ByteArrayOutputStream", "<init>", "()V"),
-            ("java/io/ByteArrayOutputStream", "<init>", "(I)V"),
-            ("java/io/ByteArrayOutputStream", "close", "()V"),
-            ("java/io/ByteArrayOutputStream", "flush", "()V"),
-            ("java/io/ByteArrayOutputStream", "reset", "()V"),
-            ("java/io/ByteArrayOutputStream", "size", "()I"),
-            ("java/io/ByteArrayOutputStream", "toByteArray", "()[B"),
-            ("java/io/ByteArrayOutputStream", "toString", "()Ljava/lang/String;"),
-            ("java/io/ByteArrayOutputStream", "toString", "(Ljava/lang/String;)Ljava/lang/String;"),
-            ("java/io/ByteArrayOutputStream", "toString", "(Ljava/nio/charset/Charset;)Ljava/lang/String;"),
-            ("java/io/ByteArrayOutputStream", "write", "(I)V"),
-            ("java/io/ByteArrayOutputStream", "write", "([BII)V"),
         ],
     ),
     (
@@ -2931,6 +2998,15 @@ struct Analysis {
     shipping: usize,
     synthetic_only: BTreeSet<String>,
     direct_synthetic_only: usize,
+    /// The direct synthetic-only children by NAME, not just counted.
+    ///
+    /// `registrar_reachability.rs` pins the same set in
+    /// `DELIBERATE_SYNTHETIC_ONLY_FAMILIES`, and
+    /// [`the_two_gates_agree_on_the_synthetic_only_population`] compares them.
+    /// Two independently written scanners over the same tree agreeing on 73
+    /// names is the strongest evidence either file has that its reachability
+    /// half is right; a count cannot deliver it.
+    direct_synthetic_only_set: BTreeSet<String>,
     synthetic_overrides_body: usize,
     brace_imbalanced_files: Vec<String>,
     /// Every triple registered anywhere -> the passes that register it.
@@ -3583,10 +3659,16 @@ fn build_analysis() -> Analysis {
     }
     let shipping = reach(&roots, &syn_gated);
     let synthetic_only: BTreeSet<String> = syn_reach.difference(&shipping).cloned().collect();
-    let direct_synthetic_only = calls_from
+    let direct_synthetic_only_set: BTreeSet<String> = calls_from
         .get(SYNTHETIC_OVERRIDES)
-        .map(|d| d.iter().filter(|n| synthetic_only.contains(*n)).count())
-        .unwrap_or(0);
+        .map(|d| {
+            d.iter()
+                .filter(|n| synthetic_only.contains(*n))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let direct_synthetic_only = direct_synthetic_only_set.len();
 
     // --- 5. constants ------------------------------------------------------
     let mut per_file_consts: Vec<BTreeMap<String, String>> = Vec::with_capacity(files.len());
@@ -3850,6 +3932,7 @@ fn build_analysis() -> Analysis {
         shipping: shipping.len(),
         synthetic_only,
         direct_synthetic_only,
+        direct_synthetic_only_set,
         synthetic_overrides_body,
         brace_imbalanced_files: brace_imbalanced,
         registrants,
@@ -4528,10 +4611,12 @@ fn the_fixed_twins_stay_fixed() {
         "THIS TEST IS VACUOUS: these triples are not registered by ANY pass this scan can \
          see, so 'they no longer drift' is true for the wrong reason — the resolver lost \
          them.\n{}\n\n\
-         All 24 are registered by `native-collections/src/lib.rs` \
-         (`register_tree_map_natives` / `register_tree_set_natives`) and were confirmed \
-         present with `kind = bridge` and `owns_slot = true` in BOTH a compatible-mode and \
-         a `--jdk-only` `--dump-native-registry`. If the scan cannot see them, repair the \
+         The 24 navigation rows are registered by `native-collections/src/lib.rs` \
+         (`register_tree_map_natives` / `register_tree_set_natives`) and the 12 \
+         `ByteArrayOutputStream` rows by `native-io/src/lib.rs` (`register_io_natives`, \
+         which binds 13 — these 12 plus `write([B)V`). All 36 were confirmed present with \
+         `kind = bridge` and `owns_slot = true` in BOTH a compatible-mode and a \
+         `--jdk-only` `--dump-native-registry`. If the scan cannot see them, repair the \
          resolver before trusting any number in this file.",
         vanished.join("\n")
     );
@@ -4549,7 +4634,296 @@ fn the_fixed_twins_stay_fixed() {
          If a second registrant is back, read \
          `native-builtins/src/phases_late/collections.rs::register_p62_navigable_expansion` \
          — the deleted family and the reason are documented on it — before assuming the new \
-         one is the good copy.",
+         one is the good copy. For a `ByteArrayOutputStream` row, read \
+         `native-builtins/src/serialization.rs::register_byte_array_output_stream`, which \
+         is deliberately empty for the same kind of reason: a returning `close`/`flush` \
+         no-op would silently skip `process_pipe_output_close` and the fd-table flush.",
         returned.join("\n")
+    );
+}
+
+// ===========================================================================
+// SECTION 5 — the cross-check against `registrar_reachability.rs`
+// ===========================================================================
+
+/// Path to the reachability gate, read at run time by
+/// [`the_two_gates_agree_on_the_synthetic_only_population`].
+const REACHABILITY_GATE: &str = "tests/registrar_reachability.rs";
+
+/// Names this file calls synthetic-only and the other gate does not, or the
+/// reverse, each with the reason the two scanners legitimately differ.
+///
+/// The two are not the same program. This one scans SEVEN crates' `src` trees
+/// and roots its shipping closure on module-level references; the other scans
+/// `native-builtins/src` for definitions and roots its shipping closure on
+/// pass names mentioned anywhere else in the workspace. So an exact match is
+/// not the right assertion — an exactly ENUMERATED difference is.
+///
+/// Every row below was checked by hand on 2026-08-17 and in every one of them
+/// the OTHER gate is right and this one over-reads `shipping`:
+///
+/// * the five `use`-import rows: SECTION 3's module-level scan counts a pass
+///   named in a `use crate::…::register_x;` item as a non-pass reference, and
+///   therefore as a shipping root. But an import is not a call. All five are
+///   called from exactly one place — `register_phase52_natives`,
+///   `register_phase53_natives`, `register_phase60_natives` (twice) or
+///   `register_phase65_natives` — every one of which is itself a direct
+///   synthetic-only child of `register_synthetic_overrides`. Their real call
+///   sites are already captured by the in-function scan, so the `use` rule
+///   buys nothing and costs five false shipping roots. Consequence: their
+///   triples are excluded from the drift census, so [`BASELINE_TOTAL_DRIFT`]
+///   is an UNDER-count by whatever they share with a shipping pass.
+/// * `register_synthetic_socket_stubs`: this scan reads `vm/src/vm/tests.rs`,
+///   which is `#[cfg(all(test, feature = "synthetic-jdk"))] mod tests;` at
+///   `vm/src/vm.rs:59-60`. Its line 582 is the pass's only reference outside
+///   `native-builtins/src`, and a test — especially one compiled only under
+///   `synthetic-jdk` — is not a shipping call site. The other gate closed this
+///   on 2026-08-17; this one has not, because doing so moves the census and a
+///   census move is a re-take, not a cross-check.
+/// * `register_synthetic_overrides` itself: structural, not a defect. This
+///   scan seeds the synthetic closure WITH the root and keeps it; the other
+///   removes it. It registers triples directly in its own body, which is why
+///   it appears in [`DRIFT_TRIPLES`] as a pass in its own right.
+///
+/// Repairing the first two is a re-take of [`DRIFT_TRIPLES`] and belongs in
+/// its own commit — see `docs/known-issues/jdk-only/G54-1-…-20260817.md` N1.
+/// Until then this table is the honest statement of where the two disagree,
+/// and a SIXTH name appearing on either side fails.
+const KNOWN_POPULATION_DIVERGENCE: &[(&str, &str)] = &[
+    (
+        "register_p60_callsite",
+        "this scan only: `use` import at phases_late.rs:49 read as a shipping root; sole \
+         caller is register_phase60_natives (synthetic-only)",
+    ),
+    (
+        "register_p60_record",
+        "this scan only: `use` import at phases_late.rs:52 read as a shipping root; sole \
+         caller is register_phase60_natives (synthetic-only)",
+    ),
+    (
+        "register_p65_method_handles_extra",
+        "this scan only: `use` import at phases_late.rs:49 read as a shipping root; sole \
+         caller is register_phase65_natives (synthetic-only)",
+    ),
+    (
+        "register_phase52_string_buffer",
+        "this scan only: `use` import at phases_early.rs:47 read as a shipping root; sole \
+         caller is register_phase52_natives (synthetic-only)",
+    ),
+    (
+        "register_phase53_record",
+        "this scan only: `use` import at phases_early.rs:44 read as a shipping root; sole \
+         caller is register_phase53_natives (synthetic-only)",
+    ),
+    (
+        "register_synthetic_socket_stubs",
+        "this scan only: vm/src/vm/tests.rs:582 read as a shipping root, but that file is \
+         `#[cfg(all(test, feature = \"synthetic-jdk\"))] mod tests;`",
+    ),
+    (
+        "register_synthetic_overrides",
+        "STRUCTURAL, not a defect: this scan keeps the closure's root in the set and the \
+         other removes it. It registers triples in its own body.",
+    ),
+];
+
+/// Pull a `const NAME: &[&str] = &[ "a", "b", … ];` list out of Rust source.
+///
+/// Deliberately dumb, and floored by the caller so that dumbness cannot pass
+/// as agreement: it takes every string literal between `= &[` and the matching
+/// `];`. Comments are skipped so a commented-out row does not count.
+fn str_list_after(src: &str, decl: &str) -> Vec<String> {
+    let Some(start) = src.find(decl) else {
+        return Vec::new();
+    };
+    let Some(open) = src[start..].find("= &[").map(|o| start + o + 4) else {
+        return Vec::new();
+    };
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 1usize;
+    let mut i = open;
+    while i < b.len() && depth > 0 {
+        match b[i] {
+            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                let mut lit = String::new();
+                while j < b.len() {
+                    if b[j] == b'\\' {
+                        if j + 1 < b.len() {
+                            lit.push(b[j + 1] as char);
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    if b[j] == b'"' {
+                        break;
+                    }
+                    lit.push(b[j] as char);
+                    j += 1;
+                }
+                out.push(lit);
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// **The two gates must agree about the POPULATION, and until 2026-08-17
+/// nobody had ever asked.**
+///
+/// `registrar_reachability.rs` decides which passes are synthetic-only; this
+/// file decides which triples those passes share with a shipping pass. The
+/// second question is meaningless if the two disagree about the first, and
+/// nothing compared them — so when reachability's own census went wrong, this
+/// gate stayed green and said nothing.
+///
+/// It had gone wrong. On 2026-08-17 an untracked `scratch/` directory holding
+/// a stray copy of `phases_late.rs` was being walked by that file's
+/// whole-workspace reference scan, injecting 203 spurious shipping roots; it
+/// reported 54 synthetic-only families where this scan reports 73, and 169
+/// synthetic-only passes where it pins 284. All three of its ratchets were red
+/// and this gate was entirely green, because nothing here reads that file.
+///
+/// Two assertions:
+///
+/// 1. **The 73 direct families must match exactly.** This is not a formality:
+///    two independently written scanners, different crate scopes, different
+///    shipping-root rules, agreeing name-for-name is the strongest evidence
+///    either file has that its reachability half is right. MEASURED
+///    2026-08-17: identical, 73/73.
+/// 2. **The transitive closures may differ only by
+///    [`KNOWN_POPULATION_DIVERGENCE`]**, which enumerates all seven names and
+///    says which scanner is wrong about each. A drift in either direction that
+///    is not on that list fails.
+///
+/// The reverse direction lives in that file, as
+/// `the_drift_gate_agrees_about_family_drift_exposure`: it re-derives each
+/// family's drift exposure from [`DRIFT_TRIPLES`]. Between them, neither
+/// gate's table can be re-taken without the other noticing.
+#[test]
+fn the_two_gates_agree_on_the_synthetic_only_population() {
+    let a = analysis();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(REACHABILITY_GATE);
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the reachability gate at {}: {e}. This cross-check is the only \
+             thing comparing the two gates; if the file moved, re-point REACHABILITY_GATE \
+             rather than deleting the test.",
+            path.display()
+        )
+    });
+
+    let families = str_list_after(&src, "const DELIBERATE_SYNTHETIC_ONLY_FAMILIES");
+    // That list is `(name, reason)` pairs, so the pass names are the even
+    // elements; a reason never starts with `register_`.
+    let their_families: BTreeSet<&str> = families
+        .iter()
+        .map(String::as_str)
+        .filter(|s| s.starts_with("register_"))
+        .collect();
+    let their_closure: BTreeSet<&str> = str_list_after(&src, "const SYNTHETIC_ONLY_CLOSURE")
+        .iter()
+        .map(|s| Box::leak(s.clone().into_boxed_str()) as &str)
+        .collect();
+
+    // --- non-vacuity: a parse that finds nothing agrees with everything ----
+    assert!(
+        their_families.len() >= 50 && their_closure.len() >= 200,
+        "parsed only {} families / {} closure entries out of {REACHABILITY_GATE}. Those \
+         lists held 73 and 285 on 2026-08-17, so this parse is broken and both assertions \
+         below would pass by finding nothing.",
+        their_families.len(),
+        their_closure.len()
+    );
+
+    // --- 1. the direct families -------------------------------------------
+    let ours: BTreeSet<&str> = a
+        .direct_synthetic_only_set
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let only_here: Vec<&str> = ours.difference(&their_families).copied().collect();
+    let only_there: Vec<&str> = their_families.difference(&ours).copied().collect();
+    assert!(
+        only_here.is_empty() && only_there.is_empty(),
+        "the two gates disagree about the DIRECT synthetic-only children of \
+         `{SYNTHETIC_OVERRIDES}`.\n  \
+         this scan sees, {REACHABILITY_GATE} does not: {only_here:?}\n  \
+         {REACHABILITY_GATE} pins, this scan does not: {only_there:?}\n\n\
+         These two scanners are independent, so a disagreement is a real signal and not a \
+         formatting difference. Read `the_scanner_is_not_vacuous` in BOTH files before \
+         editing either list: on 2026-08-17 the cause was an untracked `scratch/` directory \
+         being walked as workspace source by the other gate, which reported 54 families \
+         instead of 73 while this gate stayed green."
+    );
+
+    // --- 2. the transitive closure ----------------------------------------
+    let allowed: BTreeSet<&str> = KNOWN_POPULATION_DIVERGENCE
+        .iter()
+        .map(|&(n, _)| n)
+        .collect();
+    let ours_all: BTreeSet<&str> = a.synthetic_only.iter().map(String::as_str).collect();
+    let mut unexplained: Vec<String> = Vec::new();
+    for n in ours_all.difference(&their_closure) {
+        if !allowed.contains(n) {
+            unexplained.push(format!(
+                "  {n}: synthetic-only HERE, absent from {REACHABILITY_GATE}'s closure \
+                 (defined at {})",
+                a.where_defined
+                    .get(*n)
+                    .map(String::as_str)
+                    .unwrap_or("unknown")
+            ));
+        }
+    }
+    for n in their_closure.difference(&ours_all) {
+        if !allowed.contains(n) {
+            unexplained.push(format!(
+                "  {n}: pinned synthetic-only by {REACHABILITY_GATE}, SHIPPING-reachable here"
+            ));
+        }
+    }
+    assert!(
+        unexplained.is_empty(),
+        "the two gates' synthetic-only closures diverge on names that \
+         KNOWN_POPULATION_DIVERGENCE does not explain:\n{}\n\n\
+         Every existing row on that list is a case where THIS scan over-reads `shipping` — \
+         five `use`-import roots, one test-file root, and the closure root itself. A new \
+         name is not automatically the same species. Decide which scanner is right, say so \
+         in the record, and add the row with its reason; an unexplained row here is an \
+         exemption nobody measured.",
+        unexplained.join("\n")
+    );
+
+    // A stale divergence row is a hole in exactly the way a stale allow-list
+    // entry is: it pre-authorises a disagreement that is no longer happening,
+    // and would silently cover a different one arriving under the same name.
+    let live: BTreeSet<&str> = ours_all
+        .symmetric_difference(&their_closure)
+        .copied()
+        .collect();
+    let stale: Vec<&str> = allowed.difference(&live).copied().collect();
+    assert!(
+        stale.is_empty(),
+        "KNOWN_POPULATION_DIVERGENCE lists {stale:?}, but the two gates now AGREE about \
+         them. Good news that still has to be recorded: delete the rows, and if the repair \
+         was to this file's shipping-root rules, re-take DRIFT_TRIPLES in the same commit \
+         because the census moved."
     );
 }

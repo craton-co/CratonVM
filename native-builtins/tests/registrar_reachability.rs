@@ -81,6 +81,39 @@
 //! set size, external-reference count, and the byte size of the extracted
 //! `register_synthetic_overrides` body. Plus the two-sided control pair above.
 //! See [`the_scanner_is_not_vacuous`].
+//!
+//! **Those floors earned their keep on 2026-08-17.** An untracked `scratch/`
+//! directory containing a stray copy of `phases_late.rs` was being walked as
+//! workspace source, and because every pass name mentioned outside
+//! `native-builtins/src` is taken as a SHIPPING ROOT, it declared 115
+//! synthetic-only registrars promoted to the shipping path. Three of this
+//! file's four tests were red, and the one that said what had actually
+//! happened was `the_scanner_is_not_vacuous`'s direct-child floor. Without it
+//! the obvious repair — delete the "no longer synthetic-only" names from both
+//! allow-lists, exactly as the failure messages suggest — would have quietly
+//! discarded two thirds of the population this gate exists to watch. See
+//! [`scan::rs_files`] and `docs/known-issues/jdk-only/G54-1-…-20260817.md` §3.
+//!
+//! # Cross-checked against `registrar_drift.rs`
+//!
+//! These two files were written independently, scan different crate scopes,
+//! and had never been compared until 2026-08-17. The first comparison found
+//! them contradicting each other about
+//! `register_byte_array_output_stream` — this file said `0/12`, that one said
+//! 12/12, and a two-mode registry dump sided with that one.
+//! [`the_drift_gate_agrees_about_family_drift_exposure`] and its counterpart
+//! `the_two_gates_agree_on_the_synthetic_only_population` now compare them on
+//! every run, in both directions.
+//!
+//! # Running it without `cargo`
+//!
+//! This file depends on nothing but `std`, so it needs no workspace build:
+//!
+//! ```text
+//! CARGO_MANIFEST_DIR=<abs path to native-builtins> \
+//!   rustc --edition 2021 --test -O -o reach.exe tests/registrar_reachability.rs
+//! ./reach.exe --test-threads=1 --nocapture
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -135,151 +168,283 @@ use std::sync::OnceLock;
 /// last-write-wins and call ORDER decides which implementation survives.
 const DELIBERATE_SYNTHETIC_ONLY_FAMILIES: &[(&str, &str)] = &[
     ("register_aot_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 1/14 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_atomic_boolean_natives",
-     "SHIPPING TWIN: no class exclusive to it; 8/8 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_bigdecimal_natives",
-     "SHIPPING TWIN: no class exclusive to it; 18/32 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_biginteger_natives",
-     "SHIPPING TWIN: no class exclusive to it; 19/32 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_byte_array_output_stream",
-     "SHIPPING TWIN: no class exclusive to it; 0/12 triples also registered by a shipping pass"),
+     "TOMBSTONE: registers nothing — emptied 2026-08-17 (G50-1) after a two-mode dump showed native-io owning all 13 ByteArrayOutputStream rows (kind=bridge, owns_slot=true); this row said 0/12 while registrar_drift.rs said 12/12, see G54-1 §2"),
     ("register_cds_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 0/11 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_classfile_api_natives",
-     "REAL-JDK BYTECODE: all 16 exclusive classes exist in JDK 25 and declare no native method; 0/78 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 16 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_classloader_natives",
-     "SHIPPING TWIN: no class exclusive to it; 26/52 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_completable_future_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 0/23 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_concurrent_extras",
-     "SHIPPING TWIN: no class exclusive to it; 2/15 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_crypto_impl_natives",
-     "SHIPPING TWIN: no class exclusive to it; 2/2 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_enterprise_final_natives",
-     "APP/ABSENT: 1 of its 3 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 122/232 triples also on the shipping path"),
+     "APP/ABSENT: 1 of its 3 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_enterprise_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/8 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_enum_natives",
-     "SHIPPING TWIN: no class exclusive to it; 4/8 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_functional_completion_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/8 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_functional_extras_natives",
      "TOMBSTONE: registers nothing (deliberately empty or dynamic-only); no capability rides on it"),
     ("register_graalvm_compat_natives",
-     "APP/ABSENT: 8 of its 8 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 0/15 triples also on the shipping path"),
+     "APP/ABSENT: 8 of its 8 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_http2_natives",
-     "APP/ABSENT: 1 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 38/90 triples also on the shipping path"),
+     "APP/ABSENT: 1 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_jackson_gson_natives",
-     "APP/ABSENT: 2 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 0/38 triples also on the shipping path"),
+     "APP/ABSENT: 2 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_java_lang_extras_natives",
-     "SHIPPING TWIN: no class exclusive to it; 3/14 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_jdk25_concurrency_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/64 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_jdk25_language_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/9 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_jdk25_patterns_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/15 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_letsgo_compat_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/4 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_locale_natives",
      "TOMBSTONE: registers nothing (deliberately empty or dynamic-only); no capability rides on it"),
     ("register_logging_natives",
-     "SHIPPING TWIN: no class exclusive to it; 20/30 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_m18_concurrent_fixes",
-     "SHIPPING TWIN: no class exclusive to it; 2/41 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_number_format_natives",
      "TOMBSTONE: registers nothing (deliberately empty or dynamic-only); no capability rides on it"),
     ("register_pe_panama",
-     "APP/ABSENT: 1 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 38/52 triples also on the shipping path"),
+     "APP/ABSENT: 1 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase50_natives",
-     "SHIPPING TWIN: no class exclusive to it; 44/129 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase51_natives",
-     "SHIPPING TWIN: no class exclusive to it; 76/173 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase52_natives",
-     "REAL-JDK BYTECODE: all 7 exclusive classes exist in JDK 25 and declare no native method; 61/181 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 7 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase53_natives",
-     "SHIPPING TWIN: no class exclusive to it; 112/152 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase54_natives",
-     "SHIPPING TWIN: no class exclusive to it; 149/200 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase55_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 32/90 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase56_natives",
-     "SHIPPING TWIN: no class exclusive to it; 42/139 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase57_natives",
-     "SHIPPING TWIN: no class exclusive to it; 241/306 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase58_natives",
-     "APP/ABSENT: 1 of its 3 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 25/170 triples also on the shipping path"),
+     "APP/ABSENT: 1 of its 3 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase59_natives",
-     "SHIPPING TWIN: no class exclusive to it; 149/206 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase60_natives",
-     "SHIPPING TWIN: no class exclusive to it; 46/79 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase61_natives",
-     "APP/ABSENT: 1 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 45/121 triples also on the shipping path"),
+     "APP/ABSENT: 1 of its 2 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase62_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 29/109 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase63_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 47/68 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase64_natives",
-     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; 26/82 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase65_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 15/81 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase66_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 25/71 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase67_natives",
-     "APP/ABSENT: 3 of its 6 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 158/219 triples also on the shipping path"),
+     "APP/ABSENT: 3 of its 6 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase68_natives",
-     "REAL-JDK BYTECODE: all 14 exclusive classes exist in JDK 25 and declare no native method; 290/372 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 14 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase69_natives",
-     "APP/ABSENT: 1 of its 4 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 5/70 triples also on the shipping path"),
+     "APP/ABSENT: 1 of its 4 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase70_natives",
-     "SHIPPING TWIN: no class exclusive to it; 22/77 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase71_natives",
-     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; 74/171 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase72_natives",
-     "APP/ABSENT: 1 of its 7 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 92/155 triples also on the shipping path"),
+     "APP/ABSENT: 1 of its 7 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_phase_d_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 0/24 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_quarkus_arc_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/7 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_s1_classloading",
-     "SHIPPING TWIN: no class exclusive to it; 17/22 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_s2_nio",
-     "SHIPPING TWIN: no class exclusive to it; 130/164 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_s3_http_client",
-     "SHIPPING TWIN: no class exclusive to it; 4/4 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_security_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 38/41 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_serialization_natives",
-     "REAL-JDK BYTECODE: all 10 exclusive classes exist in JDK 25 and declare no native method; 2/95 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 10 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_slf4j_natives",
-     "APP/ABSENT: 4 of its 4 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; 48/102 triples also on the shipping path"),
+     "APP/ABSENT: 4 of its 4 exclusive classes do not exist in JDK 25, so --jdk-only bytecode cannot reference them; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_t25_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 1/29 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_t310_scripting",
-     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; 2/9 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_t311_i18n",
-     "SHIPPING TWIN: no class exclusive to it; 1/2 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_t312_tooling",
-     "REAL-JDK BYTECODE: all 10 exclusive classes exist in JDK 25 and declare no native method; 0/15 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 10 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_t31_concurrent_extras",
-     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; 2/28 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_t31_structured_concurrency",
      "TOMBSTONE: registers nothing (deliberately empty or dynamic-only); no capability rides on it"),
     ("register_t38_jndi",
-     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; 7/16 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_t39_stax",
-     "REAL-JDK BYTECODE: all 6 exclusive classes exist in JDK 25 and declare no native method; 11/26 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 6 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_time_extras_natives",
-     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; 1/115 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_time_natives",
-     "SHIPPING TWIN: no class exclusive to it; 16/89 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_tls_natives",
-     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; 53/113 triples also on the shipping path"),
+     "REAL-JDK BYTECODE: all 2 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_unsafe_define_class",
-     "SHIPPING TWIN: no class exclusive to it; 12/13 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
     ("register_vector_api_natives",
-     "SHIPPING TWIN: no class exclusive to it; 0/136 triples also registered by a shipping pass"),
+     "SHIPPING TWIN: no class exclusive to it; drift exposure in FAMILY_DRIFT_EXPOSURE"),
+];
+
+/// Path to the drift gate, read at run time by
+/// [`the_drift_gate_agrees_about_family_drift_exposure`].
+const DRIFT_GATE: &str = "tests/registrar_drift.rs";
+
+/// How many distinct `(class, name, descriptor)` triples each allow-listed
+/// family registers that a SHIPPING pass also registers.
+///
+/// # Why this is a table and not a sentence
+///
+/// Until 2026-08-17 this number lived inside the verdict strings above, as a
+/// trailing `N/M triples also registered by a shipping pass`. It was frozen
+/// prose from a one-off external census taken on 2026-08-13 and **nothing
+/// recomputed it**, so it could not go stale loudly — only silently.
+///
+/// It had. `register_byte_array_output_stream` read `0/12` while
+/// `registrar_drift.rs` recorded all 12 as drifting and a two-mode registry
+/// dump agreed with `registrar_drift.rs`. That was not a rounding difference:
+/// re-derived against the drift census, 5 of the 31 families where the two
+/// agreed on the denominator were UNDERSTATED here and **none was overstated**
+/// — a one-sided error, the signature of a lookup that misses rather than
+/// noise. Three of the five were understated by exactly the count of triples
+/// whose shipping twin lives OUTSIDE `native-builtins`:
+///
+/// | family | recorded | measured | shipping twin |
+/// |---|---|---|---|
+/// | `register_byte_array_output_stream` | 0 | 12 | `native-io` |
+/// | `register_completable_future_natives` | 0 | 3 | `native-collections` |
+/// | `register_m18_concurrent_fixes` | 2 | 35 | `native-collections` (the 2 recorded are its only `native-builtins` twins) |
+///
+/// So the old column counted only shipping registrars inside
+/// `native-builtins`, exactly the blind spot `registrar_drift.rs` was built to
+/// cover — it scans seven crates precisely because most shipping twins
+/// (`register_io_natives`, `register_tree_map_natives`,
+/// `channel_register_native`) live outside this one. The other two understated
+/// rows (`register_concurrent_extras` 2->3, `register_http2_natives` 38->48)
+/// have `native-builtins` twins and are ordinary four-day staleness.
+///
+/// # What replaces it
+///
+/// These numbers are **derived**, not asserted: each is the size of the union,
+/// over the family's synthetic-only subtree, of that pass's row list in
+/// `registrar_drift.rs`'s `DRIFT_TRIPLES`.
+/// [`the_drift_gate_agrees_about_family_drift_exposure`] recomputes them on
+/// every run and fails on any disagreement, so the two gates now ratchet each
+/// other: re-taking `DRIFT_TRIPLES` without re-taking this table is a failure,
+/// and so is the reverse.
+///
+/// The denominator is deliberately gone. `M` was the count of triples a family
+/// registers in total, and nothing in this crate's test tree can recompute it
+/// — this gate has no triple resolver. Keeping an un-recomputable number next
+/// to a recomputable one is how the `0/12` survived four months; if the scale
+/// is wanted, `registrar_drift.rs`'s census is where it can be measured.
+///
+/// A row of `0` is a real claim — the family drifts on nothing — and it is the
+/// claim that was false for `ByteArrayOutputStream`, so zeros are pinned like
+/// any other value rather than omitted.
+const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
+    ("register_aot_natives", 1),
+    ("register_atomic_boolean_natives", 8),
+    ("register_bigdecimal_natives", 18),
+    ("register_biginteger_natives", 19),
+    ("register_byte_array_output_stream", 0),
+    ("register_cds_natives", 0),
+    ("register_classfile_api_natives", 0),
+    ("register_classloader_natives", 82),
+    ("register_completable_future_natives", 3),
+    ("register_concurrent_extras", 3),
+    ("register_crypto_impl_natives", 2),
+    ("register_enterprise_final_natives", 130),
+    ("register_enterprise_natives", 0),
+    ("register_enum_natives", 4),
+    ("register_functional_completion_natives", 0),
+    ("register_functional_extras_natives", 0),
+    ("register_graalvm_compat_natives", 0),
+    ("register_http2_natives", 48),
+    ("register_jackson_gson_natives", 0),
+    ("register_java_lang_extras_natives", 27),
+    ("register_jdk25_concurrency_natives", 0),
+    ("register_jdk25_language_natives", 0),
+    ("register_jdk25_patterns_natives", 0),
+    ("register_letsgo_compat_natives", 0),
+    ("register_locale_natives", 0),
+    ("register_logging_natives", 20),
+    ("register_m18_concurrent_fixes", 35),
+    ("register_number_format_natives", 0),
+    ("register_pe_panama", 14),
+    ("register_phase50_natives", 1),
+    ("register_phase51_natives", 44),
+    ("register_phase52_natives", 35),
+    ("register_phase53_natives", 45),
+    ("register_phase54_natives", 100),
+    ("register_phase55_natives", 33),
+    ("register_phase56_natives", 40),
+    ("register_phase57_natives", 27),
+    ("register_phase58_natives", 20),
+    ("register_phase59_natives", 57),
+    ("register_phase60_natives", 28),
+    ("register_phase61_natives", 40),
+    ("register_phase62_natives", 3),
+    ("register_phase63_natives", 38),
+    ("register_phase64_natives", 6),
+    ("register_phase65_natives", 12),
+    ("register_phase66_natives", 0),
+    ("register_phase67_natives", 16),
+    ("register_phase68_natives", 0),
+    ("register_phase69_natives", 8),
+    ("register_phase70_natives", 7),
+    ("register_phase71_natives", 24),
+    ("register_phase72_natives", 25),
+    ("register_phase_d_natives", 0),
+    ("register_quarkus_arc_natives", 0),
+    ("register_s1_classloading", 17),
+    ("register_s2_nio", 9),
+    ("register_s3_http_client", 4),
+    ("register_security_natives", 10),
+    ("register_serialization_natives", 2),
+    ("register_slf4j_natives", 45),
+    ("register_t25_natives", 1),
+    ("register_t310_scripting", 2),
+    ("register_t311_i18n", 1),
+    ("register_t312_tooling", 0),
+    ("register_t31_concurrent_extras", 2),
+    ("register_t31_structured_concurrency", 0),
+    ("register_t38_jndi", 7),
+    ("register_t39_stax", 11),
+    ("register_time_extras_natives", 1),
+    ("register_time_natives", 16),
+    ("register_tls_natives", 50),
+    ("register_unsafe_define_class", 2),
+    ("register_vector_api_natives", 0),
 ];
 
 /// The full transitive synthetic-only set: every pass in `native-builtins`
@@ -555,6 +720,12 @@ const SYNTHETIC_ONLY_CLOSURE: &[&str] = &[
     "register_stream_corrupted_exception",
     "register_string_tokenizer_natives",
     "register_synchronous_queue_extras",
+    // Added 2026-08-17 (G54-1 §3.2). Not new and not newly orphaned: it has
+    // always been reachable only from `register_phase53_socket_stubs`. It was
+    // missing from this list because `vm/src/vm/tests.rs:582` names it, and
+    // until the file-level test filter above was added that test call site was
+    // read as a shipping root.
+    "register_synthetic_socket_stubs",
     "register_t25_natives",
     "register_t310_scripting",
     "register_t311_i18n",
@@ -1066,9 +1237,28 @@ mod scan {
                 // `.claude` holds sibling worktrees — whole extra copies of
                 // this repo. Descending into one would double every count and
                 // make the answer depend on which lanes happen to be running.
+                //
+                // `scratch` / `scratchpad` are the same hazard in a form that
+                // actually fired. They are untracked (one is git-ignored, the
+                // other is `??` in `git status`), they are created and deleted
+                // by whichever lanes happen to be working, and on 2026-08-17
+                // they contained `SpringTestCompilerAnnotation-phases_late.rs`
+                // — a stray copy of `phases_late.rs` — plus two copies of a
+                // crate `lib.rs`. Because SECTION 3 step 5 treats every pass
+                // name mentioned outside `native-builtins/src` as a SHIPPING
+                // ROOT, those files injected 203 spurious roots and this gate
+                // reported 54 direct synthetic-only families instead of 73 and
+                // 169 synthetic-only passes instead of 284 — i.e. it declared
+                // 115 synthetic-only registrars promoted to the shipping path
+                // on the strength of an untracked scratch file. All three of
+                // this file's ratchets were red, including its own
+                // non-vacuity floor, which is the only reason it was noticed.
+                // MEASURED: excluding these two directories restores exactly
+                // the pinned 73 / 284. See
+                // `docs/known-issues/jdk-only/G54-1-…-20260817.md` §3.
                 if matches!(
                     name.as_ref(),
-                    ".git" | "target" | "node_modules" | ".claude"
+                    ".git" | "target" | "node_modules" | ".claude" | "scratch" | "scratchpad"
                 ) {
                     continue;
                 }
@@ -1103,6 +1293,13 @@ struct Analysis {
     where_defined: BTreeMap<String, String>,
     /// `name -> callers`, for the same reason.
     called_from: BTreeMap<String, BTreeSet<String>>,
+    /// `caller -> callees`, the forward call graph.
+    ///
+    /// Needed by [`the_drift_gate_agrees_about_family_drift_exposure`], which
+    /// has to walk each allow-listed family's synthetic-only SUBTREE — a
+    /// family's drift exposure is the exposure of everything it reaches, not
+    /// just of the direct child named in the allow-list.
+    calls_from: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn analysis() -> &'static Analysis {
@@ -1243,6 +1440,27 @@ fn build_analysis() -> Analysis {
         {
             continue;
         }
+        // The segment test above only catches test DIRECTORIES. A test module
+        // that lives in a file — `vm/src/vm/tests.rs`, declared
+        // `#[cfg(all(test, feature = "synthetic-jdk"))] mod tests;` at
+        // `vm/src/vm.rs:59-60` — walked straight through it and contributed
+        // 4,003 pass-name references to the shipping roots. That is doubly not
+        // a shipping call site: it is a test, and it is a test compiled only
+        // under the very feature this gate exists to say the shipping binary
+        // does not have.
+        //
+        // MEASURED effect of closing it, with `scratch`/`scratchpad` already
+        // excluded: 63 external refs -> 60, and exactly one pass moves into
+        // the synthetic-only closure — `register_synthetic_socket_stubs`,
+        // whose only non-test caller is `register_phase53_socket_stubs`
+        // (itself synthetic-only). It was being called shipping-reachable on
+        // the strength of `vm/src/vm/tests.rs:582` alone. That is precisely
+        // the species named in the module header: a test covering an
+        // implementation the shipping modes never run.
+        let base = rel.rsplit('/').next().unwrap_or("");
+        if base == "tests.rs" || base.ends_with("_tests.rs") {
+            continue;
+        }
         workspace_files += 1;
         let Ok(raw) = std::fs::read_to_string(p) else {
             continue;
@@ -1328,6 +1546,7 @@ fn build_analysis() -> Analysis {
         synthetic_only,
         where_defined,
         called_from,
+        calls_from,
     }
 }
 
@@ -1594,5 +1813,236 @@ fn no_registrar_silently_orphaned_into_the_synthetic_arm() {
          registrar that could drift back with nothing watching.",
         left.len(),
         left
+    );
+}
+
+// ===========================================================================
+// SECTION 5 — the cross-check against `registrar_drift.rs`
+// ===========================================================================
+
+/// Parse `DRIFT_TRIPLES` out of `registrar_drift.rs`: `pass -> {triple}`.
+///
+/// Structural, not line-based, so `rustfmt` re-wrapping that table cannot
+/// silently turn this cross-check into a vacuous zero. The only bracket depths
+/// that matter are the table's own: a string literal at `[`-depth 1 is a pass
+/// name, and string literals at depth 2 come in threes and are a triple.
+///
+/// Line comments are skipped; the table is machine-generated by that file's
+/// `retake` and contains none, but a hand edit might add one.
+fn parse_drift_triples(src: &str) -> BTreeMap<String, BTreeSet<(String, String, String)>> {
+    let b = src.as_bytes();
+    let Some(start) = src.find("const DRIFT_TRIPLES") else {
+        return BTreeMap::new();
+    };
+    // `= &[`, not `&[`: the declaration's TYPE is
+    // `&[(&str, &[(&str, &str, &str)])]`, so the first `&[` after the name is
+    // the type annotation and anchoring on it puts the whole scan one bracket
+    // level out. The non-vacuity floor below caught exactly that on the first
+    // run of this test.
+    let Some(open) = src[start..].find("= &[").map(|o| start + o + 4) else {
+        return BTreeMap::new();
+    };
+
+    let mut out: BTreeMap<String, BTreeSet<(String, String, String)>> = BTreeMap::new();
+    let mut depth = 1usize; // we are inside the outer `&[`
+    let mut pass: Option<String> = None;
+    let mut pending: Vec<String> = Vec::new();
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth -= 1;
+                if depth == 1 {
+                    pending.clear();
+                } else if depth == 0 {
+                    break;
+                }
+                i += 1;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                let mut lit = String::new();
+                while j < b.len() {
+                    if b[j] == b'\\' {
+                        if j + 1 < b.len() {
+                            lit.push(b[j + 1] as char);
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    if b[j] == b'"' {
+                        break;
+                    }
+                    lit.push(b[j] as char);
+                    j += 1;
+                }
+                match depth {
+                    1 => {
+                        pass = Some(lit);
+                        pending.clear();
+                    }
+                    2 => {
+                        pending.push(lit);
+                        if pending.len() == 3 {
+                            if let Some(p) = &pass {
+                                out.entry(p.clone()).or_default().insert((
+                                    pending[0].clone(),
+                                    pending[1].clone(),
+                                    pending[2].clone(),
+                                ));
+                            }
+                            pending.clear();
+                        }
+                    }
+                    _ => {}
+                }
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Every pass this family reaches that is still synthetic-only, itself
+/// included.
+fn synthetic_subtree(a: &Analysis, family: &str) -> BTreeSet<String> {
+    let mut seen: BTreeSet<String> = [family.to_string()].into_iter().collect();
+    let mut stack = vec![family.to_string()];
+    while let Some(n) = stack.pop() {
+        if let Some(cs) = a.calls_from.get(&n) {
+            for c in cs {
+                if a.synthetic_only.contains(c) && seen.insert(c.clone()) {
+                    stack.push(c.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// **The two gates must agree, and until 2026-08-17 nobody had ever asked.**
+///
+/// `registrar_drift.rs` and this file answer different questions over the same
+/// population — which passes are synthetic-only (here) and which triples those
+/// passes share with a shipping pass (there) — and they answer them with two
+/// independently written scanners. That is worth something only if the answers
+/// are compared. The first comparison anyone ran found this file asserting
+/// `0/12` for `register_byte_array_output_stream` against the other file's
+/// `12/12`, with a two-mode registry dump siding with the other file.
+///
+/// This test closes that. [`FAMILY_DRIFT_EXPOSURE`] is re-derived on every run
+/// from the other gate's `DRIFT_TRIPLES` and this gate's own call graph, so:
+///
+/// * a re-take of `DRIFT_TRIPLES` that does not re-take this table fails here;
+/// * a family whose subtree changes shape fails here;
+/// * a drift row whose shipping twin lives in `native-io` or
+///   `native-collections` is counted, because the number now comes from the
+///   seven-crate census instead of from a `native-builtins`-only one.
+///
+/// # What it still cannot check
+///
+/// `DRIFT_TRIPLES` is the other gate's BASELINE, not a live measurement taken
+/// here. The chain that makes it trustworthy is one link longer than it looks:
+/// the live tree pins `DRIFT_TRIPLES` (via `no_new_mode_drift` and
+/// `the_drift_baseline_has_no_stale_rows`, both two-sided), and
+/// `DRIFT_TRIPLES` pins this table. If that file's ratchets are red, this
+/// number is only as good as its stale table — so read that failure first.
+#[test]
+fn the_drift_gate_agrees_about_family_drift_exposure() {
+    let a = analysis();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DRIFT_GATE);
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the drift gate at {}: {e}. This cross-check is the only thing \
+             comparing the two gates; if the file moved, re-point DRIFT_GATE rather than \
+             deleting the test.",
+            path.display()
+        )
+    });
+    let table = parse_drift_triples(&src);
+
+    // --- non-vacuity: a parser that finds nothing agrees with everything ---
+    let distinct: BTreeSet<&(String, String, String)> = table.values().flatten().collect();
+    assert!(
+        table.len() >= 80 && distinct.len() >= 900,
+        "parsed only {} passes / {} distinct triples out of {}'s DRIFT_TRIPLES. That table \
+         had 110 passes and 1,232 triples on 2026-08-17, so this parse is broken and every \
+         assertion below would pass by finding nothing — the 'confident, vacuous zero' this \
+         family has recorded three times.",
+        table.len(),
+        distinct.len(),
+        DRIFT_GATE
+    );
+
+    // --- the two lists must cover the same families ------------------------
+    let pinned: BTreeSet<&str> = FAMILY_DRIFT_EXPOSURE.iter().map(|&(n, _)| n).collect();
+    let allowed: BTreeSet<&str> = DELIBERATE_SYNTHETIC_ONLY_FAMILIES
+        .iter()
+        .map(|&(n, _)| n)
+        .collect();
+    assert_eq!(
+        pinned.len(),
+        FAMILY_DRIFT_EXPOSURE.len(),
+        "FAMILY_DRIFT_EXPOSURE contains duplicate families; the second row is ignored by \
+         every lookup below"
+    );
+    assert_eq!(
+        pinned, allowed,
+        "FAMILY_DRIFT_EXPOSURE and DELIBERATE_SYNTHETIC_ONLY_FAMILIES name different \
+         families. They are two columns of one table and must be edited together."
+    );
+
+    // --- the numbers themselves --------------------------------------------
+    let mut wrong: Vec<String> = Vec::new();
+    let mut fresh: Vec<(&str, usize)> = Vec::new();
+    for &(family, recorded) in FAMILY_DRIFT_EXPOSURE {
+        let subtree = synthetic_subtree(a, family);
+        let mut tris: BTreeSet<&(String, String, String)> = BTreeSet::new();
+        for p in &subtree {
+            if let Some(rows) = table.get(p) {
+                tris.extend(rows.iter());
+            }
+        }
+        let measured = tris.len();
+        fresh.push((family, measured));
+        if measured != recorded {
+            wrong.push(format!(
+                "  {family}: recorded {recorded}, measured {measured} (subtree of {} \
+                 synthetic-only pass(es))",
+                subtree.len()
+            ));
+        }
+    }
+
+    if !wrong.is_empty() {
+        let mut paste = String::from(
+            "\n// ======== PASTE-READY, regenerated from this run ========\n\
+             const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[\n",
+        );
+        for (f, n) in &fresh {
+            paste.push_str(&format!("    (\"{f}\", {n}),\n"));
+        }
+        paste.push_str("];\n// ======== END PASTE-READY ========\n");
+        println!("{paste}");
+    }
+    assert!(
+        wrong.is_empty(),
+        "the two gates disagree about how many triples these families share with a shipping \
+         pass:\n{}\n\n\
+         The replacement table is printed above this panic. Before pasting it, decide which \
+         gate moved. If `registrar_drift.rs` was re-taken in this commit, pasting is the \
+         whole fix. If it was NOT, a family's drift changed and the record has to say how — \
+         a re-take with no explanation is how a ratchet becomes a rubber stamp.",
+        wrong.join("\n")
     );
 }
