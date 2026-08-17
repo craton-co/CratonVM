@@ -2158,11 +2158,57 @@ impl ZObjectStartsSnapshot {
         !self.extra.is_empty() && self.extra.contains(&addr)
     }
 
+    /// Every base in the snapshot, ASCENDING, **without materialising a
+    /// `Vec`**.
+    ///
+    /// # Why this exists beside `bases`
+    ///
+    /// The 2026-08-17 pause anatomy put `snapshot_us` at **13% of the
+    /// multi-threaded concurrent pause**, and most of that is `bases()`
+    /// allocating one `usize` per registered object: on the 10.8M-object arm
+    /// that is a **87 MB allocation inside a stop-the-world pause**, followed by
+    /// two or three passes over 87 MB of cold memory.
+    ///
+    /// A bitmap scan is cheaper than that even when it runs three times: the
+    /// bitmap is one bit per 8 arena bytes, so at any occupancy above ~1.5% it
+    /// is smaller than the base list it would produce, and scanning it is
+    /// sequential.
+    ///
+    /// `bases()` is kept for the callers that genuinely need a slice — the
+    /// corpse census wants to index it, and the relocation path hands it to a
+    /// selector — and those are per-cycle, not per-phase.
+    #[inline]
+    fn for_each_base(&self, mut f: impl FnMut(usize)) {
+        for (w, &word) in self.words.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                word &= word - 1;
+                f(self.base + ((w * 64 + b) << 3));
+            }
+        }
+        for addr in self.extra.iter() {
+            f(*addr);
+        }
+    }
+
+    /// How many bases the snapshot holds, counted rather than collected.
+    fn base_count(&self) -> usize {
+        self.words
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum::<usize>()
+            + self.extra.len()
+    }
+
     /// Every base in the snapshot, bitmap portion ASCENDING.
     ///
     /// Ascending order is free here (it was not, from a hash set) and it is the
     /// order the sweep wants: adjacent dead objects hand adjacent spans to
     /// `Arena::add_free_block`, which is what the post-sweep coalescer merges.
+    ///
+    /// Prefer [`Self::for_each_base`] on a per-phase path; see its note for the
+    /// 87 MB this allocates on a large heap.
     fn bases(&self) -> Vec<usize> {
         let mut out: Vec<usize> = Vec::with_capacity(self.extra.len());
         for (w, &word) in self.words.iter().enumerate() {
@@ -10793,7 +10839,14 @@ impl GarbageCollector for ZgcRealHeap {
         // cheaper than the set clone at any occupancy above ~1.5%.
         let tlab_us = clock.lap();
         let registered: ZObjectStartsSnapshot = self.registry.snapshot();
-        let all: Vec<usize> = registered.bases();
+        // COUNTED, not collected. `bases()` here allocated one `usize` per
+        // registered object -- 87 MB on the 10.8M-object arm, inside the pause,
+        // which the 2026-08-17 anatomy measured as 13% of it. Every phase below
+        // that needs the bases iterates the bitmap instead
+        // (`for_each_base`); the only remaining `bases()` calls on this path are
+        // behind the corpse-census flag and on the relocation path, both of
+        // which are per-cycle and want a slice.
+        let registered_count = registered.base_count();
         let snapshot_us = clock.lap();
 
         // ---- PHASE G: IS THIS A YOUNG CYCLE? -----------------------------
@@ -10844,7 +10897,7 @@ impl GarbageCollector for ZgcRealHeap {
         // the registry.
         let mut gen_old_retained = 0usize;
         if !marked_concurrently {
-            for &base in &all {
+            registered.for_each_base(|base| {
                 let header = self.header_mut(base as *mut u8);
                 if young_cycle && header.gc_age() >= promo_age {
                     header.add_gc_flags(GC_FLAG_MARKED);
@@ -10852,7 +10905,7 @@ impl GarbageCollector for ZgcRealHeap {
                 } else {
                     header.clear_gc_flags(GC_FLAG_MARKED);
                 }
-            }
+            });
         }
         // The old generation's contribution to the root set. Computed after the
         // pre-mark so the mark bits and `addr_is_young` agree, and before either
@@ -11199,7 +11252,9 @@ impl GarbageCollector for ZgcRealHeap {
         // it reports is older than this cycle's zeroing, so the report cannot
         // be an echo of the damage it is looking for.
         if zgc_corpse_enabled() {
-            self.survey_registry_extents(&all, "pre-sweep");
+            // The one place on this path that still wants a slice, and it is
+            // behind a diagnostic flag, so the 87 MB is the operator's choice.
+            self.survey_registry_extents(&registered.bases(), "pre-sweep");
         }
 
         let refs_us = clock.lap();
@@ -11217,7 +11272,11 @@ impl GarbageCollector for ZgcRealHeap {
         {
             let mut arena = self.arena.lock();
             let arena_base = arena.base_ptr() as usize;
-            for &base in &all {
+            // ASCENDING, which the coalescer below depends on: adjacent dead
+            // objects hand adjacent spans to `add_free_block`. `for_each_base`
+            // preserves `bases()`'s order exactly -- the bitmap scan IS the
+            // ascending order.
+            registered.for_each_base(|base| {
                 let header = self.header_mut(base as *mut u8);
                 // A header this collector cannot size must not be swept. The
                 // dead arm below `write_bytes`es `size` bytes and hands the
@@ -11235,7 +11294,7 @@ impl GarbageCollector for ZgcRealHeap {
                 let Some(size) = Self::alloc_size(header) else {
                     unsizable += 1;
                     header.clear_gc_flags(GC_FLAG_MARKED);
-                    continue;
+                    return; // `return` and not `continue`: this is a closure now
                 };
                 if header.gc_flags() & GC_FLAG_MARKED != 0 {
                     // Survivor: clear the mark bit for next cycle, keep it.
@@ -11262,7 +11321,7 @@ impl GarbageCollector for ZgcRealHeap {
                     bytes_freed += size;
                     dead.push(base);
                 }
-            }
+            });
 
             // Coalesce the free list into maximal spans — same rationale as
             // gen_heap's post-sweep coalescer. The loop above returns ONE
@@ -11324,7 +11383,7 @@ impl GarbageCollector for ZgcRealHeap {
                     arena.largest_free_block(),
                     arena.used(),
                     arena.capacity(),
-                    all.len(),
+                    registered_count,
                 );
             }
             let reclaimed_tail = arena.retract_cursor_into_free_tail();
@@ -11504,7 +11563,7 @@ impl GarbageCollector for ZgcRealHeap {
                  markend_us={markend_us} tlab_us={tlab_us} snapshot_us={snapshot_us} \
                  mark_us={mark_us} resurrect_us={resurrect_us} refs_us={refs_us} \
                  sweep_us={sweep_us} registered={} dead={}",
-                all.len(),
+                registered_count,
                 dead.len(),
             );
         }
@@ -14166,6 +14225,74 @@ pub(crate) mod tests {
         assert!(
             heap.is_carded_for_test(holder.as_ptr() as usize),
             "write_barrier must card the written object"
+        );
+    }
+
+    // -- The registry snapshot's three readers must agree ------------------
+
+    /// **`for_each_base`, `base_count` and `bases` must report the identical
+    /// set, in the identical order.**
+    ///
+    /// # Why order is a correctness property here and not a detail
+    ///
+    /// `collect_garbage`'s sweep iterates with `for_each_base` and hands every
+    /// dead object's span to `Arena::add_free_block`. The post-sweep coalescer
+    /// then merges *adjacent* spans, and it only sees them as adjacent because
+    /// the sweep visited them in ascending address order. A reader that returned
+    /// the same set in a different order would leave the free list as one
+    /// object-sized hole per dead object — and `Arena::alloc`'s small-tier scan
+    /// is budgeted at 16 entries, so the arena then exhausts with most of itself
+    /// unreachable on the free list. That is a measured failure in this tree
+    /// (`CopyChurn` at -Xmx256m), not a hypothetical.
+    ///
+    /// Membership matters even more plainly: a base `for_each_base` skips is an
+    /// object the sweep never examines, so it is neither freed nor unmarked.
+    ///
+    /// The fixture deliberately includes a large object, because those live in
+    /// the high region and land in the snapshot's `extra` set rather than its
+    /// bitmap — the one place the two readers could diverge structurally.
+    #[test]
+    fn the_snapshot_readers_agree_on_the_set_and_the_order() {
+        let heap = ZgcRealHeap::with_capacity(32 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        for i in 0..2_000u32 {
+            let _ = heap.alloc_object(ClassId::new(1 + (i % 7)), (i % 5) as usize);
+        }
+        // A large object, so `extra` is non-empty.
+        let _big = heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 4 * 1024 * 1024);
+        for i in 0..500usize {
+            let _ = heap.alloc_object(ClassId::new(9), i % 3);
+        }
+
+        let snap = heap.registry.snapshot();
+        let via_vec = snap.bases();
+        let mut via_iter: Vec<usize> = Vec::new();
+        snap.for_each_base(|b| via_iter.push(b));
+
+        assert_eq!(
+            via_iter, via_vec,
+            "the in-place reader must produce the identical sequence, not merely \
+             the identical set -- the sweep's free-list coalescing depends on the \
+             order"
+        );
+        assert_eq!(
+            snap.base_count(),
+            via_vec.len(),
+            "and the count must not be derived differently from the bases"
+        );
+        assert!(
+            !via_vec.is_empty() && via_vec.len() >= 2_500,
+            "the fixture must actually have registered its objects: {}",
+            via_vec.len()
+        );
+        // The bitmap portion has to be ascending for the claim above to mean
+        // anything. (`extra` is appended after it and is not ordered; the sweep
+        // does not need it to be, because those are large objects in a separate
+        // region with their own free list.)
+        let bitmap_len = via_vec.len() - snap.extra.len();
+        assert!(
+            via_vec[..bitmap_len].windows(2).all(|w| w[0] < w[1]),
+            "the bitmap portion must be strictly ascending"
         );
     }
 
