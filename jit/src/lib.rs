@@ -16257,9 +16257,25 @@ fn try_compile_inner(
                         // everything else keeps the optimizing tier.
                         // `CRATONVM_JIT_IR_OVER_INTRINSIC=1` restores the old
                         // behaviour for A/B.
-                        if !ir_over_intrinsic_enabled()
-                            && try_resolve_intrinsic(&cn, &mn, &desc).is_some()
-                        {
+                        // THREE resolvers, not one. The layout-independent
+                        // ladder is `try_resolve_intrinsic`; `AtomicInteger`
+                        // and `String` have their own because they need a
+                        // field layout, and checking only the first one made
+                        // this refusal miss exactly the family that motivated
+                        // it (`AtomicInteger.getAndIncrement`, netty's
+                        // `FastThreadLocal` constructor). Both extra probes
+                        // are asked in their most permissive form — any
+                        // guard/layout — because the question here is "would
+                        // the single-pass backend inline this?", not "can it
+                        // inline it at this exact site": a false positive
+                        // costs one method the optimizing tier, a false
+                        // negative costs every call the intrinsic.
+                        let is_intrinsic_site = try_resolve_intrinsic(&cn, &mn, &desc).is_some()
+                            || try_resolve_atomic_intrinsic(&cn, &mn, &desc, 0).is_some()
+                            || cn == "java/util/concurrent/atomic/AtomicInteger"
+                            || try_resolve_string_intrinsic(&cn, &mn, &desc, None).is_some()
+                            || cn == "java/lang/String";
+                        if !ir_over_intrinsic_enabled() && is_intrinsic_site {
                             all_emittable = false;
                             if ir_stage_reporting() {
                                 nonemittable = Some(format!(
