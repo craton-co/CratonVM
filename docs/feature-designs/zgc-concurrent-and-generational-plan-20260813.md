@@ -759,6 +759,39 @@ The comparison to make, once the box is quiet: the same probe and arguments as
 the number to watch is `sweep` in `[GC] zgc-pause:` — 182 ms of a 309 ms mean
 before, and O(young) is only worth having if that falls.
 
+### G2b — the slide IS the promotion — **BUILT 2026-08-17**
+
+With the JIT-load-barrier blocker gone (see the correction under the five-step
+list above), the promotion increment turned out to be a **deletion plus two
+stores**, because the machinery was already there.
+
+`compact_low_to` packs survivors from the first selected page upward and drops
+the cursor to the end of the compacted region, so after a slide **every live
+object is below the cursor** — the ones on unselected dense pages never moved and
+are below it too. G2a's floor was being *thrown away* at that point, on the
+reasoning that a slide rewrites the low region so an address no longer says which
+generation an object is in. That was backwards: a slide rewrites the low region
+into exactly the shape a nursery wants.
+
+So the floor is now re-established at the post-slide cursor. Three consequences:
+
+* **it is promotion by copy** — survivors are moved out of the young region and
+  the nursery is left EMPTY, which is G2's defining behaviour;
+* **it carries no floating garbage**, because the registry at that point holds
+  live objects only (the sweep pruned the dead a few statements earlier), so
+  declaring everything below the cursor old retains nothing unreachable. That is
+  strictly better than G2a's floor, which inherited whatever the free list had
+  placed below it;
+* **a relocating cycle no longer forces a whole-heap cycle behind it.** It used
+  to arm `gen_force_major_next`, which meant the split was off every other
+  collection whenever relocation was on — i.e. by default.
+
+`gen_promotions_by_slide` is the engagement counter: `compaction_cycles > 0`
+with that at zero is the old behaviour exactly. The test asserts the counter, that
+**no** live base sits at or above the floor, and that the force-major latch stays
+clear — and it was checked for the vacuous case, that the selector really does
+move in its fixture rather than declining and passing through the early return.
+
 ### G2c — the nursery is where allocation GOES — **BUILT 2026-08-17**
 
 G2a had to document a cost: `Arena::alloc` serves the free list before the bump
@@ -877,40 +910,6 @@ refusal while a JIT frame is on a stack). A load barrier is what **concurrent**
 relocation needs. The lesson is the tree's own: re-derive a stated blocker from
 the source before pricing work around it — this one had been closed for four
 days.
-
-### G2b — the slide IS the promotion — **BUILT 2026-08-17**
-
-With that blocker gone, the first increment of G2 turned out to be a **deletion
-plus two stores**, because the machinery was already there.
-
-`compact_low_to` packs survivors from the first selected page upward and drops
-the cursor to the end of the compacted region, so after a slide **every live
-object is below the cursor** — the ones on unselected dense pages never moved and
-are below it too. G2a's floor was being *thrown away* at that point, on the
-reasoning that a slide rewrites the low region so an address no longer says which
-generation an object is in. That was backwards: a slide rewrites the low region
-into exactly the shape a nursery wants.
-
-So the floor is now re-established at the post-slide cursor. Three consequences:
-
-* **it is promotion by copy** — survivors are moved out of the young region and
-  the nursery is left EMPTY, which is G2's defining behaviour;
-* **it carries no floating garbage**, because the registry at that point holds
-  live objects only (the sweep pruned the dead a few statements earlier), so
-  declaring everything below the cursor old retains nothing unreachable. That is
-  strictly better than G2a's floor, which inherited whatever the free list had
-  placed below it;
-* **a relocating cycle no longer forces a whole-heap cycle behind it.** It used
-  to arm `gen_force_major_next`, which meant the split was off every other
-  collection whenever relocation was on — i.e. by default.
-
-`gen_promotions_by_slide` is the engagement counter: `compaction_cycles > 0`
-with that at zero is the old behaviour exactly. The test asserts the counter, that
-**no** live base sits at or above the floor, and that the force-major latch stays
-clear — and it was checked for the vacuous case, that the selector really does
-move in its fixture rather than declining and passing through the early return.
-
----
 
 ## 3b. What Phase G actually measured — 2026-08-17
 
