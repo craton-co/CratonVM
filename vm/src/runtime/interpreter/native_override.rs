@@ -2463,6 +2463,64 @@ pub(crate) fn is_undertow_native_override(
 /// their own: the `java/lang/String` exclusion (paired with the positive form in
 /// `vm/src/vm/vm_exec.rs`'s `check_override`) and the `ThreadPoolExecutor`
 /// family.
+///
+/// # THIS LIST IS NOT WHAT DECIDES NATIVE-VS-BYTECODE. Read this before adding
+/// a class to it.
+///
+/// The paragraph above is true of `resolve_dispatch` and **false** as a
+/// statement about `--jdk-only` as a whole, and the difference has cost several
+/// lanes a wrong inference — `G29-1` §6 called it "the thing most likely to be
+/// wrong in my fix". `resolve_dispatch` is not the first site to answer.
+/// `try_stackless_invoke` step 1 is, for nearly every call in the VM, and it
+/// goes through [`resolve_step1_native`], which passes
+/// `resolve_native_dispatch_wave1` a hard-coded `compat_native_wins: true` and
+/// a `bytecode_available` of `shadows_bytecode && enforce`, where `enforce` is
+/// `env_cache::jdk_only_enforce_shadow_for(class_name)` — **off unless
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` is set, and off by default because arming
+/// it takes the corpus from 32/17 to 3/46**. With it off, `bytecode_available`
+/// is `false`, the `NativeKind::Bridge` arm returns `Some(NativeBridge(..))`,
+/// and the registered native runs *in front of real JDK bytecode* — for any
+/// class, on or off this list. Existing bytecode buys one `#[cold]`
+/// observation (`record_native_shadow_ran_over_bytecode`) and nothing else.
+///
+/// So the operative rule is: **under `--jdk-only`, registering a `Bridge` for a
+/// triple is by itself sufficient for it to preempt real JDK bytecode.** This
+/// list is a *second, later* gate, consulted only by the sites that already
+/// resolved a bytecode `Method` without asking the registry — the vtable
+/// inline-cache (`dispatch_virtual.rs:767` and `:3432`) and the JIT
+/// (`jit_bridge.rs:2748`) — where it converts a would-be `Bytecode` cache entry
+/// into a `VirtualNative` one. It is a cache-shape override, not the policy.
+///
+/// MEASURED 2026-08-17 on `C:/craton/target-rel2/release/cratonvm.exe`
+/// (`9964ca733`) against HotSpot 25.0.3+9-LTS, and this is why
+/// `java/net/http/HttpHeaders` is deliberately **absent** below:
+///
+/// * `HttpHeaders` is a real, final JDK class; all five of its readers have
+///   `Code`; `net_phase_e.rs` registers all five as `Bridge`; none is on this
+///   list. All five run anyway, cold and after 300,000 warm iterations at one
+///   call site (inline cache + JIT tier-up): `owns_slot=true`,
+///   `overwrote=null`, `invocations=300002`, and `--jdk-only-report` tags every
+///   one `bridge-ran-over-bytecode`.
+/// * Three independent signatures separate "the native ran" from "the bytecode
+///   ran", on a receiver built by the REAL `HttpHeaders.of(Map, BiPredicate)`:
+///   `map().getClass()` is `java.util.LinkedHashMap` (the native mints one)
+///   where HotSpot says `java.util.Collections$UnmodifiableMap`; `map() ==
+///   map()` is `false` (the native mints a fresh one per call) where HotSpot
+///   says `true`; and `map().put(..)` is ACCEPTED where HotSpot throws
+///   `UnsupportedOperationException`.
+///
+/// **Adding a real, widely-used JDK class here is therefore not a fix for "my
+/// native does not run" — it already does.** The blast radius if you add one
+/// anyway: this function is called on every vtable miss and every JIT bind, its
+/// result is memoized per `CachedBytecodeMethod`, and a new entry converts that
+/// call site's inline cache to `VirtualNative` for **every** receiver of the
+/// class, including genuinely real ones the native was never written for. That
+/// is the failure the `java/lang/String` arm was deleted for on 2026-08-04 (a
+/// method's behaviour started depending on how many times its call site had
+/// run) and the one the `ThreadPoolExecutor` arm was deleted for on 2026-08-06.
+///
+/// Full derivation, both directions of the census, and the probes:
+/// `docs/known-issues/jdk-only/G34-1-who-wins-native-or-bytecode-20260817.md`.
 pub(super) fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -8088,5 +8146,104 @@ mod intercept_shape_tests {
             "org/example/MyHttpURLConnection"
         ));
         assert!(!http_carrier_declaring_class("java/net/URL"));
+    }
+}
+
+/// G34-1 — the deliberate ABSENCES from [`force_native_over_real_jdk_bytecode`].
+///
+/// A test module for things that are not there needs a reason to exist, and
+/// this is it: `G29-1` §6 recorded that its author could not tell whether the
+/// newly registered `java/net/http/HttpHeaders` readers would ever run, because
+/// the class is a real one with real bytecode and is not on the force list. The
+/// answer (MEASURED, see the banner on that function) is that they run anyway —
+/// the force list is not the gate. Someone who re-derives the question from
+/// reading alone will reach for "add HttpHeaders to the list" as the fix, and
+/// that would convert every `HttpHeaders` inline cache in the VM to
+/// `VirtualNative` for real receivers too. These tests make the absence
+/// deliberate rather than accidental.
+#[cfg(test)]
+mod force_list_deliberate_absences_tests {
+    use super::force_native_over_real_jdk_bytecode as force;
+
+    /// MEASURED 2026-08-17 (`target-rel2`, `--jdk-only`, vs HotSpot
+    /// 25.0.3+9-LTS): all five readers are registered `Bridge` by
+    /// `net_phase_e.rs`, all five have real `Code`, none is here, and all five
+    /// run — `invocations=300002` after a 300,000-iteration warm loop at one
+    /// call site, every one tagged `bridge-ran-over-bytecode` by
+    /// `--jdk-only-report`. `RJdkOptionalShape` is `checks=1418 PASS` on that
+    /// binary, which is the same fact stated end to end.
+    ///
+    /// If this test ever fails, the entry that was added did NOT make a
+    /// non-running native run; it changed which body real `HttpHeaders`
+    /// receivers get on warm call sites. Read the banner before keeping it.
+    #[test]
+    fn http_headers_readers_are_deliberately_absent() {
+        for (name, descriptor) in [
+            ("map", "()Ljava/util/Map;"),
+            ("firstValue", "(Ljava/lang/String;)Ljava/util/Optional;"),
+            ("allValues", "(Ljava/lang/String;)Ljava/util/List;"),
+            (
+                "firstValueAsLong",
+                "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+            ),
+            ("toString", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                !force("java/net/http/HttpHeaders", name, descriptor),
+                "java/net/http/HttpHeaders.{name}{descriptor} is on the force \
+                 list. It does not need to be: MEASURED, its registered Bridge \
+                 already preempts the real JDK body at try_stackless_invoke \
+                 step 1, cold and warm. See the banner on \
+                 force_native_over_real_jdk_bytecode and G34-1."
+            );
+        }
+    }
+
+    /// `java/util/Optional` is the family `G29-1` reasoned FROM, and its
+    /// reasoning was right for the wrong reason: it inferred from
+    /// `invocations=244` that a native on a real-bytecode class wins. It does —
+    /// but not because `Optional` is special, and not because anything about
+    /// `Optional` is on this list. Twenty `Optional` triples are registered by
+    /// `native-collections/src/lib.rs`, every one with
+    /// `real_declaring_method.has_code = true`, and not one of them is here.
+    #[test]
+    fn optional_is_deliberately_absent_too() {
+        for (name, descriptor) in [
+            ("isPresent", "()Z"),
+            ("get", "()Ljava/lang/Object;"),
+            ("orElse", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("toString", "()Ljava/lang/String;"),
+            ("empty", "()Ljava/util/Optional;"),
+        ] {
+            assert!(
+                !force("java/util/Optional", name, descriptor),
+                "java/util/Optional.{name}{descriptor} was added to the force \
+                 list. Its native already wins without it (MEASURED, G34-1); \
+                 adding it only changes warm-call-site behaviour."
+            );
+        }
+    }
+
+    /// The negative control for the two tests above: this list is not empty and
+    /// they are not passing because `force` answers `false` for everything.
+    ///
+    /// `java/util/ArrayList.size()I` is on it, and its comment says why — a
+    /// `Map.values()` view is minted as an `ArrayList` that must re-sync
+    /// against its source map on read, which the real `ArrayList` body cannot
+    /// do. That is the shape of a justified entry: the native is not a
+    /// duplicate of the JDK body, it services a receiver the JDK body cannot.
+    #[test]
+    fn the_list_is_not_vacuously_empty() {
+        assert!(
+            force("java/util/ArrayList", "size", "()I"),
+            "the ArrayList map-view family must still be forced; without it the \
+             two absence tests above prove nothing"
+        );
+        assert!(force("java/util/ArrayList", "get", "(I)Ljava/lang/Object;"));
+        assert!(force(
+            "java/util/HashMap$KeySet",
+            "iterator",
+            "()Ljava/util/Iterator;"
+        ));
     }
 }

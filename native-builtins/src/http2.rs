@@ -593,6 +593,47 @@ fn is_synthetic_shape(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str)
     ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
 }
 
+/// Is this `java/net/http/HttpHeaders` receiver one THIS file minted?
+///
+/// `is_synthetic_shape` cannot answer that question for this class, because
+/// every candidate answers to the same class NAME. THREE different objects are
+/// stamped `java.net.http.HttpHeaders` in a running CratonVM and they do not
+/// share a layout:
+///
+/// | minted by | slots | slot 0 holds |
+/// |---|---|---|
+/// | `alloc_http_headers` (this file) | 3 | `Value::Int` — `HDR_COUNT` |
+/// | `net_phase_e::re5_make_http_headers` | 1 | `Value::Object` — a `String[]` of `"k: v"` |
+/// | the real JDK's `HttpHeaders.of(Map, BiPredicate)` | the real class's | `Value::Object` — a real `Map` |
+///
+/// So the discriminator is the KIND of slot 0, not the class name: only the
+/// counter layout puts a primitive there. That is a property of the three
+/// minters and not of a name list, which is what makes it hold when a fourth
+/// minter appears.
+///
+/// This matters because `NativeMethodRegistry::register` is last-write-wins
+/// with no unregister API. `net_phase_e::register_phase_e_networking` and
+/// [`register_http2_natives`] both claim
+/// `HttpHeaders.{map,firstValue,allValues,firstValueAsLong}`, and in a
+/// `synthetic-jdk` build BOTH run (`lib.rs`: `register_essential_natives`
+/// reaches phase E first, then `register_synthetic_overrides` reaches this
+/// file), so this file's four bodies win the slots while `net_phase_e`'s
+/// minter keeps producing `String[]`-shaped receivers for them. Without this
+/// guard those bodies read `HDR_HAS_CT`/`HDR_HAS_CL` — slots 1 and 2 — off an
+/// object that has ONE slot, and answer a fabricated `content-type` from
+/// whatever they find. With it they decline, and a receiver this file did not
+/// mint gets the absent answer instead of another object's memory.
+///
+/// MEASURED (2026-08-17, `C:/craton/target-rel2/release/cratonvm.exe`): under
+/// `--jdk-only` this file's registrar does not run at all, so the guard is
+/// inert there — every `java/net/http/HttpHeaders` row in
+/// `--dump-native-registry` is `net_phase_e`'s with `overwrote=null`. The
+/// guard is for the boot order this file IS on, and for the one it is one
+/// call-site move away from.
+fn http_headers_is_counter_shape(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    matches!(ctx.get_field(obj, HDR_COUNT), Value::Int(_))
+}
+
 fn alloc_http_client(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 10)?;
     init_http_client_fields(ctx, obj);
@@ -2453,29 +2494,82 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/List;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let has_ct = match ctx.get_field(this, HDR_HAS_CT) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
-            let has_cl = match ctx.get_field(this, HDR_HAS_CL) {
-                Value::Int(n) => n,
-                _ => 0,
+            // Shape guard — see `http_headers_is_counter_shape`. A receiver
+            // this file did not mint keeps something OTHER than a counter in
+            // slot 0, and slots 1/2 may not exist at all; reading them would
+            // answer a fabricated `content-type` out of another minter's
+            // memory. HotSpot's `allValues` on an absent name is `[]`, never
+            // null, so declining is also the oracle-correct answer.
+            // The guard is tested BEFORE the slot reads, not folded into a
+            // match arm after them: `net_phase_e`'s receiver has exactly ONE
+            // slot, so reading `HDR_HAS_CT`/`HDR_HAS_CL` off it is an
+            // out-of-range field access, and a guard that fires afterwards has
+            // already taken it.
+            let (has_ct, has_cl) = if http_headers_is_counter_shape(ctx, this) {
+                (
+                    match ctx.get_field(this, HDR_HAS_CT) {
+                        Value::Int(n) => n,
+                        _ => 0,
+                    },
+                    match ctx.get_field(this, HDR_HAS_CL) {
+                        Value::Int(n) => n,
+                        _ => 0,
+                    },
+                )
+            } else {
+                (0, 0)
             };
             let queried = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let match_name = queried.to_lowercase();
-            let count = if match_name == "content-type" && has_ct == 1 {
-                1
+            let value = if match_name == "content-type" && has_ct == 1 {
+                Some("application/json")
             } else if match_name == "content-length" && has_cl == 1 {
-                1
+                Some("20")
             } else {
-                0
+                None
             };
-            ctx.set_field(list, 0, Value::Int(count));
-            ctx.set_field(list, 1, Value::Int(0));
+            // The crate-wide `java/util/ArrayList` convention is "allocate,
+            // then let native-collections establish the layout" — every
+            // populated list in `phases_early.rs`, `logging_shims.rs` and
+            // `jmx.rs` does it that way. The previous code hand-wrote
+            // `Int(count)` into slot 0, which is where `native_al_init` puts
+            // the backing `Object[]`: a type-punned slot that every registered
+            // `native_al_*` reader then misreads, so the list reported a size
+            // it could not produce an element for.
+            //
+            // `native_al_init` allocates the backing `Object[]` and
+            // `create_string` allocates a `String`, so `list` is a bare Rust
+            // local across two GC points. PIN it and read it back through the
+            // pin, the way `HttpRequest$Builder.version` above already does —
+            // a moving young GC otherwise relocates the list and every write
+            // after the first lands on a stale address. The pin is released
+            // BEFORE any `?`, so an error from either collections call cannot
+            // leak it.
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+            let list_pin = ctx.pin_native_root(list);
+            let inited =
+                cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))]);
+            let list = ctx.read_native_pin(list_pin, list);
+            let added = match value {
+                Some(v) if inited.is_ok() => {
+                    let sv = ctx.create_string(v);
+                    let list = ctx.read_native_pin(list_pin, list);
+                    cratonvm_native_collections::native_al_add(
+                        ctx,
+                        &[Value::Object(Some(list)), Value::Object(Some(sv))],
+                    )
+                }
+                _ => Ok(None),
+            };
+            let list = ctx.read_native_pin(list_pin, list);
+            ctx.unpin_native_roots(list_pin);
+            // `Option<Value>` is `#[must_use]`; bind it away rather than
+            // leaving a bare `expr?;` statement.
+            let _ = inited?;
+            let _ = added?;
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -2487,13 +2581,29 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let has_ct = match ctx.get_field(this, HDR_HAS_CT) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
-            let has_cl = match ctx.get_field(this, HDR_HAS_CL) {
-                Value::Int(n) => n,
-                _ => 0,
+            // Shape guard — see `http_headers_is_counter_shape`. Declining for
+            // a receiver this file did not mint yields `Optional.empty`, which
+            // is HotSpot's answer for a name the headers do not carry; reading
+            // slots 1/2 off a one-slot `String[]`-shaped object instead
+            // invents a `content-type` that is nowhere in the request.
+            // The guard is tested BEFORE the slot reads, not folded into a
+            // match arm after them: `net_phase_e`'s receiver has exactly ONE
+            // slot, so reading `HDR_HAS_CT`/`HDR_HAS_CL` off it is an
+            // out-of-range field access, and a guard that fires afterwards has
+            // already taken it.
+            let (has_ct, has_cl) = if http_headers_is_counter_shape(ctx, this) {
+                (
+                    match ctx.get_field(this, HDR_HAS_CT) {
+                        Value::Int(n) => n,
+                        _ => 0,
+                    },
+                    match ctx.get_field(this, HDR_HAS_CL) {
+                        Value::Int(n) => n,
+                        _ => 0,
+                    },
+                )
+            } else {
+                (0, 0)
             };
             let queried = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -2528,9 +2638,15 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/OptionalLong;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let has_cl = match ctx.get_field(this, HDR_HAS_CL) {
-                Value::Int(n) => n,
-                _ => 0,
+            // Shape guard, tested BEFORE the slot read — see
+            // `http_headers_is_counter_shape` and the note in `allValues`.
+            let has_cl = if http_headers_is_counter_shape(ctx, this) {
+                match ctx.get_field(this, HDR_HAS_CL) {
+                    Value::Int(n) => n,
+                    _ => 0,
+                }
+            } else {
+                0
             };
             let queried = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -2550,14 +2666,25 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
 
     // map() -> Map<String, List<String>>
     r.register(cls, "map", "()Ljava/util/Map;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let count = match ctx.get_field(this, HDR_COUNT) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 2)?;
-        ctx.set_field(map, 0, Value::Int(count));
-        ctx.set_field(map, 1, Value::Int(0));
+        // Kept for the arity/NPE check the other four accessors also get from
+        // it. `HDR_COUNT` is only a header COUNT on a receiver this file
+        // minted; on `net_phase_e`'s it is the `String[]` of headers and on a
+        // real `HttpHeaders.of(...)` it is the real `Map`. This body no longer
+        // reads that slot at all — see below — which is the strongest form of
+        // the guard the other three get from `http_headers_is_counter_shape`.
+        let _this = obj_arg(args, 0)?;
+        // The crate-wide `java/util/HashMap` convention is 3 slots plus
+        // `native_map_init` (`phases_early.rs:393`, `logging_shims.rs:3516`,
+        // `phases_late.rs:1550`, `reflect_annotations.rs:997`, and three
+        // more — this file was the ONLY 2-slot allocation of the class in the
+        // crate). The previous body hand-wrote `Int(count)` into slot 0 and
+        // `Int(0)` into slot 1, so the object it returned could not be read by
+        // any registered `java/util/HashMap` native: it claimed a size in a
+        // slot the layout does not keep a size in, over entries it never had.
+        // An honestly-empty, well-formed map beats a size no `get` can honour
+        // — the counters carry no header NAMES, so there is nothing to put.
+        let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+        let _ = cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
         Ok(Some(Value::Object(Some(map))))
     });
     r.set_category(__prev_cat);
@@ -4714,5 +4841,230 @@ mod http2_tests {
             ),
             other => panic!("bodyPublisher present must hold the publisher, got {other:?}"),
         }
+    }
+
+    // --- G34-1: the three shapes of java.net.http.HttpHeaders ---------------
+    //
+    // `NativeMethodRegistry::register` is last-write-wins with no unregister
+    // API, and TWO registrars claim
+    // `HttpHeaders.{map,firstValue,allValues,firstValueAsLong}`: this file's
+    // `register_http_headers` and `net_phase_e`'s. Whichever runs last owns
+    // the slot for every receiver in the VM, including the ones the OTHER
+    // minter produced. These tests pin the discriminator that makes that
+    // survivable, because the boot order is not something either file can see.
+
+    /// The three minters, and the one property that separates them.
+    ///
+    /// MEASURED (`--dump-native-registry`, `target-rel2`, 2026-08-17): under
+    /// `--jdk-only` only `net_phase_e`'s rows exist, all `overwrote=null`. In a
+    /// `synthetic-jdk` build both registrars run and this file's bodies own the
+    /// four slots. The guard has to hold in both.
+    #[test]
+    fn http_headers_counter_shape_separates_the_three_minters() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+
+        // (a) This file's minter: 3 slots, `Value::Int` counters.
+        let mine = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 3);
+        init_http_headers_fields(&mut ctx, mine, 2, 1, 0);
+        assert!(
+            http_headers_is_counter_shape(&ctx, mine),
+            "alloc_http_headers puts Value::Int in HDR_COUNT; that IS the counter shape"
+        );
+
+        // (b) `net_phase_e::re5_make_http_headers`: 1 slot holding a String[].
+        //     A reference in slot 0 is the whole difference.
+        let theirs = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 1);
+        let arr_stand_in = ctx.create_string("Accept: text/plain");
+        ctx.set_field(theirs, 0, Value::Object(Some(arr_stand_in)));
+        assert!(
+            !http_headers_is_counter_shape(&ctx, theirs),
+            "net_phase_e keeps a String[] in slot 0; decoding it as HDR_COUNT is the hazard"
+        );
+
+        // (c) The real JDK's `HttpHeaders.of(Map, BiPredicate)`: slot 0 is the
+        //     real `Map` field. MEASURED on HotSpot 25.0.3+9-LTS,
+        //     `map().getClass()` is `java.util.Collections$UnmodifiableMap`.
+        let real = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 1);
+        ctx.set_field(real, 0, Value::Object(None));
+        assert!(
+            !http_headers_is_counter_shape(&ctx, real),
+            "a real JDK HttpHeaders holds a Map reference in slot 0, never a counter"
+        );
+    }
+
+    /// `firstValue` on a receiver this file did not mint must answer ABSENT,
+    /// not invent a `content-type` out of another minter's slots.
+    ///
+    /// MEASURED on HotSpot: `firstValue` of a name the headers do not carry is
+    /// `Optional.empty`, so declining is also the oracle-correct answer.
+    #[test]
+    fn http_headers_first_value_declines_a_foreign_receiver() {
+        let cb = find_cb(
+            "java/net/http/HttpHeaders",
+            "firstValue",
+            "(Ljava/lang/String;)Ljava/util/Optional;",
+        );
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+
+        // This file's own receiver, content-type present: still answered.
+        let mine = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 3);
+        init_http_headers_fields(&mut ctx, mine, 1, 1, 0);
+        let name = ctx.create_string("Content-Type");
+        let slot0 = opt_slot0(
+            cb,
+            &mut ctx,
+            &[Value::Object(Some(mine)), Value::Object(Some(name))],
+        );
+        assert_not_a_flag("firstValue.own", &slot0);
+        match slot0 {
+            Value::Object(Some(sv)) => assert_eq!(
+                ctx.read_string(sv).as_deref(),
+                Some("application/json"),
+                "this file's own receiver must keep answering exactly as before the guard"
+            ),
+            other => panic!("expected the content-type string, got {other:?}"),
+        }
+
+        // A `net_phase_e`-shaped receiver: ONE slot, a reference in it. The
+        // guard must fire BEFORE HDR_HAS_CT/HDR_HAS_CL are read, because slots
+        // 1 and 2 do not exist on this object at all.
+        let theirs = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 1);
+        let arr_stand_in = ctx.create_string("Content-Type: text/plain");
+        ctx.set_field(theirs, 0, Value::Object(Some(arr_stand_in)));
+        let name2 = ctx.create_string("Content-Type");
+        let slot0 = opt_slot0(
+            cb,
+            &mut ctx,
+            &[Value::Object(Some(theirs)), Value::Object(Some(name2))],
+        );
+        assert_eq!(
+            slot0,
+            Value::Object(None),
+            "a receiver this file did not mint must get Optional.empty, not a \
+             content-type fabricated from a slot that belongs to another layout"
+        );
+    }
+
+    /// The same for `firstValueAsLong`, whose `OptionalLong` really does carry
+    /// a `(boolean isPresent, long value)` pair — so the absent answer has to
+    /// be `Int(0)` in slot 0, not merely a null reference.
+    #[test]
+    fn http_headers_first_value_as_long_declines_a_foreign_receiver() {
+        let cb = find_cb(
+            "java/net/http/HttpHeaders",
+            "firstValueAsLong",
+            "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+        );
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+
+        let mine = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 3);
+        init_http_headers_fields(&mut ctx, mine, 1, 0, 1);
+        let name = ctx.create_string("Content-Length");
+        let got = match cb(
+            &mut ctx,
+            &[Value::Object(Some(mine)), Value::Object(Some(name))],
+        )
+        .expect("native must not fail")
+        {
+            Some(Value::Object(Some(o))) => (ctx.get_field(o, 0), ctx.get_field(o, 1)),
+            other => panic!("expected an OptionalLong, got {other:?}"),
+        };
+        assert_eq!(
+            got,
+            (Value::Int(1), Value::Long(20)),
+            "this file's own receiver must keep answering exactly as before the guard"
+        );
+
+        let theirs = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 1);
+        let arr_stand_in = ctx.create_string("Content-Length: 20");
+        ctx.set_field(theirs, 0, Value::Object(Some(arr_stand_in)));
+        let name2 = ctx.create_string("Content-Length");
+        let got = match cb(
+            &mut ctx,
+            &[Value::Object(Some(theirs)), Value::Object(Some(name2))],
+        )
+        .expect("native must not fail")
+        {
+            Some(Value::Object(Some(o))) => (ctx.get_field(o, 0), ctx.get_field(o, 1)),
+            other => panic!("expected an OptionalLong, got {other:?}"),
+        };
+        assert_eq!(
+            got,
+            (Value::Int(0), Value::Long(0)),
+            "a foreign receiver must get OptionalLong.empty, not a fabricated 20"
+        );
+    }
+
+    /// The ratchet. Every accessor `register_http_headers` registers reads a
+    /// slot map that only ONE of the three minters produces, so every one of
+    /// them must consult the discriminator — or, for `map`, read no counter at
+    /// all. A guard dropped in a later edit is silent at runtime (it answers a
+    /// plausible wrong header) and this is what makes it loud instead.
+    ///
+    /// Source-level on purpose: the failure being ratcheted is "someone edits
+    /// this function and forgets", which no amount of behaviour on today's
+    /// receivers can catch.
+    #[test]
+    fn every_http_headers_accessor_is_shape_guarded() {
+        let src = include_str!("http2.rs");
+        let start = src
+            .find("fn register_http_headers(")
+            .expect("register_http_headers must exist");
+        let end = src[start..]
+            .find("\nfn register_body_publisher(")
+            .map(|o| start + o)
+            .expect("register_body_publisher must follow register_http_headers");
+        let body = &src[start..end];
+
+        let guards = body
+            .matches("http_headers_is_counter_shape(ctx, this)")
+            .count();
+        assert_eq!(
+            guards, 3,
+            "allValues / firstValue / firstValueAsLong must each test \
+             http_headers_is_counter_shape before reading HDR_HAS_CT/HDR_HAS_CL. \
+             `map` is the fourth accessor and is guarded more strongly — it \
+             reads no counter slot at all."
+        );
+
+        // `map` must not have regained a counter read.
+        let map_start = body
+            .find("r.register(cls, \"map\", \"()Ljava/util/Map;\"")
+            .expect("map must still be registered");
+        assert!(
+            !body[map_start..].contains("get_field(this, HDR_COUNT)"),
+            "map() must not read HDR_COUNT: the slot is a counter only on this \
+             file's own receiver, and the returned map carries no header names \
+             to put in it either way"
+        );
+    }
+
+    /// The `java/util/HashMap` and `java/util/ArrayList` this file hands back
+    /// must be shaped the way the rest of the crate shapes them, because it is
+    /// `native-collections`' registered natives — not this file — that answer
+    /// `size()`/`get()` on them afterwards.
+    ///
+    /// MEASURED by sweep (2026-08-17): before this change `http2.rs` was the
+    /// ONLY `java/util/HashMap` allocation in `native-builtins` that asked for
+    /// 2 slots; seven other files ask for 3 and pair it with `native_map_init`.
+    #[test]
+    fn collection_returns_follow_the_crate_wide_slot_convention() {
+        let src = include_str!("http2.rs");
+        assert!(
+            !src.contains("try_alloc_concurrent_synthetic(ctx, \"java/util/HashMap\", 2)"),
+            "a 2-slot java/util/HashMap cannot be read by any registered \
+             native_map_* body; the crate convention is 3 slots + native_map_init"
+        );
+        assert!(
+            src.contains("cratonvm_native_collections::native_map_init"),
+            "the HashMap this file returns must be initialised by the same \
+             helper every other allocator in the crate uses"
+        );
+        assert!(
+            src.contains("cratonvm_native_collections::native_al_init"),
+            "the ArrayList this file returns must be initialised by \
+             native_al_init; hand-writing Int into slot 0 type-puns the slot \
+             native_al_init keeps the backing Object[] in"
+        );
     }
 }
