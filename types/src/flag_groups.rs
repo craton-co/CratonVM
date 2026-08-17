@@ -507,6 +507,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "root-source", on_key: Some("CRATONVM_DBG_ROOT_SOURCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-verify-slide", on_key: Some("CRATONVM_DBG_ZGC_VERIFY_SLIDE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-corpse", on_key: Some("CRATONVM_DBG_ZGC_CORPSE"), off_key: None, off_word: None },
+    // Declared 2026-08-17: both were read by `runtime_var_os` and named nowhere,
+    // so `CRATONVM_DBG=mapgen` could not reach them and a test could not arrange
+    // one with `flags::with_thread_overrides` -- and while the guard was red it
+    // could not catch the NEXT undeclared flag, which is what it is for.
+    // `mapgen` reports a safepoint waiter that resumed on a pointer map from a
+    // different pause generation than the one it arrived for; `vacated-frames`
+    // arms the vacated-address ledger that catches a frame slot still holding an
+    // address the collector moved away from.
+    E { group: Group::DBG, token: "mapgen", on_key: Some("CRATONVM_DBG_MAPGEN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "vacated-frames", on_key: Some("CRATONVM_DBG_VACATED_FRAMES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "atomic-intrinsic", on_key: Some("CRATONVM_DBG_ATOMIC_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "define-filter", on_key: Some("CRATONVM_DBG_DEFINE_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "define-stack-filter", on_key: Some("CRATONVM_DBG_DEFINE_STACK_FILTER"), off_key: None, off_word: None },
@@ -1899,6 +1909,42 @@ mod tests {
             on.overrides().count(),
             1,
             "the ON form clears the opt-out key and touches nothing else",
+        );
+    }
+
+    /// Same for the two GC diagnostics declared on 2026-08-17.
+    ///
+    /// `CRATONVM_DBG_MAPGEN` (`vm/src/threading/gc_barrier.rs`) and
+    /// `CRATONVM_DBG_VACATED_FRAMES` (`gc/src/gc_quiescence.rs`) shipped as
+    /// `runtime_var_os` reads with no row, so each was served by a live
+    /// `getenv`. Both are plain opt-in diagnostics, so the assertion is just
+    /// that the grouped spelling reaches the legacy key — which is the fact a
+    /// consumer depends on and the row's existence alone does not establish.
+    ///
+    /// The wider cost of leaving them undeclared was not the two flags: while
+    /// `flag_declaration_guard` was red it could not catch the NEXT one.
+    #[test]
+    fn the_20260817_gc_diagnostics_expand_from_their_group_spelling() {
+        let c = case(&[("CRATONVM_DBG", "mapgen")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_DBG_MAPGEN"),
+            Some(OsString::from("1")),
+        );
+
+        let c = case(&[("CRATONVM_DBG", "vacated-frames")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_DBG_VACATED_FRAMES"),
+            Some(OsString::from("1")),
+        );
+
+        // And together, comma-separated, since that is how two diagnostics for
+        // one investigation actually get set.
+        let c = case(&[("CRATONVM_DBG", "mapgen,vacated-frames")]);
+        let both = c.resolve();
+        assert_eq!(both.get("CRATONVM_DBG_MAPGEN"), Some(OsString::from("1")));
+        assert_eq!(
+            both.get("CRATONVM_DBG_VACATED_FRAMES"),
+            Some(OsString::from("1")),
         );
     }
 
