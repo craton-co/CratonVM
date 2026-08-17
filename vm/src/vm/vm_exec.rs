@@ -12652,6 +12652,17 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         Some(self.thread.tlab.thread_allocated_bytes())
     }
 
+    fn total_allocated_bytes(&self) -> Option<u64> {
+        // Every thread's RETIRED total, plus this thread's live TLAB span. A
+        // peer's in-flight cursor may not be read while its owner runs, so the
+        // under-count is bounded by one TLAB per running thread — and the value
+        // stays monotonic, which the occupancy gauge this replaced was not.
+        Some(
+            cratonvm_gc::tlab::process_allocated_bytes()
+                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+        )
+    }
+
     fn committed_heap_bytes(&self) -> usize {
         self.shared.mem.heap.committed_bytes()
     }
