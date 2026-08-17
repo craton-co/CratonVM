@@ -830,6 +830,8 @@ pub fn update_all_roots(
         );
     }
     // 1. Thread frames — locals and operand stacks (SoA layout)
+    // See `JvmThread::last_heal_collection`.
+    thread.last_heal_collection = shared.mem.heap.collection_count();
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, &shared.mem.heap);
         frame

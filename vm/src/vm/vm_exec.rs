@@ -6153,6 +6153,8 @@ impl<'a> NativeContextImpl<'a> {
             crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
+        // See `JvmThread::last_heal_collection`.
+        self.thread.last_heal_collection = self.shared.mem.heap.collection_count();
         // cceres3 FIX: exact per-slot write-back for the blocked window.
         // Runs after the chain application above — any slot the chain already
         // healed reads back != orig and is skipped; any slot the chain MISSED

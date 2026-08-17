@@ -4679,6 +4679,8 @@ pub(crate) fn apply_pointer_map_to_thread(
             pointer_map.len()
         );
     }
+    // See `JvmThread::last_heal_collection`.
+    thread.last_heal_collection = heap.collection_count();
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);

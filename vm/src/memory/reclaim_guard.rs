@@ -573,6 +573,8 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
                         slot = format!("{what}[{idx}]"),
                         slot_class = %class_name_of(shared, heap.class_id_of(o).as_u32()),
                         moved_to = format!("{moved_to:#x}"),
+                        heap_collection = heap.collection_count(),
+                        thread_last_heal = thread.last_heal_collection,
                         class_at_target = %class_name_of(
                             shared,
                             // SAFETY: `moved_to` is a post-move object base the
