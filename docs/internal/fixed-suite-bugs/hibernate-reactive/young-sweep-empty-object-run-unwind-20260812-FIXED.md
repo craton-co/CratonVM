@@ -1,7 +1,7 @@
 # Young non-moving sweep unwound every reclaim decision for a dead `new Object()` — `BatchingConnectionTest` hang — FIXED
 
 **Status:** FIXED (2026-08-12), `gc/src/gen_heap.rs`. Found working
-`docs/known-issues/hibernate-reactive/investigate-batch-01.md` — the only
+`../../../known-issues/hibernate/investigate-batch-01.md` — the only
 CratonVM defect left in that 12-class batch once the SASL/SCRAM and JNA
 blockers it was collected behind had been fixed.
 
@@ -163,7 +163,7 @@ guard is load-bearing and no test passes for the wrong reason.
 ## Residual — the same predicate is wrong at other walk sites
 
 Filed as
-`docs/known-issues/hibernate-reactive/young-walk-zero-run-sibling-sites.md`.
+`../../../known-issues/hibernate/young-walk-zero-run-sibling-sites.md`.
 Seven other `zero_run_end` callers in `gc/src/gen_heap.rs` treat the identical
 benign shape as corruption; two of them are measurable on this same repro
 (`sweep_chunk` aborts the parallel prefix, `clear_all_mark_bits_in_arena`
@@ -223,4 +223,4 @@ deviations from `baseline.tsv` inside the already-failing set.
 
 The five zero rows are left alone deliberately, and the remaining 26% of
 parallel aborts is the open residual — both in
-`docs/known-issues/hibernate-reactive/young-walk-zero-run-sibling-sites.md`.
+`../../../known-issues/hibernate/young-walk-zero-run-sibling-sites.md`.

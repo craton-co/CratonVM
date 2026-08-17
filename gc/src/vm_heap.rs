@@ -2653,7 +2653,7 @@ impl VmHeap {
         // `par_accepts` far below `par_attempts` means the parallel sweep
         // prefix is being discarded and the entire arena is re-swept
         // sequentially. Until 2026-08-12 that was the state on EVERY JIT-warm
-        // workload — `attempts=5 accepts=0` on the hibernate-reactive repro,
+        // workload — `attempts=5 accepts=0` on the hibernate repro,
         // every abort the benign empty-object zero run — and these counters
         // said so the whole time with nobody to read them.
         //

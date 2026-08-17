@@ -2436,7 +2436,7 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `DefaultPromise` LISTENER. A listener that throws is logged and DROPPED, so
 /// Vert.x's `VertxImpl$2.operationComplete` never finished shutting down the
 /// remaining event-loop groups and its close promise never completed —
-/// `vertx.close()` blocked forever. In the hibernate-reactive suite that
+/// `vertx.close()` blocked forever. In the hibernate suite that
 /// surfaced as classes timing out in `RunTestOnContext.cleanUp`, one leaked
 /// Postgres container each, with the actual `IOException` swallowed by the
 /// logger delegate.
