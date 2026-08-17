@@ -5349,6 +5349,20 @@ mod tests {
     /// platform fact — pinning glibc's answer would fail on Windows for a
     /// reason that is not a defect.
     #[test]
+    /// What `Math.log10` is expected to return: the host libm, PLUS the one
+    /// correction the registration applies on top of it — a negative argument
+    /// answers the x86 default QNaN, sign bit SET, which is what HotSpot's
+    /// `_dlog10` stub yields and what this libm does not. The BACKING is still
+    /// libm, which is what the ratchet below is checking; without this the row
+    /// would read that correction as "the split collapsed onto fdlibm".
+    fn math_log10_expected(x: f64) -> f64 {
+        if x < 0.0 {
+            f64::from_bits(0xFFF8_0000_0000_0000)
+        } else {
+            x.log10()
+        }
+    }
+
     fn math_and_strictmath_stay_split_on_intrinsified_rows() {
         let mut math = NativeMethodRegistry::new();
         register_math_natives(&mut math, "java/lang/Math");
@@ -5356,8 +5370,24 @@ mod tests {
         register_math_natives(&mut strict, "java/lang/StrictMath");
         let mut ctx = mock_ctx();
 
+        // `PI` is here so the `log10` row keeps a POSITIVE witness that
+        // discriminates: libm answers 0x3FDFD14DB31BA3BA there and fdlibm
+        // 0x3FDFD14DB31BA3BB. `-0.1` used to be that witness on its own, and
+        // stopped being one when `Math.log10` gained the negative-argument NaN
+        // correction below.
         let samples = [
-            0.1_f64, -0.1, 0.5, 0.75, 0.9999, 1.0, 2.5, 3.25, 17.0, 1e-8, 1e8,
+            0.1_f64,
+            -0.1,
+            0.5,
+            0.75,
+            0.9999,
+            1.0,
+            2.5,
+            3.25,
+            17.0,
+            1e-8,
+            1e8,
+            std::f64::consts::PI,
         ];
 
         let call1 = |reg: &NativeMethodRegistry,
@@ -5385,7 +5415,7 @@ mod tests {
             ("tan", |x| x.tan(), cratonvm_types::fdlibm::tan),
             ("exp", |x| x.exp(), cratonvm_types::fdlibm::exp),
             ("log", |x| x.ln(), cratonvm_types::fdlibm::log),
-            ("log10", |x| x.log10(), cratonvm_types::fdlibm::log10),
+            ("log10", math_log10_expected, cratonvm_types::fdlibm::log10),
             ("cbrt", |x| x.cbrt(), cratonvm_types::fdlibm::cbrt),
             ("tanh", |x| x.tanh(), cratonvm_types::fdlibm::tanh),
         ];
