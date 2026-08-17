@@ -1633,6 +1633,12 @@ pub struct G1Collector {
     /// (region consumption, TLAB refill, the end of a collection) and, as a
     /// self-healing backstop for any region-type transition that does neither,
     /// re-scanned every [`NEEDS_GC_RECOUNT_INTERVAL`] queries.
+    /// `CRATONVM_DBG_G1ACCESSOR` census: field/array accessor calls that
+    /// answered from [`Self::may_be_humongous`] with NO `regions` lock, and
+    /// calls that had to take it. The load-independent half of the
+    /// accessor-lock measurement — see the flag's own doc.
+    accessor_calls_lockfree: AtomicU64,
+    accessor_calls_locked: AtomicU64,
     free_region_count: AtomicUsize,
     /// Queries since [`Self::free_region_count`] was last re-scanned. See
     /// [`NEEDS_GC_RECOUNT_INTERVAL`].
@@ -2005,6 +2011,8 @@ impl G1Collector {
             // Every region starts Free (`G1Region::from_arena`). Seeding this
             // at 0 instead would make the first `needs_gc()` on a brand-new
             // heap answer "collect now".
+            accessor_calls_lockfree: AtomicU64::new(0),
+            accessor_calls_locked: AtomicU64::new(0),
             free_region_count: AtomicUsize::new(num_regions),
             needs_gc_since_recount: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
@@ -9389,6 +9397,43 @@ impl G1Collector {
         total_object_size > self.config.region_size / 2
     }
 
+    /// Record one accessor call for the `CRATONVM_DBG_G1ACCESSOR` census, and
+    /// answer the same thing [`Self::may_be_humongous`] does.
+    ///
+    /// Wrapping the predicate rather than counting at each of the four call
+    /// sites keeps the census and the decision impossible to disagree: whatever
+    /// routed the call is what gets counted.
+    #[inline]
+    fn accessor_needs_regions_lock(&self, total_object_size: usize) -> bool {
+        let locked = self.may_be_humongous(total_object_size);
+        if gc_flags().g1_dbg_accessor {
+            if locked {
+                self.accessor_calls_locked.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.accessor_calls_lockfree.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        locked
+    }
+
+    /// Print the `CRATONVM_DBG_G1ACCESSOR` census. Called once, at VM exit.
+    pub fn dbg_report_accessor_census(&self) {
+        if !gc_flags().g1_dbg_accessor {
+            return;
+        }
+        let free = self.accessor_calls_lockfree.load(Ordering::Relaxed);
+        let locked = self.accessor_calls_locked.load(Ordering::Relaxed);
+        let total = free + locked;
+        eprintln!(
+            "[g1-accessor] field/array accessor calls={total} lock_free={free} took_regions_lock={locked} lock_free_pct={:.2}",
+            if total == 0 {
+                0.0
+            } else {
+                free as f64 * 100.0 / total as f64
+            }
+        );
+    }
+
     /// If `obj`'s start address names a `HumongousStart` region, return the
     /// start region index and the total payload byte count (object size minus
     /// the single ObjectHeader). Returns `None` for ordinary (non-humongous)
@@ -9792,7 +9837,7 @@ impl G1Collector {
         // touches the `regions` lock. This block used to take it
         // unconditionally, making every `getfield` on this collector contend
         // with every other thread's field access — see `may_be_humongous`.
-        if self.may_be_humongous(total_size) {
+        if self.accessor_needs_regions_lock(total_size) {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u64; 2];
@@ -10142,7 +10187,7 @@ impl GarbageCollector for G1Collector {
             }
             true
         };
-        let stored = if !self.may_be_humongous(total_size) {
+        let stored = if !self.accessor_needs_regions_lock(total_size) {
             flat_store()
         } else {
             let regions = self.regions.lock();
@@ -10264,7 +10309,7 @@ impl GarbageCollector for G1Collector {
         // `may_be_humongous` first: an ordinary array's element read must not
         // take the `regions` lock, which this block used to do on every call —
         // see `may_be_humongous` for what that cost.
-        if !self.may_be_humongous(total_size) {
+        if !self.accessor_needs_regions_lock(total_size) {
             flat_read(&mut raw);
         } else {
             let regions = self.regions.lock();
@@ -10370,7 +10415,12 @@ impl GarbageCollector for G1Collector {
             }
             true
         };
-        let stored = if !needs_satb_read && !self.may_be_humongous(total_size) {
+        // Evaluate the predicate BEFORE the `&&`, not inside it: `&&`
+        // short-circuits, so with the census wired through
+        // `accessor_needs_regions_lock` a store that takes the lock for SATB
+        // would never be counted at all — a funnel with one branch invisible.
+        let size_needs_lock = self.accessor_needs_regions_lock(total_size);
+        let stored = if !needs_satb_read && !size_needs_lock {
             flat_store()
         } else {
             let regions = self.regions.lock();

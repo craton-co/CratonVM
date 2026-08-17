@@ -4620,7 +4620,14 @@ fn run() -> Result<()> {
     // `--verbose:gc` or the `CRATONVM_GC_STATS` env knob so a gauntlet runner
     // can collect the table without `RUST_LOG`. No-op for the generational
     // collector and when no G1 collection ran.
-    if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
+    // `CRATONVM_DBG_G1ACCESSOR` too: the accessor census rides inside
+    // `print_gc_summary`, and a census whose only output path is gated behind a
+    // DIFFERENT flag prints nothing when you ask for it — which reads as
+    // "zero accessor calls" rather than "you never enabled the report".
+    if args.verbose_gc
+        || std::env::var_os("CRATONVM_GC_STATS").is_some()
+        || cratonvm_types::flags::flags().gc.g1_dbg_accessor
+    {
         vm.shared.mem.heap.print_gc_summary();
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the

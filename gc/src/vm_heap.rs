@@ -2449,6 +2449,11 @@ impl VmHeap {
     pub fn print_gc_summary(&self) {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
+            // Independent of GC stats being requested: this census answers
+            // "how many accessor calls still take the global regions lock?",
+            // which is a question about the MUTATOR, not about collections.
+            // Gated by its own flag (`CRATONVM_DBG_G1ACCESSOR`).
+            g1.dbg_report_accessor_census();
         }
         // ZGC: the same unconditional-counts treatment the generational branch
         // below gets, and for the same reason — without it a `--verbose:gc` run
