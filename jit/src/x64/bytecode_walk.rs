@@ -2296,6 +2296,65 @@ impl Compiler {
                     pc += 1;
                 }
 
+                // dup2_x1 — FORM-2 `[…, b, w] → […, w, b, w]` (w category-2 =
+                // ONE entry in this value model, b category-1) vs FORM-1
+                // `[…, c, b, a] → […, b, a, c, b, a]` (all three category-1).
+                //
+                // Only FORM-2 is admitted, and proving it needs just the top's
+                // width: a VERIFIED `dup2_x1` whose top is category-2 cannot be
+                // FORM-1 (that form is all category-1), and JVMS requires its
+                // value2 to be category-1 — a category-2 second operand would
+                // have had to be `dup2_x2`. So `dup2_top_cat2` answering `true`
+                // settles the shape on its own.
+                //
+                // In this model FORM-2 is then structurally identical to
+                // `dup_x1` above: push a copy of the top, rotate the top three
+                // entries right by one. FORM-1 needs a different rotate over
+                // five entries and has no witness here, so it stays interpreted
+                // — same conservatism as `dup_x2`.
+                //
+                // What this unsticks: javac emits `dup2_x1` for
+                // `return this.field = value;` on a long/double field, which is
+                // every synthetic outer-class setter of a `double` field.
+                // commons-math's `PSquarePercentile$Marker.access$502` is one,
+                // reached from the P-square min/max update path.
+                0x5d => {
+                    let top_cat2 = self.dup2_top_cat2(code, pc);
+                    if dupx_codegen_disabled()
+                        || dup_x1_codegen_disabled()
+                        || top_cat2 != Some(true)
+                        || self.stack.len() < 2
+                    {
+                        self.fail("singlepass-codegen/dup2_x1-unprovable-form");
+                        let _ = self.push_stack();
+                    } else {
+                        let a_slot = self.peek_stack();
+                        let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let before = self.stack.len();
+                        self.load_slot_to_reg(RAX, a_slot);
+                        self.push_from_rax(); // […, b, a, aC]
+                        // `push_from_rax` is silent when it cannot reserve a
+                        // spill slot — it emits nothing and does not grow the
+                        // model, and the rotate below would then reorder the
+                        // WRONG three entries. See the same guard in `dup_x1`.
+                        if self.stack.len() != before + 1 {
+                            self.fail("singlepass-codegen/dup2_x1-copy-not-pushed");
+                            pc += 1;
+                            continue;
+                        }
+                        if a_oop {
+                            self.mark_top_as_oop();
+                        }
+                        let n = self.stack.len();
+                        self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
+                        self.stack_oop_marks[n - 3..].rotate_right(1);
+                        if dupx_eager_canon() {
+                            self.canonicalize_stack();
+                        }
+                    }
+                    pc += 1;
+                }
+
                 // swap
                 0x5f => {
                     // EC oop-map fix (round 2): the previous round paired the
