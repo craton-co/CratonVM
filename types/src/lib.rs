@@ -17,6 +17,7 @@ pub mod field_layout;
 pub mod field_watch;
 pub mod flag_groups;
 pub mod flags;
+pub mod jfp;
 pub mod float_format;
 pub mod handle;
 mod heap_types;
