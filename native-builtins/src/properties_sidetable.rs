@@ -4068,9 +4068,111 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    use cratonvm_native_api::FieldMetadata;
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
-    use super::*;
+    use cratonvm_types::ClassId;
+
+    // -----------------------------------------------------------------------
+    // G49-1 — the second-largest coercion cluster, and why it is benign.
+    //
+    // MEASURED, 19 vectors under `CRATONVM_DBG_COERCION=1` on
+    // `target-rel3/release/cratonvm.exe`: 337 `primitive-into-reference` events
+    // at `props_defaults`, descriptor `L`, and every single one is a READ
+    // (frame `VmHeap::get_field_as`) carrying `value=Int(0)`. `Int(0)` is what
+    // a never-written slot decodes to under `gen_heap.rs`'s R-niche rule —
+    // `java.util.Properties.defaults` on a `Properties` built without a parent.
+    // The coercion answers `null`, which is what the field means, and a
+    // 22-check differential against HotSpot 25.0.3+9-LTS (including the
+    // non-String-own-value fall-through and a three-level chain) is identical.
+    //
+    // So the cluster is noise, not damage — but it is only noise while
+    // `props_defaults` treats a primitive as "no defaults". These pin that,
+    // and pin that it still finds a real parent when there is one, so nobody
+    // can close the noise by making the function refuse.
+    // -----------------------------------------------------------------------
+
+    /// Real-JDK flat slot of `java.util.Properties.defaults`: `Hashtable`
+    /// contributes `table`/`count`/`threshold`/`loadFactor`/`modCount`/
+    /// `keySet`/`entrySet`/`values` first. Cross-checked against
+    /// `javap -p java.util.Hashtable` on HotSpot 25.0.3+9-LTS and against
+    /// `native-collections`' own `define_field(PROPERTIES_CID, "defaults", 8)`.
+    const PROPERTIES_DEFAULTS_SLOT: usize = 8;
+
+    fn properties_class(ctx: &mut MockNativeContext) -> ClassId {
+        let cid = ctx
+            .ensure_class_initialized("java/util/Properties")
+            .expect("mock could not initialize java/util/Properties");
+        ctx.set_declared_fields(
+            cid,
+            vec![FieldMetadata {
+                name: "defaults".to_string(),
+                descriptor: "Ljava/util/Properties;".to_string(),
+                access_flags: 0,
+                slot_index: PROPERTIES_DEFAULTS_SLOT,
+                declaring_class_id: cid,
+                is_static: false,
+            }],
+        );
+        cid
+    }
+
+    /// **The 245/95-event shape.** A `Properties` with no parent: the slot was
+    /// never written, so it reads back as the raw `Int(0)` the allocator left,
+    /// the descriptor-aware read coerces it to `null`, and the answer is "no
+    /// defaults". Correct, and the reason G49-1 files this cluster benign.
+    #[test]
+    fn a_never_written_defaults_slot_means_no_defaults_not_a_lost_parent() {
+        let mut ctx = mock_ctx();
+        let cid = properties_class(&mut ctx);
+        let props = ctx.alloc_object(cid, PROPERTIES_DEFAULTS_SLOT + 2);
+        assert_eq!(
+            ctx.get_field(props, PROPERTIES_DEFAULTS_SLOT),
+            Value::Int(0),
+            "fixture must reproduce the never-initialised slot, not a null"
+        );
+        assert_eq!(props_defaults(&ctx, props), None);
+    }
+
+    /// The other half, so the test above cannot be satisfied by a function that
+    /// always answers `None` — which would silently break
+    /// `getProperty`'s fall-through chain and is exactly the failure G45-1
+    /// suspected this cluster of being.
+    #[test]
+    fn a_real_parent_is_found_so_the_fall_through_chain_survives() {
+        let mut ctx = mock_ctx();
+        let cid = properties_class(&mut ctx);
+        let parent = ctx.alloc_object(cid, PROPERTIES_DEFAULTS_SLOT + 2);
+        let child = ctx.alloc_object(cid, PROPERTIES_DEFAULTS_SLOT + 2);
+        ctx.set_field(child, PROPERTIES_DEFAULTS_SLOT, Value::Object(Some(parent)));
+        assert_eq!(props_defaults(&ctx, child), Some(parent));
+    }
+
+    /// An explicit `null` parent — what a `putfield` of `null` leaves — is
+    /// indistinguishable from "no parent", and must not be mistaken for one.
+    #[test]
+    fn an_explicitly_null_defaults_slot_is_also_no_defaults() {
+        let mut ctx = mock_ctx();
+        let cid = properties_class(&mut ctx);
+        let props = ctx.alloc_object(cid, PROPERTIES_DEFAULTS_SLOT + 2);
+        ctx.set_field(props, PROPERTIES_DEFAULTS_SLOT, Value::Object(None));
+        assert_eq!(props_defaults(&ctx, props), None);
+    }
+
+    /// When the field cannot be resolved at all the function answers `None`
+    /// rather than reading slot 0 — which on the real flat layout is
+    /// `Hashtable.table`, an `Entry[]`, and would hand `getProperty` an array
+    /// to recurse into.
+    #[test]
+    fn an_unresolvable_defaults_field_answers_none_rather_than_slot_zero() {
+        let mut ctx = mock_ctx();
+        let props = ctx.alloc_object(ClassId::new(0), PROPERTIES_DEFAULTS_SLOT + 2);
+        let table = ctx.alloc_object(ClassId::new(0), 1);
+        ctx.set_field(props, 0, Value::Object(Some(table)));
+        assert_eq!(props_defaults(&ctx, props), None);
+    }
 
     fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

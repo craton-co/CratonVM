@@ -684,18 +684,75 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     result
 }
 
+/// `java.lang.ref.ReferenceQueue.ENQUEUED`, or `None` when the class is not
+/// loaded — in which case no `Reference` can have been enqueued yet and the
+/// only caller's answer is `false` either way.
+///
+/// Resolved with `class_id_by_name` and deliberately **not**
+/// `ensure_class_initialized`: the only caller reaches here holding a live
+/// `ReferenceQueue` reference out of a `Reference.queue` slot, which already
+/// proves the class is initialised. Skipping the init call keeps
+/// [`native_ref_is_enqueued`] free of any GC-capable call, so the `ObjectRef`
+/// it is about to compare cannot be relocated underneath it and no pin is
+/// needed. Adding an `ensure_class_initialized` here would silently invalidate
+/// that reasoning.
+fn reference_queue_enqueued_sentinel(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name("java/lang/ref/ReferenceQueue")?;
+    let index = ctx.static_field_index_by_name(class_id, "ENQUEUED")?;
+    match ctx.get_static_field(class_id, index) {
+        Value::Object(Some(sentinel)) => Some(sentinel),
+        _ => None,
+    }
+}
+
+/// `Reference.isEnqueued()` — JDK: `return this.queue == ReferenceQueue.ENQUEUED;`
+///
+/// G49-1 (2026-08-17). This used to test the queue slot against the synthetic
+/// `Int(1)` sentinel ALONE, and under `--jdk-only` that sentinel can never
+/// appear, so the method answered `false` for every reference that had in fact
+/// been enqueued. MEASURED against HotSpot 25.0.3+9 before the fix: `weak`,
+/// `soft` and `phantom` all reported `isEnqueued() == false` immediately after
+/// an `enqueue()` that returned `true`.
+///
+/// Why the sentinel cannot appear on a real JDK layout: slot 1 of
+/// `java/lang/ref/Reference` is `queue`, declared
+/// `Ljava/lang/ref/ReferenceQueue;`. Anything primitive aimed at it is nulled
+/// on the way in or out by `heap::coerce_field_value_for_slot`'s `b'L'` arm —
+/// the silent reference-slot coercion of
+/// `G30-1-the-silent-reference-slot-coercion-20260817.md`. Meanwhile the arm
+/// that actually runs under `--jdk-only` is
+/// [`native_ref_enqueue`]'s real-layout arm, which delegates to the JDK's own
+/// `ReferenceQueue.enqueue` bytecode; that bytecode's `enqueue0` publishes
+/// `r.queue = ENQUEUED`, a live object. So the reader was waiting for an `Int`
+/// that the writer never writes, and could not have seen it if it did.
+///
+/// Both shapes are now accepted, and they cannot collide: the `Int(1)` arm is
+/// only reachable on the synthetic two-slot layout, where the slot carries no
+/// `L` descriptor and the coercion never fires (`vm/src/vm/tests.rs`'s
+/// `s28_is_enqueued_lifecycle` builds exactly that shape and still passes).
+///
+/// `Object(None)` covers both "never had a queue" and "already polled" —
+/// [`native_rq_poll`] detaches by writing `Object(None)` where the JDK's
+/// `poll0` writes `NULL_QUEUE`. Not enqueued either way; see G49-1 §NOMINATION
+/// for the one remaining shape this cannot answer (the GC's own auto-enqueue,
+/// which stamps a raw `Int(1)` from outside this crate).
 fn native_ref_is_enqueued(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // After enqueue, the queue field is set to sentinel Int(1).
-    // Object(None) = never had queue, Object(Some(_)) = has queue but not yet enqueued.
     let queue = ctx.get_field(this, REF_FIELD_QUEUE);
-    Ok(Some(Value::Int(match queue {
-        Value::Int(1) => 1, // enqueued sentinel
-        _ => 0,
-    })))
+    let enqueued = match queue {
+        // Synthetic two-slot shape: `native_ref_enqueue`'s non-real-layout arm
+        // overwrites the queue slot with this sentinel.
+        Value::Int(1) => true,
+        // Real JDK layout: the JDK's own `enqueue0` stored `ENQUEUED` here.
+        // A plain queue reference means "has a queue, not yet enqueued".
+        Value::Object(Some(q)) => reference_queue_enqueued_sentinel(&*ctx) == Some(q),
+        // Never had a queue, or already polled.
+        _ => false,
+    };
+    Ok(Some(Value::Int(i32::from(enqueued))))
 }
 
 fn native_ref_refers_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -941,10 +998,155 @@ fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    use cratonvm_native_api::{FieldMetadata, NativeMethodRegistry};
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
-    use super::*;
-    use cratonvm_native_api::NativeMethodRegistry;
+    use cratonvm_types::ClassId;
+
+    // -----------------------------------------------------------------------
+    // G49-1 — `isEnqueued()` and the sentinel that a reference slot eats.
+    //
+    // MEASURED before the fix, `cratonvm --jdk-only` against HotSpot
+    // 25.0.3+9-LTS: after an `enqueue()` that returned `true`, `isEnqueued()`
+    // answered `false` for WeakReference, SoftReference and PhantomReference
+    // alike. The JDK answers `true` for all three.
+    //
+    // The cause is the G30-1 coercion, read from the other end: slot 1 of a
+    // real `java/lang/ref/Reference` is `queue`, descriptor
+    // `Ljava/lang/ref/ReferenceQueue;`, so the `Int(1)` sentinel this native
+    // was matching on cannot survive in it — while the JDK's own `enqueue0`,
+    // which is what actually runs under `--jdk-only`, stores the live
+    // `ReferenceQueue.ENQUEUED` object there.
+    // -----------------------------------------------------------------------
+
+    /// Register `java/lang/ref/ReferenceQueue` in the mock with a static
+    /// `ENQUEUED` field, and return `(class_id, sentinel_object)`.
+    fn with_enqueued_sentinel(ctx: &mut MockNativeContext) -> (ClassId, ObjectRef) {
+        let cid = ctx
+            .ensure_class_initialized("java/lang/ref/ReferenceQueue")
+            .expect("mock could not initialize java/lang/ref/ReferenceQueue");
+        ctx.set_declared_fields(
+            cid,
+            vec![FieldMetadata {
+                name: "ENQUEUED".to_string(),
+                descriptor: "Ljava/lang/ref/ReferenceQueue;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: cid,
+                is_static: true,
+            }],
+        );
+        let sentinel = ctx.alloc_object(cid, 3);
+        ctx.set_static_field(cid, 0, Value::Object(Some(sentinel)));
+        (cid, sentinel)
+    }
+
+    fn is_enqueued(ctx: &mut MockNativeContext, this: ObjectRef) -> bool {
+        match native_ref_is_enqueued(ctx, &[Value::Object(Some(this))]) {
+            Ok(Some(Value::Int(v))) => v != 0,
+            other => panic!("isEnqueued did not answer a boolean: {other:?}"),
+        }
+    }
+
+    /// **The pin.** A real-JDK-layout `Reference` whose `queue` slot holds
+    /// `ReferenceQueue.ENQUEUED` — exactly what `enqueue0` leaves behind — is
+    /// enqueued. Reverting to the `Int(1)`-only test makes this red.
+    #[test]
+    fn the_real_jdk_enqueued_sentinel_reads_as_enqueued() {
+        let mut ctx = mock_ctx();
+        let (_rq_cid, sentinel) = with_enqueued_sentinel(&mut ctx);
+        let reference = ctx.alloc_object(ClassId::new(0), 4);
+        ctx.set_field(reference, REF_FIELD_QUEUE, Value::Object(Some(sentinel)));
+        assert!(
+            is_enqueued(&mut ctx, reference),
+            "queue == ReferenceQueue.ENQUEUED is the JDK's own definition of enqueued"
+        );
+        // Guard the fixture: the sentinel really is the static we planted.
+        assert_eq!(reference_queue_enqueued_sentinel(&ctx), Some(sentinel));
+    }
+
+    /// The other half, so the test above cannot be satisfied by a function that
+    /// answers `true` for any reference. A `Reference` still holding its OWN
+    /// queue has not been enqueued yet — this is the state every
+    /// `new WeakReference(o, q)` starts in, and answering `true` here would
+    /// make `isEnqueued()` useless in the opposite direction.
+    #[test]
+    fn a_reference_still_holding_its_own_queue_is_not_enqueued() {
+        let mut ctx = mock_ctx();
+        let (rq_cid, _sentinel) = with_enqueued_sentinel(&mut ctx);
+        let queue = ctx.alloc_object(rq_cid, 3);
+        let reference = ctx.alloc_object(ClassId::new(0), 4);
+        ctx.set_field(reference, REF_FIELD_QUEUE, Value::Object(Some(queue)));
+        assert!(
+            !is_enqueued(&mut ctx, reference),
+            "a live queue reference that is not ENQUEUED means 'has a queue, not yet enqueued'"
+        );
+    }
+
+    /// The synthetic two-slot shape must keep working. `vm/src/vm/tests.rs`'s
+    /// `s28_is_enqueued_lifecycle` drives exactly this path — `ClassId(0)`
+    /// objects with no `L` descriptor on slot 1, where `native_ref_enqueue`'s
+    /// non-real-layout arm writes `Int(1)` and nothing coerces it away.
+    #[test]
+    fn the_synthetic_int_sentinel_still_reads_as_enqueued() {
+        let mut ctx = mock_ctx();
+        with_enqueued_sentinel(&mut ctx);
+        let reference = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(reference, REF_FIELD_QUEUE, Value::Int(1));
+        assert!(is_enqueued(&mut ctx, reference));
+    }
+
+    /// `native_rq_poll` detaches by writing `Object(None)`, and a `Reference`
+    /// constructed without a queue never had one. Both are "not enqueued", and
+    /// so is the raw `Int(0)` a never-written slot decodes to (`gen_heap.rs`'s
+    /// R-niche rule — the shape behind the 670 benign reads in G49-1 §2).
+    #[test]
+    fn queueless_detached_and_never_written_all_read_as_not_enqueued() {
+        let mut ctx = mock_ctx();
+        with_enqueued_sentinel(&mut ctx);
+        let detached = ctx.alloc_object(ClassId::new(0), 4);
+        ctx.set_field(detached, REF_FIELD_QUEUE, Value::Object(None));
+        assert!(!is_enqueued(&mut ctx, detached), "polled -> not enqueued");
+
+        let untouched = ctx.alloc_object(ClassId::new(0), 4);
+        assert!(
+            !is_enqueued(&mut ctx, untouched),
+            "a never-written slot reads Int(0), which is not the Int(1) sentinel"
+        );
+    }
+
+    /// The lookup must degrade to `false`, never panic and never throw, when
+    /// `java/lang/ref/ReferenceQueue` is absent. This is what licenses
+    /// `reference_queue_enqueued_sentinel` to skip `ensure_class_initialized`
+    /// and stay free of GC-capable calls: with no class there is no queue
+    /// object, so there is nothing that could have been enqueued.
+    #[test]
+    fn an_unresolvable_sentinel_answers_not_enqueued_rather_than_failing() {
+        let mut ctx = mock_ctx();
+        assert_eq!(reference_queue_enqueued_sentinel(&ctx), None);
+        let queue = ctx.alloc_object(ClassId::new(0), 3);
+        let reference = ctx.alloc_object(ClassId::new(0), 4);
+        ctx.set_field(reference, REF_FIELD_QUEUE, Value::Object(Some(queue)));
+        assert!(!is_enqueued(&mut ctx, reference));
+    }
+
+    /// A null or absent receiver is `false`, not a panic — `isEnqueued` is
+    /// registered for four classes and the arg shape is not guaranteed.
+    #[test]
+    fn a_missing_receiver_answers_not_enqueued() {
+        let mut ctx = mock_ctx();
+        with_enqueued_sentinel(&mut ctx);
+        assert!(matches!(
+            native_ref_is_enqueued(&mut ctx, &[]),
+            Ok(Some(Value::Int(0)))
+        ));
+        assert!(matches!(
+            native_ref_is_enqueued(&mut ctx, &[Value::Object(None)]),
+            Ok(Some(Value::Int(0)))
+        ));
+    }
 
     #[test]
     fn register_reference_natives_registers_all_expected_entries() {
