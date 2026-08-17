@@ -886,3 +886,72 @@ Stated rather than guessed, in this index's own convention.
    session did not touch.** This pass reconciled the seven claims it was given
    plus what the suite measured. It did not re-read 244 older records, and does
    not claim their statuses are current.
+
+---
+
+# FIFTH PASS — in-session, 2026-08-17. Status only; the tables are NOT rebuilt.
+
+## §E.1 The one number that matters has moved
+
+The FOURTH PASS's §C reads **88 → 93 → 95 of 99** under `--jdk-only`. It is
+stale. MEASURED since, same three-arm method, same oracle:
+
+| binary | `--jdk-only` |
+|---|---|
+| `9ae371468` | 97 of 99 |
+| `e7e840264` | 97 of 99 |
+| `3fcc8d90f` | **98 of 99** |
+
+**`RSslLiveSession` is green** — 104 checks, empty diff against HotSpot, on a
+vector that had never passed in its life. It closed in two steps, `G57-1` (the
+carrier had to CARRY the dialled endpoint, because the session is minted long
+after the request returned) and `G58-1` (the whole `BaisEvent` mechanism
+existed and nothing had ever installed a consumer).
+
+**`RJdkBridge1` is the only red vector left.** It stops in `surrog`, and the
+step it stops at is the useful number — its check count is not comparable
+across binaries because the vector aborts at its first failure. See
+`BASELINE-20260817.md` for both, and for the two harness traps that cost a run
+each today (`run.sh`'s default `JDK` does not exist on this host; its
+per-vector `timeout` means a parallel build can manufacture a failure).
+
+## §E.2 The listing is 307, and I am not publishing a coverage number
+
+`ls docs/known-issues/jdk-only/*.md` — **307 files**, against the FOURTH PASS's
+280. So this index has rotted again, exactly as its own four warnings predicted.
+
+**How much has rotted is not established here, deliberately.** Two scripted
+attempts disagreed — 98 unindexed by one measure, 174 by another — because
+records are cited in this file three different ways: by full slug
+(`G33-1-the-instrument-that-under-reported-20260817`), by bare id (`G1-1`), and
+by id-plus-prose. No grep separates "has a row" from "is mentioned in passing
+in someone else's row", and both of my numbers conflate them. A number I cannot
+stand behind is worth less than nothing in this directory, so there is not one
+here.
+
+What IS spot-verified: **`G50-1` and `G60-1` have zero mentions anywhere in this
+file**, and the whole `G35-1`…`G60-1` run postdates the FOURTH PASS. A real
+sixth pass needs to read each record's status prose, which is what passes one
+through four each did and why they took a lane apiece.
+
+## §E.3 Records added since the FOURTH PASS, by id
+
+`G35-1` `G36-1` `G36-2` `G37-1` `G38-1` `G39-1` `G41-1` `G42-1` `G43-1` `G44-1`
+`G45-1` `G46-1` `G47-1` `G48-1` `G49-1` `G50-1` `G51-1` `G52-1` `G53-1` `G54-1`
+`G55-1` `G56-1` `G57-1` `G58-1` `G59-1` `G60-1`
+
+Three of those are worth reading before acting anywhere in this tree:
+
+* **`G56-1`** — the allocator's "reference types are already `Object(None)` from
+  zero memory" comment stopped being true when `Value::Object` gained a
+  `NonNull` niche. 1,111 of 1,122 coercion events were that one expired premise.
+* **`G59-1`** — with the noise gone, the residue was readable, and it named a
+  defect no vector points at: `URL.openConnection()` writing a synthetic slot
+  map into a real JDK class. **Two of its four wrong writes were invisible to
+  the guard**, because a well-typed value in the wrong slot is not a descriptor
+  mismatch. Read this before treating a quiet coercion log as a clean one.
+* **`G60-1`** — `--jdk-only` counts its own violations and nobody had read the
+  count. 0 classes fabricated, 0 synthetic stubs run, and **81 natives that won
+  over real JDK bytecode**, 24 of them on ordinary Java classes this VM
+  interprets every day. That is the shape of what "finishing" the mode still
+  means, and `retired_shadow.rs` is the mechanism it already has.
