@@ -949,6 +949,29 @@ cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
 /// direct-bound site with no `JitInvokeInfo` — a hole this door has since
 /// closed for its sibling non-`()V` admission. Read only at JIT compile time.
 cached_is_set!(osr_ctor_bind_disabled, "CRATONVM_NO_OSR_CTOR_BIND");
+/// `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` — put the REAL `has_prim_init` /
+/// `has_finalizer` at a `new` site compiled through the interpreter's
+/// first-call door or the OSR door, instead of the conservative
+/// `(true, true)` those two doors hard-code.
+///
+/// OPT-IN, and the reason is a measurement rather than a doubt about
+/// correctness. Setting the real flags is what makes `bytecode_walk`'s
+/// `skip_helper` reachable at all from those doors, which is the in-tree TODO
+/// the `fastthreadlocal-2e9-iteration-throughput-wall` page investigated. It
+/// works — and it buys nothing, because `emit_inline_tlab_new` does not
+/// actually allocate inline: its own comment records that the raw compiled
+/// cursor bump was routed back through the checked runtime helper after it
+/// left a malformed young-space span under Elasticsearch merge churn. Only
+/// the header writes are inline, so `skip_helper` removes a
+/// `jit_post_tlab_init` call and leaves the allocation cost where it was.
+///
+/// Measured (Azure Linux, interleaved, same binary, `probes/CtorShapeRateProbe`):
+/// `new Object()` 111.4 ns/op with the inline arm off, 118.0 ns/op with it on;
+/// the real `new FastThreadLocal<Boolean>()` loop was no better in 3 of 4
+/// rounds. Turn this on again when the JIT-emitted bump can share
+/// `Tlab::alloc_initialized`'s publication contract — at that point it is the
+/// switch that makes the inline path worth having.
+cached_is_set!(jit_real_new_site_flags, "CRATONVM_JIT_REAL_NEW_SITE_FLAGS");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
 

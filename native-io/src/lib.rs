@@ -21661,22 +21661,34 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // bind succeeded, the send worked, and inbound traffic simply never
     // reached the event loop. `PcapWriteHandlerTest`'s `udpV4*` cases and
     // `io.netty.resolver.dns`'s transport are the visible half of that.
+    // A WILDCARD bind must keep the channel dual-stack. `open()` gave this
+    // channel an AF_INET6 socket with `IPV6_V6ONLY` off; rebinding it to the
+    // literal v4 wildcard would replace that with AF_INET and silently drop
+    // the second family — see `FileDescriptorTable::udp_rebind_dual_stack`.
+    // HotSpot reports `/[0:0:0:0:0:0:0:0]:port` for both `bind(null)` and
+    // `bind(new InetSocketAddress("0.0.0.0", 0))`, which is what this matches.
+    let wildcard_port = addr_str
+        .strip_prefix("0.0.0.0:")
+        .and_then(|p| p.parse::<u16>().ok());
     if let Some(existing) = dc_fd(ctx, this) {
-        ctx.fd_table()
-            .udp_rebind(existing, Some(&addr_str), reuse)
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("DatagramChannel.bind: {e}"),
-            })?;
+        let rebound = match wildcard_port {
+            Some(port) => ctx.fd_table().udp_rebind_dual_stack(existing, port, reuse),
+            None => ctx.fd_table().udp_rebind(existing, Some(&addr_str), reuse),
+        };
+        rebound.map_err(|e| RuntimeError::IOException {
+            message: format!("DatagramChannel.bind: {e}"),
+        })?;
         if let Ok(fresh) = ctx.fd_table().udp_try_clone(existing) {
             crate::nio_selector::selector_refresh_udp(existing as i32, &fresh);
         }
         return Ok(Some(Value::Object(Some(this))));
     }
 
-    let fd_id = if reuse {
-        ctx.fd_table().open_udp_reuse(Some(&addr_str))
-    } else {
-        ctx.fd_table().open_udp(Some(&addr_str))
+    // No socket yet (a legacy channel layout). Same wildcard rule as above.
+    let fd_id = match (wildcard_port, reuse) {
+        (Some(_), false) => ctx.fd_table().open_udp_dual_stack(),
+        _ if reuse => ctx.fd_table().open_udp_reuse(Some(&addr_str)),
+        _ => ctx.fd_table().open_udp(Some(&addr_str)),
     }
     .map_err(|e| RuntimeError::IOException {
         message: format!("DatagramChannel.bind: {e}"),

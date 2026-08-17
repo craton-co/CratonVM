@@ -1654,6 +1654,64 @@ impl FileDescriptorTable {
         Ok(fd)
     }
 
+    /// Rebind an open UDP socket to the **dual-stack wildcard**, keeping its
+    /// `FdId`.
+    ///
+    /// `DatagramChannel.bind(null)` — and `bind(new InetSocketAddress(0))`,
+    /// whose address is the v4 `0.0.0.0` — are wildcard binds, and on HotSpot
+    /// they leave a dual-stack channel dual-stack: measured on JDK 25,
+    /// `DatagramChannel.open().bind(null).getLocalAddress()` is
+    /// `/[0:0:0:0:0:0:0:0]:port`, and so is the `"0.0.0.0"` form.
+    ///
+    /// Routing those through [`udp_rebind`] with the literal `"0.0.0.0:0"`
+    /// replaced the AF_INET6 socket [`open_udp_dual_stack`] had just created
+    /// with an AF_INET one, so the channel lost the second family the moment
+    /// it was bound — which is every netty datagram channel, because
+    /// `AbstractBootstrap` binds before use. The visible symptom was the one
+    /// `open_udp_dual_stack_socket` documents: a send to `::1` failing with
+    /// `EAFNOSUPPORT` on a channel that had been opened dual-stack.
+    pub fn udp_rebind_dual_stack(
+        &self,
+        fd: FdId,
+        port: u16,
+        reuse_address: bool,
+    ) -> Result<(), io::Error> {
+        match self.get_entry(fd) {
+            Some(entry) if matches!(&*entry, FileEntry::UdpSocket(_)) => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fd is not a UDP socket",
+                ))
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "bad fd for udp rebind",
+                ))
+            }
+        }
+        let udp = if reuse_address {
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            socket.set_only_v6(false)?;
+            socket.set_reuse_address(true)?;
+            let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+            socket.bind(&addr.into())?;
+            std::net::UdpSocket::from(socket)
+        } else {
+            open_udp_dual_stack_socket(port)?
+        };
+        disable_udp_connreset(&udp);
+        self.entries
+            .write()
+            .insert(fd, Arc::new(FileEntry::UdpSocket(udp)));
+        Ok(())
+    }
+
     /// Bind an already-open UDP socket to `bind_addr`, KEEPING ITS `FdId`.
     ///
     /// A bound socket cannot be rebound, so this creates a freshly bound one

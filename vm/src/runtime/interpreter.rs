@@ -2750,18 +2750,29 @@ pub fn execute(
                                         }
                                     };
                                     if accessible {
-                                        // The REAL flags — see
-                                        // `jit_bridge::jit_new_site_flags`.
-                                        // The `(true, true)` literal that
-                                        // stood here (with a TODO asking for
-                                        // exactly this) forced every `new`
-                                        // compiled through this door onto the
-                                        // `jit_new_object` helper.
+                                        // `(true, true)` unless
+                                        // `CRATONVM_JIT_REAL_NEW_SITE_FLAGS`
+                                        // is set. The in-tree TODO that stood
+                                        // here asking for the real flags is
+                                        // answered by
+                                        // `jit_bridge::jit_new_site_flags`,
+                                        // which also records why turning them
+                                        // on by default buys nothing today.
                                         let (num_fields, has_prim_init, has_finalizer) = {
                                             let cm = shared.classes.class_manager.read();
-                                            crate::runtime::interpreter::jit_bridge::jit_new_site_flags(
-                                                &cm, target_id,
-                                            )
+                                            if crate::runtime::env_cache::jit_real_new_site_flags() {
+                                                crate::runtime::interpreter::jit_bridge::jit_new_site_flags(
+                                                    &cm, target_id,
+                                                )
+                                            } else {
+                                                (
+                                                    cm.get_class(target_id)
+                                                        .map(|c| c.num_total_fields)
+                                                        .unwrap_or(0),
+                                                    true,
+                                                    true,
+                                                )
+                                            }
                                         };
                                         new_info.push((
                                             pc_new,

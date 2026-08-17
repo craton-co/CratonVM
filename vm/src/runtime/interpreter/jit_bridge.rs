@@ -1504,14 +1504,24 @@ pub(super) fn compile_osr_artifact(
                                 }
                             };
                             if accessible {
-                                // The REAL flags, not `(true, true)`. See
-                                // `jit_new_site_flags` for what the literal
-                                // cost: `skip_helper` was unreachable from
-                                // this door, so no OSR-compiled loop could
-                                // ever inline-allocate.
+                                // `(true, true)` unless `CRATONVM_JIT_REAL_NEW_SITE_FLAGS`
+                                // is set — see `jit_new_site_flags` for what
+                                // the literal costs (nothing measurable, as it
+                                // turns out) and why the real flags are behind
+                                // a lever rather than on.
                                 let (num_fields, has_prim_init, has_finalizer) = {
                                     let cm = shared.classes.class_manager.read();
-                                    jit_new_site_flags(&cm, target_id)
+                                    if crate::runtime::env_cache::jit_real_new_site_flags() {
+                                        jit_new_site_flags(&cm, target_id)
+                                    } else {
+                                        (
+                                            cm.get_class(target_id)
+                                                .map(|c| c.num_total_fields)
+                                                .unwrap_or(0),
+                                            true,
+                                            true,
+                                        )
+                                    }
                                 };
                                 new_info2.push((
                                     pc_new,

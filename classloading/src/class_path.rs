@@ -2892,12 +2892,33 @@ impl ClassPath {
         if !is_safe_class_name(class_name) {
             return None;
         }
+        // Two passes, for the reason `find_class` has two: this runs once per
+        // class DEFINE (the origin census, and `defineClass`'s CodeSource), so
+        // its own stat-per-directory scan was a second copy of the same
+        // 111-directories x 1102-classes cost. Indexing `find_class` alone took
+        // netty's first-touch 2195 ms -> 1299 ms and left 1332 ms of it here.
+        self.find_class_source_path_pass(class_name, true)
+            .or_else(|| self.find_class_source_path_pass(class_name, false))
+    }
+
+    fn find_class_source_path_pass(
+        &self,
+        class_name: &str,
+        use_dir_index: bool,
+    ) -> Option<String> {
         let relative_path = format!("{}.class", class_name);
         for entry in &self.entries {
             match entry {
                 ClassPathEntry::Directory(dir) => {
+                    if use_dir_index && self.dir_index_contains(dir, &relative_path) == Some(false)
+                    {
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(&relative_path));
                     if full_path.exists() {
+                        if !use_dir_index {
+                            self.dir_index_invalidate(dir);
+                        }
                         return Some(
                             dir.to_string_lossy()
                                 .trim_end_matches(['/', '\\'])
@@ -2906,6 +2927,8 @@ impl ClassPath {
                         );
                     }
                 }
+                // Pass 2 is only for the directory staleness window.
+                _ if !use_dir_index => continue,
                 ClassPathEntry::JarFile {
                     archive,
                     multi_release,
@@ -3026,12 +3049,31 @@ impl ClassPath {
         if !is_safe_class_name(class_name) {
             return None;
         }
+        // Two passes, same rule as `find_class` / `find_class_source_path`:
+        // this is on `defineClass`'s CodeSource path, so its directory scan
+        // was a third copy of the per-class stat sweep.
+        self.find_class_code_source_info_pass(class_name, true)
+            .or_else(|| self.find_class_code_source_info_pass(class_name, false))
+    }
+
+    fn find_class_code_source_info_pass(
+        &self,
+        class_name: &str,
+        use_dir_index: bool,
+    ) -> Option<(String, Vec<Vec<u8>>)> {
         let relative_path = format!("{}.class", class_name);
         for entry in &self.entries {
             match entry {
                 ClassPathEntry::Directory(dir) => {
+                    if use_dir_index && self.dir_index_contains(dir, &relative_path) == Some(false)
+                    {
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(&relative_path));
                     if full_path.exists() {
+                        if !use_dir_index {
+                            self.dir_index_invalidate(dir);
+                        }
                         // Directories are never signed.
                         let abs = self
                             .canonicalize_root(dir)
@@ -3042,6 +3084,8 @@ impl ClassPath {
                         return Some((format!("file:/{}/", encode_path_for_url(&p)), Vec::new()));
                     }
                 }
+                // Pass 2 is only for the directory staleness window.
+                _ if !use_dir_index => continue,
                 ClassPathEntry::JarFile {
                     archive,
                     multi_release,
