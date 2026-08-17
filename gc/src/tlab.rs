@@ -11,6 +11,7 @@
 //!
 //! TLABs dramatically reduce lock contention on the allocation path.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Default TLAB size: 256 KB — large enough to amortize the lock cost
@@ -301,6 +302,38 @@ impl Tlab {
         self.thread_alloc_carry = prior_total;
     }
 
+/// Process-wide cumulative allocation, in the sense
+/// `com.sun.management.ThreadMXBean.getTotalThreadAllocatedBytes` means it:
+/// a total over the life of the PROCESS that never decreases.
+///
+/// It has to be its own counter. The obvious source, the heap's
+/// `allocated_bytes()`, is an occupancy gauge derived from `used - free`, so it
+/// FALLS at every collection — and a caller measuring a window that contains a
+/// GC gets the difference of two occupancies rather than the bytes it
+/// allocated. The same Hibernate HQL parse read 488 MB under ZGC, 49 MB under
+/// Generational at a 2 GB heap, and 458 MB under Generational at 8 GB. Same
+/// bytecode, three answers, none of them cumulative.
+///
+/// Fed from the two places a thread's own total is fed (`retire` rolling in the
+/// consumed span, and `note_external_allocation`), so it is the sum of every
+/// thread's retired total. Readers add the calling thread's live TLAB span on
+/// top; other threads' in-flight spans are not visible cross-thread by design
+/// (see `Tlab::thread_allocated_bytes`), which bounds the under-count by one
+/// TLAB per running thread and keeps the value monotonic.
+static PROCESS_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative bytes retired into the process-wide total. See
+/// [`PROCESS_ALLOCATED_BYTES`].
+pub fn process_allocated_bytes() -> u64 {
+    PROCESS_ALLOCATED_BYTES.load(Ordering::Relaxed)
+}
+
+fn credit_process_total(bytes: u64) {
+    if bytes != 0 {
+        PROCESS_ALLOCATED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
     /// Record bytes allocated by this thread that never passed through the
     /// TLAB — humongous objects and arrays, and every post-GC retry that goes
     /// straight to the heap arena.
@@ -311,6 +344,7 @@ impl Tlab {
     #[inline]
     pub fn note_external_allocation(&mut self, bytes: usize) {
         self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(bytes as u64);
+        credit_process_total(bytes as u64);
     }
 
     /// Total bytes this thread has allocated since it started, in the sense
@@ -460,6 +494,7 @@ impl Tlab {
         // reads 0 the instant either is null. Idempotent for the same reason:
         // a second `retire()` adds 0 (the pre-filler read above is 0 too).
         self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(consumed);
+        credit_process_total(consumed);
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
