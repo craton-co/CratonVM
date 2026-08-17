@@ -18004,6 +18004,42 @@ const AFC_FIELD_PATH: usize = 1;
 const AFC_FIELD_OPEN: usize = 2;
 const AFC_NUM_FIELDS: usize = 3;
 
+/// Opt-in `AsynchronousFileChannel` tracing (`CRATONVM_DBG_AIO=1`), added
+/// 2026-08-16 for the hibernate-reactive `WrongCredentialsTest` investigation.
+///
+/// The Windows Docker transport (`docker-java`'s `NamedPipeSocket`) drives
+/// `\.\pipe\docker_engine` entirely through this family, so a hang there is
+/// only legible if each line carries the HANDLE ID next to the path — the
+/// previous round of tracing could not tell whether two Java channel objects
+/// were two pipes or one, which is exactly the question a shared-handle
+/// defect turns on. Every line therefore leads with `id=`.
+fn afc_trace_enabled() -> bool {
+    io_flags().dbg_aio
+}
+
+macro_rules! afc_trace {
+    ($($arg:tt)*) => {
+        if afc_trace_enabled() {
+            eprintln!("[dbg-afc] {}", format!($($arg)*));
+        }
+    };
+}
+
+/// First `n` bytes of a payload rendered so a chunked-HTTP frame is readable
+/// at a glance: printable ASCII verbatim, everything else as `\xNN`.
+fn afc_preview(buf: &[u8], n: usize) -> String {
+    let mut out = String::new();
+    for &b in buf.iter().take(n) {
+        match b {
+            b'\r' => out.push_str("\\r"),
+            b'\n' => out.push_str("\\n"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AfcSyncMode {
     None,
@@ -18244,13 +18280,19 @@ fn afc_open_file(path: &str, opts: AfcOpenOptions) -> io::Result<u32> {
     }
 
     let file = open.open(path)?;
-    afc_insert_file(AfcFileHandle {
+    let id = afc_insert_file(AfcFileHandle {
         file,
         readable: opts.read,
         writable: opts.write,
         sync: opts.sync,
         delete_on_close: opts.delete_on_close.then(|| PathBuf::from(path)),
-    })
+    })?;
+    afc_trace!(
+        "open   id={id} read={} write={} path={path}",
+        opts.read,
+        opts.write
+    );
+    Ok(id)
 }
 
 fn afc_read_at(id: u32, buf: &mut [u8], position: u64) -> io::Result<usize> {
@@ -18264,7 +18306,12 @@ fn afc_read_at(id: u32, buf: &mut [u8], position: u64) -> io::Result<usize> {
     }
     let saved = handle.file.stream_position()?;
     handle.file.seek(SeekFrom::Start(position))?;
+    afc_trace!(
+        "os-read  id={id} pos={position} saved={saved} want={} ENTER",
+        buf.len()
+    );
     let read_result = handle.file.read(buf);
+    afc_trace!("os-read  id={id} pos={position} -> {:?}", read_result);
     let restore_result = handle.file.seek(SeekFrom::Start(saved));
     match (read_result, restore_result) {
         (Err(e), _) => Err(e),
@@ -19183,6 +19230,7 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // rather than reusing the pre-block one, in case a moving GC
     // relocated its backing array too.
     let mut blocked_refs = [Value::Object(Some(bb))];
+    afc_trace!("read   id={handle_id} pos={position} bb[{pos}..{lim}] want={remaining} ENTER");
     ctx.begin_blocking_region();
     let read_result = afc_read_at(handle_id, &mut buf, position);
     ctx.end_blocking_region_refs(&mut blocked_refs);
@@ -19195,6 +19243,7 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     })?;
 
     if n == 0 {
+        afc_trace!("read   id={handle_id} pos={position} want={remaining} EOF -> -1");
         let boxed = afc_box_integer(ctx, -1)?;
         return Ok(Some(wrap_completed_future(ctx, boxed)?));
     }
@@ -19204,6 +19253,28 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         bb_write_byte(ctx, view, pos as usize + i, b)?;
     }
     buf_set_position(ctx, bb, pos + n as i32);
+    if afc_trace_enabled() {
+        // Report what the OS handed over AND what actually landed in the Java
+        // buffer. The two can differ (a short write-back, a stale view, a
+        // relocated backing array) and only the second is what the client
+        // parses -- reading the bytes back out of `bb` is the one instrument
+        // that can tell those apart.
+        let mut back = vec![0u8; n];
+        let delivered = bb_read_bytes(ctx, view, pos as usize, &mut back).is_ok();
+        let matched = delivered && back[..] == buf[..n];
+        afc_trace!(
+            "read   id={handle_id} pos={position} want={remaining} got={n}              bbpos={} delivered_ok={matched} :: {}",
+            pos + n as i32,
+            afc_preview(&buf[..n], 96)
+        );
+        if !matched {
+            afc_trace!(
+                "read   id={handle_id} MISMATCH os={} bb={}",
+                afc_preview(&buf[..n], 96),
+                afc_preview(&back, 96)
+            );
+        }
+    }
     // BUG (async read/write Future path, found via H2
     // TestFileSystem.testConcurrent against the "async:" filesystem):
     // this used to pass a bare Value::Int straight into
@@ -19285,6 +19356,10 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // only `bb` needs to survive the blocking window (buf_set_position
     // below touches it again).
     let mut blocked_refs = [Value::Object(Some(bb))];
+    afc_trace!(
+        "write  id={handle_id} pos={position} n={remaining} :: {}",
+        afc_preview(&data, 160)
+    );
     ctx.begin_blocking_region();
     let write_result = afc_write_at(handle_id, &data, position);
     ctx.end_blocking_region_refs(&mut blocked_refs);
@@ -19430,6 +19505,7 @@ pub(crate) fn native_afc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             Value::Int(v) if v > 0 => v as u32,
             _ => 0,
         };
+        afc_trace!("close  id={handle_id}");
         afc_remove_file(handle_id);
         ctx.set_field(this, AFC_FIELD_OPEN, Value::Int(0));
     }
