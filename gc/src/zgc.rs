@@ -15542,6 +15542,58 @@ pub(crate) mod tests {
         }
     }
 
+    /// **A floor left ABOVE the cursor must not wedge the collector.**
+    ///
+    /// `retract_cursor_into_free_tail` can drop the bump cursor below the floor a
+    /// previous whole-heap cycle published, and nothing stops it: the tail was
+    /// wholly free, so retracting is right. The floor is then above everything and
+    /// a young sweep visits NOTHING.
+    ///
+    /// That has to be survivable rather than a stall, and the mechanism is already
+    /// there: a young cycle that reclaimed nothing arms `gen_force_major_next`,
+    /// and the whole-heap cycle that follows recomputes the floor from a full
+    /// sweep. This test forces the state directly rather than waiting for a
+    /// retraction to produce it, because the point is that the recovery works, not
+    /// how the state arises.
+    #[test]
+    fn a_nursery_floor_above_the_cursor_recovers_through_a_major() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (head, chain, _g) = conc_build_graph(&heap, 400, 0);
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        assert!(heap.has_old_objects.load(Ordering::Relaxed));
+
+        // Force the pathological state: a floor beyond any live address.
+        heap.gen_young_floor.store(usize::MAX / 2, Ordering::Relaxed);
+        let junk: Vec<usize> = (0..300)
+            .map(|_| heap.alloc_object(ClassId::new(43), 2).as_ptr() as usize)
+            .collect();
+
+        // The young cycle sweeps nothing and must arm the escalation latch.
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "still counted as a minor");
+        assert!(
+            heap.gen_force_major_next.load(Ordering::Relaxed),
+            "a young cycle that reclaimed nothing must escalate, or a floor above              the cursor stalls collection until an allocation fails"
+        );
+
+        // The forced major recomputes the floor and reclaims the junk.
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let (_, floor, _) = heap.nursery_stats();
+        assert!(
+            floor < usize::MAX / 2 && floor > heap.arena_base,
+            "the major must republish a sane floor, got {floor:#x}"
+        );
+        assert!(
+            junk.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "and reclaim what the wedged young cycles could not see"
+        );
+        assert_eq!(conc_walk_chain(&heap, roots[0]), chain);
+    }
+
     /// **A card whose target is OLD is dropped, and the target survives
     /// anyway.**
     ///
