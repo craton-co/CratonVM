@@ -431,7 +431,36 @@ HotSpot.
 
   `JdkSslEngineTest` (821 tests) is **not measurable on this Windows box**: it
   exceeds 900 s on both arms (HotSpot does it in 180 s), so it was run on the Azure
-  host instead, where it completes.
+  host instead, where it completes in 468 s — **and it is the gate that caught a
+  regression every local class had passed.**
+
+  The first version of this fix HUNG five of the first 225 tests there, all
+  TLSv1.3, all `TimeoutException` rather than an assertion:
+
+  ```
+  control            755 ok, 66 aborted, 0 failed
+  fix, version 1     5 FAILED at 225 tests in, all HANGS:
+                       mustCallResumeTrustedOnSessionResumption  x3
+                       testMutualAuthSameCertChain              x2
+  ```
+
+  Those are exactly the tests that run the Java upcall. The cause:
+  `handshake_status_of` read `conn == None` as `NOT_HANDSHAKING`, and while the
+  record loop holds the connection on loan that is a lie — told to the one caller
+  that must not hear it, because an `X509ExtendedTrustManager` is handed the
+  `SSLEngine` and a caller told the handshake is over stops driving it.
+  `EngineState::conn_checked_out` existed for precisely this (the plan above names
+  it) and had been wired only into `engine_begin`; it is now the first `None` arm of
+  `handshake_status_of`.
+
+  `engine_wrap_pump` also stopped answering `(0, 0)` silently for a checked-out
+  engine: that answer is indistinguishable from "no connection yet" and it DROPS the
+  caller's write — a lost handshake record, i.e. a hang with no error. It should be
+  unreachable now; if it is ever reached it says so.
+
+  **The lesson for the next reader, and it is the reason this section took two
+  passes:** a class the local box cannot run is not a class you can skip. Every
+  locally-measurable class passed on the broken version.
 
   **What this does NOT cover.** Only the CLIENT's `checkServerTrusted` moved into
   verification, because that is what `verify_server_cert` is. A SERVER engine's
