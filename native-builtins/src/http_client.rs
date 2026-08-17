@@ -75,7 +75,12 @@ const HRQ_BODY_BYTES: usize = 2; // byte[] body
 const HRQ_HEADERS: usize = 3; // String[] of "key: value"
 const HRQ_TIMEOUT_MS: usize = 4;
 const HRQ_VERSION: usize = 5;
-const HRQ_NUM_FIELDS: usize = 6;
+// G29-1. `java.net.http.HttpRequest` declares SEVEN instance accessors and this
+// model answered four of them (`method`, `uri`, `version`, `timeout`). The
+// missing three are added below; `expectContinue` is the only one that needed
+// state, because nothing in this file has ever recorded it.
+const HRQ_EXPECT_CONTINUE: usize = 6; // Int 0/1
+const HRQ_NUM_FIELDS: usize = 7;
 
 // HttpResponseImpl synthetic field layout
 const HRS_STATUS: usize = 0;
@@ -1693,9 +1698,14 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let arr_val = ctx.get_field(this, HRS_HEADERS_ARR);
-            let headers_obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 2)?;
-            ctx.set_field(headers_obj, 0, arr_val);
-            ctx.set_field(headers_obj, 1, Value::Int(0));
+            // G29-1: was a 2-slot allocation with `Int(0)` in slot 1, while
+            // `net_phase_e::re5_make_http_headers` mints the SAME class name
+            // with 1 slot and `http2.rs::alloc_http_headers` with 3. Three
+            // shapes for one class is three ways for the accessors registered
+            // on it to read the wrong thing; the one every registered
+            // `HttpHeaders` native actually reads is slot 0 = the `String[]`
+            // of "key: value" lines, so route through that single minter.
+            let headers_obj = crate::net_phase_e::re5_make_http_headers(ctx, arr_val)?;
             Ok(Some(Value::Object(Some(headers_obj))))
         },
     );
@@ -1724,6 +1734,7 @@ fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
         // never off the request. So changing the stored default cannot reach
         // the wire path.
         ctx.set_field(this, HRQ_VERSION, Value::Int(HRQ_VERSION_UNSET));
+        ctx.set_field(this, HRQ_EXPECT_CONTINUE, Value::Int(0));
         Ok(None)
     });
     r.register(cls, "method", "()Ljava/lang/String;", |ctx, args| {
@@ -1785,6 +1796,65 @@ fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
         let opt = alloc_optional_duration_ms(ctx, ms)?;
         Ok(Some(Value::Object(Some(opt))))
     });
+    // G29-1 — the same abstract-surface gap `net_phase_e.rs`'s
+    // `java/net/http/HttpRequest` had, on this file's implementation twin.
+    // `HttpRequestImpl` IS a real JDK class, so an unregistered accessor here
+    // does not throw `AbstractMethodError`: it runs the JDK's own body against
+    // OUR slot layout, which is worse — a wrong answer instead of a refusal.
+    // `headers()` in particular would read the real class's `userHeaders` field
+    // out of slot 3, where this model keeps a `String[]`.
+    r.register(cls, "expectContinue", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Nothing in this model can SET expectContinue — there is no builder
+        // that reaches an `HttpRequestImpl` — so this is always the JDK's
+        // documented default of `false` (MEASURED on HotSpot for every request
+        // shape that does not call `expectContinue(true)`). It is read from the
+        // slot rather than returned as a literal so that the day a setter
+        // appears, the accessor is already correct.
+        let flag = ctx
+            .get_field(this, HRQ_EXPECT_CONTINUE)
+            .as_int()
+            .unwrap_or(0);
+        Ok(Some(Value::Int(i32::from(flag != 0))))
+    });
+    r.register(
+        cls,
+        "bodyPublisher",
+        "()Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // A request carries a publisher exactly when it carries a body:
+            // MEASURED, `GET`/`DELETE`/`HEAD` answer `Optional.empty` and every
+            // `POST`/`PUT`/`method(v, publisher)` answers a present one.
+            match ctx.get_field(this, HRQ_BODY_BYTES) {
+                body @ Value::Object(Some(_)) => {
+                    let publisher =
+                        match crate::net_phase_e::re5_new_body_publisher(ctx, body, None)? {
+                            Some(v) => v,
+                            None => Value::Object(None),
+                        };
+                    ctx.invoke(
+                        "java/util/Optional",
+                        "ofNullable",
+                        "(Ljava/lang/Object;)Ljava/util/Optional;",
+                        &[publisher],
+                    )
+                }
+                _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+            }
+        },
+    );
+    r.register(
+        cls,
+        "headers",
+        "()Ljava/net/http/HttpHeaders;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = ctx.get_field(this, HRQ_HEADERS);
+            let headers = crate::net_phase_e::re5_make_http_headers(ctx, arr)?;
+            Ok(Some(Value::Object(Some(headers))))
+        },
+    );
 }
 
 fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
@@ -2673,5 +2743,54 @@ mod http_client_tests {
             "if REDIRECT_* is ever renumbered to the JDK's ordinals, \
              http_redirect_mirror's remap must go with it"
         );
+    }
+
+    /// G29-1. `HttpRequestImpl` is this file's implementation twin of
+    /// `java.net.http.HttpRequest`, which declares SEVEN instance accessors.
+    /// Four were registered here (`method`, `uri`, `version`, `timeout`) and
+    /// three were not. Unlike the abstract class in `net_phase_e.rs`, an
+    /// unregistered accessor on THIS class does not throw: `HttpRequestImpl` is
+    /// a real JDK class, so the JDK's own body runs against a layout that is
+    /// not the JDK's — a wrong answer instead of a refusal, which is worse.
+    #[test]
+    fn http_request_impl_answers_all_seven_request_accessors() {
+        let mut r = NativeMethodRegistry::new();
+        register_http_client_real(&mut r);
+        for (name, descriptor) in [
+            ("method", "()Ljava/lang/String;"),
+            ("uri", "()Ljava/net/URI;"),
+            ("timeout", "()Ljava/util/Optional;"),
+            ("version", "()Ljava/util/Optional;"),
+            ("bodyPublisher", "()Ljava/util/Optional;"),
+            ("expectContinue", "()Z"),
+            ("headers", "()Ljava/net/http/HttpHeaders;"),
+        ] {
+            assert!(
+                r.find("jdk/internal/net/http/HttpRequestImpl", name, descriptor)
+                    .is_some(),
+                "jdk/internal/net/http/HttpRequestImpl.{name}{descriptor} has no native — \
+                 the real JDK body would run over this file's slot layout"
+            );
+        }
+    }
+
+    /// The slot `expectContinue` reads must be inside the object `<init>`
+    /// allocates, and must not collide with a slot that already has an owner.
+    #[test]
+    fn hrq_expect_continue_slot_is_inside_the_allocation_and_unique() {
+        let slots = [
+            HRQ_METHOD,
+            HRQ_URI,
+            HRQ_BODY_BYTES,
+            HRQ_HEADERS,
+            HRQ_TIMEOUT_MS,
+            HRQ_VERSION,
+            HRQ_EXPECT_CONTINUE,
+        ];
+        let mut sorted = slots.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), slots.len(), "two HRQ slots share an index");
+        assert_eq!(sorted, (0..HRQ_NUM_FIELDS).collect::<Vec<_>>());
     }
 }

@@ -11325,7 +11325,10 @@ fn re5_build_response(
 /// `"key: value"` lines (the shape both the synthetic `HttpResponse` and the
 /// synthetic `ResponseInfo` carry). The array is pinned across the
 /// allocation so a moving collector can't leave the stored reference stale.
-fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn re5_make_http_headers(
+    ctx: &mut dyn NativeContext,
+    hdr_arr: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pinned = match hdr_arr {
         Value::Object(Some(a)) => Some((ctx.pin_native_root(a), a)),
         _ => None,
@@ -11920,7 +11923,337 @@ fn re5_request_body_bytes(
     re5_collect_publisher_body(ctx, obj)
 }
 
-const RE5_REQUEST_TIMEOUT_FIELD: usize = 4;
+// ---------------------------------------------------------------------------
+// The synthetic `java/net/http/HttpRequest` / `HttpRequest$Builder` slot map.
+//
+// G29-1 (Mechanism A, instance 4). `HttpRequest$Builder.build()` mints an
+// object stamped with the ABSTRACT class `java/net/http/HttpRequest`, so the
+// receiver's runtime class IS the class every accessor resolves against.
+// `java.net.http.HttpRequest` declares SEVEN abstract instance methods
+// (`method`, `uri`, `timeout`, `version`, `bodyPublisher`, `expectContinue`,
+// `headers`); until 2026-08-17 only three had a native, and the other four
+// threw `AbstractMethodError: ... has no Code attribute` — the correct JVMS
+// answer to a question that should never have been asked, because the mistake
+// is at the mint, one call earlier. `HttpClient` in this same file is the
+// control: it registers 7 of 7 and all seven are measured correct.
+//
+// Both the builder and the request it builds use THIS layout, and `build()`
+// copies slot-for-slot, so the two must not drift. Slots 0..=4 predate G29-1
+// and are named here for the first time; 5..=7 are new.
+const RE5_REQUEST_METHOD: usize = 0; // String, never null (defaults to "GET")
+const RE5_REQUEST_URI: usize = 1; // String (the URI's text), null until set
+const RE5_REQUEST_BODY: usize = 2; // String | byte[] | Flow.Publisher: wire body
+const RE5_REQUEST_HEADERS: usize = 3; // String[] of "key: value", null until set
+const RE5_REQUEST_TIMEOUT_FIELD: usize = 4; // java.time.Duration, null = unset
+const RE5_REQUEST_EXPECT_CONTINUE: usize = 5; // Int 0/1 — a (Z) parameter really
+                                              // does arrive as an int here
+const RE5_REQUEST_VERSION: usize = 6; // HttpClient$Version, null = unset
+const RE5_REQUEST_BODY_PUBLISHER: usize = 7; // the BodyPublisher OBJECT itself
+const RE5_REQUEST_NUM_FIELDS: usize = 8;
+
+// The synthetic `java/net/http/HttpRequest$BodyPublisher`. Slot 0 is the
+// payload every existing reader already expects (`re5_request_body_bytes`
+// dispatches on its runtime type); slot 1 is the content length DECLARED by
+// `fromPublisher(pub, len)`, which cannot be derived from slot 0 because a
+// Flow.Publisher has no length until it is subscribed.
+const RE5_BP_PAYLOAD: usize = 0;
+const RE5_BP_DECLARED_LENGTH: usize = 1; // Long, or Object(None) = derive
+const RE5_BP_NUM_FIELDS: usize = 2;
+
+/// Allocate a fresh `HttpRequest$Builder` with every slot of
+/// [`RE5_REQUEST_NUM_FIELDS`] explicitly initialised.
+///
+/// Every slot is written, including the ones whose "unset" value is the
+/// allocator's zero: `build()` copies the whole range slot-for-slot, and a
+/// builder that only initialises a prefix leaves the tail reading whatever the
+/// allocator happened to leave there. That is how `expectContinue()` would
+/// come to answer a value nobody set.
+fn re5_new_request_builder(
+    ctx: &mut dyn NativeContext,
+    uri: Option<ObjectRef>,
+) -> MethodCallResult {
+    // `re5_uri_string`, `try_alloc_concurrent_synthetic` and `create_string`
+    // ALL allocate, and a moving collector can run inside any of them — so the
+    // URI text is produced first and pinned, the builder is pinned as soon as
+    // it exists, and both are read back through their pins before use. The
+    // batch started FIRST is the one unpinned at the end: releasing it releases
+    // everything pinned after it.
+    let uri_text = match uri {
+        Some(u) => Some(re5_uri_string(ctx, u)),
+        None => None,
+    };
+    let text_pin = uri_text.map(|t| (ctx.pin_native_root(t), t));
+    let b = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/net/http/HttpRequest$Builder",
+        RE5_REQUEST_NUM_FIELDS,
+    )?;
+    let b_pin = ctx.pin_native_root(b);
+    let m = ctx.create_string("GET");
+    let b_now = ctx.read_native_pin(b_pin, b);
+    ctx.set_field(b_now, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+    let text_now = text_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
+    ctx.set_field(b_now, RE5_REQUEST_URI, Value::Object(text_now));
+    ctx.set_field(b_now, RE5_REQUEST_BODY, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_HEADERS, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_TIMEOUT_FIELD, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_EXPECT_CONTINUE, Value::Int(0));
+    ctx.set_field(b_now, RE5_REQUEST_VERSION, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_BODY_PUBLISHER, Value::Object(None));
+    match text_pin {
+        Some((pin, _)) => ctx.unpin_native_roots(pin),
+        None => ctx.unpin_native_roots(b_pin),
+    }
+    Ok(Some(Value::Object(Some(b_now))))
+}
+
+fn ise<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: message.into(),
+    }
+    .into()
+}
+
+/// A `NullPointerException` with NO message, which is what
+/// `Objects.requireNonNull(x)` produces. MEASURED: HotSpot's `POST(null)`,
+/// `method(null, …)`, `method("POST", null)`, `timeout(null)` and
+/// `version(null)` all report `getMessage() == null`, where `header(null, …)`
+/// reports the string `"name"`. The difference is observable from Java, so it
+/// is modelled rather than approximated.
+fn npe_no_message() -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::NullPointerException { message: None }.into()
+}
+
+/// The shared body of `HttpRequest$Builder.POST` and `.PUT`.
+fn re5_builder_verb_with_body(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    verb: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // MEASURED: `POST(null)` is `NullPointerException` with a null message on
+    // HotSpot. Do not silently build a body-less POST.
+    let publisher = match args.get(1).copied() {
+        Some(v @ Value::Object(Some(_))) => v,
+        _ => return Err(npe_no_message()),
+    };
+    let m = ctx.create_string(verb);
+    ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+    re5_builder_set_publisher(ctx, this, publisher);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// Record a `BodyPublisher` on a builder: both the wire payload (slot 2, which
+/// `re5_do_request` has always read) and the publisher OBJECT (slot 7, which
+/// `HttpRequest.bodyPublisher()` hands back). Two slots because they are two
+/// different questions — "what goes on the socket" and "what did the caller
+/// give me" — and the second one had no answer at all before G29-1.
+fn re5_builder_set_publisher(ctx: &mut dyn NativeContext, this: ObjectRef, publisher: Value) {
+    match publisher {
+        Value::Object(Some(bp)) => {
+            let body = ctx.get_field(bp, RE5_BP_PAYLOAD);
+            ctx.set_field(this, RE5_REQUEST_BODY, body);
+            ctx.set_field(this, RE5_REQUEST_BODY_PUBLISHER, Value::Object(Some(bp)));
+        }
+        _ => {
+            ctx.set_field(this, RE5_REQUEST_BODY, Value::Object(None));
+            ctx.set_field(this, RE5_REQUEST_BODY_PUBLISHER, Value::Object(None));
+        }
+    }
+}
+
+/// Mint a `BodyPublisher` over `payload`, with an optionally DECLARED content
+/// length. `None` means "derive the length from the payload at call time",
+/// which is what `ofString`/`ofByteArray`/`noBody` want.
+pub(crate) fn re5_new_body_publisher(
+    ctx: &mut dyn NativeContext,
+    payload: Value,
+    declared_length: Option<i64>,
+) -> MethodCallResult {
+    // The payload is pinned across the allocation so a moving collector cannot
+    // leave the stored reference stale — the same treatment
+    // `re5_make_http_headers` gives its header array.
+    let payload_pin = match payload {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let body = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/net/http/HttpRequest$BodyPublisher",
+        RE5_BP_NUM_FIELDS,
+    )?;
+    let payload_now = match payload_pin {
+        Some((pin, o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+        None => payload,
+    };
+    ctx.set_field(body, RE5_BP_PAYLOAD, payload_now);
+    ctx.set_field(
+        body,
+        RE5_BP_DECLARED_LENGTH,
+        match declared_length {
+            Some(n) => Value::Long(n),
+            None => Value::Object(None),
+        },
+    );
+    if let Some((pin, _)) = payload_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    Ok(Some(Value::Object(Some(body))))
+}
+
+/// Append one `"name: value"` line to a builder's header array, growing it if
+/// the fixed-size backing array is full.
+///
+/// The array was allocated at a fixed 32 entries and the old `header()` simply
+/// stopped writing when it ran out — the 33rd header vanished with no error at
+/// all. Grow instead: a silently dropped header is exactly the class of defect
+/// this directory exists to remove.
+fn re5_builder_append_header(ctx: &mut dyn NativeContext, this: ObjectRef, line: &str) {
+    // `create_string` and `new_array` allocate, so the builder is read back
+    // through a pin after each of them rather than carried as a bare local.
+    let this_pin = ctx.pin_native_root(this);
+    let line_obj = ctx.create_string(line);
+    let line_pin = ctx.pin_native_root(line_obj);
+    let this = ctx.read_native_pin(this_pin, this);
+    let arr = match ctx.get_field(this, RE5_REQUEST_HEADERS) {
+        Value::Object(Some(a)) => a,
+        _ => {
+            let a = ctx.new_array(ArrayElementType::Reference, 32);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this, RE5_REQUEST_HEADERS, Value::Object(Some(a)));
+            a
+        }
+    };
+    let line_obj = ctx.read_native_pin(line_pin, line_obj);
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        // "Free" is anything that is NOT a live reference, not specifically
+        // `Object(None)`. A reference array's cells are null on a real heap, so
+        // the two agree there — but they do not agree everywhere, and a
+        // free-slot scan that only recognises one spelling of empty walks off
+        // the end of a full array and doubles it on every single append.
+        if !matches!(ctx.get_array_element(arr, i), Value::Object(Some(_))) {
+            ctx.set_array_element(arr, i, Value::Object(Some(line_obj)));
+            ctx.unpin_native_roots(this_pin);
+            return;
+        }
+    }
+    // Full: copy into a doubled array and append there.
+    let arr_pin = ctx.pin_native_root(arr);
+    let grown = ctx.new_array(ArrayElementType::Reference, (len * 2).max(32));
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let line_obj = ctx.read_native_pin(line_pin, line_obj);
+    for i in 0..len {
+        let v = ctx.get_array_element(arr, i);
+        ctx.set_array_element(grown, i, v);
+    }
+    ctx.set_array_element(grown, len, Value::Object(Some(line_obj)));
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, RE5_REQUEST_HEADERS, Value::Object(Some(grown)));
+    ctx.unpin_native_roots(this_pin);
+}
+
+/// `setHeader(name, value)` — drop every existing line whose name matches
+/// case-insensitively, then append. HotSpot, MEASURED:
+/// `header("Accept","a").setHeader("Accept","z")` -> `{Accept=[z]}`.
+fn re5_builder_set_header(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, value: &str) {
+    if let Value::Object(Some(arr)) = ctx.get_field(this, RE5_REQUEST_HEADERS) {
+        let len = ctx.array_length(arr);
+        let mut kept: Vec<Value> = Vec::with_capacity(len);
+        for i in 0..len {
+            let cell = ctx.get_array_element(arr, i);
+            let drop = match cell {
+                Value::Object(Some(s)) => ctx
+                    .read_string(s)
+                    .and_then(|line| line.find(':').map(|c| line[..c].trim().to_string()))
+                    .is_some_and(|k| k.eq_ignore_ascii_case(name)),
+                _ => false,
+            };
+            if !drop {
+                kept.push(cell);
+            }
+        }
+        for (i, v) in kept.iter().enumerate() {
+            ctx.set_array_element(arr, i, *v);
+        }
+        for i in kept.len()..len {
+            ctx.set_array_element(arr, i, Value::Object(None));
+        }
+    }
+    re5_builder_append_header(ctx, this, &format!("{name}: {value}"));
+}
+
+/// The name/value validation `HttpRequest.Builder.header` and `setHeader`
+/// share. MEASURED on HotSpot 25.0.3+9-LTS:
+///
+/// ```text
+/// header(null, "v") -> NullPointerException: name
+/// header("k", null) -> NullPointerException: value
+/// header("",   "v") -> IllegalArgumentException: invalid header name: ""
+/// ```
+fn re5_check_header_pair(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Result<(String, String), MethodCallFailed> {
+    let name = match args.get(1).copied() {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => return Err(npe("name")),
+    };
+    let value = match args.get(2).copied() {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => return Err(npe("value")),
+    };
+    if name.is_empty() {
+        return Err(iae("invalid header name: \"\""));
+    }
+    Ok((name, value))
+}
+
+/// The `name` argument the four `HttpHeaders` readers share.
+/// MEASURED: `firstValue(null)` is a message-less NPE on HotSpot
+/// (`Objects.requireNonNull(name)`), not an empty Optional.
+fn re5_header_name_arg(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Result<String, MethodCallFailed> {
+    match args.get(1).copied() {
+        Some(Value::Object(Some(s))) => Ok(ctx.read_string(s).unwrap_or_default()),
+        _ => Err(npe_no_message()),
+    }
+}
+
+/// The `"key: value"` lines a request carries, grouped case-insensitively in
+/// first-seen order. Shared by `HttpHeaders.map`/`firstValue`/`allValues`/
+/// `firstValueAsLong`/`toString` so the five cannot come to disagree about
+/// what a header name means.
+fn re5_header_groups(ctx: &dyn NativeContext, headers: ObjectRef) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    if let Value::Object(Some(arr)) = ctx.get_field(headers, 0) {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                if let Some(line) = ctx.read_string(s) {
+                    if let Some(c) = line.find(':') {
+                        let k = line[..c].trim().to_string();
+                        let v = line[c + 1..].trim().to_string();
+                        if k.is_empty() {
+                            continue;
+                        }
+                        if let Some(g) = groups
+                            .iter_mut()
+                            .find(|(gk, _)| gk.eq_ignore_ascii_case(&k))
+                        {
+                            g.1.push(v);
+                        } else {
+                            groups.push((k, vec![v]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    groups
+}
 
 fn re5_request_timeout(
     ctx: &mut dyn NativeContext,
@@ -12550,30 +12883,23 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         req,
         "newBuilder",
         "()Ljava/net/http/HttpRequest$Builder;",
-        |ctx, _args| {
-            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
-            let m = ctx.create_string("GET");
-            ctx.set_field(b, 0, Value::Object(Some(m)));
-            ctx.set_field(b, 1, Value::Object(None));
-            ctx.set_field(b, 2, Value::Object(None));
-            ctx.set_field(b, 3, Value::Object(None));
-            Ok(Some(Value::Object(Some(b))))
-        },
+        |ctx, _args| re5_new_request_builder(ctx, None),
     );
     r.register(
         req,
         "newBuilder",
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
-            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
-            let m = ctx.create_string("GET");
-            ctx.set_field(b, 0, Value::Object(Some(m)));
-            let uri = obj_arg(args, 0)?;
-            let uri_s = re5_uri_string(ctx, uri);
-            ctx.set_field(b, 1, Value::Object(Some(uri_s)));
-            ctx.set_field(b, 2, Value::Object(None));
-            ctx.set_field(b, 3, Value::Object(None));
-            Ok(Some(Value::Object(Some(b))))
+            // MEASURED on HotSpot 25.0.3+9-LTS:
+            //   HttpRequest.newBuilder((URI) null)
+            //     -> NullPointerException: uri must be non-null
+            // `obj_arg` would raise an NPE too, but with the generic
+            // "null object argument" text that no differential can match.
+            let uri = match args.first().copied() {
+                Some(Value::Object(Some(u))) => u,
+                _ => return Err(npe("uri must be non-null")),
+            };
+            re5_new_request_builder(ctx, Some(uri))
         },
     );
     r.register(req, "timeout", "()Ljava/util/Optional;", |ctx, args| {
@@ -12607,14 +12933,14 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     // own logging/retry bookkeeping after building the request).
     r.register(req, "method", "()Ljava/lang/String;", |ctx, args| {
         let request = obj_arg(args, 0)?;
-        match ctx.get_field(request, 0) {
+        match ctx.get_field(request, RE5_REQUEST_METHOD) {
             m @ Value::Object(Some(_)) => Ok(Some(m)),
             _ => Ok(Some(Value::Object(Some(ctx.create_string("GET"))))),
         }
     });
     r.register(req, "uri", "()Ljava/net/URI;", |ctx, args| {
         let request = obj_arg(args, 0)?;
-        let uri_str = match ctx.get_field(request, 1) {
+        let uri_str = match ctx.get_field(request, RE5_REQUEST_URI) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
@@ -12626,6 +12952,69 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             &[Value::Object(Some(uri_string_obj))],
         )
     });
+    // G29-1. THE OTHER FOUR. `java.net.http.HttpRequest` declares seven
+    // abstract instance methods; `method`/`uri`/`timeout` above had natives and
+    // `version`/`bodyPublisher`/`expectContinue`/`headers` did not, so a request
+    // this VM had just minted answered four of its own seven accessors with
+    // `AbstractMethodError: ... has no Code attribute` (MEASURED, RJdkOptionalShape
+    // and G29-1's `HttpProbe` on every builder shape). Nothing about the object
+    // was missing — the builder had recorded the state for all four — the
+    // registrations simply stopped after three. `HttpClient` a few hundred lines
+    // above is the control: 7 of 7, and 7 of 7 measured correct.
+    //
+    // MEASURED on HotSpot 25.0.3+9-LTS for a request built with nothing set:
+    // `version()` and `bodyPublisher()` are `Optional.empty`, `expectContinue()`
+    // is `false`, `headers()` is an empty `HttpHeaders` — never null, and never
+    // an exception.
+    r.register(req, "version", "()Ljava/util/Optional;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let stored = ctx.get_field(request, RE5_REQUEST_VERSION);
+        re5_optional(ctx, stored)
+    });
+    r.register(
+        req,
+        "bodyPublisher",
+        "()Ljava/util/Optional;",
+        |ctx, args| {
+            let request = obj_arg(args, 0)?;
+            let stored = ctx.get_field(request, RE5_REQUEST_BODY_PUBLISHER);
+            re5_optional(ctx, stored)
+        },
+    );
+    // A (Z)-returning accessor: the int encoding is CORRECT here, unlike the
+    // reference-shaped setters. `RJdkOptionalShape.httpmint` calls this out
+    // explicitly as the family's negative control.
+    r.register(req, "expectContinue", "()Z", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let flag = ctx
+            .get_field(request, RE5_REQUEST_EXPECT_CONTINUE)
+            .as_int()
+            .unwrap_or(0);
+        Ok(Some(Value::Int(i32::from(flag != 0))))
+    });
+    r.register(
+        req,
+        "headers",
+        "()Ljava/net/http/HttpHeaders;",
+        |ctx, args| {
+            let request = obj_arg(args, 0)?;
+            let arr = ctx.get_field(request, RE5_REQUEST_HEADERS);
+            let headers = re5_make_http_headers(ctx, arr)?;
+            Ok(Some(Value::Object(Some(headers))))
+        },
+    );
+    // MEASURED: `HttpRequest.newBuilder(u).build().toString()` is
+    // `http://example.com/x GET` — `jdk.internal.net.http.ImmutableHttpRequest`
+    // overrides `toString`. Our object is stamped with the abstract class,
+    // which declares no `toString`, so it inherited `Object`'s
+    // `java.net.http.HttpRequest@1b6d3586`.
+    r.register(req, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let uri = read_field_string_or(ctx, request, RE5_REQUEST_URI, "");
+        let method = read_field_string_or(ctx, request, RE5_REQUEST_METHOD, "GET");
+        let s = ctx.create_string(&format!("{uri} {method}"));
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     let bl = "java/net/http/HttpRequest$Builder";
     r.register(
@@ -12634,12 +13023,23 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let uri = obj_arg(args, 1)?;
+            // MEASURED: HotSpot answers `NullPointerException: uri must be
+            // non-null`, the same text as the static `newBuilder(null)`.
+            let uri = match args.get(1).copied() {
+                Some(Value::Object(Some(u))) => u,
+                _ => return Err(npe("uri must be non-null")),
+            };
             let uri_s = re5_uri_string(ctx, uri);
-            ctx.set_field(this, 1, Value::Object(Some(uri_s)));
+            ctx.set_field(this, RE5_REQUEST_URI, Value::Object(Some(uri_s)));
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // GET()/DELETE() take no publisher, and MEASURED on HotSpot they CLEAR any
+    // publisher a previous POST/PUT put on the builder:
+    // `newBuilder(u).GET().build().bodyPublisher()` is `Optional.empty`, while
+    // `method("GET", BodyPublishers.noBody())` is `present:contentLength=0`.
+    // The two are not the same request, and a builder that only ever adds
+    // would report the first as the second.
     r.register(
         bl,
         "GET",
@@ -12647,7 +13047,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let m = ctx.create_string("GET");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
+            ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+            re5_builder_set_publisher(ctx, this, Value::Object(None));
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -12658,39 +13059,44 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let m = ctx.create_string("DELETE");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
+            ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+            re5_builder_set_publisher(ctx, this, Value::Object(None));
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // HEAD() is a DEFAULT interface method — it has real bytecode, and that
+    // bytecode is `method("HEAD", BodyPublishers.noBody())`, which would leave
+    // the built request reporting `bodyPublisher() == present:0`. MEASURED on
+    // HotSpot, `newBuilder(u).HEAD().build().bodyPublisher()` is **empty**:
+    // `HttpRequestBuilderImpl` overrides the default and passes no publisher at
+    // all, exactly as it does for `GET()`/`DELETE()`. Register it so the
+    // default body cannot run and invent one.
+    r.register(
+        bl,
+        "HEAD",
+        "()Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let m = ctx.create_string("HEAD");
+            ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+            re5_builder_set_publisher(ctx, this, Value::Object(None));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // `register` takes a plain `fn` pointer, so these two cannot be folded into
+    // a loop over the verb name without capturing it — hence one body each,
+    // both delegating to the same helper so they cannot drift.
     r.register(
         bl,
         "POST",
         "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let m = ctx.create_string("POST");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
-            if let Some(Value::Object(Some(bp))) = args.get(1) {
-                let body = ctx.get_field(*bp, 0);
-                ctx.set_field(this, 2, body);
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
+        |ctx, args| re5_builder_verb_with_body(ctx, args, "POST"),
     );
     r.register(
         bl,
         "PUT",
         "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let m = ctx.create_string("PUT");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
-            if let Some(Value::Object(Some(bp))) = args.get(1) {
-                let body = ctx.get_field(*bp, 0);
-                ctx.set_field(this, 2, body);
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
+        |ctx, args| re5_builder_verb_with_body(ctx, args, "PUT"),
     );
     r.register(
         bl,
@@ -12698,57 +13104,166 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let k = value_or_string(ctx, args.get(1).copied().unwrap_or(Value::Object(None)), "");
-            let v = value_or_string(ctx, args.get(2).copied().unwrap_or(Value::Object(None)), "");
-            let line = ctx.create_string(&format!("{k}: {v}"));
-            let arr = match ctx.get_field(this, 3) {
-                Value::Object(Some(a)) => a,
-                _ => {
-                    let a = ctx.new_array(ArrayElementType::Reference, 32);
-                    ctx.set_field(this, 3, Value::Object(Some(a)));
-                    a
-                }
+            let (k, v) = re5_check_header_pair(ctx, args)?;
+            re5_builder_append_header(ctx, this, &format!("{k}: {v}"));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // setHeader(name, value) — REPLACES every existing value for `name`.
+    // Unregistered until G29-1: `HttpRequest$Builder` is an interface and the
+    // builder is minted as an instance of it, so calling this threw
+    // `AbstractMethodError: ... setHeader ... has no Code attribute` (MEASURED).
+    r.register(
+        bl,
+        "setHeader",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (k, v) = re5_check_header_pair(ctx, args)?;
+            re5_builder_set_header(ctx, this, &k, &v);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // headers(String...) — name/value PAIRS, appended like `header`.
+    // MEASURED: an odd count is `IllegalArgumentException: wrong number, 1, of
+    // parameters`; `headers()` with zero arguments is accepted and is a no-op.
+    r.register(
+        bl,
+        "headers",
+        "([Ljava/lang/String;)Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = match args.get(1).copied() {
+                Some(Value::Object(Some(a))) => a,
+                _ => return Err(npe_no_message()),
             };
-            let len = ctx.array_length(arr);
-            for i in 0..len {
-                if let Value::Object(None) = ctx.get_array_element(arr, i) {
-                    ctx.set_array_element(arr, i, Value::Object(Some(line)));
-                    break;
+            let n = ctx.array_length(arr);
+            if n % 2 != 0 {
+                return Err(iae(format!("wrong number, {n}, of parameters")));
+            }
+            let mut pairs: Vec<(String, String)> = Vec::with_capacity(n / 2);
+            let mut i = 0;
+            while i < n {
+                let name = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => return Err(npe_no_message()),
+                };
+                let value = match ctx.get_array_element(arr, i + 1) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => return Err(npe_no_message()),
+                };
+                if name.is_empty() {
+                    return Err(iae("invalid header name: \"\""));
                 }
+                pairs.push((name, value));
+                i += 2;
+            }
+            for (name, value) in pairs {
+                re5_builder_append_header(ctx, this, &format!("{name}: {value}"));
             }
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // copy() — an independent builder carrying the same state. The header
+    // array must be COPIED, not shared: two builders that alias one array are
+    // not two builders.
+    r.register(
+        bl,
+        "copy",
+        "()Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Two allocations happen below (the new builder, then the duplicate
+            // header array), so BOTH the source and the copy have to survive a
+            // collection that runs between them. One pin batch covers both:
+            // `unpin_native_roots(this_pin)` releases everything pinned from
+            // that point on, which is why the early-return path takes it too.
+            let this_pin = ctx.pin_native_root(this);
+            let copy = match re5_new_request_builder(ctx, None)? {
+                Some(Value::Object(Some(c))) => c,
+                other => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(other);
+                }
+            };
+            let copy_pin = ctx.pin_native_root(copy);
+            let src = ctx.read_native_pin(this_pin, this);
+            let copy_now = ctx.read_native_pin(copy_pin, copy);
+            for slot in 0..RE5_REQUEST_NUM_FIELDS {
+                if slot == RE5_REQUEST_HEADERS {
+                    continue;
+                }
+                let v = ctx.get_field(src, slot);
+                ctx.set_field(copy_now, slot, v);
+            }
+            if let Value::Object(Some(arr)) = ctx.get_field(src, RE5_REQUEST_HEADERS) {
+                let len = ctx.array_length(arr);
+                let dup = ctx.new_array(ArrayElementType::Reference, len);
+                let src = ctx.read_native_pin(this_pin, this);
+                let arr = match ctx.get_field(src, RE5_REQUEST_HEADERS) {
+                    Value::Object(Some(a)) => a,
+                    _ => arr,
+                };
+                for i in 0..len {
+                    let v = ctx.get_array_element(arr, i);
+                    ctx.set_array_element(dup, i, v);
+                }
+                let copy_now = ctx.read_native_pin(copy_pin, copy);
+                ctx.set_field(copy_now, RE5_REQUEST_HEADERS, Value::Object(Some(dup)));
+            }
+            let copy_now = ctx.read_native_pin(copy_pin, copy);
+            ctx.unpin_native_roots(this_pin);
+            Ok(Some(Value::Object(Some(copy_now))))
+        },
+    );
     // method(String, BodyPublisher) — the generic verb setter Spring uses for
-    // POST/PUT/PATCH (and any custom verb). Slot 0 = method name, slot 2 = body
-    // (carried only for literal publishers; see `re5_do_request`).
+    // POST/PUT/PATCH (and any custom verb).
     r.register(
         bl,
         "method",
         "(Ljava/lang/String;Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if let Some(m @ Value::Object(Some(_))) = args.get(1).copied() {
-                ctx.set_field(this, 0, m);
+            // MEASURED on HotSpot:
+            //   method(null, p)  -> NullPointerException (null message)
+            //   method("",   p)  -> IllegalArgumentException: illegal method <empty string>
+            //   method("POST", null) -> NullPointerException (null message)
+            // The old body accepted all three: a null name left the previous
+            // verb in place and an empty name was stored verbatim, so a
+            // request could go on the wire with a method nobody chose.
+            let name_obj = match args.get(1).copied() {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => return Err(npe_no_message()),
+            };
+            let name = value_or_string(ctx, name_obj, "");
+            if name.is_empty() {
+                return Err(iae("illegal method <empty string>"));
             }
-            if let Some(Value::Object(Some(bp))) = args.get(2) {
-                let body = ctx.get_field(*bp, 0);
-                ctx.set_field(this, 2, body);
-            }
+            let publisher = match args.get(2).copied() {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => return Err(npe_no_message()),
+            };
+            ctx.set_field(this, RE5_REQUEST_METHOD, name_obj);
+            re5_builder_set_publisher(ctx, this, publisher);
             Ok(Some(Value::Object(Some(this))))
         },
     );
-    // timeout(Duration) / expectContinue(boolean) / version(Version) — accepted
-    // and chained, but not separately modelled (request timeout is enforced by
-    // the caller; the bare client speaks HTTP/1.1). Returning `this` keeps the
-    // fluent builder chain intact instead of throwing AbstractMethodError.
     r.register(
         bl,
         "timeout",
         "(Ljava/time/Duration;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let timeout = obj_arg(args, 1)?;
+            // MEASURED: `timeout(null)` is a message-less NPE, and a
+            // non-positive duration is
+            // `IllegalArgumentException: Invalid duration: PT-1S` — the
+            // Duration's own `toString`. The message this raised until G29-1
+            // ("HttpRequest timeout must be positive") was the right refusal
+            // with the wrong words, which a differential vector compares.
+            let timeout = match args.get(1).copied() {
+                Some(Value::Object(Some(d))) => d,
+                _ => return Err(npe_no_message()),
+            };
             let is_zero = matches!(
                 ctx.invoke_virtual(timeout, "isZero", "()Z", &[])?,
                 Some(Value::Int(value)) if value != 0
@@ -12758,7 +13273,12 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(value)) if value != 0
             );
             if is_zero || is_negative {
-                return Err(iae("HttpRequest timeout must be positive"));
+                let text =
+                    match ctx.invoke_virtual(timeout, "toString", "()Ljava/lang/String;", &[])? {
+                        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                return Err(iae(format!("Invalid duration: {text}")));
             }
             ctx.set_field(
                 this,
@@ -12768,23 +13288,75 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // expectContinue(boolean) / version(Version) — both were `Ok(Some(args[0]))`
+    // until G29-1: they returned the builder for the fluent chain and DISCARDED
+    // the argument, so the two matching accessors on the built request had
+    // nothing to read even once they existed. (This is the second half of the
+    // same defect: `HttpRequest.version()` had no native AND no state.)
     r.register(
         bl,
         "expectContinue",
         "(Z)Ljava/net/http/HttpRequest$Builder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let flag = args.get(1).copied().and_then(|v| v.as_int()).unwrap_or(0);
+            ctx.set_field(
+                this,
+                RE5_REQUEST_EXPECT_CONTINUE,
+                Value::Int(i32::from(flag != 0)),
+            );
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
     r.register(
         bl,
         "version",
         "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpRequest$Builder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // MEASURED: `version(null)` is a message-less NPE on HotSpot.
+            let version = match args.get(1).copied() {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => return Err(npe_no_message()),
+            };
+            ctx.set_field(this, RE5_REQUEST_VERSION, version);
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
 
     r.register(bl, "build", "()Ljava/net/http/HttpRequest;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let req = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 5)?;
-        for i in 0..5 {
+        // MEASURED on HotSpot, in this order:
+        //   newBuilder().build()                    -> IllegalStateException: uri is null
+        //   newBuilder(URI.create("/relative"))     -> IllegalArgumentException: URI with undefined scheme
+        //   newBuilder(URI.create("ftp://h/x"))     -> IllegalArgumentException: invalid URI scheme ftp
+        // The refusals live on `build()` and not on `uri()` because that is
+        // where HotSpot puts them: `newBuilder(URI.create("ftp://..."))` alone
+        // does not throw.
+        let uri_text = read_field_string(ctx, this, RE5_REQUEST_URI);
+        match uri_text.as_deref() {
+            None => return Err(ise("uri is null")),
+            Some(text) => match text.find(':') {
+                None => return Err(iae("URI with undefined scheme")),
+                Some(colon) => {
+                    let scheme = text[..colon].to_ascii_lowercase();
+                    if scheme != "http" && scheme != "https" {
+                        return Err(iae(format!("invalid URI scheme {scheme}")));
+                    }
+                }
+            },
+        }
+        let req = try_alloc_concurrent_synthetic(
+            ctx,
+            "java/net/http/HttpRequest",
+            RE5_REQUEST_NUM_FIELDS,
+        )?;
+        // Slot-for-slot, over the WHOLE range. This loop read `0..5` while the
+        // builder carried five slots; every slot added after that would have
+        // been silently dropped at `build()` — which is how `expectContinue`
+        // and `version` could round-trip on the builder and vanish on the
+        // request. `RE5_REQUEST_NUM_FIELDS` is the single name both ends use.
+        for i in 0..RE5_REQUEST_NUM_FIELDS {
             let v = ctx.get_field(this, i);
             ctx.set_field(req, i, v);
         }
@@ -12797,14 +13369,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
-            ctx.set_field(
-                body,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            Ok(Some(Value::Object(Some(body))))
+            let payload = args.first().copied().unwrap_or(Value::Object(None));
+            re5_new_body_publisher(ctx, payload, None)
         },
     );
     r.register(
@@ -12812,11 +13378,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "noBody",
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             let empty = ctx.create_string("");
-            ctx.set_field(body, 0, Value::Object(Some(empty)));
-            Ok(Some(Value::Object(Some(body))))
+            re5_new_body_publisher(ctx, Value::Object(Some(empty)), None)
         },
     );
     r.register(
@@ -12824,41 +13387,64 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofByteArray",
         "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             // Keep the original byte[] rather than round-tripping it through a
             // Java String.  Request builders copy this literal value into their
             // request body slot, and `re5_request_body_bytes` already knows how
             // to materialise byte[] verbatim.  String::from_utf8_lossy changed
             // every non-UTF-8 octet into U+FFFD, corrupting compressed Zipkin
             // payloads (notably gzip's 0x8b and 0xff bytes) on the wire.
-            ctx.set_field(
-                body,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            Ok(Some(Value::Object(Some(body))))
+            let payload = args.first().copied().unwrap_or(Value::Object(None));
+            re5_new_body_publisher(ctx, payload, None)
         },
     );
     // fromPublisher(Flow.Publisher[, contentLength]) — Spring's streaming
     // POST/PUT path. Keep the publisher object in slot 0; `re5_do_request`
     // subscribes a native collector, requests demand, and assembles the emitted
-    // ByteBuffers into the wire body before opening the socket.
+    // ByteBuffers into the wire body before opening the socket. The one-arg
+    // overload has NO length until then, which is exactly what a declared
+    // length of -1 means; the two-arg overload carries the caller's.
     for desc in [
         "(Ljava/util/concurrent/Flow$Publisher;)Ljava/net/http/HttpRequest$BodyPublisher;",
         "(Ljava/util/concurrent/Flow$Publisher;J)Ljava/net/http/HttpRequest$BodyPublisher;",
     ] {
         r.register(bps, "fromPublisher", desc, |ctx, args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
-            ctx.set_field(
-                body,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            Ok(Some(Value::Object(Some(body))))
+            let payload = args.first().copied().unwrap_or(Value::Object(None));
+            let declared = match args.get(1).copied() {
+                Some(Value::Long(n)) => Some(n),
+                Some(Value::Int(n)) => Some(i64::from(n)),
+                _ => Some(-1),
+            };
+            re5_new_body_publisher(ctx, payload, declared)
         });
     }
+    // G29-1. `HttpRequest$BodyPublisher` is an INTERFACE declaring exactly one
+    // method, `contentLength()J`, and it had no native at all — the same 0-of-1
+    // ratio `PathMatcher.matches` had. Every publisher the five factories above
+    // mint is stamped with that interface, so
+    // `BodyPublishers.ofString("hi").contentLength()` threw
+    // `AbstractMethodError: ... has no Code attribute` (MEASURED), and
+    // `RJdkOptionalShape.httpmint` asks for it twice.
+    //
+    // MEASURED on HotSpot 25.0.3+9-LTS:
+    //   noBody()                  -> 0
+    //   ofString("hello")         -> 5   (UTF-8 bytes, not chars)
+    //   ofByteArray(new byte[5])  -> 5
+    //   fromPublisher(p)          -> -1
+    //   fromPublisher(p, 12)      -> 12
+    r.register(
+        "java/net/http/HttpRequest$BodyPublisher",
+        "contentLength",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Long(declared) = ctx.get_field(this, RE5_BP_DECLARED_LENGTH) {
+                return Ok(Some(Value::Long(declared)));
+            }
+            let payload = ctx.get_field(this, RE5_BP_PAYLOAD);
+            let bytes = re5_request_body_bytes(ctx, payload)?;
+            Ok(Some(Value::Long(bytes.len() as i64)))
+        },
+    );
 
     let bhs = "java/net/http/HttpResponse$BodyHandlers";
     r.register(
@@ -13016,32 +13602,22 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     let hh = "java/net/http/HttpHeaders";
     r.register(hh, "map", "()Ljava/util/Map;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Parse the stored "key: value" lines into insertion-ordered groups.
-        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let n = ctx.array_length(arr);
-            for i in 0..n {
-                if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
-                    if let Some(line) = ctx.read_string(s) {
-                        if let Some(c) = line.find(':') {
-                            let k = line[..c].trim().to_string();
-                            let v = line[c + 1..].trim().to_string();
-                            if k.is_empty() {
-                                continue;
-                            }
-                            if let Some(g) = groups
-                                .iter_mut()
-                                .find(|(gk, _)| gk.eq_ignore_ascii_case(&k))
-                            {
-                                g.1.push(v);
-                            } else {
-                                groups.push((k, vec![v]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Grouping is shared with `firstValue`/`allValues`/`firstValueAsLong`/
+        // `toString` (`re5_header_groups`) so the five cannot come to disagree
+        // about what a header name means. It was open-coded here.
+        //
+        // MEASURED on HotSpot 25.0.3+9-LTS: the map a real `HttpHeaders`
+        // returns is sorted CASE-INSENSITIVELY by name, not kept in first-seen
+        // order — `header("Z-Last",…).header("a-mid",…).header("A-First",…)`
+        // gives `{A-First=[3], a-mid=[2], Z-Last=[1]}`. (The real backing
+        // store is a `TreeMap<>(String.CASE_INSENSITIVE_ORDER)` made
+        // unmodifiable.) Values WITHIN one name stay in insertion order.
+        let mut groups = re5_header_groups(ctx, this);
+        groups.sort_by(|a, b| {
+            a.0.to_ascii_lowercase()
+                .cmp(&b.0.to_ascii_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let map_val = ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])?;
         let map = match map_val {
             Some(Value::Object(Some(m))) => m,
@@ -13080,6 +13656,141 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         let map_now = ctx.read_native_pin(map_pin, map);
         ctx.unpin_native_roots(map_pin);
         Ok(Some(Value::Object(Some(map_now))))
+    });
+    // G29-1. `headers()` is one of the four accessors that had no native, so
+    // until now nothing could reach an `HttpHeaders` from a REQUEST at all and
+    // `map()` was the only method this class carried. `java.net.http.HttpHeaders`
+    // declares four public readers; the other three were reachable only from a
+    // response and answered by real JDK bytecode reading slot 0 as the `Map` it
+    // declares — but slot 0 holds a `String[]` of "key: value" lines. Register
+    // all four against the shape this VM actually mints.
+    //
+    // MEASURED on HotSpot 25.0.3+9-LTS, headers {Accept: text/plain,
+    // Accept: text/html, X-Num: 42}:
+    //   firstValue("Accept")     -> Optional[text/plain]
+    //   firstValue("accept")     -> Optional[text/plain]   (case-insensitive)
+    //   firstValue("Nope")       -> Optional.empty
+    //   allValues("Accept")      -> [text/plain, text/html]
+    //   allValues("Nope")        -> []                     (empty list, not null)
+    //   firstValueAsLong("X-Num")-> OptionalLong[42]
+    //   firstValueAsLong("Nope") -> OptionalLong.empty
+    //   firstValueAsLong("Accept") -> NumberFormatException: For input string: "text/plain"
+    //   firstValue(null)         -> NullPointerException (null message)
+    r.register(
+        hh,
+        "firstValue",
+        "(Ljava/lang/String;)Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = re5_header_name_arg(ctx, args)?;
+            let first = re5_header_groups(ctx, this)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .and_then(|(_, v)| v.into_iter().next());
+            match first {
+                Some(v) => {
+                    let s = ctx.create_string(&v);
+                    ctx.invoke(
+                        "java/util/Optional",
+                        "of",
+                        "(Ljava/lang/Object;)Ljava/util/Optional;",
+                        &[Value::Object(Some(s))],
+                    )
+                }
+                None => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+            }
+        },
+    );
+    r.register(
+        hh,
+        "allValues",
+        "(Ljava/lang/String;)Ljava/util/List;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = re5_header_name_arg(ctx, args)?;
+            let values = re5_header_groups(ctx, this)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            let list_val = ctx.new_object_initialized("java/util/ArrayList", "()V", &[])?;
+            let list = match list_val {
+                Some(Value::Object(Some(l))) => l,
+                _ => return Ok(list_val),
+            };
+            let list_pin = ctx.pin_native_root(list);
+            for v in values {
+                let vs = ctx.create_string(&v);
+                let list_now = ctx.read_native_pin(list_pin, list);
+                ctx.invoke_virtual(
+                    list_now,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(vs))],
+                )?;
+            }
+            let list_now = ctx.read_native_pin(list_pin, list);
+            ctx.unpin_native_roots(list_pin);
+            Ok(Some(Value::Object(Some(list_now))))
+        },
+    );
+    r.register(
+        hh,
+        "firstValueAsLong",
+        "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = re5_header_name_arg(ctx, args)?;
+            let first = re5_header_groups(ctx, this)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .and_then(|(_, v)| v.into_iter().next());
+            match first {
+                None => ctx.invoke(
+                    "java/util/OptionalLong",
+                    "empty",
+                    "()Ljava/util/OptionalLong;",
+                    &[],
+                ),
+                // A header that is present but not a number is an ERROR, not
+                // an empty Optional: HotSpot lets `Long.parseLong`'s
+                // NumberFormatException out, message included. Answering
+                // `empty` here would make an unparsable Content-Length look
+                // like an absent one.
+                Some(text) => match text.trim().parse::<i64>() {
+                    Ok(n) => ctx.invoke(
+                        "java/util/OptionalLong",
+                        "of",
+                        "(J)Ljava/util/OptionalLong;",
+                        &[Value::Long(n)],
+                    ),
+                    Err(_) => Err(RuntimeError::NumberFormatException {
+                        message: format!("For input string: \"{text}\""),
+                    }
+                    .into()),
+                },
+            }
+        },
+    );
+    // MEASURED: `java.net.http.HttpHeaders@361e4cfc { {A-First=[3], …} }` —
+    // the Object-style identity prefix, then the map in braces.
+    r.register(hh, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mut groups = re5_header_groups(ctx, this);
+        groups.sort_by(|a, b| {
+            a.0.to_ascii_lowercase()
+                .cmp(&b.0.to_ascii_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let body = groups
+            .iter()
+            .map(|(k, v)| format!("{k}=[{}]", v.join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hash = ctx.identity_hash_code(this);
+        let text = format!("java.net.http.HttpHeaders@{hash:x} {{ {{{body}}} }}");
+        let s = ctx.create_string(&text);
+        Ok(Some(Value::Object(Some(s))))
     });
     ()
 }
@@ -20057,5 +20768,375 @@ mod tests {
                 "missing {class}.getExecutor bridge"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // G29-1 — the fabricated HttpRequest and its missing accessors.
+    //
+    // `HttpRequest$Builder.build()` mints an object stamped with the ABSTRACT
+    // class `java/net/http/HttpRequest`, so the receiver's runtime class IS the
+    // class every accessor resolves against and a missing registration is an
+    // `AbstractMethodError`, not a fallback. These tests pin the surface (every
+    // declared method has a row) and the slot map that surface reads.
+    // -----------------------------------------------------------------------
+
+    /// The seven instance accessors `java.net.http.HttpRequest` declares
+    /// (`javap -p`, JDK 25.0.3+9-LTS). Four of the seven had no row until
+    /// G29-1, and each of those four threw `AbstractMethodError` (MEASURED).
+    #[test]
+    fn http_request_registers_all_seven_declared_accessors() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        for (name, descriptor) in [
+            ("method", "()Ljava/lang/String;"),
+            ("uri", "()Ljava/net/URI;"),
+            ("timeout", "()Ljava/util/Optional;"),
+            ("version", "()Ljava/util/Optional;"),
+            ("bodyPublisher", "()Ljava/util/Optional;"),
+            ("expectContinue", "()Z"),
+            ("headers", "()Ljava/net/http/HttpHeaders;"),
+        ] {
+            assert!(
+                registry
+                    .find("java/net/http/HttpRequest", name, descriptor)
+                    .is_some(),
+                "java/net/http/HttpRequest.{name}{descriptor} has no native — it is \
+                 ABSTRACT and the receiver IS this class, so the call throws \
+                 AbstractMethodError"
+            );
+        }
+    }
+
+    /// `HttpRequest$Builder` is an INTERFACE and the builder object is stamped
+    /// with it, so the same rule covers every method it declares. `HEAD()` is a
+    /// default method with real bytecode and is registered anyway — MEASURED,
+    /// that bytecode leaves `bodyPublisher()` present where HotSpot answers
+    /// empty.
+    #[test]
+    fn http_request_builder_registers_its_whole_declared_surface() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        let b = "Ljava/net/http/HttpRequest$Builder;";
+        let publisher = "Ljava/net/http/HttpRequest$BodyPublisher;";
+        for (name, descriptor) in [
+            ("uri", format!("(Ljava/net/URI;){b}")),
+            ("expectContinue", format!("(Z){b}")),
+            (
+                "version",
+                format!("(Ljava/net/http/HttpClient$Version;){b}"),
+            ),
+            (
+                "header",
+                format!("(Ljava/lang/String;Ljava/lang/String;){b}"),
+            ),
+            ("headers", format!("([Ljava/lang/String;){b}")),
+            ("timeout", format!("(Ljava/time/Duration;){b}")),
+            (
+                "setHeader",
+                format!("(Ljava/lang/String;Ljava/lang/String;){b}"),
+            ),
+            ("GET", format!("(){b}")),
+            ("HEAD", format!("(){b}")),
+            ("POST", format!("({publisher}){b}")),
+            ("PUT", format!("({publisher}){b}")),
+            ("DELETE", format!("(){b}")),
+            ("method", format!("(Ljava/lang/String;{publisher}){b}")),
+            ("build", "()Ljava/net/http/HttpRequest;".to_string()),
+            ("copy", format!("(){b}")),
+        ] {
+            assert!(
+                registry
+                    .find("java/net/http/HttpRequest$Builder", name, &descriptor)
+                    .is_some(),
+                "java/net/http/HttpRequest$Builder.{name}{descriptor} has no native"
+            );
+        }
+    }
+
+    /// `BodyPublisher` declares exactly one method and had ZERO registrations —
+    /// the same 0-of-1 ratio `PathMatcher.matches` had. `HttpHeaders` declares
+    /// four public readers and carried only `map`.
+    #[test]
+    fn body_publisher_and_http_headers_readers_are_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        assert!(
+            registry
+                .find(
+                    "java/net/http/HttpRequest$BodyPublisher",
+                    "contentLength",
+                    "()J"
+                )
+                .is_some(),
+            "BodyPublisher.contentLength()J has no native"
+        );
+        for (name, descriptor) in [
+            ("map", "()Ljava/util/Map;"),
+            ("firstValue", "(Ljava/lang/String;)Ljava/util/Optional;"),
+            ("allValues", "(Ljava/lang/String;)Ljava/util/List;"),
+            (
+                "firstValueAsLong",
+                "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+            ),
+            ("toString", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                registry
+                    .find("java/net/http/HttpHeaders", name, descriptor)
+                    .is_some(),
+                "java/net/http/HttpHeaders.{name}{descriptor} has no native"
+            );
+        }
+    }
+
+    /// `build()` copies `0..RE5_REQUEST_NUM_FIELDS` slot-for-slot. It copied
+    /// `0..5` against a five-slot builder; the moment a slot was added past the
+    /// fifth, the copy would drop it and the accessor reading it would answer
+    /// the allocator's zero. Pin the map so the two ends cannot drift.
+    #[test]
+    fn request_slot_map_is_dense_distinct_and_bounded() {
+        let slots = [
+            RE5_REQUEST_METHOD,
+            RE5_REQUEST_URI,
+            RE5_REQUEST_BODY,
+            RE5_REQUEST_HEADERS,
+            RE5_REQUEST_TIMEOUT_FIELD,
+            RE5_REQUEST_EXPECT_CONTINUE,
+            RE5_REQUEST_VERSION,
+            RE5_REQUEST_BODY_PUBLISHER,
+        ];
+        let mut sorted = slots.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            slots.len(),
+            "two request slots share an index — one accessor is reading another's state"
+        );
+        assert_eq!(sorted, (0..RE5_REQUEST_NUM_FIELDS).collect::<Vec<_>>());
+        assert_eq!(RE5_BP_NUM_FIELDS, 2);
+        assert!(RE5_BP_PAYLOAD < RE5_BP_DECLARED_LENGTH);
+    }
+
+    /// `re5_new_request_builder` must initialise EVERY slot, not a prefix:
+    /// `build()` copies the whole range, so an uninitialised tail becomes the
+    /// built request's state.
+    #[test]
+    fn a_fresh_builder_initialises_every_slot_it_declares() {
+        let mut ctx = MockNativeContext::new();
+        let b = match re5_new_request_builder(&mut ctx, None).unwrap() {
+            Some(Value::Object(Some(b))) => b,
+            other => panic!("expected a builder object, got {other:?}"),
+        };
+        let method = match ctx.get_field(b, RE5_REQUEST_METHOD) {
+            Value::Object(Some(s)) => s,
+            other => panic!("method slot is not a String: {other:?}"),
+        };
+        assert_eq!(ctx.read_string(method), Some("GET".to_string()));
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_URI), Value::Object(None));
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_BODY), Value::Object(None));
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_HEADERS), Value::Object(None));
+        assert_eq!(
+            ctx.get_field(b, RE5_REQUEST_TIMEOUT_FIELD),
+            Value::Object(None)
+        );
+        assert_eq!(
+            ctx.get_field(b, RE5_REQUEST_EXPECT_CONTINUE),
+            Value::Int(0),
+            "expectContinue defaults to false on HotSpot (MEASURED)"
+        );
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_VERSION), Value::Object(None));
+        assert_eq!(
+            ctx.get_field(b, RE5_REQUEST_BODY_PUBLISHER),
+            Value::Object(None)
+        );
+    }
+
+    /// MEASURED on HotSpot: two `header("Accept", …)` calls group into one name
+    /// with two values in insertion order, and a differently-cased name joins
+    /// the same group.
+    #[test]
+    fn header_lines_group_case_insensitively_in_first_seen_order() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), 1);
+        let arr = ctx.new_array(ArrayElementType::Reference, 4);
+        for (i, line) in ["Accept: a", "X-Foo: b", "accept: c"].iter().enumerate() {
+            let s = ctx.create_string(line);
+            ctx.set_array_element(arr, i, Value::Object(Some(s)));
+        }
+        ctx.set_field(holder, 0, Value::Object(Some(arr)));
+        let groups = re5_header_groups(&ctx, holder);
+        assert_eq!(
+            groups,
+            vec![
+                ("Accept".to_string(), vec!["a".to_string(), "c".to_string()]),
+                ("X-Foo".to_string(), vec!["b".to_string()]),
+            ]
+        );
+    }
+
+    /// The header array was a fixed 32 entries and `header()` stopped writing
+    /// when it filled up. MEASURED on HotSpot, a request with 40 headers reports
+    /// `map().size() == 40`, so the 33rd was being dropped in silence.
+    #[test]
+    fn appending_past_the_initial_capacity_grows_instead_of_dropping() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), RE5_REQUEST_NUM_FIELDS);
+        ctx.set_field(holder, RE5_REQUEST_HEADERS, Value::Object(None));
+        for i in 0..40 {
+            re5_builder_append_header(&mut ctx, holder, &format!("H{i}: v{i}"));
+        }
+        let groups = re5_header_groups(&ctx, holder);
+        assert_eq!(
+            groups.len(),
+            40,
+            "a header past the 32nd was dropped without a word"
+        );
+        assert_eq!(groups[39].0, "H39");
+        assert_eq!(groups[39].1, vec!["v39".to_string()]);
+    }
+
+    /// MEASURED: `header("Accept","a").setHeader("Accept","z")` leaves
+    /// `{Accept=[z]}` — `setHeader` REPLACES, and must not disturb other names.
+    #[test]
+    fn set_header_replaces_every_value_for_that_name_only() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), RE5_REQUEST_NUM_FIELDS);
+        ctx.set_field(holder, RE5_REQUEST_HEADERS, Value::Object(None));
+        re5_builder_append_header(&mut ctx, holder, "Accept: a");
+        re5_builder_append_header(&mut ctx, holder, "X-Foo: keep");
+        re5_builder_append_header(&mut ctx, holder, "accept: b");
+        re5_builder_set_header(&mut ctx, holder, "Accept", "z");
+        let groups = re5_header_groups(&ctx, holder);
+        assert_eq!(
+            groups,
+            vec![
+                ("X-Foo".to_string(), vec!["keep".to_string()]),
+                ("Accept".to_string(), vec!["z".to_string()]),
+            ]
+        );
+    }
+
+    /// A publisher minted with a DECLARED length answers it verbatim, including
+    /// the `-1` that `fromPublisher(p)` means by "unknown until subscribed".
+    /// Deriving it from the payload instead would subscribe a Flow.Publisher
+    /// inside a `contentLength()` call — a side effect in a getter.
+    #[test]
+    fn a_declared_publisher_length_is_stored_verbatim() {
+        let mut ctx = MockNativeContext::new();
+        let unknown = match re5_new_body_publisher(&mut ctx, Value::Object(None), Some(-1)).unwrap()
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a publisher, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(unknown, RE5_BP_DECLARED_LENGTH),
+            Value::Long(-1)
+        );
+        let derived = match re5_new_body_publisher(&mut ctx, Value::Object(None), None).unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a publisher, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(derived, RE5_BP_DECLARED_LENGTH),
+            Value::Object(None),
+            "no declared length must stay absent so contentLength() derives it"
+        );
+    }
+
+    /// `GET()`/`DELETE()`/`HEAD()` clear the publisher; the verb setters set
+    /// both the wire payload and the publisher object. MEASURED: a builder that
+    /// only ever ADDS reports `newBuilder(u).POST(p).GET().build()
+    /// .bodyPublisher()` as present, where HotSpot answers empty.
+    #[test]
+    fn clearing_the_publisher_clears_both_slots_it_owns() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), RE5_REQUEST_NUM_FIELDS);
+        let publisher =
+            match re5_new_body_publisher(&mut ctx, Value::Object(None), Some(7)).unwrap() {
+                Some(Value::Object(Some(o))) => o,
+                other => panic!("expected a publisher, got {other:?}"),
+            };
+        let payload = ctx.create_string("hi");
+        ctx.set_field(publisher, RE5_BP_PAYLOAD, Value::Object(Some(payload)));
+        re5_builder_set_publisher(&mut ctx, holder, Value::Object(Some(publisher)));
+        assert_eq!(
+            ctx.get_field(holder, RE5_REQUEST_BODY_PUBLISHER),
+            Value::Object(Some(publisher))
+        );
+        assert_eq!(
+            ctx.get_field(holder, RE5_REQUEST_BODY),
+            Value::Object(Some(payload))
+        );
+        re5_builder_set_publisher(&mut ctx, holder, Value::Object(None));
+        assert_eq!(
+            ctx.get_field(holder, RE5_REQUEST_BODY_PUBLISHER),
+            Value::Object(None)
+        );
+        assert_eq!(ctx.get_field(holder, RE5_REQUEST_BODY), Value::Object(None));
+    }
+
+    /// The refusals, MEASURED on HotSpot 25.0.3+9-LTS. `header(null, v)` and
+    /// `header(k, null)` carry DIFFERENT messages, and both differ from the
+    /// message-less NPE the publisher/version/timeout setters raise. The
+    /// difference is observable from Java, so it is modelled, not approximated.
+    #[test]
+    fn header_pair_refusals_carry_the_measured_messages() {
+        let mut ctx = MockNativeContext::new();
+        let name = ctx.create_string("k");
+        let value = ctx.create_string("v");
+        let empty = ctx.create_string("");
+        let ok = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(Some(value)),
+            ],
+        );
+        assert_eq!(ok.ok(), Some(("k".to_string(), "v".to_string())));
+
+        let null_name = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(Some(value)),
+            ],
+        );
+        let text = format!("{:?}", null_name.err().unwrap());
+        assert!(
+            text.contains("name"),
+            "header(null, v) must be NullPointerException: name — got {text}"
+        );
+
+        let null_value = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(None),
+            ],
+        );
+        let text = format!("{:?}", null_value.err().unwrap());
+        assert!(
+            text.contains("value"),
+            "header(k, null) must be NullPointerException: value — got {text}"
+        );
+
+        let empty_name = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(empty)),
+                Value::Object(Some(value)),
+            ],
+        );
+        let text = format!("{:?}", empty_name.err().unwrap());
+        assert!(
+            text.contains("invalid header name"),
+            "header(\"\", v) must be IllegalArgumentException: invalid header \
+             name — got {text}"
+        );
     }
 }
