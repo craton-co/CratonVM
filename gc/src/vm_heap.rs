@@ -2799,9 +2799,33 @@ impl VmHeap {
     /// to consult.
     /// H2-CID0 — see [`GenerationalHeap::live_holders_of`]. Empty for every
     /// non-generational backend.
+    /// ZGC's relocation ledger: what the slide moved AWAY from `addr`, as
+    /// `(from, moved_to, class_id, size, still_live_at_target)`.
+    ///
+    /// `None` on every other backend, and `None` on ZGC unless
+    /// `CRATONVM_DBG_ZGC_CORPSE` armed the run -- the ledger costs a map insert
+    /// per relocated object and a cycle relocates hundreds of thousands, so it
+    /// cannot be flag-free. It is asked anyway because it is the one thing that
+    /// separates "the holder was never rewritten when its referent moved" from
+    /// "the object died later": `still_live_at_target` answers exactly that.
+    pub fn zgc_corpse_lookup(&self, addr: usize) -> Option<(usize, usize, u32, usize, bool)> {
+        match self {
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.corpse_lookup(addr),
+            _ => {
+                let _ = addr;
+                None
+            }
+        }
+    }
+
     pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
         match self {
             VmHeap::Generational(h) => h.live_holders_of(addr, cap),
+            // See `ZgcRealHeap::live_holders_of`: the slot ordinal it reports
+            // is the object's own reference-slot ordinal, not a field index.
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.live_holders_of(addr, cap),
             _ => Vec::new(),
         }
     }
@@ -2810,8 +2834,16 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.reclaimed_hole_at(addr),
             VmHeap::G1(_) => None,
+            // ZGC answers this now (2026-08-17). The arm said `None` on the
+            // grounds that "their liveness is region/registry based and
+            // `is_addr_live` already answers exactly, so there is no free-list
+            // view to consult" -- true of G1, but ZGC's sweep zeroes each dead
+            // object and returns its span to an arena free list, which is
+            // precisely the view this predicate wants. While it answered
+            // `None`, the DEFAULT collector reported nothing at all for a
+            // reclaimed receiver.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => None,
+            VmHeap::Zgc(h) => h.reclaimed_hole_at(addr),
         }
     }
 
