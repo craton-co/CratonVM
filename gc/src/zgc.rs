@@ -2814,6 +2814,15 @@ pub struct ZgcRealHeap {
     /// mis-fires in whichever direction the omission points. Carried forward
     /// instead of recomputed, which is the whole point.
     gen_old_live_bytes: AtomicUsize,
+    /// Survivors a relocating cycle promoted by moving them below the nursery
+    /// floor, cumulative.
+    ///
+    /// The engagement counter for G2's promotion: a run with `compaction_cycles`
+    /// greater than zero and this at zero is one where the slide ran and the
+    /// nursery was not re-established behind it, which is the state before
+    /// 2026-08-17 (the floor was dropped and the next cycle forced to be a
+    /// major).
+    gen_promotions_by_slide: AtomicUsize,
     /// Registered objects a young cycle's sweep did NOT visit, cumulative.
     ///
     /// The engagement counter for the nursery floor, and it exists because the
@@ -3201,7 +3210,7 @@ impl ZgcRealHeap {
         // and `alloc_raw` is the single allocation chokepoint.
         let arena_base = arena.base_ptr() as usize;
         let arena_end = arena_base.saturating_add(arena.capacity());
-        Self {
+        let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(
                 cratonvm_types::FIRST_LAYOUT_DOMAIN,
             ),
@@ -3268,10 +3277,15 @@ impl ZgcRealHeap {
             remembered: remembered::ZRememberedSetTable::new(),
             old_page_ids: Mutex::new(Vec::new()),
             relocation_enabled: AtomicBool::new(Self::relocation_requested_by_default()),
+            // NOTE: the arena's `prefer_bump` is seeded to match at the end of
+            // `with_capacity` -- it cannot be set here because the arena is being
+            // moved into this literal. `set_generational_enabled` keeps the two in
+            // step from then on.
             generational_enabled: AtomicBool::new(zgc_generational_enabled()),
             gen_promotion_age: std::sync::atomic::AtomicU32::new(zgc_gen_promotion_age()),
             gen_minors_per_major: AtomicUsize::new(zgc_gen_minors_per_major()),
             gen_force_major_next: AtomicBool::new(false),
+            gen_promotions_by_slide: AtomicUsize::new(0),
             gen_sweep_skipped: AtomicUsize::new(0),
             gen_young_floor: AtomicUsize::new(0),
             gen_old_live_bytes: AtomicUsize::new(0),
@@ -3302,7 +3316,15 @@ impl ZgcRealHeap {
             // grepping `ZgcRealHeap {` across the workspace.
             tlabs: ZArenaTlabRegistry::for_capacity(cap),
             tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
+        };
+        // G2c: seed the arena's allocation policy to match the mode the flag just
+        // chose. `set_generational_enabled` keeps them in step afterwards; doing
+        // it here rather than inside the literal is only because the arena is
+        // being moved into it.
+        if heap.generational_enabled.load(Ordering::Relaxed) {
+            heap.arena.lock().set_prefer_bump(true);
         }
+        heap
     }
 
     // =====================================================================
@@ -5000,6 +5022,26 @@ impl ZgcRealHeap {
     /// them differently.
     pub fn set_generational_enabled(&self, on: bool) {
         self.generational_enabled.store(on, Ordering::Relaxed);
+        // ---- G2c: THE NURSERY HAS TO BE WHERE ALLOCATION GOES -------------
+        //
+        // `Arena::alloc` serves the free list before the bump cursor, and that is
+        // the right default -- after a sweep that could not move survivors, hole
+        // reuse is the only thing keeping the arena from ratcheting. It is the
+        // wrong default for a nursery: a young cycle's sweep is bounded below by
+        // `gen_young_floor`, so an object the free list places BELOW the floor is
+        // in the old region and no young cycle reclaims it. It waits for a major,
+        // which is precisely the cost G2a had to document.
+        //
+        // Bump-first closes that. It is a preference and not a wall -- see
+        // `Arena::prefer_bump` -- so it cannot turn a servable allocation into an
+        // OutOfMemoryError, only change which space serves it; and the holes below
+        // the floor are recovered by the same slide that promotes the nursery's
+        // survivors out.
+        //
+        // Set here rather than in the constructor so the flag and the arena
+        // cannot disagree: every path that turns the mode on or off, including a
+        // test, goes through this one method.
+        self.arena.lock().set_prefer_bump(on);
         if !on {
             self.reset_generational_state();
         }
@@ -5068,6 +5110,12 @@ impl ZgcRealHeap {
             self.gen_young_floor.load(Ordering::Relaxed),
             self.gen_old_live_bytes.load(Ordering::Relaxed),
         )
+    }
+
+    /// Survivors promoted by a slide -- G2's engagement counter. See
+    /// [`Self::gen_promotions_by_slide`].
+    pub fn promotions_by_slide(&self) -> usize {
+        self.gen_promotions_by_slide.load(Ordering::Relaxed)
     }
 
     /// Apply the ZGC **load barrier** to one reference slot, in place.
@@ -12013,14 +12061,59 @@ impl GarbageCollector for ZgcRealHeap {
                 // object moved has been invalidated in the direction that loses
                 // an edge.
                 if gen_on {
-                    // THE FLOOR IS GONE TOO. A slide rewrites the low region
-                    // wholesale, so an address no longer says which generation an
-                    // object is in. Re-establishing it here would be guesswork;
-                    // dropping it makes the next cycle sweep everything, and
-                    // `gen_force_major_next` makes that next cycle a major, which
-                    // is what recomputes the floor from a full sweep.
-                    self.gen_young_floor.store(0, Ordering::Relaxed);
-                    self.gen_force_major_next.store(true, Ordering::Relaxed);
+                    // ---- G2: THE SLIDE **IS** THE PROMOTION ---------------
+                    //
+                    // The first version of this dropped the floor and forced the
+                    // next cycle to be a major, on the reasoning that a slide
+                    // rewrites the low region so an address no longer says which
+                    // generation an object is in. That is backwards: a slide
+                    // rewrites the low region into exactly the shape a nursery
+                    // wants.
+                    //
+                    // `compact_low_to` packs survivors from the first selected
+                    // page upward and then drops the cursor to the end of the
+                    // compacted region, so afterwards **every live object is
+                    // below the cursor** -- the ones on unselected dense pages
+                    // never moved and are below it too. Setting the floor there
+                    // makes every survivor old and leaves the nursery EMPTY, so
+                    // the next young cycle sweeps only what has been allocated
+                    // since. That is a young space reclaimed by moving its
+                    // survivors out, which is what G2 is.
+                    //
+                    // # And it carries NO floating garbage
+                    //
+                    // The registry at this point holds live objects only -- the
+                    // sweep pruned the dead a few statements ago -- so declaring
+                    // everything below the cursor old retains nothing that is
+                    // not reachable. Compare the ordinary (non-relocating) floor
+                    // advance, which happens at the end of a whole-heap cycle and
+                    // has the same property for the same reason.
+                    //
+                    // # Why this needs no JIT load barrier
+                    //
+                    // Because the move is at a SAFEPOINT and the collector
+                    // rewrites every slot itself. `zgc_relocation_permitted`
+                    // already decided this configuration is allowed --  stage (a)
+                    // of `zgc-jit-load-barrier.md` landed 2026-08-13 and
+                    // `zgc_codegen_honours_read_barrier()` is true -- and
+                    // `relocate_stw` refuses anyway while a JIT frame is on a
+                    // stack. Promotion inherits both. A load barrier is what
+                    // CONCURRENT relocation needs, not this.
+                    let post_slide = {
+                        let arena = self.arena.lock();
+                        arena.base_ptr() as usize + arena.used_low_for_compaction()
+                    };
+                    self.gen_young_floor.store(post_slide, Ordering::Relaxed);
+                    self.gen_old_live_bytes
+                        .store(bytes_copied, Ordering::Relaxed);
+                    self.gen_promotions_by_slide
+                        .fetch_add(moved, Ordering::Relaxed);
+                    tracing::debug!(
+                        target: "zgc",
+                        moved,
+                        floor = post_slide,
+                        "zgc G2: the slide promoted its survivors; nursery empty"
+                    );
                 }
                 if gen_on && self.has_old_objects.load(Ordering::Relaxed) {
                     let carded = self.recard_relocated_old_objects(&map, promo_age);
@@ -15592,6 +15685,213 @@ pub(crate) mod tests {
             "and reclaim what the wedged young cycles could not see"
         );
         assert_eq!(conc_walk_chain(&heap, roots[0]), chain);
+    }
+
+    /// **G2: the slide promotes its survivors, leaves the nursery EMPTY, and does
+    /// NOT force the next cycle to be a major.**
+    ///
+    /// # What changed and why the old behaviour was backwards
+    ///
+    /// The first version of the nursery threw the floor away after a relocation,
+    /// on the reasoning that a slide rewrites the low region so an address no
+    /// longer says which generation an object is in. That is backwards: a slide
+    /// rewrites the low region into exactly the shape a nursery wants.
+    /// `compact_low_to` packs survivors and drops the cursor to the end of the
+    /// compacted region, so afterwards **every live object is below the cursor**
+    /// — the ones on unselected dense pages never moved and are below it too.
+    ///
+    /// Putting the floor there is promotion by copy, which is what G2 is, and it
+    /// carries **no floating garbage**: the registry at that point holds live
+    /// objects only, because the sweep pruned the dead a few statements earlier.
+    ///
+    /// # The three assertions, and what each would otherwise hide
+    ///
+    /// `promotions_by_slide > 0` is the engagement counter — without it a slide
+    /// that ran while the nursery was left dropped looks identical. The floor
+    /// being above every live base is the property that makes the nursery empty.
+    /// And `gen_force_major_next` staying **clear** is the behavioural change: if
+    /// it were still set, every relocating cycle would be followed by a
+    /// whole-heap one and the generational split would be off half the time.
+    #[test]
+    fn a_slide_promotes_its_survivors_and_leaves_the_nursery_empty() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                let heap = ZgcRealHeap::new_shared(8 * 1024 * 1024);
+                heap.set_tlab_enabled(false);
+                heap.set_generational_enabled(true);
+                heap.set_gen_promotion_age(1);
+                heap.set_gen_minors_per_major(1_000);
+                assert!(
+                    heap.relocation_requested(),
+                    "the override must reach the heap or this test proves nothing"
+                );
+
+                // Garbage below, so the selector has profitable pages and the
+                // survivors have somewhere to slide down into.
+                for _ in 0..4_000 {
+                    heap.alloc_object(ClassId::new(1), 4);
+                }
+                let parent = heap.alloc_object(ClassId::new(2), 1);
+                let child = heap.alloc_object(ClassId::new(2), 0);
+                heap.set_field(parent, 0, Value::Object(Some(child)));
+
+                let mut roots = [parent];
+                // SAFETY: these unit tests run the heap single-threaded.
+                let stw = unsafe { StopTheWorldToken::new() };
+                let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+                if result.pointer_map.is_empty() {
+                    // The selector declined. Say so rather than pass quietly: a
+                    // test that silently measured "nothing moved" would be
+                    // vacuous, and the assertions below are all about a move.
+                    assert_eq!(
+                        heap.promotions_by_slide(),
+                        0,
+                        "nothing moved, so nothing can have been promoted by a slide"
+                    );
+                    return;
+                }
+
+                // (1) IT PROMOTED.
+                assert!(
+                    heap.promotions_by_slide() > 0,
+                    "a slide that moved objects must have promoted them -- this \
+                     counter at zero with a non-empty pointer map is the old \
+                     behaviour, where the floor was dropped instead"
+                );
+
+                // (2) THE NURSERY IS EMPTY: the floor is above every live base.
+                let (_, floor, old_live) = heap.nursery_stats();
+                let live: Vec<usize> = heap.registry.snapshot().bases();
+                assert!(!live.is_empty(), "the graph survived");
+                let above = live.iter().filter(|b| **b >= floor).count();
+                assert_eq!(
+                    above, 0,
+                    "{above} of {} live objects are at or above the floor {floor:#x}; \
+                     a slide packs every survivor below the cursor, so the nursery \
+                     must be empty",
+                    live.len()
+                );
+                assert!(old_live > 0, "and the old live bytes were published");
+
+                // (3) THE NEXT CYCLE IS NOT FORCED TO BE A MAJOR.
+                assert!(
+                    !heap.gen_force_major_next.load(Ordering::Relaxed),
+                    "a relocating cycle must no longer force a whole-heap cycle \
+                     behind it, or the split is off every other collection"
+                );
+
+                // And the graph is intact through the move.
+                match heap.get_field(roots[0], 0) {
+                    Value::Object(Some(c)) => assert!(
+                        heap.registry.contains(c.as_ptr() as usize),
+                        "the child reference must name a live, registered object"
+                    ),
+                    other => panic!("the parent's reference was lost: {other:?}"),
+                }
+
+                // Fresh allocation lands in the nursery, and a young cycle
+                // reclaims it without touching what the slide promoted.
+                let junk: Vec<usize> = (0..500)
+                    .map(|_| heap.alloc_object(ClassId::new(43), 2).as_ptr() as usize)
+                    .collect();
+                assert!(
+                    junk.iter().all(|a| *a >= floor),
+                    "allocation after the slide must land above the floor"
+                );
+                let mut roots2 = [roots[0]];
+                let _ = heap.collect_garbage(&stw, &mut roots2, &NoMonitors);
+                assert!(
+                    junk.iter().all(|a| heap.is_object_address(*a).is_none()),
+                    "the nursery's garbage must still be reclaimed"
+                );
+                assert!(
+                    heap.registry.contains(roots2[0].as_ptr() as usize),
+                    "and the promoted graph survives"
+                );
+            },
+        );
+    }
+
+    /// **G2c: with the nursery on, allocation after a collection lands ABOVE the
+    /// floor even when there are holes below it.**
+    ///
+    /// This is the gap G2a had to document as a cost: the free list hands out
+    /// space below the floor, so an object placed in a hole is in the old region
+    /// and no young cycle reclaims it. Bump-first closes it, and the assertion is
+    /// by ADDRESS against the floor — "the objects were reclaimed" would pass
+    /// either way once a major ran.
+    ///
+    /// The paired assertion is that the mode is what turns it on: the same
+    /// fixture with generational mode OFF must put objects in the holes, or this
+    /// test is measuring the allocator's mood rather than the policy.
+    #[test]
+    fn with_the_nursery_on_allocation_lands_above_the_floor() {
+        // ---- generational ON: bump-first, so nothing lands in a hole -------
+        let heap = gen_heap_for_test(16 * 1024 * 1024);
+        assert!(
+            heap.arena.lock().prefer_bump(),
+            "turning the mode on must reach the arena, or the nursery is only              wherever the cursor happened to be"
+        );
+        // Garbage first, so the sweep leaves holes low down.
+        let doomed: Vec<usize> = (0..2_000)
+            .map(|_| heap.alloc_object(ClassId::new(43), 3).as_ptr() as usize)
+            .collect();
+        let keep = heap.alloc_object(ClassId::new(2), 1);
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        let keep = roots[0];
+        assert!(
+            doomed.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "the fixture must have left holes"
+        );
+        let (_, floor, _) = heap.nursery_stats();
+        assert!(floor > heap.arena_base, "a floor was published");
+
+        let fresh: Vec<usize> = (0..500)
+            .map(|_| heap.alloc_object(ClassId::new(44), 3).as_ptr() as usize)
+            .collect();
+        let below = fresh.iter().filter(|a| **a < floor).count();
+        assert_eq!(
+            below, 0,
+            "{below} of 500 fresh objects landed BELOW the floor {floor:#x} -- each              one is in the old region and waits for a major"
+        );
+
+        // And a young cycle reclaims them, which is the point of putting them there.
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that was a minor");
+        assert!(
+            fresh.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "and a young cycle must reclaim what it placed in the nursery"
+        );
+
+        // ---- generational OFF: the default policy reuses the holes --------
+        let plain = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        plain.set_tlab_enabled(false);
+        plain.set_relocation_enabled(false);
+        plain.set_generational_enabled(false);
+        assert!(
+            !plain.arena.lock().prefer_bump(),
+            "the default policy must be unchanged with the mode off"
+        );
+        let doomed2: Vec<usize> = (0..2_000)
+            .map(|_| plain.alloc_object(ClassId::new(43), 3).as_ptr() as usize)
+            .collect();
+        let keep2 = plain.alloc_object(ClassId::new(2), 1);
+        let mut roots2 = [keep2];
+        let _ = gen_collect(&plain, &mut roots2);
+        let low_water = *doomed2.iter().min().expect("non-empty");
+        let high_water = *doomed2.iter().max().expect("non-empty");
+        let reused = (0..200)
+            .map(|_| plain.alloc_object(ClassId::new(44), 3).as_ptr() as usize)
+            .filter(|a| *a >= low_water && *a <= high_water)
+            .count();
+        assert!(
+            reused > 0,
+            "with the mode OFF the allocator must reuse the swept holes -- if it              does not, the ON assertion above proves nothing about the policy"
+        );
     }
 
     /// **A card whose target is OLD is dropped, and the target survives
