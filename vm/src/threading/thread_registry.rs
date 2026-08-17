@@ -2435,6 +2435,43 @@ impl ThreadRegistry {
                 .in_blocked_region
                 .load(Ordering::Acquire)
             {
+                // NOT blocked — but its published SNAPSHOT still has to move.
+                //
+                // The fixup chain and `slot_origins` below are blocked-region
+                // machinery and stay gated on the flag: they exist to heal
+                // frames the owner cannot heal itself. The snapshot is a
+                // different thing. It is what the collector MARKS this thread
+                // from, it lives in the registry rather than in the thread, and
+                // nothing else rewrites it — so after a moving collection every
+                // non-blocked thread's snapshot was left naming addresses this
+                // collection vacated, and the next collection marked from them.
+                //
+                // Usually harmless because a thread refreshes its snapshot when
+                // it parks at its next safepoint. Not harmless when a thread is
+                // censused as blocked and then leaves the blocked region: the
+                // fold skips it (flag now clear) and the pause does not wait for
+                // it (it was excluded), so its stale snapshot is what the NEXT
+                // collection marks from — the marker then keeps whatever now
+                // occupies the vacated address and can miss the real object,
+                // which is a live object freed under a frame that still holds
+                // it.
+                //
+                // MEASURED with `CRATONVM_DBG_ROOT_REMAP_AUDIT=1`: 5-27 scanned
+                // roots per collection were left naming an address that same
+                // collection moved an object away from, every one of them from
+                // scan section 11, "Root snapshot (for cross-thread GC
+                // scanning)". Remapping an entry to the address the collector
+                // itself reports is always correct, so this is unconditional.
+                let mut snapshot = entry.root_snapshot.lock();
+                for r in snapshot.iter_mut() {
+                    if let Some(&new) = pointer_map.get(&(r.as_ptr() as usize)) {
+                        if new != 0 {
+                            // SAFETY: `new` is a post-move object base the
+                            // collector just published in its pointer map.
+                            *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                        }
+                    }
+                }
                 continue;
             }
             let mut fixup = entry.gc_block_state.fixup.lock();
