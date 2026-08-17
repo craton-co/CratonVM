@@ -80,7 +80,7 @@ What the loops actually cost, therefore:
 | name loop | 8.2 ns/iter | **19 242 ns/iter** | **2 100x** |
 
 Not the "~1.5x the sibling's per-iteration work" this page estimated. The sibling
-is a compiled loop that is 2.6x too slow; this is an interpreted loop four to
+is a compiled loop that is 2.9x too slow; this is an interpreted loop four to
 five orders of magnitude too slow.
 
 ## Why: `RBC.6b`, and it is deliberate

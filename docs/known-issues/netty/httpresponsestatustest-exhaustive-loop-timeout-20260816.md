@@ -1,7 +1,7 @@
-# `HttpResponseStatusTest` — `testHttpStatusClassValueOf` needs 42 ns/iteration and gets 109
+# `HttpResponseStatusTest` — `testHttpStatusClassValueOf` needs 42 ns/iteration and gets 120
 
 **Status: OPEN, throughput. The compile-ORDER mechanism this page was about is
-FIXED (2026-08-17); the remaining gap is ~2.6x and has a different cause.**
+FIXED (2026-08-17); the remaining gap is ~2.9x and has a different cause.**
 Original measurement 2026-08-16 on `3ef3eb744`; per-iteration decomposition
 2026-08-17 on `cf141b8a8`; the fix and the numbers below 2026-08-17 on
 `perf/netty-exhaustive-loop-walls-20260817`. Windows host, release build, G1,
@@ -49,12 +49,17 @@ only through OSR — the shape a `@Test` method has:
 | | CratonVM ns/iter | extrapolated full run |
 |---|---:|---:|
 | 2026-08-16 / 08-17, as first measured | 283-308 | 1214-1321 s |
-| this branch's binary, `-eager-callee-chain` (the control) | **477.6** | 2051 s |
-| **this branch's binary, default** | **109.4** | **470 s** |
+| this branch's binary, `-eager-callee-chain` (the control) | **413.6** | 1776 s |
+| **this branch's binary, default** | **120.3** | **517 s** |
 | budget | 42 | 180 |
 
-So the compile-order mechanism was worth **4.4x** on the real loop, and the class
-is still **2.6x** over.
+So the compile-order mechanism is worth **3.4x** on the real loop, and the class
+is still **2.9x** over.
+
+Both rows are one interleaved pair on the shipping binary. Take the ratio and not
+the absolute: this host was running four other release builds throughout, and the
+same pair measured earlier in the session gave 477.6 against 109.4 (4.4x). The
+number that does not move with load is the dispatch counter below.
 
 ## FIXED: compile ORDER — a body compiled before its callee never re-binds
 
@@ -62,10 +67,13 @@ is still **2.6x** over.
 one switch: whether the JUnit callees are exercised from a *different* method
 before the hot method is ever compiled.
 
-| arm | before | after |
+| arm | `-eager-callee-chain` | default |
 |---|---:|---:|
-| cold (hot method compiles first) | 478 / 548 ns/iter | **73 / 81** |
-| prewarm (callees compile first) | 78-95 ns/iter | 110-125 |
+| cold (hot method compiles first) | 249 / 233 ns/iter | **57 / 61** |
+| prewarm (callees compile first) | 78-95 ns/iter (unchanged; nothing to fix) | |
+
+Interleaved, two rounds, one binary. The cold arm is now *faster* than the
+prewarm arm used to be, which is the point: after the fix there is no cold arm.
 
 **The mechanism, and the measurement that named it.** `CRATONVM_DBG_MIC_PROF=1`
 reports the generic dispatch helper's call count, and in the cold arm it was
@@ -97,9 +105,8 @@ top-level compile, cycle-guarded through
 
 **Proved by the counter, not the clock.** Same binary, cold arm, 1e6 iterations:
 `disp_calls` **2 003 538 → 3 926**. That matters on this host, whose run-to-run
-spread on a fixed configuration reaches 3x — the prewarm arm above moved 78 → 256
-with the fix *disabled*, which is noise, not a regression — and a counter cannot
-be confounded that way.
+spread on a fixed configuration reaches 3x, and every absolute number on this
+page moved by 1.5-2x between rounds while the counter did not move at all.
 
 Three explanations this page carried are therefore superseded. The compile records
 being identical between the arms, both of the hot method's call sites binding
@@ -108,7 +115,7 @@ addresses were all *true* and all irrelevant: the differing bind was one level
 DEEPER than either body, in a method neither dump covered. The MIC/PIC
 "per-site runtime state" hypothesis the page ended on is not the answer either.
 
-## What the remaining 109 ns is
+## What the remaining 120 ns is
 
 `probes/CallCostProbe.java`, same binary, after the fix:
 
@@ -151,7 +158,7 @@ non-leaf inline, so there is nothing for the planner to admit here either way.
 
 ## What is left
 
-Closing 109 → 42 ns/iteration on this shape needs an inliner that can splice a
+Closing 120 → 42 ns/iteration on this shape needs an inliner that can splice a
 callee containing calls — one that nests. Two smaller items are worth doing
 first, because each is measurable on its own and generalises well beyond this
 class:
