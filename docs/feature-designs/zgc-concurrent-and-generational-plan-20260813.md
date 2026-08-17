@@ -1178,6 +1178,54 @@ and `ZMarkContext::visit_refs` being intrinsically more expensive than
 `enumerate_references` (it is a fork of it, for stated reasons, and the fork has
 never been priced).
 
+### One part of that fixed cost was a wait nobody notified — FIXED 2026-08-17
+
+Found by reading rather than by profiling, and it is worth recording *how*,
+because the profile would not have shown it as anything but "slower".
+
+**The mark driver's fixed-point wait was the one wait in the marker that is not
+notified.** `ZgcConcurrentMarkController::await_fixed_point` polled
+`ZgcConcurrentMarkState`'s *own* condvar on a `DRIVER_POLL_MS` = 5 ms grid. The
+only thing that ever notified that condvar outside a stop was
+`notify_work_available`, and it had **zero callers on any ZGC path** —
+`vm_heap.rs`'s single call site is G1's controller. So every pass of every cycle
+waited out the full 5 ms before noticing a fixed point the workers had often
+reached immediately. Every *other* wait in `mark.rs` is properly notified
+(`worker_idle` sets `terminated` and calls `notify_all`; publishing work bumps
+`work_generation` and notifies; `release_pause` notifies) — this one was not, and
+it was the one the pause waits on.
+
+**Why it survived.** Every wait in the marker is a `wait_for` and never a bare
+`wait`, deliberately, so a lost notification costs a poll interval instead of a
+hang. That insurance makes the failure *invisible*: a wait that always times out
+behaves identically to one that is notified, only 5 ms slower, and no assertion
+anywhere fires. `ZMarkTerminator::park_timeouts` and `park_termination_wakes` now
+count expiries and termination-edge wakes, and `[GC] zgc-mark-wait:` reports the
+first at shutdown — **counts, so they read the same on a loaded host as on a
+quiet one**, which is the whole reason they are counts.
+
+**And the stated reason for polling was wrong about the API it described.** The
+`DRIVER_POLL_MS` comment said `ZMarkTerminator::wait_for_fixed_point` "can only
+be released by the *pool's* stop flag, not by this controller's". It takes the
+stop flag **as a parameter**; it is `ZMarkCoordinator`'s no-argument *wrapper*
+that hardwires the pool's flag, and the comment described the wrapper while the
+driver had the terminator in hand. A test's doc had inherited the same claim —
+"if it waited on the pool's own condvar instead, this would deadlock, which is the
+whole reason `await_fixed_point` polls" — and that test
+(`stopping_the_driver_mid_cycle_does_not_hang`, run against a deliberately wedged
+pool) now passes with the driver waiting on exactly that condvar. Interruption is
+in fact *faster* than before: the flag is re-read every `Z_MARK_PARK_POLL_MS`
+**and** kicked directly by `ZMarkTerminator::wake_blocked_waiters`.
+
+**How much of C5 this is: a small part, and it must not be reported as more.** At
+`Z_PARMARK_RESTART_BUDGET = 1` the driver waits at most twice per cycle, so the
+ceiling is ~5–10 ms of a ~100 ms gap. What it removes is a **floor** under the
+parallel-mark pause that no amount of worker scaling could have reached, and a
+5 ms quantum inside the loop that every per-cycle timing above was carrying as
+instrument noise. Fix the instrument, then measure — the remaining candidates in
+the paragraph above are unchanged and still want `perf record` on a one-worker
+cycle.
+
 **The next step for C5 is `perf record` on a one-worker cycle, not another
 counter.** That is this tree's own standing rule and three rounds of lock hunting
 against a fixed cost is what ignoring it looks like. Note also the spread — 380
@@ -1218,7 +1266,15 @@ frees live old objects.
 ### What is still open, 2026-08-17, ranked by what the measurements say
 
 1. **C5 — make the marker scale.** All three per-object locks are fixed
-   (2026-08-17) and **it was not enough — see §3c.** One worker is already +98%
+   (2026-08-17) and **it was not enough — see §3c.** A fourth thing was fixed the
+   same day and is also not enough on its own: **the driver's fixed-point wait
+   was polling a condvar nothing notified**, on a 5 ms grid, so every pass paid an
+   interval it did not need to. Worth ~5–10 ms of a ~100 ms gap, but it was a
+   *floor* under the pause that worker count could not reach, and a 5 ms quantum
+   that every timing in §3c was carrying. `[GC] zgc-mark-wait: park_timeouts=`
+   is nonzero if it returns. **The next step is still `perf record` on a
+   one-worker cycle**, and it now measures the marker rather than the marker plus
+   a poll interval. One worker is already +98%
    to +189% against zero, and a single worker contends with nobody, so the
    remaining cost is the engine's fixed overhead and not contention. The next
    step is `perf record` on a one-worker cycle. The three locks were:

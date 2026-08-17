@@ -2603,6 +2603,17 @@ impl VmHeap {
             // already met and silently worked around, one warning per process.
             // A run that ends with a nonzero here has corrupt headers whatever
             // else it reports.
+            // A NOTIFICATION THAT IS MISSING IS A SLOWDOWN, NOT A FAILURE.
+            // The mark driver's fixed-point wait is a `wait_for`, so a lost
+            // notification costs a poll interval and is otherwise
+            // indistinguishable from a working one -- which is how the driver
+            // came to poll a never-notified condvar on a 5 ms grid for months.
+            // Nonzero here means it is back. A count, so it reads the same on a
+            // loaded host as on a quiet one.
+            eprintln!(
+                "[GC] zgc-mark-wait: park_timeouts={}",
+                h.mark_park_timeouts(),
+            );
             eprintln!(
                 "[GC] zgc-integrity: unsizable_registered_objects={}",
                 crate::zgc::ZGC_UNSIZABLE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed),
