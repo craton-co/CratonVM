@@ -680,6 +680,25 @@ store **accessor** and then a real collection, which is the only version of that
 test that could have failed before G0; and `old_retained` is the count of objects
 a young cycle retained without tracing. §3b has the measurement.
 
+#### What Phase G costs, stated
+
+* **The card barrier on every reference store.** One relaxed load and a
+  not-taken branch until the first promotion; after that, for a store whose
+  receiver is old, one header read plus a bitmap `fetch_or` under a per-page
+  lock. Nothing on the read path.
+* **The remembered set's memory.** A card is one bit per 8 bytes over a 2 MiB
+  logical page, double-buffered: **64 KiB per page that has ever taken a store
+  into an old object**. On a 1.2 GB heap that is up to ~38 MB, or 3%.
+  `young_extra_roots` drops a set that has become empty, so the steady state is
+  the pages that really hold old objects with live young references — but a run
+  that never takes a *young* cycle never cleans, so the ceiling is reachable.
+* **Floating garbage in old.** A young cycle retains every old object without
+  asking whether it is reachable, so garbage promoted before it died is
+  invisible until the next major. That is what the `minors_per_major` ceiling
+  bounds and what `zgc_gen_minors_per_major`'s note is about; it is the phase's
+  defining trade, not a defect.
+* **A whole-heap sweep on every cycle, including young ones.** See G2.
+
 ### G2 — promotion, and a real young space — **NOT BUILT, and re-scoped**
 
 This item said promotion needs `ZPageAllocator` because "a logical grid cannot
@@ -706,6 +725,29 @@ What is still missing, and what it would buy:
 Those two are the same project and it does need the page allocator. Sequence it
 after C5, and treat the allocator swap as its own change with its own
 measurement.
+
+**What the swap concretely involves**, so the next attempt starts from a list
+rather than from "replace `Arena`":
+
+1. `alloc_object` / `alloc_array` allocate from a **young** page rather than the
+   arena's bump cursor, and the large-object path from its own size class.
+2. `zgc::tlab` carves chunks out of young pages instead of the arena, and
+   `retire_all_tlabs` returns them to pages.
+3. Promotion **copies** a survivor into an old page. That is the first time this
+   collector moves an object outside `relocate_stw`, so it needs the same
+   root-rewriting and pointer-map plumbing — and it needs the JIT load barrier,
+   for the reason `zgc_relocation_permitted` already refuses relocation whenever
+   the JIT is on.
+4. A young sweep frees whole young pages by **resetting a cursor**, which is the
+   part that answers `sweep_us`. Objects that survive are gone from the page by
+   step 3, so there is nothing to walk.
+5. `ZObjectStarts` becomes per page rather than one flat bitmap over the arena,
+   or `is_object_address` stops being O(1).
+
+Steps 1, 2 and 5 are the allocator swap; 3 and 4 are the generational part and
+cannot be done first. Step 3's dependency on the JIT load barrier is the real
+critical path, and it is a separate design
+([`zgc-jit-load-barrier.md`](zgc-jit-load-barrier.md)).
 
 ---
 
@@ -735,32 +777,53 @@ frees live old objects.
 
 ### What is still open, 2026-08-17, ranked by what the measurements say
 
-1. **C5 — make the marker scale.** Unaddressed and it is the one with a number:
-   four workers cost **+153% pause** against zero on `probes/BigLive.java`, so
-   `Z_PARMARK_DEFAULT_WORKERS` is 0 and parallel marking is a feature nobody can
-   turn on. The rise is monotonic in worker count, which is a lock, and building
-   Phase G found three per-object candidates that all fit:
-   `metadata_pin::roots_for_loader` takes its registry `RwLock` and clones a
-   `Vec` for **every** marked object (its own module already has a `snapshot()`
-   written for exactly this reason, which nothing calls);
-   `external_roots::snapshot()` **clones the provider `Vec` per object**; and
-   `concurrent_mark_skip_set` takes an `RwLock` read plus an `Arc` clone per
-   object. The serial marker pays all three too — uncontended.
+1. **C5 — make the marker scale.** **All three per-object locks are now
+   fixed** (2026-08-17); what is open is whether that is *enough* to meet the
+   exit criterion, which is a measurement, not a change. The three were:
+   `metadata_pin::roots_for_loader`, which took its registry `RwLock` and cloned
+   a `Vec` for **every** marked object — its own module already had a
+   `snapshot()` written for exactly that reason, which nothing called — now
+   behind the `NON_EMPTY` latch its two siblings always had;
+   `external_roots::snapshot()`, which **cloned the provider `Vec` per object**,
+   now a `PROVIDER_COUNT` latch plus in-place iteration under
+   `read_recursive`; and `concurrent_mark_skip_set`, an `RwLock` read plus an
+   `Arc` clone *and drop* per object — three contended atomic RMWs — now behind
+   a **Bloom filter** over the skip-set addresses, because the "is it empty?"
+   trick that fixed the other two cannot work there: the skip set is non-empty
+   during every cycle in a real run, since it is every registered `Reference`
+   object. A filter works because the question is per *object* and almost no
+   object is a `Reference`. The serial marker paid all three too, uncontended.
+   §3c has the sweep.
 2. **G2 — a real young space.** The answer to `sweep_us`, which is 30–52% of the
    concurrent pause and the pause floor (§2c). A young cycle's mark cost falls
    with the generation split; its **sweep** cost does not, because the sweep
    walks every registered object whatever the split says. Needs the page
    allocator; see §3's G2.
-3. **`snapshot_us`**, 13% of the threaded concurrent pause: `bases()`
-   materialises a `Vec` of every registered base — 10.8M × 8 B = 87 MB allocated
-   inside the pause. Iterating the bitmap in place removes it.
-4. **C4 — per-thread mark buffers.** Pure throughput, and the larger half of it
-   is already done (`hand_satb_batch_to_the_marker`). What remains needs
-   thread-keyed state on the heap, because `satb_pre_barrier` is reached with no
-   thread context at all. **Must use `ZMarkHandle::new_buffer`, never
-   `ZMarkMutatorBuffer::new`** — the latter is detached, and a detached buffer
-   dropped non-empty leaves objects marked-and-unscanned, which is a
-   use-after-free because the mark bit is what dedups them.
+3. ~~**`snapshot_us`**, 13% of the threaded concurrent pause~~ — **FIXED
+   2026-08-17.** `bases()` materialised a `Vec` of every registered base (10.8M ×
+   8 B = 87 MB allocated *inside* the pause, then walked two or three times);
+   `for_each_base` scans the bitmap in place instead. Order is a correctness
+   property, not a detail: the sweep hands adjacent dead spans to
+   `add_free_block` and the coalescer only sees them as adjacent because the walk
+   is ascending — get that wrong and the arena exhausts with most of itself
+   unreachable on the free list, which is a measured failure here (`CopyChurn` at
+   `-Xmx256m`).
+4. **C4 — per-thread mark buffers.** Two of three parts done. The batching was
+   done on 2026-08-16 (`hand_satb_batch_to_the_marker`); the **shared counters
+   came off the per-store path on 2026-08-17**, which was the part that mattered
+   more than it looked — `ZMarkIngress` buckets its queues across 16 mutexes so
+   mutators do not contend, and then every push did a `fetch_add` on one
+   `pending_hint` cache line *and* one on the caller's own counter. Striping N
+   locks behind a single shared counter is not striping. The counters now live
+   inside each bucket's mutex, which the push already holds.
+
+   What remains is the genuine per-thread buffer, and it needs thread-keyed state
+   on the heap because `satb_pre_barrier` is reached with **no thread context at
+   all**. **Must use `ZMarkHandle::new_buffer`, never `ZMarkMutatorBuffer::new`**
+   — the latter is detached, and a detached buffer dropped non-empty leaves
+   objects marked-and-unscanned, which is a use-after-free because the mark bit
+   is what dedups them. It is throughput on a path that is armed only during a
+   concurrent cycle, i.e. only when `CRATONVM_ZGC_CONC_START` is set.
 5. **A concurrent sweep.** Its own project, not in Phase C as written, and
    largely superseded by G2: a young space reclaimed by resetting a cursor has
    no sweep to make concurrent.
