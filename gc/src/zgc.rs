@@ -3160,12 +3160,29 @@ impl ZgcRealHeap {
             return false;
         };
 
+        // THE MARK-START PAUSE IS A PAUSE, and until 2026-08-17 nothing
+        // measured it. `--verbose:gc`'s `pause_us` is taken inside
+        // `collect_garbage`, so a concurrent cycle's cost was reported as one
+        // pause when it is two -- and the unmeasured half contains a full
+        // registry walk (the mark-bit clear). Any total-pause comparison that
+        // omitted it understated the concurrent arm.
+        let armed = self.gc_log_enabled.load(Ordering::Relaxed);
+        let started_at = armed.then(std::time::Instant::now);
+        let mut clock = ZPhaseClock::new(armed);
+
         // (1)
         let registered = self.registry.snapshot();
-        for base in registered.bases() {
+        let snapshot_us = clock.lap();
+        // ONE `bases()` call: it materialises a `Vec` of every registered
+        // base, so calling it again just to count would double a
+        // multi-megabyte allocation inside the pause being measured.
+        let bases = registered.bases();
+        let n_registered = bases.len();
+        for base in bases {
             self.header_mut(base as *mut u8)
                 .clear_gc_flags(GC_FLAG_MARKED);
         }
+        let clearbits_us = clock.lap();
 
         // (2)
         let _skip = self.begin_concurrent_mark_cycle();
@@ -3177,15 +3194,27 @@ impl ZgcRealHeap {
         let workers = self.conc_mark_workers();
         let ctx: std::sync::Arc<dyn mark::ZMarkContext> = me;
         let coordinator = std::sync::Arc::new(mark::ZMarkCoordinator::new(ctx, workers));
+        let pool_us = clock.lap();
         coordinator.begin_cycle();
         let marked_roots = coordinator.push_roots(roots);
         coordinator.start_marking();
+        let roots_us = clock.lap();
         *self.conc_pool.lock() = Some(coordinator);
         self.conc_cycle_active.store(true, Ordering::Release);
         self.conc_cycles_started.fetch_add(1, Ordering::Relaxed);
         self.conc_mark_started_at
             .store(Self::monotonic_nanos(), Ordering::Relaxed);
 
+        if let Some(t0) = started_at {
+            eprintln!(
+                "[GC] zgc-markstart: pause_us={} snapshot_us={snapshot_us} \
+                 clearbits_us={clearbits_us} poolspawn_us={pool_us} roots_us={roots_us} \
+                 registered={n_registered} roots={} marked_roots={marked_roots} \
+                 workers={workers}",
+                t0.elapsed().as_micros(),
+                roots.len(),
+            );
+        }
         tracing::debug!(
             target: "zgc",
             workers,
@@ -3274,8 +3303,25 @@ impl ZgcRealHeap {
         coordinator.push_roots(&root_addrs);
 
         // ---- drive to a certified fixed point ---------------------------
+        //
+        // Snapshot `objects_scanned` on BOTH sides of this, because the
+        // difference is the one number that says whether the concurrent phase
+        // did its job: everything the pool had not finished tracing by the time
+        // the collection arrived is traced HERE, inside the pause. A cycle
+        // whose window was too short looks identical to one whose window was
+        // ample in every other figure.
+        let scanned_before = coordinator.stats().snapshot().objects_scanned;
         let report = coordinator.mark_to_completion(Z_CONC_MARK_END_RESTART_BUDGET);
         let stats = coordinator.stats().snapshot();
+        let scanned_at_safepoint = stats.objects_scanned.saturating_sub(scanned_before);
+        if self.gc_log_enabled.load(Ordering::Relaxed) {
+            eprintln!(
+                "[GC] zgc-markend: scanned_concurrently={scanned_before} \
+                 scanned_at_safepoint={scanned_at_safepoint} marked={} \
+                 satb_replayed={replayed} passes={} restarts={}",
+                stats.objects_marked, report.passes, report.restarts,
+            );
+        }
         coordinator.end_cycle();
         self.end_concurrent_mark_cycle();
 
@@ -9420,6 +9466,49 @@ impl ZgcRealHeap {
     }
 }
 
+
+/// Phase stopwatch for the `--verbose:gc` pause anatomy.
+///
+/// # Why the anatomy exists
+///
+/// The 2026-08-16 concurrent-marking measurement reported a per-cycle pause and
+/// nothing about what was IN it, and that turned out to hide two things at once:
+/// the mark-start pause was not being measured at all, and the pause that WAS
+/// measured is mostly not the mark. A pause number with no breakdown cannot
+/// answer "why is there still a pause on a concurrent collector", which is the
+/// only question worth asking of one.
+///
+/// `None` when logging is off: every `lap` is then a branch on an `Option` and
+/// no clock read at all.
+#[derive(Debug)]
+struct ZPhaseClock {
+    last: Option<std::time::Instant>,
+}
+
+impl ZPhaseClock {
+    #[inline]
+    fn new(armed: bool) -> Self {
+        ZPhaseClock {
+            last: armed.then(std::time::Instant::now),
+        }
+    }
+
+    /// Microseconds since the previous `lap` (or since construction), and
+    /// restart. `0` when disarmed.
+    #[inline]
+    fn lap(&mut self) -> u128 {
+        match self.last {
+            Some(t) => {
+                let now = std::time::Instant::now();
+                let us = now.duration_since(t).as_micros();
+                self.last = Some(now);
+                us
+            }
+            None => 0,
+        }
+    }
+}
+
 impl GarbageCollector for ZgcRealHeap {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         let compact_body =
@@ -9859,8 +9948,10 @@ impl GarbageCollector for ZgcRealHeap {
         // the handshake refused to certify one -- in both cases the mark loop
         // below runs from scratch, which is the same fail-closed fallback
         // `mark_with_controller_stw` has always had.
+        let mut clock = ZPhaseClock::new(gc_started.is_some());
         let concurrent_off_heap = self.finish_concurrent_mark(roots);
         let marked_concurrently = concurrent_off_heap.is_some();
+        let markend_us = clock.lap();
 
         // ---- RETIRE EVERY TLAB -------------------------------------------
         // First statement after the concurrent-cycle handshake above, before
@@ -9905,8 +9996,10 @@ impl GarbageCollector for ZgcRealHeap {
         // membership is O(1). On the bitmap arm it copies one bit per 8 arena
         // bytes rather than 8+ bytes per live object, so it is also strictly
         // cheaper than the set clone at any occupancy above ~1.5%.
+        let tlab_us = clock.lap();
         let registered: ZObjectStartsSnapshot = self.registry.snapshot();
         let all: Vec<usize> = registered.bases();
+        let snapshot_us = clock.lap();
 
         // Clear all mark bits first (objects may carry a stale bit from a
         // prior cycle's survivors).
@@ -10082,6 +10175,11 @@ impl GarbageCollector for ZgcRealHeap {
         // mark dead-but-finalizable objects (and their subtrees) live so the
         // sweep keeps them for the finalizer thread. Runs after the main
         // closure so "unmarked" == dead, and before the sweep decides.
+        // Everything from the snapshot to here is the mark: bit clearing plus
+        // whichever marker ran. Zero on a concurrently-marked cycle, which is
+        // the whole point of the phase.
+        let mark_us = clock.lap();
+
         let fin_candidates = std::mem::take(&mut *self.pending_finalizer_roots.lock());
         if !fin_candidates.is_empty() {
             let mut resurrected = Vec::new();
@@ -10149,6 +10247,8 @@ impl GarbageCollector for ZgcRealHeap {
         // `WeakReference` semantics silently broke under this backend. The
         // enqueue/finalize actions are surfaced for the runtime to drain; the
         // referent-null writes are applied in place here.
+        let resurrect_us = clock.lap();
+
         let ref_result = self.process_references();
         if !ref_result.to_enqueue.is_empty()
             || !ref_result.to_finalize.is_empty()
@@ -10238,6 +10338,8 @@ impl GarbageCollector for ZgcRealHeap {
         if zgc_corpse_enabled() {
             self.survey_registry_extents(&all, "pre-sweep");
         }
+
+        let refs_us = clock.lap();
 
         // ---- Sweep phase -------------------------------------------------
         let mut dead: Vec<usize> = Vec::new();
@@ -10458,6 +10560,7 @@ impl GarbageCollector for ZgcRealHeap {
         // callsite. Adopting the metrics module is a larger step — it has to be
         // fed from every phase, not just here — so this line stays standalone
         // until then; replace it wholesale at that point.
+        let sweep_us = clock.lap();
         if let Some(started) = gc_started {
             let pause_us = started.elapsed().as_micros();
             // `mark=` is the ONE field that says whether this collection's
@@ -10477,6 +10580,19 @@ impl GarbageCollector for ZgcRealHeap {
                 "[GC] zgc-real: cycle={cycle} pause_us={pause_us} mark={mark} \
                  objects_copied={objects_copied} bytes_copied={bytes_copied} \
                  bytes_freed={bytes_freed} occupancy={bytes_copied}/{cap} bytes",
+            );
+            // THE ANATOMY. Without it, "the pause is 230 ms" cannot be acted
+            // on: a pause that is mostly `mark_us` wants a longer concurrent
+            // window, and a pause that is mostly `sweep_us` wants a concurrent
+            // SWEEP and does not care about marking at all. `registered` is
+            // here because every phase except `markend` scales with it.
+            eprintln!(
+                "[GC] zgc-pause: cycle={cycle} total_us={pause_us} \
+                 markend_us={markend_us} tlab_us={tlab_us} snapshot_us={snapshot_us} \
+                 mark_us={mark_us} resurrect_us={resurrect_us} refs_us={refs_us} \
+                 sweep_us={sweep_us} registered={} dead={}",
+                all.len(),
+                dead.len(),
             );
         }
 
