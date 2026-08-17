@@ -1937,6 +1937,40 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     *dests = to;
 }
 
+/// Addresses the per-bci local-liveness filter kept OUT of a root snapshot,
+/// with the frame that held them.
+///
+/// `CRATONVM_DBG_VACATED_FRAMES` only. The filter's contract is that a slot it
+/// reports dead can never be read again under bytecode semantics — so if an
+/// address it dropped later turns up as a failing receiver, the analysis was
+/// wrong about that slot, and this names the method and the slot to look at.
+/// Bounded; oldest entries are simply overwritten.
+static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, String>>> =
+    parking_lot::RwLock::new(None);
+
+const LIVENESS_FILTERED_MAX: usize = 8192;
+
+/// Record that `addr` was in `where_` and the liveness filter dropped it.
+pub fn note_liveness_filtered(addr: usize, where_: impl FnOnce() -> String) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    let mut g = LIVENESS_FILTERED.write();
+    let map = g.get_or_insert_with(Default::default);
+    if map.len() >= LIVENESS_FILTERED_MAX {
+        map.clear();
+    }
+    map.insert(addr, where_());
+}
+
+/// Was `addr` dropped from a root snapshot by the liveness filter, and where?
+pub fn liveness_filtered_at(addr: usize) -> Option<String> {
+    if !vacated_frames_enabled() {
+        return None;
+    }
+    LIVENESS_FILTERED.read().as_ref()?.get(&addr).cloned()
+}
+
 /// Report a heap access whose RECEIVER is an address this collector moved an
 /// object away from, with the Rust caller chain.
 ///
