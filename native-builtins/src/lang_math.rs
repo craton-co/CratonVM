@@ -1825,6 +1825,16 @@ pub(crate) fn native_math_pow(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // - Negative bases with integer exponents are fine: powi does repeated multiplication, which
     //   matches Java's result for integer-valued b. Only fractional b on negative a yields NaN in
     //   Java, and we route those through powf.
+    // The comment above used to claim that falling through to `powf` preserved
+    // `pow(1, ±inf) == NaN`. It does not: C99 defines `pow(±1, anything)` as
+    // 1.0, NaN exponent included, and Java deliberately overrides that — the
+    // javadoc's second rule is "if the absolute value of the first argument
+    // equals 1 and the second argument is infinite, then the result is NaN",
+    // and a NaN exponent is NaN for every base. So the case has to be taken
+    // BEFORE libm sees it. (`StrictMath.pow`, being fdlibm, already agreed.)
+    if a.abs() == 1.0 && (b.is_infinite() || b.is_nan()) {
+        return Ok(Some(Value::Double(f64::NAN)));
+    }
     if a.is_finite() && b.is_finite() && b.fract() == 0.0 && b.abs() < 64.0 {
         let bi = b as i32;
         return Ok(Some(Value::Double(a.powi(bi))));
@@ -1874,6 +1884,15 @@ pub(crate) fn native_math_log10(_ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    // `log10` of a negative (including -Infinity) is NaN, but WHICH NaN is
+    // observable: HotSpot's `_dlog10` stub yields the x86 default QNaN, which
+    // has its SIGN BIT SET (0xFFF8...), while the libm we call here returns the
+    // positive canonical NaN. `Math.log` already agrees with HotSpot; only
+    // `log10` needed pinning. -0.0 is not `< 0.0`, so it still answers
+    // -Infinity as specified.
+    if v < 0.0 {
+        return Ok(Some(Value::Double(f64::from_bits(0xFFF8_0000_0000_0000))));
+    }
     Ok(Some(Value::Double(v.log10())))
 }
 
@@ -1910,7 +1929,14 @@ pub(crate) fn native_math_rint(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // Java Math.rint: round to nearest even (banker's rounding)
+    // Java Math.rint: round to nearest even (banker's rounding).
+    // The JDK body is `sign * abs(a)` with an early-out for large magnitudes,
+    // so a NaN comes back through `Math.abs` — payload intact, SIGN CLEARED.
+    // `round_ties_even` passes a negative NaN through unchanged, which is one
+    // bit off the oracle.
+    if v.is_nan() {
+        return Ok(Some(Value::Double(v.abs())));
+    }
     Ok(Some(Value::Double(v.round_ties_even())))
 }
 
@@ -2676,7 +2702,9 @@ pub(crate) fn native_math_next_up_double(
         _ => 0.0,
     };
     let result = if v.is_nan() {
-        f64::NAN
+        // The JDK returns the argument itself, so both the sign bit and the
+        // payload survive; `f64::NAN` canonicalised them away.
+        v
     } else if v == f64::INFINITY {
         f64::INFINITY
     } else if v == 0.0 {
@@ -2703,7 +2731,8 @@ pub(crate) fn native_math_next_down_double(
         _ => 0.0,
     };
     let result = if v.is_nan() {
-        f64::NAN
+        // See `native_math_next_up_double`: the argument is returned as-is.
+        v
     } else if v == f64::NEG_INFINITY {
         f64::NEG_INFINITY
     } else if v == 0.0 {
@@ -2734,7 +2763,12 @@ pub(crate) fn native_math_next_after(
         _ => 0.0,
     };
     let result = if start.is_nan() || direction.is_nan() {
-        f64::NAN
+        // The JDK writes exactly `return start + direction;` here, which is not
+        // the same as a canonical NaN: whichever operand is the NaN propagates
+        // with its sign and payload. (When BOTH are NaN the answer is whatever
+        // the add picks, which is a register-allocation detail on x86 and is
+        // left unspecified by the JLS — the sweep excludes those rows.)
+        start + direction
     } else if start == direction {
         direction
     } else if direction > start {
@@ -2782,8 +2816,16 @@ pub(crate) fn native_math_ulp_double(
         v.abs()
     } else {
         let abs = v.abs();
-        let next = f64::from_bits(abs.to_bits() + 1);
-        next - abs
+        if abs == f64::MAX {
+            // Stepping UP from MAX_VALUE lands on infinity, so `next - abs` was
+            // infinity — but `ulp(±Double.MAX_VALUE)` is specified as 2^971.
+            // At the top of the range the gap below equals the gap above, so
+            // step DOWN instead; the subtraction is exact.
+            abs - f64::from_bits(abs.to_bits() - 1)
+        } else {
+            let next = f64::from_bits(abs.to_bits() + 1);
+            next - abs
+        }
     };
     Ok(Some(Value::Double(result)))
 }
@@ -2802,8 +2844,14 @@ pub(crate) fn native_math_ulp_float(
         v.abs()
     } else {
         let abs = v.abs();
-        let next = f32::from_bits(abs.to_bits() + 1);
-        next - abs
+        if abs == f32::MAX {
+            // See `native_math_ulp_double`: `ulp(±Float.MAX_VALUE)` is 2^104,
+            // not the infinity that stepping up produces.
+            abs - f32::from_bits(abs.to_bits() - 1)
+        } else {
+            let next = f32::from_bits(abs.to_bits() + 1);
+            next - abs
+        }
     };
     Ok(Some(Value::Float(result)))
 }
@@ -2823,15 +2871,13 @@ pub(crate) fn native_math_get_exponent_double(
         // NaN or Infinity → MAX_EXPONENT + 1
         1024
     } else if biased == 0 {
-        if (bits & 0x000F_FFFF_FFFF_FFFF) == 0 {
-            // zero → MIN_EXPONENT - 1
-            -1023
-        } else {
-            // subnormal: count leading zeros of significand
-            let sig = bits & 0x000F_FFFF_FFFF_FFFF;
-            let lz = sig.leading_zeros() as i32 - 12; // 12 bits for sign+exponent
-            -1023 - lz
-        }
+        // Zero AND subnormal both answer MIN_EXPONENT - 1 == -1023. This branch
+        // used to normalize the significand and report the TRUE exponent of a
+        // subnormal (-1074 for Double.MIN_VALUE), which is the mathematically
+        // interesting number but not the specified one: `Math.getExponent` reads
+        // "the unbiased exponent used in the REPRESENTATION", and a subnormal's
+        // stored exponent field is 0 for all of them.
+        -1023
     } else {
         biased - 1023
     };
@@ -5963,6 +6009,135 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge rows pinned against a HotSpot JDK 25 oracle (probes/MathSurfaceSweep)
+    //
+    // Every expectation below is a RAW BIT PATTERN recorded from HotSpot, not a
+    // value reasoned from the javadoc — for NaN the javadoc only says "a NaN",
+    // and the payload/sign that actually comes back is what callers observe.
+    // -----------------------------------------------------------------------
+
+    /// The negative NaN with a payload that the oracle sweep uses.
+    const NAN_NEG_PAYLOAD: u64 = 0xFFF8_AE0A_0000_0000;
+
+    fn d(v: &MethodCallResult) -> u64 {
+        match v {
+            Ok(Some(Value::Double(x))) => x.to_bits(),
+            other => panic!("expected a double, got {other:?}"),
+        }
+    }
+    fn f(v: &MethodCallResult) -> u32 {
+        match v {
+            Ok(Some(Value::Float(x))) => x.to_bits(),
+            other => panic!("expected a float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn math_ulp_at_max_value_is_two_to_the_971_not_infinity() {
+        let mut ctx = mock_ctx();
+        // 0x7CA0000000000000 == 2^971
+        for v in [f64::MAX, -f64::MAX] {
+            let r = native_math_ulp_double(&mut ctx, &[Value::Double(v)]);
+            assert_eq!(d(&r), 0x7CA0_0000_0000_0000, "ulp({v:e})");
+        }
+        // 0x73800000 == 2^104
+        for v in [f32::MAX, -f32::MAX] {
+            let r = native_math_ulp_float(&mut ctx, &[Value::Float(v)]);
+            assert_eq!(f(&r), 0x7380_0000, "ulpF({v:e})");
+        }
+    }
+
+    #[test]
+    fn math_get_exponent_of_a_subnormal_is_min_exponent_minus_one() {
+        let mut ctx = mock_ctx();
+        for v in [f64::MIN_POSITIVE / 2.0, f64::from_bits(1), -f64::from_bits(1)] {
+            let r = native_math_get_exponent_double(&mut ctx, &[Value::Double(v)]);
+            assert_eq!(r.unwrap(), Some(Value::Int(-1023)), "getExponent({v:e})");
+        }
+        // ...and a normal number still reports its real exponent.
+        let r = native_math_get_exponent_double(&mut ctx, &[Value::Double(1.0)]);
+        assert_eq!(r.unwrap(), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn math_pow_of_unit_base_with_infinite_or_nan_exponent_is_nan() {
+        let mut ctx = mock_ctx();
+        for base in [1.0f64, -1.0f64] {
+            for exp in [
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NAN,
+                f64::from_bits(NAN_NEG_PAYLOAD),
+            ] {
+                let r = native_math_pow(&mut ctx, &[Value::Double(base), Value::Double(exp)]);
+                assert_eq!(d(&r), 0x7FF8_0000_0000_0000, "pow({base}, {exp})");
+            }
+        }
+        // A unit base with an ordinary exponent is untouched.
+        let r = native_math_pow(&mut ctx, &[Value::Double(1.0), Value::Double(3.0)]);
+        assert_eq!(d(&r), 1.0f64.to_bits());
+    }
+
+    #[test]
+    fn math_log10_of_a_negative_is_the_negative_default_nan() {
+        let mut ctx = mock_ctx();
+        for v in [-1.0, -1e300, -f64::MIN_POSITIVE, f64::NEG_INFINITY] {
+            let r = native_math_log10(&mut ctx, &[Value::Double(v)]);
+            assert_eq!(d(&r), 0xFFF8_0000_0000_0000, "log10({v:e})");
+        }
+        // -0.0 is not negative for this purpose: it is still -Infinity.
+        let r = native_math_log10(&mut ctx, &[Value::Double(-0.0)]);
+        assert_eq!(d(&r), f64::NEG_INFINITY.to_bits());
+    }
+
+    #[test]
+    fn math_rint_clears_a_nan_sign_but_keeps_its_payload() {
+        let mut ctx = mock_ctx();
+        let r = native_math_rint(&mut ctx, &[Value::Double(f64::from_bits(NAN_NEG_PAYLOAD))]);
+        assert_eq!(d(&r), 0x7FF8_AE0A_0000_0000);
+        // ties-to-even is unchanged for ordinary values.
+        let r = native_math_rint(&mut ctx, &[Value::Double(2.5)]);
+        assert_eq!(d(&r), 2.0f64.to_bits());
+    }
+
+    #[test]
+    fn math_next_up_down_and_after_propagate_a_nan_unchanged() {
+        let mut ctx = mock_ctx();
+        let nan = f64::from_bits(NAN_NEG_PAYLOAD);
+        assert_eq!(
+            d(&native_math_next_up_double(&mut ctx, &[Value::Double(nan)])),
+            NAN_NEG_PAYLOAD
+        );
+        assert_eq!(
+            d(&native_math_next_down_double(&mut ctx, &[Value::Double(nan)])),
+            NAN_NEG_PAYLOAD
+        );
+        // Whichever side is the NaN, that NaN is what comes back.
+        assert_eq!(
+            d(&native_math_next_after(
+                &mut ctx,
+                &[Value::Double(0.0), Value::Double(nan)]
+            )),
+            NAN_NEG_PAYLOAD
+        );
+        assert_eq!(
+            d(&native_math_next_after(
+                &mut ctx,
+                &[Value::Double(nan), Value::Double(0.0)]
+            )),
+            NAN_NEG_PAYLOAD
+        );
+        // A non-NaN pair still steps one ulp.
+        assert_eq!(
+            d(&native_math_next_after(
+                &mut ctx,
+                &[Value::Double(1.0), Value::Double(2.0)]
+            )),
+            (1.0f64).to_bits() + 1
+        );
     }
 
     // -----------------------------------------------------------------------
