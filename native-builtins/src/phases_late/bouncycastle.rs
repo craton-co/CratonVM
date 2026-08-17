@@ -8593,10 +8593,11 @@ fn bc_sha256_slots(
 /// `processBlock` here. Tagged `Intrinsic`, not a stub: it computes the method's
 /// exact result rather than standing in for it.
 pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
-
-    r.register(
+    // `register_with_kind` rather than the ambient `set_category` the older BC
+    // registrars around this one use: it records `kind_stated`, so the census
+    // can tell "somebody adjudicated this as an Intrinsic" from "this inherited
+    // whatever category was ambient at the registration site".
+    r.register_with_kind(
         "org/bouncycastle/crypto/digests/SHA256Digest",
         "processBlock",
         "()V",
@@ -8660,9 +8661,8 @@ pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, slots.x_off, Value::Int(0));
             Ok(None)
         },
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
-
-    r.set_category(__prev_cat);
 }
 
 pub(crate) const BC_KECCAK_ROUND_CONSTANTS: [u64; 24] = [

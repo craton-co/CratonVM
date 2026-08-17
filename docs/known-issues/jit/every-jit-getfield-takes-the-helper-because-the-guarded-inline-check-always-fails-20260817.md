@@ -98,7 +98,7 @@ overhead today.**
    site — one increment on the inline branch, one on the fall-through — and
    print both. The whole point of this page is that a fast path can be emitted,
    measured, and still never run; a fix priced on anything but that counter is a
-   guess. (See `reference_put_the_engagement_counter_next_to_the_number`.)
+   guess.
 2. **Then** decide whether ZGC should publish its arena bounds.
    `ZgcRealHeap` holds a single contiguous `Mutex<Arena>`, so
    `[base, base+capacity)` is available and has the same "mapped for the heap's
