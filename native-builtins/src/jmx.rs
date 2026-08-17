@@ -5721,13 +5721,28 @@ fn register_thread_mxbean_extensions(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    // `getTotalThreadAllocatedBytes()` is process-wide, so unlike the
-    // per-thread getters it has a source that does not need a foreign thread's
-    // cursor: the VM's own cumulative allocation counter.
+    // `getTotalThreadAllocatedBytes()` is process-wide and CUMULATIVE — a
+    // total over the life of the process that never decreases.
+    //
+    // This used to answer with `heap_allocated_bytes()`, which is not that. It
+    // is an occupancy gauge derived from `used - free`, so it FALLS at every
+    // collection, and a caller measuring a window containing a GC gets the
+    // difference of two occupancies. Hibernate's `HqlParserMemoryUsageTest`
+    // measures exactly such a window, and read the identical HQL parse as
+    // 488 MB under ZGC, 49 MB under Generational at a 2 GB heap, and 458 MB
+    // under Generational at 8 GB — same bytecode, three answers.
+    //
+    // `process_allocated_bytes` is the real thing: fed from every TLAB retire
+    // and every non-TLAB allocation, so it is the sum of all threads' retired
+    // totals. The calling thread's live TLAB span is added on top because it is
+    // the one in-flight span readable here — other threads' cursors may not be
+    // read while their owner runs, which bounds the under-count at one TLAB per
+    // running thread and keeps the answer monotonic.
     r.register(cls, "getTotalThreadAllocatedBytes", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(
-            i64::try_from(ctx.heap_allocated_bytes()).unwrap_or(i64::MAX),
-        )))
+        let total = ctx
+            .total_allocated_bytes()
+            .unwrap_or_else(|| ctx.heap_allocated_bytes() as u64);
+        Ok(Some(Value::Long(i64::try_from(total).unwrap_or(i64::MAX))))
     });
     // The bulk CPU/user-time forms the extension interface adds. Same
     // per-id resolution the scalar `getThreadCpuTime(J)` uses, so the two

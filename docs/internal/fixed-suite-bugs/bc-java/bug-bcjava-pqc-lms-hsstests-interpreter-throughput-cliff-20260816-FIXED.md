@@ -13,8 +13,9 @@ compression leaf made native it is **1047 s**, and the isolated kernel improves
 
 What is deliberately **not** claimed: `pqc.crypto.test.AllTests` is not fixed,
 and the decomposition below shows why no single-algorithm fix could have fixed
-it. Two costs the profile exposed are handed to their own pages rather than
-carried here.
+it. **`pqc.jcajce.provider` is not resolved either** — it exceeds a 7200 s cap
+on both arms (HotSpot: 271 s) and keeps its own section below. Two costs the
+profile exposed are handed to their own pages rather than carried here.
 
 Filed originally as: *`pqc.crypto.lms.AllTests` / `pqc.crypto.test.AllTests`
 exceed even a 10x timeout — confirmed CPU-bound, not deadlocked.*
@@ -279,12 +280,27 @@ too, so the check is whether anything *else* moved. Base vs fix, same host:
 | suite | base | +fix | outcome |
 |---|---|---|---|
 | `crypto.test.AllTests` | 1407 s | **707 s** | `Tests run: 21, Failures: 1, Errors: 14` on **both**, and the 15 failing test names diff **identical** |
+| `cms.test.AllTests` | 187 s | 221 s | `Tests run: 433, Failures: 0, Errors: 1` on **both**, same single test name |
+| `lms.AllTests` | 1008 s | **315 s** | `OK (29 tests)` on both |
+| `openssl.test.AllTests` | 18 s | 20 s | `OK (5 tests)` on **both** |
 | `jce.provider.test.AllTests` | 2 s | 2 s | identical on both (a harness artefact — the class exposes no JUnit suite, same as `crypto.test.RegressionTest`) |
+| `crypto.test.RegressionTest` | 8 s | 7 s | identical (same harness artefact) |
 
-`crypto.test.AllTests`'s 15 residuals are pre-existing and unrelated: fourteen
-are `HPKETestVectors` failing `CryptoServiceConstraintsException: service does
-not provide 192 bits of security only 128`. They fail identically without the
-intrinsic. **Same behaviour, 1.99x the speed.**
+**Six suites, zero regressions.** Every verdict, count and failing test name is
+the same on both arms.
+
+The residuals are pre-existing and unrelated. `crypto.test.AllTests`'s fourteen
+errors are all `HPKETestVectors` failing `CryptoServiceConstraintsException:
+service does not provide 192 bits of security only 128`; `cms.test.AllTests`'s
+single error is `NewEnvelopedDataTest.testKeyTransDESEDE3Short`. Every one fails
+identically without the intrinsic.
+
+**`cms.test.AllTests` is the honest counter-example**: 187 s → 221 s, i.e. no
+gain, and if anything slightly worse inside run-to-run variance on a loaded
+shared host. That is expected — CMS is not SHA-256-bound, and this fix buys
+nothing where the digest is not the workload. It is reported rather than
+dropped, because a table of only the favourable suites would misrepresent what
+the intrinsic does.
 
 ### Throughput
 
@@ -345,6 +361,30 @@ These are ASN.1 parsers reached once per signature. At 628–884 invocations
 inside a 1047 s run dominated by millions of hash blocks they cannot be
 material, so they are recorded rather than chased — but the verdict comes from
 the invocation counts, not from the microbench's `hot_but_stuck=0`.
+
+## The third class this page owns: `pqc.jcajce.provider` is NOT resolved
+
+Handed over by the residual sweep as Residual 0. Measured on both arms with a
+**7200 s** cap — double the budget the original report used:
+
+| arm | result |
+|---|---|
+| HotSpot 25 | 271 s |
+| CratonVM, unmodified | **rc=124 at 7200 s** |
+| CratonVM, +fix | **rc=124 at 7200 s** |
+
+So this class does **not** finish inside two hours either way, and the SHA-256
+intrinsic does not rescue it. That is consistent with the decomposition above:
+`pqc.jcajce.provider` exercises ML-KEM / ML-DSA, which are SHAKE/Keccak and
+polynomial arithmetic, not SHA-256.
+
+**It is slow rather than stuck, but that is an observation and not a proof.**
+Its log had emitted 43 test verdicts (`......F..........F...`) when the cap
+fired, so it was still making forward progress — it is not wedged on the first
+test. What this page cannot say is that it *terminates*: nothing here ran it to
+completion, and an `rc=124` never distinguishes "blocked" from "slower than the
+budget". Unlike `lms.AllTests`, which was run to a real `OK (29 tests)`, this
+one stays open.
 
 ## What is NOT claimed
 

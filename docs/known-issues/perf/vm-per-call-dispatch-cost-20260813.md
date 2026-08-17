@@ -1,26 +1,56 @@
 # The VM-wide per-call cost, and why its profile does not convert into time
 
-**Status:** RETIRED 2026-08-13 — a characterisation, not an open defect. This is
-what was left of
-[the netty `io.netty.buffer` throughput page](netty-per-call-throughput-20260813.md)
-after its netty-specific half was closed. Nothing here is netty: it is the cost
-CratonVM pays on every transfer of control, measured on the netty classes
-because they are the densest call workload in the tree.
+**Status: OPEN — reopened 2026-08-17**, moved back here from the internal
+performance folder. It was retired on 2026-08-13 as "a characterisation, not an
+open defect"; that retirement is now the wrong shape, for two reasons, both
+measured since.
+
+**1. It is the named residual of live suite failures.** Three
+`docs/known-issues/netty` pages were retired on 2026-08-17 by
+`fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`,
+and every one of them hands its remainder to *this* page. The classes are still
+over the netty suite's 180 s per-class cap after that fix —
+`AdaptiveByteBufAllocatorTest` at 419-432 s against 635-725 s before,
+`JdkZlibIntegrationTest#testHugeDecompress` at 455-528 s against 1 063 s — and
+what is left is exactly the ~150-210 ns floor this page measures, paid per
+registered native call from compiled code. `MessageDigest.update(byte)` is the
+clean single-call specimen: **6.4 ns on HotSpot 25, ~170-210 ns here**, before
+and after the VarHandle work, which does not touch it. A page that is the
+stated cause of open suite failures belongs in `known-issues`, whatever its
+own conclusion says about tractability.
+
+**2. Its central conclusion has one counter-example now, and the distinction
+matters more than the number.** §3's finding — that removing instructions from
+this VM's dispatch does not convert into time, and that a percentage in a flat
+profile is a lead rather than a quantity — still stands for everything it
+tested. But the 2026-08-17 work found a case it does not cover: `VarHandle.get`
+cost 1 979 ns because the JIT's per-call-site native cache could not resolve a
+signature-polymorphic descriptor and cached that refusal forever. Its profile
+looked exactly like this page's — ~21% registry probing, ~16% `invoke_or_native`,
+nothing above 11% — and the fix was worth **12.8×**.
+
+> **A missing cache is not a percentage.** §3's rule applies to shaving work off
+> a path that runs; it does not apply to a path that should not be running at
+> all. The instrument that separates them is a *counter*, not a profile:
+> `CRATONVM_DBG=mic-prof`'s `hit_entry=0` beside a climbing `hit_noentry` said
+> in one run what four profiles could not, and
+> `CRATONVM_DBG=intrinsic-stats` prints the per-reason refusal tally that names
+> which gate declined. **Before sizing anything on this page, check that the
+> site cache is actually serving the call.**
 
 The one open item this page carried was §2's lever 2 — "a real fix is one lookup
 per invoke, handed down the chain" — together with the instruction to **get the
-per-invoke lookup COUNT before building it**. That count now exists
+per-invoke lookup COUNT before building it**. That count exists
 (`CRATONVM_DBG_NATIVE_LOOKUPS=1`), it has been taken, and §2.1 records what it
 says: the divisor is **~4.2**, worth ~1.5% of CPU on a box whose measurement
-floor is ~5%. The lever is real and it is too small to build. With that answered
-nothing here is actionable, so the page moves out of `known-issues` and stays as
-the reference it always was: what the number is, how it was measured, and which
-five hypotheses it rules out.
+floor is ~5%. **That lever is still real and still too small to build**, and
+nothing below has been retracted. What has changed is that this page is no
+longer the end of the road for the workloads that cite it — see the boxed
+caveat above for where the next reader should look first.
 
 **Read §3 before optimising anything on this page.** Two changes were made on
 2026-08-13 that removed ~5.5% and ~10% of the attributed profile samples
-respectively, and neither moved CPU by a measurable amount. A percentage in a
-flat profile of this VM is a lead, not a quantity.
+respectively, and neither moved CPU by a measurable amount.
 
 ## 1. The shape
 
@@ -223,7 +253,8 @@ This box runs many concurrent agents. Anything that needs better than ±20% must
 be ABBA-interleaved, repeated, and measured in CPU time on a fixed workload. A
 ratio against the same method body written in plain Java **in the same process**
 is the one figure immune to load, and is what
-[the ArrayList record](../fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md)
+the ArrayList record
+(`fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md`)
 quotes.
 
 A **count** is immune to load outright, which is why §2.1 is a count and not a
