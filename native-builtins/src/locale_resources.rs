@@ -786,6 +786,45 @@ pub(crate) fn cldr_collation_rule(
     if lang.is_empty() {
         return None;
     }
+    // Cache like `load_cldr_table` does, and for the same reason: the rule
+    // string is read by instantiating the bundle class and walking its
+    // `getContents()` array, which is far too expensive to repeat. A collation
+    // rule is asked for once per `Collator.getInstance`, and callers that build
+    // one per comparison are common.
+    let cache_key = format!("CollationRule|{lang}|{country}");
+    if let Ok(cache) = collation_rule_cache().lock() {
+        if let Some(hit) = cache.get(&cache_key) {
+            return hit.clone();
+        }
+    }
+    let found = cldr_collation_rule_uncached(ctx, lang, country);
+    if let Ok(mut cache) = collation_rule_cache().lock() {
+        cache.insert(cache_key, found.clone());
+    }
+    found
+}
+
+fn collation_rule_cache(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<String>>>
+{
+    static INSTANCE: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<
+            std::collections::HashMap<String, Option<String>>,
+        >,
+    > = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
+}
+
+fn cldr_collation_rule_uncached(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<String> {
     // Most specific first: a `_tr_TR` tailoring wins over `_tr`. Unlike the
     // CLDR chain there is nothing to merge — a bundle either carries the whole
     // `Rule` for that locale or does not exist.
