@@ -1156,6 +1156,15 @@ fn huc_real_perform(
                 e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
             ))
         }
+        // An application `HostnameVerifier` was consulted and answered `false`.
+        // MEASURED: a plain `java.io.IOException`, NOT the
+        // `SSLPeerUnverifiedException` above — see
+        // `TLS_HOSTNAME_REFUSED_SENTINEL` for the transcript and the JDK source
+        // line.
+        Err(ref e) if e.starts_with(TLS_HOSTNAME_REFUSED_SENTINEL) => Err(ioex(
+            e.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL)
+                .to_string(),
+        )),
         // A refused TCP connect (see `CONNECT_REFUSED_SENTINEL`'s doc) must
         // reach Java as `ConnectException`, not a generic IOException — real
         // code catches it specifically (see the type's own doc).
@@ -1653,6 +1662,54 @@ const TLS_HANDSHAKE_FAILURE_SENTINEL: &str = "__cratonvm_tls_handshake_failure__
 /// certificate is deterministic, so retrying would just run the app's verifier
 /// a second time and fail identically.
 const TLS_PEER_UNVERIFIED_SENTINEL: &str = "__cratonvm_tls_peer_unverified__: ";
+
+/// Prefix on an error string returned by [`perform`] when an application
+/// `HostnameVerifier` WAS consulted and answered `false`.
+///
+/// **A separate sentinel from [`TLS_PEER_UNVERIFIED_SENTINEL`] because HotSpot
+/// answers it with a different exception CLASS, which is the opposite of what
+/// this file assumed.** [`huc_unverified_peer_message`]'s doc used to argue
+/// that the three ways to reach a failed endpoint identification "cannot
+/// describe the same outcome three different ways" and gave all three one
+/// message. MEASURED 2026-08-17 on HotSpot 25.0.3+9-LTS over a live loopback
+/// TLS 1.3 handshake (`scratchpad/g31/HvCase.java`, one case per process so a
+/// refusal cannot poison the next row), they are three different outcomes:
+///
+/// ```text
+///   case      installed verifier      HotSpot getResponseCode()
+///   -----     --------------------    -----------------------------------------
+///   true      returns true            200
+///   false     returns false           java.io.IOException
+///                                       Wrong HTTPS hostname: should be <127.0.0.1>
+///   throws    throws ISE              java.lang.RuntimeException
+///                                       java.lang.IllegalStateException: verifier exploded
+///   none      none installed          javax.net.ssl.SSLHandshakeException
+///                                       (certificate_unknown) No subject alternative
+///                                       names matching IP address 127.0.0.1 found
+/// ```
+///
+/// The `false` row is the one this sentinel carries, and it is a PLAIN
+/// `java.io.IOException` — `sun.net.www.protocol.https.HttpsClient
+/// .checkURLSpoofing` ends with `throw new IOException(formatMsg("Wrong HTTPS
+/// hostname%s", ...))` (SOURCE-VERIFIED against `$JAVA_HOME/lib/src.zip`),
+/// having already closed the socket and invalidated the session. It is NOT an
+/// `SSLPeerUnverifiedException`: that type is what `checkURLSpoofing` CATCHES
+/// and swallows on its way to consulting the verifier, not what it throws
+/// afterwards. Code that catches `IOException` is unaffected either way; code
+/// that switches on the type — which is the shape a pinning test has — was
+/// being told the peer could not be authenticated when what actually happened
+/// is that its own verifier said no.
+///
+/// The `none` and `throws` rows are NOT served by this sentinel and remain
+/// divergent; both are NOMINATED in G31-1 because neither can be fixed in this
+/// file (one is a rustls-layer handshake message, the other needs `perform`'s
+/// `Result<_, String>` to carry a pending Java exception).
+///
+/// `perform_with_retry` must not retry this, for the same reason it must not
+/// retry [`TLS_PEER_UNVERIFIED_SENTINEL`]: a verifier's verdict on the same
+/// certificate is deterministic. It does not, because its retry arm matches two
+/// specific strings and this is neither.
+const TLS_HOSTNAME_REFUSED_SENTINEL: &str = "__cratonvm_tls_hostname_refused__: ";
 
 /// Prefix on an error string returned by [`perform`] when its TCP connect
 /// phase failed with `ConnectionRefused` specifically. `huc_real_perform`
@@ -2328,13 +2385,49 @@ fn huc_hostname_verifier(
 ///     once `f6028ba50` started honouring the stored verifier, and is the
 ///     defect this predicate exists to prevent.
 ///
-/// `None` (a receiver whose class cannot be named) is folded in here too: with
-/// no identifiable verifier there is nothing to consult, and real JSSE treats
-/// a null verifier as the default for the same reason.
+/// **`None` IS NOT ONE OF THEM, AND THAT WAS THE BUG.** This predicate used to
+/// fold `None` in, on the reasoning that *"with no identifiable verifier there
+/// is nothing to consult, and real JSSE treats a null verifier as the default
+/// for the same reason"*. The premise is true of a NULL verifier and false of
+/// the `None` this argument actually carries: the caller has already handled a
+/// null with its own `let ... else`, so by the time `None` reaches here a
+/// verifier object EXISTS and it is only its CLASS NAME that could not be
+/// resolved. Those are different facts, and the second one is a statement about
+/// this VM, not about the application.
+///
+/// MEASURED 2026-08-17 against HotSpot 25.0.3+9-LTS on a live TLS 1.3 loopback
+/// handshake (`scratchpad/g31/HvFamily.java`, `HvCase.java`, `HvLambda.java`;
+/// certificate carries a `localhost` dNSName SAN and deliberately no iPAddress
+/// SAN, so the URL `https://127.0.0.1:<port>/` fails the built-in check and the
+/// verifier is reached). Two verifiers, same connection shape, same request:
+///
+/// ```text
+///                                     HotSpot      CratonVM (before)
+///   named class  HvFamily$Rec          calls=1      calls=1   verifier=Some("HvFamily$Rec")
+///   lambda       (h,s) -> true         calls=1      calls=0   verifier=None
+/// ```
+///
+/// A lambda's runtime class is a hidden class; `class_name_of_id` answers
+/// `None` for it, this predicate read that as "the JDK's own default is
+/// installed", and the request was refused with `SSLPeerUnverifiedException`.
+/// Every `HostnameVerifier` written the way applications actually write them —
+/// and the one `RSslLiveSession.verifier` installs — took that path.
+///
+/// The alternative diagnosis, that the per-connection field read simply fails
+/// for a lambda, is RULED OUT rather than argued away. `HvLambda decide`
+/// installs a NAMED verifier process-wide via `setDefaultHostnameVerifier` AND
+/// a lambda on the connection: if the instance read had returned nothing,
+/// [`huc_hostname_verifier`]'s static fallback would have found the named one
+/// and called it. MEASURED on CratonVM: `namedDefault.calls = 0`. The instance
+/// read returned the lambda; only the naming failed.
+///
+/// So the two entries that remain are the only two that are genuinely "no
+/// application verifier is installed", and both are named by a class this VM
+/// can always resolve.
 fn is_default_hostname_verifier(name: Option<&str>) -> bool {
     matches!(
         name,
-        None | Some("javax/net/ssl/HostnameVerifier")
+        Some("javax/net/ssl/HostnameVerifier")
             | Some("javax/net/ssl/HttpsURLConnection$DefaultHostnameVerifier")
     )
 }
@@ -2499,7 +2592,19 @@ fn huc_verify_hostname(
         None => None,
     };
     if crate::nbflags().dbg_tls_auth_ok {
-        eprintln!("[dbg-tls-auth] huc_verify_hostname verifier={verifier_class:?}");
+        // The two `None`s are printed DIFFERENTLY, and that is not cosmetic.
+        // This line used to render `verifier_class` alone, so "no verifier
+        // object was found" and "a verifier object was found whose class this
+        // VM cannot name" both printed `verifier=None` — and the second is the
+        // lambda defect [`is_default_hostname_verifier`] documents. A debug
+        // line that cannot separate a missing thing from an unnameable one is
+        // how that defect stayed hidden behind a trace that was already on.
+        let shown = match (verifier0, verifier_class.as_deref()) {
+            (None, _) => "<none installed>".to_string(),
+            (Some(_), Some(n)) => n.to_string(),
+            (Some(_), None) => "<installed, class name unresolvable>".to_string(),
+        };
+        eprintln!("[dbg-tls-auth] huc_verify_hostname verifier={shown}");
     }
     let Some(verifier0) = verifier0 else {
         return Err(huc_unverified_peer_message(host));
@@ -2586,7 +2691,12 @@ fn huc_verify_hostname(
 
     match outcome {
         Ok(Some(v)) if v.as_int().unwrap_or(0) != 0 => Ok(()),
-        Ok(_) => Err(huc_unverified_peer_message(host)),
+        // The verifier was consulted and DECLINED. MEASURED on HotSpot: a plain
+        // `java.io.IOException` carrying `Wrong HTTPS hostname: should be
+        // <host>` — a different class and a different sentence from the
+        // "nothing was installed" exit below, which this arm used to share. See
+        // [`TLS_HOSTNAME_REFUSED_SENTINEL`] for the transcript.
+        Ok(_) => Err(huc_verifier_declined_message(host)),
         Err(_) => Err(format!(
             "{TLS_PEER_UNVERIFIED_SENTINEL}the installed HostnameVerifier threw while \
              verifying <{host}>; treating the peer as unverified"
@@ -2594,12 +2704,49 @@ fn huc_verify_hostname(
     }
 }
 
-/// The one rejection message for a failed endpoint identification, shared by
-/// every exit in `huc_verify_hostname` so the three ways to get there (no
-/// verifier installed, a default stand-in, an app verifier that declined)
-/// cannot describe the same outcome three different ways. Wording follows real
-/// JSSE's `checkURLSpoofing` ("should be <host>"), which likewise reports the
-/// hostname mismatch rather than naming the verifier.
+/// HotSpot's refusal when an application `HostnameVerifier` was consulted and
+/// answered `false`, transcribed rather than composed.
+///
+/// The wording is `HttpsClient.checkURLSpoofing`'s own — `formatMsg("Wrong
+/// HTTPS hostname%s", filterNonSocketInfo(url.getHost()).prefixWith(": should
+/// be <").suffixWith(">"))`, which renders as
+/// `Wrong HTTPS hostname: should be <127.0.0.1>` (MEASURED on this host, and
+/// the source line is in `$JAVA_HOME/lib/src.zip`). Note it names ONLY the
+/// host: no certificate, no subject alternative names, no mention of the
+/// verifier. That is the whole message, and the difference from
+/// [`huc_unverified_peer_message`] is deliberate on HotSpot's part — one says
+/// the certificate did not match, the other says the application refused it.
+fn huc_verifier_declined_message(host: &str) -> String {
+    format!("{TLS_HOSTNAME_REFUSED_SENTINEL}Wrong HTTPS hostname: should be <{host}>")
+}
+
+/// The rejection message for a failed endpoint identification with NO
+/// application verifier to fall back on — either none was installed, or the one
+/// installed is a JDK/VM default stand-in.
+///
+/// **It is no longer shared with the "an app verifier declined" exit, and the
+/// note that used to justify sharing it was wrong.** That note said the three
+/// ways to reach a failed identification "cannot describe the same outcome
+/// three different ways". MEASURED (see [`TLS_HOSTNAME_REFUSED_SENTINEL`]),
+/// HotSpot describes them as three DIFFERENT outcomes with three different
+/// exception classes, because they are three different facts: the certificate
+/// did not match; the application refused it; the application's verifier blew
+/// up. Collapsing them was a decision about tidiness taken where a measurement
+/// was available and had not been made.
+///
+/// This exit's own HotSpot answer is still divergent and deliberately left so:
+/// on HotSpot nothing reaches here at all, because with only the default
+/// verifier installed JSSE performs endpoint identification INSIDE the
+/// handshake (`setEndpointIdentificationAlgorithm("HTTPS")`) and the connection
+/// fails as `SSLHandshakeException: (certificate_unknown) No subject
+/// alternative names matching IP address 127.0.0.1 found`. CratonVM cannot
+/// raise that here — it is a rustls-layer handshake abort, and this VM
+/// deliberately re-derives endpoint identification AFTER the handshake because
+/// rustls skips it whenever the application supplied Java `TrustManager`s (see
+/// [`huc_builtin_endpoint_identification`]). NOMINATED in G31-1 against the TLS
+/// layer rather than papered over here: the message can be copied, the
+/// TIMING — failing before any application code sees a connected socket —
+/// cannot.
 fn huc_unverified_peer_message(host: &str) -> String {
     format!(
         "{TLS_PEER_UNVERIFIED_SENTINEL}Certificate for <{host}> does not match any of the \
@@ -3629,6 +3776,15 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
                 ctx,
                 "javax/net/ssl/SSLPeerUnverifiedException",
                 e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
+            ));
+        }
+        // See the matching arm in `huc_real_perform`: a verifier that answered
+        // `false` is a plain `IOException`. Registered on this path too so
+        // `connect()` and `getResponseCode()` cannot disagree about the type.
+        Err(ref e) if e.starts_with(TLS_HOSTNAME_REFUSED_SENTINEL) => {
+            return Err(ioex(
+                e.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL)
+                    .to_string(),
             ));
         }
         Err(e) => return Err(ioex(format!("HttpURLConnection.connect failed: {e}"))),
@@ -5554,5 +5710,95 @@ mod http_url_connection_tests {
             .map(|b| b.len())
             .unwrap_or(0);
         assert_eq!(len, POOL_MAX_PER_KEY);
+    }
+
+    // -----------------------------------------------------------------------
+    // G31 — the per-connection `HostnameVerifier` that was never asked
+    //
+    // Rows measured 2026-08-17 against HotSpot 25.0.3+9-LTS over a live
+    // loopback TLS 1.3 handshake (`scratchpad/g31/HvFamily.java`,
+    // `HvCase.java`, `HvLambda.java`), one case per process.
+    // -----------------------------------------------------------------------
+
+    /// THE REGRESSION GUARD. `None` means "a verifier object exists whose class
+    /// this VM could not name" by the time it reaches this predicate — the
+    /// caller has already dealt with "no verifier at all" — and a lambda is
+    /// exactly that. Reading it as "the JDK default is installed" refused every
+    /// connection whose application verifier was written as a lambda.
+    ///
+    /// MEASURED, same connection shape, same request, HotSpot vs CratonVM:
+    /// a named-class verifier was called on both (`calls=1`); a lambda was
+    /// called on HotSpot and NOT on CratonVM (`calls=0`).
+    #[test]
+    fn an_unnameable_verifier_is_not_a_default_stand_in() {
+        assert!(
+            !is_default_hostname_verifier(None),
+            "a verifier whose class name could not be resolved is an APPLICATION \
+             verifier (a lambda), not a JDK default — MEASURED: HotSpot calls it"
+        );
+    }
+
+    /// The two entries that are genuinely "nothing application-specific is
+    /// installed", and a sample of the shapes that are not. Both survivors are
+    /// named by classes this VM always resolves, which is why the predicate can
+    /// afford to be a name match at all.
+    #[test]
+    fn the_two_default_stand_ins_are_the_only_ones() {
+        assert!(is_default_hostname_verifier(Some(
+            "javax/net/ssl/HttpsURLConnection$DefaultHostnameVerifier"
+        )));
+        assert!(is_default_hostname_verifier(Some(
+            "javax/net/ssl/HostnameVerifier"
+        )));
+        // MEASURED: `HvFamily$Rec` is consulted on both VMs.
+        assert!(!is_default_hostname_verifier(Some("HvFamily$Rec")));
+        // A third-party permissive verifier must still be consulted.
+        assert!(!is_default_hostname_verifier(Some(
+            "org/apache/http/conn/ssl/NoopHostnameVerifier"
+        )));
+    }
+
+    /// A verifier that DECLINED and a certificate that never matched are two
+    /// different facts, and HotSpot reports them with two different exception
+    /// classes and two different sentences. The messages are transcribed, so
+    /// they are asserted character for character.
+    #[test]
+    fn a_declined_verifier_and_an_unmatched_certificate_read_differently() {
+        let declined = huc_verifier_declined_message("127.0.0.1");
+        // MEASURED: java.io.IOException | Wrong HTTPS hostname: should be <127.0.0.1>
+        assert_eq!(
+            declined.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL),
+            "Wrong HTTPS hostname: should be <127.0.0.1>"
+        );
+        assert!(
+            declined.starts_with(TLS_HOSTNAME_REFUSED_SENTINEL),
+            "the declined exit must route to the plain-IOException sentinel, not the \
+             SSLPeerUnverifiedException one"
+        );
+        let unmatched = huc_unverified_peer_message("127.0.0.1");
+        assert!(unmatched.starts_with(TLS_PEER_UNVERIFIED_SENTINEL));
+        assert_ne!(
+            declined.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL),
+            unmatched.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
+            "MEASURED: HotSpot gives these two exits different messages"
+        );
+    }
+
+    /// The two sentinels must stay distinguishable by prefix, or the arm that
+    /// picks the exception class would match the wrong one. They share no
+    /// prefix relation in either direction.
+    #[test]
+    fn the_tls_sentinels_do_not_shadow_each_other() {
+        for (a, b) in [
+            (TLS_HOSTNAME_REFUSED_SENTINEL, TLS_PEER_UNVERIFIED_SENTINEL),
+            (
+                TLS_HOSTNAME_REFUSED_SENTINEL,
+                TLS_HANDSHAKE_FAILURE_SENTINEL,
+            ),
+            (TLS_HOSTNAME_REFUSED_SENTINEL, CONNECT_REFUSED_SENTINEL),
+        ] {
+            assert!(!a.starts_with(b), "{a} must not start with {b}");
+            assert!(!b.starts_with(a), "{b} must not start with {a}");
+        }
     }
 }

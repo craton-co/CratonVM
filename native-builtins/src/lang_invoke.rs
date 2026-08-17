@@ -753,6 +753,308 @@ pub(crate) fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String
     Some((params, desc[i + 1..].to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// `MethodHandle.asType` CONVERTIBILITY — the pairwise rule, and the closed
+// table it rests on
+// ---------------------------------------------------------------------------
+//
+// `asType` is the gate every JDK adapter goes through, and it had NO check at
+// all here until 2026-08-17: the native wrote the requested `MethodType` into
+// the receiver's `type` field and handed the receiver back, so a
+// `(String)String` handle happily became a `(int,int)int` one. That is the
+// single missing assertion in `RJdkProxyIface` — `MethodHandleProxies
+// .asInterfaceInstance(Subtractor.class, <(String)String handle>)` returned a
+// live proxy where HotSpot refuses.
+//
+// The rule below is a TRANSCRIPTION of `java.lang.invoke.MethodType.canConvert`
+// (JDK 25 `src.zip`, lines 1078-1128) and `MethodType.isConvertibleTo` (986),
+// checked cell by cell against a 613-row sweep of HotSpot 25.0.3+9-LTS on this
+// host (`scratchpad/g31/AsTypeFamily.java`, `AsTypeExtra.java`; the matrices
+// are printed in full in
+// `docs/known-issues/jdk-only/G31-1-astype-and-the-verifier-that-was-never-asked-20260817.md`).
+//
+// The three things that sweep settled, none of which is guessable:
+//
+//   1. **Reference -> reference is ALWAYS convertible.** `String -> Integer`,
+//      `int[] -> String`, `Void -> Comparable` — every one is accepted, because
+//      `null` is always dynamically valid and the cast is deferred to invoke
+//      time. Only the primitive edges refuse.
+//   2. **`void` is convertible in BOTH directions**, as a return type: to
+//      `void` the value is dropped, from `void` a zero/null is introduced. The
+//      whole `void` row and the whole `void` column of the return matrix are
+//      accepts.
+//   3. **`explicitCastArguments` has DIFFERENT rules and is the trap.** Its
+//      324-cell return matrix and 289-cell parameter matrix are accepts in
+//      EVERY cell; it refuses on arity alone. Applying this predicate there
+//      would refuse 248 pairs HotSpot accepts, so [`register_p65_extras`]'s
+//      body checks arity and nothing else.
+//
+// Everything here is a pure function of descriptor strings so it is unit
+// testable without a VM, which is the only way it could be checked at all in a
+// lane that may not build.
+
+/// The wrapper class descriptor `MethodType.canConvert` boxes a primitive to.
+///
+/// `V` is deliberately absent: `canConvert` short-circuits `void` before it
+/// ever reaches the boxing arm, and `Void` is NOT a wrapper for the purposes of
+/// the reference->primitive arm (MEASURED: `Void` unboxes to no primitive —
+/// every cell of its row is a refusal).
+fn wrapper_desc_for_primitive(prim: &str) -> Option<&'static str> {
+    Some(match prim {
+        "Z" => "Ljava/lang/Boolean;",
+        "B" => "Ljava/lang/Byte;",
+        "C" => "Ljava/lang/Character;",
+        "S" => "Ljava/lang/Short;",
+        "I" => "Ljava/lang/Integer;",
+        "J" => "Ljava/lang/Long;",
+        "F" => "Ljava/lang/Float;",
+        "D" => "Ljava/lang/Double;",
+        _ => return None,
+    })
+}
+
+/// The inverse of [`wrapper_desc_for_primitive`] — `Wrapper.isWrapperType(src)`
+/// plus `Wrapper.forWrapperType(src)` in one lookup, which is exactly how
+/// `canConvert`'s third reference->primitive test uses it.
+fn primitive_desc_for_wrapper(wrapper: &str) -> Option<&'static str> {
+    Some(match wrapper {
+        "Ljava/lang/Boolean;" => "Z",
+        "Ljava/lang/Byte;" => "B",
+        "Ljava/lang/Character;" => "C",
+        "Ljava/lang/Short;" => "S",
+        "Ljava/lang/Integer;" => "I",
+        "Ljava/lang/Long;" => "J",
+        "Ljava/lang/Float;" => "F",
+        "Ljava/lang/Double;" => "D",
+        _ => return None,
+    })
+}
+
+/// JLS 5.1.2 widening primitive conversion, plus identity — `Wrapper
+/// .forPrimitiveType(dst).isConvertibleFrom(sw)`.
+///
+/// `boolean` widens to nothing and nothing widens to it; `char` widens to
+/// `int`/`long`/`float`/`double` but NOT to `short`, and `byte`/`short` do not
+/// widen to `char`. All three asymmetries are in the measured matrix.
+fn primitive_widens_to(from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    let wider: &[&str] = match from {
+        "B" => &["S", "I", "J", "F", "D"],
+        "S" => &["I", "J", "F", "D"],
+        "C" => &["I", "J", "F", "D"],
+        "I" => &["J", "F", "D"],
+        "J" => &["F", "D"],
+        "F" => &["D"],
+        // `Z` and `V` widen to nothing.
+        _ => &[],
+    };
+    wider.contains(&to)
+}
+
+/// `reference.isAssignableFrom(wrapper)` for the eight wrapper classes — the
+/// only assignability question `canConvert` ever asks.
+///
+/// This is a CLOSED table, not an approximation, and that is what makes it
+/// usable without a class-hierarchy walk (`NativeContext` offers `is_subclass`,
+/// which cannot answer for interfaces, and `Comparable`/`Serializable`/
+/// `Constable`/`ConstantDesc` are all interfaces). The wrappers are `final`,
+/// so nothing outside `java.base` can ever be one of their supertypes.
+/// Enumerated by reflection on HotSpot 25.0.3+9 (`scratchpad/g31/Sup.java`)
+/// and cross-checked against the measured conversion matrix:
+///
+/// ```text
+///   Boolean   <: Object Comparable Serializable Constable
+///   Character <: Object Comparable Serializable Constable
+///   Byte      <: Object Comparable Serializable Constable Number
+///   Short     <: Object Comparable Serializable Constable Number
+///   Integer   <: Object Comparable Serializable Constable Number ConstantDesc
+///   Long      <: Object Comparable Serializable Constable Number ConstantDesc
+///   Float     <: Object Comparable Serializable Constable Number ConstantDesc
+///   Double    <: Object Comparable Serializable Constable Number ConstantDesc
+///   Void      <: Object                                                (only)
+/// ```
+///
+/// `ConstantDesc` covering four wrappers and not six is the row that would have
+/// been got wrong by inspection: `Byte` and `Short` are `Constable` but NOT
+/// `ConstantDesc`, and the measured matrix agrees (`ConstantDesc` accepts
+/// `int`/`long`/`float`/`double` and refuses `byte`/`short`/`char`/`boolean`).
+fn reference_accepts_wrapper(reference: &str, wrapper: &str) -> bool {
+    if reference == wrapper {
+        return true;
+    }
+    match reference {
+        "Ljava/lang/Object;" => true,
+        "Ljava/lang/Comparable;" | "Ljava/io/Serializable;" | "Ljava/lang/constant/Constable;" => {
+            primitive_desc_for_wrapper(wrapper).is_some()
+        }
+        "Ljava/lang/Number;" => matches!(
+            wrapper,
+            "Ljava/lang/Byte;"
+                | "Ljava/lang/Short;"
+                | "Ljava/lang/Integer;"
+                | "Ljava/lang/Long;"
+                | "Ljava/lang/Float;"
+                | "Ljava/lang/Double;"
+        ),
+        "Ljava/lang/constant/ConstantDesc;" => matches!(
+            wrapper,
+            "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Float;" | "Ljava/lang/Double;"
+        ),
+        _ => false,
+    }
+}
+
+/// True when a descriptor token names one of the nine primitive types
+/// (`void` included — `canConvert` handles it, so it must reach the arms).
+fn is_primitive_descriptor(tok: &str) -> bool {
+    matches!(tok, "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" | "V")
+}
+
+/// `MethodType.canConvert(src, dst)`, transcribed arm for arm.
+///
+/// Read it against the JDK source rather than against intuition: the third
+/// reference->primitive test (`isWrapperType(src) && dw.isConvertibleFrom(...)`)
+/// is what makes `Byte -> short` and `Character -> int` convertible while
+/// `Number -> char` is not, and dropping it silently narrows 20 accepted cells
+/// into refusals.
+fn mh_can_convert(src: &str, dst: &str) -> bool {
+    // Short-circuits, in the JDK's own order.
+    if src == dst || src == "Ljava/lang/Object;" || dst == "Ljava/lang/Object;" {
+        return true;
+    }
+    if is_primitive_descriptor(src) {
+        // `void` forces to an explicit null or a primitive zero.
+        if src == "V" {
+            return true;
+        }
+        let Some(sw) = wrapper_desc_for_primitive(src) else {
+            return false;
+        };
+        if is_primitive_descriptor(dst) {
+            // P -> P must widen — except to `void`, which accepts every
+            // primitive. The JDK spells that as `Wrapper.VOID
+            // .isConvertibleFrom(sw)`; MEASURED, the whole `void` COLUMN of
+            // the return matrix is accepts, so it is spelled out here rather
+            // than folded into `primitive_widens_to`, where a `V` entry would
+            // wrongly claim `void` is a widening of `int` in both directions.
+            if dst == "V" {
+                return true;
+            }
+            return primitive_widens_to(src, dst);
+        }
+        // P -> R must box and widen.
+        return reference_accepts_wrapper(dst, sw);
+    }
+    if is_primitive_descriptor(dst) {
+        // Any value can be dropped.
+        if dst == "V" {
+            return true;
+        }
+        let Some(dw) = wrapper_desc_for_primitive(dst) else {
+            return false;
+        };
+        // R -> P must be able to unbox from a dynamically chosen type: the
+        // wrapper must be cast-compatible with the source.
+        if reference_accepts_wrapper(src, dw) {
+            return true;
+        }
+        // ... or the source is strongly typed to a wrapper whose primitive
+        // widens to the destination (`Byte -> short`, `Character -> int`).
+        if let Some(sp) = primitive_desc_for_wrapper(src) {
+            return primitive_widens_to(sp, dst);
+        }
+        return false;
+    }
+    // R -> R always works, since null is always valid dynamically.
+    true
+}
+
+/// `MethodType.isConvertibleTo` on two method descriptors — the whole-signature
+/// predicate `asType` gates on.
+///
+/// **The parameter direction is reversed and that is not a typo.** The RETURN
+/// value travels old -> new (the callee produces it, the caller receives it);
+/// each PARAMETER travels new -> old (the caller supplies it, the callee
+/// receives it). Getting this backwards passes the primitive-widening rows and
+/// fails on every narrowing one, which is a diff that looks like an off-by-one
+/// rather than a reversal.
+///
+/// Arity is checked first and exactly: `asType` never adds or drops a
+/// parameter (`asCollector`/`asSpreader`/`bindTo` do), so all five measured
+/// arity rows refuse.
+fn method_type_is_convertible_to(old_desc: &str, new_desc: &str) -> Option<bool> {
+    let (old_params, old_ret) = split_descriptor_params(old_desc)?;
+    let (new_params, new_ret) = split_descriptor_params(new_desc)?;
+    if old_params.len() != new_params.len() {
+        return Some(false);
+    }
+    if !mh_can_convert(&old_ret, &new_ret) {
+        return Some(false);
+    }
+    for (new_p, old_p) in new_params.iter().zip(old_params.iter()) {
+        if !mh_can_convert(new_p, old_p) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// One descriptor token in `Class.getSimpleName()` spelling, which is what
+/// `MethodType.toString()` prints and therefore what the exception message
+/// carries: `[I` -> `int[]`, `Ljava/util/Map$Entry;` -> `Entry`.
+///
+/// MEASURED, so the message can be transcribed rather than composed:
+/// `MethodType.methodType(int[].class, String[].class, Object[][].class)`
+/// prints `(String[],Object[][])int[]`, and a nested class prints its inner
+/// name alone (`(Entry)Inner`).
+fn descriptor_simple_name(tok: &str) -> Option<String> {
+    let dims = tok.bytes().take_while(|b| *b == b'[').count();
+    let base = &tok[dims..];
+    let name = match base {
+        "Z" => "boolean".to_string(),
+        "B" => "byte".to_string(),
+        "C" => "char".to_string(),
+        "S" => "short".to_string(),
+        "I" => "int".to_string(),
+        "J" => "long".to_string(),
+        "F" => "float".to_string(),
+        "D" => "double".to_string(),
+        "V" => "void".to_string(),
+        other => {
+            let inner = other.strip_prefix('L')?.strip_suffix(';')?;
+            if inner.is_empty() {
+                return None;
+            }
+            inner
+                .rsplit(['/', '$'])
+                .next()
+                .filter(|s| !s.is_empty())?
+                .to_string()
+        }
+    };
+    Some(name + &"[]".repeat(dims))
+}
+
+/// A method descriptor in `MethodType.toString()` spelling — `(int,String)void`.
+///
+/// `None` when any token cannot be named, so a caller can decline to compose a
+/// half-rendered message rather than print a signature with a `?` in it.
+fn method_type_display(desc: &str) -> Option<String> {
+    let (params, ret) = split_descriptor_params(desc)?;
+    let mut out = String::from("(");
+    for (i, p) in params.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&descriptor_simple_name(p)?);
+    }
+    out.push(')');
+    out.push_str(&descriptor_simple_name(&ret)?);
+    Some(out)
+}
+
 /// The heap array kind an array whose COMPONENT descriptor is `comp` must have.
 ///
 /// Anything that is not one of the eight primitive tokens — including `[…` and
@@ -950,6 +1252,100 @@ fn mh_type_descriptor(ctx: &mut dyn NativeContext, mh: ObjectRef) -> Option<Stri
         }
     }
     mh_read_desc(ctx, mh)
+}
+
+/// The `WrongMethodTypeException` `mh.asType(newType)` must raise, or `None`
+/// when the conversion is one HotSpot performs.
+///
+/// Every way of not knowing is an ACCEPT. The check needs four things to hold
+/// before it will refuse — the receiver's `type` field must be a real
+/// `MethodType`, both descriptors must parse, the raw bytecode descriptor must
+/// agree that the conversion is impossible, and both signatures must render —
+/// and if any of them fails this returns `None` and the passthrough proceeds
+/// exactly as it did before. A missing refusal is the state this VM was already
+/// in; a refusal HotSpot does not issue would break working `invokedynamic`
+/// call sites, and there is no ordering of those two errors in which the second
+/// is the better one.
+///
+/// The raw-descriptor step is the one that is not obvious: see the block
+/// comment on the `asType` registration for why this body's own type mutation
+/// makes a second `asType` on the same reference look unconvertible when
+/// HotSpot, which hands out a fresh handle each time, would still be looking at
+/// the original signature.
+///
+/// The message is HotSpot's, transcribed from
+/// `MethodHandle.asTypeUncached` — `"cannot convert " + this + " to " + newType`
+/// where `MethodHandle.toString()` is the literal `MethodHandle` followed
+/// immediately by its `MethodType`, e.g.
+/// `cannot convert MethodHandle(String)String to (int,int)int`. There is no
+/// space after `MethodHandle`, and both signatures use simple type names.
+fn mh_astype_refusal(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    new_type: ObjectRef,
+) -> Option<MethodCallFailed> {
+    // A real `MethodType` receiver only. `mh_type_descriptor` would fall back
+    // to `MH_DESC`, which is the UNADAPTED signature — refusing on it would
+    // refuse adapters that are already legal.
+    let old_desc = match ctx.get_field_by_name(mh, "type") {
+        Value::Object(Some(mt)) => methodtype_to_descriptor(ctx, mt)?,
+        _ => return None,
+    };
+    let new_desc = methodtype_to_descriptor(ctx, new_type)?;
+    if method_type_is_convertible_to(&old_desc, &new_desc)? {
+        return None;
+    }
+    // Our own aliasing, not a conversion HotSpot refuses.
+    if let Some(raw) = mh_read_desc(ctx, mh) {
+        if method_type_is_convertible_to(&raw, &new_desc) == Some(true) {
+            return None;
+        }
+    }
+    let old_shown = method_type_display(&old_desc)?;
+    let new_shown = method_type_display(&new_desc)?;
+    Some(crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/invoke/WrongMethodTypeException",
+        &format!("cannot convert MethodHandle{old_shown} to {new_shown}"),
+    ))
+}
+
+/// The `WrongMethodTypeException`
+/// `MethodHandles.explicitCastArguments(target, newType)` must raise, or `None`.
+///
+/// Same shape and the same "every way of not knowing is an accept" rule as
+/// [`mh_astype_refusal`], and the same reason for the raw-descriptor escape —
+/// but the PREDICATE is different, and deliberately so: parameter count and
+/// nothing else. See the registration's comment for the measurement.
+fn mh_explicit_cast_refusal(
+    ctx: &mut dyn NativeContext,
+    target: ObjectRef,
+    new_type: ObjectRef,
+) -> Option<MethodCallFailed> {
+    let old_desc = match ctx.get_field_by_name(target, "type") {
+        Value::Object(Some(mt)) => methodtype_to_descriptor(ctx, mt)?,
+        _ => return None,
+    };
+    let new_desc = methodtype_to_descriptor(ctx, new_type)?;
+    let (old_params, _) = split_descriptor_params(&old_desc)?;
+    let (new_params, _) = split_descriptor_params(&new_desc)?;
+    if old_params.len() == new_params.len() {
+        return None;
+    }
+    if let Some(raw) = mh_read_desc(ctx, target) {
+        if let Some((raw_params, _)) = split_descriptor_params(&raw) {
+            if raw_params.len() == new_params.len() {
+                return None;
+            }
+        }
+    }
+    let old_shown = method_type_display(&old_desc)?;
+    let new_shown = method_type_display(&new_desc)?;
+    Some(crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/invoke/WrongMethodTypeException",
+        &format!("cannot explicitly cast MethodHandle{old_shown} to {new_shown}"),
+    ))
 }
 
 /// WP2.9 — Robust class-name extraction that survives the descriptor-coercion
@@ -7401,6 +7797,21 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     // strict `explicitCastArgumentsChecks` that rejects synthetic handles whose
     // MethodType doesn't match the JDK form (WrongMethodTypeException). STATIC:
     // args[0]=target MH, args[1]=newType.
+    //
+    // G31 — **ARITY ONLY, and that is the whole finding.** It is tempting to
+    // reuse `asType`'s convertibility predicate here because the two methods
+    // sit beside each other in `MethodHandles` and read alike. MEASURED on
+    // HotSpot 25.0.3+9 over the same 613-cell sweep that produced `asType`'s
+    // matrices: `explicitCastArguments` accepts **every** type pair in both the
+    // return and the parameter position — `String -> boolean`, `double -> char`,
+    // `int[] -> long`, all of them — because it inserts an explicit cast (a
+    // primitive narrowing, an unbox-or-zero, a checked reference cast) instead
+    // of demanding the conversion be lossless. Its only refusal is a parameter
+    // COUNT mismatch. Applying `asType`'s rule here would refuse 248 pairs
+    // HotSpot performs.
+    //
+    // The message is its own, transcribed: `cannot explicitly cast
+    // MethodHandle(int)void to ()void` — "explicitly cast", not "convert".
     r.register(
         "java/lang/invoke/MethodHandles",
         "explicitCastArguments",
@@ -7409,7 +7820,11 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             if let (Some(Value::Object(Some(t))), Some(Value::Object(Some(mt)))) =
                 (args.first(), args.get(1))
             {
-                ctx.set_field_by_name(*t, "type", Value::Object(Some(*mt)));
+                let (t, mt) = (*t, *mt);
+                if let Some(refusal) = mh_explicit_cast_refusal(ctx, t, mt) {
+                    return Err(refusal);
+                }
+                ctx.set_field_by_name(t, "type", Value::Object(Some(mt)));
             }
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
@@ -11488,6 +11903,33 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // MethodType into the `type` field so subsequent JDK-internal reads of
     // `mh.type()` / `parameterSlotCount` reflect the adapted signature.
     // invoke()/invokeExact handle the actual argument coercions.
+    //
+    // G31: and REFUSE the conversions HotSpot refuses, which this body did not
+    // do at all. See [`mh_can_convert`] for the transcribed rule and the sweep
+    // it was checked against. Two things about the shape of the refusal here:
+    //
+    // **It is gated on both descriptors, and on a REAL `MethodType` receiver.**
+    // The check only runs when the handle's `type` field holds a MethodType
+    // this file can turn back into a descriptor and the requested MethodType
+    // does too. A handle whose type is the `MH_DESC` fallback is left alone:
+    // that descriptor is the raw bytecode signature, not the adapted one, and
+    // refusing on it would refuse conversions HotSpot allows.
+    //
+    // **It never refuses where the divergence is OURS.** HotSpot's `asType`
+    // returns a NEW handle and leaves the receiver's `type()` untouched
+    // (MEASURED: `identity(int).asType((int)long)` answers `(int)long` while
+    // the receiver still answers `(int)int`, and the two are different
+    // objects). This body has always had ONE object, so a second `asType` on
+    // the same reference sees the FIRST one's adapted type where HotSpot would
+    // still see the original. Adding a check on top of that aliasing would
+    // manufacture refusals HotSpot never issues, so a conversion that the raw
+    // `MH_DESC` signature would have allowed is accepted even when the mutated
+    // `type` field forbids it. That is a deliberate UNDER-refusal in exactly
+    // the cases the aliasing creates, and it cannot turn an accept into a
+    // refusal. Collapsing the aliasing (minting a real second handle) is
+    // NOMINATED in G31-1, not done here: it would have to reproduce every
+    // synthetic dispatch slot of an arbitrary handle kind, and this lane could
+    // not build the VM to find out what that breaks.
     r.register(
         mh,
         "asType",
@@ -11508,10 +11950,32 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                     return Ok(Some(args[0]));
                 }
             }
+            // `asType(null)`. MEASURED on HotSpot 25.0.3+9, transcribed rather
+            // than composed — it is the helpful-NPE text for the first field
+            // read `asTypeUncached` performs on `newType`:
+            //   java.lang.NullPointerException: Cannot invoke
+            //   "java.lang.invoke.MethodType.form()" because "newType" is null
+            // This body used to hand the receiver straight back for a null
+            // argument, which is the silent-lie shape: a caller asking for an
+            // adaptation it did not describe got an unadapted handle.
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(
+                        "Cannot invoke \"java.lang.invoke.MethodType.form()\" because \
+                         \"newType\" is null"
+                            .to_string(),
+                    ),
+                }
+                .into());
+            }
             if let (Some(Value::Object(Some(this))), Some(Value::Object(Some(mt)))) =
                 (args.first(), args.get(1))
             {
-                ctx.set_field_by_name(*this, "type", Value::Object(Some(*mt)));
+                let (this, mt) = (*this, *mt);
+                if let Some(refusal) = mh_astype_refusal(ctx, this, mt) {
+                    return Err(refusal);
+                }
+                ctx.set_field_by_name(this, "type", Value::Object(Some(mt)));
             }
             Ok(Some(args[0]))
         },
@@ -14920,6 +15384,256 @@ mod tests {
         assert_eq!(
             lk_member_access_flags(&ctx, mirror, "inherited", false),
             Some(ACC_PUBLIC_U16)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // G31 — `MethodHandle.asType` CONVERTIBILITY
+    //
+    // Every assertion below is a cell of a sweep MEASURED on HotSpot
+    // 25.0.3+9-LTS (`scratchpad/g31/AsTypeFamily.java`, `AsTypeExtra.java`;
+    // 613 + 304 cells). The predicate is a pure function of descriptor
+    // strings, so the whole rule is testable with no mock and no VM — which is
+    // the only reason it could be checked at all by a lane forbidden to build.
+    //
+    // The rows chosen here are the ones a plausible WRONG implementation
+    // passes the rest of the matrix while failing: the two direction traps,
+    // the three primitive asymmetries, the `ConstantDesc` split, and the
+    // reference-to-reference blanket accept.
+    // -----------------------------------------------------------------------
+
+    /// The blanket rule that is easiest to disbelieve: `asType` accepts EVERY
+    /// reference-to-reference pair, however unrelated, because the cast is
+    /// deferred to invoke time and `null` is always dynamically valid.
+    #[test]
+    fn reference_to_reference_is_always_convertible() {
+        // MEASURED: R String -> Integer = ok, R int[] -> String = ok,
+        //           R Void -> Comparable = ok
+        for (a, b) in [
+            ("Ljava/lang/String;", "Ljava/lang/Integer;"),
+            ("[I", "Ljava/lang/String;"),
+            ("Ljava/lang/Void;", "Ljava/lang/Comparable;"),
+            ("Ljava/lang/Runnable;", "[[Ljava/lang/Object;"),
+        ] {
+            assert!(
+                mh_can_convert(a, b),
+                "MEASURED ok on HotSpot: {a} -> {b} must be convertible"
+            );
+        }
+    }
+
+    /// `void` is convertible in BOTH directions as a return type — the value is
+    /// dropped one way, a zero/null introduced the other. The whole `void` row
+    /// and the whole `void` column of the measured return matrix are accepts.
+    #[test]
+    fn void_converts_in_both_directions() {
+        for t in ["Z", "I", "D", "Ljava/lang/String;", "[I"] {
+            assert!(mh_can_convert("V", t), "MEASURED: void -> {t} = ok");
+            assert!(mh_can_convert(t, "V"), "MEASURED: {t} -> void = ok");
+        }
+    }
+
+    /// The three primitive asymmetries. Each of them is a cell an
+    /// "any primitive to any primitive" rule gets wrong.
+    #[test]
+    fn primitive_widening_is_jls_5_1_2_and_not_symmetric() {
+        // MEASURED: R byte -> short = ok, R short -> byte = WrongMethodTypeException
+        assert!(mh_can_convert("B", "S"));
+        assert!(!mh_can_convert("S", "B"));
+        // char does NOT widen to short, and short/byte do NOT widen to char.
+        // MEASURED: R char -> short / R short -> char / R byte -> char all refuse.
+        assert!(!mh_can_convert("C", "S"));
+        assert!(!mh_can_convert("S", "C"));
+        assert!(!mh_can_convert("B", "C"));
+        // ... but char DOES widen to int and up. MEASURED: R char -> int = ok.
+        assert!(mh_can_convert("C", "I"));
+        // boolean widens to nothing and nothing widens to it.
+        // MEASURED: the whole boolean row and column of the primitive block.
+        for t in ["B", "C", "S", "I", "J", "F", "D"] {
+            assert!(!mh_can_convert("Z", t), "MEASURED: boolean -> {t} refuses");
+            assert!(!mh_can_convert(t, "Z"), "MEASURED: {t} -> boolean refuses");
+        }
+    }
+
+    /// The reference-to-primitive arm has THREE tests in the JDK, and the third
+    /// one — unbox from a strongly typed wrapper, then widen — is the one that
+    /// is easy to leave out. Leaving it out turns 20 measured accepts into
+    /// refusals.
+    #[test]
+    fn a_wrapper_source_may_unbox_and_then_widen() {
+        // MEASURED: U Byte -> short/int/long/float/double = Y, Byte -> char = n
+        assert!(mh_can_convert("Ljava/lang/Byte;", "S"));
+        assert!(mh_can_convert("Ljava/lang/Byte;", "D"));
+        assert!(!mh_can_convert("Ljava/lang/Byte;", "C"));
+        // MEASURED: U Character -> int = Y, Character -> short = n
+        assert!(mh_can_convert("Ljava/lang/Character;", "I"));
+        assert!(!mh_can_convert("Ljava/lang/Character;", "S"));
+        // MEASURED: U Double -> double = Y, Double -> float = n (narrowing)
+        assert!(mh_can_convert("Ljava/lang/Double;", "D"));
+        assert!(!mh_can_convert("Ljava/lang/Double;", "F"));
+    }
+
+    /// The supertype table, and the row that inspection gets wrong: `Byte` and
+    /// `Short` are `Constable` but NOT `ConstantDesc`.
+    #[test]
+    fn the_wrapper_supertype_table_matches_the_measured_rows() {
+        // MEASURED: U Number -> byte = Y but Number -> char = n and
+        //           Number -> boolean = n (no Number subclass wraps either)
+        assert!(mh_can_convert("Ljava/lang/Number;", "B"));
+        assert!(!mh_can_convert("Ljava/lang/Number;", "C"));
+        assert!(!mh_can_convert("Ljava/lang/Number;", "Z"));
+        // MEASURED: U ConstantDesc -> int/long/float/double = Y, byte/short = n
+        assert!(mh_can_convert("Ljava/lang/constant/ConstantDesc;", "I"));
+        assert!(!mh_can_convert("Ljava/lang/constant/ConstantDesc;", "B"));
+        // MEASURED: B byte -> Constable = Y but byte -> ConstantDesc = n
+        assert!(mh_can_convert("B", "Ljava/lang/constant/Constable;"));
+        assert!(!mh_can_convert("B", "Ljava/lang/constant/ConstantDesc;"));
+        // MEASURED: U Comparable/Serializable/Constable -> every primitive = Y
+        for r in [
+            "Ljava/lang/Comparable;",
+            "Ljava/io/Serializable;",
+            "Ljava/lang/constant/Constable;",
+        ] {
+            for p in ["Z", "B", "C", "S", "I", "J", "F", "D"] {
+                assert!(mh_can_convert(r, p), "MEASURED: {r} -> {p} = Y");
+            }
+        }
+        // MEASURED: U CharSequence / Cloneable / String / Void -> every
+        // primitive = n. None of them is a supertype of any wrapper.
+        for r in [
+            "Ljava/lang/CharSequence;",
+            "Ljava/lang/Cloneable;",
+            "Ljava/lang/String;",
+            "Ljava/lang/Void;",
+        ] {
+            for p in ["Z", "B", "C", "S", "I", "J", "F", "D"] {
+                assert!(!mh_can_convert(r, p), "MEASURED: {r} -> {p} = n");
+            }
+        }
+    }
+
+    /// The direction trap. The RETURN travels old -> new; each PARAMETER
+    /// travels new -> old. A reversed implementation passes every widening row
+    /// and fails every narrowing one, which reads like an off-by-one.
+    #[test]
+    fn parameters_convert_backwards_and_the_return_forwards() {
+        // A callee that wants a `long` can be fed by a caller offering an
+        // `int`; the reverse is a narrowing and refuses.
+        // MEASURED: A int -> long = ok, A long -> int = WrongMethodTypeException
+        assert_eq!(method_type_is_convertible_to("(J)V", "(I)V"), Some(true));
+        assert_eq!(method_type_is_convertible_to("(I)V", "(J)V"), Some(false));
+        // A callee that returns `int` can satisfy a caller expecting `long`;
+        // the reverse refuses. MEASURED: R int -> long = ok, R long -> int = X.
+        assert_eq!(method_type_is_convertible_to("()I", "()J"), Some(true));
+        assert_eq!(method_type_is_convertible_to("()J", "()I"), Some(false));
+    }
+
+    /// `asType` never adds or drops a parameter. All five measured arity rows
+    /// refuse, in both directions and at every count.
+    #[test]
+    fn arity_must_match_exactly() {
+        // MEASURED: cannot convert MethodHandle(int)void to ()void, and the
+        // four sibling rows of the same family.
+        assert_eq!(method_type_is_convertible_to("(I)V", "()V"), Some(false));
+        assert_eq!(method_type_is_convertible_to("(I)V", "(II)V"), Some(false));
+        assert_eq!(method_type_is_convertible_to("()V", "(I)V"), Some(false));
+        assert_eq!(
+            method_type_is_convertible_to("(ILjava/lang/String;)V", "()V"),
+            Some(false)
+        );
+        assert_eq!(
+            method_type_is_convertible_to("(ILjava/lang/String;)V", "(ILjava/lang/String;J)V"),
+            Some(false)
+        );
+    }
+
+    /// The exact row `RJdkProxyIface`'s `refusals` step is missing, and the two
+    /// neighbours that separate "refuses everything" from "refuses this".
+    #[test]
+    fn the_rjdkproxyiface_row() {
+        // MEASURED: MethodHandleProxies.asInterfaceInstance(Subtractor.class,
+        //   <(String)String>) throws
+        //   WrongMethodTypeException: cannot convert MethodHandle(String)String
+        //   to (int,int)int
+        let target = "(Ljava/lang/String;)Ljava/lang/String;";
+        assert_eq!(method_type_is_convertible_to(target, "(II)I"), Some(false));
+        assert_eq!(
+            format!(
+                "cannot convert MethodHandle{} to {}",
+                method_type_display(target).unwrap(),
+                method_type_display("(II)I").unwrap()
+            ),
+            "cannot convert MethodHandle(String)String to (int,int)int"
+        );
+        // MEASURED: the MATCHING handle is accepted and its proxy invokes.
+        assert_eq!(method_type_is_convertible_to("(II)I", "(II)I"), Some(true));
+        // MEASURED: S subtractor.fromWidening = WrongMethodTypeException —
+        // `(long,long)long` is refused even though int->long widens, because
+        // the RETURN long->int does not.
+        assert_eq!(method_type_is_convertible_to("(JJ)J", "(II)I"), Some(false));
+    }
+
+    /// The message is transcribed from HotSpot, so its rendering is asserted
+    /// character for character. `MethodType.toString()` uses simple names,
+    /// arrays keep their brackets, and a nested class prints its inner name
+    /// alone.
+    #[test]
+    fn method_type_display_matches_hotspots_tostring() {
+        // MEASURED: T arrays = (String[],Object[][])int[]
+        assert_eq!(
+            method_type_display("([Ljava/lang/String;[[Ljava/lang/Object;)[I").as_deref(),
+            Some("(String[],Object[][])int[]")
+        );
+        // MEASURED: T nested = (Entry)Inner
+        assert_eq!(
+            method_type_display("(Ljava/util/Map$Entry;)LAsTypeExtra$Inner;").as_deref(),
+            Some("(Entry)Inner")
+        );
+        // MEASURED: T void = ()void
+        assert_eq!(method_type_display("()V").as_deref(), Some("()void"));
+        // MEASURED: T prims = (boolean,byte,char,short,int,long,float)double
+        assert_eq!(
+            method_type_display("(ZBCSIJF)D").as_deref(),
+            Some("(boolean,byte,char,short,int,long,float)double")
+        );
+        // A descriptor this file cannot name yields `None` rather than a
+        // signature with a hole in it, so `mh_astype_refusal` declines to
+        // compose a half-rendered message.
+        assert_eq!(method_type_display("(L;)V"), None);
+        assert_eq!(method_type_display("not a descriptor"), None);
+    }
+
+    /// The TRAP: `explicitCastArguments` has different rules. Every type pair
+    /// `asType` refuses, it accepts — it refuses on arity alone.
+    #[test]
+    fn explicit_cast_shares_no_type_rule_with_astype() {
+        // MEASURED: X String -> boolean = ok, X double -> char = ok,
+        //           X int[] -> long = ok — all three are asType refusals.
+        for (a, b) in [
+            ("Ljava/lang/String;", "Z"),
+            ("D", "C"),
+            ("[I", "J"),
+            ("Ljava/lang/Void;", "I"),
+        ] {
+            assert!(
+                !mh_can_convert(a, b),
+                "asType MUST refuse {a} -> {b} (MEASURED)"
+            );
+        }
+        // The only thing `explicitCastArguments` checks is the parameter count,
+        // which is why its refusal is expressed on `split_descriptor_params`
+        // and not on `method_type_is_convertible_to`.
+        // MEASURED: Z drop1 = cannot explicitly cast MethodHandle(int)void to ()void
+        let (old_params, _) = split_descriptor_params("(I)V").unwrap();
+        let (new_params, _) = split_descriptor_params("()V").unwrap();
+        assert_ne!(old_params.len(), new_params.len());
+        assert_eq!(
+            format!(
+                "cannot explicitly cast MethodHandle{} to {}",
+                method_type_display("(I)V").unwrap(),
+                method_type_display("()V").unwrap()
+            ),
+            "cannot explicitly cast MethodHandle(int)void to ()void"
         );
     }
 }
