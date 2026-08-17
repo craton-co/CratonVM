@@ -58,7 +58,9 @@ A `javap -c` sweep over BouncyCastle's `core`/`prov` main and test classes
 
 None is on the PQC path that motivated the search, and `WhirlpoolDigest` already
 has a native override for its `processBlock`. So this did **not** contribute to
-the PQC throughput cliff, and the page that found it says so.
+the PQC throughput cliff, and the page that found it
+(fixed-suite-bugs/bc-java/bug-bcjava-pqc-lms-hsstests-interpreter-throughput-cliff-20260816-FIXED.md)
+says so.
 
 javac emits `dup2_x2` for a nested assignment whose value is category-2 sitting
 above two more slots — rare in ordinary code, which is why the count is low.

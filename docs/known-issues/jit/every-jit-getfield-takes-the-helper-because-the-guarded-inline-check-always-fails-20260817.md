@@ -2,9 +2,9 @@
 
 ## Status
 **OPEN**, found 2026-08-17 on `dev` @`a276dfe09` while profiling the bc-java PQC
-throughput page
-(bug-bcjava-pqc-lms-hsstests-interpreter-throughput-cliff-20260816, now
-retired). Split out because it is not a bc-java defect: it is a whole-VM JIT
+throughput page, since retired to
+fixed-suite-bugs/bc-java/bug-bcjava-pqc-lms-hsstests-interpreter-throughput-cliff-20260816-FIXED.md.
+Split out because it is not a bc-java defect: it is a whole-VM JIT
 throughput cost on **every** collector, and any field-dense compiled workload
 pays it.
 

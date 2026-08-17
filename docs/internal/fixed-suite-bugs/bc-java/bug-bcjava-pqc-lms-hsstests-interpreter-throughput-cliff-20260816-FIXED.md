@@ -1,15 +1,24 @@
-# bc-java PQC: not a hang, and the SHA-256 hypothesis named the right kernel behind the wrong class
+# ✅ FIXED — bc-java PQC: not a hang, and the SHA-256 hypothesis named the right kernel behind the wrong class
 
 ## Status
-**IN PROGRESS** on `fix/bcjava-pqc-lms-throughput-20260817`. Every measurement
-below is final; the fix-result table is pending its verification run.
+**RESOLVED 2026-08-17** on `fix/bcjava-pqc-lms-throughput-20260817`.
+
+`HSSTests` — 15.9 of `lms.AllTests`'s 16 HotSpot seconds — **passes in every
+mode**, and the class the original page called a HANG passes on the *unmodified*
+binary in 2062 s once the forced-interpreter flag is dropped. With the SHA-256
+compression leaf made native it is **1047 s**, and the isolated kernel improves
+**1.8–3.2x** under the JIT and **~6x** under `--nojit`.
+
+What is deliberately **not** claimed: `pqc.crypto.test.AllTests` is not fixed,
+and the decomposition below shows why no single-algorithm fix could have fixed
+it. Two costs the profile exposed are handed to their own pages rather than
+carried here.
 
 Filed originally as: *`pqc.crypto.lms.AllTests` / `pqc.crypto.test.AllTests`
 exceed even a 10x timeout — confirmed CPU-bound, not deadlocked.*
 
 This page also owns a third class, handed over by the bc-java residual sweep
-(fixed-suite-bugs/bc-java/bug-bcjava-residual-suite-failures-20260816.md,
-Residual 0): `pqc.jcajce.provider`, 271 s on HotSpot.
+(bug-bcjava-residual-suite-failures-20260816.md in this directory, Residual 0): `pqc.jcajce.provider`, 271 s on HotSpot.
 
 ## The original report was right about what it declined to claim
 
