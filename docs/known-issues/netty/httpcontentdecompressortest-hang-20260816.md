@@ -80,23 +80,61 @@ registered native.
 allocator's buffer measured 534 ms/MiB — the same shape at a different buffer
 kind. Either way 256 MiB of it does not fit in 180 s.
 
+## One `putLong` is SEVEN native calls
+
+`--dump-native-registry` reports a per-native invocation count, so the question
+"what does one accessor actually execute" is answerable without a profiler.
+Running `NioAccessorRate` (800 000 ops per arm) and dumping:
+
+| invocations | native | registered by |
+|---:|---|---|
+| 4 000 000 | `jdk/internal/util/Preconditions.checkIndex(IILjava/util/function/BiFunction;)I` | `native-builtins/src/preconditions.rs:404` |
+| 3 200 000 | `java/lang/ref/Reference.reachabilityFence(Ljava/lang/Object;)V` | `native-builtins/src/lib.rs:14012` |
+| 2 400 000 | `java/nio/DirectByteBuffer.session()Ljdk/internal/foreign/MemorySessionImpl;` | `native-builtins/src/lib.rs:19560` |
+| 1 600 000 | `jdk/internal/misc/ScopedMemoryAccess.putLongUnaligned(...)` | `native-builtins/src/lib.rs:15697` |
+| 800 000 | `java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;` | `native-io/src/direct_buffer.rs:1908` |
+| 800 000 | `java/nio/HeapByteBuffer.session()...` | `native-builtins/src/lib.rs:19560` |
+| 800 000 | `ScopedMemoryAccess.getLongUnaligned(...)` / `putIntUnaligned(...)` | `native-builtins/src/lib.rs:15679` |
+
+That is **~7 native calls for one `ByteBuffer.putLong(int,long)`**, at the
+~160 ns funnel cost each — which is where 1088 ns comes from, arithmetic that
+closes.
+
+And **three of the four hottest are trivial or literally constant**:
+
+* `Reference.reachabilityFence` is `black_box(arg); Ok(None)` — a no-op. HotSpot
+  intrinsifies it to *nothing at all*. 3.2 M calls, ~2 per accessor.
+* `DirectByteBuffer.session()` is `Ok(Some(Value::Object(None)))` — it returns
+  the constant `null`. 2.4 M calls.
+* `Preconditions.checkIndex(int,int,BiFunction)` is
+  `if (index < 0 || index >= length) throw; return index;`. 4 M calls.
+
+Together they are 9.6 M of the ~11.2 M native calls in that run. `put(int,byte)`
+at ~260 ns is the same story with fewer rungs.
+
 **A single-byte `put` already costs ~260-280 ns** — one native call, one stored
-byte. That per-call floor, not anything about the buffer, is the finding.
+byte. That per-call floor, multiplied by the rung count above, is the finding.
 
 ## What was ruled out, with the measurement that ruled it out
 
-* **Per-byte storage re-resolution.** `s2_bb_write8` / `s2_bb_read8`
-  (`native-builtins/src/servlet.rs`) really did call `s2_bb_put_byte` /
-  `s2_bb_get_byte` once per byte, and each of those re-resolved the backing
-  store from scratch through up to three NAME-keyed field lookups (`hb`,
-  `offset`, `address`) — 8x redundant work per `putLong`. It looked like the
-  answer. It is not: rewriting all six accessors to resolve storage ONCE
+* **Per-byte storage re-resolution in `servlet.rs`.** `s2_bb_write8` /
+  `s2_bb_read8` really did call `s2_bb_put_byte` / `s2_bb_get_byte` once per
+  byte, each re-resolving the backing store through up to three NAME-keyed field
+  lookups (`hb`, `offset`, `address`) — 8x redundant work per `putLong`. It
+  looked like the answer. Rewriting all six accessors to resolve storage ONCE
   (`s2_bb_read_n` / `s2_bb_write_n`, landed 2026-08-17) moved `direct putLong`
   from 918 to 943 and from 864 to 877 ns/op, interleaved, two rounds — nothing.
-  The `putLong`-to-`put(byte)` ratio is ~3.5x, not 8x, which is the shape of one
-  native call plus a few field reads rather than eight byte stores. The rewrite
-  is kept (strictly less work, pinned by `probes/NioAccessorOracle.java`) but it
-  is **not** a fix for this page.
+  **The reason is that those natives are not on this path at all.** The
+  invocation census above shows the real-JDK `DirectByteBuffer` / `HeapByteBuffer`
+  bytecode running instead, served by `native-io/src/direct_buffer.rs` and the
+  `ScopedMemoryAccess` / `session` / `Preconditions` / `reachabilityFence`
+  natives; `java/nio/ByteBuffer.putLong` (the `servlet.rs` registration) records
+  **zero** invocations in the probe. The rewrite is kept — it is strictly less
+  work on the paths it *does* serve and it is pinned by
+  `probes/NioAccessorOracle.java` — but it is **not** a fix for this page, and
+  the census, not the microbenchmark, is what proved that. Ask
+  `--dump-native-registry` which native actually serves a call before optimizing
+  one.
 * **netty refusing `sun.misc.Unsafe`.** netty does select the non-Unsafe
   `PooledDirectByteBuf` on CratonVM, and `-Dio.netty.noUnsafe=false` cuts the
   compress phase 11499 -> 1735 ms (6.6x). But **HotSpot 25 reports the identical
