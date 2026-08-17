@@ -1467,6 +1467,18 @@ const MARK_WORKLIST_CAP: usize = 1 << 20;
 /// records are evicted (and counted) so memory stays bounded.
 const PAUSE_HISTORY_CAP: usize = 1 << 16;
 
+/// How many [`GarbageCollector::needs_gc`] queries may be answered from
+/// [`G1Collector::free_region_count`] before it is re-scanned, as a backstop
+/// for a region-type transition that forgot to publish a fresh count.
+///
+/// Every path that MOVES a region out of the Free pool already publishes
+/// (`note_region_consumed_locked`, the TLAB refill's own reserve count) and a
+/// collection publishes on its way out, so in practice the cache is exact.
+/// This bound only decides how long a hypothetical missed transition could go
+/// unnoticed: 1024 allocations is at most ~40 KB of objects, against a trigger
+/// that fires on 25% of the whole heap.
+const NEEDS_GC_RECOUNT_INTERVAL: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // Collection type
 // ---------------------------------------------------------------------------
@@ -1599,6 +1611,31 @@ pub struct G1Collector {
     /// set several times per pause). Decays back to the baseline after a
     /// clean collection so healthy workloads keep the larger eden.
     needs_gc_free_percent: AtomicUsize,
+
+    /// Cached count of `RegionType::Free` regions — the answer
+    /// [`GarbageCollector::needs_gc`] needs, kept as an atomic so that query
+    /// costs one relaxed load instead of `regions.lock()` plus an
+    /// O(num_regions) scan.
+    ///
+    /// `maybe_gc` runs `needs_gc()` after EVERY `new` / `newarray` /
+    /// `anewarray` bytecode, so the scan it used to do ran once per allocated
+    /// object over every region in the heap — 1500 regions at `-Xmx1500m`,
+    /// under the one mutex every allocation path also needs. Single-threaded
+    /// that is ~1 us of pure overhead per object; with several mutators it is
+    /// a convoy, and the same total allocation work measured 1.5 s on one
+    /// thread against 13.4 s on eight (ZGC, whose trigger is O(1), was flat at
+    /// 0.8 s for both). `note_region_consumed_locked` already documents the
+    /// discipline this violated: count Free regions when a region is
+    /// CONSUMED, never per object.
+    ///
+    /// Refreshed wherever the count is already being computed under the lock
+    /// (region consumption, TLAB refill, the end of a collection) and, as a
+    /// self-healing backstop for any region-type transition that does neither,
+    /// re-scanned every [`NEEDS_GC_RECOUNT_INTERVAL`] queries.
+    free_region_count: AtomicUsize,
+    /// Queries since [`Self::free_region_count`] was last re-scanned. See
+    /// [`NEEDS_GC_RECOUNT_INTERVAL`].
+    needs_gc_since_recount: AtomicUsize,
 
     /// Native-allocation pressure latch — G1's half of the "the allocation
     /// wrappers cannot collect, so the next `safe_native_call` boundary does
@@ -1964,6 +2001,11 @@ impl G1Collector {
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
             needs_gc_free_percent: AtomicUsize::new(25),
+            // Every region starts Free (`G1Region::from_arena`). Seeding this
+            // at 0 instead would make the first `needs_gc()` on a brand-new
+            // heap answer "collect now".
+            free_region_count: AtomicUsize::new(num_regions),
+            needs_gc_since_recount: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
             mark_start_snapshot: Mutex::new(Vec::new()),
             gc_state: Arc::new(ConcurrentGcState::new()),
@@ -2050,10 +2092,36 @@ impl G1Collector {
             .iter()
             .filter(|r| r.region_type == RegionType::Free)
             .count();
+        self.publish_free_region_count(free);
         let pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
         if free * 100 < regions.len() * pct {
             self.native_alloc_pressure.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Hand a freshly-counted Free-region total to [`Self::free_region_count`]
+    /// and restart the backstop interval. Call this from anywhere that has
+    /// just done the O(num_regions) count under the lock — the point of the
+    /// cache is that nobody should ever do that count for `needs_gc` alone.
+    #[inline]
+    fn publish_free_region_count(&self, free: usize) {
+        self.free_region_count.store(free, Ordering::Relaxed);
+        self.needs_gc_since_recount.store(0, Ordering::Relaxed);
+    }
+
+    /// Recount Free regions under the lock and publish the result.
+    ///
+    /// Only for callers that do NOT already hold `regions` — everything that
+    /// does should call [`Self::publish_free_region_count`] with the count it
+    /// already has.
+    fn recount_free_regions(&self) -> usize {
+        let regions = self.regions.lock();
+        let free = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Free)
+            .count();
+        self.publish_free_region_count(free);
+        free
     }
 
     /// Native-allocation pressure signal — see the field doc. Consumed at the
@@ -8621,6 +8689,7 @@ impl G1Collector {
             .iter()
             .filter(|r| r.region_type == RegionType::Free)
             .count();
+        self.publish_free_region_count(free_count);
         if free_count <= self.tlab_reserve_regions(regions.len()) {
             // Latch the pressure signal on the way out: the workload is
             // allocating hard enough to exhaust the pool and something must
@@ -10245,12 +10314,21 @@ impl GarbageCollector for G1Collector {
     }
 
     fn needs_gc(&self) -> bool {
-        let regions = self.regions.lock();
-        let free_count = regions
-            .iter()
-            .filter(|r| r.region_type == RegionType::Free)
-            .count();
-        let total = regions.len();
+        // Read the cache; re-scan only every `NEEDS_GC_RECOUNT_INTERVAL`
+        // queries. This used to lock `regions` and count Free regions on every
+        // call — and `maybe_gc` calls this after every single `new` bytecode.
+        // See `G1Collector::free_region_count` for the measurement.
+        // `regions` is built once in `new` and never grows or shrinks, so its
+        // length is exactly the figure `new` computed — no lock needed to
+        // learn it.
+        let total = self.config.heap_size / self.config.region_size;
+        let free_count = if self.needs_gc_since_recount.fetch_add(1, Ordering::Relaxed)
+            >= NEEDS_GC_RECOUNT_INTERVAL
+        {
+            self.recount_free_regions()
+        } else {
+            self.free_region_count.load(Ordering::Relaxed)
+        };
         // Trigger a GC when the Free fraction drops below the (adaptive)
         // threshold. Baseline 25%; raised after a collection that hit
         // evacuation failure so the NEXT pause starts with a to-space pool
@@ -10395,6 +10473,12 @@ impl GarbageCollector for G1Collector {
         //    latch; the next region claim re-latches it if the workload is
         //    still outrunning the collector (see `native_alloc_pressure`).
         self.native_alloc_pressure.store(false, Ordering::Relaxed);
+
+        // 5. …and that rebuilt pool is exactly what `needs_gc` reads. Republish
+        //    it here, or the cache keeps answering with the pre-collection
+        //    count and every allocation until the next backstop re-scan asks
+        //    for another collection. See `G1Collector::free_region_count`.
+        self.recount_free_regions();
 
         result
     }
