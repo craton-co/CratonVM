@@ -16150,10 +16150,13 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// `phases_late::ssl_security`: any method left to the real body reads
 /// uninitialised instance state, and fails in a way that looks nothing like
 /// "this class is synthetic".
-fn skf_algo_table() -> &'static std::sync::Mutex<std::collections::HashMap<usize, String>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — five acquisition sites, every
+/// one a single statement over a `pbkdf2_key_for(ctx, ..)` computed before the
+/// guard: two `insert`s, two `get(..).cloned()`s and a `contains_key`.
+fn skf_algo_table() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<usize, String>> {
+    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<usize, String>>> =
         std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `SecretKeyFactory.getAlgorithm()` — the name `getInstance` was called with.

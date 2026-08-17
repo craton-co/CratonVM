@@ -126,9 +126,13 @@ fn class_name_for_mirror(
 /// way back to `io.netty.AllocateChunk` is a table this side keeps as it hands
 /// the ids out. Recorded here rather than derived later because the `Class`
 /// mirror — the one thing that knows the `@Name` — is only in hand at this call.
-fn type_id_event_names() -> &'static Mutex<HashMap<i64, String>> {
-    static NAMES: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
-    NAMES.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), on a reading of both acquisition
+/// sites: `type_id_from_class_mirror` inserts and drops, and the settings
+/// walk reads a name out with `.get(..).cloned()`. Neither touches `ctx` under
+/// the guard, so it is never held across a re-entry into the VM.
+fn type_id_event_names() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<i64, String>> {
+    static NAMES: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<i64, String>>> = OnceLock::new();
+    NAMES.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn type_id_from_class_mirror(ctx: &mut dyn NativeContext, args: &[Value]) -> i64 {
@@ -346,9 +350,13 @@ const JFR_FIELD_DESCRIPTORS: [&str; 9] = [
 /// They share one row (and therefore one lock acquisition) because every caller
 /// wants both: the name to record under, and whether the type is recorded at
 /// all.
-fn event_types() -> &'static Mutex<HashMap<String, (String, bool)>> {
-    static TYPES: OnceLock<Mutex<HashMap<String, (String, bool)>>> = OnceLock::new();
-    TYPES.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), on a reading of both acquisition
+/// sites in `event_type_facts`: the lookup's `if let` body is a bare `return`,
+/// and the store is a temporary-guard `.insert(..)`. `ctx.class_annotations`
+/// runs between them, after the read guard has been dropped.
+fn event_types() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<String, (String, bool)>> {
+    static TYPES: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<String, (String, bool)>>> = OnceLock::new();
+    TYPES.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The JFR name of an event class: its `@Name` value when it declares one,
@@ -506,9 +514,13 @@ fn capture_event_fields(
 ///
 /// Keyed by `(vm_identity, thread id)`: Rust tests build several independent
 /// `Vm`s in one process and thread ids restart per VM.
-fn event_timing() -> &'static Mutex<HashMap<(usize, u64), (u64, Option<u64>)>> {
-    static TIMING: OnceLock<Mutex<HashMap<(usize, u64), (u64, Option<u64>)>>> = OnceLock::new();
-    TIMING.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), on a reading of all three
+/// acquisition sites (`Event.begin`, `Event.end`, `commit`): each computes its
+/// `(vm, thread)` key BEFORE taking the guard, then does one `insert`,
+/// `get_mut` or `remove` under it. No `ctx` call happens under the guard.
+fn event_timing() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<(usize, u64), (u64, Option<u64>)>> {
+    static TIMING: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<(usize, u64), (u64, Option<u64>)>>> = OnceLock::new();
+    TIMING.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +547,15 @@ struct JavaRecording {
     thresholds: HashMap<String, u64>,
 }
 
+/// ARCH-2026-08-04 A6 — deliberately NOT given a `LockLevel`.
+///
+/// `refresh_java_recording_settings` and `forget_java_recording` both hold this
+/// guard across `ctx.resolve_global_root(..)` inside an `iter().position(..)`
+/// predicate — a re-entry into the VM under the guard, which is exactly the
+/// shape a level is supposed to forbid. The `ctx` call is per-element, so it
+/// cannot simply be hoisted the way the sites in this file's other tables were;
+/// closing it needs the lookup restructured. Left in the §A6 backlog rather
+/// than stamped with a level nobody can honour.
 fn java_recordings() -> &'static Mutex<Vec<JavaRecording>> {
     static RECORDINGS: OnceLock<Mutex<Vec<JavaRecording>>> = OnceLock::new();
     RECORDINGS.get_or_init(|| Mutex::new(Vec::new()))
@@ -546,9 +567,16 @@ fn java_recordings() -> &'static Mutex<Vec<JavaRecording>> {
 /// a full Java-side `getSettings()` re-read. Cleared by
 /// [`publish_java_recording_settings`], i.e. by every start, stop and re-read,
 /// so a later `enable(...)` is still picked up.
-fn java_events_known_disabled() -> &'static Mutex<HashMap<usize, HashSet<String>>> {
-    static DENIED: OnceLock<Mutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
-    DENIED.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), on a reading of all three
+/// acquisition sites: `publish_java_recording_settings` removes, the fast
+/// refusal check's `if let` body is a bare `return false`, and the memo store
+/// is `entry(..).or_default().insert(..)`. All temporary guards, no `ctx`.
+///
+/// It IS acquired while `java_recordings`' guard is held, which is legal only
+/// because `java_recordings` is deliberately NOT ordered — see its own comment.
+fn java_events_known_disabled() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>> {
+    static DENIED: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
+    DENIED.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Per-VM set of Java event names this bridge has decided to record.
@@ -567,9 +595,17 @@ fn java_events_known_disabled() -> &'static Mutex<HashMap<usize, HashSet<String>
 /// custom events and none of the JDK's own, because `jdk.jfr.Enabled` defaults
 /// to `true` for a user event class while the JDK's metadata ships most `jdk.*`
 /// types with `enabled=false`.
-fn java_events_admitted() -> &'static Mutex<HashMap<usize, HashSet<String>>> {
-    static ADMITTED: OnceLock<Mutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
-    ADMITTED.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), on a reading of all three
+/// acquisition sites: a `remove`, a `for name in ..get(..).into_iter().flatten()`
+/// whose body only pushes into a local `Vec`, and an `entry(..).or_default()
+/// .insert(..)` whose `publish_java_recording_settings(ctx)` follows AFTER the
+/// statement — and therefore after the guard — has ended.
+///
+/// Same nesting note as [`java_events_known_disabled`]: taken under
+/// `java_recordings`' unordered guard, which is why that one stays unordered.
+fn java_events_admitted() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>> {
+    static ADMITTED: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
+    ADMITTED.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Parse a JFR timespan setting value into nanoseconds.
@@ -1027,6 +1063,10 @@ struct JavaEventStream {
     subscriptions: Vec<(Option<String>, usize)>,
 }
 
+/// ARCH-2026-08-04 A6 — deliberately NOT given a `LockLevel`, for the same
+/// reason as [`java_recordings`]: `java_stream_slot_or_insert` and the
+/// `close()` bridge both pass `ctx` into `java_stream_slot` while holding this
+/// guard, and that helper calls `ctx.resolve_global_root` once per entry.
 fn java_event_streams() -> &'static Mutex<Vec<JavaEventStream>> {
     static STREAMS: OnceLock<Mutex<Vec<JavaEventStream>>> = OnceLock::new();
     STREAMS.get_or_init(|| Mutex::new(Vec::new()))
