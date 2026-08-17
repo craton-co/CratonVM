@@ -17635,6 +17635,11 @@ mod jit_native_dispatch_profile {
                         callback: cb,
                         native_id: None,
                         receiver_class_id: Some(0),
+                        // These rungs price the ORDINARY native dispatch. A
+                        // signature-polymorphic entry takes a different tail
+                        // (`try_varhandle_instance_field_read`), so setting
+                        // this would make the numbers about something else.
+                        poly: false,
                     }),
                 ),
             );
