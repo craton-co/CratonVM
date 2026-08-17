@@ -2536,12 +2536,19 @@ impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
 
 impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
 
-    // Mirror the production NativeContext memory bridge for REAL pointers:
-    // vm_exec falls through to a raw copy when the address is not a tagged
-    // Unsafe-arena handle. The t27_tls direct-buffer tests hand this mock
-    // genuine malloc pointers (Vec backing stores), so the arena-aware
-    // accessors (bb_get_byte & co.) must be able to reach them here too.
+    // Mirror the production NativeContext memory bridge, BOTH halves:
+    // `vm_exec` routes a TAGGED `Unsafe.allocateMemory` handle to the arena
+    // store and only falls through to a raw copy for an untagged address. This
+    // mock used to do the raw copy unconditionally, so a test that handed it an
+    // arena handle dereferenced the tag bit as an address — an access violation
+    // on the first byte, which is how `set_memory_off_heap_fills_in_bulk_and_
+    // stays_in_bounds` found this. The t27_tls direct-buffer tests still hand
+    // this mock genuine malloc pointers (Vec backing stores), and those keep
+    // taking the raw path.
     fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        if crate::unsafe_arena_addr_is_tagged(addr) {
+            return crate::unsafe_arena_copy_out(addr, out);
+        }
         if addr <= 0 {
             return false;
         }
@@ -2552,6 +2559,9 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
     }
 
     fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if crate::unsafe_arena_addr_is_tagged(addr) {
+            return crate::unsafe_arena_copy_in(addr, data);
+        }
         if addr <= 0 {
             return false;
         }
