@@ -2196,7 +2196,26 @@ fn cipher_delegate_init(
         }
         .into());
     };
+    // Every reference below survives the (allocating) `SecureRandom`
+    // construction: pin them before it runs.
+    let spi_pin = ctx.pin_native_root(spi);
+    let key_pin = key.map(|k| ctx.pin_native_root(k));
+    let params_pin = params.map(|p| ctx.pin_native_root(p));
     let key_v = Value::Object(key);
+    // `Cipher.init(mode, key)` does NOT pass a null `SecureRandom` on a real
+    // JDK — it passes `JCAUtil.getSecureRandom()`. A provider is entitled to
+    // dereference it: BouncyCastle's `BaseWrapCipher.engineInit` wraps the
+    // argument in a `ParametersWithRandom` and `RFC3211WrapEngine` calls
+    // `nextBytes` on it, which is `NullPointerException: Cannot invoke
+    // "java.security.SecureRandom.nextBytes(byte[])"` on every one of
+    // bc-java's `RFC3211WrapTest` cases when the argument is null.
+    let random = match random {
+        Some(r) => Some(r),
+        None => match ctx.new_object_initialized("java/security/SecureRandom", "()V", &[]) {
+            Ok(Some(Value::Object(Some(r)))) => Some(r),
+            _ => None,
+        },
+    };
     let random_v = Value::Object(random);
     let args: Vec<Value> = match params {
         Some(p) => vec![
@@ -2212,7 +2231,19 @@ fn cipher_delegate_init(
         (true, true) => SPI_INIT_SPEC,
         (true, false) => SPI_INIT_PARAMS,
     };
-    ctx.invoke_virtual(spi, "engineInit", desc, &args)?;
+    // Re-read every argument from its pin: `new SecureRandom()` above may have
+    // moved them.
+    let spi = ctx.read_native_pin(spi_pin, spi);
+    let mut args = args;
+    if let (Some(pin), Some(k)) = (key_pin, key) {
+        args[1] = Value::Object(Some(ctx.read_native_pin(pin, k)));
+    }
+    if let (Some(pin), Some(p)) = (params_pin, params) {
+        args[2] = Value::Object(Some(ctx.read_native_pin(pin, p)));
+    }
+    let result = ctx.invoke_virtual(spi, "engineInit", desc, &args);
+    ctx.unpin_native_roots(spi_pin);
+    result?;
     Ok(None)
 }
 

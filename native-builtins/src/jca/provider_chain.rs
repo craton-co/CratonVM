@@ -2173,6 +2173,50 @@ fn seed_sunjce_pbe_services() {
         "PBES2",
         "com.sun.crypto.provider.PBES2Parameters$General",
     );
+    // SunJCE's SYMMETRIC `AlgorithmParameters` services. Enumerated from
+    // `Security.getProvider("SunJCE").getServices()` on JDK 25, not guessed —
+    // the block-cipher rows were missing here entirely, so
+    // `AlgorithmParameters.getInstance("AES", "SunJCE")` answered
+    // `no such algorithm: AES for provider SunJCE` while HotSpot serves it.
+    // BouncyCastle's `EnvelopedDataHelper.createAlgorithmParameters` asks by
+    // exactly that (name, provider) pair to decode a CMS content-encryption
+    // AlgorithmIdentifier, so every `SunProviderTest`/`NullProviderTest` KeyTrans
+    // case in bc-java's `cms` suite lost the IV and failed to decrypt.
+    //
+    // Note `GCM` lives in `sun.security.util`, not `com.sun.crypto.provider` —
+    // the one row whose package differs from its siblings.
+    for (algo, cls) in [
+        ("AES", "com.sun.crypto.provider.AESParameters"),
+        ("GCM", "sun.security.util.GCMParameters"),
+        ("DESede", "com.sun.crypto.provider.DESedeParameters"),
+        ("DES", "com.sun.crypto.provider.DESParameters"),
+        ("Blowfish", "com.sun.crypto.provider.BlowfishParameters"),
+        ("RC2", "com.sun.crypto.provider.RC2Parameters"),
+        (
+            "ChaCha20-Poly1305",
+            "com.sun.crypto.provider.ChaCha20Poly1305Parameters",
+        ),
+        ("DiffieHellman", "com.sun.crypto.provider.DHParameters"),
+    ] {
+        put_service(P, "AlgorithmParameters", algo, cls);
+    }
+    // The PKCS#12 / PKCS#5 v1.5 PBE rows, which all share one SPI class.
+    for algo in [
+        "PBEWithMD5AndDES",
+        "PBEWithMD5AndTripleDES",
+        "PBEWithSHA1AndDESede",
+        "PBEWithSHA1AndRC2_40",
+        "PBEWithSHA1AndRC2_128",
+        "PBEWithSHA1AndRC4_40",
+        "PBEWithSHA1AndRC4_128",
+    ] {
+        put_service(
+            P,
+            "AlgorithmParameters",
+            algo,
+            "com.sun.crypto.provider.PBEParameters",
+        );
+    }
     const HASHES: &[&str] = &[
         "SHA1",
         "SHA224",

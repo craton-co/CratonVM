@@ -2001,6 +2001,24 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // The name the CALLER asked for, which `sig_get_instance` wrote into the
+    // real `algorithm` field. `algo_name(idx)` is this engine's own canonical
+    // spelling and answers `"Unknown"` for every name outside its table, which
+    // is not a name any caller can use: BouncyCastle's
+    // `X509SignatureUtil.setSignatureParameters` feeds `signature.getAlgorithm()`
+    // straight back to `AlgorithmParameters.getInstance(..)` and got
+    // `NoSuchAlgorithmException: no AlgorithmParameters Unknown implementation
+    // for provider BC` while verifying an RSASSA-PSS certificate. It also
+    // rewrote `SHA256withRSA/PSS` to `SHA256withRSAandMGF1`, where HotSpot
+    // echoes the request verbatim.
+    if let Value::Object(Some(name)) = ctx.get_field_by_name(this, "algorithm") {
+        if let Some(text) = ctx.read_string(name) {
+            if !text.is_empty() {
+                let s = ctx.create_string(&text);
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+    }
     // `getAlgorithm()` is a benign accessor — keep the slot-read fallback
     // so callers that only invoke it after a state-eroding bug elsewhere
     // still get *some* answer instead of an exception cascade.  The loud
