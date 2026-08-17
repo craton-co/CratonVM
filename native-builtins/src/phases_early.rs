@@ -21746,6 +21746,28 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     r.register(uri, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw_ref = obj_arg(args, 1)?;
+        // The ARGUMENT is the authoritative text, and it must be stored rather
+        // than rebuilt. `read_string` decodes to a Rust `String`, which cannot
+        // hold an unpaired surrogate; every `create_string(&raw)` below is
+        // therefore a lossy round trip. MEASURED on both VMs at `b9f302019`:
+        //
+        //   new URI("http://h/a<U+D800>b").toString()
+        //     HotSpot   len=12  charAt(10)=d800
+        //     CratonVM  len=12  charAt(10)=fffd
+        //
+        // The length was right, which is why this survived so long — only the
+        // one code unit was wrong. `raw` stays for the PARSING below, which
+        // splits on ASCII delimiters and is unaffected by the substitution;
+        // what must not be rebuilt is the text handed back verbatim.
+        //
+        // Pinned because this closure allocates a dozen strings between here
+        // and the stores, and a moving young collection would leave `raw_ref`
+        // pointing into from-space. NOTE, and deliberately NOT fixed here:
+        // `this` and the parsed component refs are held across those same
+        // allocations with no pin. That hazard is pre-existing and widening
+        // this change to cover it would put an unmeasured rewrite of the whole
+        // constructor behind a one-code-unit fix.
+        let raw_pin = ctx.pin_native_root(raw_ref);
         let raw = ctx.read_string(raw_ref).unwrap_or_default();
         // JDK URI authority is introduced only by `//` after the optional
         // scheme. A plain relative URI such as `docProps/core.xml` is all path;
@@ -21841,7 +21863,10 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         } else {
             Value::Object(None)
         };
-        let raw_str = ctx.create_string(&raw);
+        // Slot 6 and `string` are the same text and may be the same object:
+        // `java.lang.String` is immutable, and HotSpot's `URI` likewise keeps
+        // one reference to the string it was constructed from.
+        let raw_str = ctx.read_native_pin(raw_pin, raw_ref);
         ctx.set_field(this, 0, scheme);
         ctx.set_field(this, 1, host);
         ctx.set_field(this, 2, port);
@@ -21849,7 +21874,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 4, query_val);
         ctx.set_field(this, 5, fragment_val);
         ctx.set_field(this, 6, Value::Object(Some(raw_str)));
-        let named_raw = ctx.create_string(&raw);
+        let named_raw = ctx.read_native_pin(raw_pin, raw_ref);
         ctx.set_field_by_name(this, "string", Value::Object(Some(named_raw)));
         if let Some(scheme) = scheme_text {
             let named_scheme = ctx.create_string(scheme);
@@ -21870,6 +21895,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
             let named_decoded_path = ctx.create_string(path_str);
             ctx.set_field_by_name(this, "decodedPath", Value::Object(Some(named_decoded_path)));
         }
+        ctx.unpin_native_roots(raw_pin);
         Ok(Some(Value::Object(None)))
     });
     r.register(
