@@ -552,6 +552,32 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
             if heap.is_heap_addr(a).is_none() {
                 return;
             }
+            // `CRATONVM_DBG_VACATED_FRAMES` — the RE-OCCUPIED face, which the
+            // `ClassId(0)` test below cannot see. A compacting collector slides
+            // a survivor onto the address it vacated, so a slot left naming the
+            // old address reads back a perfectly valid object of an unrelated
+            // class, and every test in this function stays silent. Asked FIRST,
+            // and only when armed.
+            if cratonvm_gc::gc_quiescence::was_vacated(a) {
+                static V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{a:#x}"),
+                        site = site,
+                        tid = thread.thread_id.0,
+                        frame = fi,
+                        class = %fr.class_name(),
+                        method = %fr.method_name(),
+                        pc = fr.pc,
+                        slot = format!("{what}[{idx}]"),
+                        slot_class = %class_name_of(shared, heap.class_id_of(o).as_u32()),
+                        "a LIVE frame slot still names an address the LAST collection moved an \
+                         object away from — the frame remap did not reach this slot. \
+                         `slot_class` is whatever the slide has since put at that address.",
+                    );
+                }
+            }
             if heap.class_id_of(o).as_u32() != 0 || heap.kind_of(o) != ObjectKind::Object {
                 return;
             }
