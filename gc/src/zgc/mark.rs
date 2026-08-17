@@ -939,12 +939,35 @@ impl ZMarkStripeSet {
 /// the *thread* rather than the *heap* is exactly that bug in miniature (see
 /// `satb.rs`'s `thread_local_buffers_are_queue_scoped` regression test, which
 /// exists because the SATB buffers were once not queue-scoped).
+/// One ingress bucket: the queue and its counters, all under one lock.
+///
+/// # Why the counters are inside the mutex rather than atomics beside it
+///
+/// `ZMarkIngress` buckets its queues so mutators publishing SATB work land on
+/// different locks instead of contending on one. That striping was **defeated by
+/// two shared `AtomicUsize`s** on the same path: `pending_hint` here and
+/// `ZgcRealHeap::mark_ingress_pushes` at the caller, each a `fetch_add` on one
+/// cache line per reference store, from every mutator. Striping N locks and then
+/// funnelling every push through one atomic counter leaves the contention exactly
+/// where it was.
+///
+/// The push already holds this bucket's lock, so a plain `usize` increment under
+/// it is free. Telemetry reads sum across buckets, which is rare and is allowed
+/// to be slow.
+#[derive(Debug, Default)]
+struct ZIngressBucket {
+    queue: Vec<u64>,
+    /// Cumulative pushes into this bucket, for
+    /// [`ZMarkIngress::pushed_total`]. Never reset by `drain_into` — a
+    /// *cumulative* count is what a caller deciding "have I published enough to
+    /// hand off?" wants, and it is what the suppression-channel test asserts on.
+    pushed_total: usize,
+}
+
 #[derive(Debug)]
 pub struct ZMarkIngress {
-    buckets: Vec<Mutex<Vec<u64>>>,
+    buckets: Vec<Mutex<ZIngressBucket>>,
     mask: usize,
-    /// Telemetry only — a hint, never consulted by the termination probe.
-    pending_hint: AtomicUsize,
 }
 
 impl Default for ZMarkIngress {
@@ -957,12 +980,11 @@ impl ZMarkIngress {
     /// A fresh ingress with [`Z_MARK_INGRESS_BUCKETS`] buckets.
     pub fn new() -> Self {
         let buckets = (0..Z_MARK_INGRESS_BUCKETS)
-            .map(|_| Mutex::new(Vec::new()))
+            .map(|_| Mutex::new(ZIngressBucket::default()))
             .collect();
         ZMarkIngress {
             buckets,
             mask: Z_MARK_INGRESS_BUCKETS - 1,
-            pending_hint: AtomicUsize::new(0),
         }
     }
 
@@ -971,17 +993,30 @@ impl ZMarkIngress {
         slot & self.mask
     }
 
-    /// Push one address. The single-address path, for a load-barrier slow
-    /// path that has no buffer to batch into.
+    /// Push one address, and return this **bucket's** cumulative push count.
     ///
     /// Costs one uncontended mutex per call, which is why
     /// [`ZMarkMutatorBuffer`] exists and should be preferred wherever the
     /// caller can hold per-thread state.
-    pub fn push(&self, slot: usize, addr: u64) {
+    ///
+    /// # Why it returns a count
+    ///
+    /// So a caller deciding "have I published enough to hand off to the marker?"
+    /// can read the answer out of the lock it is already holding, instead of
+    /// keeping a shared atomic of its own. `ZgcRealHeap::satb_pre_barrier_slow`
+    /// did keep one, and it was a `fetch_add` on a single cache line per
+    /// reference store from every mutator — which is precisely the contention
+    /// the buckets exist to avoid. It is a PER-BUCKET count, so a handoff
+    /// interval of K now means "K pushes into one bucket" rather than "K pushes
+    /// in total"; with `Z_MARK_INGRESS_BUCKETS` buckets and addresses spread over
+    /// them, the effective interval is that much longer, and the caller's
+    /// constant is chosen with that in mind.
+    pub fn push(&self, slot: usize, addr: u64) -> usize {
         let idx = self.bucket_for(slot);
-        self.buckets[idx].lock().push(addr);
-        // Relaxed: telemetry, and nothing is published through it.
-        self.pending_hint.fetch_add(1, Ordering::Relaxed);
+        let mut b = self.buckets[idx].lock();
+        b.queue.push(addr);
+        b.pushed_total += 1;
+        b.pushed_total
     }
 
     /// Move everything in `buf` into this slot's bucket.
@@ -991,15 +1026,16 @@ impl ZMarkIngress {
         }
         let idx = self.bucket_for(slot);
         let n = buf.len();
-        self.buckets[idx].lock().append(buf);
-        self.pending_hint.fetch_add(n, Ordering::Relaxed);
+        let mut b = self.buckets[idx].lock();
+        b.queue.append(buf);
+        b.pushed_total += n;
         n
     }
 
     /// Does any bucket hold work? Authoritative — scans under the locks, for
     /// the same reason [`ZMarkStripeSet::has_work`] does.
     pub fn has_work(&self) -> bool {
-        self.buckets.iter().any(|b| !b.lock().is_empty())
+        self.buckets.iter().any(|b| !b.lock().queue.is_empty())
     }
 
     /// Move everything out of every bucket into `out`. Returns the count.
@@ -1007,32 +1043,36 @@ impl ZMarkIngress {
         let mut moved = 0usize;
         for bucket in &self.buckets {
             let mut b = bucket.lock();
-            if b.is_empty() {
+            if b.queue.is_empty() {
                 continue;
             }
-            moved += b.len();
-            out.append(&mut b);
-        }
-        if moved > 0 {
-            self.pending_hint.fetch_sub(
-                moved.min(self.pending_hint.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
+            moved += b.queue.len();
+            out.append(&mut b.queue);
         }
         moved
     }
 
-    /// Telemetry hint. Never use this to decide termination.
+    /// Telemetry hint: how much is queued right now. Never use this to decide
+    /// termination.
+    ///
+    /// Summed under the locks rather than kept in a shared counter — see
+    /// [`ZIngressBucket`]. It is O(buckets) and it runs on a diagnostic path.
     pub fn pending_hint(&self) -> usize {
-        self.pending_hint.load(Ordering::Relaxed)
+        self.buckets.iter().map(|b| b.lock().queue.len()).sum()
+    }
+
+    /// Cumulative pushes since the last [`Self::clear`], across every bucket.
+    pub fn pushed_total(&self) -> usize {
+        self.buckets.iter().map(|b| b.lock().pushed_total).sum()
     }
 
     /// Drop everything. Only legal between cycles.
     pub fn clear(&self) {
         for bucket in &self.buckets {
-            bucket.lock().clear();
+            let mut b = bucket.lock();
+            b.queue.clear();
+            b.pushed_total = 0;
         }
-        self.pending_hint.store(0, Ordering::Relaxed);
     }
 }
 

@@ -2753,7 +2753,6 @@ pub struct ZgcRealHeap {
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
     /// which are the two states an inert-looking instrument confuses.
-    mark_ingress_pushes: AtomicUsize,
     /// "The arena can no longer serve a request of [`headroom_margin`] bytes."
     ///
     /// # Why the live-bytes trigger is not enough on THIS backend
@@ -3140,7 +3139,6 @@ impl ZgcRealHeap {
                     (cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100) / 100 * pct
                 }
             }),
-            mark_ingress_pushes: AtomicUsize::new(0),
             barrier_good_mask: AtomicU64::new(vaddr::Z_REMAPPED),
             relocate_active: AtomicBool::new(false),
             barrier_armed: AtomicBool::new(false),
@@ -4009,9 +4007,24 @@ impl ZgcRealHeap {
         // into its bucket count, so any well-distributed key works; the
         // address shifted past the object-alignment zeros is the cheapest one
         // available here.
-        self.mark_ingress.push(old_addr >> 3, old_addr as u64);
-        let n = self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % Z_SATB_HANDOFF_INTERVAL == 0 {
+        // THE HANDOFF COUNT COMES OUT OF THE BUCKET'S OWN LOCK.
+        //
+        // This was `self.mark_ingress_pushes.fetch_add(1, Relaxed)` -- a
+        // `fetch_add` on ONE cache line, per reference store, from every mutator.
+        // Bucketing the ingress so mutators land on different mutexes and then
+        // funnelling every push through a single shared counter leaves the
+        // contention exactly where it was; the counter was the bottleneck the
+        // buckets exist to remove. `push` now returns the count from inside the
+        // lock it already took, so the per-store path has **no shared atomic at
+        // all**.
+        //
+        // The count is now PER BUCKET, so the interval means "this many pushes
+        // into one bucket" -- with `Z_MARK_INGRESS_BUCKETS` buckets and addresses
+        // spread over them, handoffs are correspondingly rarer per bucket and
+        // about as frequent overall. `Z_SATB_HANDOFF_INTERVAL` is divided by the
+        // bucket count for that reason; see its own note.
+        let n = self.mark_ingress.push(old_addr >> 3, old_addr as u64);
+        if n % Z_SATB_HANDOFF_PER_BUCKET == 0 {
             self.hand_satb_batch_to_the_marker();
         }
     }
@@ -4191,11 +4204,11 @@ impl ZgcRealHeap {
     pub fn set_mark_active(&self, active: bool) {
         if !active {
             self.mark_active.store(false, Ordering::Relaxed);
+            // `clear` resets the buckets' cumulative counts too.
             self.mark_ingress.clear();
-            self.mark_ingress_pushes.store(0, Ordering::Relaxed);
         } else {
+            // `clear` resets the buckets' cumulative counts too.
             self.mark_ingress.clear();
-            self.mark_ingress_pushes.store(0, Ordering::Relaxed);
             self.mark_active.store(true, Ordering::Relaxed);
         }
     }
@@ -4211,7 +4224,11 @@ impl ZgcRealHeap {
     /// workload overwrote no references, which is a different fact from the
     /// barrier not being wired.
     pub fn mark_ingress_pushes(&self) -> usize {
-        self.mark_ingress_pushes.load(Ordering::Relaxed)
+        // Summed out of the buckets, under their own locks. The shared
+        // `AtomicUsize` this used to read was removed from the per-store path --
+        // see `satb_pre_barrier_slow` for why a striped queue behind one counter
+        // is not striped.
+        self.mark_ingress.pushed_total()
     }
 
     /// Drain the mutator ingress — what a coordinator's mark-end flush calls.
@@ -8388,6 +8405,23 @@ fn conc_start_percent_setting() -> usize {
     })
 }
 
+/// [`Z_SATB_HANDOFF_INTERVAL`] expressed per ingress bucket.
+///
+/// The handoff decision is made from a bucket's own push count (see
+/// `satb_pre_barrier_slow`), so the interval has to be divided by the number of
+/// buckets or handoffs would become `Z_MARK_INGRESS_BUCKETS` times rarer than
+/// intended -- and everything still in the ingress when the collection arrives is
+/// traced INSIDE the pause, which is the cost the batching exists to avoid.
+///
+/// Floored at 1: a bucket count above the interval would otherwise make this 0
+/// and `n % 0` panics.
+const Z_SATB_HANDOFF_PER_BUCKET: usize =
+    if Z_SATB_HANDOFF_INTERVAL / mark::Z_MARK_INGRESS_BUCKETS > 0 {
+        Z_SATB_HANDOFF_INTERVAL / mark::Z_MARK_INGRESS_BUCKETS
+    } else {
+        1
+    };
+
 /// Words in the skip-set Bloom filter -- see
 /// [`ZgcRealHeap::mark_ref_skip_bloom`]. 512 words is 32768 bits and 4 KiB per
 /// heap; with 1000 `Reference` objects and two bits each the false-positive rate
@@ -9935,8 +9969,9 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
         if !self.registry.contains(absolute) {
             return;
         }
-        self.mark_ingress.push(absolute >> 3, absolute as u64);
-        self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed);
+        // The count comes back from the bucket's own lock; there is no shared
+        // counter on this path either. See `satb_pre_barrier_slow`.
+        let _ = self.mark_ingress.push(absolute >> 3, absolute as u64);
     }
 
     fn stats(&self) -> &barrier::ZBarrierStats {
@@ -14355,6 +14390,84 @@ pub(crate) mod tests {
             via_vec[..bitmap_len].windows(2).all(|w| w[0] < w[1]),
             "the bitmap portion must be strictly ascending"
         );
+    }
+
+    // -- C4: the SATB handoff, off the shared counter -----------------------
+
+    /// **The SATB ingress must still hand off in batches once the count came out
+    /// of the bucket instead of a shared atomic.**
+    ///
+    /// # Why the change could silently stop the handoff
+    ///
+    /// The handoff used to fire on a process-wide push count; it now fires on a
+    /// **per-bucket** one, which is `Z_MARK_INGRESS_BUCKETS` times smaller for
+    /// the same number of stores. `Z_SATB_HANDOFF_PER_BUCKET` divides the
+    /// interval to compensate. Get that wrong in either direction and nothing
+    /// fails: too rare and the ingress grows until the collection arrives and
+    /// traces all of it INSIDE the pause — which is the cost the batching exists
+    /// to remove, and it presents as a slow pause, not as a bug. Too frequent and
+    /// the pool mutex is taken per store.
+    ///
+    /// So the assertion is on the ingress staying BOUNDED under a store load that
+    /// is many multiples of the interval, which is the property that actually
+    /// matters and the only one visible from outside.
+    #[test]
+    fn the_satb_handoff_keeps_the_ingress_bounded() {
+        let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let (head, chain, _g) = conc_build_graph(&heap, 400, 0);
+
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        assert!(heap.concurrent_mark_active());
+
+        // Overwrite slot 1 of every chain object, over and over. Each overwrite
+        // publishes the reference it lost, so this is `stores` SATB pushes.
+        let stores = Z_SATB_HANDOFF_PER_BUCKET * mark::Z_MARK_INGRESS_BUCKETS * 8;
+        let filler = heap.alloc_object(ClassId::new(99), 0);
+        let mut pushed = 0usize;
+        let mut worst_pending = 0usize;
+        while pushed < stores {
+            for addr in &chain {
+                // SAFETY: `addr` came from an `ObjectRef` in this test and this
+                // heap does not move objects under its own mutator.
+                let obj = unsafe { ObjectRef::from_raw(*addr as *mut u8) };
+                heap.set_field(obj, 1, Value::Object(Some(filler)));
+                pushed += 1;
+                worst_pending = worst_pending.max(heap.mark_ingress.pending_hint());
+                if pushed >= stores {
+                    break;
+                }
+            }
+        }
+        // Minus one pass: slot 1 starts null on every chain object, and a null
+        // overwrite carries no edge. That the shortfall is EXACTLY `chain.len()`
+        // is itself the check that the count is the barrier's and not an estimate.
+        assert_eq!(
+            heap.mark_ingress_pushes(),
+            stores - chain.len(),
+            "the barrier must have published every non-null overwrite and nothing              else"
+        );
+        assert!(
+            worst_pending < stores / 2,
+            "the ingress must be handed off in batches, not accumulated: it held \
+             {worst_pending} of {stores} pushes at its peak, so whatever is still \
+             there when the collection arrives gets traced inside the pause"
+        );
+
+        // And the cycle still certifies with the right survivor set, so the
+        // handoff is not dropping work.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        assert_eq!(heap.concurrent_mark_stats().1, 1, "the cycle certified");
+        assert_eq!(conc_walk_chain(&heap, head), chain);
     }
 
     // -- C5: the skip-set Bloom filter -------------------------------------
