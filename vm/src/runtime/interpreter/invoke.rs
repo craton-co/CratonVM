@@ -1921,45 +1921,38 @@ pub(super) fn execute_invoke_kind(
                 &args[1..],
             )?;
             if let Some(value) = result {
-                // Unbox the result if the method returns a primitive type
-                let ret_char = method_descriptor
-                    .rsplit(')')
-                    .nth(0)
-                    .unwrap_or("L")
-                    .chars()
-                    .next()
-                    .unwrap_or('L');
-                let unboxed = match ret_char {
-                    'I' | 'Z' | 'B' | 'C' | 'S' => {
-                        if let Value::Object(Some(obj)) = value {
-                            shared.mem.heap.get_field(obj, 0)
-                        } else {
-                            value
-                        }
-                    }
-                    'J' => {
-                        if let Value::Object(Some(obj)) = value {
-                            shared.mem.heap.get_field(obj, 0)
-                        } else {
-                            value
-                        }
-                    }
-                    'F' => {
-                        if let Value::Object(Some(obj)) = value {
-                            shared.mem.heap.get_field(obj, 0)
-                        } else {
-                            value
-                        }
-                    }
-                    'D' => {
-                        if let Value::Object(Some(obj)) = value {
-                            shared.mem.heap.get_field(obj, 0)
-                        } else {
-                            value
-                        }
-                    }
-                    _ => value, // Object return type — no unboxing
-                };
+                // G24-1. This used to be five copies of one `if let
+                // Value::Object(Some(obj)) = value { get_field(obj, 0) } else
+                // { value }`, one per return-descriptor group, and it was the
+                // whole of the return coercion on the live proxy path. Two
+                // things were wrong with it and neither was the duplication:
+                // `Value::Object(None)` fell into the `else` arm and was pushed
+                // as the primitive return value where HotSpot throws
+                // `NullPointerException` (8 measured rows), and slot 0 was read
+                // off WHATEVER object arrived with no wrapper-class check at
+                // all, so 18 more measured rows silently succeeded — three of
+                // them by reinterpreting an `int` payload as float bits.
+                //
+                // Both now live in `vm::proxy_coerce_handler_return`, applied
+                // inside `proxy_invoke_handler_shared` at the points where the
+                // USER's handler result comes back. That placement is
+                // deliberate: the AnnotationProxy arm of that function returns
+                // earlier and keeps the lenient unbox, so annotation member
+                // data — which is the VM's own bookkeeping, not a value any
+                // Java code chose — cannot be refused by the strict contract.
+                //
+                // So by the time a value reaches this line it has already been
+                // coerced, by one arm or the other, and is a raw JVM value for
+                // a primitive return. The lenient helper is still called rather
+                // than dropped, because it is a no-op on an already-raw value
+                // and this is the documented boundary between the shared
+                // dispatch hook and the interpreter's operand stack.
+                let unboxed = crate::vm::proxy_unbox_primitive_return(
+                    shared,
+                    &method_descriptor,
+                    Ok(Some(value)),
+                )?
+                .unwrap_or(value);
                 let ret = crate::jit::return_type(&method_descriptor);
                 let pushed = coerce_value_for_return(unboxed, ret);
                 // T18.K4 — tag-exact push for J/D proxy return values.

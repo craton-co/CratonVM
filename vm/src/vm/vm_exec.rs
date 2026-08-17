@@ -19032,7 +19032,10 @@ pub(super) fn proxy_invoke_handler(
             // return contract) into a fresh wrapper's raw-value slot,
             // corrupting the value (observed: `Bean.getAge()` through two
             // nested JDK proxies returned an unrelated int instead of 5).
-            return proxy_unbox_primitive_return(ctx.shared, descriptor, Ok(result));
+            // G24-1: this is a USER handler's value, so it takes the strict
+            // contract (null -> NPE, wrong type -> CCE), not the annotation
+            // arm's lenient unbox.
+            return proxy_coerce_handler_return(ctx.shared, descriptor, Ok(result));
         }
         return Err(MethodCallFailed::InternalError(VmError::Linkage(
             LinkageError::AbstractMethodError {
@@ -19075,7 +19078,14 @@ pub(super) fn proxy_invoke_handler(
     // (confirmed: double-nested `Proxy.newProxyInstance` around a plain
     // pass-through `InvocationHandler`, `int getAge()` returned garbage
     // instead of the real value; a single proxy layer was unaffected).
-    proxy_unbox_primitive_return(
+    //
+    // G24-1 promoted this from the lenient unbox to the strict contract: the
+    // value here is whatever the user's `InvocationHandler` chose, so `null`
+    // for a primitive return is an NPE and a mismatched wrapper is a CCE. The
+    // nested-proxy case above still works, because a nested dispatch hands back
+    // an already-raw value and every arm of the strict helper passes those
+    // through untouched.
+    proxy_coerce_handler_return(
         ctx.shared,
         descriptor,
         proxy_wrap_undeclared_if_needed(
@@ -19155,7 +19165,7 @@ fn class_name_is(shared: &SharedVm, obj: ObjectRef, name: &str) -> bool {
 /// the boundary here (rather than in the individual callers) so native and
 /// interpreter proxy dispatch cannot accidentally hand an `Integer` reference
 /// to code expecting an `int`.
-fn proxy_unbox_primitive_return(
+pub(crate) fn proxy_unbox_primitive_return(
     shared: &SharedVm,
     descriptor: &str,
     result: MethodCallResult,
@@ -19180,6 +19190,284 @@ fn proxy_unbox_primitive_return(
         }
         _ => Ok(Some(value)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// G24-1 — the InvocationHandler return contract on the LIVE proxy path
+// ---------------------------------------------------------------------------
+//
+// HotSpot's generated `$ProxyN` body does not merely *read* the handler's
+// `Object` result — it emits a `checkcast` to the declared return type and, for
+// a primitive return, a `checkcast` to the wrapper followed by the wrapper's
+// `xxxValue()` call. Both bytecodes can fail, and the two failures are the
+// whole of `RJdkProxy` checks 32 and 33:
+//
+//   * `null` for a primitive return -> `NullPointerException`, whose text is
+//     the helpful-NPE for the `xxxValue()` call site and so names a DIFFERENT
+//     wrapper per return type (G24-1 §2);
+//   * any object that is not exactly the declared type -> `ClassCastException`.
+//     There is **no widening**: an `Integer` returned for a `long`-declared
+//     method is a CCE on HotSpot, not a conversion (G24-1 §3, MEASURED — the
+//     row a careful reading of the JDK gets wrong).
+//
+// `proxy_unbox_primitive_return` above stays as it was, deliberately: it is the
+// ANNOTATION arm's coercion, where the values are the VM's own recorded member
+// data rather than something a user handler chose, and refusing one of those
+// would turn a CratonVM bookkeeping gap into a thrown exception on a path
+// `RJdkStrict` (359 checks) drives hard. The strict contract below is applied
+// one level in — at the three points inside `proxy_invoke_handler{,_shared}`
+// where the USER's `InvocationHandler` result comes back — so the annotation
+// arm, which returns earlier, never reaches it.
+
+/// The wrapper class and the unboxing accessor HotSpot's generated `$ProxyN`
+/// body calls for each primitive return descriptor.
+///
+/// The accessor name is not decoration: it is quoted verbatim in the NPE
+/// message, and it is the half that varies per type. TRANSCRIBED from the
+/// oracle (`PRet` probe, HotSpot 25.0.3+9-LTS), not composed from a template.
+fn proxy_primitive_return_wrapper(ret: char) -> Option<(&'static str, &'static str)> {
+    Some(match ret {
+        'Z' => ("java/lang/Boolean", "booleanValue"),
+        'B' => ("java/lang/Byte", "byteValue"),
+        'C' => ("java/lang/Character", "charValue"),
+        'S' => ("java/lang/Short", "shortValue"),
+        'I' => ("java/lang/Integer", "intValue"),
+        'J' => ("java/lang/Long", "longValue"),
+        'F' => ("java/lang/Float", "floatValue"),
+        'D' => ("java/lang/Double", "doubleValue"),
+        _ => return None,
+    })
+}
+
+/// The return descriptor of `descriptor` — everything after the last `)`.
+///
+/// Spelled out rather than reusing the `rsplit(')')` idiom above because that
+/// one answers the WHOLE string for a descriptor with no `)` at all, which
+/// would make `proxy_coerce_handler_return` read a malformed descriptor's first
+/// character as a return kind.
+fn proxy_return_descriptor(descriptor: &str) -> &str {
+    match descriptor.rfind(')') {
+        Some(idx) => &descriptor[idx + 1..],
+        None => "",
+    }
+}
+
+/// HotSpot's `Klass::external_name()` for a cast-message operand: dotted, with
+/// arrays left in descriptor form. The `(… are in module …)` parenthetical is
+/// appended later by `runtime::exceptions::throw_runtime_error`, the single
+/// funnel every VM-raised `RuntimeError` passes through — so the message built
+/// here is deliberately the bare two-operand form that funnel recognises.
+fn proxy_cast_display_name(internal: &str) -> String {
+    internal.replace('/', ".")
+}
+
+/// HotSpot's helpful-NPE for the `xxxValue()` call the generated `$ProxyN` body
+/// makes on a `null` handler result.
+///
+/// A separate function only so the text can be asserted without a VM: it is
+/// TRANSCRIBED, and it is the half of this change that no amount of reading the
+/// JDK would produce. The `because` clause is invariant — the receiver is
+/// always the handler's return value — while the `Cannot invoke` half names the
+/// wrapper and accessor for the declared return type.
+fn proxy_null_return_npe_message(wrapper_internal: &str, accessor: &str) -> String {
+    format!(
+        "Cannot invoke \"{}.{accessor}()\" because the return value of \
+         \"java.lang.reflect.InvocationHandler.invoke(Object, \
+         java.lang.reflect.Method, Object[])\" is null",
+        proxy_cast_display_name(wrapper_internal)
+    )
+}
+
+/// The bare two-operand cast refusal `runtime::exceptions::throw_runtime_error`
+/// recognises and decorates with the module/loader parenthetical.
+fn proxy_cast_refusal_message(from_internal: &str, to_internal: &str) -> String {
+    format!(
+        "class {} cannot be cast to class {}",
+        proxy_cast_display_name(from_internal),
+        proxy_cast_display_name(to_internal)
+    )
+}
+
+/// Can this VM state, with confidence, what `obj`'s type is *not*?
+///
+/// `true` means "no opinion" and the caller must fail open. The strict contract
+/// can only ever REFUSE, so every uncertainty has to answer `true` here: a
+/// wrong refusal turns a working proxy into a thrown `ClassCastException`,
+/// which is strictly worse than the missing refusal it replaces.
+///
+/// Four populations are opaque:
+///
+/// * **Arrays.** `class_id_of` on an array header carries the COMPONENT class
+///   (see the `Thread.clone` H2-CID0 note in `interpreter/invoke.rs`), so a
+///   `String[]` would answer `is_assignable_to_name("java/lang/String")` —
+///   true, for the wrong reason. Two measured rows (`String[]` -> `int[]`,
+///   `int[]` -> `Object[]`) are left diverging by this and nothing asserts
+///   them.
+/// * **Lambda proxies.** Their `ClassId` is synthetic and absent from the class
+///   store, so their SAM interface is on no `interfaces` list to walk. Costs
+///   the measured `lambda` -> `String` row.
+/// * **Anything on a proxy superclass chain** (`Proxy$Instance` or the real
+///   `java/lang/reflect/Proxy`). A fabricated `$ProxyN` records
+///   `GeneratedProxy { interfaces: [] }` — "no record", not "implements
+///   nothing" — the same distinction `recorded_proxy_interface_set` in
+///   `interpreter/typecheck.rs` exists to make.
+/// * **A class the class manager cannot produce at all.**
+fn proxy_return_type_is_opaque(shared: &SharedVm, obj: ObjectRef) -> bool {
+    if shared.mem.heap.kind_of(obj) == ObjectKind::Array {
+        return true;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    if shared.classes.lambda_proxies.read().contains_key(&class_id) {
+        return true;
+    }
+    if crate::runtime::interpreter::class_chain_reaches_proxy_instance(shared, class_id) {
+        return true;
+    }
+    shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .is_none()
+}
+
+/// The runtime class name to quote in a cast refusal, or `None` when
+/// [`proxy_return_type_is_opaque`] says we must not refuse at all.
+fn proxy_refusable_class_name(shared: &SharedVm, obj: ObjectRef) -> Option<String> {
+    if proxy_return_type_is_opaque(shared, obj) {
+        return None;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|c| c.name.to_string())
+}
+
+/// `Some(runtime_class_name)` when `obj` must be refused for a method whose
+/// declared reference return descriptor is `ret_desc`; `None` to accept.
+///
+/// Assignability is answered by `Class::is_assignable_to_name`, which walks the
+/// superclass chain AND the interface DAG comparing NAMES — so it needs no
+/// `ClassId` for the declared type and therefore triggers no class loading on
+/// a dispatch path. That matters: this runs once per proxy call with a
+/// reference return, and a `load_class` here would put classloading behind
+/// every such dispatch.
+///
+/// Two gates before a refusal, both measured-neutral, both there to keep a
+/// refusal from being invented out of a lookup failure:
+///
+/// * `Ljava/lang/Object;` — by far the most common proxy return descriptor —
+///   short-circuits before any lock is taken;
+/// * the declared type must itself be a class this VM has a unique definition
+///   for. If it is not loaded, "not assignable" is a statement about the class
+///   store rather than about the value.
+fn proxy_reference_return_refusal(
+    shared: &SharedVm,
+    obj: ObjectRef,
+    ret_desc: &str,
+) -> Option<String> {
+    if ret_desc == "Ljava/lang/Object;" {
+        return None;
+    }
+    // Array return types fail open together with array values: see
+    // `proxy_return_type_is_opaque`.
+    let target = ret_desc.strip_prefix('L')?.strip_suffix(';')?;
+    if proxy_return_type_is_opaque(shared, obj) {
+        return None;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    let name = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        if class.is_assignable_to_name(target, &cm.class_store) {
+            return None;
+        }
+        // The declared type must itself be a class this VM has a unique
+        // definition for — otherwise "not assignable" is a statement about the
+        // class store rather than about the value.
+        cm.find_unique_class_by_name(target)?;
+        class.name.to_string()
+    };
+    // The two admit-only heuristics `aastore_element_assignable` reaches for at
+    // the same point, after its own by-name walk has already declined. Both can
+    // only ADMIT, and both cover populations whose real supertypes are not on
+    // any `interfaces` list: a class this VM fabricated, and an annotation
+    // proxy whose annotation interface lives on the heap object rather than in
+    // its class entry. Borrowed rather than reimplemented so this predicate
+    // cannot drift away from the one `aastore` and `checkcast` already use.
+    if crate::runtime::interpreter::synthetic_implements_public(shared, class_id, target)
+        || crate::runtime::interpreter::annotation_proxy_satisfies_target(shared, obj, target)
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Apply the `InvocationHandler` return contract to the value a USER handler
+/// produced, exactly as HotSpot's generated `$ProxyN` body would.
+///
+/// A raw (already-unboxed) `Value` passes through untouched on every arm. That
+/// is not laxity — it is the re-entrancy valve. A proxy whose handler
+/// reflectively re-invokes through a NESTED proxy gets that inner dispatch's
+/// result back already coerced here, and `Method.invoke` re-boxes it per the
+/// inner method's own descriptor, so the outer coercion sees a wrapper again.
+/// A raw value at this boundary can therefore only be the VM's own, and
+/// refusing it would refuse a value no Java code ever chose.
+pub(crate) fn proxy_coerce_handler_return(
+    shared: &SharedVm,
+    descriptor: &str,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Some(value) = result? else {
+        return Ok(None);
+    };
+    let ret_desc = proxy_return_descriptor(descriptor);
+    let ret = ret_desc.chars().next().unwrap_or('L');
+
+    if let Some((wrapper, accessor)) = proxy_primitive_return_wrapper(ret) {
+        return match value {
+            // The `because` clause is fixed text — the generated body's
+            // receiver is always the handler's return value; the `Cannot
+            // invoke` half names the wrapper for THIS return type.
+            Value::Object(None) => Err(RuntimeError::NullPointerException {
+                message: Some(proxy_null_return_npe_message(wrapper, accessor)),
+            }
+            .into()),
+            Value::Object(Some(obj)) => {
+                if class_name_is(shared, obj, wrapper) {
+                    return Ok(Some(shared.mem.heap.get_field(obj, 0)));
+                }
+                match proxy_refusable_class_name(shared, obj) {
+                    // The wrapper checkcast. NOT a widening site: an `Integer`
+                    // for a `J` return refuses here rather than converting.
+                    Some(actual) => Err(RuntimeError::ClassCastException {
+                        message: proxy_cast_refusal_message(&actual, wrapper),
+                    }
+                    .into()),
+                    // Opaque: keep the pre-G24 read of slot 0 verbatim.
+                    None => Ok(Some(shared.mem.heap.get_field(obj, 0))),
+                }
+            }
+            other => Ok(Some(other)),
+        };
+    }
+
+    if ret == 'V' {
+        return Ok(Some(value));
+    }
+    if let Value::Object(Some(obj)) = value {
+        if let Some(actual) = proxy_reference_return_refusal(shared, obj, ret_desc) {
+            let target = ret_desc.trim_start_matches('L').trim_end_matches(';');
+            return Err(RuntimeError::ClassCastException {
+                message: proxy_cast_refusal_message(&actual, target),
+            }
+            .into());
+        }
+    }
+    Ok(Some(value))
 }
 
 /// Dispatch a real JDK `$ProxyN` annotation method through its synthetic
@@ -19495,7 +19783,14 @@ pub(crate) fn proxy_invoke_handler_shared(
             }
         };
         if let Some(result) = dispatch {
-            return Ok(result);
+            // G24-1: a `(proxy, m, a) -> …` handler passed straight to
+            // `newProxyInstance` is the common shape — it is what `RJdkProxy`
+            // uses — and its result is a user value, so it takes the same
+            // strict contract as the object-handler tail below. This arm
+            // returned verbatim before, leaving the coercion entirely to the
+            // caller in `interpreter/invoke.rs`, whose `else { value }` arm is
+            // what pushed a handler's `null` as `0`.
+            return proxy_coerce_handler_return(shared, descriptor, Ok(result));
         }
         // Fell through unexpectedly вЂ” surface as a clearer error than
         // "no Code attribute".
@@ -19529,7 +19824,19 @@ pub(crate) fn proxy_invoke_handler_shared(
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
     );
-    proxy_wrap_undeclared_if_needed(shared, thread, proxy, method_name, descriptor, result)
+    // G24-1: the object-handler tail. Everything reaching here came out of a
+    // real `InvocationHandler.invoke` body, so the return contract applies —
+    // `null` for a primitive return is an NPE and a value that is not the
+    // declared type is a CCE, with no widening. The AnnotationProxy arm
+    // returned long before this point, which is what keeps annotation member
+    // data (and `RJdkStrict`) out of the blast radius; the exception wrap
+    // stays innermost so an undeclared checked throw is still rewrapped before
+    // the coercion sees `Err` and passes it straight through.
+    proxy_coerce_handler_return(
+        shared,
+        descriptor,
+        proxy_wrap_undeclared_if_needed(shared, thread, proxy, method_name, descriptor, result),
+    )
 }
 
 /// proxy-real-classfile increment 6 — `UndeclaredThrowableException` parity for
@@ -30239,5 +30546,211 @@ mod tests {
         assert_ne!(strict.vm_identity, lax.vm_identity);
         assert!(capabilities_for(VmId::from_raw(strict.vm_identity)).is_some());
         assert!(capabilities_for(VmId::from_raw(lax.vm_identity)).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // G24-1 — the proxy return contract
+    // -----------------------------------------------------------------------
+
+    /// The eight NPE texts, TRANSCRIBED from HotSpot 25.0.3+9-LTS (the `PRet`
+    /// probe of G24-1 §2), asserted one at a time rather than generated from a
+    /// template.
+    ///
+    /// They differ only in the wrapper and the accessor, which is exactly why
+    /// the test is written out: a template would encode the guess that they
+    /// differ only there, and the guess is what the record says to stop making.
+    /// If a future edit derives `charValue` from `Character` by lowercasing,
+    /// this still passes — but if it derives the wrapper from the descriptor
+    /// with `B`/`S` transposed, or spells `Object[]` as
+    /// `java.lang.Object[]` in the `because` clause, this fails.
+    #[test]
+    fn the_null_return_npe_text_is_transcribed_per_primitive() {
+        let expected = [
+            ('Z', "Cannot invoke \"java.lang.Boolean.booleanValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('B', "Cannot invoke \"java.lang.Byte.byteValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('C', "Cannot invoke \"java.lang.Character.charValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('S', "Cannot invoke \"java.lang.Short.shortValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('I', "Cannot invoke \"java.lang.Integer.intValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('J', "Cannot invoke \"java.lang.Long.longValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('F', "Cannot invoke \"java.lang.Float.floatValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('D', "Cannot invoke \"java.lang.Double.doubleValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+        ];
+        for (ret, want) in expected {
+            let (wrapper, accessor) = proxy_primitive_return_wrapper(ret)
+                .unwrap_or_else(|| panic!("'{ret}' must be a primitive return"));
+            assert_eq!(
+                proxy_null_return_npe_message(wrapper, accessor),
+                want,
+                "NPE text for return descriptor '{ret}'"
+            );
+        }
+    }
+
+    /// Only the eight JVMS primitive return descriptors take the unboxing arm.
+    /// `V` in particular must not: a `void` proxy method whose handler returns
+    /// `null` is legal on HotSpot (MEASURED, `null->void | NO-THROW`), so
+    /// letting `V` into the wrapper table would invent an NPE.
+    #[test]
+    fn only_the_eight_primitive_returns_have_a_wrapper() {
+        for ret in ['Z', 'B', 'C', 'S', 'I', 'J', 'F', 'D'] {
+            assert!(proxy_primitive_return_wrapper(ret).is_some(), "'{ret}'");
+        }
+        for ret in ['V', 'L', '[', 'X', 'i', 'z'] {
+            assert!(proxy_primitive_return_wrapper(ret).is_none(), "'{ret}'");
+        }
+    }
+
+    /// Each primitive maps to its OWN wrapper — the whole content of "there is
+    /// no widening". `Integer` for a `J` return is a refusal, not a conversion,
+    /// so no two descriptors may share a wrapper.
+    #[test]
+    fn each_primitive_return_has_a_distinct_wrapper() {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for ret in ['Z', 'B', 'C', 'S', 'I', 'J', 'F', 'D'] {
+            let (wrapper, _) = proxy_primitive_return_wrapper(ret).unwrap();
+            assert!(!seen.contains(&wrapper), "{wrapper} claimed twice");
+            seen.push(wrapper);
+        }
+        assert_eq!(
+            proxy_primitive_return_wrapper('J').unwrap().0,
+            "java/lang/Long"
+        );
+        assert_eq!(
+            proxy_primitive_return_wrapper('I').unwrap().0,
+            "java/lang/Integer"
+        );
+    }
+
+    /// The return-descriptor split, including the malformed input the previous
+    /// `rsplit(')')` spelling answered wrongly.
+    #[test]
+    fn the_return_descriptor_is_everything_after_the_last_paren() {
+        assert_eq!(proxy_return_descriptor("()I"), "I");
+        assert_eq!(proxy_return_descriptor("(Ljava/lang/String;)V"), "V");
+        assert_eq!(
+            proxy_return_descriptor("(II)Ljava/lang/String;"),
+            "Ljava/lang/String;"
+        );
+        assert_eq!(
+            proxy_return_descriptor("()[Ljava/lang/String;"),
+            "[Ljava/lang/String;"
+        );
+        assert_eq!(proxy_return_descriptor("()[[I"), "[[I");
+        // No `)` at all: answer nothing rather than reading the first
+        // character of the parameter list as a return kind. `rsplit(')')`
+        // would have handed back `"Ljava/lang/String;"` here, whose first
+        // character is `L` — harmless — but `"I"` for a stray `"I"` would have
+        // put a malformed descriptor onto the primitive arm.
+        assert_eq!(proxy_return_descriptor("I"), "");
+        assert_eq!(proxy_return_descriptor(""), "");
+    }
+
+    /// The cast refusal must be in the exact bare two-operand shape
+    /// `runtime::exceptions::split_cast_operands` accepts, or the funnel that
+    /// adds HotSpot's `(… are in module …)` parenthetical silently declines and
+    /// the message ships half-built. That splitter requires both operands to be
+    /// whitespace-free with nothing else in the message.
+    #[test]
+    fn the_cast_refusal_is_in_the_shape_the_message_funnel_rewrites() {
+        let msg = proxy_cast_refusal_message("java/lang/Integer", "java/lang/String");
+        assert_eq!(
+            msg,
+            "class java.lang.Integer cannot be cast to class java.lang.String"
+        );
+        let (lhs, rhs) = msg.split_once(" cannot be cast to ").expect("two operands");
+        let lhs = lhs.strip_prefix("class ").expect("class-prefixed lhs");
+        let rhs = rhs.strip_prefix("class ").expect("class-prefixed rhs");
+        assert!(!lhs.contains(char::is_whitespace), "lhs {lhs:?}");
+        assert!(!rhs.contains(char::is_whitespace), "rhs {rhs:?}");
+        // Arrays keep descriptor form, matching `Klass::external_name()` —
+        // MEASURED: `class [Ljava.lang.String; cannot be cast to class [I`.
+        assert_eq!(
+            proxy_cast_refusal_message("[Ljava/lang/String;", "[I"),
+            "class [Ljava.lang.String; cannot be cast to class [I"
+        );
+    }
+
+    /// The three arms of the strict coercion that need no heap object:
+    /// a `void`/absent result, a `null` over a primitive return, a `null` over
+    /// a reference return, and an already-raw value.
+    #[test]
+    fn the_strict_coercion_refuses_null_only_for_a_primitive_return() {
+        let shared = test_shared();
+
+        // Void / no value at all — nothing to coerce.
+        assert!(matches!(
+            proxy_coerce_handler_return(&shared, "()V", Ok(None)),
+            Ok(None)
+        ));
+
+        // `null` over a reference return is the legal case and must survive.
+        assert!(matches!(
+            proxy_coerce_handler_return(
+                &shared,
+                "()Ljava/lang/String;",
+                Ok(Some(Value::Object(None)))
+            ),
+            Ok(Some(Value::Object(None)))
+        ));
+
+        // `null` over a primitive return is the defect this record closes.
+        for (desc, want_wrapper) in [
+            ("()I", "java.lang.Integer"),
+            ("()J", "java.lang.Long"),
+            ("()D", "java.lang.Double"),
+            ("()Z", "java.lang.Boolean"),
+        ] {
+            match proxy_coerce_handler_return(&shared, desc, Ok(Some(Value::Object(None)))) {
+                Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NullPointerException { message: Some(m) },
+                ))) => assert!(
+                    m.contains(want_wrapper) && m.ends_with("is null"),
+                    "{desc}: {m}"
+                ),
+                other => panic!("{desc} must NPE, got {other:?}"),
+            }
+        }
+
+        // An already-raw value is the VM's own and passes through untouched —
+        // the re-entrancy valve the nested-proxy path depends on.
+        assert!(matches!(
+            proxy_coerce_handler_return(&shared, "()I", Ok(Some(Value::Int(7)))),
+            Ok(Some(Value::Int(7)))
+        ));
+        match proxy_coerce_handler_return(&shared, "()D", Ok(Some(Value::Double(1.5)))) {
+            Ok(Some(Value::Double(d))) => assert_eq!(d, 1.5),
+            other => panic!("a raw double must pass through, got {other:?}"),
+        }
+
+        // An `Err` is threaded through unchanged, so the
+        // `UndeclaredThrowableException` wrap that runs INSIDE this call
+        // stays authoritative.
+        let failed = proxy_coerce_handler_return(
+            &shared,
+            "()I",
+            Err(RuntimeError::NullPointerException { message: None }.into()),
+        );
+        assert!(matches!(
+            failed,
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { message: None }
+            )))
+        ));
+    }
+
+    /// `Ljava/lang/Object;` — the most common proxy return descriptor — is
+    /// accepted before any class-manager lock is taken, and an array return
+    /// descriptor fails open. Both are load-bearing narrowings rather than
+    /// omissions: see `proxy_reference_return_refusal`.
+    #[test]
+    fn an_object_return_and_an_array_return_never_refuse() {
+        let shared = test_shared();
+        // SAFETY: never dereferenced — both arms answer before touching the
+        // heap. `Ljava/lang/Object;` short-circuits on the descriptor, and the
+        // array arm fails the `strip_prefix('L')`.
+        let obj = unsafe { ObjectRef::from_raw(8usize as *mut u8) };
+        assert!(proxy_reference_return_refusal(&shared, obj, "Ljava/lang/Object;").is_none());
+        assert!(proxy_reference_return_refusal(&shared, obj, "[Ljava/lang/String;").is_none());
+        assert!(proxy_reference_return_refusal(&shared, obj, "[I").is_none());
     }
 }
