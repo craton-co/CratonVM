@@ -8499,6 +8499,28 @@ impl mark::ZMarkContext for ZgcRealHeap {
     // somebody forgot to fill in.
 }
 
+// G45: this impl has NO descriptor-aware field accessor of its own.
+//
+// `get_field_as`, `get_field_volatile_as`, `set_field_as` and
+// `set_field_volatile_as` are inherited verbatim from the
+// `GarbageCollector` defaults in `collector.rs`, and nothing anywhere under
+// `zgc.rs` / `zgc/` / `zgc_concurrent.rs` names
+// `coerce_field_value_by_descriptor`, `coerce_field_value_for_slot` or
+// `FieldCoercionSite` — VERIFIED by grep, zero hits. This heap only supplies
+// the raw `get_field` / `set_field` half that those defaults call.
+//
+// That is worth stating rather than leaving to be rediscovered, because ZGC
+// is the DEFAULT collector (`vm/src/config.rs:769`, since 2026-08-10). So
+// the coercion provenance of a default `cratonvm` run comes entirely from
+// `collector.rs`, not from here: there is no ZGC-side site to repair, and a
+// lane that goes looking for one in this file will find nothing and may
+// conclude the instrument does not cover ZGC. It does. Conversely, a
+// measurement blamed on `gen_heap.rs` is not measuring a default run at all
+// — a previous performance lane lost time to exactly that.
+//
+// If this heap ever overrides one of the four for a fused fast path, it must
+// pass a real `FieldCoercionSite` (see `collector.rs`), or the default
+// collector silently reverts to `class_id=-1 index=-1`.
 impl GarbageCollector for ZgcRealHeap {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         let compact_body =
