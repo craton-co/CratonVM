@@ -39,11 +39,11 @@ pattern" was right: it was 42 methods, not one. Two causes.
   compared the RFC 2253 string instead of the CANONICAL form, so two DNs
   differing only in attribute-name case or in runs of spaces were unequal and a
   CRL could not be matched to its issuer. FIXED.
-* The remaining 35 are **a JIT defect**, not a PKIX one:
+* The remaining 35 were **a JIT defect**, not a PKIX one:
   `CRATONVM_JIT_DENY=org/bouncycastle/jce/provider/ProvRevocationChecker.check`
-  takes the class from 12 failures to 0 on a 208-vector run, and `--nojit` does
-  the same. Re-homed to
-  `docs/known-issues/jit/bug-jit-compiled-body-loses-a-callee-thrown-exception-20260817.md`.
+  took the class from 12 failures to 0 on a 208-vector run, and `--nojit` did
+  the same. Root-caused and FIXED — the class now passes all 286 vectors. See
+  `fixed-suite-bugs/jit/bug-jit-compiled-body-loses-a-callee-thrown-exception-20260817.md`.
 
 **Not covered here — `pqc.jcajce.provider`.** The doc asked for its two shapes
 to be separated. They were: the process-crashing `NotImplemented` was the JCA

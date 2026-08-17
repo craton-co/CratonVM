@@ -1,26 +1,33 @@
 # netty OpenSSL key material: the opaque-key gap, and what is left of it
 
-**Status:** OPEN, and down to two named defects plus two unexamined
-`SslHandlerTest` behaviours. Sections A (`KEY_VALUES_MISMATCH`), C
-(`SslContextBuilder` accepting an invalid cipher) and the
-`AbstractMethodError` half of A′ are fixed; the **JCA half of A′ is fixed**
-(2026-08-15) and what remains of A′ is netty's OPENSSL **client** path;
-section B is halved; section D still hangs on a LOADED host but finishes on
-a quiet one, and two failures it was hiding were an unpinned array — fixed.
+**Status:** OPEN, and down to **one** named defect (section B) plus section D's
+intermittent stall. Sections A (`KEY_VALUES_MISMATCH`), C (`SslContextBuilder`
+accepting an invalid cipher) and **all of A′** are fixed — A′'s last half, the
+OPENSSL **client** path, closed 2026-08-17 on
+`fix/netty-nio-pcap-tls-residuals-20260817`; see §A′ below for the mechanism.
 
 Measured on Azure host 2 (Linux x86_64, JDK 25), one class per process,
 `-XX:+UseG1GC`, with `netty-tcnative-boringssl-static` on the classpath for
 BOTH VMs. If a class in this suite aborts inside `gc/`, check that first
 rather than reading it as a TLS defect.
 
-| class | dev 2026-08-15 | now (`e5f4597e6`) | HotSpot 25 |
-|---|---|---|---|
-| `JdkSslEngineTest` | 707 / 821, 48 failed | **755 / 821, 0 failed** ✅ | 755, 0 failed |
-| `JdkDelegatingPrivateKeyMethodTest` | 1 / 27 | **10 / 27** | 27 / 27 |
-| `OpenSslPrivateKeyMethodTest` | 24 / 24 | 24 / 24 | 3 / 24 |
-| `SslHandlerTest` | 47 / 54 | **48 / 54** | 53 / 54 |
-| `SslContextBuilderTest` | 21 / 21 | 21 / 21 ✅ | 21 / 21 |
-| `ParameterizedSslHandlerTest` | never finished, or hangs | **61–63 / 63; still stalls intermittently, quiet host or not** | 63 / 63 |
+| class | dev 2026-08-15 | 2026-08-13 page (`e5f4597e6`) | 2026-08-17 | HotSpot 25 |
+|---|---|---|---|---|
+| `JdkSslEngineTest` | 707 / 821, 48 failed | 755 / 821, 0 failed ✅ | — | 755, 0 failed |
+| `JdkDelegatingPrivateKeyMethodTest` | 1 / 27 | 10 / 27 | **27 / 27** ✅ | 27 / 27 |
+| `OpenSslPrivateKeyMethodTest` | 24 / 24 | 24 / 24 | 24 / 24 | 3 / 24 |
+| `SslHandlerTest` | 47 / 54 | 48 / 54 | **52 ok + 1 aborted + 1 failed** | 53 ok + 1 aborted |
+| `SslContextBuilderTest` | 21 / 21 | 21 / 21 ✅ | 21 / 21 ✅ | 21 / 21 |
+| `ParameterizedSslHandlerTest` | never finished, or hangs | 61–63 / 63; still stalls intermittently, quiet host or not | not re-measured | 63 / 63 |
+
+The 2026-08-17 column is `fix/netty-nio-pcap-tls-residuals-20260817` on this same
+host. `JdkDelegatingPrivateKeyMethodTest` measured 27/27, 26/27, 27/27 across
+three consecutive runs at host load 27 / 21 / 19; the single failure in the
+middle run is a `TimeoutException` against the class's own `@Timeout(30)` on an
+RSA-PSS SHA512 row, and it landed on a DIFFERENT parameterisation each time it
+appeared (`[8] ...true`, then `[19] ...false`), which is load, not a defect. Its
+14 real failures before the fix were exactly the 11 + 3 rows this page attributed
+to "the client sends no certificate".
 
 `JdkSslEngineTest` is now the oracle exactly and its page is retired — see the
 retired `jdksslenginetest-engine-level-gaps` write-up for the four causes that
@@ -32,7 +39,7 @@ direction is a claim to check, not a win to bank. HotSpot's 21 failures on
 this host are netty-tcnative's own; the number is recorded so the next reader
 does not mistake the gap for progress.
 
-## A′ — the JCA half is fixed; netty's OPENSSL *client* path is not
+## ~~A′~~ — FIXED 2026-08-17. The client had no alias, because an EKU was read as an eligibility test
 
 **What A′ was.** `KeyManagerFactory.getKeyManagers()` answered with an object
 stamped with the `javax/net/ssl/X509KeyManager` INTERFACE's class id, every
@@ -76,28 +83,67 @@ provider):
 `NoSuchAlgorithmException` for `MD5andSHA1withRSA` (the mock provider does not
 register it).
 
-**The residual (17 of 27).** It splits cleanly along one axis:
+**The residual was 14 of 27** (this page said 17; a re-measurement on
+2026-08-17 found 14, i.e. dev had already picked up three of the ECDSA rows).
+It split cleanly along one axis:
 
 | n | parameterisations | error |
 |---|---|---|
 | 11 | every `clientUsesProvider=true` | `SSLV3_ALERT_HANDSHAKE_FAILURE` — the client sends no certificate |
 | 3 | `testClientServerScenarios` 1–3 | `TLSV1_ALERT_CERTIFICATE_REQUIRED`, same shape |
-| 3 | ECDSA with `clientUsesProvider=false` | separate; not yet examined |
 
-All eight RSA `clientUsesProvider=false` rows pass, as do
-`testMultipleHandshakes` and `testAlgorithmCaching` — so the SERVER-side
-opaque key works end to end and the JCA layer is no longer the constraint.
-What fails is netty's OPENSSL **client** key material:
-`SslContextBuilder.forClient().keyManager(opaqueKey, "", cert)` with
-`USE_JDK_PROVIDER_SIGNATURES`, against a server with `ClientAuth.REQUIRE`.
-`CRATONVM_DBG_TLS_AUTH=1` shows the live-keystore enumeration succeeding on
-that side too (`kmf(phases_late).init(live KeyStore) aliases=1`), so the next
-step is downstream of the KeyManager — `OpenSslKeyMaterialProvider` for a
-client, and the tcnative private-key-method callback — not in `keystore.rs`.
+**"The client sends no certificate" was literal, and the cause was one line
+above the TLS layer.** `chooseClientAlias` answered `null`, so netty's
+`OpenSslKeyMaterialProvider` had nothing to present.
 
-Two cheap moves that are still worth making: `keystore::engine_set_key_entry`
-still drops an entry silently on `if key_der.is_empty() { return Ok(None) }`,
-and should say something.
+`build_key_manager_state` used `is_client_cert`/`is_server_cert` to decide
+MEMBERSHIP of `client_aliases_by_key_type` / `server_aliases_by_key_type`, and
+both predicates reject a certificate whose ExtendedKeyUsage is present but does
+not name their role. This fixture builds exactly one certificate —
+
+```java
+.setKeyUsage(true, CertificateBuilder.KeyUsage.digitalSignature)
+.addExtendedKeyUsageServerAuth()      // EKU = { id-kp-serverAuth } ONLY
+```
+
+— and uses it on BOTH sides. So the alias was a server alias and never a client
+alias, and a client with no alias sends no certificate; a `ClientAuth.REQUIRE`
+server answers with exactly the two alerts above.
+
+**JSSE does not filter that way.** The default `KeyManagerFactory` algorithm is
+`SunX509`, and `SunX509KeyManagerImpl.getAliases` filters on the key's algorithm
+and (when the peer sends one) the issuer list only — KeyUsage and EKU are never
+consulted. `X509KeyManagerImpl` (NewSunX509) does look at them, but it RANKS on
+the result and still answers. Measured on JDK 25, same certificate, same
+classpath, both VMs (`/data/nssl/KmAliasProbe.java`):
+
+```
+HotSpot   SunX509     getClientAliases(RSA)=[key]      chooseClientAlias(RSA)=key
+HotSpot   NewSunX509  getClientAliases(RSA)=[1.0.key]  chooseClientAlias(RSA)=3.0.key
+CratonVM  SunX509     getClientAliases(RSA)=[]         chooseClientAlias(RSA)=null
+CratonVM  NewSunX509  getClientAliases(RSA)=[]         chooseClientAlias(RSA)=null
+```
+
+**Fix.** Both population sites push every private-key alias into BOTH lists, in
+two passes so a role-matching certificate still comes first and a caller taking
+`.first()` keeps preferring it. The predicates themselves are unchanged and are
+re-documented as preferences; their tests are renamed `..._requires_...` →
+`..._prefers_...` so the names stop asserting the old contract.
+`an_eku_mismatch_orders_an_alias_last_but_never_drops_it` pins both halves.
+
+**Read this as a shape, not just a fix.** A capability predicate borrowed from
+the certificate-validation vocabulary (`is_client_cert`) reads like an
+eligibility test and was used as one; the platform it has to imitate treats the
+same information as a preference. When a native reimplements a JDK selection
+policy, the thing to check is not whether the predicate is *correct* but whether
+the original is allowed to answer *no*.
+
+`keystore::engine_set_key_entry`'s silent drop — the other cheap move this page
+asked for — is closed too: the `if key_der.is_empty() { return Ok(None) }` arm now
+names the store, alias, algorithm and format, and says the live-KeyStore
+enumeration path keeps such a key by reference. An opaque provider key is the
+NORMAL case for that branch, so the silence was hiding the routine case, not an
+exotic one.
 
 ## B — `SslHandlerTest`, 52 ok + 1 aborted + 1 failed (HotSpot 53 + 1 aborted)
 
@@ -245,11 +291,46 @@ HotSpot.
   `engine_run_trust_check` becomes the fallback for paths with no published
   context.
 
-  Prove the destination before the refactor: an in-tree client/server
-  `EngineState` pair test (the `engine_wrap_pump`/`engine_unwrap_pump` harness
-  around line 8030) with a client verifier that always rejects should show the
-  SERVER receiving a decryptable alert while `is_handshaking()` is still
-  true — which is the whole property the current design cannot deliver.
+  **The destination is PROVEN, 2026-08-17.** The in-tree pair test this page
+  asked for exists:
+  `t27_tls::tests::a_verifier_time_rejection_reaches_the_server_while_it_is_still_handshaking`.
+  A client whose `ServerCertVerifier` returns
+  `InvalidCertificate(ApplicationVerificationFailure)` produces an alert the
+  server DECRYPTS (no `DecryptError`) while `is_handshaking()` is still true, so
+  a verifier-time verdict does deliver the property. The test carries its own
+  ACCEPTING control arm through the same driver — with the chain accepted the
+  server must COMPLETE its handshake and see no error — because otherwise the
+  three assertions would also pass on a driver that never handshook at all.
+
+  So what is left is only the plumbing, and it is the plumbing that is
+  expensive. Sizing it, measured on the source rather than estimated:
+
+  * The record loop is `do_unwrap`'s
+    `if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) { loop { … } }`,
+    ~210 lines, inside a single `let (status, hs, plaintext, pending_trust_check) = { … }`
+    block that holds `engine_registry().write()` across the pre-loop replay, the
+    loop, and ~150 lines of post-loop work. Splitting it into
+    lock / no-lock / lock means moving all three.
+  * The loop body itself IS clean: a census of `s.*` accesses between the loop's
+    braces finds none — every one belongs to the pre- or post-loop section — so
+    checking `conn` out of `EngineState` for the loop's duration is sound. It
+    needs an RAII restore guard rather than an explicit put-back, because the
+    loop has an early `return Err(throw_jca_exc(…))` on the
+    `process_new_packets` error path and a missed restore leaves `s.conn == None`
+    for the life of that engine, i.e. every later wrap and unwrap on it fails.
+  * `set_active_native_context` publishes the ctx with no lifetime on its guard,
+    and three call sites already publish-then-keep-using `ctx`, so the
+    verifier's upcall has a working mechanism.
+
+  **Not attempted on `fix/netty-nio-pcap-tls-residuals-20260817`, deliberately.**
+  This is the busiest path in the TLS engine, and its verification surface is
+  `JdkSslEngineTest` (821 tests), `SslHandlerTest`, `SslContextBuilderTest` and
+  `ParameterizedSslHandlerTest`, ABBA-interleaved — which this page itself says
+  must be read only from a QUIET host. The Azure box sat at load 17-35 with
+  14-16 users throughout this session. Shipping an unverifiable restructuring of
+  the record loop to fix ONE test risks the hundreds that pass today, and the
+  failure mode of getting the restore wrong is a permanently dead engine, not a
+  test failure. The next session should start from the proof test above.
 * ~~`testClientHandshakeTimeoutBecauseExecutorNotExecute` /
   `testServerHandshakeTimeoutBecauseExecutorNotExecute`~~ — FIXED 2026-08-16.
   The engine implements JSSE's delegated-task contract now; `DelegatedTask` in

@@ -1092,6 +1092,31 @@ pub fn classify_key_type(spki_oid: &[u8]) -> &'static str {
 }
 
 /// True if the cert is acceptable as a *server* certificate.
+/// True if the cert is *preferred* as a **server** certificate.
+///
+/// **This is a preference, not an eligibility test.** JSSE's default
+/// `KeyManagerFactory` algorithm is `SunX509`, and
+/// `SunX509KeyManagerImpl.getAliases` filters ONLY on the key's algorithm and
+/// (when the peer supplies one) the issuer list — it never consults KeyUsage or
+/// ExtendedKeyUsage. `X509KeyManagerImpl` (NewSunX509) does look at them, but it
+/// *ranks* on the result and still answers; an `EXTENSION_MISMATCH` alias sorts
+/// last rather than dropping out. Measured on JDK 25 with a self-signed cert
+/// carrying `KeyUsage=digitalSignature` and `EKU={id-kp-serverAuth}` only:
+///
+/// ```text
+/// SunX509     getClientAliases(RSA)=[key]      chooseClientAlias(RSA)=key
+/// NewSunX509  getClientAliases(RSA)=[1.0.key]  chooseClientAlias(RSA)=3.0.key
+/// ```
+///
+/// So callers must use these to ORDER the by-key-type alias lists, never to
+/// decide membership. Using them as a filter is what made
+/// `chooseClientAlias(RSA)` answer `null` here for exactly that certificate,
+/// and a client that has no alias sends no certificate: against a server with
+/// `ClientAuth.REQUIRE` that is `SSLV3_ALERT_HANDSHAKE_FAILURE` /
+/// `TLSV1_ALERT_CERTIFICATE_REQUIRED` — the 14 residual rows of
+/// `JdkDelegatingPrivateKeyMethodTest`, whose fixture builds its cert with
+/// `.setKeyUsage(true, digitalSignature).addExtendedKeyUsageServerAuth()` and
+/// then uses it on BOTH sides.
 pub fn is_server_cert(p: &ParsedCert) -> bool {
     // KeyUsage check (if extension present): need digitalSignature OR
     // keyEncipherment. Many server certs only set keyEncipherment.
@@ -1114,7 +1139,8 @@ pub fn is_server_cert(p: &ParsedCert) -> bool {
     true
 }
 
-/// True if the cert is acceptable as a *client* certificate.
+/// True if the cert is *preferred* as a **client** certificate. See
+/// [`is_server_cert`] for why this must not be used as an eligibility filter.
 pub fn is_client_cert(p: &ParsedCert) -> bool {
     if let Some(ku) = p.key_usage {
         if (ku & KU_DIGITAL_SIGNATURE) == 0 {
@@ -1259,24 +1285,31 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
             .map(|a| a.alias.to_string())
             .collect::<Vec<_>>(),
     );
-    for alias in &ordered_aliases {
-        let entry = private_key_aliases
-            .iter()
-            .find(|a| a.alias == alias)
-            .expect("alias came from private_key_aliases");
-        if entry.is_server {
-            state
-                .server_aliases_by_key_type
-                .entry(entry.key_type.clone())
-                .or_default()
-                .push(alias.clone());
-        }
-        if entry.is_client {
-            state
-                .client_aliases_by_key_type
-                .entry(entry.key_type.clone())
-                .or_default()
-                .push(alias.clone());
+    // `is_server`/`is_client` ORDER these lists; they do not gate them. Every
+    // alias with a matching key type is a candidate for both roles, exactly as
+    // `SunX509KeyManagerImpl` (the default) treats it — see `is_server_cert`.
+    // Two passes so a properly-marked cert still wins when a keystore holds
+    // several.
+    for preferred in [true, false] {
+        for alias in &ordered_aliases {
+            let entry = private_key_aliases
+                .iter()
+                .find(|a| a.alias == alias)
+                .expect("alias came from private_key_aliases");
+            if entry.is_server == preferred {
+                state
+                    .server_aliases_by_key_type
+                    .entry(entry.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
+            if entry.is_client == preferred {
+                state
+                    .client_aliases_by_key_type
+                    .entry(entry.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
         }
     }
     state
@@ -1419,23 +1452,27 @@ pub(crate) fn build_key_manager_state_from_live_keystore(
             .map(|c| c.alias.clone())
             .collect::<Vec<_>>(),
     );
-    for alias in &ordered {
-        let Some(c) = candidates.iter().find(|c| &c.alias == alias) else {
-            continue;
-        };
-        if c.is_server {
-            state
-                .server_aliases_by_key_type
-                .entry(c.key_type.clone())
-                .or_default()
-                .push(alias.clone());
-        }
-        if c.is_client {
-            state
-                .client_aliases_by_key_type
-                .entry(c.key_type.clone())
-                .or_default()
-                .push(alias.clone());
+    // Preference, not eligibility — same two-pass shape as
+    // `build_key_manager_state`; see `is_server_cert`.
+    for preferred in [true, false] {
+        for alias in &ordered {
+            let Some(c) = candidates.iter().find(|c| &c.alias == alias) else {
+                continue;
+            };
+            if c.is_server == preferred {
+                state
+                    .server_aliases_by_key_type
+                    .entry(c.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
+            if c.is_client == preferred {
+                state
+                    .client_aliases_by_key_type
+                    .entry(c.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
         }
     }
 
@@ -5385,7 +5422,7 @@ mod tests {
     }
 
     #[test]
-    fn server_cert_requires_eku_serverauth_when_eku_present() {
+    fn server_cert_prefers_eku_serverauth_when_eku_present() {
         let cert_ok = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
             not_after_utc: "300101000000Z",
@@ -5413,7 +5450,7 @@ mod tests {
     }
 
     #[test]
-    fn client_cert_requires_eku_clientauth_when_eku_present() {
+    fn client_cert_prefers_eku_clientauth_when_eku_present() {
         let cert_ok = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
             not_after_utc: "300101000000Z",
@@ -5441,7 +5478,7 @@ mod tests {
     }
 
     #[test]
-    fn cert_without_eku_is_acceptable_for_both_roles() {
+    fn cert_without_eku_is_preferred_for_both_roles() {
         let cert = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
             not_after_utc: "300101000000Z",
@@ -5456,6 +5493,98 @@ mod tests {
         let p = parse_certificate(&cert).unwrap();
         assert!(is_server_cert(&p));
         assert!(is_client_cert(&p));
+    }
+
+    /// An EKU that names only `serverAuth` must still yield a CLIENT alias.
+    ///
+    /// `SunX509KeyManagerImpl` — the default `KeyManagerFactory` algorithm —
+    /// filters aliases on the key algorithm and the peer's issuer list only, so
+    /// on JDK 25 this exact certificate answers `chooseClientAlias(RSA)=key`.
+    /// Treating [`is_client_cert`] as an eligibility test instead of a
+    /// preference made `getClientAliases(RSA)` answer `[]` and
+    /// `chooseClientAlias(RSA)` answer `null`, so netty's OPENSSL client sent no
+    /// certificate at all and a `ClientAuth.REQUIRE` server closed the
+    /// handshake with `SSLV3_ALERT_HANDSHAKE_FAILURE` — 14 of the 17 residual
+    /// rows of `JdkDelegatingPrivateKeyMethodTest`, whose fixture builds
+    /// `.setKeyUsage(true, digitalSignature).addExtendedKeyUsageServerAuth()`
+    /// and then uses that one cert on BOTH sides.
+    #[test]
+    fn an_eku_mismatch_orders_an_alias_last_but_never_drops_it() {
+        let server_only = mk_cert(&CertSpec {
+            not_before_utc: "200101000000Z",
+            not_after_utc: "300101000000Z",
+            subject_cn: "serveronly.example",
+            issuer_cn: "serveronly.example",
+            spki_alg: OID_RSA,
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH],
+            basic_constraints_ca: Some(false),
+            subject_alt_dns: &[],
+        });
+        let both = mk_cert(&CertSpec {
+            not_before_utc: "200101000000Z",
+            not_after_utc: "300101000000Z",
+            subject_cn: "both.example",
+            issuer_cn: "both.example",
+            spki_alg: OID_RSA,
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH, OID_KP_CLIENT_AUTH],
+            basic_constraints_ca: Some(false),
+            subject_alt_dns: &[],
+        });
+
+        // A store holding ONLY the serverAuth-marked cert: the client list must
+        // still name it. This is the shape the netty fixture builds.
+        let mut only = crate::keystore::LoadedKeyStore::default();
+        only.entries.insert(
+            "key".to_string(),
+            crate::keystore::KeyStoreEntry {
+                alias: "key".to_string(),
+                creation_time_ms: 0,
+                kind: crate::keystore::EntryKind::PrivateKey {
+                    key_der: vec![0x30, 0x00],
+                    chain: vec![server_only.clone()],
+                },
+            },
+        );
+        let st = build_key_manager_state(crate::keystore::keystore_register(only));
+        assert_eq!(
+            st.client_aliases_by_key_type.get("RSA").map(Vec::as_slice),
+            Some(&["key".to_string()][..]),
+            "a serverAuth-only cert must still be offered as a client alias"
+        );
+        assert_eq!(
+            st.server_aliases_by_key_type.get("RSA").map(Vec::as_slice),
+            Some(&["key".to_string()][..])
+        );
+
+        // With BOTH in one store the properly-marked one must come first, so a
+        // caller taking `.first()` still prefers it.
+        let mut two = crate::keystore::LoadedKeyStore::default();
+        for (alias, der) in [("aserver", &server_only), ("zboth", &both)] {
+            two.entries.insert(
+                alias.to_string(),
+                crate::keystore::KeyStoreEntry {
+                    alias: alias.to_string(),
+                    creation_time_ms: 0,
+                    kind: crate::keystore::EntryKind::PrivateKey {
+                        key_der: vec![0x30, 0x00],
+                        chain: vec![der.clone()],
+                    },
+                },
+            );
+        }
+        let st2 = build_key_manager_state(crate::keystore::keystore_register(two));
+        let clients = st2
+            .client_aliases_by_key_type
+            .get("RSA")
+            .expect("both aliases are RSA");
+        assert_eq!(
+            clients.first().map(String::as_str),
+            Some("zboth"),
+            "the clientAuth-marked alias must be preferred: got {clients:?}"
+        );
+        assert_eq!(clients.len(), 2, "neither alias may be dropped: {clients:?}");
     }
 
     #[test]

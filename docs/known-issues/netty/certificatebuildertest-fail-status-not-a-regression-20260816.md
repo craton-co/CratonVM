@@ -4,7 +4,7 @@
 Written 2026-08-16/17, commit `3ef3eb744`, Windows host, `cratonvm.exe`
 release build, to head off future sessions re-investigating this as a
 reopening of
-`docs/internal/fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`.
+`fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`.
 
 Same shape as this session's sibling finding,
 `pemencodedtest-aborted-status-not-a-regression-20260816.md` — a different
@@ -58,10 +58,10 @@ be zero.
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`
+- `fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`
   — the fix this doc confirms is still holding, exactly.
-- `docs/internal/fixed-suite-bugs/netty/keypairgenerator-getinstance-accepts-any-algorithm-FIXED-20260813.md`
-  and `docs/internal/fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`
+- `fixed-suite-bugs/netty/keypairgenerator-getinstance-accepts-any-algorithm-FIXED-20260813.md`
+  and `fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`
   — the other two records read for this triage; neither's described symptoms
   (lenient `getInstance`, the `X509CertImpl.getAlgorithm()` receiver
   confusion, the Inet6/SHA-1-OID causes) reappear here — today's failing set

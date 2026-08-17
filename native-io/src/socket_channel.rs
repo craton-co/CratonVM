@@ -1687,6 +1687,10 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             crate::nio_selector::deregister_fd_everywhere(id);
             tcp_remove(id);
         }
+        // A registration made before this channel had a socket is filed under a
+        // placeholder pseudo-fd, which the fd-keyed sweep above cannot see; drop
+        // it too, or `Selector.keys()` keeps reporting a closed channel.
+        crate::nio_selector::deregister_channel_everywhere(ctx, this);
         // Drop the synthetic state entirely: a later isOpen()/isConnected()
         // then reads the default Int(0) (== closed/not-connected), and the
         // side-table does not grow across many short-lived connections.

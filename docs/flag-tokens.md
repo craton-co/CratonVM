@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-447 tokens.
+450 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -311,6 +311,8 @@ export inherited from a parent shell.
 | `root-source` | `CRATONVM_DBG_ROOT_SOURCE` |
 | `zgc-verify-slide` | `CRATONVM_DBG_ZGC_VERIFY_SLIDE` |
 | `zgc-corpse` | `CRATONVM_DBG_ZGC_CORPSE` |
+| `mapgen` | `CRATONVM_DBG_MAPGEN` |
+| `vacated-frames` | `CRATONVM_DBG_VACATED_FRAMES` |
 | `atomic-intrinsic` | `CRATONVM_DBG_ATOMIC_INTRINSIC` |
 | `define-filter` | `CRATONVM_DBG_DEFINE_FILTER` |
 | `define-stack-filter` | `CRATONVM_DBG_DEFINE_STACK_FILTER` |
@@ -364,6 +366,7 @@ export inherited from a parent shell.
 | `owner-filter` | `CRATONVM_DBG_OWNER_FILTER` |
 | `osr-exit-after` | `CRATONVM_OSR_EXIT_AFTER` |
 | `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
+| `osr-bind` | `CRATONVM_DBG_OSR_BIND` |
 | `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
@@ -698,7 +701,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-50 tokens.
+53 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -749,6 +752,9 @@ export inherited from a parent shell.
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
+| `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |
+| `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
+| `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
