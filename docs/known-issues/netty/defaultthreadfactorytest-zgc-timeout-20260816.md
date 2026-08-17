@@ -83,7 +83,7 @@ scattershot-any-method) are different enough not to be the same phenomenon.
 `testDefaultThreadFactoryInheritsThreadGroupFromSecurityManager` don't apply
 
 Recorded already in
-`docs/internal/fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md`
+`fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md`
 §4: CratonVM deliberately did not adopt JEP 486, so `System.setSecurityManager`
 actually installs a manager here (HotSpot 25 makes it a permanent
 `UnsupportedOperationException`, so these two methods `assumeFalse`-skip on
@@ -115,7 +115,7 @@ printf 'io.netty.util.concurrent.DefaultThreadFactoryTest\n' > /tmp/zgcgroup.txt
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md`
+- `fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md`
   — establishes CratonVM's expected 5/5-pass baseline for this class and the
   deliberate JEP-486 divergence from HotSpot.
 - `sniclienttest-ocspclienttest-triage-20260816.md` — same session's sibling

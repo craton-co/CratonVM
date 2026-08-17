@@ -1525,7 +1525,7 @@ pub(crate) fn inet_addr_scoped_text(
 /// `pub(crate)` because the duplicate registration in `phases_early.rs` must
 /// answer identically — `getHostName` had six registrations and the winning
 /// pair was on the concrete subclasses (see
-/// `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
+/// `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
 /// so a scope fix applied to only one of them is invisible half the time.
 pub(crate) fn inet_addr_host_address_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     // `inet_addr_field` keeps the legacy fallback: an address object we never
@@ -15170,7 +15170,7 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Resul
         // `/fe80:…%eth0` for every row of `getInetAddresses()`. Labelling them
         // `localhost` / `<hostname>` — which this loop used to do — is the
         // exact divergence
-        // `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`
+        // `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`
         // removed everywhere else; this call site was missed. `getHostName()`
         // still answers the numeric text, because that is its no-name
         // fallback.

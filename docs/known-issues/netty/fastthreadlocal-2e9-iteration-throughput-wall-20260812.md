@@ -4,7 +4,7 @@
 2026-08-13**, see "Re-measured" below — every rate in the original table has
 moved, two of them by more than an order of magnitude, and the attribution has
 changed). The correctness half of this class was fixed on 2026-08-12 (see
-[jit-elided-constructor-side-effects-FIXED-20260812.md](../../internal/fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md),
+`fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md`,
 retired 2026-08-13); what remains is a performance workstream, recorded here
 with the numbers that size it.
 
@@ -101,7 +101,7 @@ changed.**
 
 * **Recommendation 1 (atomic intrinsics) is DONE.** `AtomicIntGetAndIncrement`
   is an intrinsic in the JIT's ladder now
-  ([record](../../internal/fixed-suite-bugs/netty/atomicinteger-lock-xadd-intrinsic-20260812-FIXED.md)):
+  (record: `fixed-suite-bugs/netty/atomicinteger-lock-xadd-intrinsic-20260812-FIXED.md`):
   4.1 M/s → **200 M/s**, i.e. **49x**, and within 1.2x of HotSpot. The atomic
   half of this loop is 11 seconds, not 534.
 * **Recommendation 2 (allocation) improved 2.3x** without being worked on

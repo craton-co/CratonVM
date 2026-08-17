@@ -1097,7 +1097,7 @@ pub(super) fn compile_osr_artifact(
             // backend may elide only these; a no-arg constructor that is NOT proven empty
             // keeps both its allocation and its call, because eliding it would drop
             // whatever the body writes to global state (see
-            // docs/internal/fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
+            // fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
             let mut elidable_init_pcs: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {

@@ -92,11 +92,7 @@ cratonvm-types`:
 |---|---|
 | distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 692 |
 | exact string literals (i.e. actually named by code, not prose) | 658 |
-<<<<<<< HEAD
 | **declared** in `flag_groups::INVENTORY` + scalars + group variables | **798** |
-=======
-| **declared** in `flag_groups::INVENTORY` + scalars + group variables | **798** |
->>>>>>> origin/dev
 | declared before this pass | 576 |
 | declared by this pass | **71** |
 | allowlisted as intentionally undeclared | 11 |
