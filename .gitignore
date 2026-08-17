@@ -122,3 +122,4 @@ hs-url.txt
 # H2 corpus runs write their database here (regression-suite/corpus).
 # Test output, not source.
 data/
+scratchpad/
