@@ -141,6 +141,6 @@ grep 'DatagramChannel.send to' runs/repro/*/on-real/shard-0/raw.log
   — cause 3, which first recorded these two classes' pre-08-13 numbers
   (`SearchDomainTest` 1/7, hang) as the *before* state the 08-13 fix moved away
   from and this page's numbers now match again.
-- `certificatebuildertest-fail-status-not-a-regression-20260816.md` (this
-  session, same run) — the third assigned class; unlike these two, it is
+- `fixed-suite-bugs/netty/certificatebuildertest-fail-status-not-a-regression-20260816.md`
+  (this session, same run) — the third assigned class; unlike these two, it is
   **not** a regression.

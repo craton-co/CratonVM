@@ -9050,7 +9050,7 @@ fn resolve_native_site(
 /// field read, and, through `AbstractByteBuf.ensureAccessible()` ->
 /// `RefCnt.isLiveNonVolatile` -> `VH.get`, made every netty `ByteBuf`
 /// accessor cost ~2.6 µs. See
-/// `docs/known-issues/netty/compression-testhugedecompress-shared-timeout-20260816.md`.
+/// `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
 ///
 /// [`vm_exec::invoke_on_class_shared_inner`] already handles the shape, in the
 /// `None` arm of its hierarchy resolution — i.e. exactly where rules 1-3

@@ -90,12 +90,20 @@ public final class RVarHandleAccess {
         }
     }
 
-    static int failures;
+    static int checks;
 
+    /**
+     * Assert AND publish. The suite diffs the two VMs through a filter that
+     * keeps only `PASS `/`CK ` lines, so an assertion whose value never reaches
+     * stdout is invisible to the cross-VM comparison — a vector that printed
+     * only its verdict would diff a constant against itself. Every checked
+     * value therefore goes out on its own `CK` line.
+     */
     static void eq(String what, Object expected, Object actual) {
+        checks++;
+        System.out.println("CK RVarHandleAccess " + what + "=" + actual);
         if (!expected.equals(actual)) {
-            System.out.println("FAIL " + what + ": expected " + expected + " got " + actual);
-            failures++;
+            throw new AssertionError(what + ": expected " + expected + " got " + actual);
         }
     }
 
@@ -166,14 +174,16 @@ public final class RVarHandleAccess {
         // 2. Writes still go through the native. Interleaving them with reads
         //    at a warm site is what catches a read fast path that answers from
         //    anything staler than the heap.
+        int roundTripped = -1;
         for (int n = 0; n < WARM; n++) {
             VI.set(h, n);
-            if ((int) VI.get(h) != n) {
-                System.out.println("FAIL set/get round trip at n=" + n);
-                failures++;
-                break;
+            int back = (int) VI.get(h);
+            if (back != n) {
+                throw new AssertionError("set/get round trip at n=" + n + " read " + back);
             }
+            roundTripped = back;
         }
+        eq("set/get round trip last", WARM - 1, roundTripped);
         VI.set(h, 0x0BADF00D);
 
         // 3. compareAndSet / getAndAdd — the mutating modes, unchanged, but
@@ -237,6 +247,7 @@ public final class RVarHandleAccess {
         eq("receiver A", 47, mine);
         eq("receiver B", 0x1234, theirs);
 
-        System.out.println(failures == 0 ? "RVarHandleAccess OK" : ("RVarHandleAccess FAILURES=" + failures));
+        System.out.println("CK RVarHandleAccess checks=" + checks);
+        System.out.println("PASS RVarHandleAccess");
     }
 }
