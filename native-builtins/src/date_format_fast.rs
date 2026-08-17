@@ -1122,6 +1122,30 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(prev);
+
+    // G28-1: the `sun.util.calendar.ZoneInfo` daylight-saving family
+    // (`getDSTSavings`, `useDaylightTime`, `observesDaylightTime`,
+    // `inDaylightTime(Date)` and the six-argument `getOffset`). It is a strange
+    // address for it and this comment exists to say why it is here anyway.
+    //
+    // The obvious home is `util_time.rs`, next to the other `java.time` doors.
+    // That module is `#[cfg(feature = "synthetic-jdk")]` and IS NOT COMPILED
+    // INTO THE DEFAULT BUILD (`lib.rs`, the `mod util_time` declaration): a
+    // registration added there would be dead code that reads as a fix, which
+    // `HANDOFF-20260814` §5 records as a trap this campaign has fallen into
+    // twice. MEASURED, not assumed: `--dump-native-registry` under `--jdk-only`
+    // carries `java/text/DateFormat format ... owns_slot=true
+    // by=date_format_fast.rs`, and names `util_time.rs` in no row at all. So
+    // `register_date_format_fast` demonstrably runs on the real-JDK path and
+    // this one does not.
+    //
+    // Relocating the call next to `register_tzdb_offset_natives_for` in
+    // `lib.rs` -- which is not this lane's file -- is NOMINATED in
+    // `docs/known-issues/jdk-only/G28-1-the-dst-rule-layer-rebuilt-20260817.md`.
+    // Whoever moves it: register on `ZoneInfo` ONLY. The reason the base class
+    // is excluded is on `register_zoneinfo_dst_natives` itself, and following
+    // the neighbouring call's two-class shape would silently undo it.
+    crate::tzdb::register_zoneinfo_dst_natives(r);
 }
 
 #[cfg(test)]
