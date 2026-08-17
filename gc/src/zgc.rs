@@ -2677,6 +2677,33 @@ pub struct ZgcRealHeap {
     generational_enabled: AtomicBool,
     gen_promotion_age: std::sync::atomic::AtomicU32,
     gen_minors_per_major: AtomicUsize,
+    /// Must the next collection be whole-heap?
+    ///
+    /// # Why an escalation latch exists instead of a stricter trigger
+    ///
+    /// The first version of the trigger forced a major whenever `headroom_low`
+    /// was set, reasoning that a young cycle retains the whole old generation
+    /// unexamined and so is the wrong tool for "the heap is full". **The
+    /// 2026-08-17 measurement showed that reasoning turns the phase off
+    /// entirely.** On a heap that is large relative to its live set, the
+    /// live-bytes threshold is never reached and *every* collection is
+    /// allocation-driven — so every collection was forced major and
+    /// `young_cycles` was **0 on every arm**, with the flag on and 3.2M
+    /// promotions recorded. The engagement counter is the only reason that read
+    /// as a vacuous measurement rather than as "generational does not help".
+    ///
+    /// `headroom_low` is a *soft* signal (the arena cannot serve a
+    /// `zgc_headroom_margin` request) and a young cycle answers it perfectly
+    /// well when the garbage is young, which on that workload was 800 MB of 1.2
+    /// GB. So the trigger now tries young and **escalates on evidence**: a young
+    /// cycle that reclaimed nothing sets this, and the next collection is
+    /// whole-heap. `hard_alloc_failure` — an allocation that actually failed
+    /// after a collection — still forces a major immediately, because there the
+    /// evidence is already in.
+    ///
+    /// The cost of being wrong is one cycle, and it is self-correcting. The cost
+    /// of the stricter rule was the whole feature.
+    gen_force_major_next: AtomicBool,
     /// Has any object been promoted yet? The card barrier's gate.
     ///
     /// # Why a flag and not a lock
@@ -3126,6 +3153,7 @@ impl ZgcRealHeap {
             generational_enabled: AtomicBool::new(zgc_generational_enabled()),
             gen_promotion_age: std::sync::atomic::AtomicU32::new(zgc_gen_promotion_age()),
             gen_minors_per_major: AtomicUsize::new(zgc_gen_minors_per_major()),
+            gen_force_major_next: AtomicBool::new(false),
             has_old_objects: AtomicBool::new(false),
             young_cycles: AtomicUsize::new(0),
             minors_since_major: AtomicUsize::new(0),
@@ -10863,15 +10891,19 @@ impl GarbageCollector for ZgcRealHeap {
         //    handed over IS the whole-heap closure. It cannot be scoped after
         //    the fact, and re-marking would throw away the concurrent phase's
         //    entire product.
-        //  * `headroom_low` / `hard_alloc_failure` -- the caller could not serve
-        //    an allocation. A young cycle retains the whole old generation
-        //    unexamined, so it is the wrong tool for "the heap is full": it may
-        //    reclaim nothing and the allocation fails again.
+        //  * `hard_alloc_failure` -- an allocation actually failed after a
+        //    collection. A young cycle retains the whole old generation
+        //    unexamined, and here the evidence that that is not enough is
+        //    already in.
+        //  * `gen_force_major_next` -- a previous young cycle reclaimed nothing.
+        //    See that field for why this is an escalation latch rather than a
+        //    stricter trigger, and for the vacuous measurement the stricter
+        //    trigger produced. **`headroom_low` is deliberately NOT here.**
         //  * the `minors_per_major` ceiling -- see `zgc_gen_minors_per_major`
         //    for why an unbounded run of young cycles is a leak.
         let force_major = marked_concurrently
-            || self.headroom_low.load(Ordering::Relaxed)
             || self.hard_alloc_failure.load(Ordering::Relaxed)
+            || self.gen_force_major_next.load(Ordering::Relaxed)
             || self.minors_since_major.load(Ordering::Relaxed)
                 >= self.gen_minors_per_major.load(Ordering::Relaxed);
         // `has_old_objects` rather than just `gen_on`: with nothing promoted yet
@@ -11410,7 +11442,18 @@ impl GarbageCollector for ZgcRealHeap {
         if young_cycle {
             self.young_cycles.fetch_add(1, Ordering::Relaxed);
             self.minors_since_major.fetch_add(1, Ordering::Relaxed);
+            // ESCALATE ON EVIDENCE. A young cycle that freed nothing did not
+            // answer whatever asked for it, and repeating it would be a
+            // collection per allocation against an old generation it will not
+            // examine. `bytes_freed` and not a ratio: "reclaimed literally
+            // nothing" needs no tuning parameter and cannot be wrong about the
+            // direction.
+            self.gen_force_major_next
+                .store(bytes_freed == 0, Ordering::Relaxed);
         } else if gen_on {
+            // A whole-heap cycle has just run, so whatever the latch was asking
+            // for has happened.
+            self.gen_force_major_next.store(false, Ordering::Relaxed);
             // Reset on EVERY non-young collection, including one that was
             // whole-heap because nothing had been promoted yet: the budget means
             // "young cycles since the whole heap was last examined", and any
@@ -14830,6 +14873,13 @@ pub(crate) mod tests {
         // collection meaningful -- and it is also the honest statement of the
         // phase's cost.
         for cycle in 1..=3 {
+            // Fresh young garbage before each cycle. Without it the young cycle
+            // frees nothing, which arms `gen_force_major_next` and makes the very
+            // next collection a major -- correct behaviour (see that field), and
+            // it would silently turn this test into a different one.
+            for _ in 0..200 {
+                let _ = heap.alloc_object(ClassId::new(90), 2);
+            }
             let mut roots = [holder];
             let _ = gen_collect(&heap, &mut roots);
             assert_eq!(heap.generational_stats().0, cycle, "minor {cycle}");
@@ -14850,6 +14900,77 @@ pub(crate) mod tests {
         assert!(
             heap.is_object_address(doomed_addr).is_none(),
             "and that cycle must reclaim the old garbage every minor kept"
+        );
+    }
+
+    /// **`headroom_low` must NOT force a major, and a young cycle that reclaims
+    /// nothing must escalate.**
+    ///
+    /// # The vacuous measurement this pins
+    ///
+    /// The first version of the trigger forced a whole-heap cycle whenever
+    /// `headroom_low` was set. On a heap that is large relative to its live set
+    /// the live-bytes threshold is never reached and **every** collection is
+    /// allocation-driven, so every collection was forced major: the 2026-08-17
+    /// measurement came back with `young_cycles=0` on every arm, flag on, 3.2M
+    /// promotions recorded. Only the engagement counter distinguished that from
+    /// "generational does not help".
+    ///
+    /// Both halves are asserted, because each alone is the opposite bug. Never
+    /// escalating means a young cycle that answers nothing repeats forever
+    /// against an old generation it will not examine; escalating on
+    /// `headroom_low` itself is the vacuity above.
+    #[test]
+    fn headroom_low_permits_a_young_cycle_and_an_empty_one_escalates() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let holder = heap.alloc_object(ClassId::new(80), 2);
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let holder = roots[0];
+        assert!(heap.has_old_objects.load(Ordering::Relaxed));
+
+        // (a) `headroom_low` set, and young garbage to reclaim. This MUST be a
+        // minor: the soft headroom signal is exactly what a young cycle answers
+        // when the garbage is young.
+        for _ in 0..500 {
+            let _ = heap.alloc_object(ClassId::new(91), 2);
+        }
+        heap.headroom_low.store(true, Ordering::Relaxed);
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(
+            heap.generational_stats().0,
+            1,
+            "headroom_low is a SOFT signal and must not force a whole-heap cycle \
+             -- forcing it here is what made the first measurement vacuous"
+        );
+        assert!(
+            !heap.gen_force_major_next.load(Ordering::Relaxed),
+            "that cycle freed 500 objects, so there is nothing to escalate"
+        );
+
+        // (b) A young cycle with NOTHING to reclaim must arm the latch, and the
+        // next collection must then be whole-heap.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 2, "still a minor");
+        assert!(
+            heap.gen_force_major_next.load(Ordering::Relaxed),
+            "a young cycle that reclaimed nothing did not answer whatever asked \
+             for it; repeating it is a collection per allocation"
+        );
+
+        let before = heap.generational_stats().0;
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(
+            heap.generational_stats().0,
+            before,
+            "the latch must have forced a whole-heap cycle"
+        );
+        assert!(
+            !heap.gen_force_major_next.load(Ordering::Relaxed),
+            "and the major clears it, or every later cycle is a major too"
         );
     }
 
