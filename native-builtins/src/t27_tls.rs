@@ -12681,42 +12681,46 @@ fn engine_session_for(
             }
         }
     }
-    // PROMOTE the session that was being negotiated, rather than building a
-    // second one.
+    // Carry the BINDINGS of the session that was being negotiated, not the
+    // object.
     //
     // This table is keyed `(engine, handshaked)`, so an engine asked for a
-    // session DURING its handshake and again after it used to get two distinct
-    // objects. JSSE has one: `getHandshakeSession()` answers "the session being
-    // negotiated", and when negotiation succeeds that same session is what
-    // `getSession()` returns — so anything an application put on it mid-handshake
-    // has to still be there afterwards.
+    // session DURING its handshake and again after it gets two objects. JSSE has
+    // one: `getHandshakeSession()` answers "the session being negotiated" and,
+    // once negotiation succeeds, that same session is what `getSession()`
+    // returns — so whatever an application bound to it mid-handshake is still
+    // bound afterwards.
     //
     // `SSLEngineTest.mustCallResumeTrustedOnSessionResumption` is exactly that
     // application: its `X509ExtendedTrustManager` does
     // `engine.getHandshakeSession().putValue("key", "client")` and the test then
     // blocks on `engine.getSession().getValue("key")`. While the TrustManager was
-    // consulted AFTER the handshake, both calls saw the `handshaked = true`
-    // object and it worked by accident; consulting it inside
-    // `verify_server_cert` (where JSSE consults it) made the write land on the
-    // pending object and the read find nothing — so the test's
-    // `LinkedBlockingQueue.take()` never returned and it HUNG. 5 of 821 on the
-    // Azure gate, invisible on a host that cannot run that class.
-    let promoted = if handshaked {
-        let pending_key = (key.0, false);
-        engine_session_table().lock().get(&pending_key).copied()
-    } else {
-        None
-    };
-    let ses = match promoted {
-        Some(pending) => {
-            // Refresh the fields the completed handshake now knows (cipher,
-            // protocol, peer chain, wire session id) onto the SAME object, so
-            // promotion costs no accuracy.
-            refresh_synthetic_ssl_session(ctx, pending, id)?;
-            pending
+    // consulted AFTER the handshake both calls saw the same object and it worked
+    // by accident; consulting it inside `verify_server_cert` (where JSSE consults
+    // it) made the write land on the pending object and the read find nothing —
+    // `LinkedBlockingQueue.take()` never returned and the test HUNG.
+    //
+    // Only the ATTRIBUTE MAP is shared, deliberately. Promoting the whole object
+    // was tried first and is much too broad a change: it makes the pending object
+    // the negotiated one, and `testSessionAfterHandshake`,
+    // `…KeyManagerFactory`, `…MutualAuth` and `…KeyManagerFactoryMutualAuth` then
+    // fail 12 parameterisations each (48 of 821) on `expected: <0> but was: <1>`.
+    // Sharing the map leaves session IDENTITY exactly as it was and moves only
+    // the thing JSSE's contract is actually about.
+    let ses = build_synthetic_ssl_session(ctx, id)?;
+    if handshaked {
+        let pending = engine_session_table().lock().get(&(key.0, false)).copied();
+        if let Some(pending) = pending {
+            let attrs_slot = ctx.object_num_fields(pending) - 1;
+            if let Value::Object(Some(attrs)) = ctx.get_field(pending, attrs_slot) {
+                // Only when the pending session actually has a map — allocating
+                // one here would hand every negotiated session a non-null slot
+                // it did not have before.
+                let ses_slot = ctx.object_num_fields(ses) - 1;
+                ctx.set_field(ses, ses_slot, Value::Object(Some(attrs)));
+            }
         }
-        None => build_synthetic_ssl_session(ctx, id)?,
-    };
+    }
     if handshaked {
         let k = gc_stable_objref_key(ctx, ses);
         negotiated_session_keys().lock().insert(k);
@@ -12726,69 +12730,6 @@ fn engine_session_for(
         client_session_cache().lock().insert(ck, ses);
     }
     Ok(ses)
-}
-
-/// Update an EXISTING synthetic session object with what a now-completed
-/// handshake knows, without replacing the object.
-///
-/// Used when `engine_session_for` promotes the session that was being
-/// negotiated into the negotiated one (JSSE's contract — see the comment
-/// there). Only the four negotiated facts move; slot 7 (`putValue` attributes)
-/// and the creation time are deliberately left alone, because carrying an
-/// application's bindings across the promotion is the entire point.
-fn refresh_synthetic_ssl_session(
-    ctx: &mut dyn NativeContext,
-    ses: ObjectRef,
-    id: i32,
-) -> Result<(), MethodCallFailed> {
-    let (proto, cipher, alpn) = negotiated_facts_of(id);
-    let cipher_s = ctx.create_string(&cipher);
-    let proto_s = ctx.create_string(&proto);
-    let alpn_s = ctx.create_string(&alpn);
-    ctx.set_field(ses, 0, Value::Object(Some(cipher_s)));
-    ctx.set_field(ses, 1, Value::Object(Some(proto_s)));
-    ctx.set_field(ses, 2, Value::Int(1));
-    ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
-    if proto == "TLSv1.2" {
-        let sid = with_engine(id, |s| s.negotiated_session_id.clone()).unwrap_or_default();
-        if !sid.is_empty() {
-            let wire_key = gc_stable_objref_key(ctx, ses);
-            session_wire_id_table().lock().insert(wire_key, sid);
-        }
-    }
-    let peer_chain = with_engine(id, |s| s.peer_cert_chain_der.clone()).unwrap_or_default();
-    if !peer_chain.is_empty() {
-        let k = gc_stable_objref_key(ctx, ses);
-        session_peer_certs_table().lock().insert(k, peer_chain);
-    }
-    Ok(())
-}
-
-/// The protocol / cipher / ALPN this engine has negotiated, with the same
-/// defaults `build_synthetic_ssl_session` has always used for "not yet".
-fn negotiated_facts_of(id: i32) -> (String, String, String) {
-    with_engine(id, |s| {
-        let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
-            Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
-            Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-            _ => "TLSv1.3",
-        };
-        let cipher = s
-            .conn
-            .as_ref()
-            .and_then(|c| c.negotiated_cipher_suite())
-            .map(|cs| suite_to_java_cipher_name(cs.suite()))
-            .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
-        let alpn = s.negotiated_alpn.clone().unwrap_or_default();
-        (proto.to_string(), cipher, alpn)
-    })
-    .unwrap_or_else(|| {
-        (
-            "TLSv1.3".into(),
-            "TLS_AES_256_GCM_SHA384".into(),
-            String::new(),
-        )
-    })
 }
 
 /// Shared by `getSession()` and `getHandshakeSession()` — see the latter's
@@ -12843,7 +12784,6 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     // both ends must agree: a completed TLS 1.2 handshake. Under TLS 1.3 the
     // field is a meaningless echo and `getId()`'s per-object pseudo-id is the
     // right answer (see `peek_server_hello_session_id`).
-    #[allow(clippy::collapsible_if)]
     if proto == "TLSv1.2" {
         let sid = with_engine(id, |s| s.negotiated_session_id.clone()).unwrap_or_default();
         if !sid.is_empty() {
