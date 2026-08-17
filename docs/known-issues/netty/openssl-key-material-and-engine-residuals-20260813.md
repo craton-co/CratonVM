@@ -1,16 +1,16 @@
 # netty OpenSSL key material: the opaque-key gap, and what is left of it
 
-**Status:** OPEN on **section D alone** — every named defect on this page is
-fixed. Sections A (`KEY_VALUES_MISMATCH`) and C (`SslContextBuilder` accepting an
-invalid cipher) closed earlier; **A′** closed 2026-08-17 on
-`fix/netty-nio-pcap-tls-residuals-20260817` (an EKU read as an eligibility filter,
-see §A′); **B** closed 2026-08-17 on
-`fix/netty-tls-verifier-time-trust-20260817` (the TrustManager verdict now reaches
-rustls INSIDE certificate verification, see §B). What is left is section D's
-intermittent stall in `ParameterizedSslHandlerTest`, which this page already
-records as not attributable to any VM change on the branch that found it, plus one
-LATENCY residual noted under §B: `testHandshakeFailureOnlyFireExceptionOnce` needs
-7-19 s against its own `@Timeout(10000)` where HotSpot needs 4-7 s, on both arms.
+**Status:** OPEN on **B and D**. Sections A (`KEY_VALUES_MISMATCH`) and C
+(`SslContextBuilder` accepting an invalid cipher) closed earlier; **A′** closed
+2026-08-17 on `fix/netty-nio-pcap-tls-residuals-20260817` (an EKU read as an
+eligibility filter — see §A′).
+
+**Section B was attempted on 2026-08-17 and WITHDRAWN.** The fix works — the
+server's handshake fails as it must, 6/6 against a control that fails 6/6 — but
+it costs 49 of `JdkSslEngineTest`'s 821 tests against a control that fails 0, so
+it is a net regression and was reverted. §B below is rewritten as a handover:
+the destination is proven, four of five blockers are identified and each has a
+measured fix, and the fifth is named. Nothing about it is speculative any more.
 
 Measured on Azure host 2 (Linux x86_64, JDK 25), one class per process,
 `-XX:+UseG1GC`, with `netty-tcnative-boringssl-static` on the classpath for
@@ -217,9 +217,11 @@ HotSpot.
   well as on this branch, measured 2026-08-16. So it is a per-process latch,
   not a residual of the class-run fix, and a solo `#testTruncatedPacket`
   result says nothing about it either way.
-* ~~`testHandshakeFailureOnlyFireExceptionOnce`~~ — **FIXED 2026-08-17.** The
-  anatomy below stands; what changed is that the refactor it asks for is built.
-  Jump to "What the fix actually was" at the end of this bullet for the outcome.
+* `testHandshakeFailureOnlyFireExceptionOnce` — the ONE real residual. The
+  anatomy below stands and is still correct; what is new is that the refactor it
+  asks for has been BUILT AND MEASURED, and withdrawn because it costs more than
+  it gains. Jump to "ATTEMPTED AND WITHDRAWN" at the end of this bullet for the
+  handover.
 
   Examined 2026-08-16.
 
@@ -331,154 +333,106 @@ HotSpot.
     and three call sites already publish-then-keep-using `ctx`, so the
     verifier's upcall has a working mechanism.
 
-  **What the fix actually was** (`fix/netty-tls-verifier-time-trust-20260817`).
+  **ATTEMPTED AND WITHDRAWN, 2026-08-17** — branch
+  `fix/netty-tls-verifier-time-trust-20260817` (pushed, not merged). It works, and
+  it costs more than it gains. Read this before starting again.
 
-  `do_unwrap` is now three phases: PHASE 1 (registry LOCKED) does the
+  ### It works
+
+  `do_unwrap` becomes three phases: PHASE 1 (registry LOCKED) does the
   delegated-task replay, PHASE 2 runs the record loop with the lock **DROPPED**
-  and the connection checked out through `ConnCheckout`, PHASE 3 (LOCKED) writes
-  back and classifies. The loop body is untouched.
+  and the connection checked out through an RAII `ConnCheckout`, PHASE 3 (LOCKED)
+  writes back and classifies. The loop body needs no change — a census of `s.*`
+  accesses between its braces finds none. `engine_run_trust_check` is not
+  duplicated; it gains a `TrustCheckMode` so the post-handshake path keeps its
+  behaviour byte for byte while the verifier path REPORTS its verdict (rustls
+  emits its own alert from inside its state machine, and a Java exception thrown
+  from that frame would sit pending on `ctx` and surface at an arbitrary later
+  call).
 
-  `ConnCheckout` restores through `Drop`, not an explicit put-back, because the
-  loop has an early `return Err(throw_jca_exc(...))` and a missed restore is not a
-  test failure — it leaves `conn == None` for the life of that engine, so every
-  later `wrap`/`unwrap` silently does nothing.
-  `a_checked_out_connection_is_restored_on_every_exit` covers the normal exit, the
-  early return and a panic-driven unwind, and asserts `engine_begin` refuses to
-  build a rival connection in the window (the restore would discard it, along with
-  anything the re-entrant caller had done to it).
-
-  `engine_run_trust_check` is NOT duplicated; it gains a `TrustCheckMode`.
-  `PostHandshake` keeps today's behaviour byte for byte. `InVerifier` REPORTS the
-  verdict instead of acting on it: rustls emits its own fatal alert from inside its
-  state machine, under handshake keys, and a Java exception thrown from that frame
-  would sit pending on `ctx` and surface at an arbitrary later call. A Java `Error`
-  (not `Exception`) still propagates through the post-handshake gate untouched, so
-  `throwable_is_error`'s rule stays in one place.
-
-  The verifier marks `trust_check_done` through `with_engine` — a registry lock
-  taken from INSIDE `process_new_packets`, which is exactly the re-entrancy the
-  split buys and would have deadlocked before it. That is also what stops the
-  post-handshake gate asking a manager that has already answered; a double
-  consultation is observable, because an application manager may count its calls.
-
-  `handshake_error_message` spends the recorded rejection detail so the caller
-  still reads "TrustManager rejected the peer certificate chain: …" rather than
-  rustls's "application verification failure" — moving the check earlier must not
-  cost diagnostics.
-
-  **Measured on the LOCAL 32-core Windows box, not on Azure.** BoringSSL is
-  available to both VMs there (`OpenSsl.isAvailable()=true`,
-  `versionString=BoringSSL`, from the `netty-tcnative-boringssl-static-…-windows-x86_64.jar`
-  the local `common.args` carries), the class reproduces the residual exactly, and
-  the box is not the 8-core Azure host that sat at load 17-35 with 14-16 users.
-
-  **This test has TWO failure modes and they must be separated before any claim
-  about it means anything.** The method carries its own
-  `@Timeout(value = 10000, unit = MILLISECONDS)`, and on this VM it needs 7-19 s
-  where HotSpot needs 4-7 s — so on a busy box BOTH arms simply time out, and the
-  timeout tells you nothing about the defect:
-
-  | mode | what it means | seen on |
-  |---|---|---|
-  | `AssertionFailedError` at line **1546** (`expected: <false> but was: <true>`) | the SERVER's handshake SUCCEEDED where it must fail — **the defect this section is about** | control only |
-  | `TimeoutException` at line **1545**, suppressed `SslHandler$LazyChannelPromise(incomplete)` | the CLIENT's promise had not completed at the 10 s budget — a LATENCY overrun | control and fix, equally |
-
-  Under load the two arms are indistinguishable: 5 control and 5 fix runs all gave
-  `TIMEOUT@1545` at 10.9-25.6 s. So the correctness question was answered with the
-  latency variable removed — `-Djunit.jupiter.execution.timeout.mode=disabled`,
-  which switches off `@Timeout` annotations too — and then it separates cleanly,
-  ABBA-interleaved:
+  On `SslHandlerTest`, ABBA-interleaved, with the latency variable removed —
+  `-Djunit.jupiter.execution.timeout.mode=disabled`, because this method's own
+  `@Timeout(10000)` is tighter than the run needs on a busy box and both arms then
+  just time out:
 
   ```
-  tlsctl  FAILED     ms=12400   ASSERT@1546   <- the server completed its handshake
-  tlsfix  SUCCESSFUL ms=10292
-  tlsfix  SUCCESSFUL ms= 7465
-  tlsctl  FAILED     ms= 9739   ASSERT@1546
-  tlsctl  FAILED     ms=17145   ASSERT@1546
+  control  FAILED  ASSERT@1546  x6    <- the server completed its handshake
+  fix      SUCCESSFUL           x6
   ```
 
-  `ASSERT@1546` never appears on the fix arm and appears on every control run.
-  That is the property this section asked for.
+  ### It costs 49 tests
 
-  **The `TIMEOUT@1545` overrun is left open and is NOT attributable to this
-  change** — it is present on the control at the same rate and with the same
-  timing distribution, and it is the same shape as
-  `fixed-suite-bugs/netty/nioeventlooptest-unbound-registration-fd-slot-collision-FIXED-20260817.md`
-  §2: a netty test whose own `@Timeout` is tighter than this VM's cold-start plus
-  handshake cost. On a quiet box the fix arm passes with the annotation left on
-  (measured 6815, 7685, 9494, 9813, 9828 ms against the 10 000 ms budget); on a
-  busy one it does not, and neither does the control.
+  `JdkSslEngineTest`, 821 tests, on the Azure host (the Windows box CANNOT run
+  this class — it exceeds 900 s there where HotSpot takes 180 s, which is why
+  every local class passed on every broken version):
 
-  Read the rest of this class **per-METHOD, not by count**: HotSpot itself fails
-  three `testSessionTickets*` tests on this host, and which members of that family
-  fail moves run to run on BOTH arms — a pre-existing load-sensitive flake, not a
-  regression, and not something this change touches.
-  `testHandshakeFailureCipherMissmatchTLSv13OpenSsl` ABORTS on all three arms
-  (its `assumeFalse(OpenSsl.isBoringSSL())`).
+  | version | result |
+  |---|---|
+  | control | 755 ok, 66 aborted, **0 failed** |
+  | v1 verifier-time check | 5 hangs at 225 in: `mustCallResume…` x3, `testMutualAuthSameCertChain` x2 |
+  | v2 + `conn_checked_out` in `handshake_status_of` | mutual-auth closed; `mustCallResume…` x5 |
+  | v3 + promote the session OBJECT | **49 failed** — 48 new `testSessionAfterHandshake*` |
+  | v4 + share the session's BINDINGS instead | `mustCallResume…` 5 → **1**; the 48 remain. 706 ok, **49 failed** |
 
-  **Regression check**, one class per process, control vs fix on the same host:
+  ### The five blockers, four of them solved
 
-  | class | control | fix |
-  |---|---|---|
-  | `SslContextBuilderTest` | 21 / 21 | 21 / 21 |
-  | `JdkDelegatingPrivateKeyMethodTest` | 27 / 27 | 27 / 27 |
-  | `ParameterizedSslHandlerTest` | 61 / 63 (params 1, 5) | **62 / 63** (param 4) |
+  1. **The registry lock.** Solved by `ConnCheckout` (PHASE 2). Restore through
+     `Drop`, not an explicit put-back: the loop has an early
+     `return Err(throw_jca_exc(...))` and a missed restore leaves `conn == None`
+     for the life of the engine, so every later `wrap`/`unwrap` silently does
+     nothing.
+  2. **`handshake_status_of` read `conn == None` as `NOT_HANDSHAKING`.** While the
+     connection is on loan that is a lie, told to the one caller that must not
+     hear it: an `X509ExtendedTrustManager` is handed the `SSLEngine`, and a
+     caller told the handshake is over stops driving it. Closed
+     `testMutualAuthSameCertChain`. `EngineState::conn_checked_out` (the flag this
+     page's original plan named) is the fix, as the FIRST `None` arm.
+  3. **The engine `ObjectRef` published for the verifier must be a PIN HANDLE.**
+     The window spans `process_new_packets`, which runs Java and therefore
+     allocates.
+  4. **`getHandshakeSession()` and `getSession()` are two different objects here.**
+     `engine_session_for` keys its cache `(engine, handshaked)`. JSSE has ONE
+     session: what an application binds mid-handshake is still bound afterwards.
+     `SSLEngineTest.mustCallResumeTrustedOnSessionResumption`'s TrustManager does
+     `engine.getHandshakeSession().putValue(...)` and the test blocks on
+     `engine.getSession().getValue(...)`, so it HUNG. Sharing the attribute MAP
+     took it 5 → 1. Do NOT promote the whole object — that changes session
+     identity and costs 48 tests on its own (v3).
+  5. **UNSOLVED: the TrustManager is invoked TWICE.** The remaining 48 are
+     `testSessionAfterHandshake` / `…KeyManagerFactory` / `…MutualAuth` /
+     `…KeyManagerFactoryMutualAuth`, 12 parameterisations each, all
+     `expected: <0> but was: <1>` at `SSLEngineTest.java:3698` — which is
 
-  `ParameterizedSslHandlerTest`'s failures on both arms are in the OPENSSL /
-  OPENSSL_REFCNT family section D is about, and which parameterisation fails moves
-  between runs — the fix arm happens to be one better, which is not a claim, just
-  the number.
+     ```java
+     assertEquals(0, engine.getHandshakeSession().getValueNames().length);
+     engine.getHandshakeSession().putValue(handshakeKey, Boolean.TRUE);
+     ```
 
-  `JdkSslEngineTest` (821 tests) is **not measurable on this Windows box**: it
-  exceeds 900 s on both arms (HotSpot does it in 180 s), so it was run on the Azure
-  host instead, where it completes in 468 s — **and it is the gate that caught a
-  regression every local class had passed.**
+     inside `checkServerTrusted`. Seeing 1 means the manager already ran once on
+     that engine and bound the key. So the verifier-time call and something else
+     both fire. `mark_trust_check_done` sets `EngineState::trust_check_done` from
+     inside the verifier and `engine_take_pending_trust_check` honours it, so the
+     post-handshake gate is not the obvious culprit — **instrument the count
+     first**. That is the next measurement, and it is one build-and-gate cycle
+     (~40 min on Azure), not a guess.
 
-  The first version of this fix HUNG five of the first 225 tests there, all
-  TLSv1.3, all `TimeoutException` rather than an assertion:
+  ### What to keep from this
 
-  ```
-  control            755 ok, 66 aborted, 0 failed
-  fix, version 1     5 FAILED at 225 tests in, all HANGS:
-                       mustCallResumeTrustedOnSessionResumption  x3
-                       testMutualAuthSameCertChain              x2
-  ```
+  * `a_verifier_time_rejection_reaches_the_server_while_it_is_still_handshaking`
+    is on `dev` and proves the destination: a rejection raised inside
+    `verify_server_cert` reaches the server as a DECRYPTABLE alert while it is
+    still handshaking. It carries an accepting control arm so it cannot pass
+    vacuously.
+  * **Read this test per-MODE, not per-count.** It fails two ways —
+    `AssertionFailedError` at 1546 (the server completed: the defect) and
+    `TimeoutException` at 1545 (the client's promise missed the 10 s budget: pure
+    latency, present on the control at the same rate). Under load only the second
+    appears, on both arms, and it decides nothing.
+  * **A class the local box cannot run is not a class you can skip.** Every
+    locally-measurable class — `SslContextBuilderTest` 21/21,
+    `JdkDelegatingPrivateKeyMethodTest` 27/27, `ParameterizedSslHandlerTest` 62/63
+    — passed on all four versions, including the two that were badly broken.
 
-  Those are exactly the tests that run the Java upcall. The cause:
-  `handshake_status_of` read `conn == None` as `NOT_HANDSHAKING`, and while the
-  record loop holds the connection on loan that is a lie — told to the one caller
-  that must not hear it, because an `X509ExtendedTrustManager` is handed the
-  `SSLEngine` and a caller told the handshake is over stops driving it.
-  `EngineState::conn_checked_out` existed for precisely this (the plan above names
-  it) and had been wired only into `engine_begin`; it is now the first `None` arm of
-  `handshake_status_of`.
-
-  `engine_wrap_pump` also stopped answering `(0, 0)` silently for a checked-out
-  engine: that answer is indistinguishable from "no connection yet" and it DROPS the
-  caller's write — a lost handshake record, i.e. a hang with no error. It should be
-  unreachable now; if it is ever reached it says so.
-
-  **The lesson for the next reader, and it is the reason this section took two
-  passes:** a class the local box cannot run is not a class you can skip. Every
-  locally-measurable class passed on the broken version.
-
-  **What this does NOT cover.** Only the CLIENT's `checkServerTrusted` moved into
-  verification, because that is what `verify_server_cert` is. A SERVER engine's
-  `checkClientTrusted` still runs post-handshake through
-  `engine_take_pending_trust_check`, so a server whose TrustManager rejects a
-  CLIENT certificate has the mirror-image problem: it will have completed its own
-  handshake first. No test in this suite asks for it, and closing it means the same
-  treatment for `ClientCertVerifier::verify_client_cert` — the plumbing built here
-  (`ConnCheckout`, the published binding, `TrustCheckMode::InVerifier`) is what it
-  would reuse.
-
-  One GC note worth carrying: the engine's `ObjectRef` is published for the window
-  as a PIN HANDLE, not a bare reference (`set_active_engine_binding`). The window
-  spans `process_new_packets`, which runs the application's Java TrustManager and
-  therefore allocates, so a bare reference there is the "native local held live
-  across an allocation" family — the same hazard `engine_run_trust_check`'s own
-  chain-array pin already exists for. `UnpinOnDrop` releases the frame on the
-  early-return path too.
 * ~~`testClientHandshakeTimeoutBecauseExecutorNotExecute` /
   `testServerHandshakeTimeoutBecauseExecutorNotExecute`~~ — FIXED 2026-08-16.
   The engine implements JSSE's delegated-task contract now; `DelegatedTask` in
