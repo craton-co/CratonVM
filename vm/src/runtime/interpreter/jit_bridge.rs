@@ -805,6 +805,71 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // `Preconditions.checkIndex` / `Reference.reachabilityFence`
+                    // thin direct calls — the THIRD door.
+                    //
+                    // Both are recognised in `jit::try_compile`'s single-pass
+                    // ladder and in its IR path, and for `checkIndex` that was
+                    // enough: it is reached through `Objects.checkIndex`, a JDK
+                    // method the method-entry door compiles, so the bind landed
+                    // inside the callee. `reachabilityFence` has no such
+                    // intermediary — a hot loop calls it directly — and a hot
+                    // loop's body is compiled HERE, by the OSR door, which runs
+                    // its own callee-binding loop rather than that ladder.
+                    // Wiring the other two doors and not this one bound
+                    // `Preconditions.checkIndex=2 Reference.reachabilityFence=0`
+                    // (`CRATONVM_DBG=jit-method-stats`) while the fence's cost
+                    // did not move — 361 ns before, 142 after, against
+                    // `Objects.checkIndex`'s 352 -> 15. Three doors, and the
+                    // counter is what said which one was missing.
+                    //
+                    // Address taken directly rather than through the jit-crate
+                    // atomic, for the reason the `Thread.currentThread` bind
+                    // above states: `build_helpers` registers those cells only
+                    // after this construction block, so reading one here yields
+                    // 0 on the first OSR compile in a process.
+                    if invoke_kind == 3
+                        && target_class == "jdk/internal/util/Preconditions"
+                        && mn == "checkIndex"
+                        && desc == "(IILjava/util/function/BiFunction;)I"
+                    {
+                        let entry = crate::jit::helpers::jit_preconditions_check_index_direct
+                            as *const () as usize;
+                        cratonvm_jit::PRECONDITIONS_CHECK_INDEX_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 3,
+                                return_type: b'I',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    if invoke_kind == 3
+                        && target_class == "java/lang/ref/Reference"
+                        && mn == "reachabilityFence"
+                        && desc == "(Ljava/lang/Object;)V"
+                    {
+                        let entry = crate::jit::helpers::jit_reachability_fence_direct
+                            as *const () as usize;
+                        cratonvm_jit::REACHABILITY_FENCE_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'V',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
                     // `Integer.valueOf(I)` thin direct call — statically bound
                     // NATIVE callee, so the eager callee compile below can never
                     // succeed and the generic dispatch round trip is pure fixed
@@ -1259,12 +1324,13 @@ pub(super) fn compile_osr_artifact(
                     );
                     if dbg_bind {
                         eprintln!(
-                            "[osr-bind] {}.{}{} @pc={} compiled=yes direct={} requires_dispatch={} declares_handlers={} indy_trap={}",
+                            "[osr-bind] {}.{}{} @pc={} compiled=yes direct={} entry={:#x} requires_dispatch={} declares_handlers={} indy_trap={}",
                             callee_class,
                             callee_method,
                             callee_desc,
                             ipc,
                             !(refuse_dispatch || refuse_handlers || refuse_indy),
+                            entry,
                             refuse_dispatch,
                             refuse_handlers,
                             refuse_indy
@@ -1724,6 +1790,34 @@ pub(super) fn compile_osr_artifact(
             cm._jit_invoke_infos = owned_jit_invoke_infos2;
             cm._jit_mic_slots.extend(owned_mic_slots2);
             cm._jit_pic_slots.extend(owned_pic_slots2);
+            // `CRATONVM_DBG_JIT_CODE=<substring>` dumped single-pass and IR
+            // bodies but never an OSR one, so the artifact that actually runs a
+            // `@Test` method's hot loop was the one body no diff could see.
+            // That is precisely the artifact the compile-order question turns
+            // on — see
+            // docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md,
+            // where the callee's body was byte-comparable between the fast and
+            // slow arms and the CALLER's was not observable at all. Same
+            // format as the other two dumps, tagged `backend=osr`.
+            if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_CODE") {
+                let full = format!("{class_name}.{method_name}{method_descriptor}");
+                if full.contains(&want) {
+                    let slice = cm._buffer_slice_for_debug();
+                    let mut hex = String::new();
+                    for b in slice {
+                        hex.push_str(&format!("{:02x}", b));
+                    }
+                    eprintln!(
+                        "[JIT_CODE] backend=osr {} entry={:p} entry_pc={} len={}
+{}",
+                        full,
+                        cm.entry_ptr(),
+                        entry_pc,
+                        slice.len(),
+                        hex
+                    );
+                }
+            }
             stamp_compilation_epoch(
                 shared,
                 &class_name_arc,
