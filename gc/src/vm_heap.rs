@@ -3581,6 +3581,70 @@ mod concurrent_mark_controller_tests {
         );
     }
 
+    /// Every `zgc_*_concurrent_mark` arm of `VmHeap` reaches the collector.
+    ///
+    /// # Why this is a separate test from the ones in `zgc.rs`
+    ///
+    /// Those exercise `ZgcRealHeap` directly. This exercises the **dispatch**,
+    /// and in this enum the dispatch is where a feature goes quietly missing:
+    /// every one of these methods has two arms that are a literal `false` /
+    /// `{}` / `(0, 0, 0, 0, 0)`, and a fifth arm that reads
+    /// `VmHeap::Zgc(_) => false` compiles, passes every collector-level test,
+    /// and turns the whole feature off. This tree has shipped exactly that
+    /// shape before — an inert registration is indistinguishable from a
+    /// missing feature from anywhere except the call site.
+    ///
+    /// The exact edit that trips it: change any `VmHeap::Zgc(h) => h.…` arm in
+    /// the ZGC concurrent-marking block to the neutral value its siblings use.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_vm_heap_zgc_concurrent_arms_reach_the_collector() {
+        let heap = VmHeap::new(GcBackend::Zgc, 8 * 1024 * 1024);
+        assert!(!heap.zgc_concurrent_mark_active());
+        assert_eq!(heap.zgc_concurrent_mark_stats(), (0, 0, 0, 0, 0));
+
+        let holder = heap.alloc_object(ClassId::new(1), 2);
+        let child = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(holder, 0, Value::Object(Some(child)));
+        let garbage = heap.alloc_object(ClassId::new(1), 0);
+        let garbage_addr = garbage.as_ptr() as usize;
+
+        // SAFETY: this test is the only mutator.
+        let stw = unsafe { crate::collector::StopTheWorldToken::new() };
+        assert!(
+            heap.zgc_start_concurrent_mark(&stw, &[holder]),
+            "the VmHeap arm must open a cycle, not return a neutral false"
+        );
+        assert!(heap.zgc_concurrent_mark_active());
+
+        // The mutator ingress, through the funnel every reference store in the
+        // VM already reaches.
+        let extra = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(holder, 1, Value::Object(Some(extra)));
+        heap.satb_barrier(Value::Object(Some(child)));
+
+        let mut roots = [holder];
+        let _ = heap.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+
+        let (started, completed, black, _replayed, _ns) = heap.zgc_concurrent_mark_stats();
+        assert_eq!(
+            (started, completed),
+            (1, 1),
+            "the cycle must have been opened AND certified through the VmHeap arms"
+        );
+        assert!(black >= 1, "the object allocated mid-cycle was born marked");
+        assert!(!heap.zgc_concurrent_mark_active());
+
+        assert!(
+            heap.is_object_address(child.as_ptr() as usize).is_some(),
+            "the live child survived a concurrently-marked collection"
+        );
+        assert!(
+            heap.is_object_address(garbage_addr).is_none(),
+            "...and the garbage did not, so this is not just 'nothing was freed'"
+        );
+    }
+
     /// ...and the same funnel is inert on ZGC while no cycle is marking, which
     /// is what makes it free to leave wired in every build.
     #[cfg(feature = "zgc")]
