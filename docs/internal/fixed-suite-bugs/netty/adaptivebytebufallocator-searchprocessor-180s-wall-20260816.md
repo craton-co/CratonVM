@@ -1,5 +1,76 @@
 # `AdaptiveByteBufAllocator*` and `SearchProcessorTest` — confirmed genuine (non-contention) 180 s wall hits, not deadlocks
 
+**Status: RETIRED 2026-08-17 — the "genuine VM-wide throughput ceiling" this
+page reconfirmed was, for the larger part, one cacheable call shape, and that
+is now FIXED.**
+
+This page's central claim was that the three `AdaptiveByteBufAllocator*`
+classes cost what they cost because of "per-call/JIT-entry dispatch cost ×
+hundreds of millions of calls", with "no VM-wide fix for the underlying
+per-call cost" available. The call count was right; the attribution was not.
+Every `ByteBuf` accessor runs `ensureAccessible()` → `RefCnt.isLiveNonVolatile`
+→ **`VarHandle.get`**, and a signature-polymorphic call site cannot be found in
+the native registry by its own descriptor — so the JIT's per-call-site native
+cache had cached a permanent refusal for every one of them, and each call
+re-ran `invoke_or_native`'s whole cascade plus a compile probe that could never
+succeed. `VarHandle.get` on an `int` field cost **1 979 ns**; it now costs
+**155 ns**. Full record:
+`fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
+
+Re-measured on this page's own four classes, same host, same day, `-Xmx 1500m`,
+no per-method cap (so the class completes instead of being clipped). The host
+carried unrelated load of 8-35 throughout, so read the CPU column, not wall:
+
+| class | before (wall / CPU) | after (wall / CPU) | ratio (CPU) |
+| --- | ---: | ---: | ---: |
+| `AdaptiveByteBufAllocatorTest` | 635–725 s / 638–727 s | **419–432 s / 421–435 s** | 1.51–1.67× |
+| `AdaptiveByteBufAllocatorGrowthTest` | 1 081 s / 2 963 s | **645 s / 2 042 s** | 1.45× |
+| `AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest` | 752 s / 754 s | **435 s / 432 s** | 1.75× |
+| `search.SearchProcessorTest` | 153 s / 141 s | **131–139 s / 130–135 s** | ~1.07× |
+| `BigEndianHeapByteBufTest` (control, not on this page) | 37.4 s / 56.5 s | 38.4 s / **48.5 s** | 1.17× |
+
+**One reading in this table was nearly a cherry-pick, and naming it is the
+point.** An un-paired run of `AdaptiveByteBufAllocatorTest` on the fixed binary
+came back at **270 s**, which would have made that row read 2.6×. Re-run
+interleaved against `base` — same class, same host, adjacent — it measured
+**432 s** and **419 s** against a `base` of 725 s and 635 s, with two further
+un-paired runs at 426 s and 475 s. The 270 s was this box, not this change, and
+1.45-1.75x is where the family actually sits. The ancestor page said so in
+advance
+(`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` §6: the same class
+measured 450, 551, 559 and 594 s on one binary): **interleave, or do not
+compare.**
+
+All of them still pass every test they did before — `AdaptiveByteBufAllocatorTest`
+127/127, `GrowthTest` 400/400, `UseCacheForNonEventLoopThreadsTest` 128/128,
+`SearchProcessorTest` 15/15, `BigEndianHeapByteBufTest` 414/414 — which is the
+half of this that a timing table cannot show.
+
+**What this settles, and what it does not.**
+
+* The **misattribution** is settled. Anyone arriving here should not read these
+  classes as evidence for the size of the generic per-call cost; a 1.7× on the
+  allocator class came out of one cache, not out of the dispatcher.
+* The **wall cap** is not settled. `AdaptiveByteBufAllocatorTest` is 419-432 s
+  against a 180 s cap — 2.4× over, down from 4×. The other two remain further
+  over. Under the suite's 180 s cap all three still report HANG, and this page
+  still answers why.
+* `SearchProcessorTest` is unchanged in kind: it is the same load-margin case
+  the fix doc it cites already recorded, now with ~15% more headroom. The
+  quiet-box re-run this page asked for has still not been taken on a genuinely
+  quiet box — every measurement above was made at load 8-35.
+
+The residual is the ordinary native-dispatch floor (~150-210 ns per registered
+native call from compiled code), which is
+`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` — reopened on
+2026-08-17 because these classes are what is still failing on it — and not a
+netty matter. This page moves here because its one actionable finding has been found
+and fixed and because its stated cause is now corrected.
+
+---
+
+*Original text follows, unedited.*
+
 **Status: OPEN**, re-measured 2026-08-16 on `dev` `3ef3eb7441c` (checkout
 `C:\craton\cratonvm`). Three of the four classes below are **not a new
 finding** — they restate and reconfirm a throughput ceiling already fully
@@ -83,12 +154,12 @@ defect and not something HotSpot also struggles with.
 This is not new. It was already measured in detail on 2026-08-12/13 and the
 conclusion has not changed on today's commit:
 
-* `fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`
+* [`netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`](../../fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md)
   first filed these three classes' wall-clock timeouts (no assertion
   failures), noting "All of them **pass when run solo**" — meaning given
   enough wall-clock room, not within the suite's 180 s cap — "the gap is 10×
   broadly and ~90× through `AdaptivePoolingAllocator`."
-* `performance/netty-per-call-throughput-20260813.md`
+* [`internal/performance/netty-per-call-throughput-20260813.md`](../../performance/netty-per-call-throughput-20260813.md)
   (RETIRED, kept as a measurement record) sized it exactly:
   `AdaptiveByteBufAllocatorTest` alone executes **826,764,658** `jit_entries`
   (JIT call-boundary crossings) across its 127 tests, at ~667 ns/entry, for a
@@ -125,7 +196,7 @@ current floor.
 
 This class **does** have current FIXED-tagged coverage:
 
-* `fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md`
+* [`arraylist-native-overhead-and-view-carrier-FIXED-20260813.md`](../../fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md)
   fixed the `ArrayList`-native-call-tax defect behind this class's failure and
   reports it **15/15 at 95–105 s wall** on "a reasonably quiet box" — but adds
   its own explicit warning: *"the fix moves the class from ~1.3x OVER the
@@ -133,7 +204,7 @@ This class **does** have current FIXED-tagged coverage:
   quiet box and does not on a busy one. This host was at load 20-29
   throughout this branch's runs."* At that load it measured **14/15** with a
   `TimeoutException` on `testUniqueLen64Substrings`.
-* `fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md`
+* [`misc-non-tls-residuals-CLOSED-20260813.md`](../../fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md)
   independently confirms the same fix and repeats the identical caveat
   verbatim.
 
@@ -182,8 +253,8 @@ cat /proc/loadavg; ps aux | grep -i cratonvm
 
 ## Related
 
-* `performance/netty-per-call-throughput-20260813.md` — RETIRED, the full per-call-cost measurement behind the three `AdaptiveByteBufAllocator*` classes.
-* `fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md` — first filed these three classes as wall-clock-only timeouts.
-* `fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md` and
-  `fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md` — the `SearchProcessorTest` fix and its quiet-box-only caveat.
+* [`netty-per-call-throughput-20260813.md`](../../performance/netty-per-call-throughput-20260813.md) — RETIRED, the full per-call-cost measurement behind the three `AdaptiveByteBufAllocator*` classes.
+* [`netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`](../../fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md) — first filed these three classes as wall-clock-only timeouts.
+* [`arraylist-native-overhead-and-view-carrier-FIXED-20260813.md`](../../fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md) and
+  [`misc-non-tls-residuals-CLOSED-20260813.md`](../../fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md) — the `SearchProcessorTest` fix and its quiet-box-only caveat.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md) — sibling case: a different class hitting the same class of VM-wide per-call-cost ceiling.

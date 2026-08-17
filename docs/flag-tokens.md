@@ -516,7 +516,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-175 tokens.
+179 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -538,12 +538,15 @@ export inherited from a parent shell.
 | `bytecode-loop-xform` | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` |
 | `bulk-byte-loops` | `CRATONVM_JIT_BULK_BYTE_LOOPS` |
 | `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
+| `census-direct-helpers` | `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
 | `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
 | `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
 | `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
+| `osr-ctor-bind` | `CRATONVM_NO_OSR_CTOR_BIND` |
+| `real-new-site-flags` | `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` |
 | `deny` | `CRATONVM_JIT_DENY` |
 | `deopt-real` | `CRATONVM_DEOPT_REAL` |
 | `direct-callee-calls` | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` |
@@ -579,6 +582,7 @@ export inherited from a parent shell.
 | `ir-call` | `CRATONVM_JIT_IR_CALL` |
 | `ir-call-special` | `CRATONVM_JIT_IR_CALL_SPECIAL` |
 | `ir-call-virtual` | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
+| `ir-over-intrinsic` | `CRATONVM_JIT_IR_OVER_INTRINSIC` |
 | `ir-deopt-resume` | `CRATONVM_IR_DEOPT_RESUME` |
 | `ir-direct-call` | `CRATONVM_JIT_IR_DIRECT_CALL` |
 | `ir-buffer-estimate` | `CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE` |
@@ -698,7 +702,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-51 tokens.
+54 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -750,6 +754,9 @@ export inherited from a parent shell.
 | `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
+| `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
+| `zgc-gen-header-zero` | `CRATONVM_ZGC_GEN_HEADER_ZERO` |
+| `zgc-gen-dead-runs` | `CRATONVM_ZGC_GEN_DEAD_RUNS` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |

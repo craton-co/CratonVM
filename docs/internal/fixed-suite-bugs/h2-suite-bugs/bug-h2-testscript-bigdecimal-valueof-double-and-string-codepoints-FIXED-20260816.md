@@ -9,8 +9,9 @@ HotSpot JDK 25 on the same host, same JDK image, same classpath.
 Two unrelated root causes, one commit, because they were found in the same
 census and each closes part of the same run. Between them they take
 `org.h2.test.scripts.TestScript` from 15 errors to 10 (a third root cause, fixed
-2026-08-17, has since taken it to 9). The remainder are recorded in
-[`../../../known-issues/h2/testscript-sql-divergences-20260816.md`](../../../known-issues/h2/testscript-sql-divergences-20260816.md).
+2026-08-17, took it to 9, and the last two took it to 0 the same day). The whole
+census, now closed, is
+`fixed-suite-bugs/h2-suite-bugs/testscript-sql-divergences-20260816-CLOSED.md`.
 
 ## The failures, as measured
 

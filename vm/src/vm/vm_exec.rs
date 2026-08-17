@@ -1900,6 +1900,65 @@ fn varhandle_reference_return_mismatch(
     Some(actual)
 }
 
+/// The descriptors a signature-polymorphic `MethodHandle` / `VarHandle`
+/// native is actually registered under.
+///
+/// A polymorphic call site names its OWN descriptor (`(LFoo;)I`), which is
+/// never the registration descriptor, so a registry lookup by the call-site
+/// triple always misses. The dispatch tail below re-probes with these three,
+/// in this order, and so does the JIT's per-call-site native cache
+/// (`jit::helpers::resolve_native_owner_for_receiver`) — the constant is
+/// shared so the two cannot drift.
+pub(crate) const SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS: [&str; 3] = [
+    "([Ljava/lang/Object;)Ljava/lang/Object;",
+    "([Ljava/lang/Object;)V",
+    "([Ljava/lang/Object;)Z",
+];
+
+/// Is this one of the method names JVMS §5.4.3.4's signature-polymorphic rule
+/// covers? Extracted from the dispatch tail below so the JIT site cache asks
+/// exactly the same question.
+pub(crate) fn is_signature_polymorphic_method_name(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "invoke"
+            | "invokeExact"
+            | "invokeWithArguments"
+            | "invokeBasic"
+            | "get"
+            | "set"
+            | "getVolatile"
+            | "setVolatile"
+            | "getOpaque"
+            | "setOpaque"
+            | "getAcquire"
+            | "setRelease"
+            | "compareAndSet"
+            | "compareAndExchange"
+            | "compareAndExchangeAcquire"
+            | "compareAndExchangeRelease"
+            | "weakCompareAndSet"
+            | "weakCompareAndSetPlain"
+            | "weakCompareAndSetAcquire"
+            | "weakCompareAndSetRelease"
+            | "getAndSet"
+            | "getAndSetAcquire"
+            | "getAndSetRelease"
+            | "getAndAdd"
+            | "getAndAddAcquire"
+            | "getAndAddRelease"
+            | "getAndBitwiseOr"
+            | "getAndBitwiseOrAcquire"
+            | "getAndBitwiseOrRelease"
+            | "getAndBitwiseAnd"
+            | "getAndBitwiseAndAcquire"
+            | "getAndBitwiseAndRelease"
+            | "getAndBitwiseXor"
+            | "getAndBitwiseXorAcquire"
+            | "getAndBitwiseXorRelease"
+    )
+}
+
 fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/MethodHandle"
         || class_name.starts_with("java/lang/invoke/MethodHandle")
@@ -1907,7 +1966,7 @@ fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
         || class_name == "java/lang/foreign/DowncallHandle"
 }
 
-fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+pub(crate) fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/VarHandle"
         || class_name.starts_with("java/lang/invoke/VarHandle")
         || (class_name.starts_with("java/lang/invoke/") && class_name.contains("VarHandle"))
@@ -11745,6 +11804,90 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         n
     }
 
+    fn read_int_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [i32]) -> usize {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return 0;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return 0;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if src_off > len {
+            return 0;
+        }
+        let available = len - src_off;
+        let n = available.min(dst.len());
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: bounds checked above. Int arrays are a flat 4-bytes-per-element
+        // payload (`element_byte_size`), so `n * 4` bytes from `base + src_off*4`
+        // is exactly elements `src_off..src_off+n`, in host order — the same
+        // convention the char twin above relies on. `dst` is caller-owned and
+        // cannot alias the heap arena.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    base.add(src_off * 4),
+                    dst.as_mut_ptr() as *mut u8,
+                    n * 4,
+                );
+            },
+            // G1 humongous int[]: region-safe per-element read, same fallback
+            // shape as the byte/char twins.
+            None => {
+                for (i, slot) in dst.iter_mut().take(n).enumerate() {
+                    match self.shared.mem.heap.get_array_element(arr, src_off + i) {
+                        Ok(Value::Int(x)) => *slot = x,
+                        _ => return i,
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    fn write_int_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[i32]) -> bool {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return false;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return false;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if dst_off.checked_add(src.len()).map_or(true, |end| end > len) {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: bounds checked above; see `read_int_array_into` for the
+        // 4-bytes-per-element layout argument.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    base.add(dst_off * 4),
+                    src.len() * 4,
+                );
+            },
+            None => {
+                for (i, v) in src.iter().enumerate() {
+                    if self
+                        .shared
+                        .mem
+                        .heap
+                        .set_array_element(arr, dst_off + i, Value::Int(*v))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return 0;
@@ -12507,6 +12650,17 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn current_thread_allocated_bytes(&self) -> Option<u64> {
         Some(self.thread.tlab.thread_allocated_bytes())
+    }
+
+    fn total_allocated_bytes(&self) -> Option<u64> {
+        // Every thread's RETIRED total, plus this thread's live TLAB span. A
+        // peer's in-flight cursor may not be read while its owner runs, so the
+        // under-count is bounded by one TLAB per running thread — and the value
+        // stays monotonic, which the occupancy gauge this replaced was not.
+        Some(
+            cratonvm_gc::tlab::process_allocated_bytes()
+                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+        )
     }
 
     fn committed_heap_bytes(&self) -> usize {
@@ -24773,42 +24927,7 @@ fn invoke_on_class_shared_inner(
                 // MethodHandle.invoke / invokeExact / invokeWithArguments and
                 // VarHandle.get / set / compareAndSet etc. are called with the
                 // call-site descriptor, but registered with a generic one.
-                if method_name == "invoke"
-                    || method_name == "invokeExact"
-                    || method_name == "invokeWithArguments"
-                    || method_name == "invokeBasic"
-                    || method_name == "get"
-                    || method_name == "set"
-                    || method_name == "getVolatile"
-                    || method_name == "setVolatile"
-                    || method_name == "getOpaque"
-                    || method_name == "setOpaque"
-                    || method_name == "getAcquire"
-                    || method_name == "setRelease"
-                    || method_name == "compareAndSet"
-                    || method_name == "compareAndExchange"
-                    || method_name == "compareAndExchangeAcquire"
-                    || method_name == "compareAndExchangeRelease"
-                    || method_name == "weakCompareAndSet"
-                    || method_name == "weakCompareAndSetPlain"
-                    || method_name == "weakCompareAndSetAcquire"
-                    || method_name == "weakCompareAndSetRelease"
-                    || method_name == "getAndSet"
-                    || method_name == "getAndSetAcquire"
-                    || method_name == "getAndSetRelease"
-                    || method_name == "getAndAdd"
-                    || method_name == "getAndAddAcquire"
-                    || method_name == "getAndAddRelease"
-                    || method_name == "getAndBitwiseOr"
-                    || method_name == "getAndBitwiseOrAcquire"
-                    || method_name == "getAndBitwiseOrRelease"
-                    || method_name == "getAndBitwiseAnd"
-                    || method_name == "getAndBitwiseAndAcquire"
-                    || method_name == "getAndBitwiseAndRelease"
-                    || method_name == "getAndBitwiseXor"
-                    || method_name == "getAndBitwiseXorAcquire"
-                    || method_name == "getAndBitwiseXorRelease"
-                {
+                if is_signature_polymorphic_method_name(method_name) {
                     // Check if receiver is a MethodHandle or VarHandle.
                     // DirectMethodHandle / BoundMethodHandle / DelegatingMethodHandle
                     // and their inner species (e.g. DirectMethodHandle$Constructor,
@@ -24871,11 +24990,7 @@ fn invoke_on_class_shared_inner(
                         //
                         // Try all possible registered descriptors for signature-polymorphic methods.
                         // These methods are registered with generic Object[] params but varying return types.
-                        let poly_descs = [
-                            "([Ljava/lang/Object;)Ljava/lang/Object;",
-                            "([Ljava/lang/Object;)V",
-                            "([Ljava/lang/Object;)Z",
-                        ];
+                        let poly_descs = SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS;
                         let prefer_exact =
                             prefers_exact_signature_polymorphic_receiver(&class_name);
                         // The resolved owner of invokeExact is MethodHandle, not
