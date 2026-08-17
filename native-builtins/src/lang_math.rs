@@ -2429,10 +2429,19 @@ pub(crate) fn native_math_floor_div_int(
         }
         .into());
     }
-    // Java floorDiv: rounds toward negative infinity
-    let d = a / b;
-    let r = a % b;
-    let result = if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d };
+    // Java floorDiv: rounds toward negative infinity. `wrapping_*` is not a
+    // shortcut here, it is the SPECIFIED behaviour: javadoc says that for
+    // `floorDiv(Integer.MIN_VALUE, -1)` "integer overflow occurs and the result
+    // is equal to Integer.MIN_VALUE" — the same wraparound `idiv` gives. Plain
+    // `/` and `%` are checked in Rust and PANIC on that pair, which aborts the
+    // whole VM process instead of returning a value.
+    let d = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
+    let result = if (r != 0) && ((r ^ b) < 0) {
+        d.wrapping_sub(1)
+    } else {
+        d
+    };
     Ok(Some(Value::Int(result)))
 }
 
@@ -2455,9 +2464,16 @@ pub(crate) fn native_math_floor_div_long(
         }
         .into());
     }
-    let d = a / b;
-    let r = a % b;
-    let result = if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d };
+    // See `native_math_floor_div_int` for why these are `wrapping_*`:
+    // `floorDiv(Long.MIN_VALUE, -1L)` is specified to overflow to
+    // `Long.MIN_VALUE`, and a checked `/` panics there.
+    let d = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
+    let result = if (r != 0) && ((r ^ b) < 0) {
+        d.wrapping_sub(1)
+    } else {
+        d
+    };
     Ok(Some(Value::Long(result)))
 }
 
@@ -2480,8 +2496,10 @@ pub(crate) fn native_math_floor_mod_int(
         }
         .into());
     }
-    // Java floorMod: a - floorDiv(a,b) * b
-    let r = a % b;
+    // Java floorMod: a - floorDiv(a,b) * b. `wrapping_rem` for the same reason
+    // as `floorDiv`: `MIN_VALUE % -1` panics under a checked `%` even though the
+    // mathematical answer (0) is representable.
+    let r = a.wrapping_rem(b);
     let result = if (r != 0) && ((r ^ b) < 0) { r + b } else { r };
     Ok(Some(Value::Int(result)))
 }
@@ -2505,7 +2523,7 @@ pub(crate) fn native_math_floor_mod_long(
         }
         .into());
     }
-    let r = a % b;
+    let r = a.wrapping_rem(b);
     let result = if (r != 0) && ((r ^ b) < 0) { r + b } else { r };
     Ok(Some(Value::Long(result)))
 }
@@ -5873,6 +5891,78 @@ mod tests {
         let mut ctx = mock_ctx();
         let r = native_math_floor_mod_int(&mut ctx, &[Value::Int(-7), Value::Int(3)]);
         assert_eq!(r.unwrap(), Some(Value::Int(2))); // Java floorMod(-7,3) == 2
+    }
+
+    // MIN_VALUE / -1 is the one input pair where a checked Rust `/` or `%`
+    // PANICS rather than returning a value. Java specifies a value for all four
+    // of these, so a panic here is not just wrong, it aborts the process:
+    // commons-math's `AccurateMathStrictComparisonTest` reflectively calls
+    // every `StrictMath` method over edge-case inputs and took the whole VM
+    // down with it.
+    #[test]
+    fn math_floor_div_int_min_by_minus_one_wraps_not_panics() {
+        let mut ctx = mock_ctx();
+        let r = native_math_floor_div_int(&mut ctx, &[Value::Int(i32::MIN), Value::Int(-1)]);
+        assert_eq!(r.unwrap(), Some(Value::Int(i32::MIN)));
+    }
+
+    #[test]
+    fn math_floor_div_long_min_by_minus_one_wraps_not_panics() {
+        let mut ctx = mock_ctx();
+        let r = native_math_floor_div_long(&mut ctx, &[Value::Long(i64::MIN), Value::Long(-1)]);
+        assert_eq!(r.unwrap(), Some(Value::Long(i64::MIN)));
+    }
+
+    #[test]
+    fn math_floor_mod_int_min_by_minus_one_is_zero() {
+        let mut ctx = mock_ctx();
+        let r = native_math_floor_mod_int(&mut ctx, &[Value::Int(i32::MIN), Value::Int(-1)]);
+        assert_eq!(r.unwrap(), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn math_floor_mod_long_min_by_minus_one_is_zero() {
+        let mut ctx = mock_ctx();
+        let r = native_math_floor_mod_long(&mut ctx, &[Value::Long(i64::MIN), Value::Long(-1)]);
+        assert_eq!(r.unwrap(), Some(Value::Long(0)));
+    }
+
+    #[test]
+    fn math_floor_div_mod_long_by_zero_throws() {
+        let mut ctx = mock_ctx();
+        assert!(native_math_floor_div_long(&mut ctx, &[Value::Long(1), Value::Long(0)]).is_err());
+        assert!(native_math_floor_mod_long(&mut ctx, &[Value::Long(1), Value::Long(0)]).is_err());
+        assert!(native_math_floor_mod_int(&mut ctx, &[Value::Int(1), Value::Int(0)]).is_err());
+    }
+
+    // Cross the four natives against the interpreter's own `idiv`/`irem`
+    // identity `floorMod(a,b) == a - floorDiv(a,b) * b` over the signed corners,
+    // so a future edit that swaps a `wrapping_*` back for a checked op fails
+    // here rather than in a workload.
+    #[test]
+    fn math_floor_div_mod_identity_over_signed_corners() {
+        let mut ctx = mock_ctx();
+        let vals = [i32::MIN, i32::MIN + 1, -7, -1, 0, 1, 7, i32::MAX];
+        for &a in &vals {
+            for &b in &vals {
+                if b == 0 {
+                    continue;
+                }
+                let d = match native_math_floor_div_int(&mut ctx, &[Value::Int(a), Value::Int(b)]) {
+                    Ok(Some(Value::Int(v))) => v,
+                    other => panic!("floorDiv({a},{b}) -> {other:?}"),
+                };
+                let m = match native_math_floor_mod_int(&mut ctx, &[Value::Int(a), Value::Int(b)]) {
+                    Ok(Some(Value::Int(v))) => v,
+                    other => panic!("floorMod({a},{b}) -> {other:?}"),
+                };
+                assert_eq!(
+                    m,
+                    a.wrapping_sub(d.wrapping_mul(b)),
+                    "floorMod({a},{b}) must equal a - floorDiv(a,b)*b"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
