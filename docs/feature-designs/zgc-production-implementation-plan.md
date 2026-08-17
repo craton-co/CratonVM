@@ -1,9 +1,13 @@
 # Production ZGC
 
-**Status:** Partial — selectable behind the `zgc` cargo feature, but the
-collector it selects is a stop-the-world non-moving mark-sweep. The concurrent,
-generational, compacting machinery is written and unit-tested and **not
-adopted**.
+**Status:** Partial, and the default collector. It can **mark concurrently**
+as of 2026-08-16 (opt-in, `CRATONVM_ZGC_CONC_START=60`) and it **compacts** as
+of 2026-08-13; the sweep is still
+stop-the-world, marking is snapshot-at-the-beginning rather than ZGC's load
+barrier, and the generational machinery is written, unit-tested and **not
+adopted**. See
+[the concurrent+generational plan](zgc-concurrent-and-generational-plan-20260813.md)
+for what landed and what is left.
 
 ## What is built
 

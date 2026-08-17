@@ -4563,6 +4563,12 @@ fn register_map_view_carrier_natives(r: &mut NativeMethodRegistry) {
         r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
         r.register(
             c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_al_spliterator,
+        );
+        r.register(
+            c,
             "removeIf",
             "(Ljava/util/function/Predicate;)Z",
             native_al_remove_if,
@@ -22751,6 +22757,66 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     ctx.unpin_native_roots(stream_pin);
     ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(stream))))
+}
+
+/// `spliterator()` for a [`MAP_VIEW_CARRIERS`] (a map's `values()` view,
+/// ArrayList-layout under its own class — e.g. `TreeMap$Values`,
+/// `HashMap$Values`).
+///
+/// The `Set`-shaped twin of this gap (`keySet()`/`entrySet()` views) was
+/// already covered by [`native_hs_spliterator`], registered alongside
+/// `native_hs_stream` in `register_set_view_carrier_natives`. This one was
+/// missing its `Collection`-shaped equivalent: `register_map_view_carrier_natives`
+/// registered `stream` (`native_al_stream`, above) but never `spliterator`, so
+/// `StreamSupport.stream(view.spliterator(), false)` — as opposed to
+/// `view.stream()` — fell through to the real inherited `AbstractCollection
+/// .spliterator()` bytecode, which this ArrayList-layout carrier's fields
+/// don't back correctly and which silently produced an EMPTY spliterator
+/// rather than throwing. `view.stream()` was unaffected (it has its own
+/// native, above) — only the explicit `.spliterator()` call broke. First
+/// surfaced as `Hibernate boot metadata: `Database.getNamespaces()`
+/// (`TreeMap$Values`) streamed via `StreamSupport.stream(iterable
+/// .spliterator(), false).flatMap(...)` (e.g. `CommentsTest`,
+/// `SchemaUpdateTest`) silently finding zero tables/namespaces.
+///
+/// Mirrors [`native_hs_spliterator`]'s synthetic `java/util/Spliterator`
+/// (fields: backing array, cursor, limit) built from a snapshot — reuses
+/// `al_or_collection_elements`, the same element-reading helper
+/// `native_al_stream` already relies on, so any collection `stream()` gets
+/// right, `spliterator()` now gets right too.
+fn native_al_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let this = resync_values_view(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let len = al_or_collection_elements(ctx, this)?.len();
+    let arr = alloc_ref_array(ctx, len);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elements = al_or_collection_elements(ctx, this)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    for (i, element) in elements.iter().enumerate().take(len) {
+        ctx.set_array_element(arr, i, *element);
+    }
+    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(len as i32));
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(spl))))
 }
 
 fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
