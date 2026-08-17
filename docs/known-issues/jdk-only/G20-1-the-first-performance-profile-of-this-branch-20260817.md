@@ -1,5 +1,37 @@
 # G20-1 — the first performance profile of this branch
 
+> **RECONCILED 2026-08-17 (lane G40) — the GC headline below is FALSIFIED. Read
+> `G27-1` before §0 or §4.**
+>
+> * **`moving_young: cycles=0` did not mean the young path was broken.**
+>   `gen_heap.rs` is **not the collector** in a default run: `vm/src/config.rs:769`
+>   has defaulted to `GcAlgorithm::Zgc` since 2026-08-10, and
+>   `grep -c moving_young gc/src/zgc.rs` returns 0, so the gating predicate at
+>   `gen_heap.rs:5719` is never reached. All three diagnostics this record rests
+>   on mislead the same way: `moving_young_requested=true` is a **JIT-codegen
+>   capability flag**, not a request; *"no collection has run yet"* fires because
+>   ZGC never calls `record_collector_decision`; the `[GC] cards:` block is
+>   generational-only and structurally zero. §8's guess that the `zgc-*` counter
+>   labels were a "legacy prefix" was the finding — the label was the collector.
+>   `G27-1` re-measured it: **ZGC is 4.37x–6.35x slower than the generational
+>   backend** at every heap size, ranges not touching, 96 runs, every checksum
+>   `68332206`. Landed as `3765fad76`.
+> * **§8's `invocations` claim is not reproducible.** `--nojit` was exact for
+>   every registry-dispatched native `G33-1` probed. The supporting evidence
+>   (`Preconditions.checkIndex = 1` over a `charAt` loop) was not instrument
+>   failure: there is **no registry row for `String.charAt` in this binary**, so
+>   that zero was honest. The *conclusion* — that an arm-independent
+>   under-reporting mechanism exists — was right; the mechanism is the
+>   interpreter's intrinsic table, not sampling. See `G33-1`.
+> * **The binary this record measured is `C:/craton/target-fcheck/…`, which the
+>   tree now says to ignore** — that build partly failed and its timestamp
+>   misrepresents its contents (`G34-1` §provenance). This record already flagged
+>   its attribution as only "partly" sound.
+>
+> The startup, throughput and native-boundary numbers were **not** re-taken on a
+> good binary. They are not marked wrong here; they are **unre-measured**, which
+> is not the same thing.
+
 **Status:** MEASURED, end to end. **Provenance:** every number below was taken
 on this host, on the shipping release binary, against HotSpot 25.0.3+9-LTS as
 the oracle. Nothing here is PREDICTED. That is worth stating in this directory,

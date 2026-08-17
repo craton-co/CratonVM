@@ -1,5 +1,21 @@
 # G28-1 — the DST rule layer rebuilt, and what re-measuring G17-1 confirmed
 
+> **RECONCILED 2026-08-17 (lane G40) — the rule layer is CONFIRMED GREEN; one
+> restated inference is weakened.**
+>
+> * **Confirmed.** `RSimpleTimeZoneRaw` passes, **MEASURED** on the `9964ca733`
+>   binary under `--jdk-only`. The prediction of 74 divergences → 0, made from a
+>   rule validated at 632 zones × 9,480 rows against `java.time.zone.ZoneRules`
+>   by a lane that could not build, **held exactly**. That is one of the few
+>   places in this directory where a PREDICTED value was checked and survived.
+> * **Weakened.** §1 restates `G17-1`'s finding that *"`java/util/TimeZone`'s
+>   offset family reads `invocations=0`"* and uses it to justify narrow
+>   registration. `G33-1` established that `invocations` is a **floor** — it
+>   counts only registry-resolved dispatches, so `invocations == 0` proves
+>   nothing. The observation that `getID` and `getTimeZone` on the same class run
+>   heavily is a real control against "the class is cold"; it is not a control
+>   against the intrinsic cache or a JIT direct-call helper. See `INDEX.md` §B.1.
+
 **Status:** BEFORE **RE-MEASURED** on both VMs this session, on the committed
 `RSimpleTimeZoneRaw` and on the whole 632-id catalog. The RULE the fix
 implements is **MEASURED** against the oracle on 9,480 rows / 632 zones, 0

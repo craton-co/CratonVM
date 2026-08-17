@@ -1,5 +1,23 @@
 # G15-1 — the JUL null axis, and how far `RJdkIntrinsics3` got
 
+> **RECONCILED 2026-08-17 (lane G40) — the `invocations` premise in §"one
+> measurement that outlived its purpose" is FALSIFIED.**
+>
+> This record concludes that *"the registry dump is taken at registration time,
+> before the main class runs"* because every `java/util/logging` row read
+> `invocations=0` in a run that called `Handler.setLevel` three times. **It is
+> not taken at registration time.** `G21-1` dumped the same rows against
+> `RJdkIntrinsics3` and read `invocations=2` on `Handler.setLevel`; the zero came
+> from dumping against a workload that did not call it. `G33-1` then found the
+> deeper mechanism: `invocations` counts only *registry-resolved* dispatches, so
+> it is a **floor** — `invocations > 0` proves the body ran, `invocations == 0`
+> proves nothing at all. It is exact only under `--nojit` **and**
+> `CRATONVM_DISABLE_INTRINSICS=1`.
+>
+> This record's *practical* conclusion — that `owns_slot=true` is the usable
+> proof of ownership in that file — is **correct and unchanged**. Only the stated
+> reason for it was wrong. See `INDEX.md` §B.1.
+
 **Status:** MIXED. The `java.util.logging` null axis is **MEASURED on both VMs,
 in both modes, 102 rows**. Seven Compatible-mode divergences are **FIXED in
 `logmanager.rs`, PREDICTED-not-measured** (this lane could not build — see §7,

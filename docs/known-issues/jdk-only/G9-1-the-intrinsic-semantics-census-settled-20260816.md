@@ -1,5 +1,13 @@
 # G9-1 — the `Intrinsic` semantics census, settled where it could be
 
+> **RECONCILED 2026-08-17 (lane G40) — a question this record left open for want
+> of sources was answerable.** It names `C:\craton\jdk25src`'s absence as the
+> reason. That directory is indeed absent, but the JDK's sources ship with the
+> oracle itself, at `$JAVA_HOME/lib/src.zip` (52,462,198 bytes) — the sources of
+> the exact HotSpot 25.0.3+9-LTS build used here. Nothing measured in this record
+> is invalidated; the open question was cheaper than it looked. See `INDEX.md`
+> §B.3.
+
 **Status:** FIXED-UNVERIFIED-ON-CRATONVM. Four defects fixed, all four measured
 against the oracle **before** the fix and re-measured after it *through a
 standalone `rustc` build of the edited Rust*, never through a CratonVM binary.

@@ -1,5 +1,13 @@
 # G7-1 — the SSLSession surface measured end to end, and the three questions the merge left open
 
+> **RECONCILED 2026-08-17 (lane G40) — the provenance premise "no JDK source was
+> read" was avoidable.** `C:\craton\jdk25src` is indeed absent, and this record
+> is right about that. But the JDK's sources ship with the oracle itself, at
+> `$JAVA_HOME/lib/src.zip` (52,462,198 bytes) — the sources of the exact
+> HotSpot 25.0.3+9-LTS build used here, `javax.net.ssl` included. Nothing
+> measured in this record is invalidated. `RSslLiveSession` was still red at
+> `9964ca733`; see `G16-1` and `BASELINE-20260817.md`. See `INDEX.md` §B.3.
+
 **Status:** FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`,
 `native-builtins/src/http_url_connection.rs`,
 `native-builtins/src/phases_late/ssl_security.rs` — this lane's three files).

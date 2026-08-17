@@ -1,5 +1,20 @@
 # G24-1 — the proxy return coercion, on the path that actually runs
 
+> **RECONCILED 2026-08-17 (lane G40) — the fix is CONFIRMED; one supporting
+> inference is not.**
+>
+> * **Confirmed.** `RJdkProxy` passes, **MEASURED** on the `783685c34` binary
+>   under `--jdk-only`. §8's pending-a-binary state is closed.
+> * **Not sufficient.** §7.3 says of `Proxy$Dispatch.invokeProxy` that *"its doc
+>   comment says it is dead, and `invocations=0` confirms it"*. It does not
+>   confirm it. `G33-1` established that `invocations` is a **floor** — it counts
+>   only registry-resolved dispatches, so `invocations == 0` proves nothing about
+>   liveness. The doc comment and the interpreter's `is_proxy_dispatch`
+>   interception are the load-bearing evidence here; the zero adds nothing. The
+>   companion case is `G18-1`'s reading of `MethodHandle.asType`, which the same
+>   reasoning got **wrong** — `G31-1` proved that body live and fixed it in
+>   `2944095fe`. See `INDEX.md` §B.1.
+
 **Status:** FIXED, before-state MEASURED, after-state PENDING-A-BINARY (§8).
 **Provenance:** MEAS on both VMs for every "before" cell. HotSpot
 25.0.3+9-LTS (`$JAVA_HOME`) is the oracle throughout; CratonVM is

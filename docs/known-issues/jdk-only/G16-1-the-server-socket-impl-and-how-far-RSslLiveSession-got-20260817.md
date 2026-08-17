@@ -1,5 +1,21 @@
 # G16-1 — the ServerSocket impl that was never there, and how far `RSslLiveSession` got
 
+> **RECONCILED 2026-08-17 (lane G40) — one inference in §8 no longer holds.**
+>
+> §8 argues that `plain_socket.rs` is not on the path because *"`plain_socket.rs`'s
+> 17 rows have `invocations = 0` under `--jdk-only`"*. **A zero does not support
+> that conclusion.** `G33-1` established that `invocations` is a **floor**: it
+> counts only registry-resolved dispatches, and the interpreter's intrinsic cache
+> and the JIT's thin direct-call helpers dispatch without ever holding a
+> `NativeMethodId`. `invocations > 0` still proves a body ran; `invocations == 0`
+> proves nothing. To settle whether `plain_socket.rs` is on the path, use
+> `owns_slot` plus a behavioural probe, or re-dump under `--nojit` **and**
+> `CRATONVM_DISABLE_INTRINSICS=1`, where the counter is exact.
+>
+> The rest of the record — the measured `ServerSocket.getImpl()` NPE, the field
+> writes, `RSslLiveSession` going 0 → 67 check rows, and the nominations — is
+> unaffected. `RSslLiveSession` was still red at `9964ca733`. See `INDEX.md` §B.1.
+
 **Status:** BEFORE-MEASURED / AFTER-PENDING-BUILD. **Provenance:** MEAS on both
 VMs for every "before" row and every oracle row below; the "after" column of
 §0 is the only thing in this record that is not yet measured, and it is marked

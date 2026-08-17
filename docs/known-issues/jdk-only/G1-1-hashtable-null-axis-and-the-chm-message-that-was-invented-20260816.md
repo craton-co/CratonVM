@@ -1,5 +1,15 @@
 # G1-1 — the Hashtable null axis, and the ConcurrentHashMap message that was invented
 
+> **RECONCILED 2026-08-17 (lane G40) — the provenance premise "no JDK source was
+> read" was avoidable.** `C:\craton\jdk25src` is indeed absent, and this record
+> is right about that. But the JDK's sources ship with the oracle itself, at
+> `$JAVA_HOME/lib/src.zip` (52,462,198 bytes) — the sources of the exact
+> HotSpot 25.0.3+9-LTS build used here. `unzip -p "$JAVA_HOME/lib/src.zip"
+> java.base/java/util/Hashtable.java`. Nothing measured in this record is
+> invalidated; the point is that the `ConcurrentHashMap` message this record
+> calls invented is **transcribable in two minutes** rather than derivable from
+> behaviour. See `INDEX.md` §B.3.
+
 **Status:** ORACLE MEASURED / **CRATONVM PREDICTED**.
 **Provenance:** every number in §2 and §3 was **MEASURED on HotSpot
 25.0.3+9-LTS** (`$JAVA_HOME`, single-file source mode) on 2026-08-16. **Not one

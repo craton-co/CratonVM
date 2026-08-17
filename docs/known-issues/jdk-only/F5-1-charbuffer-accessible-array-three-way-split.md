@@ -1,5 +1,28 @@
 # F5-1 — `CharBuffer.hasArray/array/arrayOffset` had ONE branch where the JDK has THREE
 
+> **RECONCILED 2026-08-17 (lane G40) — the reachability argument in §"the
+> `--jdk-only` question" is VOID. The three-way split itself is untouched.**
+>
+> This record argues that because `java/nio/CharBuffer` is in neither
+> `force_native_over_real_jdk_bytecode`'s list nor the `check_override` name
+> chain, *"in real-JDK mode these natives answer for exactly the receivers whose
+> resolved method has no `Code`"*. **The force list is not the gate.** `G34-1`
+> measured it on a real binary in both directions, cold and warm: under
+> `--jdk-only`, registering a `Bridge` for a triple is **by itself sufficient**
+> to preempt real JDK bytecode. The decision is taken at the first dispatch site
+> that answers, and for nearly every call that is `try_stackless_invoke` step 1 →
+> `resolve_step1_native`, which runs *before* method resolution and passes
+> `bytecode_available: false` unless `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed.
+> The force list is a **second, later, cache-shape-only** override, consulted
+> only by the vtable inline cache and the JIT. The answer is therefore
+> **site**-dependent, not triple-dependent.
+>
+> **What this banner does NOT claim.** It does not say this record's conclusion
+> about the `CharBuffer` family is wrong — only that the argument for it is void.
+> Re-deriving the answer needs a registry dump and a behavioural probe on the
+> current binary, from a lane that may edit Rust. That was not done. See
+> `INDEX.md` §B.2 and §D.1.
+
 **2026-08-13, lane F5.** Fixes the `java.nio.CharBuffer` half of the
 "accessible backing array" contract in
 `native-builtins/src/phases_late/charset_buffers.rs`

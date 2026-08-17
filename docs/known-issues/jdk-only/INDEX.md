@@ -21,6 +21,27 @@ branch `claude/jdk-only-mode-completion-1351c0` at `HEAD = 7c00dee66`
 > C18's snapshot stays legible as the snapshot it is. **This block will rot the
 > same way**: lanes F14–F25 were still landing while it was written.
 
+> **FOURTH PASS — lane G40, 2026-08-17. Start here.** The warning above was
+> right again. Listing re-taken: **280 `.md` files** including this one, and
+> **36 of them had no row** — the entire wave-G line (`G1-1` … `G34-1`), plus
+> `BASELINE-20260817.md` and `HANDOFF-20260814.md`, which are the two most
+> current documents in this directory. They are added in the **FOURTH PASS**
+> block at the bottom, §A. That block also carries:
+>
+> * **§B — seven standing claims this session falsified**, each naming the
+>   record that asserted it, the record or commit that falsified it, and the
+>   class of evidence. Read §B.1 before you trust any "this body is dead"
+>   conclusion anywhere in this directory, and §B.2 before you reason about
+>   which of a native and real JDK bytecode wins.
+> * **§C — the statuses measurement settled**: 88 → 93 → 95 of 99 under
+>   `--jdk-only`, and the eight vectors that closed.
+> * **§D — what that pass could not settle.** An honest `unknown` is worth more
+>   here than a confident label.
+>
+> **The count 280 will rot too, and faster than 155 or 227 did**: seven lanes
+> were editing this tree as it was taken, and five records (`G35-1` … `G39-1`)
+> were being written during the pass and have no row. Re-take the listing.
+
 ## How to read the columns
 
 **Status** — derived by **reading each record's own status prose**, never from
@@ -635,3 +656,233 @@ These predicted a denominator or a flip, and the binary agreed **exactly**:
   construction — see F41-1 §6. The current behaviour is a *documented
   workaround* protecting every `Executors` path; moving it needs
   interpreter-level tracing.
+
+---
+
+# FOURTH PASS — the listing re-taken, and seven claims this directory got wrong
+
+**Lane G40, 2026-08-17.** Listing re-taken at `ls docs/known-issues/jdk-only/*.md
+| wc -l` = **280 files**, including `INDEX.md` and `README.md`, on branch
+`claude/jdk-only-mode-completion-1351c0` at `HEAD = 9ae371468`. Every file is
+`.md`; there are no non-`.md` entries in this directory.
+
+**Thirty-six of those 280 had no row anywhere in this index** — the whole wave-G
+line (`G1-1` … `G34-1`, 34 records), plus `BASELINE-20260817.md` and
+`HANDOFF-20260814.md`, both of which are the most current documents here and
+neither of which was listed. They are added in §A below. The eight SSL-chain
+records that a first-cell scan reports as missing are **not** missing: they are
+rowed in "The SSL / TLS session chain", whose first column is a sequence number.
+
+> **This block will rot too, and faster than its predecessors.** Seven lanes were
+> editing this tree while it was written and five further records (`G35-1`,
+> `G36-1`, `G37-1`, `G38-1`, `G39-1`) were being written *as* the count was
+> taken. If you find a file with no row, it is newer than this pass, not a stray.
+> **Re-take the listing before quoting 280.** The number has been 155, then 227,
+> then 280 in four days.
+
+**How completeness was checked**, so the next lane can repeat it rather than
+trust it: extract every table row's first cell from `INDEX.md`, strip backticks
+and bold, and test each filename's first 18 characters against that set. That
+method has one known false-positive mode (the SSL chain, above) and one known
+false-negative mode (a record named only in prose, never in a row) — both were
+resolved by hand here.
+
+---
+
+## A. Records added — the wave-G line, the baseline and the handoff
+
+Status is read from **each record's own status prose**, as everywhere else in
+this index. Where the record's own prose and a later measurement disagree, the
+row carries both and the Notes column says which is which.
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| BASELINE-20260817 | the measured state of the suite after `dev` merged: 88 → 93 → 95 of 99 under `--jdk-only`, plus this session's running corrections | META | MEAS | **the most current document in this directory.** Every number in it was executed |
+| HANDOFF-20260814 | the previous session's handoff: build loop, traps, ordered next steps | META | MIXED | **carries a banner now** — §1's "two remain red", §3's `jdk25src` path and §4's `--dump-native-registry` recommendation are each falsified or narrowed. §2 stands, and is the standard this directory holds itself to |
+| G1-1-hashtable-null-axis-and-the-chm-message-that-was-invented | `Hashtable`'s null axis; the `ConcurrentHashMap` message that was invented | OPEN | MIXED (oracle MEAS, CratonVM PRED) | bannered: its "no JDK source was read" premise was wrong — `src.zip` was there |
+| G2-1-the-formatter-conversion-surface-measured-against-the-oracle | 2,932 oracle cells over the `Formatter` conversion surface; four disagreements | OPEN | MIXED (2,932 HotSpot cells MEAS; every CratonVM value PRED) | its §0 is the clearest provenance statement in this directory; copy it |
+| G3-1-the-triple-level-mode-drift-census-and-its-gate | F34-1's 2,412 drifting triples re-counted at triple granularity: **1,540, not 2,412**; gate written | META (census + gate) | SRC | its own §0 says "NOTHING HERE WAS MEASURED ON A BINARY" |
+| G4-1-the-io-and-nio-fabricated-success-sweep-measured | the `java.io` / `java.nio.file` fabricated-success sweep | OPEN | MIXED (oracle MEAS, CratonVM arm not) | bannered: "no JDK source was read" |
+| G5-1-inheritable-threadlocal-captures-at-construction | `InheritableThreadLocal` captures at construction; the note that named the wrong cause | OPEN | MIXED | partial — the `--jdk-only` half is a NOMINATION, not a fix. Still red as `tlocal` inside `RJdkIntrinsics3` |
+| G6-1-the-ffm-surface-measured-and-the-merge-questions-settled | the FFM surface; the merge's three questions | FIXED-UNVERIFIED (own prose: "FIXED-ON-ORACLE, NOT MEASURED ON A CRATONVM BINARY") | MIXED | **`RJdkForeign` has since gone green, MEASURED at `783685c34`** — see §C |
+| G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled | the `SSLSession` surface end to end | FIXED-UNVERIFIED | MIXED | bannered: "no JDK source was read". `RSslLiveSession` is still red |
+| G8-1-the-collections-view-families-and-the-null-function-axis | the collections view families; the null-function axis | OPEN | MIXED (oracle MEAS, CratonVM PRED) | bannered: "no JDK source was read" |
+| G9-1-the-intrinsic-semantics-census-settled | the `Intrinsic` semantics census, settled where it could be | FIXED-UNVERIFIED | MIXED | bannered: it names `jdk25src`'s absence as the reason a question stayed open |
+| G10-1-the-bignum-surface-measured-and-the-shipping-twin | the bignum surface; the twin that is not compiled at all | FIXED-UNVERIFIED (own prose: "CODE LANDED, BEHAVIOUR UNVERIFIED ON CRATONVM") | MIXED | flags its own `invocations = 0` risk; that risk is now **larger**, not smaller (§B.1) |
+| G11-1-shutdown-hooks-and-the-process-cluster | the shutdown-hook contract measured end to end; the process cluster re-read | FIXED-UNVERIFIED | MIXED | bannered: "no JDK source was read" |
+| G12-1-the-proxy-that-any-interface-array-accepted | the `$Proxy` substring blanket in `typecheck.rs`, scoped | FIXED-UNVERIFIED per the record | MIXED (before MEASURED) | **`RArrayStoreInterfaces` went RED → GREEN, MEASURED**, at `d2e127930` |
+| G13-1-the-abstract-declaration-that-was-invoked-directly | three vectors, **two** mechanisms, and the discriminator is a single field | OPEN (partial) | MEAS | the record that corrected `BASELINE-20260817`'s own owner column in place |
+| G14-1-the-uri-value-surface-and-how-far-RJdkBridge1-got | the URI value surface | OPEN (own prose: PARTIAL) | MIXED (before MEAS) | `RJdkBridge1` is one of the four still red at `9964ca733` |
+| G15-1-the-jul-null-axis-and-how-far-RJdkIntrinsics3-got | the `java.util.logging` null axis | OPEN | MIXED | **bannered** — its "the registry dump is taken at registration time" is falsified (§B.1) |
+| G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got | the `ServerSocket` impl that was never there | OPEN | MIXED (before MEAS) | **bannered** — §8 concludes `plain_socket.rs` is off the path from `invocations = 0` (§B.1) |
+| G17-1-the-dst-family-and-the-fixture-that-compared-two-empty-strings | the DST family answered "no zone has ever observed daylight saving"; the fixture that would have caught it compared two empty strings | OPEN in its own prose; **its vector is now GREEN, MEASURED** | MIXED | **bannered** for one `invocations = 0` inference (§B.1). `RSimpleTimeZoneRaw` green at `9964ca733` |
+| G18-1-the-proxy-invocation-contract-and-two-vectors | the proxy invocation contract, and the two vectors that ride on it | OPEN (own prose: PART-FIXED-MEASURED) | MEAS | **bannered** — its `MethodHandle.asType` "not the live body either" was falsified by `G31-1` (§B.1) |
+| G19-1-the-layout-step-and-the-scope-that-was-not-stable | the layout step; the scope that was not stable | FIXED-UNVERIFIED per the record | MEAS (before) | **`RJdkForeign` and `RForeignLayoutJdkInterfaces` both green, MEASURED**, at `783685c34` |
+| G20-1-the-first-performance-profile-of-this-branch | the first performance profile: startup 3.2x, JIT 239x on matrix, the native boundary at ~141 ns | META | MEAS, **with two falsified findings** | **bannered.** Its GC headline is wrong (`G27-1`, `3765fad76`), its `invocations` §8 claim is not reproducible (`G33-1`), and its binary is `target-fcheck` — the build the tree now says to ignore |
+| G21-1-the-handler-setlevel-store-and-how-far-RJdkIntrinsics3-got | the `Handler.setLevel` store | OPEN | MIXED (before MEAS, both modes) | the record that **falsified `G15-1`'s registration-time premise**, and that found `--only=<family>` (§B.6) |
+| G22-1-the-slot-collision-and-the-matcher-with-no-method | the field-slot collision behind `Map.isEmpty()`; the matcher with no method | FIXED-UNVERIFIED per the record ("AFTER NOT MEASURED ON A VECTOR") | MEAS (before) | **`RJdkMapViews` green, MEASURED**, at `783685c34`. First record here to read `src.zip` (§B.3) |
+| G23-1-the-nominations-that-needed-lib-rs | the nominations that needed `lib.rs`; the three that turned out to be wrong | OPEN | MIXED (vector rewrite FIXED-MEASURED) | states the inverse of the `invocations` trap correctly, before `G33-1` had the mechanism |
+| G24-1-the-proxy-return-coercion-on-the-live-path | the proxy return coercion, on the path that actually runs | FIXED per the record; after PENDING-A-BINARY | MEAS (before) | **`RJdkProxy` green, MEASURED**, at `783685c34`. **bannered** for §7.3's "`invocations=0` confirms it" |
+| G25-1-the-int-written-into-a-reference-slot | the int written into a reference slot, and the null it actually wrote | OPEN (SOURCE-FIXED / BEFORE-MEASURED) | MEAS | **the authority for the W7-84 correction** (§B.5) |
+| G26-1-four-families-of-RJdkIntrinsics3 | four families of `RJdkIntrinsics3`, and the one that turned out to be its own | OPEN | MIXED (before MEAS on both VMs) | |
+| G27-1-the-young-collection-that-never-runs | `gen_heap.rs` is not the collector; ZGC is, and has been since 2026-08-10 | META | MEAS (96 runs, every checksum 68332206) | **the record that falsified `G20-1`'s headline** (§B.4) |
+| G28-1-the-dst-rule-layer-rebuilt | the DST rule layer rebuilt from the JDK's own arithmetic; 632 zones × 9,480 rows | FIXED — **`RSimpleTimeZoneRaw` GREEN, MEASURED** at `9964ca733` | MEAS | **bannered** for restating `G17-1`'s `invocations = 0` inference. Its "74 divergences → 0" prediction held exactly |
+| G29-1-the-fabricated-http-request-and-its-missing-accessors | Mechanism A, instances 4 and 5: `HttpRequest` minted with 3 of 7 accessors | FIXED — **`RJdkOptionalShape` GREEN, MEASURED** at `9964ca733` | MEAS (before) | its §6 worry about the force list is answered by `G34-1`, and was unfounded |
+| G30-1-the-silent-reference-slot-coercion | the silent reference-slot coercion, made visible without moving it | OPEN (instrumented) | MEAS (census + runtime population) | with `G25-1`, the authority for §B.5 |
+| G31-1-astype-and-the-verifier-that-was-never-asked | `asType` had no convertibility check; a lambda verifier that was invisible | FIXED-UNVERIFIED (own prose: "FIXED-UNRUN") | MEAS (before) | **falsifies `G18-1`'s reading of `MethodHandle.asType`.** `RJdkProxyIface` was still red at `9964ca733`; the fix landed in `2944095fe`, after |
+| G32-1-the-four-families-at-their-owners | `fmtobj`, `inet`, `bufslice`, `misc` fixed at their real owners | FIXED-UNVERIFIED (own prose: "before MEASURED, after PREDICTED") | MIXED | landed in `1eb5f8346`, **after** the `9964ca733` binary — not represented in 95/99 |
+| G33-1-the-instrument-that-under-reported | `invocations` is a FLOOR; the configuration in which it is exact | META (tooling) | MEAS (causal) + SRC (mechanism) | **the authority for §B.1.** Supersedes two earlier corrections in `BASELINE-20260817` |
+| G34-1-who-wins-native-or-bytecode | registering a `Bridge` is by itself the gate under `--jdk-only`; the force list is a later cache-shape override | META (rule) + FIXED-UNVERIFIED (§5 hazard fix) | MEAS, both directions, cold and warm | **the authority for §B.2** |
+| G40-1-the-index-reconciled-20260817 | this pass: the listing re-taken at 280, 36 rows added, seven claims reconciled, sixteen banners placed | META | — (documentation only; no `.rs`, no `cargo`, no VM run) | **written after the listing was taken, so it makes the directory 281.** That is the rot, in one row |
+
+---
+
+## B. RECONCILED 2026-08-17 (lane G40) — seven standing claims this session falsified
+
+House convention: each row names the record that asserted the claim, the record
+or commit that falsified it, and the class of evidence that did the falsifying.
+Where a record's headline is affected it now carries a `RECONCILED 2026-08-17
+(lane G40)` banner of its own, in the style the five `aastore` records already
+use. **Histories are not rewritten — the banner goes on top and the record's own
+account is left exactly as written.**
+
+### B.1 `invocations` in `--dump-native-registry` is a FLOOR. Zero proves nothing.
+
+| | |
+|---|---|
+| **the claim** | `invocations == 0` shows the body is dead, off the path, or has no constituency |
+| **asserted in** | `HANDOFF-20260814` §4 (recommends the tool with no caveat); `G15-1` §"one measurement that outlived its purpose" (*"the registry dump is taken at registration time"*); `G16-1` §8 (`plain_socket.rs` "not on the path"); `G17-1` §1.3 and §4 (*"the base's rows read `invocations=0` … so the narrow registration loses nothing measured"*), restated in `G28-1`; `G18-1` §1 and its `MethodHandle.asType` paragraph (*"so that native is not the live body either"*); `G24-1` §7.3 (*"`invocations=0` confirms it"*) |
+| **falsified by** | `G33-1`, and `G31-1` for the `asType` instance specifically |
+| **evidence class** | MEASURED, causally isolated on the `783685c34` binary, plus source reading of `record_invocation` |
+| **what is true now** | `invocations > 0` proves the body **ran** — unchanged. `invocations == 0` proves **nothing**: the counter is an exact count of *registry-resolved* dispatches and a lower bound on Java-level calls, because `CachedInvokeTarget::Intrinsic` and the JIT's thin direct-call helpers dispatch without ever holding a `NativeMethodId`. `Math.abs` reads **1** for 100,000 calls under `--nojit`, and **100,000** with `CRATONVM_DISABLE_INTRINSICS=1`. The magnitude was never usable. `owns_slot`, `kind`, `registered_by`, `overwrote`, `kind_stated`, `kind_chosen` and the `counts` block are untouched |
+| **the exact configuration** | `--nojit` **and** `CRATONVM_DISABLE_INTRINSICS=1`. Every native probed counted 1:1 there |
+| **what a reader must do** | any conclusion of the form "this body is dead because the dump says zero" must be re-derived from `owns_slot` plus a behavioural probe. `G31-1` is the worked example of that re-derivation returning the opposite answer |
+
+### B.2 `force_native_over_real_jdk_bytecode` is not the gate
+
+| | |
+|---|---|
+| **the claim** | a class must be on the force list for its natives to preempt real JDK bytecode; a class absent from the list answers only where the resolved method has no `Code` |
+| **asserted in** | `F5-1` §"`resolve_dispatch` step 3" (`CharBuffer` "is in neither … so in real-JDK mode these natives answer for exactly the receivers whose resolved method has **no `Code`**"); `F14-1` §, in the same form; and the doc banner on the Rust function itself, which `G34-1` §5.2 corrects in place |
+| **falsified by** | `G34-1` (`9ae371468`) |
+| **evidence class** | MEASURED on a real binary against a real oracle, in both directions, cold and warm, with a second, differently-registered binary as a control |
+| **what is true now** | under `--jdk-only`, registering a `Bridge` for a triple is **by itself sufficient** to preempt real JDK bytecode. The decision is taken at the first dispatch site that answers, and for nearly every call that site is `try_stackless_invoke` step 1 → `resolve_step1_native`, which runs *before* method resolution and so passes `bytecode_available: false` unless `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed. The force list is a **second, later, cache-shape-only** override, consulted by the vtable inline cache and the JIT — the sites that resolved a bytecode `Method` without asking the registry. Two rows of `G34-1`'s decision table fire in the same run for the same triple from different sites: the answer is **site**-dependent, not triple-dependent |
+| **what this lane could not settle** | whether `F5-1`'s and `F14-1`'s *specific* conclusions survive. Their general reachability argument is void; re-deriving each family's answer needs a dump and a probe, which is a Rust-owning lane's work. Their banners say that and no more |
+| **still correct** | `C13-2` §, `W4-4` §, and `P2-COLLECTIONS-SHADOWS` §2.3 already described the force list as *reinstating* a default on the warm/cached/reflective/JIT paths rather than as the mode's policy. Those readings are confirmed, not falsified |
+
+### B.3 The JDK's sources are readable on this machine
+
+| | |
+|---|---|
+| **the claim** | JDK 25 sources cannot be read locally; work from the oracle's behaviour |
+| **asserted in** | `G1-1` §provenance, `G4-1` §, `G7-1` §, `G8-1` §provenance, `G9-1` §, `G11-1` §provenance — each in the form "`C:\craton\jdk25src` is absent … so no JDK source was read". `HANDOFF-20260814`'s preamble asserts the *opposite* error: "JDK 25 source is checked out at `C:\craton\jdk25src`" |
+| **falsified by** | `BASELINE-20260817` §"CORRECTION: the JDK's sources ARE readable"; first used in practice by `G22-1`, then `G14-1`, `G23-1`, `G28-1`, `G31-1`, `G34-1` |
+| **evidence class** | FILESYSTEM, re-verified by this lane: `C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot\lib\src.zip`, **52,462,198 bytes**, dated 2026-04-27. `C:\craton\jdk25src` does not exist — that half of the claim was always right |
+| **what is true now** | `unzip -p "$JAVA_HOME/lib/src.zip" java.base/java/net/URI.java`. It is the source of the exact build being used as the oracle. It does not replace the oracle — a source reading can be wrong about what the shipped build does — but it is the difference between transcribing a contract and guessing at one. Two results this session were not derivable from black-box probing in reasonable time and were two minutes of reading: `URI.parseAuthority`'s demotion rule, and `ZoneInfoFile`'s `dstSavings` arithmetic |
+
+### B.4 `moving_young: cycles=0` did not mean a broken young path
+
+| | |
+|---|---|
+| **the claim** | the generational moving-young collection was requested and never ran, making every collection a whole-heap non-moving pass — the session's headline performance finding |
+| **asserted in** | `G20-1` §0 and §4 |
+| **falsified by** | `G27-1`, landed as `3765fad76` |
+| **evidence class** | MEASURED — 96 interleaved runs, order rotated per round, every checksum `68332206` — plus source: `vm/src/config.rs:769` has defaulted to `GcAlgorithm::Zgc` since 2026-08-10, and `grep -c moving_young gc/src/zgc.rs` returns **0** |
+| **what is true now** | `gen_heap.rs` is not the collector in a default run, so its gating predicate at `:5719` is never reached. All three diagnostics the finding rested on mislead in the same direction: `moving_young_requested=true` is a **JIT-codegen capability flag**, not a request for a collection; `"no collection has run yet"` fires because ZGC never calls `record_collector_decision`; the whole `[GC] cards:` block is generational-only and structurally zero. The real result is that **ZGC is 4.37x–6.35x slower than the generational backend** at every heap size, with the ranges not touching. The predicate itself works: 8/8 cycles MOVING when the generational backend is selected |
+| **also wrong in that record** | its binary is `C:/craton/target-fcheck/release/cratonvm.exe`, which `G34-1` §provenance now says to ignore outright ("that build partly failed; its timestamp misrepresents its contents"). `G20-1` itself flagged the attribution as only "partly" sound |
+
+### B.5 The `gc::guard` W7-84 warning is not a reference-slot census
+
+| | |
+|---|---|
+| **the claim** | the ~16 `gc::guard` W7-84 warnings per VM start are a census of native reference-slot violations, and an `Int` written into a reference slot is "silently dropped by the field-layout guard" |
+| **asserted in** | the orchestrator's own lane briefs and its `RSslLiveSession` write-up, quoted verbatim in `G25-1` §1 |
+| **falsified by** | `G25-1`, re-measured and widened by `G30-1` §2.2 |
+| **evidence class** | MEASURED with `CRATONVM_DBG_LAYOUT=1` over a full `--jdk-only` run, then re-measured across six vectors, plus a line-numbered source trace |
+| **what is true now** | the int is **not dropped, it is actively written as null** — `NativeContextImpl::set_field` → `VmHeap::set_field_as(.., b'L')` → `coerce_field_value_by_descriptor` (`gc/src/heap.rs:1674`), which maps `Value::Int` / `Value::Long` to `Value::Object(None)`. That coercion is deliberate and documented (tag `S111r29`) and it is **bidirectional**. It is silent unless `CRATONVM_DBG_OVERLAY` is set. W7-84 is a different path entirely: **every** warning in every run is `class_id=ClassId(12) index=0` — one class, one slot, the VM's own class-mirror populator writing over `java.lang.Class.cachedConstructor`. Native reference-slot writes produce **no warning at all**. A W7-84 count is a census of one line of `vm_object.rs` |
+| **the real number** | 271 sites, by source scan — a **lower bound** (single-line allocations only). `phases_early.rs` 68, `servlet.rs` 22, `http2.rs` 19, `net_channels.rs` 19, `tls.rs` 18; by class, `ArrayList.elementData` 56, `SocketChannel` 22, `HashMap.table` 19. The systemic fix is a layout-aware field writer, not 271 individual edits |
+
+### B.6 `--only=<family>`, `--list` and `--jdk-only-report` exist and are under-used
+
+| | |
+|---|---|
+| **the claim** | not a false claim so much as an absent one: every lane so far has worked from "the first failing assertion", because an `AssertionError` aborts the run |
+| **reframes** | every record that describes a vector as one assertion from green — most sharply `HANDOFF-20260814` §6.1, which says of `RJdkBridge1` and `RJdkIntrinsics3` that "each cycle is roughly one build. Nothing clever is needed" |
+| **established by** | lane G21, recorded in `BASELINE-20260817` §"Process" |
+| **evidence class** | MEASURED, on a binary that already existed, before a line was written |
+| **what is true now** | the vectors take a family selector: `cratonvm.exe --java-home "$JAVA_HOME" --jdk-only -cp regression-suite/build RJdkIntrinsics3 --only=logrec`. Used on `RJdkIntrinsics3` it showed the vector is **not** one assertion from green: it reaches **800 of 1011** and stops at `tlocal`, with `fmtobj`, `inet`, `misc` and `bufslice` red for four unrelated reasons and `regex` (42) and `mathexact` (57) green. `--list` enumerates the families; `--jdk-only-report` is a complete census that `JDK-ONLY-REPORT-CENSUS-20260812` recorded as unused two waves ago and which is still unused. Any lane blocked at "assertion X, and I cannot see past it" should reach for these first |
+
+### B.7 `SUITE` defaults to `core`, and `SUITE=all` is still not `--jdk-only`
+
+| | |
+|---|---|
+| **the claim** | a green suite run says something about the `RJdk*` corpus, or about the `--jdk-only` policy |
+| **asserted in** | implicitly by every record quoting a bare suite pass count; `HANDOFF-20260814` §3's one-vector recipe does not mention the arms at all |
+| **falsified by** | `BASELINE-20260817` §"Three things this measurement corrects", items 2 and 3 |
+| **evidence class** | MEASURED, three separate runs, plus `run.sh:330` and `:585` read directly |
+| **what is true now** | **three distinct runs, and they disagree.** `bash run.sh` runs `core` only — 61 vectors — and the 38-vector `RJdk*` corpus this whole effort is named after does **not** run. `SUITE=all` runs all 99 but in **Compatible** mode, because `run.sh:330` sets `JDK_ONLY=1` only when `CRATONVM_ARGS` names the flag. The policy arm is a third run: `CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh`. At the merge the three read 53/61, 84/99 and **88/99** — the policy arm was the *best* of the three, which inverts the framing used everywhere else in this directory that `--jdk-only` is the harder mode |
+
+---
+
+## C. Statuses this session settled — MEASURED, not predicted
+
+The suite under `--jdk-only` went **88 → 93 → 95 of 99** across three attributable
+binaries. This is the first sustained sequence in this directory where predictions
+made by lanes that could not build were checked against a binary that could.
+
+| | `d2e127930` | `783685c34` | `9964ca733` |
+|---|---|---|---|
+| passing of 99 | 88 | 93 | **95** |
+| failing | 11 | 6 | **4** |
+
+**Vectors closed and MEASURED this session**, with the record each closes out. A
+green vector proves the vector's own assertions pass; it does **not**
+retroactively promote every claim in the named record from PREDICTED to
+MEASURED, and these rows must not be read that way.
+
+| vector | closed at | the record it closes out | note |
+|---|---|---|---|
+| `RArrayStoreInterfaces` | `d2e127930` | `G12-1` | the `$Proxy` substring blanket in `typecheck.rs`, scoped |
+| `RJdkProxy` | `783685c34` | `G24-1` | the return coercion, one level in from where the nomination pointed |
+| `RJdkMapViews` | `783685c34` | `G22-1`, `G13-1` | a **field-slot collision**, not the interface doors — in Compatible mode the substitution *succeeded* and reported a three-entry view as empty, so the `AbstractMethodError` was the better outcome |
+| `RCrypto` | `783685c34` | `d378eee51` | went GREEN → RED first, for a correct reason: it had only ever been green because `Files.newDirectoryStream`'s filter was never called |
+| `RJdkForeign` | `783685c34` | `G19-1`, `G6-1` | |
+| `RForeignLayoutJdkInterfaces` | `783685c34` | `G19-1` | |
+| `RSimpleTimeZoneRaw` | `9964ca733` | `G28-1`, `G17-1`, `G23-1` | three pieces, in three commits, by three lanes; the fixture had to be rewritten first because the old one compared `104` against `104` and **could not fail**. The rule layer's author predicted 74 divergences → 0 without ever building, and it held exactly |
+| `RJdkOptionalShape` | `9964ca733` | `G29-1`, `G13-1` | |
+
+**Still red at `9964ca733` (4):** `RJdkIntrinsics3`, `RJdkBridge1`,
+`RSslLiveSession`, `RJdkProxyIface`. None is untouched — each has a fix
+committed after that binary was built (`1eb5f8346`, `c703cff68`, `2944095fe`) or
+in flight. **No binary has yet measured any of those four fixes.**
+
+---
+
+## D. What this lane could NOT settle
+
+Stated rather than guessed, in this index's own convention.
+
+1. **Whether `F5-1`'s and `F14-1`'s `CharBuffer` reachability conclusions
+   survive `G34-1`.** The *argument* they rest on is void. The *answer* needs a
+   registry dump and a behavioural probe on the current binary, from a lane that
+   may edit Rust. Their banners say the argument is void and stop there.
+2. **How many of this directory's "dead body" conclusions rest on a zero.** The
+   seven sites in §B.1 are what a targeted grep found; the phrasing varies too
+   much for a grep to be a census. Treat §B.1's list as a floor — exactly like
+   the instrument it is about.
+3. **Which of `G20-1`'s remaining numbers are affected by its binary.** Its
+   provenance names `target-fcheck`, which `G34-1` says to ignore. `G27-1`
+   re-measured the GC claims on a good binary; the startup, throughput and
+   native-boundary numbers were not re-taken. They are not marked wrong here —
+   they are marked **unre-measured**, which is not the same thing.
+4. **The five records being written as this pass ran** (`G35-1`, `G36-1`,
+   `G37-1`, `G38-1`, `G39-1`). They did not exist when the listing was taken and
+   have no row. That is not an oversight; it is the rot this block's header
+   warns about, observed in the act.
+5. **`README.md`'s per-record tables.** Its headline count is corrected; the ~86
+   per-record rows below it were not audited row by row and may name records
+   that have since moved.
+6. **Whether any pre-wave-G record's status prose is now stale for a reason this
+   session did not touch.** This pass reconciled the seven claims it was given
+   plus what the suite measured. It did not re-read 244 older records, and does
+   not claim their statuses are current.

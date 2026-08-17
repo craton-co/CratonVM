@@ -1,5 +1,21 @@
 # G11-1 — the shutdown-hook contract measured end to end, and the process cluster re-read
 
+> **RECONCILED 2026-08-17 (lane G40) — two notes.**
+>
+> * **The provenance premise "no JDK source was read" was avoidable.**
+>   `C:\craton\jdk25src` is indeed absent, and this record is right about that.
+>   But the JDK's sources ship with the oracle itself, at
+>   `$JAVA_HOME/lib/src.zip` (52,462,198 bytes) — the sources of the exact
+>   HotSpot 25.0.3+9-LTS build used here, `java.lang.ApplicationShutdownHooks`
+>   included. See `INDEX.md` §B.3.
+> * **Its verification recipe needs one caveat.** The record asks for
+>   `owns_slot=true`, `kind=bridge` and a **non-zero `invocations`** as proof.
+>   That direction is sound and unchanged. The converse is not: `G33-1`
+>   established that `invocations` is a **floor**, so a zero is not evidence of
+>   absence. If the check comes back zero, re-run it under `--nojit` **and**
+>   `CRATONVM_DISABLE_INTRINSICS=1`, where the counter is exact. See `INDEX.md`
+>   §B.1.
+
 **Status:** code landed in three files; **NOTHING HERE WAS RUN ON A CRATONVM
 BINARY.** **Provenance:** every HotSpot cell is `MEASURED` on Temurin
 25.0.3+9-LTS or `SOURCE-VERIFIED` by `javap` against the same image; every

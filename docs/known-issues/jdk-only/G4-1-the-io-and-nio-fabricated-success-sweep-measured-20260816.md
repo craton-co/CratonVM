@@ -1,5 +1,15 @@
 # G4-1 — the `java.io` / `java.nio.file` fabricated-success sweep, with the oracle arm MEASURED
 
+> **RECONCILED 2026-08-17 (lane G40) — the provenance premise "no JDK source was
+> read" was avoidable.** `C:\craton\jdk25src` is indeed absent, and this record
+> is right about that. But the JDK's sources ship with the oracle itself, at
+> `$JAVA_HOME/lib/src.zip` (52,462,198 bytes) — the sources of the exact
+> HotSpot 25.0.3+9-LTS build used here. Nothing measured in this record is
+> invalidated. Related: the `Files.newDirectoryStream` filter defect this sweep's
+> family produced was fixed in `d378eee51`, which turned `RCrypto` red for a
+> correct reason — it had only ever been green because that filter was never
+> called. `RCrypto` is green again at `783685c34`. See `INDEX.md` §B.3.
+
 Status: **oracle arm MEASURED on HotSpot 25.0.3+9-LTS. CratonVM arm entirely
 PREDICTED.** No `cargo` command of any kind was run for this record, no binary
 carries these edits, and no CratonVM output appears anywhere below. Every

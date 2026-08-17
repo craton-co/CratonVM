@@ -1,5 +1,29 @@
 # F14-1 — the mutable alias `hasArray()` handed out, and the supertype that makes half the family's assertions ornamental
 
+> **RECONCILED 2026-08-17 (lane G40) — the mode/reachability argument in §"what
+> the fixtures actually measure" is VOID. The mutable-alias defect and the
+> supertype finding are untouched.**
+>
+> This record argues that because `CharBuffer`/`ByteBuffer` carry `Code` and
+> neither class is in `force_native_over_real_jdk_bytecode` nor the
+> `check_override` name chain, the fixtures measure field resolution in real-JDK
+> mode and this lane's natives only under `--features synthetic-jdk`. **The force
+> list is not the gate.** `G34-1` measured it on a real binary in both
+> directions, cold and warm: under `--jdk-only`, registering a `Bridge` is **by
+> itself sufficient** to preempt real JDK bytecode, because
+> `try_stackless_invoke` step 1 answers *before* method resolution and passes
+> `bytecode_available: false` unless `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed.
+> The force list is a later, cache-shape-only override consulted by the vtable
+> inline cache and the JIT. Which body runs is **site**-dependent, not
+> triple-dependent.
+>
+> **What this banner does NOT claim.** It does not say the conclusion is wrong —
+> only that the argument is void. Re-deriving it needs a registry dump and a
+> probe on the current binary, from a lane that may edit Rust. That was not done.
+> Note also that this record's §N1 was already falsified by measurement once
+> (INDEX, third pass: `native_tb_array` never ran), which is the same failure
+> mode: a reachability claim settled by reading. See `INDEX.md` §B.2 and §D.1.
+
 **2026-08-13, lane F14.** Lands F5-1's NOMINATIONS 1, 3 and 4 — the
 `native-io/src/lib.rs` copy of the accessible-backing-array contract, the
 `servlet.rs` detail message, and the missing fixture cell — plus one defect

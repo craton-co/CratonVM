@@ -1,5 +1,16 @@
 # G8-1 — the collections view families, and the null-function axis
 
+> **RECONCILED 2026-08-17 (lane G40) — the provenance premise "no JDK source was
+> read" was avoidable.** `C:\craton\jdk25src` is indeed absent, and this record
+> is right about that. But the JDK's sources ship with the oracle itself, at
+> `$JAVA_HOME/lib/src.zip` (52,462,198 bytes) — the sources of the exact
+> HotSpot 25.0.3+9-LTS build used here, so the view classes' declared fields are
+> readable rather than inferable from `javap -p`. Nothing measured in this record
+> is invalidated. Since it was written, `G22-1`/`G13-1` proved the
+> `LinkedHashMap$LinkedValues` failure to be a **field-slot collision** rather
+> than an interface-door problem, and `RJdkMapViews` went green, MEASURED, at
+> `783685c34`. See `INDEX.md` §B.3.
+
 **Status:** ORACLE MEASURED / **CRATONVM PREDICTED**.
 
 **Provenance, stated first because it is the thing most easily lost.** Every

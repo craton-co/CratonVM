@@ -1,5 +1,26 @@
 # G18-1 — the proxy invocation contract, and the two vectors that ride on it
 
+> **RECONCILED 2026-08-17 (lane G40) — one "dead body" conclusion is FALSIFIED,
+> and the reasoning behind the other is no longer sufficient.**
+>
+> * **FALSIFIED.** This record reads *"`java/lang/invoke/MethodHandle.asType` **is**
+>   registered (`lang_invoke.rs:11491`, `owns_slot=true`) with `invocations=0`, so
+>   that native is not the live body either."* **It is the live body.** `G31-1`
+>   re-derived it from `owns_slot` plus a behavioural probe and found a
+>   passthrough with no convertibility check; the fix landed there, in
+>   `2944095fe`.
+> * **No longer sufficient.** §1's conclusion that `Proxy$Dispatch.invokeProxy`
+>   is dead rests on `invocations=0`. `G33-1` established that `invocations` is a
+>   **floor**: it counts only registry-resolved dispatches, and the intrinsic
+>   cache and the JIT's direct-call helpers do not go through the registry.
+>   `invocations > 0` still proves a body ran; `invocations == 0` proves nothing.
+>   That §1 conclusion is independently supported here by the interpreter's
+>   `is_proxy_dispatch` interception, and `G24-1` §7.3 reaches the same place —
+>   so it is probably right, but **not on the evidence given**.
+>
+> Everything measured on both VMs in §2 onward is unaffected. `RJdkProxy` has
+> since gone green, MEASURED at `783685c34`. See `INDEX.md` §B.1.
+
 **Status:** PART-FIXED-MEASURED. Everything below is MEASURED on both VMs,
 **before and after**, and each row says which. **Provenance:** MEAS on both VMs.
 HotSpot 25.0.3+9-LTS (`$JAVA_HOME`) is the oracle throughout; CratonVM is

@@ -1,5 +1,24 @@
 # G17-1 — the DST family answered "no zone has ever observed daylight saving", and the fixture that would have said so compared two empty strings
 
+> **RECONCILED 2026-08-17 (lane G40) — one inference weakened; the record's
+> headline is CONFIRMED and its vector is now GREEN.**
+>
+> * **Confirmed and closed.** `RSimpleTimeZoneRaw` passes, **MEASURED** on the
+>   `9964ca733` binary under `--jdk-only`. Three pieces had to land first, in
+>   three commits by three lanes: this record's fixture rewrite (the old fixture
+>   compared two empty strings and could not fail — it went from 0 surviving
+>   `extract()` lines to 469), the `rawOffset` field seeding, and the DST rule
+>   layer of `G28-1` (`93cd4e8da`). The rule layer's author predicted 74
+>   divergences → 0 without ever being able to build, and it held exactly.
+> * **Weakened.** §1.3 and §4 argue that registering narrowly on `ZoneInfo`
+>   "loses nothing measured" because *"the base's rows read `invocations=0`"*.
+>   `G33-1` established that `invocations` is a **floor** — it counts only
+>   registry-resolved dispatches, so `invocations == 0` proves nothing. The
+>   narrow registration is not shown to be wrong by this; the *argument* for it
+>   no longer stands on its own, and §4's own hypothetical (an application's
+>   `extends TimeZone` subclass) is exactly the case a zero cannot rule out. See
+>   `INDEX.md` §B.1.
+
 **Status:** BEFORE **MEASURED** on both VMs; the RULE the fix implements
 **MEASURED** against the oracle on 9,480 rows / 632 zone ids, 0 mismatches; the
 Rust "after" is **UNMEASURED — needs a build** (see §8). The corrected fixture
