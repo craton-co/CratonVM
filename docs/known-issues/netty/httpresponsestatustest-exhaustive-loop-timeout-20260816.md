@@ -103,7 +103,31 @@ excluded:
   method's own call sites bound as **direct** machine-code calls in *both* arms,
   with `requires_dispatch=false declares_handlers=false indy_trap=false`;
 * the callee's emitted optimizing-tier body is the same 703 bytes in both arms,
-  differing only in three baked rel32 addresses and two single bytes.
+  differing only in three baked rel32 addresses and two single bytes;
+* **the hot method's own OSR body is byte-identical between the arms apart from
+  baked addresses** — 3987 bytes in both, 84 differing bytes, every one of them
+  inside a 4-6 byte address group or an adjacent displacement
+  (`CRATONVM_DBG_JIT_CODE` covers OSR artifacts as of 2026-08-17, tagged
+  `backend=osr`; before that the one body that runs a `@Test` method's hot loop
+  was the one body no diff could see);
+* **and it binds to the SAME callee artifact in both arms.** `CRATONVM_DBG_OSR_BIND`
+  now prints the bound entry, and it equals the address `CRATONVM_DBG_JIT_CODE`
+  reports for the callee's `backend=ir` body in both arms — cold
+  `entry=0x12143130000` against `[JIT_CODE] backend=ir ... entry=0x12143130000`,
+  prewarm `entry=0x2d63c0e0000` against `entry=0x2d63c0e0000`. So the appealing
+  hypothesis — that the cold arm's eager mid-compile `try_jit_compile_callee`
+  hands back a single-pass body and the caller is stuck on C1 forever — is
+  **false**: both arms bind the 703-byte optimizing-tier artifact.
+
+What is left, and where the next session should start: the difference is not the
+caller's instructions, not the callee's instructions, and not which callee
+artifact the caller calls. It is therefore either deeper in the chain
+(`AssertEquals.assertEquals` -> `AssertionUtils.objectsAreEqual` -> `Enum.equals`,
+whose own binds have not been compared) or in per-site runtime state the code
+consults rather than encodes — the MIC/PIC inline-cache slots, which are
+allocated per compile and populated by the helper. The one non-address
+difference found so far is two single bytes in the callee's body, `0x27` against
+`0x25`, at 0x03e and 0x1c6 — an immediate or a register field, not an address.
 
 ## Even with that 4.6x recovered, the class does not fit
 

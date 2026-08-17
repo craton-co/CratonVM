@@ -383,6 +383,59 @@ impl ValueStack {
         (compact_vec_to_u64(slots), kinds)
     }
 
+    /// `CRATONVM_DBG_VACATED_FRAMES`: catch a stale reference as it is PUSHED.
+    ///
+    /// `Frame::set_local`'s twin, and the one that matters for the residual the
+    /// H2 MVStore-writer page is chasing: a value returned by a method or a
+    /// native goes onto the operand stack and is consumed by the very next
+    /// `checkcast`, so it never reaches a local and `set_local` reports nothing.
+    /// The Rust backtrace is the point — it names the producer while it is
+    /// still on the stack.
+    #[cold]
+    fn report_vacated_push(value: &Value, moved_to: usize) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 12 {
+            return;
+        }
+        let addr = match value {
+            Value::Object(Some(o)) => o.as_ptr() as usize,
+            _ => 0,
+        };
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            moved_to = format!("{moved_to:#x}"),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "a STALE reference is being pushed onto the operand stack — the collector moved              this object and nothing has been allocated at the old address since. The              backtrace names the VM code that produced it."
+        );
+    }
+
+    #[inline(always)]
+    fn check_vacated_compact(cv: &CompactValue) {
+        if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+            return;
+        }
+        if cv.is_object() {
+            if let Some(ptr) = cv.as_object_ptr() {
+                if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(ptr as usize) {
+                    Self::report_vacated_push(&Value::Object(None), moved_to);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn check_vacated_push(value: &Value) {
+        if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+            return;
+        }
+        if let Value::Object(Some(o)) = value {
+            if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(o.as_ptr() as usize) {
+                Self::report_vacated_push(value, moved_to);
+            }
+        }
+    }
+
     pub fn push(&mut self, value: Value) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
             // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
@@ -396,6 +449,7 @@ impl ValueStack {
             // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
             return Err(RuntimeError::StackOverflowError);
         }
+        Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
@@ -427,6 +481,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_unchecked(&mut self, value: Value) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_unchecked");
+        Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
@@ -442,6 +497,7 @@ impl ValueStack {
                 message: "operand stack overflow".to_string(),
             });
         }
+        Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
@@ -466,6 +522,11 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_compact(&mut self, cv: CompactValue) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_compact");
+        // Same check as the `Value` pushes, decoded from the compact form. This
+        // is the path `dup`, a local reload and the cached field/return
+        // producers take, so leaving it out would blind the instrument to
+        // exactly the values that reach a `checkcast` without touching a local.
+        Self::check_vacated_compact(&cv);
         // Raw compact push: the bits alone cannot distinguish a collision-long
         // from a tagged value, so mark UNKNOWN (safe fallback). Genuine long/
         // double producers call push_long/push_double instead.
