@@ -1511,6 +1511,25 @@ public class RJdkIntrinsics3 {
             t = x;
         }
         ckX("bigdec:BigDecimal.valueOf(NaN)", t, "java.lang.NumberFormatException");
+        // Both infinities, because valueOf's guard is one `isFinite` test and a
+        // fix that checks only NaN passes the row above while leaving these two
+        // answering a NUMBER. Measured: all three returned 0.
+        t = null;
+        try {
+            sinkO = BigDecimal.valueOf(dInf);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("bigdec:BigDecimal.valueOf(+Inf)", t, "java.lang.NumberFormatException");
+        ckS("bigdec:BigDecimal.valueOf(+Inf) message", t == null ? null : t.getMessage(),
+                "Infinite or NaN");
+        t = null;
+        try {
+            sinkO = BigDecimal.valueOf(dNegInf);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("bigdec:BigDecimal.valueOf(-Inf)", t, "java.lang.NumberFormatException");
 
         // -- toString vs toPlainString ----------------------------------------
         BigDecimal sci = new BigDecimal("1E+10");
@@ -1585,7 +1604,7 @@ public class RJdkIntrinsics3 {
         ckS("bigdec:-2.9 toBigInteger", new BigDecimal("-2.9").toBigInteger().toString(), "-2");
         ckS("bigdec:1E+10 toBigInteger", sci.toBigInteger().toString(), "10000000000");
 
-        sectionEnd("bigdec", 56);
+        sectionEnd("bigdec", 59);
     }
 
     // ========================================================================
