@@ -1,20 +1,21 @@
 # `org.h2.test.scripts.TestScript` — the SQL-level divergences, censused against a HotSpot oracle
 
 ## Status
-**OPEN as a group, partially fixed (2026-08-16).** 16 errors were reported on
-`dev` @ `0d8c5f077`; **15** of them still reproduce on `dev` @ `496bc3c2c`
+**OPEN as a group, mostly fixed (updated 2026-08-17).** 16 errors were reported
+on `dev` @ `0d8c5f077`; **15** of them still reproduce on `dev` @ `496bc3c2c`
 (`functions/numeric/cosh.sql:7` was fixed in between, see below). Of those 15,
-**5 are fixed on this branch** (`fix/h2-testscript-sql-divergences-20260816`,
-worktree `/data/cvm-h2sql-20260816`, Azure host `azureuser@20.80.105.49`) by two
-one-root-cause-each JDK-semantics fixes; **10 remain open** under three distinct
-root causes, each with its own record:
+**6 are now fixed** (worktree `/data/cvm-h2sql-20260816`, Azure host
+`azureuser@20.80.105.49`) under three root causes; **9 remain open** under two:
 
-* [`testscript-concurrenthashmap-iteration-order-20260816.md`](testscript-concurrenthashmap-iteration-order-20260816.md) — 4 errors
-* [`testscript-collation-turkish-and-locale-display-names-20260816.md`](testscript-collation-turkish-and-locale-display-names-20260816.md) — 5 errors
-* [`testscript-foreign-key-existing-data-check-not-run-20260816.md`](testscript-foreign-key-existing-data-check-not-run-20260816.md) — 1 error
+* [`testscript-concurrenthashmap-iteration-order-20260816.md`](testscript-concurrenthashmap-iteration-order-20260816.md) — 4 errors, **open**
+* [`testscript-collation-turkish-and-locale-display-names-20260816.md`](testscript-collation-turkish-and-locale-display-names-20260816.md) — 5 errors, **open**
+* [`testscript-foreign-key-existing-data-check-not-run-20260816.md`](testscript-foreign-key-existing-data-check-not-run-20260816.md) — 1 error, **fixed 2026-08-17**
 
-The two fixes are written up in
-[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md).
+The fixes are written up in
+[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md)
+(`BigDecimal.valueOf(double)`, `String.codePoints()` — 5 errors) and
+[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md)
+(the H2 `checkExistingData` native's empty-table shortcut — 1 error).
 
 None of this was previously recorded anywhere under `docs/known-issues/`.
 `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-parsedatetime-german-locale-month-name-FIXED-20260816.md`
@@ -52,7 +53,7 @@ are counted as errors by the runner even though they duplicate a `line:` row.
 | 9 | `datatypes/varchar-ignorecase.sql:153` | `INSERT INTO TEST VALUES 'I', 'i'` → `DUPLICATE_KEY_1` instead of `update count: 2` | cascade of #7 (collation never took) | open |
 | 10 | *(script-level)* | that statement's `Unique index or primary key violation` stack trace | cascade of #7 | open |
 | 11 | `datatypes/varchar-ignorecase.sql:156` | `INSERT ... CHAR(0x0130)` → `update count: 1` instead of `DUPLICATE_KEY_1` | cascade of #7 | open |
-| 12 | `ddl/alterTableAdd.sql:166` | `ALTER TABLE B ADD FOREIGN KEY(C) REFERENCES A(C)` (`INTEGER ARRAY` → `TIME ARRAY`) is accepted instead of raising `TYPES_ARE_NOT_COMPARABLE_2` | referential `checkExistingData` never raises | open |
+| 12 | `ddl/alterTableAdd.sql:166` | `ALTER TABLE B ADD FOREIGN KEY(C) REFERENCES A(C)` (`INTEGER ARRAY` → `TIME ARRAY`) is accepted instead of raising `TYPES_ARE_NOT_COMPARABLE_2` | CratonVM's `checkExistingData` native skipped the type check with its empty-table shortcut | **fixed** |
 | 13 | `functions/aggregate/percentile.sql:451` | `MEDIAN` over `DOUBLE` gives `1.5` where `1.50` is expected | `BigDecimal.valueOf(double)` | **fixed** |
 | 14 | `functions/aggregate/percentile.sql:457` | same | `BigDecimal.valueOf(double)` | **fixed** |
 | 15 | `functions/string/btrim.sql:22` | `BTRIM` with a 3-code-point astral trim set removes nothing | `String.codePoints()` | **fixed** |
@@ -97,10 +98,20 @@ The oracle is the same command with `/data/toolchain/jdk-25/bin/java -Xmx1g -cp
 
 ## Next steps
 
-Per-cluster next steps live in the three linked records. As a group: nothing
-here is a throughput or GC issue, and nothing here is flaky — all 15 reproduce
-on every run, and the two fixed ones were fixed by making a JDK method mean what
-the JDK spec says it means. That is the shape to expect from the rest: the
-`ConcurrentHashMap` cluster is the only one that is arguably not a spec
-violation at all (iteration order is unspecified), and it is the one that will
-cost the most to close.
+Per-cluster next steps live in the linked records. As a group: nothing here is a
+throughput or GC issue, and nothing here is flaky — all 15 reproduce on every
+run.
+
+Two of the three root causes fixed so far were a JDK method not meaning what the
+JDK spec says it means. The third was different and worth remembering: an H2
+method that CratonVM **natively overrides**, whose Rust reimplementation had
+dropped a check the Java original performed as a side effect. Instrumenting the
+Java source could not see it — see that record's "Why the Java source was a dead
+end". When a divergence lands in a framework CratonVM has natives for (H2,
+Hibernate, Netty, ...), check `vm/src/runtime/interpreter/native_override.rs` and
+`native-builtins/src/apps_*.rs` before assuming the application's own code is
+what runs.
+
+Of the two that remain, the `ConcurrentHashMap` cluster is the only one that is
+arguably not a spec violation at all (iteration order is unspecified), and it is
+the one that will cost the most to close.
