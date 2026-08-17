@@ -3297,45 +3297,297 @@ pub(crate) fn uri_split(
 }
 
 /// Split a URI authority (`[userinfo "@"] host [":" port]`, RFC 3986 §3.2) into
-/// `(userInfo, host, port)`. `port` is -1 when absent or unparsable. Host of an
-/// IPv6 literal keeps its brackets (`[::1]`), matching `java.net.URI.getHost()`.
+/// `(userInfo, host, port)`. Host of an IPv6 literal keeps its brackets
+/// (`[::1]`), matching `java.net.URI.getHost()`.
+///
+/// **The three components stand or fall TOGETHER.** `java.net.URI` parses an
+/// authority twice: first as *server-based* (`parseServer`), and — when that
+/// fails and `requireServerAuthority` is false, which is the case for every
+/// `new URI(String)` — it **undoes the whole attempt** and keeps the authority
+/// as *registry-based*:
+///
+/// ```text
+/// } catch (URISyntaxException x) {
+///     // Undo results of failed parse
+///     userInfo = null;
+///     host = null;
+///     port = -1;
+/// ```
+/// (`java.base/java/net/URI.java`, `Parser.parseAuthority`, JDK 25.0.3+9.)
+///
+/// So `new URI("http://h:-5/p")` is a perfectly legal URI whose
+/// `getAuthority()` is `h:-5` and whose `getHost()`, `getUserInfo()` and
+/// `getPort()` are `null`, `null` and `-1`. This function used to end in
+/// `p.parse::<i32>().ok()`, which took Rust's leading `+`/`-` and answered
+/// `-5`/`80` where HotSpot answers `-1`, and kept a non-null host besides —
+/// `RJdkBridge1`'s check 197. Clamping only the port would have satisfied
+/// `RJdkBridge1.java:1181` and failed `:1183`; the demotion is the contract.
+///
+/// Returning `(None, None, -1)` here is also what the callers already expect:
+/// [`uri_equals`], [`uri_hash_code`] and `uri_compare` all branch on
+/// `host.is_some()` to pick the JDK's server-vs-registry comparison, so a
+/// demoted authority routes them onto the raw-string branch by itself.
 pub(crate) fn uri_parse_authority(authority: &str) -> (Option<String>, Option<String>, i32) {
-    // userinfo ends at the last '@' (host cannot contain '@').
-    let (userinfo, hostport) = match authority.rfind('@') {
-        Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
-        None => (None, authority),
-    };
-    let (host, port_str) = if hostport.starts_with('[') {
-        // IPv6 literal: host is "[...]", optional ":port" after the ']'.
-        match hostport.find(']') {
-            Some(j) => {
-                let h = hostport[..=j].to_string();
-                let p = hostport[j + 1..].strip_prefix(':').map(|x| x.to_string());
-                (h, p)
+    uri_parse_server_authority(authority).unwrap_or((None, None, -1))
+}
+
+/// Transcription of `java.net.URI$Parser.parseServer` (JDK 25.0.3+9) as a pure
+/// function over the authority text. `None` is the JDK's "server-based parse
+/// failed", which `parseAuthority` turns into a registry-based authority.
+///
+/// The JDK's `checkChars(p, q, L_USERINFO, …, "user info")` is deliberately NOT
+/// transcribed, and that is not a gap: `L_REG_NAME` and `L_USERINFO` differ by
+/// exactly one character, `@`, and an `@` inside the user-info span can only
+/// arise when a *later* `@` was chosen as the delimiter — which never happens,
+/// because the JDK takes the FIRST `@` (`scan(p, n, "/?#", "@")` stops at it),
+/// and the text after it then fails `parseHostname` anyway. MEASURED:
+/// `new URI("http://a@b@c/p").getUserInfo()` is `null` on HotSpot. Every other
+/// character that is legal in a user info but not in an authority is already
+/// refused upstream by the whole-authority character check.
+fn uri_parse_server_authority(a: &str) -> Option<(Option<String>, Option<String>, i32)> {
+    let b = a.as_bytes();
+    let n = b.len();
+    let mut p = 0usize;
+
+    // userinfo — `q = scan(p, n, "/?#", "@")`, i.e. the FIRST '@', and never
+    // across a '/', '?' or '#'.
+    let mut user_info: Option<String> = None;
+    {
+        let mut q = p;
+        let mut at = None;
+        while q < n {
+            match b[q] {
+                b'/' | b'?' | b'#' => break,
+                b'@' => {
+                    at = Some(q);
+                    break;
+                }
+                _ => q += 1,
             }
-            None => (hostport.to_string(), None),
+        }
+        if let Some(q) = at {
+            user_info = Some(a[p..q].to_string());
+            p = q + 1; // skip '@'
+        }
+    }
+
+    // hostname, IPv4 address, or IPv6 address
+    let host;
+    if p < n && b[p] == b'[' {
+        // DEVIATION from RFC2396, per RFC2732: an IPv6 literal. The body's own
+        // grammar (`parseIPv6Reference`, scope ids) is policed by the URI
+        // constructor before an object exists, so it is not re-checked here;
+        // what matters for the accessors is where the host ends.
+        let start = p;
+        p += 1;
+        let mut q = p;
+        let mut close = None;
+        while q < n {
+            match b[q] {
+                b'/' | b'?' | b'#' => break,
+                b']' => {
+                    close = Some(q);
+                    break;
+                }
+                _ => q += 1,
+            }
+        }
+        match close {
+            Some(q) if q > p => {
+                host = Some(a[start..=q].to_string());
+                p = q + 1;
+            }
+            // failExpecting("closing bracket for IPv6 address")
+            _ => return None,
         }
     } else {
-        // Reg-name: port (if any) follows the last ':'.
-        match hostport.rfind(':') {
-            Some(j) => (
-                hostport[..j].to_string(),
-                Some(hostport[j + 1..].to_string()),
-            ),
-            None => (hostport.to_string(), None),
-        }
-    };
-    let port = port_str
-        .and_then(|p| {
-            if p.is_empty() {
-                None
-            } else {
-                p.parse::<i32>().ok()
+        match uri_parse_ipv4_address(b, p, n) {
+            Some(q) if q > p => {
+                host = Some(a[p..q].to_string());
+                p = q;
             }
-        })
-        .unwrap_or(-1);
-    let host = if host.is_empty() { None } else { Some(host) };
-    (userinfo, host, port)
+            _ => {
+                let (h, q) = uri_parse_hostname(a, p, n)?;
+                host = Some(h);
+                p = q;
+            }
+        }
+    }
+
+    // port
+    let mut port = -1i32;
+    if p < n && b[p] == b':' {
+        p += 1;
+        // `q = scan(p, n, "/")` — an authority never contains a '/', so the
+        // port runs to the end of the authority. That is why `http://h:80:90/p`
+        // has port text "80:90" and demotes, rather than splitting on the LAST
+        // colon and answering 90.
+        let q = n;
+        if q > p {
+            // checkChars(p, q, L_DIGIT, H_DIGIT, "port number") — DIGITS ONLY.
+            // No sign, no space, no trailing junk.
+            if !b[p..q].iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            // Integer.parseInt(input, p, q, 10); a NumberFormatException here
+            // is `fail("Malformed port number")`, which demotes just the same.
+            // Leading zeros are fine and are not part of the value:
+            // MEASURED `http://h:00000000080/p` → 80, `http://h:007/p` → 7.
+            port = a[p..q].parse::<i32>().ok()?;
+            p = q;
+        }
+    } else if p < n {
+        // `else if (p < n && skipParseException) return p;` — the caller then
+        // sees `q < n` and demotes.
+        return None;
+    }
+
+    if p < n {
+        // failExpecting("port number", p)
+        return None;
+    }
+    Some((user_info, host, port))
+}
+
+/// Transcription of `java.net.URI$Parser.parseHostname` (JDK 25.0.3+9).
+/// Returns `(host, end)` or `None` when the hostname parse fails — which is
+/// the JDK's `fail(...)`, and also its `skipParseException` early return, both
+/// of which end in the same registry-based demotion.
+///
+/// The grammar is `domainlabel = alphanum [ *( alphanum | "-" ) alphanum ]`,
+/// labels joined by `.`, and one extra rule that is NOT in RFC 2396: when
+/// there is more than one label, the LAST one must START with a letter.
+/// MEASURED: `http://a.9b/p` has a null host and `http://a.b9/p` does not,
+/// while the single-label `http://9h/p` and `http://12/p` are both fine
+/// because the check is `l > start`.
+fn uri_parse_hostname(a: &str, start: usize, n: usize) -> Option<(String, usize)> {
+    let b = a.as_bytes();
+    let mut p = start;
+    let mut l: Option<usize> = None; // start of last parsed label
+    loop {
+        let q = {
+            let mut q = p;
+            while q < n && b[q].is_ascii_alphanumeric() {
+                q += 1;
+            }
+            q
+        };
+        if q <= p {
+            break;
+        }
+        l = Some(p);
+        p = q;
+        let q = {
+            let mut q = p;
+            while q < n && (b[q].is_ascii_alphanumeric() || b[q] == b'-') {
+                q += 1;
+            }
+            q
+        };
+        if q > p {
+            if b[q - 1] == b'-' {
+                // fail("Illegal character in hostname", q - 1)
+                return None;
+            }
+            p = q;
+        }
+        if !(p < n && b[p] == b'.') {
+            break;
+        }
+        p += 1;
+        if p >= n {
+            break;
+        }
+    }
+    if p < n && b[p] != b':' {
+        return None;
+    }
+    let l = l?; // if (l < 0) failExpecting("hostname", start)
+    if l > start && !b[l].is_ascii_alphabetic() {
+        return None;
+    }
+    Some((a[start..p].to_string(), p))
+}
+
+/// Transcription of `java.net.URI$Parser.parseIPv4Address` plus the non-strict
+/// arm of `scanIPv4Address` (JDK 25.0.3+9). `Some(end)` when the text at
+/// `start` begins with a legal dotted quad that is followed by nothing or by a
+/// `:`; `None` otherwise, which sends the caller to `parseHostname`.
+fn uri_parse_ipv4_address(b: &[u8], start: usize, n: usize) -> Option<usize> {
+    let p = uri_scan_ipv4_address(b, start, n)?;
+    if p > start && p < n && b[p] != b':' {
+        return None;
+    }
+    Some(p)
+}
+
+fn uri_scan_ipv4_address(b: &[u8], start: usize, n: usize) -> Option<usize> {
+    let mut p = start;
+    // m = scan(p, n, L_DIGIT | L_DOT, …) — the address may only be looked for
+    // inside the leading run of digits and dots.
+    let mut m = p;
+    while m < n && (b[m].is_ascii_digit() || b[m] == b'.') {
+        m += 1;
+    }
+    if m <= p {
+        return None;
+    }
+    // The JDK's unrolled four-byte loop: `scanByte`, `.`, `scanByte`, `.`,
+    // `scanByte`, `.`, `scanByte`, and then the whole digit-and-dot run must be
+    // consumed. Any short break is a failure (the non-strict arm returns -1).
+    for i in 0..4 {
+        if i > 0 {
+            if !(p < m && b[p] == b'.') {
+                return None;
+            }
+            p += 1;
+        }
+        let q = uri_scan_byte(b, p, m);
+        if q <= p {
+            return None;
+        }
+        p = q;
+    }
+    if p < m {
+        return None;
+    }
+    Some(p)
+}
+
+/// `java.net.URI$Parser.scanByte` — a run of decimal digits whose value fits in
+/// a byte. Leading zeros do not count towards the three-digit limit, which is
+/// why `http://01.2.3.4/p` has host `01.2.3.4` on HotSpot (MEASURED) while
+/// `http://256.1.1.1/p` has none.
+fn uri_scan_byte(b: &[u8], start: usize, n: usize) -> usize {
+    let p = start;
+    let mut q = p;
+    while q < n && b[q].is_ascii_digit() {
+        q += 1;
+    }
+    if q <= p {
+        return q;
+    }
+    let mut i = p;
+    while i < q && b[i] == b'0' {
+        i += 1;
+    }
+    let significant = q - i;
+    if significant < 3 {
+        return q; // definitely < 255
+    }
+    if significant > 3 {
+        return p; // definitely > 255
+    }
+    // Exactly three significant digits: at most 999, so no overflow is possible
+    // and the JDK's `Integer.parseInt` cannot throw here.
+    let v: u32 = std::str::from_utf8(&b[i..q])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
+    if v > 255 {
+        return p;
+    }
+    q
 }
 
 /// Match `java.net.URI`'s server-based host acceptance for the cases keycloak's
@@ -3738,9 +3990,31 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // authority. Absent port is -1 (java.net.URI contract), not the int-default 0.
     r.register(uri, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Slot 2 is OUR model's `port`; on a real `java.net.URI` it is
-        // `authority`, a `String`, so this read used to answer a reference
-        // where an `Int` was expected on every real-layout receiver.
+        // The raw string is the authoritative source, exactly as it is for
+        // `getHost` above, and for the same reason: the stored `port` slot is
+        // written by several producers that do not all use `java.net.URI`'s
+        // grammar. `url_parse` serves `java.net.URL` too, whose port production
+        // is `Integer.parseInt` and therefore accepts a leading `+` — MEASURED,
+        // `new URL("http://h:+80/p").getPort()` is 80 on HotSpot while
+        // `new URI("http://h:+80/p").getPort()` is -1. While this read came
+        // first, guarded only by `if p > 0`, a URL-shaped 80 in the slot
+        // masked the URI answer; and for an authority-less `urn:isbn:0451450523`
+        // the same slot held 451450523. Deriving from the raw string keeps
+        // `getPort` and `getHost` on ONE model, so they cannot disagree about
+        // whether the authority demoted.
+        let raw = uri_raw_string(ctx, this);
+        if !raw.is_empty() {
+            if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+                let (_, _, port) = uri_parse_authority(&auth);
+                return Ok(Some(Value::Int(port)));
+            }
+            // A raw string with no `//authority` has no port at all.
+            return Ok(Some(Value::Int(-1)));
+        }
+        // No raw string: a purely synthetic receiver. Slot 2 is OUR model's
+        // `port`; on a real `java.net.URI` it is `authority`, a `String`, so
+        // this read used to answer a reference where an `Int` was expected on
+        // every real-layout receiver.
         if uri_has_synthetic_layout(ctx, this) {
             if let Value::Int(p) = ctx.get_field(this, 2) {
                 if p > 0 {
@@ -3751,11 +4025,6 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             if p > 0 {
                 return Ok(Some(Value::Int(p)));
             }
-        }
-        let raw = uri_raw_string(ctx, this);
-        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
-            let (_, _, port) = uri_parse_authority(&auth);
-            return Ok(Some(Value::Int(port)));
         }
         Ok(Some(Value::Int(-1)))
     });
@@ -8171,6 +8440,30 @@ struct HttpsCarrierSession {
     cipher: String,
     /// The peer's certificate chain, leaf first, DER-encoded.
     peer_chain_der: Vec<Vec<u8>>,
+    /// Global-root HANDLE (never an `ObjectRef`) for the ONE `SSLSession`
+    /// object this carrier hands out; `0` until the first accessor mints it.
+    ///
+    /// A handle is plain data, so the "this table holds no `ObjectRef`" rule
+    /// stated above still holds exactly: the collector owns the reference, and
+    /// [`NativeContext::resolve_global_root`] hands back its current, possibly
+    /// relocated address. This is the same shape `jca::provider_chain` and
+    /// `jboss_jdkspecific` already use for a cached Java object.
+    ///
+    /// WHY IT HAS TO BE CACHED. MEASURED, `RSslLiveSession` on
+    /// `9964ca733`, 2026-08-17:
+    ///
+    /// ```text
+    /// CK RSslLiveSession client.sslSession.sameObjectTwice = false  WANT true
+    /// ```
+    ///
+    /// HotSpot's `HttpsURLConnection` holds one `SSLSession` for the
+    /// connection's lifetime; every accessor answers from it and
+    /// `getSSLSession()` wraps *that* object in a fresh `Optional`. This VM
+    /// minted a new session on every accessor call, which was invisible while
+    /// `getId()` answered `byte[0]` and became visible the moment the ids were
+    /// real — `getId()` is seeded from the object's identity, so two reads of
+    /// one connection disagreed about the same handshake.
+    session_root: usize,
 }
 
 fn https_carrier_sessions() -> &'static OrderedPlMutex<HashMap<NativeObjKey, HttpsCarrierSession>> {
@@ -8189,32 +8482,84 @@ fn https_carrier_sessions() -> &'static OrderedPlMutex<HashMap<NativeObjKey, Htt
 /// answer for a connection that has not handshaken -- so a missing call is a
 /// missing ANSWER, never a wrong one.
 ///
-/// UNCALLED AS OF THIS COMMIT, deliberately and temporarily. The one call site
-/// is a single line inside `http_url_connection.rs`'s `huc_verify_hostname`,
-/// which is the only place holding all three values at once; that file belongs
-/// to another lane, so it is a NOMINATION rather than an edit here. Until it
-/// lands, all six accessors answer `IllegalStateException: connection not yet
-/// open` -- HotSpot's own answer for an unhandshaken connection, so the
-/// half-landed state is safe but useless. `#[allow(dead_code)]` is scoped to
-/// this one function so its removal is the reviewer's cue that the call site
-/// arrived.
-#[allow(dead_code)]
+/// THE CALL SITE HAS ARRIVED. It is a single line inside
+/// `http_url_connection.rs`'s `huc_verify_hostname` (STEP 0), which is the only
+/// place holding all three values at once, and that file's own test asserts the
+/// line stays ABOVE the built-in check's early return. The note that used to
+/// stand here said this function was uncalled and carried `#[allow(dead_code)]`
+/// as "the reviewer's cue that the call site arrived"; the cue has fired.
+///
+/// A second handshake recorded against the same carrier REPLACES the entry, so
+/// the previously cached session object is released here rather than left
+/// rooted for the life of the VM — the `provider_chain::set_cached_provider`
+/// idiom. That is why this takes `&mut dyn NativeContext`: releasing a global
+/// root is a mutation. The existing call site passes a `&mut dyn
+/// NativeContext` already, so the signature change is invisible to it.
 pub(crate) fn record_https_carrier_session(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     connection: ObjectRef,
     protocol: &str,
     cipher: &str,
     peer_chain_der: &[Vec<u8>],
 ) {
-    let key = native_obj_key(ctx, connection);
-    https_carrier_sessions().lock().insert(
-        key,
-        HttpsCarrierSession {
-            protocol: protocol.to_string(),
-            cipher: cipher.to_string(),
-            peer_chain_der: peer_chain_der.to_vec(),
-        },
-    );
+    let key = native_obj_key(&*ctx, connection);
+    let stale = {
+        let mut table = https_carrier_sessions().lock();
+        let stale = table.get(&key).map(|e| e.session_root).unwrap_or(0);
+        table.insert(
+            key,
+            HttpsCarrierSession {
+                protocol: protocol.to_string(),
+                cipher: cipher.to_string(),
+                peer_chain_der: peer_chain_der.to_vec(),
+                session_root: 0,
+            },
+        );
+        stale
+    };
+    if stale != 0 {
+        ctx.remove_global_root(stale);
+    }
+}
+
+/// Forget the recorded handshake for a carrier that has been RECYCLED, and
+/// release the `SSLSession` object it was holding.
+///
+/// MEASURED on HotSpot, `RSslLiveSession`'s `drainTrap` family: once the
+/// response body is fully drained the connection goes back to the
+/// `KeepAliveCache`, its delegate is released, and every CONNECTION-level
+/// accessor throws `IllegalStateException: connection not yet open` again —
+/// the same exception a never-handshaked connection throws. The SESSION object
+/// the application already holds survives and stays valid; it is the
+/// *connection's* view that is torn down. MEASURED on CratonVM
+/// (`9ae371468`, `target-rel3`) the four rows that says:
+///
+/// ```text
+/// drain.conn.cipherSuite.raises  = none  WANT java.lang.IllegalStateException
+/// drain.conn.cipherSuite.message = none  WANT connection not yet open
+/// drain.conn.sslSession.raises   = none  WANT java.lang.IllegalStateException
+/// drain.conn.sslSession.message  = none  WANT connection not yet open
+/// ```
+///
+/// This is the entry point that closes them, and it is deliberately the ONLY
+/// thing this file can contribute to it: the place that knows a body has been
+/// drained to EOF is the `https:` input stream in `http_url_connection.rs`, so
+/// the call site is a NOMINATION. Nothing here is unsafe while it is uncalled —
+/// the accessors simply answer for longer than HotSpot does, which is the
+/// friendlier direction and is what they do today.
+///
+/// It is also the table's only eviction path. Without it an entry — and, since
+/// this commit, a global root on one `SSLSession` — lives for as long as the VM
+/// does, one per HTTPS carrier ever handshaked.
+pub(crate) fn forget_https_carrier_session(ctx: &mut dyn NativeContext, connection: ObjectRef) {
+    let key = native_obj_key(&*ctx, connection);
+    let stale = {
+        let mut table = https_carrier_sessions().lock();
+        table.remove(&key).map(|e| e.session_root).unwrap_or(0)
+    };
+    if stale != 0 {
+        ctx.remove_global_root(stale);
+    }
 }
 
 /// The recorded session for this carrier, CLONED out of the table before
@@ -8335,10 +8680,26 @@ pub(crate) const HTTPS_CLIENT_SESSION_MARKER: i32 = 0x0800_0000;
 /// `javax/net/ssl/SSLSession`; the accessors below delegate to them rather than
 /// re-deriving an X.509 subject from DER, which is the "thin direct helper
 /// reimplements the native" shape this workspace keeps finding.
+/// ONE OBJECT PER CARRIER, not one per call. The first accessor to ask mints
+/// the session, roots it globally and records the handle against the carrier;
+/// every later ask — from any of the six accessors, and from
+/// [`https_carrier_session_object`] — gets that same object back. See
+/// [`HttpsCarrierSession::session_root`] for the measured row this closes.
 fn https_session_object(
     ctx: &mut dyn NativeContext,
+    connection: ObjectRef,
     s: &HttpsCarrierSession,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(cached) = https_cached_session_object(&*ctx, connection) {
+        return Ok(cached);
+    }
+    // GC: the carrier is read again AFTER the allocations below, to key the
+    // table when the new session is published. A raw `ObjectRef` does not
+    // survive a moving young GC, and `identity_hash_code` on a vacated
+    // from-space address is not the identity of anything — so pin it first.
+    // This pin must be taken BEFORE the session's, because releasing a pin
+    // truncates the stack above it.
+    let conn_pin = ctx.pin_native_root(connection);
     let session0 = try_alloc_concurrent_synthetic(
         ctx,
         "javax/net/ssl/SSLSession",
@@ -8377,7 +8738,77 @@ fn https_session_object(
     );
     let session = ctx.read_native_pin(session_pin, session0);
     crate::t27_tls::record_client_peer_chain(ctx, session, s.peer_chain_der.clone());
-    Ok(session)
+
+    // Publish it as THE session for this carrier. The root is taken before the
+    // table is touched, and the table is consulted under its own lock with no
+    // allocation in between, so a second thread that minted concurrently loses
+    // its object here rather than leaving two live sessions and a leaked root.
+    let session = ctx.read_native_pin(session_pin, session0);
+    let handle = ctx.add_global_root(session);
+    let connection = ctx.read_native_pin(conn_pin, connection);
+    let key = native_obj_key(&*ctx, connection);
+    let mut claimed = false;
+    let mut winner = 0usize;
+    {
+        let mut table = https_carrier_sessions().lock();
+        if let Some(entry) = table.get_mut(&key) {
+            if entry.session_root == 0 {
+                entry.session_root = handle;
+                claimed = true;
+            } else {
+                winner = entry.session_root;
+            }
+        }
+    }
+    if !claimed {
+        ctx.remove_global_root(handle);
+        if winner != 0 {
+            if let Some(obj) = ctx.resolve_global_root(winner) {
+                return Ok(obj);
+            }
+        }
+    }
+    Ok(ctx.read_native_pin(session_pin, session0))
+}
+
+/// The session object already minted for this carrier, or `None` if none has
+/// been. Reads through the global-root handle, so the address is the collector's
+/// current one even after a moving collection.
+fn https_cached_session_object(
+    ctx: &dyn NativeContext,
+    connection: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = native_obj_key(ctx, connection);
+    let handle = {
+        let table = https_carrier_sessions().lock();
+        table.get(&key).map(|e| e.session_root)?
+    };
+    if handle == 0 {
+        return None;
+    }
+    ctx.resolve_global_root(handle)
+}
+
+/// THE `SSLSession` for a carrier whose handshake completed, for callers
+/// OUTSIDE this file — specifically `http_url_connection::huc_verify_hostname`,
+/// which currently mints a second, private one to hand to the application's
+/// `HostnameVerifier`.
+///
+/// MEASURED on HotSpot (`RSslLiveSession`'s `verifier` family): the object a
+/// `HostnameVerifier` is given and the object `getSSLSession()` returns
+/// afterwards are the SAME object — `verifier.sameObjectAsGetSSLSession`. Two
+/// minters cannot satisfy that no matter how identical their field writes are,
+/// which is why the fix is one minter with an entry point rather than a second
+/// copy of the same four `set_field` calls.
+///
+/// `None` means the carrier has no recorded handshake, i.e. the caller is
+/// upstream of `record_https_carrier_session`; it is NOT an error.
+pub(crate) fn https_carrier_session_object(
+    ctx: &mut dyn NativeContext,
+    connection: ObjectRef,
+) -> Option<Result<ObjectRef, MethodCallFailed>> {
+    let s = https_carrier_session(&*ctx, connection)?;
+    Some(https_session_object(ctx, connection, &s))
 }
 
 /// The six `javax.net.ssl.HttpsURLConnection` session accessors, on BOTH
@@ -8396,22 +8827,28 @@ fn https_session_object(
 /// function name as this one -- `register_https_session_accessors`, at
 /// `http_url_connection.rs:404` -- and it runs later.
 ///
-/// MEASURED 2026-08-17, `--dump-native-registry` under `--jdk-only` on the
-/// binary from `d87dff06a`+2, both carrier classes, identical rows:
+/// RE-MEASURED 2026-08-17 on `9964ca733` (`target-rel2`), after another lane
+/// had edited `http_url_connection.rs`: the collapse is UNCHANGED, only the
+/// line numbers moved. `--dump-native-registry` under `--jdk-only`, both
+/// carrier classes, identical rows:
 ///
 /// ```text
-/// getCipherSuite         owns_slot=false  net_phase_e.rs:8315
-/// getCipherSuite         owns_slot=TRUE   http_url_connection.rs:307  overwrote=bridge
-/// getServerCertificates  owns_slot=false  net_phase_e.rs:8323
-/// getServerCertificates  owns_slot=TRUE   http_url_connection.rs:283  overwrote=bridge
-/// getLocalCertificates   owns_slot=false  net_phase_e.rs:8346
-/// getLocalCertificates   owns_slot=TRUE   http_url_connection.rs:301  overwrote=bridge
-/// getPeerPrincipal       owns_slot=false  net_phase_e.rs:8364
-/// getPeerPrincipal       owns_slot=TRUE   http_url_connection.rs:325  overwrote=bridge
-/// getLocalPrincipal      owns_slot=false  net_phase_e.rs:8377
-/// getLocalPrincipal      owns_slot=TRUE   http_url_connection.rs:351  overwrote=bridge
-/// getSSLSession          owns_slot=TRUE   net_phase_e.rs:8395
+/// getCipherSuite         owns_slot=false  net_phase_e.rs:8439
+/// getCipherSuite         owns_slot=TRUE   http_url_connection.rs:445  overwrote=bridge
+/// getServerCertificates  owns_slot=false  net_phase_e.rs:8447
+/// getServerCertificates  owns_slot=TRUE   http_url_connection.rs:405  overwrote=bridge
+/// getLocalCertificates   owns_slot=false  net_phase_e.rs:8470
+/// getLocalCertificates   owns_slot=TRUE   http_url_connection.rs:433  overwrote=bridge
+/// getPeerPrincipal       owns_slot=false  net_phase_e.rs:8488
+/// getPeerPrincipal       owns_slot=TRUE   http_url_connection.rs:466  overwrote=bridge
+/// getLocalPrincipal      owns_slot=false  net_phase_e.rs:8501
+/// getLocalPrincipal      owns_slot=TRUE   http_url_connection.rs:495  overwrote=bridge
+/// getSSLSession          owns_slot=TRUE   net_phase_e.rs:8519
 /// ```
+///
+/// `invocations` is 0 on every row of that dump, and that is NOT evidence of
+/// death: the probe it was taken from makes no HTTPS request. The field that
+/// settles ownership is `owns_slot`.
 ///
 /// So FIVE of the six bodies below are dead: only `getSSLSession` runs, and
 /// only because the other file does not register it. A change to any of the
@@ -8453,7 +8890,7 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
                 let Some(s) = https_carrier_session(ctx, this) else {
                     return Err(https_not_yet_open(ctx));
                 };
-                let session = https_session_object(ctx, &s)?;
+                let session = https_session_object(ctx, this, &s)?;
                 // `SSLSession.getPeerCertificates` is the single implementation
                 // of "decode this chain into java.security.cert.Certificate
                 // mirrors", and it already throws SSLPeerUnverifiedException
@@ -8476,7 +8913,7 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
                 let Some(s) = https_carrier_session(ctx, this) else {
                     return Err(https_not_yet_open(ctx));
                 };
-                let session = https_session_object(ctx, &s)?;
+                let session = https_session_object(ctx, this, &s)?;
                 ctx.invoke_virtual(
                     session,
                     "getLocalCertificates",
@@ -8494,7 +8931,7 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
                 let Some(s) = https_carrier_session(ctx, this) else {
                     return Err(https_not_yet_open(ctx));
                 };
-                let session = https_session_object(ctx, &s)?;
+                let session = https_session_object(ctx, this, &s)?;
                 ctx.invoke_virtual(session, "getPeerPrincipal", "()Ljava/security/Principal;", &[])
             },
         );
@@ -8507,7 +8944,7 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
                 let Some(s) = https_carrier_session(ctx, this) else {
                     return Err(https_not_yet_open(ctx));
                 };
-                let session = https_session_object(ctx, &s)?;
+                let session = https_session_object(ctx, this, &s)?;
                 ctx.invoke_virtual(
                     session,
                     "getLocalPrincipal",
@@ -8524,7 +8961,7 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
                 // this change exists to remove.
                 return Err(https_not_yet_open(ctx));
             };
-            let session = https_session_object(ctx, &s)?;
+            let session = https_session_object(ctx, this, &s)?;
             let session_pin = ctx.pin_native_root(session);
             // `java.util.Optional` has exactly one instance field, `value`, at
             // slot 0 -- this is `Optional.ofNullable(session)` in the real
@@ -19639,6 +20076,315 @@ mod tests {
         assert_eq!(path, "user@example.com?subject=hello");
         assert_eq!(query, None);
         assert_eq!(fragment.as_deref(), Some("frag"));
+    }
+
+    /// Helper for the authority family: `(userInfo, host, port)` as three
+    /// `Option`-free strings so a row reads like the oracle's own output.
+    fn auth_row(authority: &str) -> (String, String, i32) {
+        let (u, h, p) = uri_parse_authority(authority);
+        (
+            u.unwrap_or_else(|| "null".into()),
+            h.unwrap_or_else(|| "null".into()),
+            p,
+        )
+    }
+
+    const DEMOTED: (&str, &str, i32) = ("null", "null", -1);
+
+    fn assert_demoted(authority: &str) {
+        let (u, h, p) = auth_row(authority);
+        assert_eq!(
+            (u.as_str(), h.as_str(), p),
+            DEMOTED,
+            "authority {authority:?} must demote to registry-based: HotSpot answers \
+             null/null/-1 for getUserInfo/getHost/getPort together"
+        );
+    }
+
+    /// The blocker behind `RJdkBridge1`'s check 197 (`RJdkBridge1.java:1181`).
+    ///
+    /// MEASURED on Temurin 25.0.3+9-LTS, 2026-08-17: `java.net.URI`'s port
+    /// production is `*DIGIT`. Rust's `str::parse::<i32>` takes a leading `+`
+    /// or `-`, and the old body ended in `p.parse::<i32>().ok()`, so
+    /// `http://h:-5/p` answered `-5` where HotSpot answers `-1`.
+    ///
+    /// The half that a port-only clamp would have missed is on the next line
+    /// of the vector: a failed server-based parse does not just drop the port,
+    /// it demotes the whole authority to registry-based, so `getHost()` is
+    /// `null` too.
+    #[test]
+    fn uri_authority_port_is_digits_only_and_a_bad_port_demotes_the_whole_authority() {
+        for bad in [
+            "h:-5",          // leading '-'
+            "h:+80",         // leading '+', which java.net.URL DOES take
+            "h:-0",          // sign, even on a value that would parse
+            "h:8x",          // trailing non-digit
+            "h:x80",         // leading non-digit
+            "h:x",           // no digits at all
+            "h:80x80",       // digits either side of a non-digit
+            "h:99999999999", // all digits, overflows int
+            "h:2147483648",  // one past Integer.MAX_VALUE
+            "h:4294967296",  // and past the unsigned range too
+            "h:80:90",       // the port text runs to the END of the authority
+            "h::80",         // so a second colon is a non-digit, not a split
+            "u@h:x",         // userInfo is discarded WITH the host and port
+            "u:pw@h:8x",
+            "u@1.2.3.4:8x",
+        ] {
+            assert_demoted(bad);
+        }
+    }
+
+    /// The boundary rows that keep the demotion from over-firing. Leading
+    /// zeros are not part of the value and do not overflow anything.
+    #[test]
+    fn uri_authority_keeps_every_port_java_actually_accepts() {
+        for (authority, expect_host, expect_port) in [
+            ("h:80", "h", 80),
+            ("h:0", "h", 0),
+            ("h:007", "h", 7),
+            ("h:080", "h", 80),
+            ("h:00000000080", "h", 80),
+            ("h:0000000000000", "h", 0),
+            ("h:2147483647", "h", 2147483647),
+            ("h:", "h", -1),
+            ("h", "h", -1),
+            ("[::1]:80", "[::1]", 80),
+            ("[::1]:", "[::1]", -1),
+            ("[::1]:0", "[::1]", 0),
+            ("[::1]", "[::1]", -1),
+            ("1.2.3.4:80", "1.2.3.4", 80),
+        ] {
+            let (u, h, p) = auth_row(authority);
+            assert_eq!(
+                (u.as_str(), h.as_str(), p),
+                ("null", expect_host, expect_port),
+                "authority {authority:?}"
+            );
+        }
+    }
+
+    /// An EMPTY host demotes exactly like a bad port — `parseHostname`'s
+    /// `if (l < 0) failExpecting("hostname", start)`. MEASURED:
+    /// `new URI("http://:80/p").getPort()` is `-1` on HotSpot, not `80`, and
+    /// `new URI("http://u@:80/p").getUserInfo()` is `null`, not `u`.
+    #[test]
+    fn uri_authority_with_no_host_demotes_even_though_the_port_is_well_formed() {
+        assert_demoted(":80");
+        assert_demoted("u@:80");
+        assert_demoted("");
+        assert_demoted(".a");
+        assert_demoted("a..");
+    }
+
+    /// `parseHostname`'s grammar, which is NOT "anything that is not a port".
+    /// MEASURED, HotSpot answers a null host for every row here.
+    #[test]
+    fn uri_authority_hostname_grammar_rejects_what_java_rejects() {
+        for bad in [
+            "a_b",       // '_' is legal in a reg-name, not in a domain label
+            "a..b",      // empty label
+            "-h",        // label must START alphanumeric
+            "h-",        // and must not END with '-'
+            "a.9b",      // multi-label: the LAST label must start with a letter
+            "1.2.3",     // three octets is not an IPv4 address, and "3" is a
+            "1.2.3.4.5", //  digit-leading last label, so neither production fits
+            "1.2.3.4x",
+            "256.1.1.1",
+            "192.196.0.5555",
+            "h$x",
+            "h,x",
+            "h;x",
+            "h=x",
+            "h&x",
+            "h!x",
+            "h~x",
+            "h*x",
+            "h'x",
+            "h(x)",
+            "h%20x",
+            "h%41x", // an escape is legal in a reg-name, not in a host
+            "a@b@c", // the FIRST '@' delimits, so "b@c" must parse as a host
+            "u@h@",
+            "u@h:80@x",
+        ] {
+            assert_demoted(bad);
+        }
+    }
+
+    /// …and the hostnames it must keep. `9h` and `12` are single labels, where
+    /// the "starts with a letter" rule does not apply (`l > start` is false).
+    #[test]
+    fn uri_authority_hostname_grammar_keeps_what_java_keeps() {
+        for (authority, expect_host) in [
+            ("h.", "h."),
+            ("a.b.", "a.b."),
+            ("9h", "9h"),
+            ("h9", "h9"),
+            ("12", "12"),
+            ("a.b9", "a.b9"),
+            ("a-b", "a-b"),
+            ("a-b.c-d", "a-b.c-d"),
+            ("xn--d1acufc.xn--p1ai", "xn--d1acufc.xn--p1ai"),
+            ("A.B", "A.B"),
+            ("1.2.3.4", "1.2.3.4"),
+            ("255.255.255.255", "255.255.255.255"),
+            ("01.2.3.4", "01.2.3.4"), // leading zeros are not significant digits
+        ] {
+            let (_, h, p) = auth_row(authority);
+            assert_eq!(
+                (h.as_str(), p),
+                (expect_host, -1),
+                "authority {authority:?}"
+            );
+        }
+    }
+
+    /// User-info survives only when the whole server-based parse survives.
+    #[test]
+    fn uri_authority_user_info_is_taken_at_the_first_at_sign() {
+        assert_eq!(
+            auth_row("u:pw@h:80"),
+            ("u:pw".to_string(), "h".to_string(), 80)
+        );
+        assert_eq!(auth_row("u@h"), ("u".to_string(), "h".to_string(), -1));
+        // An empty user-info is not an absent one: HotSpot's
+        // `new URI("http://@h/p").getUserInfo()` is "".
+        assert_eq!(auth_row("@h"), (String::new(), "h".to_string(), -1));
+        // Escapes are legal in a user info; `getUserInfo` decodes them.
+        assert_eq!(
+            auth_row("a%40b@h"),
+            ("a%40b".to_string(), "h".to_string(), -1)
+        );
+        assert_eq!(
+            auth_row("u@[::1]:80"),
+            ("u".to_string(), "[::1]".to_string(), 80)
+        );
+    }
+
+    /// A second handshake recorded against the same carrier must DROP the
+    /// cached session handle, so the next accessor mints a session for the new
+    /// handshake instead of handing back the previous one, and so the old
+    /// global root is released rather than pinning that object for the life of
+    /// the VM.
+    ///
+    /// The mock context has no moving collector, so `add_global_root` is a
+    /// no-op returning 0 there; the handle slot is therefore driven directly.
+    /// What this test can see — and what a live run cannot easily be made to
+    /// show — is the INVALIDATION, which is the half that leaks if it is
+    /// missing.
+    #[test]
+    fn re_recording_a_carrier_handshake_drops_the_cached_session_handle() {
+        let mut ctx = MockNativeContext::new();
+        let carrier = ctx.alloc_object(ClassId::new(0), 4);
+        let key = native_obj_key(&ctx, carrier);
+
+        record_https_carrier_session(&mut ctx, carrier, "TLSv1.3", "TLS_AES_256_GCM_SHA384", &[]);
+        let first = https_carrier_session(&ctx, carrier).expect("the handshake was recorded");
+        assert_eq!(first.protocol, "TLSv1.3");
+        assert_eq!(first.cipher, "TLS_AES_256_GCM_SHA384");
+        assert_eq!(
+            first.session_root, 0,
+            "a freshly recorded handshake has no session object yet"
+        );
+
+        // Stand in for "an accessor minted and rooted the session".
+        https_carrier_sessions()
+            .lock()
+            .get_mut(&key)
+            .expect("entry")
+            .session_root = 7;
+        assert_eq!(
+            https_carrier_session(&ctx, carrier).unwrap().session_root,
+            7
+        );
+
+        record_https_carrier_session(&mut ctx, carrier, "TLSv1.2", "TLS_RSA_WITH_AES_128", &[]);
+        let second = https_carrier_session(&ctx, carrier).expect("still recorded");
+        assert_eq!(second.protocol, "TLSv1.2");
+        assert_eq!(
+            second.session_root, 0,
+            "a new handshake must not hand out the previous handshake's SSLSession"
+        );
+    }
+
+    /// Recycling a carrier removes its entry outright, so the six accessors go
+    /// back to answering `IllegalStateException: connection not yet open` —
+    /// HotSpot's own answer after a drained body — and the cached session stops
+    /// being held.
+    #[test]
+    fn forgetting_a_recycled_carrier_removes_the_entry_entirely() {
+        let mut ctx = MockNativeContext::new();
+        let carrier = ctx.alloc_object(ClassId::new(0), 4);
+        record_https_carrier_session(&mut ctx, carrier, "TLSv1.3", "TLS_AES_128_GCM_SHA256", &[]);
+        assert!(https_carrier_session(&ctx, carrier).is_some());
+
+        forget_https_carrier_session(&mut ctx, carrier);
+        assert!(
+            https_carrier_session(&ctx, carrier).is_none(),
+            "a recycled carrier must have no recorded handshake left — a stale entry is how \
+             a connection that HotSpot reports as closed keeps answering"
+        );
+        // Idempotent: draining twice, or draining a connection that never
+        // handshaked, must not panic and must not release a handle twice.
+        forget_https_carrier_session(&mut ctx, carrier);
+    }
+
+    /// `https_session_object` must consult the cache BEFORE it allocates.
+    ///
+    /// The order is the whole fix: an allocation-first body that only *then*
+    /// looked at the table would still mint one `SSLSession` per accessor call
+    /// and only cache the last one, which is exactly the shape that made
+    /// `RSslLiveSession`'s `client.sslSession.sameObjectTwice` answer `false`.
+    /// No behavioural test can see that without a live TLS peer, so the
+    /// ordering is asserted against the source — the same witness shape
+    /// `http_url_connection.rs` already uses for `huc_verify_hostname`'s
+    /// capture-before-early-return rule.
+    #[test]
+    fn the_session_cache_lookup_precedes_the_allocation() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("net_phase_e.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("net_phase_e.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn https_session_object("))
+            .expect("https_session_object must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("https_session_object must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        let lookup = body
+            .iter()
+            .position(|l| l.contains("https_cached_session_object("))
+            .expect(
+                "https_session_object must consult the per-carrier cache; without it every \
+                 accessor mints a new SSLSession and getSSLSession() is not idempotent",
+            );
+        let alloc = body
+            .iter()
+            .position(|l| l.contains("try_alloc_concurrent_synthetic("))
+            .expect("https_session_object must still be the minter");
+        assert!(
+            lookup < alloc,
+            "the cache lookup is at body line {lookup}, BELOW the allocation at {alloc} — \
+             a session would be minted on every call and the cache would only ever record \
+             the last one"
+        );
+        assert!(
+            body.iter().any(|l| l.contains("add_global_root(")),
+            "the minted session must be held by a GLOBAL root: a raw ObjectRef in \
+             https_carrier_sessions would dangle after a moving collection"
+        );
     }
 
     #[test]
