@@ -20152,7 +20152,7 @@ const AFC_FIELD_OPEN: usize = 2;
 const AFC_NUM_FIELDS: usize = 3;
 
 /// Opt-in `AsynchronousFileChannel` tracing (`CRATONVM_DBG_AIO=1`), added
-/// 2026-08-16 for the hibernate-reactive `WrongCredentialsTest` investigation.
+/// 2026-08-16 for the hibernate `WrongCredentialsTest` investigation.
 ///
 /// The Windows Docker transport (`docker-java`'s `NamedPipeSocket`) drives
 /// `\.\pipe\docker_engine` entirely through this family, so a hang there is

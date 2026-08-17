@@ -419,7 +419,7 @@ the full run's `others.txt` is categorized.
 
 None yet — first netty-specific finding this session. Distinct from the
 hibernate-reactive JNA `Native.<clinit>` NPE
-(`docs/known-issues/hibernate-reactive/jna-native-clinit-nativeversion-npe-20260812.md`)
+(`../../known-issues/hibernate/jna-native-clinit-nativeversion-npe-20260812.md`)
 found the same day, but both involve JNI-adjacent native-library
 interaction on CratonVM — worth keeping in mind as a possible shared
 theme (CratonVM's JNI/native-library support surface) even though the

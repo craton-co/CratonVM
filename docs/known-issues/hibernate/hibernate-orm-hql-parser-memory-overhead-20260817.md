@@ -155,7 +155,7 @@ real HotSpot on the *same* host before assuming a CratonVM regression.
 that do not exist on this host — only `target/classes/java/main` was ever
 compiled; the Gradle `jar` task for those five modules was never run. This is a
 local build-completeness issue, not a CratonVM defect: the missing jars also mean
-the `META-INF/services` files behind two `ServiceLoader` lookups are absent,
+the `../../../META-INF/services` files behind two `ServiceLoader` lookups are absent,
 producing a `ServiceConfigurationError` for `CheckClearSchemaListener` and then
 an `AssertionFailure` about `TestableLoggerProvider`.
 
@@ -176,6 +176,6 @@ java -Xmx2g -cp "$CP" CratonRunner org.hibernate.orm.test.hql.HqlParserMemoryUsa
 ```
 
 The two probes this record rests on, both runnable against either VM:
-`probes/AllocShapeProbe.java` (per-shape bytes/op) and
-`probes/AllocCounterFidelity.java` (does the counter report a known volume
+`../../../probes/AllocShapeProbe.java` (per-shape bytes/op) and
+`../../../probes/AllocCounterFidelity.java` (does the counter report a known volume
 correctly, across heap sizes and collectors).

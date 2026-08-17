@@ -421,7 +421,7 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 /// [`clear_all_mark_bits_in_arena`]. Deliberately a SEPARATE counter from
 /// [`SWEEP_ZERO_SPAN_HITS`], which now counts only the runs that still take the
 /// unwind: this shape is normal and frequent (147 per young cycle on the
-/// hibernate-reactive repro), so folding the two together would turn its
+/// hibernate repro), so folding the two together would turn its
 /// arrival into apparent corruption. Like its siblings above it has no printer
 /// — it is read from a debugger or an instrumented repro build.
 pub static SWEEP_ZERO_SPAN_EMPTY_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -16164,7 +16164,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
         // legitimately reads zero. Bailing on either was expensive out of all
         // proportion — one `None` makes `parallel_sweep_walk` discard EVERY
         // chunk and re-run the whole arena sequentially, and on the
-        // hibernate-reactive repro that happened on every cycle
+        // hibernate repro that happened on every cycle
         // (`par_attempts=5 par_fails=5`, all five the zero-run branch, so
         // `par_prefix_end` was 0 for the entire run). Anything the predicate
         // does not vouch for still bails; the sequential path still owns the
@@ -17245,7 +17245,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
         // non-moving sweep treats a set `GC_FLAG_MARKED` as live regardless of
         // reachability (the bug-C5 note at the call site). So the false
         // positive feeds itself — measured at ~800 re-anchors per young cycle
-        // on the hibernate-reactive repro. Step over the run instead: it can
+        // on the hibernate repro. Step over the run instead: it can
         // hold no mark to clear, because a header carrying `GC_FLAG_MARKED` is
         // by definition not all-zero, and the predicate refuses any run with a
         // marked base inside it.

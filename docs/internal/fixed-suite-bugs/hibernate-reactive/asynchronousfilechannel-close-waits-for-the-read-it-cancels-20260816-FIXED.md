@@ -257,7 +257,7 @@ close.
 ## Reproducing
 
 ```bash
-cd apps/hibernate-reactive-suite-runner
+cd apps/hibernate-suite-runner
 CRATONVM_DBG_AIO=1 <cratonvm> --java-home <jdk25> --Xmx 1500m \
   -XX:+UseG1GC @common.args -Dcraton.batch=1 CratonRunner \
   org.hibernate.reactive.WrongCredentialsTest
