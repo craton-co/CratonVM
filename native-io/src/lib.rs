@@ -21682,6 +21682,72 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// Render a real-JDK `java.net.InetAddress`'s NUMERIC address as a literal
+/// that `std::net::ToSocketAddrs` parses without consulting a resolver —
+/// dotted-quad for v4, bracketed for v6 so `format!("{host}:{port}")` stays
+/// unambiguous.
+///
+/// Returns `None` for anything that is not a real-JDK holder layout, and for
+/// an `InetSocketAddress` whose `addr` is null (an unresolved one); the caller
+/// falls back to the hostname there.
+///
+/// # Why the caller must prefer this over the hostname
+///
+/// `dc_socket_addr` used to answer `InetSocketAddressHolder.hostname` first,
+/// and `InetAddressHolder.hostName` after it, reaching the numeric `address`
+/// int only when both were absent. That handed a NAME to
+/// `UdpSocket::bind`/`send_to`, which resolves it again through the platform
+/// resolver — a second, independent answer to a question Java had already
+/// answered.
+///
+/// The two resolvers disagree on `localhost`. Windows `getaddrinfo` orders
+/// `::1` first; glibc, with the stock `127.0.0.1 localhost` line ahead of
+/// `::1 localhost` in `/etc/hosts`, orders `127.0.0.1` first. So
+/// `DatagramChannel.bind(new InetSocketAddress("localhost", 0))` — whose
+/// `InetSocketAddress` already holds a resolved `127.0.0.1` — bound `::1` on
+/// Windows and `127.0.0.1` on Linux, from identical bytes. HotSpot never has
+/// this divergence: `sun.nio.ch.Net.bind` takes `isa.getAddress()` and never
+/// looks at the name.
+///
+/// Downstream that produced a destination address no test constructs.
+/// Apache MINA's `NioDatagramAcceptor.localAddress()` rewrites any bound
+/// `Inet6Address` for which `isIPv4CompatibleAddress()` holds into the v4
+/// address in its last four bytes ("Ugly hack to workaround a problem on
+/// linux", per its own comment). `::1` satisfies that predicate, and its last
+/// four bytes are `[0, 0, 0, 1]` — so netty's `TestDnsServer.localAddress()`
+/// answered `0.0.0.1`, every `DnsNameResolver` query went to `0.0.0.1`, and
+/// Windows failed each one with `WSAENETUNREACH`.
+fn inet_addr_literal(ctx: &dyn NativeContext, inet_addr: ObjectRef) -> Option<String> {
+    // IPv6 FIRST. `Inet6Address` keeps its sixteen bytes in a separate
+    // `holder6` (`Inet6Address$Inet6AddressHolder.ipaddress`), and the base
+    // holder's `address` int stays 0 for it — reading that would render every
+    // v6 address as `0.0.0.0`, which binds the v4 wildcard.
+    if let Value::Object(Some(h6)) = ctx.get_field_by_name(inet_addr, "holder6") {
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(h6, "ipaddress") {
+            if ctx.array_length(arr) == 16 {
+                let mut octets = [0u8; 16];
+                for (i, slot) in octets.iter_mut().enumerate() {
+                    match ctx.get_array_element(arr, i) {
+                        Value::Int(b) => *slot = b as u8,
+                        _ => return None,
+                    }
+                }
+                // Bracketed: the caller appends `:{port}`, and a bare v6
+                // literal there is ambiguous to every parser that sees it.
+                return Some(format!("[{}]", std::net::Ipv6Addr::from(octets)));
+            }
+        }
+    }
+    let inet_holder = match ctx.get_field_by_name(inet_addr, "holder") {
+        Value::Object(Some(h)) => h,
+        _ => return None,
+    };
+    match ctx.get_field_by_name(inet_holder, "address") {
+        Value::Int(address) => Some(std::net::Ipv4Addr::from((address as u32).to_be_bytes()).to_string()),
+        _ => None,
+    }
+}
+
 /// Extract a printable host:port from both the real JDK 25 holder layout and
 /// CratonVM's small synthetic InetSocketAddress layout.
 fn dc_socket_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<String> {
@@ -21690,30 +21756,25 @@ fn dc_socket_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<String> {
             Value::Int(port) if (0..=65_535).contains(&port) => port,
             _ => return None,
         };
+        // The RESOLVED address wins over the hostname, and this ordering is
+        // load-bearing — see [`inet_addr_literal`]. Java has already resolved
+        // the name; handing the name back to the OS asks a SECOND resolver the
+        // same question and takes whichever answer it happens to order first.
+        if let Value::Object(Some(inet_addr)) = ctx.get_field_by_name(holder, "addr") {
+            if let Some(host) = inet_addr_literal(ctx, inet_addr) {
+                return Some(format!("{host}:{port}"));
+            }
+        }
+        // Only an UNRESOLVED `InetSocketAddress` (`createUnresolved`, or a
+        // constructor whose lookup failed) reaches here with a name and no
+        // address; the name is then all there is, and the OS resolver is the
+        // right place to send it.
         let hostname = match ctx.get_field_by_name(holder, "hostname") {
             Value::Object(Some(hostname)) => ctx.read_string(hostname).unwrap_or_default(),
             _ => String::new(),
         };
         if !hostname.is_empty() {
             return Some(format!("{hostname}:{port}"));
-        }
-        if let Value::Object(Some(inet_addr)) = ctx.get_field_by_name(holder, "addr") {
-            if let Value::Object(Some(inet_holder)) = ctx.get_field_by_name(inet_addr, "holder") {
-                if let Value::Object(Some(host_name)) =
-                    ctx.get_field_by_name(inet_holder, "hostName")
-                {
-                    if let Some(host_name) = ctx.read_string(host_name) {
-                        if !host_name.is_empty() {
-                            return Some(format!("{host_name}:{port}"));
-                        }
-                    }
-                }
-                if let Value::Int(address) = ctx.get_field_by_name(inet_holder, "address") {
-                    let octets = (address as u32).to_be_bytes();
-                    let host = std::net::Ipv4Addr::from(octets);
-                    return Some(format!("{host}:{port}"));
-                }
-            }
         }
         return None;
     }

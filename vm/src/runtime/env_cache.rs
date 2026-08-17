@@ -936,6 +936,19 @@ cached_is_set!(ctor_direct_call_disabled, "CRATONVM_NO_CTOR_DIRECT_CALL");
 /// elision (which ctor sites are deferred / resolved elidable). Read only at
 /// JIT compile time.
 cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
+/// `CRATONVM_NO_OSR_CTOR_BIND` — opt OUT of routing a NON-elidable
+/// `invokespecial …<init>()V` site in the **OSR** compile door through the
+/// eager-compile + direct-bind path every other statically-bound site there
+/// already takes. When set, such sites fall back to the per-allocation
+/// `jit_invoke_dispatch` slow path.
+///
+/// The off-switch exists because this exact reroute was tried on 2026-08-13
+/// and reverted: it made `compile_with_param_slots` refuse the enclosing
+/// method, and an OSR refusal marks the method OSR-denied for the process, so
+/// the hot loop interpreted forever (4.5x SLOWER). The cause was a
+/// direct-bound site with no `JitInvokeInfo` — a hole this door has since
+/// closed for its sibling non-`()V` admission. Read only at JIT compile time.
+cached_is_set!(osr_ctor_bind_disabled, "CRATONVM_NO_OSR_CTOR_BIND");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
 

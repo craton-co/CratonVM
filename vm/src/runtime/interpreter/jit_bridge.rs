@@ -588,6 +588,7 @@ pub(super) fn compile_osr_artifact(
             // lock drops, and emit elidable ones as `Object.<init>` so codegen
             // drops the per-object dispatch. See `execute` for the rationale.
             let ctor_direct_call_off = crate::runtime::env_cache::ctor_direct_call_disabled();
+            let osr_ctor_bind_off = crate::runtime::env_cache::osr_ctor_bind_disabled();
             let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
             // THIRD COMPILE DOOR, 2026-08-13. `java/lang/String`'s call-site
             // intrinsics (`length`/`isEmpty`/`charAt`/`hashCode`/`equals`/
@@ -1136,25 +1137,47 @@ pub(super) fn compile_osr_artifact(
                     let info_ptr: *const _ = &*info;
                     owned_jit_invoke_infos2.push(info);
                     invoke_info.push((pc, info_ptr));
-                } else {
-                    // NOT elidable: keep the dispatch, exactly as before.
+                } else if !osr_ctor_bind_off {
+                    // NOT elidable, and the site joins `pending_callee_compiles`
+                    // for the same eager-compile + direct bind every other
+                    // statically-bound site in this door gets. This is what the
+                    // `new FastThreadLocal<Boolean>()` loop was paying a
+                    // per-allocation `jit_invoke_dispatch` for.
                     //
-                    // Routing these through the eager-compile + direct-bind
-                    // path below was tried and REVERTED (2026-08-13). It makes
+                    // HISTORY, because the obvious reading of it is wrong.
+                    // This reroute was tried on 2026-08-13 and REVERTED: it made
                     // `compile_with_param_slots` refuse the enclosing method,
-                    // which marks it **OSR-denied for the process** — so the
-                    // hot loop interprets forever. Measured, same host, same
-                    // run: `new A()` where `A(){i=ATOMIC.getAndIncrement();}`
-                    // went 311 ns -> 1412 ns (4.5x SLOWER), and the real
-                    // `new FastThreadLocal<Boolean>()` 451 ns -> 1868 ns, with
-                    // `OSR-compile FAILED … marked OSR-denied` in the trace.
+                    // and an OSR refusal is not a fallback to a slower compile —
+                    // it marks the method OSR-denied for the process lifetime,
+                    // so the hot loop interpreted forever (`new A()` 311 ns ->
+                    // 1412 ns). The page filed that as "why the codegen refuses
+                    // that shape is unresolved".
                     //
-                    // The sibling admission for non-`()V` `invokespecial` in
-                    // the scan loop above does NOT hit this and is a 2.3x win,
-                    // so the refusal is specific to the `()V` shape reaching
-                    // the bind through here — not to binding `invokespecial`
-                    // as such. Why the codegen refuses it is unresolved; see
-                    // the FastThreadLocal page.
+                    // It was not the shape. A direct-bound site ALSO needs a
+                    // `JitInvokeInfo` — the codegen's direct-call arm reads it
+                    // to name the callee for the exceptional-return service —
+                    // and this door pushed none, which is exactly the refusal
+                    // the sibling non-`()V` `invokespecial` admission hit and
+                    // fixed a few hundred lines below ("an `invokespecial` bind
+                    // without it makes `compile_with_param_slots` refuse the
+                    // whole method"). That fix landed for kind-1 sites arriving
+                    // through the scan loop; `()V` ctor sites arrive through
+                    // HERE, bypassed it, and so still had none. Routing them
+                    // into the same list makes them take the same bind, and the
+                    // `JitInvokeInfo` comes with it.
+                    //
+                    // `CRATONVM_NO_OSR_CTOR_BIND=1` restores the dispatch.
+                    pending_callee_compiles.push((
+                        pc,
+                        tclass,
+                        "<init>".to_string(),
+                        "()V".to_string(),
+                        pcount,
+                        1u8,
+                    ));
+                } else {
+                    // `CRATONVM_NO_OSR_CTOR_BIND=1`: keep the per-allocation
+                    // dispatch, the pre-2026-08-17 behaviour.
                     let class_box: Box<str> = tclass.into_boxed_str();
                     let method_box: Box<str> = "<init>".to_string().into_boxed_str();
                     let desc_box: Box<str> = "()V".to_string().into_boxed_str();
