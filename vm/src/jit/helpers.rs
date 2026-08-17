@@ -10902,6 +10902,18 @@ unsafe fn try_jit_site_cached_native_dispatch(
         thread.native_pending_return = Some(obj);
         return Some(obj.as_ptr() as i64);
     }
+    // `VarHandle` read modes on an ordinary instance field are a field load
+    // wearing a native's clothes. Serving them here rather than through the
+    // funnel is what takes `VarHandle.get` off the boxing round trip — see
+    // `try_varhandle_instance_field_read`.
+    if entry.poly {
+        if let Some(bits) = try_varhandle_instance_field_read(vm, info, args_slice, thread) {
+            SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            VARHANDLE_FIELD_READ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            count_jit_native_dispatch(vm, entry.native_id);
+            return Some(bits);
+        }
+    }
     // `JitDecodedArgs::new()` and not `with_capacity(args_slice.len())`: the
     // latter is an outlined call whose ~144-byte return the caller has to
     // materialise, and it measured 10.3 ns for a zero-argument decode that has
@@ -10955,6 +10967,112 @@ unsafe fn try_jit_site_cached_native_dispatch(
         Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
         Some(Value::Object(None)) | None => 0,
         Some(_) => 0,
+    })
+}
+
+/// `VarHandle` instance-field READS served as a direct field load, reported by
+/// `CRATONVM_DBG=intrinsic-stats`. Zero here with a non-zero site-cached count
+/// means every VarHandle site refused the plan — which is a different problem
+/// from "no VarHandle site was reached", and only a counter separates them.
+static VARHANDLE_FIELD_READ_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `VarHandle` reads served as a direct field load from compiled code.
+pub fn varhandle_field_read_hit_count() -> u64 {
+    VARHANDLE_FIELD_READ_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Serve a signature-polymorphic `VarHandle` READ mode as what it actually is
+/// — one field load — instead of a native call.
+///
+/// The funnel route for `VH.get(receiver)` is: build a `NativeContextImpl`,
+/// record a thread transition, run `varhandle_get`'s access-shape cascade,
+/// **allocate a wrapper object** for the erased `Object` return, then unbox it
+/// again against the call site's descriptor and throw the wrapper away. That
+/// round trip is ~40% of a `VarHandle.get`, and netty pays it twice per
+/// `ByteBuf.writeByte` through `ensureAccessible()` -> `RefCnt.isLiveNonVolatile`.
+///
+/// # What it refuses, and why each refusal matters
+///
+/// * **Anything but a read mode.** `set`/CAS/`getAndAdd` mutate, and the
+///   write-side semantics (`safeConstructPutInt`, the ordered stores) live in
+///   the native.
+/// * **Any handle the side table does not describe as a resolved instance
+///   field** — `varhandle_instance_field_plan` answers `None` for static,
+///   array-element, byte-array/ByteBuffer-view and `SegmentVarHandle`
+///   handles, and for one whose slot is still unresolved (the native resolves
+///   and memoises it, so the second call qualifies).
+/// * **A boxed primitive reaching a reference return, or the reverse.** That
+///   is precisely the shape `unbox_poly_return_checked`'s W6-1 rule turns
+///   into a `WrongMethodTypeException`; declining hands it back to the funnel
+///   rather than reimplementing the rule here.
+///
+/// Every refusal is a fall-through to the existing dispatch, so the worst
+/// case is the cost that was already being paid.
+unsafe fn try_varhandle_instance_field_read(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    thread: &mut JvmThread,
+) -> Option<i64> {
+    if !matches!(
+        info.method_name,
+        "get" | "getVolatile" | "getOpaque" | "getAcquire"
+    ) {
+        return None;
+    }
+    // [VarHandle, receiver] and nothing else: a coordinate-carrying access
+    // (array index, byte offset) is not an instance-field read.
+    if args_slice.len() != 2 {
+        return None;
+    }
+    let vh_raw = args_slice[0] as u64;
+    let recv_raw = args_slice[1] as u64;
+    if vh_raw == 0 || recv_raw == 0 {
+        return None;
+    }
+    let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
+    let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
+    // The GC-stable key `vh_meta_get` files the handle under. Mirrors
+    // `NativeContextImpl::identity_hash_code`, including the displaced-hash
+    // consultation a thin-locked or inflated header needs.
+    let heap = &vm.mem.heap;
+    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
+        heap.next_identity_hash()
+    });
+    let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
+    // Reference/primitive agreement between the variable and the call site.
+    // `info.return_type` is the site's own descriptor return, which is what
+    // the funnel would have unboxed against.
+    let site_ret = info.return_type;
+    let site_is_ref = matches!(site_ret, b'L' | b'[');
+    let plan_is_ref = plan.value_desc == b'L';
+    if site_is_ref != plan_is_ref || (!site_is_ref && site_ret != plan.value_desc) {
+        return None;
+    }
+    // Same read `NativeContextImpl::get_field` performs, minus the class-id
+    // and descriptor-cache round trip: the declared descriptor is already on
+    // the plan, straight from the handle's own metadata.
+    let receiver = heap.load_and_forward(receiver);
+    let value = heap.get_field_as(receiver, plan.field_index as usize, plan.value_desc);
+    Some(match value {
+        Value::Int(v) => v as i64,
+        Value::Long(v) => v,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Double(d) => d.to_bits() as i64,
+        Value::Object(Some(obj)) => {
+            // Object-return handoff root, same contract as every other JIT
+            // native fast path (see `jit_integer_value_of_direct`): the
+            // reference is live only in a register until the caller stores
+            // it, so it has to be reachable across that window.
+            thread.native_pending_return = Some(obj);
+            obj.as_ptr() as i64
+        }
+        Value::Object(None) => 0,
+        // A slot whose storage tag disagrees with the declared descriptor is
+        // exactly what `get_field_as` exists to normalise; anything still
+        // unexpected here goes back to the funnel rather than being guessed at.
+        _ => return None,
     })
 }
 
