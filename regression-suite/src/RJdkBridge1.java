@@ -1,3 +1,4 @@
+import java.text.Normalizer;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -1920,7 +1921,29 @@ public class RJdkBridge1 {
                 "String.join must carry an element's surrogate, got charAt(1)="
                         + Integer.toHexString(js.charAt(1)));
 
-        sectionEnd("surrog", 29);
+        // Normalizer runs its input through a host-language normalizer whose
+        // input type cannot hold a lone surrogate at all. The mixed row is the
+        // one that matters: a decomposed e-acute on EACH side of the lone unit
+        // must compose independently, which is only true if the lone unit is
+        // treated as a run boundary rather than as text.
+        step("surrog", "Normalizer.normalize with a lone surrogate");
+        String nz = Normalizer.normalize(LONE_HI, Normalizer.Form.NFC);
+        check(nz.length() == 3 && nz.charAt(1) == 0xD800,
+                "normalize must pass an unpaired surrogate through, got charAt(1)="
+                        + Integer.toHexString(nz.charAt(1)));
+        check(Normalizer.isNormalized(LONE_HI, Normalizer.Form.NFC),
+                "a lone surrogate is unassigned and composes with nothing, so it IS normalized");
+
+        step("surrog", "Normalizer composes the runs either side of a lone surrogate");
+        String mixed = new String(new char[] {'e', 0x0301, (char) 0xD800, 'e', 0x0301});
+        String mz = Normalizer.normalize(mixed, Normalizer.Form.NFC);
+        check(mz.length() == 3 && mz.charAt(0) == 0x00E9 && mz.charAt(1) == 0xD800
+                        && mz.charAt(2) == 0x00E9,
+                "both runs must compose to U+00E9 with the surrogate intact between them");
+        check(!Normalizer.isNormalized(mixed, Normalizer.Form.NFC),
+                "isNormalized must answer for the runs, not skip them");
+
+        sectionEnd("surrog", 33);
     }
 
     static final int SFF = 15;
