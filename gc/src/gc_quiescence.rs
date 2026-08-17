@@ -1937,6 +1937,140 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     *dests = to;
 }
 
+/// Report a USE of a reference whose object the collector moved and whose
+/// address has since been handed out again — see `VmHeap::stale_use_verdict`
+/// for why that predicate and not the vacated ledger.
+///
+/// The Rust backtrace is the payload: it names the VM code that still held the
+/// address, which is the one thing every other instrument in this family has
+/// been unable to say.
+#[cold]
+pub fn report_stale_use(
+    addr: usize,
+    moved_to: usize,
+    class_at_moved_to: u32,
+    class_at_addr: u32,
+    site: &'static str,
+) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        moved_to = format!("{moved_to:#x}"),
+        class_at_moved_to,
+        class_at_addr,
+        site,
+        backtrace = %std::backtrace::Backtrace::force_capture(),
+        "a STALE reference is being USED: the collector moved this object to `moved_to`, the \
+         allocator has since re-issued the address, and the object now there is of a different \
+         class. The backtrace names the VM code still holding it."
+    );
+}
+
+/// `vacated address -> (where the object went, its class there)`, kept for the
+/// whole run.
+///
+/// # Why a SECOND ledger, and why this one keeps history
+///
+/// The exact ledger above is exact precisely because [`note_allocated`] drops
+/// an address the instant it is re-issued — and that is why every use-site
+/// detector built on it reports ZERO on a failing run. A stale holder is
+/// INVISIBLE until re-issue (until then it reads the zeroed corpse and nothing
+/// looks wrong) and the exact ledger has forgotten the address by the time the
+/// damage becomes visible. The two windows do not overlap.
+///
+/// This one keeps the history, and uses the CLASS as the discriminator: if the
+/// object now at the address is not the class of the object that moved away,
+/// the holder is naming the wrong object. Equal classes are declined rather
+/// than guessed — a same-class re-issue is real but indistinguishable here, and
+/// guessing is what made the first vacated-frames instrument manufacture eight
+/// findings a run.
+///
+/// Bounded and flag-gated: one entry per relocated object is far too much to
+/// carry on a production run.
+static MOVED_HISTORY: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, (usize, u32)>>> =
+    parking_lot::RwLock::new(None);
+
+const MOVED_HISTORY_MAX: usize = 2_000_000;
+
+/// Record one slide's `from -> (to, class at to)` pairs.
+pub fn record_moved_history(pairs: &[(usize, usize, u32)]) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    let mut g = MOVED_HISTORY.write();
+    let map = g.get_or_insert_with(Default::default);
+    if map.len() + pairs.len() > MOVED_HISTORY_MAX {
+        map.clear();
+    }
+    for (from, to, class_at_to) in pairs {
+        map.insert(*from, (*to, *class_at_to));
+    }
+}
+
+/// Is `addr` a reference to an object the collector moved away, whose space has
+/// since been handed out to an object of a DIFFERENT class?
+///
+/// Returns `(moved_to, class_at_moved_to, class_at_addr)`. Reads the class id
+/// straight out of the header at `addr` — it is at offset 0 by the layout
+/// contract every JIT type guard also relies on — so this is callable from any
+/// site that has a reference and no heap handle.
+pub fn stale_use_verdict(addr: usize) -> Option<(usize, u32, u32)> {
+    if !vacated_frames_enabled() || addr == 0 || addr % 8 != 0 {
+        return None;
+    }
+    let (to, class_at_to) = {
+        let g = MOVED_HISTORY.read();
+        *g.as_ref()?.get(&addr)?
+    };
+    // SAFETY: `addr` is an address a live reference names and the caller is
+    // about to use it as an object; the first four header bytes are mapped
+    // managed memory whatever they contain.
+    let here = unsafe { std::ptr::read_unaligned(addr as *const u32) };
+    (here != class_at_to).then_some((to, class_at_to, here))
+}
+
+/// Report a USE of such a reference, with the Rust caller chain — the one thing
+/// every other instrument in this family has been unable to say.
+#[cold]
+pub fn report_stale_use(
+    addr: usize,
+    moved_to: usize,
+    class_at_moved_to: u32,
+    class_at_addr: u32,
+    site: &'static str,
+) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        moved_to = format!("{moved_to:#x}"),
+        class_at_moved_to,
+        class_at_addr,
+        site,
+        backtrace = %std::backtrace::Backtrace::force_capture(),
+        "a STALE reference is being USED: the collector moved this object to `moved_to`, the          allocator has since re-issued the address, and the object now there is of a different          class. The backtrace names the VM code still holding it."
+    );
+}
+
+/// [`stale_use_verdict`] + [`report_stale_use`], for a use site that only wants
+/// one call.
+#[inline(always)]
+pub fn check_stale_use(addr: usize, site: &'static str) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    if let Some((to, cto, chere)) = stale_use_verdict(addr) {
+        report_stale_use(addr, to, cto, chere, site);
+    }
+}
+
 /// Addresses the per-bci local-liveness filter kept OUT of a root snapshot,
 /// with the frame that held them.
 ///

@@ -5985,6 +5985,23 @@ impl ZgcRealHeap {
                 reloc.insert(*from, *to);
             }
         }
+        // `CRATONVM_DBG_VACATED_FRAMES`: the same pairs with the class each
+        // object has at its DESTINATION, kept for the whole run so a use of the
+        // vacated address can still be judged after the allocator has handed
+        // the space out again. See `gc_quiescence::MOVED_HISTORY`.
+        if crate::gc_quiescence::vacated_frames_enabled() {
+            let classed: Vec<(usize, usize, u32)> = pairs
+                .iter()
+                .map(|(from, to)| {
+                    (
+                        *from,
+                        *to,
+                        self.header_ref(*to as *mut u8).class_id.as_u32(),
+                    )
+                })
+                .collect();
+            crate::gc_quiescence::record_moved_history(&classed);
+        }
 
         if unwalkable > 0 {
             tracing::error!(
