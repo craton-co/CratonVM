@@ -417,6 +417,7 @@ impl ValueStack {
         }
         if cv.is_object() {
             if let Some(ptr) = cv.as_object_ptr() {
+                cratonvm_gc::gc_quiescence::check_stale_use(ptr as usize, "operand stack push");
                 if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(ptr as usize) {
                     Self::report_vacated_push(&Value::Object(None), moved_to);
                 }
@@ -430,6 +431,7 @@ impl ValueStack {
             return;
         }
         if let Value::Object(Some(o)) = value {
+            cratonvm_gc::gc_quiescence::check_stale_use(o.as_ptr() as usize, "operand stack push");
             if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(o.as_ptr() as usize) {
                 Self::report_vacated_push(value, moved_to);
             }

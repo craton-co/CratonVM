@@ -1641,6 +1641,63 @@ fn sig_init_verify_cert(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     sig_init_verify(ctx, &[Value::Object(Some(this)), key])
 }
 
+/// Route an `update()` payload: straight to an application `SignatureSpi` when
+/// this `Signature` wraps one, otherwise into the accumulator that
+/// `drive_real_signature_spi` / `drive_user_spi` flush at `sign()`/`verify()`.
+///
+/// A provider's SPI has to SEE the updates as they happen. `SignatureSpi`
+/// implementations key real behaviour off "am I in the middle of a message":
+/// BouncyCastle's ML-DSA and SLH-DSA services refuse `engineSetParameter` with
+/// `ProviderException: cannot call setParameter in the middle of update`, and
+/// with every byte withheld until `sign()` the signer never was in the middle
+/// of one, so the refusal never came
+/// (`SignatureSetParameterTest.testSetParameterMidUpdateStillRejected`).
+///
+/// Buffering stays for this VM's own engines, where nothing can observe the
+/// difference. The two paths compose rather than race: which one a payload
+/// takes is decided by whether an SPI is attached, an SPI is attached at
+/// `initSign`/`initVerify` and never detached, and `drive_user_spi` flushes
+/// any accumulator content BEFORE asking the SPI for the answer — so bytes
+/// buffered before an SPI existed still reach it in order.
+fn sig_append_or_forward(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    bytes: &[u8],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let Some(spi) = sig_user_spi_obj(ctx, this) else {
+        append_data(ctx, this, bytes);
+        return Ok(());
+    };
+    // Record an EMPTY payload rather than nothing at all. `take_data` reads the
+    // accumulator's presence as "this receiver was initialised through this
+    // registrar" and raises `SignatureException: object not initialized` on a
+    // miss, and for the paths where `clear_data` does not run at init time the
+    // entry was being created as a side effect of the first `append_data`.
+    // Forwarding without this left `sign()` on an otherwise healthy delegated
+    // signer refusing itself — measured as five `RuntimeOperatorException:
+    // exception obtaining signature` in `cms`.
+    append_data(ctx, this, &[]);
+    let pin = ctx.pin_native_root(spi);
+    let arr = alloc_byte_array(ctx, bytes);
+    let spi = ctx.read_native_pin(pin, spi);
+    let result = user_spi_call(
+        ctx,
+        spi,
+        "engineUpdate",
+        "([BII)V",
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(bytes.len() as i32),
+        ],
+    );
+    ctx.unpin_native_roots(pin);
+    result.map(|_| ())
+}
+
 fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     // `Signature.update` DECLARES `SignatureException`, and HotSpot raises it
@@ -1654,7 +1711,7 @@ fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
     };
-    append_data(ctx, this, &[b]);
+    sig_append_or_forward(ctx, this, &[b])?;
     Ok(None)
 }
 
@@ -1669,7 +1726,7 @@ fn sig_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     require_initialized_for_update(ctx, this)?;
     if let Some(Value::Object(Some(arr))) = args.get(1) {
         let buf = read_byte_array_full(ctx, *arr);
-        append_data(ctx, this, &buf);
+        sig_append_or_forward(ctx, this, &buf)?;
     }
     Ok(None)
 }
@@ -1693,7 +1750,7 @@ fn sig_update_bytes_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             _ => 0,
         };
         let buf = read_byte_array_range(ctx, *arr, off, len);
-        append_data(ctx, this, &buf);
+        sig_append_or_forward(ctx, this, &buf)?;
     }
     Ok(None)
 }

@@ -13,8 +13,9 @@ compression leaf made native it is **1047 s**, and the isolated kernel improves
 
 What is deliberately **not** claimed: `pqc.crypto.test.AllTests` is not fixed,
 and the decomposition below shows why no single-algorithm fix could have fixed
-it. Two costs the profile exposed are handed to their own pages rather than
-carried here.
+it. **`pqc.jcajce.provider` is not resolved either** — it exceeds a 7200 s cap
+on both arms (HotSpot: 271 s) and keeps its own section below. Two costs the
+profile exposed are handed to their own pages rather than carried here.
 
 Filed originally as: *`pqc.crypto.lms.AllTests` / `pqc.crypto.test.AllTests`
 exceed even a 10x timeout — confirmed CPU-bound, not deadlocked.*
@@ -360,6 +361,30 @@ These are ASN.1 parsers reached once per signature. At 628–884 invocations
 inside a 1047 s run dominated by millions of hash blocks they cannot be
 material, so they are recorded rather than chased — but the verdict comes from
 the invocation counts, not from the microbench's `hot_but_stuck=0`.
+
+## The third class this page owns: `pqc.jcajce.provider` is NOT resolved
+
+Handed over by the residual sweep as Residual 0. Measured on both arms with a
+**7200 s** cap — double the budget the original report used:
+
+| arm | result |
+|---|---|
+| HotSpot 25 | 271 s |
+| CratonVM, unmodified | **rc=124 at 7200 s** |
+| CratonVM, +fix | **rc=124 at 7200 s** |
+
+So this class does **not** finish inside two hours either way, and the SHA-256
+intrinsic does not rescue it. That is consistent with the decomposition above:
+`pqc.jcajce.provider` exercises ML-KEM / ML-DSA, which are SHAKE/Keccak and
+polynomial arithmetic, not SHA-256.
+
+**It is slow rather than stuck, but that is an observation and not a proof.**
+Its log had emitted 43 test verdicts (`......F..........F...`) when the cap
+fired, so it was still making forward progress — it is not wedged on the first
+test. What this page cannot say is that it *terminates*: nothing here ran it to
+completion, and an `rc=124` never distinguishes "blocked" from "slower than the
+budget". Unlike `lms.AllTests`, which was run to a real `OK (29 tests)`, this
+one stays open.
 
 ## What is NOT claimed
 
