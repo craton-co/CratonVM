@@ -411,6 +411,20 @@ impl ValueStack {
     }
 
     #[inline(always)]
+    fn check_vacated_compact(cv: &CompactValue) {
+        if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+            return;
+        }
+        if cv.is_object() {
+            if let Some(ptr) = cv.as_object_ptr() {
+                if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(ptr as usize) {
+                    Self::report_vacated_push(&Value::Object(None), moved_to);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
     fn check_vacated_push(value: &Value) {
         if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
             return;
@@ -483,6 +497,7 @@ impl ValueStack {
                 message: "operand stack overflow".to_string(),
             });
         }
+        Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
@@ -507,6 +522,11 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_compact(&mut self, cv: CompactValue) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_compact");
+        // Same check as the `Value` pushes, decoded from the compact form. This
+        // is the path `dup`, a local reload and the cached field/return
+        // producers take, so leaving it out would blind the instrument to
+        // exactly the values that reach a `checkcast` without touching a local.
+        Self::check_vacated_compact(&cv);
         // Raw compact push: the bits alone cannot distinguish a collision-long
         // from a tagged value, so mark UNKNOWN (safe fallback). Genuine long/
         // double producers call push_long/push_double instead.
