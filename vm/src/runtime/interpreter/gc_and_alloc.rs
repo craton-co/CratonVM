@@ -2754,24 +2754,131 @@ pub(super) fn gc_alloc_object(
         shared.register_finalizable(obj.as_ptr() as usize); // Cast: GC object pointer to address
     }
 
-    // Initialize primitive-typed instance fields to their JVM default values.
-    // Zero-initialized memory reads as Object(None) due to Rust enum layout,
-    // which is correct for reference fields (null). But int/long/float/double
-    // fields need explicit initialization to Int(0)/Long(0)/Float(0.0)/Double(0.0).
+    // Write the JVM default (JVMS §2.3 / §4.12.5) into EVERY instance field --
+    // reference fields included. Zero-initialized memory does not read back as
+    // any of those defaults: after `Value::Object` gained its `NonNull` niche
+    // the all-zero 16-byte slot decodes as `Int(0)`, so `null` has to be
+    // written just as `Int(0)`/`Long(0)`/`Float(0.0)`/`Double(0.0)` do.
+    // (The function keeps its historical name; see its doc comment.)
     init_primitive_fields(shared, obj, class_id);
 
     Ok(obj)
 }
 
-/// Initialize primitive-typed instance fields to their JVM default values.
+/// The JVM default value (JVMS §2.3 table, §4.12.5) for a field whose
+/// descriptor starts with `desc_first`.
 ///
-/// Zero-initialized heap memory decodes as `Object(None)` via `std::ptr::read::<Value>()`.
-/// This is correct for reference-typed fields (default null per JVM spec §2.3), but
-/// int/boolean/byte/char/short fields must be `Int(0)`, long fields `Long(0)`,
-/// float fields `Float(0.0)`, and double fields `Double(0.0)`.
+/// Total, by construction: an unrecognised or malformed byte answers `null`,
+/// which is the same fall-open
+/// `cratonvm_gc::heap::default_value_for_descriptor` +
+/// `alloc_object_with_descriptors` take together
+/// (`.unwrap_or(Value::Object(None))`), so the two allocation entry points
+/// cannot disagree about a broken descriptor.
 ///
-/// We walk the class hierarchy to find all primitive instance fields and write
-/// the proper typed zero value to their heap slots.
+/// Split out of [`init_primitive_fields`]' hot loop so the mapping is
+/// testable without a `SharedVm` and a populated class store, and so the
+/// JIT's byte-for-byte duplicate of that loop
+/// (`vm/src/jit/helpers.rs::jit_init_primitive_fields`) can be collapsed onto
+/// one table — see `G56-1` NOMINATION 1. `#[inline]`, so the split costs the
+/// allocation path nothing.
+#[inline]
+pub fn jvm_default_for_descriptor(desc_first: u8) -> Value {
+    match desc_first {
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Value::Int(0),
+        b'J' => Value::Long(0),
+        b'F' => Value::Float(0.0),
+        b'D' => Value::Double(0.0),
+        // Reference (`L`), array (`[`), and every malformed or unrecognised
+        // descriptor byte: null, WRITTEN. See `init_primitive_fields` for why
+        // this cannot be left to the allocator's zero fill.
+        _ => Value::Object(None),
+    }
+}
+
+/// Write the JVM default value (JVMS §2.3, §4.12.5) into every *instance*
+/// field of a freshly allocated object: `Int(0)` for `I B C S Z`, `Long(0)`
+/// for `J`, `Float(0.0)` for `F`, `Double(0.0)` for `D`, and
+/// **`Object(None)` for `L`/`[` and for any descriptor byte this match does
+/// not recognise**.
+///
+/// The name is historical — it predates the reference arm and is spelled at
+/// eleven call sites outside this file, so renaming it is a wider edit than
+/// the fix deserves. Read it as `init_default_fields`.
+///
+/// # Why the reference arm is a WRITE and not a skip (G56-1)
+///
+/// Until 2026-08-17 the `L`/`[` arm was `_ => None` carrying the comment
+/// *"Reference types: already `Object(None)` from zero memory"*. That premise
+/// was true when it was written and has been false since `Value::Object`
+/// gained its `NonNull` niche. `Value` is `#[repr(u32)]` with `Int = 0` and
+/// `Object = 4` (`types/src/value.rs`), so:
+///
+/// | slot bytes | decodes as |
+/// |---|---|
+/// | all zero | `Value::Int(0)` — tag word 0 |
+/// | tag word 4, payload64 0 | `Value::Object(None)` |
+///
+/// `gen_heap::read_slot` says the same thing in its own doc: *"there is no
+/// 'zeroed slot reads as null' shortcut"*. So a `null` default cannot be
+/// obtained from the allocator's zero fill; the tag word has to be stored.
+/// This is not an optimisation that was skipped, it is the one write that
+/// makes the slot mean what the class declares.
+///
+/// MEASURED, `target-rel4` (`cb2ade4fd`), `--jdk-only`,
+/// `CRATONVM_DBG_COERCION=1`, 16 vectors: **1,105 of 1,120** descriptor-
+/// coercion events were `primitive-into-reference`/`read`/`L`|`[`/`Int(0)`,
+/// i.e. the first descriptor-aware read of a reference field this loop had
+/// left as raw zero. Two clusters that were opened as suspected defects —
+/// `ReferenceQueue.head` (736) and `Properties.defaults` (243) — are that
+/// shape and nothing else (`G49-1`).
+///
+/// # Every reader already agrees on the answer, which is why this is safe
+///
+/// SOURCE-VERIFIED, all four readers of a never-written reference slot:
+///
+/// * the interpreter's own `getfield` (`opcodes.rs`) carries a local fixup,
+///   `Value::Int(0) | Value::Long(0) => value = Value::Object(None)`, for
+///   exactly this slot shape; an `Object(None)` falls through its `_ => {}`;
+/// * the JIT's inline `getfield` (`jit/src/x64/bytecode_walk.rs`) loads the
+///   8-byte payload at `FIELD_CELL_PAYLOAD64_OFFSET` and never looks at the
+///   tag — zero either way;
+/// * the descriptor-aware pair (`heap::coerce_field_value_for_slot`) turns
+///   `Int(0)` at an `L` slot into `Object(None)` *and reports the loss*;
+///   handed an `Object(None)` it passes it through silently;
+/// * `values_equal_for_cas` (`vm_exec.rs`) equates `Object(None)` and
+///   `Int(0)` in **both** directions, so no CAS loop changes outcome.
+///
+/// The collector agrees too: `gen_heap::for_each_ref_slot`'s legacy arm
+/// matches `Value::Object(Some(_))`, which neither shape satisfies.
+///
+/// So the write changes no answer anywhere — it removes a mis-tagged
+/// intermediate state that four separate readers were each repairing
+/// locally, and with it 98.7% of the G30 instrument's population.
+///
+/// # Cost
+///
+/// One extra `VmHeap::set_field` per reference instance field per object.
+/// This lane may not build and so cannot measure the after-cost; the bound is
+/// stated instead. The added store is the *cheapest* store this function
+/// makes: `write_barrier` returns on its first tag test for anything that is
+/// not `Object(Some(_))` (`gen_heap.rs`), there is no SATB pre-barrier on
+/// this path, the class-manager read lock is held once for the whole walk,
+/// and the object body was bump-allocated microseconds earlier so it is
+/// L1-resident. MEASURED (static, `javap -p -s` over the 494 classes
+/// `RJdkHello --jdk-only` loads): instance fields split 361 primitive /
+/// 613 reference, so the store count rises by ~1.7x on that mix. The
+/// *cheaper* option — filling the object body with the `Object(None)`
+/// pattern in the allocator instead of zeroing it — is a `gc/` change and is
+/// nominated in `G56-1`, not taken here.
+///
+/// # Callers
+///
+/// Every one of the eleven call sites (`gc_and_alloc.rs`, `vm_exec.rs` ×8,
+/// `vm_init.rs` ×2) invokes this immediately after `alloc_object` /
+/// `try_alloc_object_full` on an object nothing has written yet. That is now
+/// load-bearing: called on a *populated* object this would null every
+/// reference field. It was harmless before only because the reference arm
+/// did nothing.
 pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassId) {
     let cm = shared.classes.class_manager.read();
     let store = &cm.class_store;
@@ -2784,16 +2891,10 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
                     continue;
                 }
                 let desc_first = f.descriptor.as_bytes().first().copied().unwrap_or(b'L');
-                let default = match desc_first {
-                    b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(0)),
-                    b'J' => Some(Value::Long(0)),
-                    b'F' => Some(Value::Float(0.0)),
-                    b'D' => Some(Value::Double(0.0)),
-                    _ => None, // Reference types: already Object(None) from zero memory
-                };
-                if let Some(val) = default {
-                    shared.mem.heap.set_field(obj, inst_idx, val);
-                }
+                shared
+                    .mem
+                    .heap
+                    .set_field(obj, inst_idx, jvm_default_for_descriptor(desc_first));
                 inst_idx += 1;
             }
             cid = class.superclass;
@@ -5820,4 +5921,205 @@ pub(super) fn run_cleaner_actions_forced(shared: &SharedVm, thread: &mut JvmThre
         None
     });
     run_cleaner_actions_impl(shared, thread, true);
+}
+
+#[cfg(test)]
+mod default_field_init_tests {
+    //! G56-1 — the premise `init_primitive_fields` used to rest on, and the
+    //! behaviours the new reference arm must not move.
+    //!
+    //! The heap tests pin `GcAlgorithm::Generational` deliberately, exactly as
+    //! `root_snapshot_screen_tests` does and for a related reason: the claim
+    //! under test is about the LEGACY 16-byte `Value` cell's decode rule, which
+    //! is a property of `gen_heap::read_slot`. Whether ZGC's and G1's own slot
+    //! encodings answer the same way is a real and separate question, and this
+    //! fixture cannot ask it.
+
+    use super::*;
+    use crate::config::{GcAlgorithm, VmConfig};
+    use crate::vm::SharedVm;
+    use cratonvm_types::ClassId;
+
+    fn generational_vm() -> SharedVm {
+        SharedVm::new(VmConfig {
+            gc_algorithm: GcAlgorithm::Generational,
+            ..VmConfig::default()
+        })
+    }
+
+    /// The JVMS §2.3 default table, spelled out. Byte for byte, so a future
+    /// edit that (say) folds `Z` in with `J` is red here and not in a vector.
+    #[test]
+    fn every_jvm_field_descriptor_gets_its_spec_default() {
+        for b in [b'I', b'B', b'C', b'S', b'Z'] {
+            assert_eq!(
+                jvm_default_for_descriptor(b),
+                Value::Int(0),
+                "the int family (JVMS 2.3.1) all live in Value::Int"
+            );
+        }
+        assert_eq!(jvm_default_for_descriptor(b'J'), Value::Long(0));
+        assert_eq!(jvm_default_for_descriptor(b'F'), Value::Float(0.0));
+        assert_eq!(jvm_default_for_descriptor(b'D'), Value::Double(0.0));
+        // The arm this record exists for. Before 2026-08-17 both of these
+        // answered "no write needed" and the slot kept its raw zero.
+        assert_eq!(
+            jvm_default_for_descriptor(b'L'),
+            Value::Object(None),
+            "a reference field's default is null, and null has to be WRITTEN"
+        );
+        assert_eq!(
+            jvm_default_for_descriptor(b'['),
+            Value::Object(None),
+            "an array field is a reference field"
+        );
+    }
+
+    /// The whole byte space, against the `gc` crate's own table.
+    ///
+    /// `alloc_object_with_descriptors` is the other allocation entry point that
+    /// writes defaults, and it composes `heap::default_value_for_descriptor(b)`
+    /// with `.unwrap_or(Value::Object(None))`. If the two ever disagree, an
+    /// object's field defaults depend on which allocator ran — the class of
+    /// divergence this record was opened to close. Sweeping all 256 bytes also
+    /// covers the malformed-descriptor fall-open, which
+    /// `f.descriptor.as_bytes().first()` can genuinely produce.
+    #[test]
+    fn the_two_allocation_entry_points_agree_on_all_256_descriptor_bytes() {
+        for b in 0u8..=255 {
+            let theirs =
+                cratonvm_gc::heap::default_value_for_descriptor(b).unwrap_or(Value::Object(None));
+            assert_eq!(
+                jvm_default_for_descriptor(b),
+                theirs,
+                "descriptor byte {b:#04x}: init_primitive_fields and \
+                 alloc_object_with_descriptors must not disagree"
+            );
+        }
+    }
+
+    /// The expired premise, asserted directly.
+    ///
+    /// The comment this record removes said reference slots were "already
+    /// Object(None) from zero memory". `Value` is `#[repr(u32)]` with `Int = 0`
+    /// and `Object = 4`, so the all-zero cell decodes as `Int(0)`. If the first
+    /// assertion below ever fails in the direction of null, the niche was
+    /// reverted and the reference write becomes redundant rather than
+    /// load-bearing — which is worth being told.
+    #[test]
+    fn zero_memory_does_not_decode_as_null_which_is_why_the_write_exists() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Int(0),
+            "a freshly allocated, never-written slot reads as Int(0) -- the \
+             R-niche decode rule (gen_heap::read_slot), and the entire reason \
+             1,105 of 1,120 instrument events existed"
+        );
+        assert_ne!(
+            heap.get_field(obj, 0),
+            Value::Object(None),
+            "if this ever passes, the zero-bits-are-null shortcut is back"
+        );
+
+        heap.set_field(obj, 0, Value::Object(None));
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Object(None),
+            "and an EXPLICIT null is a different bit pattern that reads back as \
+             null -- so the two states are distinguishable, and writing one is \
+             not a no-op"
+        );
+    }
+
+    /// ...and the fix changes no answer, which is why it is safe.
+    ///
+    /// The descriptor-aware read is the one that was reporting the loss. Both
+    /// slot shapes answer `Object(None)` through it; only one of them fires the
+    /// G30 instrument on the way. That is the whole delta: signal, not
+    /// behaviour.
+    #[test]
+    fn a_raw_zero_and_an_explicit_null_read_identically_through_the_descriptor() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+
+        // slot 0: left as the allocator produced it (the BEFORE state).
+        // slot 1: written the way init_primitive_fields now writes it (AFTER).
+        heap.set_field(obj, 1, Value::Object(None));
+
+        for (slot, what) in [(0usize, "raw zero"), (1usize, "explicit null")] {
+            for desc in [b'L', b'['] {
+                assert_eq!(
+                    heap.get_field_as(obj, slot, desc),
+                    Value::Object(None),
+                    "{what} at a '{}' slot must read as null either way",
+                    desc as char,
+                );
+            }
+        }
+    }
+
+    /// `HashMap.table` must still degrade to null.
+    ///
+    /// Pinned in `gc/src/heap.rs` by
+    /// `the_hashmap_table_degrade_to_null_is_pinned` against the test-only
+    /// `Heap`; this is the same three values through the LIVE `VmHeap`
+    /// dispatch, so the guarantee is also asserted on the path a running VM
+    /// takes. `HashMap.resize()` reads `(oldTab == null) ? 0 : oldTab.length`,
+    /// so refusing or boxing the store breaks resize outright.
+    #[test]
+    fn the_hashmap_table_degrade_to_null_still_holds_through_vmheap() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let map = heap.alloc_object(ClassId::new(0), 3);
+
+        for capacity in [Value::Int(16), Value::Int(1), Value::Long(64)] {
+            heap.set_field_as(map, 2, capacity, b'[');
+            assert_eq!(
+                heap.get_field(map, 2),
+                Value::Object(None),
+                "a capacity written at an array-descriptor slot must degrade to \
+                 null; {capacity:?} did not"
+            );
+            assert_eq!(heap.get_field_as(map, 2, b'['), Value::Object(None));
+        }
+    }
+
+    /// The `Int(1)` enqueued sentinel must survive default-initialisation.
+    ///
+    /// `Reference.isEnqueued` was just repaired to accept BOTH the synthetic
+    /// `Int(1)` sentinel and a live `ReferenceQueue.ENQUEUED` object (G49-1
+    /// §4). The GC's auto-enqueue in this file writes that sentinel through the
+    /// RAW setter, and default-initialisation now writes `Object(None)` into
+    /// the same slot — earlier, at allocation. This pins the ordering: the
+    /// sentinel is written second and wins, and a reference that was never
+    /// enqueued reads as null rather than as the sentinel.
+    #[test]
+    fn the_enqueued_int_sentinel_outlives_the_default_null_written_at_alloc() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let reference = heap.alloc_object(ClassId::new(0), 3);
+
+        // What init_primitive_fields now does for `queue : LReferenceQueue;`.
+        heap.set_field(reference, 1, jvm_default_for_descriptor(b'L'));
+        assert_ne!(
+            heap.get_field(reference, 1),
+            Value::Int(1),
+            "a never-enqueued reference must not read as enqueued"
+        );
+
+        // What the post-GC auto-enqueue above does.
+        heap.set_field(reference, 1, Value::Int(1));
+        assert_eq!(
+            heap.get_field(reference, 1),
+            Value::Int(1),
+            "the raw sentinel write must still win over the allocation-time \
+             default -- un-fixing isEnqueued's synthetic arm is the failure \
+             this guards"
+        );
+    }
 }

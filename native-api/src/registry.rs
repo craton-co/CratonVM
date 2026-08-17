@@ -2246,6 +2246,22 @@ pub trait NativeInvokeAccess: NativeClassAccess {
     }
 }
 
+/// The descriptor byte that means "do not decode this slot, hand me the bits".
+///
+/// A JVM field descriptor's first byte is always one of `B C D F I J S Z L [`
+/// (JVMS §4.3.2). `0` is none of them and cannot be produced by a well-formed
+/// class file, so it is unambiguous as a sentinel.
+///
+/// It is load-bearing for [`NativeHeapAccess::get_field_raw`]: the descriptor
+/// -aware decode in `gc::heap::coerce_field_value_for_slot` is a `match` on
+/// this byte whose final arm is `_ => value`, so an unrecognised byte returns
+/// the slot verbatim AND — because every coercion-loss report lives inside one
+/// of the recognised arms — reports nothing to the G30 instrument. If a future
+/// arm is ever added for `0`, `get_field_raw` silently stops being raw; that is
+/// why the byte is named here rather than spelled inline at the call, and why
+/// `a_raw_read_uses_a_byte_that_is_not_a_jvm_descriptor` pins it.
+pub const RAW_SLOT_DESCRIPTOR: u8 = 0;
+
 pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Capability boundary: Allocation, roots, object fields, arrays, and strings.
 
@@ -2604,6 +2620,95 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// The caller must ensure it is in range for `obj`'s class; the
     /// implementation MUST bounds-check and MUST NOT write out of range (M4a).
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value);
+
+    /// Read an object field by slot index **without descriptor coercion** —
+    /// the `Value` exactly as it is stored, tag included.
+    ///
+    /// # Why this exists (G52-1 NOMINATION 1, G56-1)
+    ///
+    /// Every other slot-indexed accessor on this trait resolves the field's
+    /// declared descriptor and routes the slot through
+    /// `gc::heap::coerce_field_value_for_slot`: [`get_field`](Self::get_field),
+    /// [`get_field_volatile`](Self::get_field_volatile),
+    /// [`compare_and_swap_field`](Self::compare_and_swap_field), and
+    /// [`get_field_typed`](Self::get_field_typed) with a real descriptor.
+    /// The only non-coercing pair was
+    /// [`get_field_by_name`](Self::get_field_by_name) /
+    /// [`set_field_by_name`](Self::set_field_by_name), which is **name**-keyed:
+    /// it cannot be driven from a slot index at all, and it resolves a shadowed
+    /// field name to the wrong slot. So a native that holds a slot index and
+    /// wants the stored bits — `Object.clone()`, which the JVM specifies as a
+    /// verbatim field copy, and any reader that must tell "never written" from
+    /// "explicitly null" — had no way to ask for them. `Object.clone()` did not
+    /// opt into coercion; the API moved underneath it.
+    ///
+    /// # Contract
+    ///
+    /// An implementation MUST return the slot's stored `Value` unchanged, and
+    /// MUST still bounds-check `index` and fail safe exactly as
+    /// [`get_field`](Self::get_field) does (M4a). "Raw" licenses skipping the
+    /// descriptor decode; it never licenses an out-of-range access. The
+    /// reference must still be canonicalised (forwarded) before the read — a
+    /// raw read of a stale address is not a raw read of the object.
+    ///
+    /// # The default implementation is already raw, on both impls that exist
+    ///
+    /// It routes through [`get_field_typed`](Self::get_field_typed) with
+    /// [`RAW_SLOT_DESCRIPTOR`], which is not a JVM field-descriptor first byte.
+    ///
+    /// * Production (`NativeContextImpl` in the `vm` crate) overrides
+    ///   `get_field_typed` as `heap.get_field_as(obj, index, descriptor)`, and
+    ///   `coerce_field_value_for_slot` dispatches on the descriptor byte with a
+    ///   final `_ => value` arm. A byte outside `J D F I B C S Z L [` therefore
+    ///   returns the slot verbatim and — this is the half that matters for the
+    ///   G30 instrument — fires **no** coercion-loss event. It is also cheaper
+    ///   than [`get_field`](Self::get_field): the descriptor is supplied, so
+    ///   `resolve_field_descriptor_byte_cached` is skipped entirely.
+    /// * Mocks that do not override `get_field_typed` get this trait's default,
+    ///   which ignores the byte and calls `get_field` — already raw there.
+    ///
+    /// An implementor with a cheaper direct route should override this; one
+    /// with none needs to do nothing.
+    fn get_field_raw(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field_typed(obj, index, RAW_SLOT_DESCRIPTOR)
+    }
+
+    /// Write an object field by slot index **without descriptor coercion** —
+    /// the `Value` is stored with the tag the caller handed over.
+    ///
+    /// The store half of [`get_field_raw`](Self::get_field_raw). See that
+    /// method for why the pair exists; the contract is the same, and an
+    /// implementation MUST still bounds-check `index` and MUST NOT write out
+    /// of range (M4a).
+    ///
+    /// # THIS DEFAULT IS NOT RAW. Read before pairing it with a raw read.
+    ///
+    /// There is no typed setter on this trait to lean on the way
+    /// [`get_field_raw`](Self::get_field_raw) leans on
+    /// [`get_field_typed`](Self::get_field_typed), and the only non-coercing
+    /// setter reachable from here — [`set_field_by_name`](Self::set_field_by_name)
+    /// — is name-keyed and cannot be driven from a slot index. The default
+    /// therefore delegates to [`set_field`](Self::set_field), which in the
+    /// production `NativeContextImpl` resolves the descriptor and coerces.
+    /// Overriding it there is a one-line body — `heap.set_field(obj, index,
+    /// value)` after the usual `load_and_forward` — and until that lands this
+    /// method is raw only on impls whose `set_field` was already raw (the test
+    /// mocks).
+    ///
+    /// **Do not pair a raw read with this default in a copy loop.** That
+    /// combination is strictly worse for the G30 instrument than coercing
+    /// both halves: a `read` of `Int(0)` at an `L` slot currently answers
+    /// `Object(None)` and is counted in the benign `read` column, whereas a
+    /// raw read followed by a coercing store hands the `Int(0)` to the setter
+    /// and re-reports it as a **`store`** — the column `gc/src/collector.rs`
+    /// reserves for real defects ("a read that coerces is usually the slot
+    /// repairing a never-initialised tag, a store that coerces has destroyed
+    /// something a writer meant"). G52-1 §1.5 measured that migration at ~24
+    /// events for `native_object_clone` alone. The verbatim-copy callers must
+    /// wait for both halves to be genuinely raw and then switch together.
+    fn set_field_raw(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field(obj, index, value);
+    }
 
     /// Read an object field by name. Resolves the field name to a slot index
     /// by searching the object's class hierarchy. Returns `Value::Object(None)`
@@ -10369,5 +10474,160 @@ mod tests {
                 .is_some(),
             "the permissive registry is unaffected by the other VM's policy"
         );
+    }
+
+    // ----- G56-1: the slot-indexed raw accessors ---------------------------
+    //
+    // `MockNativeContext` overrides neither `get_field_typed` nor
+    // `get_field_raw`/`set_field_raw`, so every test below exercises the trait
+    // DEFAULTS — which is the code this lane added and the code every mock in
+    // the tree will inherit.
+
+    fn fresh_object(ctx: &mut MockNativeContext) -> ObjectRef {
+        match ctx.new_object("java/lang/Object") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock new_object must hand back an object, got {other:?}"),
+        }
+    }
+
+    /// The sentinel has to be a byte no class file can produce.
+    ///
+    /// JVMS §4.3.2: a field descriptor begins with one of `B C D F I J S Z L
+    /// [`. `RAW_SLOT_DESCRIPTOR` must be outside that set, or `get_field_raw`
+    /// would decode the slot as whichever type it collided with — silently, and
+    /// only for slots whose real descriptor differs.
+    #[test]
+    fn the_raw_slot_descriptor_is_not_a_jvm_field_descriptor() {
+        for d in b"BCDFIJSZL[" {
+            assert_ne!(
+                RAW_SLOT_DESCRIPTOR, *d,
+                "the raw sentinel collided with the real descriptor '{}'",
+                *d as char
+            );
+        }
+    }
+
+    /// A raw read hands back the tag that is stored, not a decoded one.
+    ///
+    /// The distinction this accessor exists for is `Int(0)` vs `Object(None)`
+    /// at a slot the class declares `L`: the first is a never-written slot
+    /// (`gen_heap::read_slot`'s R-niche rule), the second is an explicit null.
+    /// Every other slot-indexed reader on the trait collapses them.
+    #[test]
+    fn get_field_raw_hands_back_the_stored_tag_verbatim() {
+        let mut ctx = MockNativeContext::new();
+        let obj = fresh_object(&mut ctx);
+
+        for (slot, stored) in [
+            Value::Int(0),
+            Value::Int(-7),
+            Value::Long(1 << 40),
+            Value::Float(0.5),
+            Value::Double(-2.5),
+            Value::Object(None),
+            Value::Uninitialized,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.set_field(obj, slot, stored);
+            assert_eq!(
+                ctx.get_field_raw(obj, slot),
+                stored,
+                "slot {slot} must read back byte-identically"
+            );
+        }
+
+        // The falsifier: a reader that always answered null, or always
+        // answered the descriptor default, would pass every assertion above
+        // for exactly one of these two and fail for the other.
+        ctx.set_field(obj, 20, Value::Int(0));
+        ctx.set_field(obj, 21, Value::Object(None));
+        assert_ne!(
+            ctx.get_field_raw(obj, 20),
+            ctx.get_field_raw(obj, 21),
+            "a raw read must keep `Int(0)` and `Object(None)` distinguishable -- \
+             that is the entire capability being added"
+        );
+    }
+
+    /// A live reference survives the round trip.
+    ///
+    /// This is the case that makes a verbatim `Object.clone()` possible and the
+    /// one where the coercing pair can do real damage: an `Object(Some(_))`
+    /// sitting in a slot the class declares primitive is truncated to
+    /// `Int(ptr as i32)` by `coerce_field_value_for_slot`, a stale address no
+    /// collector will remap (G52-1 §1.6).
+    #[test]
+    fn the_raw_pair_round_trips_a_live_reference() {
+        let mut ctx = MockNativeContext::new();
+        let src = fresh_object(&mut ctx);
+        let dst = fresh_object(&mut ctx);
+        let payload = fresh_object(&mut ctx);
+
+        ctx.set_field(src, 3, Value::Object(Some(payload)));
+        let copied = ctx.get_field_raw(src, 3);
+        ctx.set_field_raw(dst, 3, copied);
+
+        assert_eq!(
+            ctx.get_field_raw(dst, 3),
+            Value::Object(Some(payload)),
+            "the copy must hold the SAME reference, not a truncated address"
+        );
+    }
+
+    /// The store half is a real store, and it is the one a copy loop uses.
+    ///
+    /// The default delegates to `set_field`; this pins that the delegation
+    /// exists and lands in the same slot the raw reader reads. It does NOT
+    /// claim the production `NativeContextImpl` stores raw — see the method's
+    /// own doc comment, which says the opposite in as many words.
+    #[test]
+    fn set_field_raw_writes_the_slot_the_raw_reader_reads() {
+        let mut ctx = MockNativeContext::new();
+        let obj = fresh_object(&mut ctx);
+
+        ctx.set_field_raw(obj, 5, Value::Long(0x5EED));
+        assert_eq!(ctx.get_field_raw(obj, 5), Value::Long(0x5EED));
+        assert_eq!(
+            ctx.get_field(obj, 5),
+            Value::Long(0x5EED),
+            "the raw and ordinary readers must agree about WHICH slot was written"
+        );
+    }
+
+    /// A two-line verbatim copy, which is the whole point of the pair.
+    ///
+    /// `Object.clone()` is specified as a verbatim field copy. Before these
+    /// accessors existed there was no slot-indexed way to express one from a
+    /// native: `get_field`/`set_field` resolve and coerce, and the only raw
+    /// pair was name-keyed (G52-1 §1.4). This is the loop the follow-up in
+    /// `native-builtins/src/lib.rs` is expected to become.
+    #[test]
+    fn the_raw_pair_expresses_a_verbatim_field_copy() {
+        let mut ctx = MockNativeContext::new();
+        let src = fresh_object(&mut ctx);
+        let dst = fresh_object(&mut ctx);
+
+        // A receiver whose slots hold three tags the descriptor pair would
+        // rewrite: a never-written reference (raw zero), an explicit null, and
+        // a long.
+        let planted = [Value::Int(0), Value::Object(None), Value::Long(-1)];
+        for (i, v) in planted.iter().enumerate() {
+            ctx.set_field(src, i, *v);
+        }
+
+        for i in 0..planted.len() {
+            let v = ctx.get_field_raw(src, i);
+            ctx.set_field_raw(dst, i, v);
+        }
+
+        for (i, v) in planted.iter().enumerate() {
+            assert_eq!(
+                ctx.get_field_raw(dst, i),
+                *v,
+                "slot {i} of the copy diverged from the original"
+            );
+        }
     }
 }
