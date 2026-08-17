@@ -8928,7 +8928,7 @@ fn resolve_native_site(
     // reached with a `ReentrantLock$NonfairSync` receiver, two levels down —
     // and `invoke_or_native` has a specific rule for that walk which has to be
     // reproduced, not approximated. See `resolve_native_owner_for_receiver`.
-    let Some((owner_class, id)) = resolve_native_owner_for_receiver(
+    let Some((owner_class, id, poly_descriptor)) = resolve_native_owner_for_receiver(
         vm,
         &lookup_class,
         receiver_class_id,
@@ -8937,6 +8937,13 @@ fn resolve_native_site(
     ) else {
         return site_refusal::note(4);
     };
+    // A signature-polymorphic entry was resolved under the REGISTRATION
+    // descriptor, not the site's own, so every downstream question about the
+    // registration (`--jdk-only` admission, and the `Debug`/census identity)
+    // has to be asked with that one. `info.descriptor` stays the authority for
+    // argument decode and for the return unboxing, which are call-site
+    // properties.
+    let registered_descriptor: &str = poly_descriptor.unwrap_or(info.descriptor);
     // `Thread.currentThread()` is served from the thread mirror instead of the
     // registered body — see `LeafNativeKind::ThreadCurrentThread` — so it is
     // recognised here rather than claimed at registration. Everything else
@@ -8975,7 +8982,7 @@ fn resolve_native_site(
         vm,
         &owner_class,
         info.method_name,
-        info.descriptor,
+        registered_descriptor,
         callback,
         Some(id),
     ) else {
@@ -8987,6 +8994,7 @@ fn resolve_native_site(
         callback,
         native_id,
         receiver_class_id: guard,
+        poly: poly_descriptor.is_some(),
     })
 }
 
@@ -9030,6 +9038,32 @@ fn resolve_native_site(
 /// the name is used only for the registry lookups, which are name-keyed by
 /// construction.
 ///
+/// # Rule 4 — the signature-polymorphic tail
+///
+/// Rules 1-3 all look the native up under the CALL SITE's descriptor. A
+/// `VarHandle` accessor never has one: `VH.get(holder)` is emitted as
+/// `invokevirtual java/lang/invoke/VarHandle.get:(LHolder;)I`, while the
+/// native is registered under `([Ljava/lang/Object;)Ljava/lang/Object;`. So
+/// every one of those sites used to end here as refusal reason 4 ("no native
+/// for the triple") and pay `invoke_or_native`'s full cascade on every call —
+/// which is what made `VarHandle.get` cost **2.03 µs** against a 3 ns plain
+/// field read, and, through `AbstractByteBuf.ensureAccessible()` ->
+/// `RefCnt.isLiveNonVolatile` -> `VH.get`, made every netty `ByteBuf`
+/// accessor cost ~2.6 µs. See
+/// `docs/known-issues/netty/compression-testhugedecompress-shared-timeout-20260816.md`.
+///
+/// [`vm_exec::invoke_on_class_shared_inner`] already handles the shape, in the
+/// `None` arm of its hierarchy resolution — i.e. exactly where rules 1-3
+/// arrive with nothing. This reproduces that arm's lookup order (base class
+/// first, then the exact receiver class) using the same shared descriptor
+/// list, and reports `poly = true` so the dispatch side runs
+/// `unbox_poly_return_checked` rather than `coerce_native_return`: the erased
+/// `Object` return has to be unboxed against the call site's own descriptor.
+///
+/// `MethodHandle.invoke`/`invokeExact`/`invokeBasic` do NOT reach here —
+/// `site_name_is_special_cased` refuses them one level up, and this path
+/// deliberately does not widen that.
+///
 /// Cold: fill time only.
 fn resolve_native_owner_for_receiver(
     vm: &SharedVm,
@@ -9037,10 +9071,10 @@ fn resolve_native_owner_for_receiver(
     receiver_class_id: Option<ClassId>,
     info: &JitInvokeInfo,
     walk_supers: bool,
-) -> Option<(String, cratonvm_native_api::NativeMethodId)> {
+) -> Option<(String, cratonvm_native_api::NativeMethodId, Option<&'static str>)> {
     let registry = &vm.natives.native_methods;
     if let Some(id) = registry.resolve_id(dispatch_class, info.method_name, info.descriptor) {
-        return Some((dispatch_class.to_string(), id));
+        return Some((dispatch_class.to_string(), id, None));
     }
     if !walk_supers {
         // `invoke_or_native` looks the native up on `effective_class` and
@@ -9078,12 +9112,45 @@ fn resolve_native_owner_for_receiver(
         {
             // Rule 3: bytecode here ends the walk, and only a native declared
             // on THIS parent may override it.
-            return parent_native.map(|id| (parent.name.to_string(), id));
+            return parent_native.map(|id| (parent.name.to_string(), id, None));
         }
         if let Some(id) = parent_native {
-            return Some((parent.name.to_string(), id));
+            return Some((parent.name.to_string(), id, None));
         }
         cid = parent_id;
+    }
+    drop(cm);
+    // Rule 4 — the signature-polymorphic tail (see this function's doc).
+    resolve_signature_polymorphic_native_site(vm, dispatch_class, info)
+}
+
+/// Resolve a `VarHandle` access-mode call site to the erased native the
+/// registry actually holds, mirroring `invoke_on_class_shared_inner`'s
+/// signature-polymorphic arm: base class first, then the exact receiver class.
+///
+/// `None` for anything that is not a `VarHandle` receiver carrying a
+/// polymorphic method name, which keeps every other site on the behaviour it
+/// had. `prefers_exact_signature_polymorphic_receiver` names only
+/// `java/lang/foreign/DowncallHandle`, a `MethodHandle` receiver, so the
+/// exact-first ordering that predicate selects cannot apply here.
+fn resolve_signature_polymorphic_native_site(
+    vm: &SharedVm,
+    dispatch_class: &str,
+    info: &JitInvokeInfo,
+) -> Option<(String, cratonvm_native_api::NativeMethodId, Option<&'static str>)> {
+    if !crate::vm::vm_exec::is_var_handle_signature_polymorphic_receiver(dispatch_class)
+        || !crate::vm::vm_exec::is_signature_polymorphic_method_name(info.method_name)
+    {
+        return None;
+    }
+    let registry = &vm.natives.native_methods;
+    const BASE: &str = "java/lang/invoke/VarHandle";
+    for owner in [BASE, dispatch_class] {
+        for poly_desc in crate::vm::vm_exec::SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS {
+            if let Some(id) = registry.resolve_id(owner, info.method_name, poly_desc) {
+                return Some((owner.to_string(), id, Some(poly_desc)));
+            }
+        }
     }
     None
 }
@@ -9242,6 +9309,17 @@ struct NativeSiteCache {
     /// so a site that goes polymorphic falls out to the generic dispatcher
     /// rather than calling the wrong body.
     receiver_class_id: Option<u32>,
+    /// The entry was resolved through rule 4 — a signature-polymorphic
+    /// `VarHandle` access mode, whose native is registered with an erased
+    /// `Object[]`/`Object` signature that has nothing to do with the call
+    /// site's own descriptor.
+    ///
+    /// The dispatch side must then unbox the erased result against the CALL
+    /// SITE descriptor (`unbox_poly_return_checked`), exactly as
+    /// `invoke_on_class_shared_inner` does. `coerce_native_return` — what
+    /// every other entry uses — would hand a boxed `Integer` back into an
+    /// `int` return slot.
+    poly: bool,
 }
 
 // Thread-local map from [`JitSiteKey`] -> cached JIT entry.
@@ -10848,6 +10926,24 @@ unsafe fn try_jit_site_cached_native_dispatch(
         crate::vm::safe_native_call_prevalidated_objects(vm, thread, entry.callback, &values)
     };
     let result = match called {
+        // A signature-polymorphic native returns the erased `Object` the
+        // registration promises, so it needs the call site's own descriptor
+        // applied — including the `WrongMethodTypeException` rule
+        // `unbox_poly_return_checked` owns. That call can itself fail (it
+        // raises the exception), so it is folded into the same error arm the
+        // native's own failure takes.
+        Ok(value) if entry.poly => {
+            match crate::vm::unbox_poly_return_checked(
+                vm,
+                thread,
+                value,
+                info.descriptor,
+                info.method_name,
+            ) {
+                Ok(unboxed) => crate::vm::coerce_native_return(unboxed, info.descriptor),
+                Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+            }
+        }
         Ok(value) => crate::vm::coerce_native_return(value, info.descriptor),
         Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
     };

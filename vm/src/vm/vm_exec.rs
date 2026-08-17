@@ -1900,6 +1900,65 @@ fn varhandle_reference_return_mismatch(
     Some(actual)
 }
 
+/// The descriptors a signature-polymorphic `MethodHandle` / `VarHandle`
+/// native is actually registered under.
+///
+/// A polymorphic call site names its OWN descriptor (`(LFoo;)I`), which is
+/// never the registration descriptor, so a registry lookup by the call-site
+/// triple always misses. The dispatch tail below re-probes with these three,
+/// in this order, and so does the JIT's per-call-site native cache
+/// (`jit::helpers::resolve_native_owner_for_receiver`) — the constant is
+/// shared so the two cannot drift.
+pub(crate) const SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS: [&str; 3] = [
+    "([Ljava/lang/Object;)Ljava/lang/Object;",
+    "([Ljava/lang/Object;)V",
+    "([Ljava/lang/Object;)Z",
+];
+
+/// Is this one of the method names JVMS §5.4.3.4's signature-polymorphic rule
+/// covers? Extracted from the dispatch tail below so the JIT site cache asks
+/// exactly the same question.
+pub(crate) fn is_signature_polymorphic_method_name(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "invoke"
+            | "invokeExact"
+            | "invokeWithArguments"
+            | "invokeBasic"
+            | "get"
+            | "set"
+            | "getVolatile"
+            | "setVolatile"
+            | "getOpaque"
+            | "setOpaque"
+            | "getAcquire"
+            | "setRelease"
+            | "compareAndSet"
+            | "compareAndExchange"
+            | "compareAndExchangeAcquire"
+            | "compareAndExchangeRelease"
+            | "weakCompareAndSet"
+            | "weakCompareAndSetPlain"
+            | "weakCompareAndSetAcquire"
+            | "weakCompareAndSetRelease"
+            | "getAndSet"
+            | "getAndSetAcquire"
+            | "getAndSetRelease"
+            | "getAndAdd"
+            | "getAndAddAcquire"
+            | "getAndAddRelease"
+            | "getAndBitwiseOr"
+            | "getAndBitwiseOrAcquire"
+            | "getAndBitwiseOrRelease"
+            | "getAndBitwiseAnd"
+            | "getAndBitwiseAndAcquire"
+            | "getAndBitwiseAndRelease"
+            | "getAndBitwiseXor"
+            | "getAndBitwiseXorAcquire"
+            | "getAndBitwiseXorRelease"
+    )
+}
+
 fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/MethodHandle"
         || class_name.starts_with("java/lang/invoke/MethodHandle")
@@ -1907,7 +1966,7 @@ fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
         || class_name == "java/lang/foreign/DowncallHandle"
 }
 
-fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+pub(crate) fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/VarHandle"
         || class_name.starts_with("java/lang/invoke/VarHandle")
         || (class_name.starts_with("java/lang/invoke/") && class_name.contains("VarHandle"))
@@ -24748,42 +24807,7 @@ fn invoke_on_class_shared_inner(
                 // MethodHandle.invoke / invokeExact / invokeWithArguments and
                 // VarHandle.get / set / compareAndSet etc. are called with the
                 // call-site descriptor, but registered with a generic one.
-                if method_name == "invoke"
-                    || method_name == "invokeExact"
-                    || method_name == "invokeWithArguments"
-                    || method_name == "invokeBasic"
-                    || method_name == "get"
-                    || method_name == "set"
-                    || method_name == "getVolatile"
-                    || method_name == "setVolatile"
-                    || method_name == "getOpaque"
-                    || method_name == "setOpaque"
-                    || method_name == "getAcquire"
-                    || method_name == "setRelease"
-                    || method_name == "compareAndSet"
-                    || method_name == "compareAndExchange"
-                    || method_name == "compareAndExchangeAcquire"
-                    || method_name == "compareAndExchangeRelease"
-                    || method_name == "weakCompareAndSet"
-                    || method_name == "weakCompareAndSetPlain"
-                    || method_name == "weakCompareAndSetAcquire"
-                    || method_name == "weakCompareAndSetRelease"
-                    || method_name == "getAndSet"
-                    || method_name == "getAndSetAcquire"
-                    || method_name == "getAndSetRelease"
-                    || method_name == "getAndAdd"
-                    || method_name == "getAndAddAcquire"
-                    || method_name == "getAndAddRelease"
-                    || method_name == "getAndBitwiseOr"
-                    || method_name == "getAndBitwiseOrAcquire"
-                    || method_name == "getAndBitwiseOrRelease"
-                    || method_name == "getAndBitwiseAnd"
-                    || method_name == "getAndBitwiseAndAcquire"
-                    || method_name == "getAndBitwiseAndRelease"
-                    || method_name == "getAndBitwiseXor"
-                    || method_name == "getAndBitwiseXorAcquire"
-                    || method_name == "getAndBitwiseXorRelease"
-                {
+                if is_signature_polymorphic_method_name(method_name) {
                     // Check if receiver is a MethodHandle or VarHandle.
                     // DirectMethodHandle / BoundMethodHandle / DelegatingMethodHandle
                     // and their inner species (e.g. DirectMethodHandle$Constructor,
@@ -24846,11 +24870,7 @@ fn invoke_on_class_shared_inner(
                         //
                         // Try all possible registered descriptors for signature-polymorphic methods.
                         // These methods are registered with generic Object[] params but varying return types.
-                        let poly_descs = [
-                            "([Ljava/lang/Object;)Ljava/lang/Object;",
-                            "([Ljava/lang/Object;)V",
-                            "([Ljava/lang/Object;)Z",
-                        ];
+                        let poly_descs = SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS;
                         let prefer_exact =
                             prefers_exact_signature_polymorphic_receiver(&class_name);
                         // The resolved owner of invokeExact is MethodHandle, not
