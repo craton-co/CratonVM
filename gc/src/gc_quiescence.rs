@@ -1937,39 +1937,6 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     *dests = to;
 }
 
-/// Report a USE of a reference whose object the collector moved and whose
-/// address has since been handed out again — see `VmHeap::stale_use_verdict`
-/// for why that predicate and not the vacated ledger.
-///
-/// The Rust backtrace is the payload: it names the VM code that still held the
-/// address, which is the one thing every other instrument in this family has
-/// been unable to say.
-#[cold]
-pub fn report_stale_use(
-    addr: usize,
-    moved_to: usize,
-    class_at_moved_to: u32,
-    class_at_addr: u32,
-    site: &'static str,
-) {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
-        return;
-    }
-    tracing::error!(
-        target: "cratonvm::gc::guard",
-        obj = format!("{addr:#x}"),
-        moved_to = format!("{moved_to:#x}"),
-        class_at_moved_to,
-        class_at_addr,
-        site,
-        backtrace = %std::backtrace::Backtrace::force_capture(),
-        "a STALE reference is being USED: the collector moved this object to `moved_to`, the \
-         allocator has since re-issued the address, and the object now there is of a different \
-         class. The backtrace names the VM code still holding it."
-    );
-}
-
 /// `vacated address -> (where the object went, its class there)`, kept for the
 /// whole run.
 ///
