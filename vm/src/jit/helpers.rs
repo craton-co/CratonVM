@@ -324,7 +324,7 @@ pub mod mic_prof {
              disp_calls={} cyc_disp_total={} \
              pub_probe_none={} (not_probed_disabled={} not_probed_redefine={} \
              not_probed_uncacheable={} probe_returned_none={}) \
-             pub_barred={} pub_published={} ic_refusals={} ic_unowned_pub={}",
+             pub_barred={} pub_published={} probe_memo_skips={}              owner_reuse={} registry_pins={} ic_refusals={} ic_unowned_pub={}",
             cratonvm_gc::gc_quiescence::depth(),
             g(&MIC_CALLS),
             g(&MIC_HIT_ENTRY),
@@ -344,6 +344,9 @@ pub mod mic_prof {
             g(&PROBE_RETURNED_NONE),
             g(&PUB_BARRED),
             g(&PUB_PUBLISHED),
+            super::MIC_COMPILE_PROBE_MEMO_SKIPS.load(Ordering::Relaxed),
+            super::CACHED_ENTRY_OWNER_REUSE_HITS.load(Ordering::Relaxed),
+            super::CACHED_ENTRY_REGISTRY_PINS.load(Ordering::Relaxed),
             cratonvm_jit::unowned_ic_entry_refusals(),
             cratonvm_jit::unowned_ic_entry_publishes(),
         );
@@ -353,6 +356,119 @@ pub mod mic_prof {
         // "hit_entry=0 forever" observation that has been made before and left
         // unexplained. No-op unless `CRATONVM_DBG=callee-probe` is also set.
         crate::runtime::interpreter::jit_bridge::dump_callee_probe_tally();
+        super::disp_census::report();
+    }
+}
+
+/// WHAT the generic dispatch helper's calls are — by invoke kind, and by which
+/// arm answered them.
+///
+/// `disp_calls` alone is a denominator with no shape. On netty's
+/// `BigEndianHeapByteBufTest` it read **110 863 473** for a 63 s run against
+/// 6 203 669 `jit_invoke_virtual_mic` calls, i.e. the run's 113 890 789
+/// `jit_entries` are overwhelmingly this helper — and nothing said whether they
+/// were natives, compiled callees reached through a thread-local cache, or the
+/// `invoke_or_native` tail. Those three have completely different fixes, and
+/// `perf` cannot separate them: the samples land in the same handful of
+/// symbols whichever arm called them.
+///
+/// Rides on `CRATONVM_DBG=mic-prof` — one more line on a dump that is already
+/// the place this question gets asked, and one relaxed `fetch_add` behind the
+/// same gate as every other counter here.
+pub mod disp_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `invoke_kind` 0-3 (virtual, special, interface, static).
+    pub const KIND: [usize; 4] = [0, 1, 2, 3];
+    /// The exact-receiver object-native cache (`HashMap`/`Matcher`/`StringBuilder`).
+    pub const OUT_OBJECT_NATIVE: usize = 4;
+    /// `try_jit_site_cached_native_dispatch` — the leaf/site native cache.
+    pub const OUT_SITE_NATIVE: usize = 5;
+    /// The `Integer.valueOf`/`intValue` boxing cache.
+    pub const OUT_INTEGER_NATIVE: usize = 6;
+    /// `VIRTUAL_DISPATCH_CACHE` — a compiled callee for a virtual site.
+    pub const OUT_VIRT_CACHE: usize = 7;
+    /// `DISPATCH_CACHE` — a compiled callee for a statically bound site.
+    pub const OUT_DCACHE: usize = 8;
+    /// A `JitCache` lookup that found a body this site had not cached yet.
+    pub const OUT_JCACHE: usize = 9;
+    /// The tier-up arm compiled the callee and called it.
+    pub const OUT_COMPILED_NOW: usize = 10;
+    /// Everything past the fast arms: the `invoke_or_native` tail.
+    pub const OUT_TAIL: usize = 11;
+    /// `jit_invoke_virtual_mic`: served by the leaf/site native cache.
+    pub const MIC_SITE_NATIVE: usize = 12;
+    /// `jit_invoke_virtual_mic`: served by a by-name native fast path (Matcher,
+    /// `StringBuilder`, the `ClassLoader` resource intercept) or the lambda/SAM
+    /// arm — every arm that returns before the MIC's own hit/miss counters.
+    pub const MIC_EARLY_OTHER: usize = 13;
+    /// `jit_invoke_virtual_mic`: served out of `VIRTUAL_DISPATCH_CACHE` — the
+    /// exception-table callees the machine-code caches are barred from holding.
+    pub const MIC_RUST_CACHE: usize = 14;
+    /// `jit_invoke_virtual_mic`: reached the megamorphic PIC secondary cache.
+    pub const MIC_PIC: usize = 15;
+
+    const N: usize = 16;
+    const NAMES: [&str; N] = [
+        "kind_virtual",
+        "kind_special",
+        "kind_interface",
+        "kind_static",
+        "out_object_native",
+        "out_site_native",
+        "out_integer_native",
+        "out_virt_cache",
+        "out_dcache",
+        "out_jcache",
+        "out_compiled_now",
+        "out_tail",
+        "mic_site_native",
+        "mic_early_other",
+        "mic_rust_cache",
+        "mic_pic",
+    ];
+
+    static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Count one event. Gated on [`super::mic_prof::enabled`], like every counter here.
+    #[inline]
+    pub fn note(slot: usize) {
+        if super::mic_prof::enabled() {
+            if let Some(c) = COUNTS.get(slot) {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Count the invoke kind of one `jit_invoke_dispatch` call.
+    #[inline]
+    pub fn note_kind(invoke_kind: u8) {
+        note(usize::from(invoke_kind).min(3));
+    }
+
+    pub fn report() {
+        let mut line = String::from("[DISP_CENSUS]");
+        for (i, name) in NAMES.iter().enumerate() {
+            line.push_str(&format!(" {name}={}", COUNTS[i].load(Ordering::Relaxed)));
+        }
+        eprintln!("{line}");
     }
 }
 
@@ -1465,6 +1581,7 @@ unsafe fn try_call_compiled_entry_reentrant(
     vm_ptr: i64,
     args_slice: &[i64],
 ) -> Option<i64> {
+    note_cached_entry_arm(&CACHED_ENTRY_REGISTRY_PINS);
     // This helper is itself called from compiled dispatch code.  Its raw ABI
     // call used to enter the nested compiled method without registering a
     // `JitEntryGuard`, so a GC triggered by that callee found a JIT return
@@ -1473,7 +1590,6 @@ unsafe fn try_call_compiled_entry_reentrant(
     // the repeated Hibernate bootstrap graphs until OOM.  Resolve the entry
     // back to its live CompiledMethod and register the precise frame for the
     // full duration of the nested call.
-    let mut needs_ctx = needs_ctx;
     // Pin, don't peek. This is the ONE path into compiled code that used to hold
     // no owning reference to the body it entered: it resolved a bare `cm_ptr`
     // out of the code-range registry and dereferenced it, on the argument that
@@ -1491,7 +1607,109 @@ unsafe fn try_call_compiled_entry_reentrant(
     // to it**, so a reference count reaching zero is itself a proof that no
     // thread is inside. One atomic increment (the registry carries a `Weak`).
     let pinned = cratonvm_jit::pin_jit_code_range_owner(entry);
-    let jit_root_guard = pinned.as_deref().map(|compiled| {
+    call_compiled_entry_under_owner(pinned.as_deref(), entry, needs_ctx, vm_ptr, args_slice)
+}
+
+/// [`try_call_compiled_entry_reentrant`] for a caller that ALREADY holds an
+/// owning reference to the callee's artifact.
+///
+/// The registry round trip the other form performs — an `ArcSwap` load, a binary
+/// search over every registered code range, a `Weak::upgrade` CAS and the
+/// matching `Arc` drop — re-derives an `Arc<CompiledMethod>` the thread-local
+/// dispatch caches already hold in their [`cratonvm_jit::RetainedCode`] field.
+/// A `RetainedCode` clone is one relaxed increment and answers the same
+/// question, so the documented invariant is unchanged: **a thread inside a
+/// compiled body always holds an owning reference to it**, which is what
+/// `RetainedCode`'s own `Drop` relies on when it declines to route a
+/// provably-not-last release through the retirement queue.
+///
+/// It is a clone and not a borrow because the map cannot be kept borrowed across
+/// the call: a nested dispatch from the callee re-enters
+/// `flush_raw_entry_dispatch_caches`, which takes `borrow_mut` on the same
+/// thread-local — and, more to the point, may evict this very entry. The clone
+/// is what survives that.
+///
+/// `CRATONVM_JIT='-cached-entry-owner-reuse'` sends these callers back through
+/// the registry so one binary can be A/B'd against itself, and the two counters
+/// this bumps say which arm ran.
+#[inline]
+// SAFETY: same entry ABI contract as `try_call_compiled_entry_reentrant`.
+unsafe fn try_call_compiled_entry_reentrant_owned(
+    owner: &cratonvm_jit::RetainedCode,
+    entry: usize,
+    needs_ctx: bool,
+    vm_ptr: i64,
+    args_slice: &[i64],
+) -> Option<i64> {
+    if !cached_entry_owner_reuse_enabled() {
+        return try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice);
+    }
+    note_cached_entry_arm(&CACHED_ENTRY_OWNER_REUSE_HITS);
+    call_compiled_entry_under_owner(Some(&**owner), entry, needs_ctx, vm_ptr, args_slice)
+}
+
+/// `CRATONVM_JIT='-cached-entry-owner-reuse'` — make every cached compiled
+/// dispatch re-resolve its keep-alive through the code-range registry, as it did
+/// before 2026-08-17. Default ON.
+fn cached_entry_owner_reuse_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// How often a site whose callee the compiler declined re-asks. See
+/// [`MIC_COMPILE_DECLINED`].
+const MIC_COMPILE_PROBE_RETRY: u32 = 1024;
+
+/// Compile probes skipped because [`MIC_COMPILE_DECLINED`] already held a
+/// refusal for this `(site, receiver class)`.
+///
+/// Counted separately from `not_probed_*`/`probe_returned_none` deliberately:
+/// the comment on those says why a skip that lands in a "the compiler refused"
+/// counter makes the number unreadable.
+pub static MIC_COMPILE_PROBE_MEMO_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Cached dispatches that reused the owner their cache entry already held.
+pub static CACHED_ENTRY_OWNER_REUSE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Cached dispatches that resolved the owner through the code-range registry.
+pub static CACHED_ENTRY_REGISTRY_PINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count one arm of the cached-dispatch split, **behind the same gate as every
+/// other counter in this file**.
+///
+/// The gate is not tidiness. The reuse arm runs 111 564 628 times in a 55 s
+/// netty run, and an ungated `fetch_add` there is one contended cache line
+/// shared by every thread in the VM — an instrument that would have been a
+/// variable of the very comparison it exists to settle, present on one arm of
+/// the A/B and absent from the other.
+#[inline]
+fn note_cached_entry_arm(counter: &'static std::sync::atomic::AtomicU64) {
+    if mic_prof::enabled() {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The body both forms share: register the precise frame for the nested call,
+/// correct a lying ABI flag against the artifact's own, and make the raw call.
+#[inline]
+// SAFETY: `entry` must be a live JIT entry owned by `compiled` when it is
+// `Some`; `args_slice` must match the callee's ABI.
+unsafe fn call_compiled_entry_under_owner(
+    compiled: Option<&cratonvm_jit::CompiledMethod>,
+    entry: usize,
+    needs_ctx: bool,
+    vm_ptr: i64,
+    args_slice: &[i64],
+) -> Option<i64> {
+    let mut needs_ctx = needs_ctx;
+    let jit_root_guard = compiled.map(|compiled| {
         // cceres2 (WildFly SIGSEGV cores SF2/SF3/SM): the caller-supplied ABI
         // flag can come from a cache whose (entry, needs_context) pair was
         // read non-atomically across a concurrent inline-cache retarget or
@@ -1524,9 +1742,9 @@ unsafe fn try_call_compiled_entry_reentrant(
     #[cfg(debug_assertions)]
     restore_jit_borrow(borrow);
     drop(jit_root_guard);
-    // AFTER the guard: the pin is what keeps the body mapped for the whole
-    // call, so it must outlive both the call and the chain entry naming it.
-    drop(pinned);
+    // AFTER the guard: the caller's owning reference is what keeps the body
+    // mapped for the whole call, so it must outlive both the call and the chain
+    // entry naming it. Both callers hold theirs across this return.
     result
 }
 
@@ -2236,9 +2454,21 @@ unsafe fn try_mic_rust_cached_entry(
         return None;
     }
     let key = (jit_site_key(vm.vm_identity, info_ptr as usize), receiver_cid);
-    let (entry, needs_ctx) =
-        VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow().get(&key).map(|c| (c.entry, c.needs_context)))?;
-    let rc = try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)?;
+    // The owner comes out WITH the entry: it is the keep-alive this map already
+    // holds for exactly this raw pointer, so cloning it here spares the callee a
+    // code-range registry round trip per call. See
+    // `try_call_compiled_entry_reentrant_owned`.
+    let (entry, needs_ctx, owner) = VIRTUAL_DISPATCH_CACHE.with(|dc| {
+        dc.borrow()
+            .get(&key)
+            .map(|c| (c.entry, c.needs_context, c.owner.clone()))
+    })?;
+    let rc = match owner.as_ref() {
+        Some(owner) => {
+            try_call_compiled_entry_reentrant_owned(owner, entry, needs_ctx, vm_ptr, args_slice)?
+        }
+        None => try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)?,
+    };
     if rc == i64::MIN {
         if let Some(v) = handle_compiled_callee_deopt_sentinel(
             vm,
@@ -2277,7 +2507,7 @@ fn publish_mic_rust_cached_entry(
             DispatchCache {
                 entry: entry_ptr,
                 needs_context: needs_ctx,
-                _owner: Some(owner.into()),
+                owner: Some(owner.into()),
             },
         );
     });
@@ -9245,7 +9475,11 @@ struct DispatchCache {
     /// `BasicErrorControllerIntegrationTests` at
     /// `active_jit_executions` = 1. The wrapper releases through
     /// `defer_jit_owner`, which retains until no thread is in compiled code.
-    _owner: Option<cratonvm_jit::RetainedCode>,
+    ///
+    /// Read as well as held since 2026-08-17: the dispatch sites clone it and
+    /// hand it to `try_call_compiled_entry_reentrant_owned` instead of making
+    /// that function re-derive the same `Arc` out of the code-range registry.
+    owner: Option<cratonvm_jit::RetainedCode>,
 }
 
 #[derive(Clone, Copy)]
@@ -9402,6 +9636,22 @@ site_keyed_memos! {
     /// an interface method may resolve to a receiver override.
     VIRTUAL_DISPATCH_CACHE: (JitSiteKey, u32) => DispatchCache;
     VIRTUAL_DISPATCH_COUNTER: (JitSiteKey, u32) => u32;
+    /// `(JitSiteKey, receiver ClassId) -> declined-probe count`.
+    ///
+    /// A compile probe that declined this callee will decline it again. On
+    /// netty's `AdaptiveByteBufAllocatorTest` `probe_returned_none` read
+    /// **6 592 571** — every single entryless MIC hit in the run — against
+    /// `cyc_compile_probe` of 9.16e9 cycles, i.e. ~3.5 s of a ~430 s run spent
+    /// re-asking a question that had already been answered on the first call.
+    ///
+    /// Throttled rather than permanent: a refusal can be transient (another
+    /// thread holding the compile, a tier budget), and a never-retry memo would
+    /// pin such a site to the helper for the life of the process. One probe per
+    /// [`MIC_COMPILE_PROBE_RETRY`] calls keeps the retry while removing 1023 of
+    /// every 1024 probes. Being a `site_keyed_memos!` member is what makes it
+    /// safe: the same generation and class-identity flushes that drop every
+    /// other dispatch memo drop this one too.
+    MIC_COMPILE_DECLINED: (JitSiteKey, u32) => u32;
     /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
     ///
     /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
@@ -9929,6 +10179,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // SAFETY: vm_ptr and info_ptr originate from JIT code; both point to valid, live objects.
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
+    disp_census::note_kind(info.invoke_kind);
     // DIAGNOSTIC (gated): record the dispatched callee (restored on return) so
     // a downstream jit_putfield_int miscompile can name the offending method.
     let _callee_guard = if crate::runtime::env_cache::jit_putfield_diag() {
@@ -10065,6 +10316,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                             if let Some(result) = call_object_native_raw(
                                 vm, thread, info, receiver, args_slice, entry,
                             ) {
+                                disp_census::note(
+                                    disp_census::OUT_OBJECT_NATIVE,
+                                );
                                 return result;
                             }
                         }
@@ -10080,6 +10334,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // atomic, or a constant. Everything after this point is per-call work that
     // such a site was paying for no reason. See `NativeSiteCache`.
     if let Some(result) = try_jit_site_cached_native_dispatch(vm, info, info_key, args_slice) {
+        disp_census::note(disp_census::OUT_SITE_NATIVE);
         return result;
     }
     if !class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
@@ -10136,6 +10391,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         if let Some(entry) = integer_native {
             if let Some((thread, _guard)) = jit_thread_mut() {
                 if let Some(result) = call_integer_native_raw(vm, thread, info, args_slice, entry) {
+                    disp_census::note(disp_census::OUT_INTEGER_NATIVE);
                     return result;
                 }
             }
@@ -10214,12 +10470,21 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // on the Linux build host).
             if globally_named {
                 let key = (info_key, receiver_cid.as_u32());
-                if let Some(cached) = VIRTUAL_DISPATCH_CACHE
-                    .with(|dc| dc.borrow().get(&key).map(|c| (c.entry, c.needs_context)))
-                {
-                    if let Some(rc) =
-                        try_call_compiled_entry_reentrant(cached.0, cached.1, vm_ptr, args_slice)
-                    {
+                if let Some(cached) = VIRTUAL_DISPATCH_CACHE.with(|dc| {
+                    dc.borrow()
+                        .get(&key)
+                        .map(|c| (c.entry, c.needs_context, c.owner.clone()))
+                }) {
+                    let called = match cached.2.as_ref() {
+                        Some(owner) => try_call_compiled_entry_reentrant_owned(
+                            owner, cached.0, cached.1, vm_ptr, args_slice,
+                        ),
+                        None => try_call_compiled_entry_reentrant(
+                            cached.0, cached.1, vm_ptr, args_slice,
+                        ),
+                    };
+                    if let Some(rc) = called {
+                        disp_census::note(disp_census::OUT_VIRT_CACHE);
                         return route_implicit_exc_through_callee(vm, info, args_slice, rc);
                     }
                 } else {
@@ -10253,7 +10518,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                         DispatchCache {
                                             entry,
                                             needs_context,
-                                            _owner: Some(owner.into()),
+                                            owner: Some(owner.into()),
                                         },
                                     );
                                 });
@@ -10280,12 +10545,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         DISPATCH_CACHE.with(|dc| {
             dc.borrow()
                 .get(&info_key)
-                .map(|c| (c.entry, c.needs_context))
+                .map(|c| (c.entry, c.needs_context, c.owner.clone()))
         })
     } else {
         None
     };
-    if let Some((entry, needs_ctx)) = cached_entry {
+    if let Some((entry, needs_ctx, owner)) = cached_entry {
         if crate::runtime::env_cache::jit_dispatch_dbg() {
             eprintln!(
                 "[JIT_DISPATCH_ARM/dcache] {}.{} entry=0x{:x}",
@@ -10299,7 +10564,14 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         // wave-2 changed it to fall through to the slow path, and this wave goes one
         // step further by routing directly through `bail_to_interpreter` so the bail is
         // explicit at the call site (matches the MIC fast-path at `:1722`).
-        if let Some(rc) = try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice) {
+        let called = match owner.as_ref() {
+            Some(owner) => {
+                try_call_compiled_entry_reentrant_owned(owner, entry, needs_ctx, vm_ptr, args_slice)
+            }
+            None => try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice),
+        };
+        if let Some(rc) = called {
+            disp_census::note(disp_census::OUT_DCACHE);
             if crate::runtime::env_cache::jit_dispatch_dbg() {
                 eprintln!(
                     "[JIT_DISPATCH_RET/dcache] {}.{}{} ret=0x{:x}",
@@ -10364,7 +10636,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     DispatchCache {
                         entry,
                         needs_context: needs_ctx,
-                        _owner: Some(compiled.clone().into()),
+                        owner: Some(compiled.clone().into()),
                     },
                 );
             });
@@ -10377,6 +10649,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             if let Some(rc) =
                 try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)
             {
+                disp_census::note(disp_census::OUT_JCACHE);
                 if crate::runtime::env_cache::jit_dispatch_dbg() {
                     eprintln!(
                         "[JIT_DISPATCH_RET/jcache] {}.{}{} ret=0x{:x}",
@@ -10426,7 +10699,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         DispatchCache {
                             entry,
                             needs_context: needs_ctx,
-                            _owner: Some(owner.into()),
+                            owner: Some(owner.into()),
                         },
                     );
                 });
@@ -10437,6 +10710,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             if let Some(rc) =
                 try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)
             {
+                disp_census::note(disp_census::OUT_COMPILED_NOW);
                 // BUG-H: route a callee-thrown implicit exception through the
                 // callee's own exception table (see dcache site above).
                 return route_implicit_exc_through_callee(vm, info, args_slice, rc);
@@ -10449,6 +10723,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
     }
 
+    disp_census::note(disp_census::OUT_TAIL);
     // Slow path: interpreter fallback
     let (thread, _jit_thread_guard) = match jit_thread_mut() {
         Some(t) => t,
@@ -13102,6 +13377,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         jit_site_key(vm.vm_identity, info_ptr as usize),
         args_slice,
     ) {
+        disp_census::note(disp_census::MIC_SITE_NATIVE);
         return result;
     }
 
@@ -13412,10 +13688,27 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // and is as trustworthy as any other inline cache. Steady state is one
     // relaxed load and a compare.
     let epoch_now = cratonvm_jit::redefine_epoch();
-    let redefine_jit_quiesced = mic
-        .redefine_epoch
-        .swap(epoch_now, std::sync::atomic::Ordering::AcqRel)
-        != epoch_now;
+    // Read first; write only when the epoch actually moved.
+    //
+    // This was an unconditional `swap`, i.e. a locked read-modify-write on the
+    // MIC slot's first eight bytes on EVERY helper-side dispatch — including
+    // every run in which nothing is ever redefined, where it stored the value
+    // that was already there. `redefine_epoch` lives at offset 4 and
+    // `cached_class_id` at offset 0 (see `JitMICSlot`'s layout note), so the
+    // store dirtied the very line the inline machine-code MIC cascade loads on
+    // every probe, and did so from each thread sharing the site.
+    //
+    // The semantics are unchanged: a load that already equals `epoch_now`
+    // proves the slot was populated after the most recent redefinition, which
+    // is exactly what the `swap`'s `prev == epoch_now` arm concluded.
+    let redefine_jit_quiesced =
+        if mic.redefine_epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_now {
+            false
+        } else {
+            mic.redefine_epoch
+                .swap(epoch_now, std::sync::atomic::Ordering::AcqRel)
+                != epoch_now
+        };
     if redefine_jit_quiesced {
         mic.clear_compiled_entry();
         if pic_ptr != 0 {
@@ -13431,6 +13724,50 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let cached_cid = mic
         .cached_class_id
         .load(std::sync::atomic::Ordering::Acquire);
+
+    // A callee that declares an exception table is barred from the MIC and the
+    // PIC (`mic_callee_has_exception_table`), so nothing ever writes this slot's
+    // class id for it and **every** call to it is a "miss" — for the life of the
+    // process. `VIRTUAL_DISPATCH_CACHE` exists precisely to serve those callees,
+    // and the consult used to sit on the miss path *behind* `mic.record_miss`
+    // and `virtual_dispatch_target_cached` — a memoized-but-real class-name
+    // resolution and round-trip test the warm hit does not need. It is hoisted
+    // here, ahead of the megamorphic PIC probe as well, because a hit means a
+    // compiled Java callee was published for exactly this `(site, receiver
+    // class)` pair and none of the work below can improve on that.
+    //
+    // Ordering obligations, all already discharged above: `forward_jit_reference_args`
+    // has canonicalised the arguments, `flush_raw_entry_dispatch_caches` and
+    // `flush_class_identity_dispatch_memos` have revalidated the cache against
+    // the current generations, and `redefine_jit_quiesced` carries the
+    // redefinition epoch. `cached_cid != receiver_cid` keeps the MIC's own
+    // machine-callable entry first when it has one.
+    //
+    // The consult it replaces was additionally gated on `cacheable_receiver &&
+    // globally_named`, and dropping those here is sound rather than convenient:
+    // both are PUBLICATION conditions (`publish_mic_rust_cached_entry` is called
+    // under them), and the key carries the receiver's own class id — so a hit
+    // means a compiled callee was published for exactly this `(site, receiver
+    // class)` pair while those conditions held. Re-testing them would mean
+    // calling `virtual_dispatch_target_cached`, which is the work this hoist
+    // exists to skip. What is kept is the receiver guard the MIC's own fast path
+    // uses one branch below — `receiver_is_plain_object` — so this arm is no
+    // weaker than the machine-code entry it stands in for.
+    //
+    // Worth 11x on a monomorphic interface call whose callee holds a never-taken
+    // `try`/`catch`: 220 ns against 19 ns for the identical call without one
+    // (`probes/NativeFunnelFloorProbe.java`, ABBA on one binary). Most of that
+    // 11x is the inline machine-code cascade this callee cannot be published
+    // into at all, which is a separate and much larger piece of work; this is
+    // the part that can be taken off the Rust route without touching codegen.
+    if cached_cid != receiver_cid && receiver_is_plain_object && !redefine_jit_quiesced {
+        if let Some(rc) = try_mic_rust_cached_entry(
+            vm, thread, info, info_ptr, receiver_cid, vm_ptr, args_slice,
+        ) {
+            disp_census::note(disp_census::MIC_RUST_CACHE);
+            return rc;
+        }
+    }
 
     if crate::runtime::env_cache::jit_mic_dbg() {
         let (pic_classes, pic_entries, pic_contexts) = if pic_ptr == 0 {
@@ -13482,6 +13819,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         let pic = &*(pic_ptr as *const JitPICSlot);
         if let Some((entry, needs_context)) = pic.lookup_megamorphic(receiver_cid) {
             if entry != 0 {
+                disp_census::note(disp_census::MIC_PIC);
                 mic_prof::bump(&mic_prof::MIC_HIT_ENTRY);
                 if let Some(result) = try_call_compiled_entry_reentrant(
                     entry as usize,
@@ -13642,16 +13980,35 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // machine-code MIC/PIC was left ungated. Not globally named -> do not
         // compile by name, leave the site on the dispatch helper, which resolves
         // on the actual receiver.
-        let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
+        // Has the compiler already declined this callee for this receiver? See
+        // `MIC_COMPILE_DECLINED` — the probe below is the single most expensive
+        // thing on this arm and it answered `None` on every one of 6.59 M calls
+        // in the measured run.
+        let declined_key = (jit_site_key(vm.vm_identity, info_ptr as usize), receiver_cid);
+        let skip_probe = MIC_COMPILE_DECLINED.with(|m| match m.borrow_mut().get_mut(&declined_key) {
+            Some(n) => {
+                *n = n.wrapping_add(1);
+                *n % MIC_COMPILE_PROBE_RETRY != 0
+            }
+            None => false,
+        });
+        if skip_probe {
+            note_cached_entry_arm(&MIC_COMPILE_PROBE_MEMO_SKIPS);
+        }
+        let compile_res = if skip_probe
+            || !direct_virtual_compiled_callee_entry_enabled()
             || redefine_jit_quiesced
             || !cacheable_receiver
             || !globally_named
         {
-            // Attribute the skip. All three of these land in `pub_probe_none`
+            // Attribute the skip. All of these land in `pub_probe_none`
             // below without a probe ever running, which is why that counter
             // reading equal to `hit_noentry` could not distinguish "the compiler
             // refused every callee" from "we never asked".
-            if !direct_virtual_compiled_callee_entry_enabled() {
+            if skip_probe {
+                // Already attributed above, and deliberately NOT folded into any
+                // `not_probed_*` counter: those name gates, this names a memo.
+            } else if !direct_virtual_compiled_callee_entry_enabled() {
                 mic_prof::bump(&mic_prof::NOT_PROBED_DISABLED);
             } else if redefine_jit_quiesced {
                 mic_prof::bump(&mic_prof::NOT_PROBED_REDEFINE);
@@ -13674,6 +14031,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // only one of the four `pub_probe_none` causes that names a
                 // compile refusal, and `CRATONVM_DBG=callee-probe` says which.
                 mic_prof::bump(&mic_prof::PROBE_RETURNED_NONE);
+                MIC_COMPILE_DECLINED.with(|m| {
+                    m.borrow_mut().entry(declined_key).or_insert(0);
+                });
+            } else {
+                // It compiles now — drop the refusal so a later eviction of the
+                // published entry re-probes immediately instead of waiting out
+                // the retry interval.
+                MIC_COMPILE_DECLINED.with(|m| {
+                    m.borrow_mut().remove(&declined_key);
+                });
             }
             probed
         };
@@ -13861,17 +14228,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         );
     }
 
-    // This, not the entryless-hit arm, is where a barred callee lands: nothing
-    // ever writes the MIC's class id for it, so its slot stays empty and every
-    // call is a "miss". See `try_mic_rust_cached_entry`.
-    if cacheable_receiver && globally_named && !redefine_jit_quiesced {
-        if let Some(rc) = try_mic_rust_cached_entry(
-            vm, thread, info, info_ptr, receiver_cid, vm_ptr, args_slice,
-        ) {
-            return rc;
-        }
-    }
-
+    // The `VIRTUAL_DISPATCH_CACHE` consult that used to be here has moved ABOVE
+    // `record_miss` and `virtual_dispatch_target_cached` — see the note at the
+    // `cached_cid` load. It is not merely reordered: the entries this cache can
+    // hold are published only for a `cacheable_receiver && globally_named`
+    // plain-object receiver, which is a subset of the condition the hoisted
+    // consult tests, so nothing that could hit here fails to hit there.
     mic_prof::bump(&mic_prof::MIC_MISS);
     // Try to compile callee for cached entry. Resolve by the RECEIVER's class
     // (`class_name`), not the static `info.class_name` — see the matching
@@ -15016,7 +15378,7 @@ mod tests {
                 DispatchCache {
                     entry: 0xdead_beef,
                     needs_context: false,
-                    _owner: None,
+                    owner: None,
                 },
             );
         });
@@ -15047,7 +15409,7 @@ mod tests {
                 DispatchCache {
                     entry: 0x1234_5678,
                     needs_context: true,
-                    _owner: None,
+                    owner: None,
                 },
             );
         });
@@ -15164,7 +15526,7 @@ mod tests {
         DISPATCH_CACHE.with(|c| {
             c.borrow_mut().insert(
                 key,
-                DispatchCache { entry: 0xdead_beef, needs_context: false, _owner: None },
+                DispatchCache { entry: 0xdead_beef, needs_context: false, owner: None },
             );
         });
         DISPATCH_COUNTER.with(|c| {
@@ -15179,7 +15541,7 @@ mod tests {
         VIRTUAL_DISPATCH_CACHE.with(|c| {
             c.borrow_mut().insert(
                 vkey,
-                DispatchCache { entry: 0xfeed_face, needs_context: true, _owner: None },
+                DispatchCache { entry: 0xfeed_face, needs_context: true, owner: None },
             );
         });
         VIRTUAL_DISPATCH_COUNTER.with(|c| {
@@ -15211,6 +15573,12 @@ mod tests {
                     native_id: None,
                 },
             );
+        });
+
+        // The declined-compile-probe memo. Its value is a call count, and the
+        // key is `(site, receiver class)` like the two caches above.
+        MIC_COMPILE_DECLINED.with(|c| {
+            c.borrow_mut().insert((key, 77), 1);
         });
 
         // Every memo non-empty first, or the post-flush sweep proves nothing.

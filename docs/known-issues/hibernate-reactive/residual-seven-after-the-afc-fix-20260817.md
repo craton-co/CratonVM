@@ -141,7 +141,7 @@ the native stack" — forward progress through the persist pipeline, not a wait.
 `probes/CompletionStageChainProbe.java`, 200 000 ops per shape,
 ABBA-interleaved on a quiet box. The project's own yardstick is that **2.5x
 versus HotSpot `-Xint` is the statement about this VM** (see
-`perf/vm-per-call-dispatch-cost-20260813.md`); the C2 column is
+`performance/vm-per-call-dispatch-cost-RETIRED-20260817.md`); the C2 column is
 a statement about not having an optimising compiler.
 
 | shape | HotSpot C2 | HotSpot `-Xint` | CratonVM | **vs `-Xint`** |
@@ -223,7 +223,7 @@ time, `--percent-limit 0.8`):
 
 **It is flat, and that is the point.** The lambda-named frames together are
 ~11%; nothing is a hot spot. This is precisely the shape
-`perf/vm-per-call-dispatch-cost-20260813.md` §3 warns about —
+`performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` §3 warns about —
 two changes made on 2026-08-13 each removed 5–10% of attributed samples and
 neither moved CPU measurably. So this page deliberately stops at the
 measurement and does **not** prescribe an optimisation.

@@ -540,6 +540,7 @@ export inherited from a parent shell.
 | `bulk-byte-loops` | `CRATONVM_JIT_BULK_BYTE_LOOPS` |
 | `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
 | `census-direct-helpers` | `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` |
+| `cached-entry-owner-reuse` | `CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |

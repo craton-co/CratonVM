@@ -8406,6 +8406,32 @@ pub static STATIC_SITES_SEEN_IR: std::sync::atomic::AtomicU64 =
 pub static THREAD_CURRENT_THREAD_SITES_OSR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Statically bound call sites at which a ladder ASKED `callee_compiler` for a
+/// direct target, split by whether it got one.
+///
+/// The question these answer is the one netty's census raised and no other
+/// instrument could: `AdaptiveByteBufAllocatorTest` runs 259 M
+/// `jit_invoke_dispatch` calls of which **98.4% are `DISPATCH_CACHE` hits** —
+/// a compiled callee, reached through a Rust helper, on every call. The callee
+/// is compiled; the caller simply could not bind it, because at the caller's
+/// compile time it was not compiled YET, and a call site's binding is decided
+/// once and never revisited. A miss here is that event, counted.
+///
+/// Compile-time only — one relaxed `fetch_add` per statically bound site per
+/// compile, never on a runtime path.
+pub static DIRECT_CALLEE_BIND_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(bound, unbound)` — see [`DIRECT_CALLEE_BIND_HITS`].
+pub fn direct_callee_bind_counts() -> (u64, u64) {
+    (
+        DIRECT_CALLEE_BIND_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        DIRECT_CALLEE_BIND_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `(single-pass, IR)` counts of `invokestatic` sites each direct-call ladder
 /// examined since process start.
 pub fn static_sites_seen() -> (u64, u64) {
@@ -16675,9 +16701,20 @@ fn try_compile_inner(
                                             )
                                         {
                                             direct_target = Some((entry, callee_needs_ctx));
+                                            DIRECT_CALLEE_BIND_HITS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         } else {
                                             mark_current_jit_compile_method_recursive_cycle();
+                                            DIRECT_CALLEE_BIND_MISSES
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                    } else {
+                                        // The one that matters: the compiler had
+                                        // nothing to give, so this site is bound
+                                        // to the dispatch helper for the life of
+                                        // this body. See `DIRECT_CALLEE_BIND_HITS`.
+                                        DIRECT_CALLEE_BIND_MISSES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -18463,9 +18500,17 @@ fn try_compile_inner(
                     // are why this only bites a small overridable method.
                     if direct_jit_callee_calls_enabled && matches!(invoke_kind, 1 | 3) {
                         if let Some(compiler) = callee_compiler.as_ref() {
-                            if let Some((entry, callee_needs_ctx)) =
-                                compiler(&class_name, &method_name, &descriptor)
-                            {
+                            let probed = compiler(&class_name, &method_name, &descriptor);
+                            if probed.is_none() {
+                                // See `DIRECT_CALLEE_BIND_HITS`: this site is now
+                                // bound to `jit_invoke_dispatch` permanently, and
+                                // the callee is very often compiled moments later.
+                                DIRECT_CALLEE_BIND_MISSES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some((entry, callee_needs_ctx)) = probed {
+                                DIRECT_CALLEE_BIND_HITS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if jit_direct_call_requires_dispatch(
                                     &class_name,
                                     &method_name,
