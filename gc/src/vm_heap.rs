@@ -210,8 +210,20 @@ fn clear_pending_pre_barrier() {
 pub enum VmHeap {
     Generational(GenerationalHeap),
     G1(G1State),
+    /// # Why an `Arc` and not the heap by value
+    ///
+    /// Genuine concurrent marking (2026-08-16) needs the marking engine's
+    /// worker threads to keep tracing **after** the mark-start safepoint
+    /// returns, and [`crate::zgc::mark::ZMarkCoordinator::new`] takes an
+    /// `Arc<dyn ZMarkContext>`. `ZgcRealHeap` *is* that context, so the only
+    /// two ways to hand it over are an `Arc` or a raw-pointer bridge whose
+    /// soundness argument degrades from "cannot outlive one `&self` call" to
+    /// "the heap is never moved", which nothing enforces. This is the honest
+    /// one, and `Arc<T>: Deref<Target = T>` keeps every existing
+    /// `VmHeap::Zgc(h) => h.method()` call site compiling unchanged --
+    /// `ZgcRealHeap` has no `&mut self` method.
     #[cfg(feature = "zgc")]
-    Zgc(ZgcRealHeap),
+    Zgc(std::sync::Arc<ZgcRealHeap>),
 }
 
 // Safety: both inner types are already Send + Sync.
@@ -275,7 +287,7 @@ impl VmHeap {
                 VmHeap::G1(G1State::new(config))
             }
             #[cfg(feature = "zgc")]
-            GcBackend::Zgc => VmHeap::Zgc(ZgcRealHeap::with_capacity(total_bytes)),
+            GcBackend::Zgc => VmHeap::Zgc(ZgcRealHeap::new_shared(total_bytes)),
         }
     }
 
@@ -2004,6 +2016,83 @@ impl VmHeap {
             VmHeap::Generational(_) => false,
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => false,
+        }
+    }
+
+    // =====================================================================
+    // ZGC concurrent marking (2026-08-16)
+    // =====================================================================
+    //
+    // Deliberately NOT folded into the `g1_*` predicates above. The two
+    // collectors reach the same shape (open at a brief STW, trace with
+    // mutators running, close at the next collection's STW) from opposite
+    // sides -- G1 opens on an old-gen occupancy that only a young collection
+    // updates, ZGC on total allocation, and G1 closes on a quiescence poll
+    // while ZGC closes when the collection itself arrives. A shared predicate
+    // would have to be a union of both, and the arm that did not apply would
+    // be dead code that reads as coverage.
+
+    /// Should a ZGC concurrent mark cycle open now?
+    ///
+    /// On the allocation path (`maybe_gc`), so the ZGC arm is two relaxed
+    /// loads and the others are a compile-time-known `false`.
+    #[inline]
+    pub fn zgc_should_start_concurrent_mark(&self) -> bool {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.should_start_concurrent_mark(),
+        }
+    }
+
+    /// Is a ZGC concurrent mark cycle in flight?
+    #[inline]
+    pub fn zgc_concurrent_mark_active(&self) -> bool {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.concurrent_mark_active(),
+        }
+    }
+
+    /// Open a ZGC concurrent mark cycle at a brief stop-the-world pause.
+    ///
+    /// `roots` must be the COMPLETE root set -- this thread, every parked
+    /// peer's snapshot, and the conservative roots of any forcibly-stopped
+    /// in-JIT peer. A root missed here is an object the concurrent phase never
+    /// traces, and the mark-end re-scan only covers roots that still exist
+    /// then. Returns `true` iff a cycle opened.
+    pub fn zgc_start_concurrent_mark(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &[ObjectRef],
+    ) -> bool {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                let addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
+                h.start_concurrent_mark(stw, &addrs)
+            }
+        }
+    }
+
+    /// Abandon an open ZGC concurrent cycle, discarding its mark bits.
+    pub fn zgc_abandon_concurrent_mark(&self) {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => {}
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.abandon_concurrent_mark(),
+        }
+    }
+
+    /// `(started, completed, black_allocations, ingress_replayed, phase_nanos)`
+    /// for the ZGC concurrent marker; all zeros on the other backends.
+    pub fn zgc_concurrent_mark_stats(&self) -> (usize, usize, usize, usize, u64) {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => (0, 0, 0, 0, 0),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.concurrent_mark_stats(),
         }
     }
 
