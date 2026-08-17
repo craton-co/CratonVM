@@ -4533,6 +4533,51 @@ impl ZgcRealHeap {
         use census::ZCensusHeapView;
         let base = self.arena_base;
         let mut roots: Vec<usize> = Vec::new();
+
+        // ---- (0) THE EDGES NO CARD COVERS -------------------------------
+        //
+        // `collect_garbage`'s mark loop pushes four kinds of edge for every
+        // object it VISITS: the class's loader, that loader's class mirrors, its
+        // metadata roots, and the native collection overlays it owns. A young
+        // cycle never visits an old object, so it never pushes any of them --
+        // and **not one of the four is written through `set_field`**, so the card
+        // barrier cannot see them either. An old `HashMap` with a native overlay
+        // whose contents are young would have those contents freed while the map
+        // is live: a use-after-free with no wild pointer and no failing
+        // assertion, surfacing later as an empty collection.
+        //
+        // Rooted WHOLESALE rather than per old object, for two reasons. It is
+        // O(registry) once instead of O(old objects) times four global lookups
+        // -- and those lookups are the per-object shared-cache-line cost
+        // `metadata_pin::snapshot`'s own note warns about. And it is safe in the
+        // right direction: over-approximating retains an edge whose owner is
+        // dead for one more cycle, while under-approximating frees a live
+        // object.
+        //
+        // `gen_heap` does exactly this for the overlays already
+        // (`external_roots_for_matching_owners(&|_| true)`), which is the
+        // precedent for the shape and the reason the predicate form exists.
+        //
+        // Every one of these registries is empty in a `--jdk-only` or unit-test
+        // run and each has a relaxed-load latch for that, so an arm that
+        // exercises none of them pays four loads per CYCLE.
+        roots.extend(cratonvm_types::loader_pin::all_pinned_loaders());
+        roots.extend(cratonvm_types::mirror_pin::all_pinned_mirrors());
+        if let Some(metadata) = cratonvm_types::metadata_pin::snapshot() {
+            for (_loader, objects) in metadata {
+                roots.extend(objects);
+            }
+        }
+        for overlay in crate::external_roots::external_roots_for_matching_owners(&|_| true) {
+            roots.push(overlay.as_ptr() as usize);
+        }
+        // Anything the registries name that this heap does not own -- another
+        // VM's rows, or an address a previous cycle has already reclaimed -- is
+        // dropped here rather than handed to a marker as a wild root.
+        roots.retain(|addr| self.registry.contains(*addr));
+        let pinned = roots.len();
+
+        // ---- (1) the cards, cleaned as they are consumed -----------------
         self.remembered.swap_all();
         let mut emptied: Vec<u64> = Vec::new();
         for set in self.remembered.snapshot() {
@@ -4569,6 +4614,12 @@ impl ZgcRealHeap {
         for page in emptied {
             self.remembered.remove(page);
         }
+        tracing::debug!(
+            target: "zgc",
+            pinned,
+            carded = roots.len() - pinned,
+            "zgc young cycle: extra roots"
+        );
         roots
     }
 
@@ -13239,6 +13290,22 @@ pub(crate) mod tests {
         }
     }
 
+    /// The predicate form of [`overlay_provider_roots`].
+    ///
+    /// This arm was a `|_p| Vec::new()` stub, which made every test built on
+    /// this fixture blind to the wholesale rooting a generational young cycle
+    /// depends on -- the real provider in `native-collections` implements it
+    /// (`gc_overlay_roots_for_matching_owners`), so the STUB was the difference
+    /// between the fixture and production, not the feature.
+    fn overlay_provider_roots_matching(
+        owner_matches: &crate::external_roots::OwnerPredicate<'_>,
+    ) -> Vec<ObjectRef> {
+        match *OVERLAY_ARMED.lock() {
+            Some((armed_owner, root)) if owner_matches(armed_owner) => vec![root],
+            _ => Vec::new(),
+        }
+    }
+
     fn register_overlay_provider() {
         crate::external_roots::register_external_root_provider(
             crate::external_roots::ExternalRootProvider {
@@ -13246,7 +13313,7 @@ pub(crate) mod tests {
                 scan: |_out| {},
                 owner_addrs: || None,
                 roots_for_owner: overlay_provider_roots,
-                roots_for_matching_owners: |_p| Vec::new(),
+                roots_for_matching_owners: overlay_provider_roots_matching,
                 remap: |_m| {},
                 prune: |_p| {},
             },
@@ -14278,6 +14345,67 @@ pub(crate) mod tests {
                  must have been re-dirtied by the scan that consumed it"
             );
         }
+    }
+
+    /// **A young cycle keeps a native collection overlay whose owner is OLD.**
+    ///
+    /// # The hole this closes, and why no card could have covered it
+    ///
+    /// `collect_garbage`'s mark loop pushes four kinds of edge for every object
+    /// it VISITS: the class's loader, that loader's mirrors, its metadata roots
+    /// and the native collection overlays it owns. A young cycle never visits an
+    /// old object, so it pushes none of them for the old generation -- and not
+    /// one of the four is written through `set_field`, so the card barrier
+    /// cannot see them either. An old `HashMap` with a native overlay holding
+    /// young contents would have those contents freed while the map is live.
+    ///
+    /// The failure has no wild pointer and no failing assertion in the
+    /// collector: the overlay's side-table entry survives, its objects are
+    /// zeroed, and the symptom is a collection that has silently emptied. This
+    /// is the only test that can catch it, and it is why the young cycle roots
+    /// those four registries wholesale.
+    ///
+    /// The overlay provider is the same fixture
+    /// `the_parallel_mark_keeps_a_collection_overlay_alive` uses, and the shared
+    /// lock is why: it is a process-global registry.
+    #[test]
+    fn a_young_cycle_keeps_an_overlay_whose_owner_is_old() {
+        let _guard = OVERLAY_TEST_LOCK.lock();
+        register_overlay_provider();
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let owner = heap.alloc_object(ClassId::new(7), 0);
+
+        // Promote the OWNER with one collection, with no overlay armed yet.
+        let mut roots = [owner];
+        let _ = gen_collect(&heap, &mut roots);
+        let owner = roots[0];
+        assert!(
+            heap.header_ref(owner.as_ptr()).gc_age() >= 1,
+            "the owner must be old, or this test is about nothing"
+        );
+
+        // Now the overlay: a fresh YOUNG object reachable ONLY through the
+        // native side table of an OLD owner. No `set_field` anywhere, so there
+        // is no card and there could not be one.
+        let overlay = heap.alloc_object(ClassId::new(8), 0);
+        let overlay_addr = overlay.as_ptr() as usize;
+        *OVERLAY_ARMED.lock() = Some((owner.as_ptr() as usize, overlay));
+
+        let mut roots = [owner];
+        let _ = gen_collect(&heap, &mut roots);
+        *OVERLAY_ARMED.lock() = None;
+
+        assert_eq!(
+            heap.generational_stats().0,
+            1,
+            "that has to have been a MINOR, or the test proves nothing"
+        );
+        assert!(
+            heap.is_object_address(overlay_addr).is_some(),
+            "an overlay reachable only through an OLD owner must survive a young \
+             cycle: the owner is never visited, so the edge has to come from the \
+             wholesale rooting"
+        );
     }
 
     /// **A card whose target is OLD is dropped, and the target survives
