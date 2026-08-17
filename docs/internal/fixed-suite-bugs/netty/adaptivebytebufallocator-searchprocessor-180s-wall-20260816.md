@@ -37,7 +37,7 @@ interleaved against `base` — same class, same host, adjacent — it measured
 un-paired runs at 426 s and 475 s. The 270 s was this box, not this change, and
 1.45-1.75x is where the family actually sits. The ancestor page said so in
 advance
-(`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` §6: the same class
+(`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` §6: the same class
 measured 450, 551, 559 and 594 s on one binary): **interleave, or do not
 compare.**
 
@@ -60,10 +60,11 @@ half of this that a timing table cannot show.
   quiet-box re-run this page asked for has still not been taken on a genuinely
   quiet box — every measurement above was made at load 8-35.
 
-The residual is the ordinary native-dispatch floor (~150-200 ns per registered
+The residual is the ordinary native-dispatch floor (~150-210 ns per registered
 native call from compiled code), which is
-`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` and not a netty
-matter. This page moves here because its one actionable finding has been found
+`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` — reopened on
+2026-08-17 because these classes are what is still failing on it — and not a
+netty matter. This page moves here because its one actionable finding has been found
 and fixed and because its stated cause is now corrected.
 
 ---

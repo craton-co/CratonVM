@@ -516,7 +516,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-178 tokens.
+179 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -538,6 +538,7 @@ export inherited from a parent shell.
 | `bytecode-loop-xform` | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` |
 | `bulk-byte-loops` | `CRATONVM_JIT_BULK_BYTE_LOOPS` |
 | `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
+| `census-direct-helpers` | `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
@@ -701,7 +702,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-52 tokens.
+54 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -754,6 +755,8 @@ export inherited from a parent shell.
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
+| `zgc-gen-header-zero` | `CRATONVM_ZGC_GEN_HEADER_ZERO` |
+| `zgc-gen-dead-runs` | `CRATONVM_ZGC_GEN_DEAD_RUNS` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |

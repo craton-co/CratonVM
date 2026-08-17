@@ -13,7 +13,7 @@ happened, so it moves out of `known-issues`:
 * **Its two VM-wide levers are re-filed where they belong**, with fresh numbers
   and with the three attempts that did NOT convert into time recorded beside
   them:
-  [the VM-wide per-call cost](vm-per-call-dispatch-cost-RETIRED-20260813.md).
+  [the VM-wide per-call cost](../../known-issues/perf/vm-per-call-dispatch-cost-20260813.md).
   Read that page's §3 before sizing anything from the profile below.
 
 Nothing measured here has been retracted. The §5a gate-pass memo is still the
