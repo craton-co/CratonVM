@@ -47,7 +47,7 @@ count).
 ## Hibernate Reactive
 
 Full detail in
-[residual-seven-after-the-afc-fix-20260817.md](hibernate-reactive/residual-seven-after-the-afc-fix-20260817.md),
+[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md),
 filed the same day after a fix took the Windows FAIL bucket from 238 classes
 to seven. Summarized here; nothing in the seven is a hang, a deadlock, or a
 wrong answer.
@@ -56,7 +56,7 @@ wrong answer.
 
 | Class | Cause |
 |---|---|
-| `ORMReactivePersistenceTest` | Windows host's `America/Buenos_Aires` time zone ID is the pre-2009 spelling; the `postgres:18.4` container's tzdata (no `backward` file) rejects it in the JDBC driver's startup packet. Verified identical under HotSpot and CratonVM (`probes/DefaultLocaleTimeZoneProbe.java`), and both classes pass on the Azure host, which is UTC/`en`. |
+| `ORMReactivePersistenceTest` | Windows host's `America/Buenos_Aires` time zone ID is the pre-2009 spelling; the `postgres:18.4` container's tzdata (no `backward` file) rejects it in the JDBC driver's startup packet. Verified identical under HotSpot and CratonVM (`../../../probes/DefaultLocaleTimeZoneProbe.java`), and both classes pass on the Azure host, which is UTC/`en`. |
 | `it.quarkus.qe.database.DatabaseHibernateReactiveTest` | Windows host's `ru_RU` display language makes hibernate-validator resolve the Russian Bean Validation message instead of the English one the test asserts. Identical under HotSpot. |
 
 ### Five are one open CratonVM performance defect, not a correctness bug
@@ -73,7 +73,7 @@ Root cause, measured and reproduced on both Windows and Azure Linux: invoking
 a lambda/functional-interface method costs CratonVM ~1.7–2.1 µs — 8–10x
 HotSpot's *interpreter*, while a plain static call on CratonVM is 2–4x
 *faster* than HotSpot's interpreter (own control probe,
-`probes/CompositionPrimitivesProbe.java`). HotSpot's interpreter puts a lambda
+`../../../probes/CompositionPrimitivesProbe.java`). HotSpot's interpreter puts a lambda
 call at ~11–13x a static call; CratonVM puts it at ~200–300x. hibernate-reactive's
 `CompletableFuture`/`AsyncTrampoline`/Vert.x `Handler` pipeline is built almost
 entirely out of functional-interface invocations, which is why exactly these

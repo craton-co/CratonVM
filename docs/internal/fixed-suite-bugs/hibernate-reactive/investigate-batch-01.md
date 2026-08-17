@@ -63,7 +63,7 @@ Throughput and over-retention, not a hang.
 ## Repro
 
 ```bash
-cd apps/hibernate-reactive-suite-runner   # on azureuser@20.80.105.49, /data/cratonvm
+cd apps/hibernate-suite-runner   # on azureuser@20.80.105.49, /data/cratonvm
 export DOCKER_HOST=unix:///var/run/docker.sock
 export TESTCONTAINERS_RYUK_DISABLED=true
 <cratonvm> --java-home /data/toolchain/jdk-25 --Xmx 1500m -XX:+UseGenerationalGC \

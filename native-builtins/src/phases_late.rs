@@ -10275,7 +10275,7 @@ mod cert_verify_bounds_security_tests {
     /// demonstrated works.
     ///
     /// That is exactly how `doFinal([BI)V` went missing: it broke every
-    /// SCRAM-SHA-256 login (hibernate-reactive / Vert.x reactive Postgres saw
+    /// SCRAM-SHA-256 login (hibernate / Vert.x reactive Postgres saw
     /// `FATAL: expected SASL response, got message type 88` — 88 is 'X', the
     /// client sending Terminate after `com.ongres.scram`'s PBKDF2 loop died on
     /// iteration 2 of 4096), while every other Mac caller in the tree stayed

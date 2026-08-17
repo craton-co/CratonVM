@@ -1,7 +1,7 @@
 # "Stale pointer detected in invokevirtual receiver" fired on a healthy `new Object()` — FIXED
 
 **Status:** FIXED (2026-08-12). Found while clearing
-`docs/known-issues/hibernate-reactive/investigate-batch-04.md` — not from a
+`../../known-issues/hibernate/investigate-batch-04.md` — not from a
 failing test, but from a warning that appeared **exactly once per test class**,
 in every run, on every collector, while all 12 classes passed.
 
