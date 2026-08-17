@@ -2395,6 +2395,34 @@ pub struct ZgcRealHeap {
     /// the second a raw address kept across a safepoint. Capped, oldest cycles
     /// evicted first, so a long run cannot grow it without bound.
     corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize, u64)>>,
+
+    /// `vacated address -> where the object went`, for every object this
+    /// collector's slide has relocated and whose old address has not been
+    /// handed out again.
+    ///
+    /// **This is what makes `VmHeap::load_and_forward` work on this backend.**
+    /// That barrier repairs a possibly-stale reference by reading a FORWARDING
+    /// WORD at the old address, and the slide leaves none: `compact_low_to`
+    /// zeroes the span above the new cursor and the memmove overwrites
+    /// everything below it. So on the DEFAULT collector the barrier was a
+    /// silent no-op at all 46 of its call sites — every one of which exists
+    /// because its caller holds an `ObjectRef` somewhere no root scan can see
+    /// (a native's Rust local, an invoke's popped-argument buffer) across an
+    /// operation that can collect.
+    ///
+    /// Measured before this table existed, with `CRATONVM_DBG_VACATED_FRAMES`
+    /// armed on H2 `TestMultiThread.testConcurrentUpdate`: the barrier was
+    /// handed an address the collector had moved an object away from, from
+    /// `apps_h2::h2_comparison_compare`, `h2_comparison_get_value` and
+    /// `properties_sidetable::mirror_loaded_entries_to_properties_backend`,
+    /// and could not repair any of them.
+    ///
+    /// **Why no pruning is needed for correctness.** A lookup is only consulted
+    /// when the address is NOT a registered object base, so a re-issued address
+    /// never reaches the table — the entry is simply unreachable, not wrong.
+    /// Pruning at the end of each collection is therefore pure memory
+    /// hygiene.
+    relocations: Mutex<FxHashMap<usize, usize>>,
     /// `base -> alloc_size(header)` as the LAST slide left it, taken after the
     /// registry rebuild and before any mutator resumed.
     ///
@@ -2525,6 +2553,30 @@ pub struct ZgcRealHeap {
     /// [`Self::conc_phase_nanos`] can be closed out at mark end. `0` when no
     /// cycle is open.
     conc_mark_started_at: AtomicU64,
+    /// Is every registered object's [`GC_FLAG_MARKED`] known to be clear?
+    ///
+    /// # Why this exists: a 34-66 ms pause spent clearing bits that are clear
+    ///
+    /// `start_concurrent_mark` used to walk the whole registry clearing the mark
+    /// bit. The 2026-08-17 pause anatomy measured that walk at **94-96% of the
+    /// mark-start pause** -- 34 ms of 35 on a 4.6M-entry registry, 66 of 69 on a
+    /// 10.8M one -- and then a counter showed `stale_marked=0` on **every one of
+    /// 20 mark starts**, at two different window settings. The walk was clearing
+    /// a bit that was already clear, every time.
+    ///
+    /// It is redundant because the sweep is exhaustive: it visits every
+    /// registered object and clears `GC_FLAG_MARKED` on every survivor, zeroes
+    /// every corpse, and clears the bit even on the object it refuses to size.
+    /// Objects allocated afterwards are born with clear flags, and
+    /// `allocate_black_if_marking` is a no-op with no cycle open.
+    ///
+    /// It is NOT unconditionally redundant, which is why this is a latch and not
+    /// a deletion: [`Self::abandon_concurrent_mark`] drops a partially-traced
+    /// cycle with **no sweep following it**, so the bits that trace set are still
+    /// there. That is the one path that clears this flag.
+    ///
+    /// Starts `true`: a fresh heap has no objects, so the claim holds vacuously.
+    conc_bits_known_clear: AtomicBool,
     /// `allocated` at which a concurrent cycle opens, precomputed from
     /// [`conc_start_percent_setting`] and [`Self::gc_threshold`]. `0` means
     /// concurrent marking is off for this heap, which is the default.
@@ -2908,6 +2960,7 @@ impl ZgcRealHeap {
             gc_stress_mark: AtomicUsize::new(0),
             critical_pins: Mutex::new(FxHashMap::default()),
             corpse_ledger: Mutex::new(FxHashMap::default()),
+            relocations: Mutex::new(FxHashMap::default()),
             slide_exit_sizes: Mutex::new(FxHashMap::default()),
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
@@ -2927,6 +2980,7 @@ impl ZgcRealHeap {
             conc_ingress_replayed: AtomicUsize::new(0),
             conc_phase_nanos: AtomicU64::new(0),
             conc_mark_started_at: AtomicU64::new(0),
+            conc_bits_known_clear: AtomicBool::new(true),
             conc_start_bytes: AtomicUsize::new({
                 let pct = conc_start_percent_setting();
                 if pct == 0 {
@@ -3160,12 +3214,61 @@ impl ZgcRealHeap {
             return false;
         };
 
-        // (1)
-        let registered = self.registry.snapshot();
-        for base in registered.bases() {
-            self.header_mut(base as *mut u8)
-                .clear_gc_flags(GC_FLAG_MARKED);
+        // THE MARK-START PAUSE IS A PAUSE, and until 2026-08-17 nothing
+        // measured it. `--verbose:gc`'s `pause_us` is taken inside
+        // `collect_garbage`, so a concurrent cycle's cost was reported as one
+        // pause when it is two -- and the unmeasured half contains a full
+        // registry walk (the mark-bit clear). Any total-pause comparison that
+        // omitted it understated the concurrent arm.
+        let armed = self.gc_log_enabled.load(Ordering::Relaxed);
+        let started_at = armed.then(std::time::Instant::now);
+        let mut clock = ZPhaseClock::new(armed);
+
+        // (1) CLEAR THE MARK BITS -- only if they might not already be clear.
+        //
+        // This walk was 94-96% of the mark-start pause and a counter found
+        // `stale_marked=0` on every one of 20 mark starts: it was clearing bits
+        // that the previous sweep had already cleared. See
+        // `conc_bits_known_clear` for the full argument and for the one path
+        // (`abandon_concurrent_mark`) that makes it necessary.
+        //
+        // The registry snapshot goes with it: its only consumer was this loop.
+        let mut stale = 0usize;
+        let mut n_registered = 0usize;
+        let mut snapshot_us = 0u128;
+        let mut clearbits_us = 0u128;
+        let known_clear = self.conc_bits_known_clear.load(Ordering::Acquire);
+        // In a debug build, VERIFY the latch rather than trusting it: walk
+        // anyway and count. A latch that silently lies here hands the sweep a
+        // mark set with a previous cycle's bits in it, which is a retained
+        // object at best. Release builds skip the walk entirely, which is the
+        // whole point.
+        if !known_clear || cfg!(debug_assertions) {
+            let registered = self.registry.snapshot();
+            snapshot_us = clock.lap();
+            // ONE `bases()` call: it materialises a `Vec` of every registered
+            // base, so calling it again just to count would double a
+            // multi-megabyte allocation inside the pause being measured.
+            let bases = registered.bases();
+            n_registered = bases.len();
+            for base in bases {
+                let h = self.header_mut(base as *mut u8);
+                if h.gc_flags() & GC_FLAG_MARKED != 0 {
+                    stale += 1;
+                }
+                h.clear_gc_flags(GC_FLAG_MARKED);
+            }
+            clearbits_us = clock.lap();
+            debug_assert!(
+                !known_clear || stale == 0,
+                "zgc: conc_bits_known_clear was set but {stale} registered objects \
+                 carried GC_FLAG_MARKED into mark start"
+            );
         }
+        // Whatever the state was, it is clear now and this cycle is about to
+        // start setting bits again -- so the claim is false from here until the
+        // sweep re-establishes it.
+        self.conc_bits_known_clear.store(false, Ordering::Release);
 
         // (2)
         let _skip = self.begin_concurrent_mark_cycle();
@@ -3177,15 +3280,27 @@ impl ZgcRealHeap {
         let workers = self.conc_mark_workers();
         let ctx: std::sync::Arc<dyn mark::ZMarkContext> = me;
         let coordinator = std::sync::Arc::new(mark::ZMarkCoordinator::new(ctx, workers));
+        let pool_us = clock.lap();
         coordinator.begin_cycle();
         let marked_roots = coordinator.push_roots(roots);
         coordinator.start_marking();
+        let roots_us = clock.lap();
         *self.conc_pool.lock() = Some(coordinator);
         self.conc_cycle_active.store(true, Ordering::Release);
         self.conc_cycles_started.fetch_add(1, Ordering::Relaxed);
         self.conc_mark_started_at
             .store(Self::monotonic_nanos(), Ordering::Relaxed);
 
+        if let Some(t0) = started_at {
+            eprintln!(
+                "[GC] zgc-markstart: pause_us={} snapshot_us={snapshot_us} \
+                 clearbits_us={clearbits_us} poolspawn_us={pool_us} roots_us={roots_us} \
+                 registered={n_registered} stale_marked={stale} roots={} \
+                 marked_roots={marked_roots} workers={workers}",
+                t0.elapsed().as_micros(),
+                roots.len(),
+            );
+        }
         tracing::debug!(
             target: "zgc",
             workers,
@@ -3274,8 +3389,25 @@ impl ZgcRealHeap {
         coordinator.push_roots(&root_addrs);
 
         // ---- drive to a certified fixed point ---------------------------
+        //
+        // Snapshot `objects_scanned` on BOTH sides of this, because the
+        // difference is the one number that says whether the concurrent phase
+        // did its job: everything the pool had not finished tracing by the time
+        // the collection arrived is traced HERE, inside the pause. A cycle
+        // whose window was too short looks identical to one whose window was
+        // ample in every other figure.
+        let scanned_before = coordinator.stats().snapshot().objects_scanned;
         let report = coordinator.mark_to_completion(Z_CONC_MARK_END_RESTART_BUDGET);
         let stats = coordinator.stats().snapshot();
+        let scanned_at_safepoint = stats.objects_scanned.saturating_sub(scanned_before);
+        if self.gc_log_enabled.load(Ordering::Relaxed) {
+            eprintln!(
+                "[GC] zgc-markend: scanned_concurrently={scanned_before} \
+                 scanned_at_safepoint={scanned_at_safepoint} marked={} \
+                 satb_replayed={replayed} passes={} restarts={}",
+                stats.objects_marked, report.passes, report.restarts,
+            );
+        }
         coordinator.end_cycle();
         self.end_concurrent_mark_cycle();
 
@@ -3327,6 +3459,11 @@ impl ZgcRealHeap {
             drop(p);
         }
         self.end_concurrent_mark_cycle();
+        // The partial trace's mark bits are still set and NO SWEEP FOLLOWS an
+        // abandon, so the next mark start must do the walk. This is the only
+        // path that makes that walk necessary, and dropping this store is how
+        // a retained-object bug would be introduced.
+        self.conc_bits_known_clear.store(false, Ordering::Release);
         tracing::debug!(target: "zgc", "zgc concurrent mark: cycle ABANDONED");
     }
 
@@ -5118,6 +5255,16 @@ impl ZgcRealHeap {
             self.registry.insert(*to);
         }
 
+        // Publish this slide's moves so the forwarding barrier has something to
+        // read. See `ZgcRealHeap::relocations`.
+        {
+            let mut reloc = self.relocations.lock();
+            reloc.reserve(pairs.len());
+            for (from, to) in &pairs {
+                reloc.insert(*from, *to);
+            }
+        }
+
         if unwalkable > 0 {
             tracing::error!(
                 target: "cratonvm::gc::guard",
@@ -5958,6 +6105,8 @@ impl ZgcRealHeap {
         // section header for the measurement this replaced.
         self.audit_registry_insert(ptr as usize, size, "alloc_raw");
         self.registry.insert(ptr as usize);
+        // See the same call in `register_allocations`.
+        crate::gc_quiescence::note_allocated(&[ptr as usize]);
         let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
         // Arm the native-allocation-pressure latch on the crossing edge. This
         // is the ZGC analogue of G1's `note_region_consumed_locked`
@@ -6598,7 +6747,57 @@ impl ZgcRealHeap {
     /// three things -- whether any registered object CONTAINS the receiver
     /// (an interior pointer, so the caller derived it), how far into that
     /// object it points, and what class that container is.
-     /// The flag-free "was this receiver RECLAIMED?" verdict, for THIS
+     /// Where did the object that used to live at `addr` go?
+    ///
+    /// Chained, because an object can move again in a later cycle and the
+    /// table records each hop separately; bounded so a cycle in the table
+    /// (which would be a bug in the slide, not in a caller) cannot hang the
+    /// barrier. Returns `None` unless the final target is a live object base.
+    ///
+    /// See [`Self::relocations`] for why this exists and why a re-issued
+    /// address cannot reach it.
+    pub fn forwarded_after_slide(&self, addr: usize) -> Option<usize> {
+        let reloc = self.relocations.lock();
+        if reloc.is_empty() {
+            return None;
+        }
+        let mut cur = *reloc.get(&addr)?;
+        for _ in 0..8 {
+            match reloc.get(&cur) {
+                Some(&next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        drop(reloc);
+        self.registry.contains(cur).then_some(cur)
+    }
+
+    /// Drop entries whose vacated address has been handed out again — the
+    /// lookup can no longer reach them, so they are pure memory. Called once
+    /// per collection, after the sweep has published the live registry.
+    fn prune_relocations(&self) {
+        let mut reloc = self.relocations.lock();
+        if reloc.is_empty() {
+            return;
+        }
+        reloc.retain(|from, _| !self.registry.contains(*from));
+        // A hard ceiling as well: this table is bounded by the arena in
+        // principle, but "in principle" is not a bound anyone can point at in a
+        // heap dump. Clearing degrades the barrier to what it did before this
+        // table existed, which is the safe direction, and says so.
+        const MAX: usize = 4_000_000;
+        if reloc.len() > MAX {
+            tracing::warn!(
+                target: "cratonvm::gc",
+                entries = reloc.len(),
+                "zgc relocation table exceeded its ceiling and was cleared — the forwarding \
+                 barrier degrades to a no-op for older moves until the next slide"
+            );
+            reloc.clear();
+        }
+    }
+
+    /// The flag-free "was this receiver RECLAIMED?" verdict, for THIS
     /// collector -- the port of `GenerationalHeap::reclaimed_hole_at`.
     ///
     /// ZGC has been the DEFAULT collector since 2026-08-10, and until this
@@ -8057,6 +8256,10 @@ impl ZTlabHeapHooks for ZgcRealHeap {
             }
         }
         self.registry.insert_all(addrs);
+        // `CRATONVM_DBG_VACATED_FRAMES`: these addresses are live objects again,
+        // so a reference to one is no longer evidence that a holder went stale.
+        // See `gc_quiescence::note_allocated`.
+        crate::gc_quiescence::note_allocated(addrs);
         if bytes == 0 {
             return;
         }
@@ -9420,6 +9623,49 @@ impl ZgcRealHeap {
     }
 }
 
+
+/// Phase stopwatch for the `--verbose:gc` pause anatomy.
+///
+/// # Why the anatomy exists
+///
+/// The 2026-08-16 concurrent-marking measurement reported a per-cycle pause and
+/// nothing about what was IN it, and that turned out to hide two things at once:
+/// the mark-start pause was not being measured at all, and the pause that WAS
+/// measured is mostly not the mark. A pause number with no breakdown cannot
+/// answer "why is there still a pause on a concurrent collector", which is the
+/// only question worth asking of one.
+///
+/// `None` when logging is off: every `lap` is then a branch on an `Option` and
+/// no clock read at all.
+#[derive(Debug)]
+struct ZPhaseClock {
+    last: Option<std::time::Instant>,
+}
+
+impl ZPhaseClock {
+    #[inline]
+    fn new(armed: bool) -> Self {
+        ZPhaseClock {
+            last: armed.then(std::time::Instant::now),
+        }
+    }
+
+    /// Microseconds since the previous `lap` (or since construction), and
+    /// restart. `0` when disarmed.
+    #[inline]
+    fn lap(&mut self) -> u128 {
+        match self.last {
+            Some(t) => {
+                let now = std::time::Instant::now();
+                let us = now.duration_since(t).as_micros();
+                self.last = Some(now);
+                us
+            }
+            None => 0,
+        }
+    }
+}
+
 impl GarbageCollector for ZgcRealHeap {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         let compact_body =
@@ -9859,8 +10105,10 @@ impl GarbageCollector for ZgcRealHeap {
         // the handshake refused to certify one -- in both cases the mark loop
         // below runs from scratch, which is the same fail-closed fallback
         // `mark_with_controller_stw` has always had.
+        let mut clock = ZPhaseClock::new(gc_started.is_some());
         let concurrent_off_heap = self.finish_concurrent_mark(roots);
         let marked_concurrently = concurrent_off_heap.is_some();
+        let markend_us = clock.lap();
 
         // ---- RETIRE EVERY TLAB -------------------------------------------
         // First statement after the concurrent-cycle handshake above, before
@@ -9905,8 +10153,10 @@ impl GarbageCollector for ZgcRealHeap {
         // membership is O(1). On the bitmap arm it copies one bit per 8 arena
         // bytes rather than 8+ bytes per live object, so it is also strictly
         // cheaper than the set clone at any occupancy above ~1.5%.
+        let tlab_us = clock.lap();
         let registered: ZObjectStartsSnapshot = self.registry.snapshot();
         let all: Vec<usize> = registered.bases();
+        let snapshot_us = clock.lap();
 
         // Clear all mark bits first (objects may carry a stale bit from a
         // prior cycle's survivors).
@@ -10082,6 +10332,11 @@ impl GarbageCollector for ZgcRealHeap {
         // mark dead-but-finalizable objects (and their subtrees) live so the
         // sweep keeps them for the finalizer thread. Runs after the main
         // closure so "unmarked" == dead, and before the sweep decides.
+        // Everything from the snapshot to here is the mark: bit clearing plus
+        // whichever marker ran. Zero on a concurrently-marked cycle, which is
+        // the whole point of the phase.
+        let mark_us = clock.lap();
+
         let fin_candidates = std::mem::take(&mut *self.pending_finalizer_roots.lock());
         if !fin_candidates.is_empty() {
             let mut resurrected = Vec::new();
@@ -10149,6 +10404,8 @@ impl GarbageCollector for ZgcRealHeap {
         // `WeakReference` semantics silently broke under this backend. The
         // enqueue/finalize actions are surfaced for the runtime to drain; the
         // referent-null writes are applied in place here.
+        let resurrect_us = clock.lap();
+
         let ref_result = self.process_references();
         if !ref_result.to_enqueue.is_empty()
             || !ref_result.to_finalize.is_empty()
@@ -10238,6 +10495,8 @@ impl GarbageCollector for ZgcRealHeap {
         if zgc_corpse_enabled() {
             self.survey_registry_extents(&all, "pre-sweep");
         }
+
+        let refs_us = clock.lap();
 
         // ---- Sweep phase -------------------------------------------------
         let mut dead: Vec<usize> = Vec::new();
@@ -10385,6 +10644,9 @@ impl GarbageCollector for ZgcRealHeap {
         for d in &dead {
             self.registry.remove(*d);
         }
+        // Memory hygiene for the forwarding table, on the same pass that
+        // decided which addresses are live. See `prune_relocations`.
+        self.prune_relocations();
         self.allocated.store(bytes_copied, Ordering::Relaxed);
         // Re-arm the trigger: require at least a quarter of the remaining
         // headroom (min 64 KiB) of NEW allocation before the next
@@ -10458,6 +10720,14 @@ impl GarbageCollector for ZgcRealHeap {
         // callsite. Adopting the metrics module is a larger step — it has to be
         // fed from every phase, not just here — so this line stays standalone
         // until then; replace it wholesale at that point.
+        // THE SWEEP HAS JUST MADE EVERY MARK BIT CLEAR. It visited every
+        // registered object: survivors had `GC_FLAG_MARKED` cleared, corpses
+        // were zeroed, and the object it refuses to size had the bit cleared
+        // too. That is what lets the next mark start skip a full registry walk
+        // -- see `conc_bits_known_clear`.
+        self.conc_bits_known_clear.store(true, Ordering::Release);
+
+        let sweep_us = clock.lap();
         if let Some(started) = gc_started {
             let pause_us = started.elapsed().as_micros();
             // `mark=` is the ONE field that says whether this collection's
@@ -10477,6 +10747,19 @@ impl GarbageCollector for ZgcRealHeap {
                 "[GC] zgc-real: cycle={cycle} pause_us={pause_us} mark={mark} \
                  objects_copied={objects_copied} bytes_copied={bytes_copied} \
                  bytes_freed={bytes_freed} occupancy={bytes_copied}/{cap} bytes",
+            );
+            // THE ANATOMY. Without it, "the pause is 230 ms" cannot be acted
+            // on: a pause that is mostly `mark_us` wants a longer concurrent
+            // window, and a pause that is mostly `sweep_us` wants a concurrent
+            // SWEEP and does not care about marking at all. `registered` is
+            // here because every phase except `markend` scales with it.
+            eprintln!(
+                "[GC] zgc-pause: cycle={cycle} total_us={pause_us} \
+                 markend_us={markend_us} tlab_us={tlab_us} snapshot_us={snapshot_us} \
+                 mark_us={mark_us} resurrect_us={resurrect_us} refs_us={refs_us} \
+                 sweep_us={sweep_us} registered={} dead={}",
+                all.len(),
+                dead.len(),
             );
         }
 
@@ -15528,6 +15811,74 @@ pub(crate) mod tests {
             heap.is_object_address(victim_addr).is_none(),
             "the next cycle must reclaim it, or SATB conservatism is a leak"
         );
+    }
+
+    /// The mark-start mark-bit walk is skipped when the sweep has already
+    /// cleared them, and NOT skipped after an abandoned cycle.
+    ///
+    /// # Why the second half is the important half
+    ///
+    /// Skipping the walk is worth 94-96% of the mark-start pause, and it is safe
+    /// only because the sweep is exhaustive. `abandon_concurrent_mark` breaks
+    /// that: it drops a partially-traced cycle with no sweep following, so the
+    /// bits that trace set are still on the objects. If the latch stayed `true`
+    /// across an abandon, the next cycle would inherit them and the sweep would
+    /// retain whatever the abandoned trace had reached -- a leak that grows with
+    /// every abandon and that no reachability assertion can see.
+    #[test]
+    fn the_mark_bit_walk_is_skipped_only_when_the_sweep_has_cleared_them() {
+        let heap = ZgcRealHeap::new_shared(32 * 1024 * 1024);
+        // A fresh heap has no objects, so the claim holds vacuously.
+        assert!(heap.conc_bits_known_clear.load(Ordering::Acquire));
+
+        let (head, chain, garbage) = conc_build_graph(&heap, 400, 80);
+
+        // Opening a cycle invalidates it: this cycle is about to set bits.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        assert!(!heap.conc_bits_known_clear.load(Ordering::Acquire));
+
+        // ABANDON: no sweep follows, so the claim must stay false.
+        heap.abandon_concurrent_mark();
+        assert!(
+            !heap.conc_bits_known_clear.load(Ordering::Acquire),
+            "an abandoned cycle leaves its partial trace's mark bits set and no \
+             sweep behind it -- the next mark start MUST do the walk"
+        );
+
+        // A collection re-establishes it, because the sweep is exhaustive.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        assert!(
+            heap.conc_bits_known_clear.load(Ordering::Acquire),
+            "the sweep clears every survivor and zeroes every corpse, so after \
+             one the claim holds"
+        );
+        assert_eq!(conc_walk_chain(&heap, head), chain);
+        assert!(garbage.iter().all(|a| heap.is_object_address(*a).is_none()));
+
+        // And the NEXT cycle, opened on that basis, still marks correctly -- the
+        // skip must not turn into a lost mark set.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        assert_eq!(heap.concurrent_mark_stats().1, 1, "the second cycle certified");
+        assert_eq!(conc_walk_chain(&heap, head), chain);
     }
 
     /// The trigger fires below the collection threshold and not above it, and
