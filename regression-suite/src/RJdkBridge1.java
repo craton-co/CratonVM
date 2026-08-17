@@ -1890,7 +1890,37 @@ public class RJdkBridge1 {
                 "s.equals(t) must imply s.intern() == t.intern(), including when the text "
                         + "is not representable in the host language");
 
-        sectionEnd("surrog", 24);
+        // String.valueOf(Object) is `obj.toString()` in the JDK, so for a
+        // String it is an IDENTITY. A bridge that decodes and rebuilds passes
+        // nothing here — neither the units nor the identity.
+        step("surrog", "String.valueOf(Object) with a lone surrogate");
+        String vs = String.valueOf((Object) LONE_HI);
+        check(vs.length() == 3 && vs.charAt(1) == 0xD800,
+                "String.valueOf(Object) must carry the surrogate, got charAt(1)="
+                        + Integer.toHexString(vs.charAt(1)));
+        check(vs == LONE_HI,
+                "String.valueOf(Object) on a String is obj.toString(), which for String is "
+                        + "`this` — it must not allocate a copy");
+
+        // The no-match case is the discriminating one: a bridge that rebuilds
+        // the receiver loses the surrogate even when it replaces nothing.
+        step("surrog", "String.replace(CharSequence,CharSequence) that matches nothing");
+        String rp = LONE_HI.replace("q", "z");
+        check(rp.length() == 3 && rp.charAt(1) == 0xD800,
+                "replace(CharSequence,CharSequence) must not disturb a receiver it does not "
+                        + "match, got charAt(1)=" + Integer.toHexString(rp.charAt(1)));
+        step("surrog", "String.replace(CharSequence,CharSequence) that matches");
+        String rp2 = LONE_HI.replace("a", "z");
+        check(rp2.length() == 3 && rp2.charAt(0) == 'z' && rp2.charAt(1) == 0xD800,
+                "replace(CharSequence,CharSequence) must replace the match and keep the rest");
+
+        step("surrog", "String.join with a lone surrogate element");
+        String js = String.join("-", LONE_HI);
+        check(js.length() == 3 && js.charAt(1) == 0xD800,
+                "String.join must carry an element's surrogate, got charAt(1)="
+                        + Integer.toHexString(js.charAt(1)));
+
+        sectionEnd("surrog", 29);
     }
 
     static final int SFF = 15;

@@ -4564,9 +4564,9 @@ pub(crate) fn native_string_replace_charseq(
     };
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let target = match args.get(1) {
+    let target_units = match args.get(1) {
         Some(Value::Object(Some(o))) => {
-            invoke_to_string(&mut *scope, *o).unwrap_or_default()
+            invoke_to_string_units_opt(&mut *scope, *o)?.unwrap_or_default()
         }
         // A `null` target is an NPE, matching the JDK. This used to return a
         // null `String` on the reasoning that "real callers never pass null" —
@@ -4574,18 +4574,61 @@ pub(crate) fn native_string_replace_charseq(
         // `s.replace(null, "x")` hand back `null` where HotSpot throws.
         _ => return Err(regex_arg_npe("target").into()),
     };
-    let replacement = match args.get(2) {
+    let replacement_units = match args.get(2) {
         Some(Value::Object(Some(o))) => {
-            invoke_to_string(&mut *scope, *o).unwrap_or_default()
+            invoke_to_string_units_opt(&mut *scope, *o)?.unwrap_or_default()
         }
         _ => return Err(regex_arg_npe("replacement").into()),
     };
     let this = scope.get(&this_handle);
-    let s = scope.read_string(this).unwrap_or_default();
-    let result = s.replace(&target, &replacement);
-    Ok(Some(Value::Object(Some(
-        scope.create_string_uninterned(&result),
-    ))))
+    // Units, not text, all the way through. This method took its receiver
+    // through `read_string` and handed the result to `create_string`, so an
+    // unpaired surrogate anywhere in it became U+FFFD — MEASURED on both VMs
+    // at `89e2c56f1`, including on a call that matches NOTHING, which is what
+    // proves the loss is the round trip and not the replacement:
+    //
+    //   "a<U+D800>b".replace("q", "z")   HotSpot 61,d800,62   CratonVM 61,fffd,62
+    //
+    // `replace_units` is the only implementation rather than a second one
+    // behind a surrogate guard: `sb_string_from_units` already takes the
+    // plain-text path when the units are representable, so behaviour for
+    // every input that works today is unchanged, and there is no rarely-taken
+    // copy to drift.
+    let s_units = read_string_chars(&*scope, this);
+    let out = replace_units(&s_units, &target_units, &replacement_units);
+    let result = sb_string_from_units(&mut *scope, &out)?;
+    Ok(Some(Value::Object(Some(result))))
+}
+
+/// Literal find-and-replace over UTF-16 code units — `str::replace`'s contract,
+/// in the space Java strings actually live in.
+///
+/// The empty-target case is the one worth stating: both Java and Rust insert
+/// the replacement before every unit and once at the end, so `"abc"` with
+/// `("", "-")` is `-a-b-c-`. It is handled explicitly because the obvious loop
+/// silently produces `a-b-c` instead, and no test in this tree would have
+/// caught the difference.
+fn replace_units(haystack: &[u16], target: &[u16], replacement: &[u16]) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::with_capacity(haystack.len());
+    if target.is_empty() {
+        out.extend_from_slice(replacement);
+        for &u in haystack {
+            out.push(u);
+            out.extend_from_slice(replacement);
+        }
+        return out;
+    }
+    let mut i = 0usize;
+    while i < haystack.len() {
+        if i + target.len() <= haystack.len() && &haystack[i..i + target.len()] == target {
+            out.extend_from_slice(replacement);
+            i += target.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Shared body of every `String.to{Lower,Upper}Case` native.
@@ -4961,13 +5004,38 @@ pub(crate) fn native_string_value_of_object(
     // write(String) legitimately throws NullPointerException on a real null
     // (str.length()) but would silently write 4 chars for the text "null".
     match args.first() {
-        Some(Value::Object(Some(obj))) => match invoke_to_string_opt(ctx, *obj)? {
-            Some(text) => {
-                let result = ctx.create_string_uninterned(&text);
-                Ok(Some(Value::Object(Some(result))))
+        Some(Value::Object(Some(obj))) => {
+            // `String.toString()` returns `this`, so for a String argument the
+            // JDK contract is an identity: `String.valueOf(s) == s`. Returning
+            // the object is exact AND allocation-free on the hottest arm of a
+            // very hot method — the previous code decoded it to Rust text and
+            // built a second String on every call.
+            //
+            // Exactness matters here, not just cost. `invoke_to_string_opt` is
+            // the LOSSY wrapper over `invoke_to_string_units_opt`: it exists
+            // only to hand back a Rust `String`, which cannot carry an
+            // unpaired surrogate. MEASURED on both VMs at `89e2c56f1`:
+            //
+            //   String.valueOf((Object) "a<U+D800>b")
+            //     HotSpot   61,d800,62      CratonVM   61,fffd,62
+            //
+            // The units form was built by `G26` for exactly this reason and
+            // this call site never moved to it.
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(*obj))
+                .as_deref()
+                == Some("java/lang/String")
+            {
+                return Ok(Some(Value::Object(Some(*obj))));
             }
-            None => Ok(Some(Value::Object(None))),
-        },
+            match invoke_to_string_units_opt(ctx, *obj)? {
+                Some(units) => {
+                    let result = sb_string_from_units(ctx, &units)?;
+                    Ok(Some(Value::Object(Some(result))))
+                }
+                None => Ok(Some(Value::Object(None))),
+            }
+        }
         _ => {
             let result = ctx.create_string_uninterned("null");
             Ok(Some(Value::Object(Some(result))))
