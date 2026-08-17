@@ -3482,6 +3482,24 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
     "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
 ];
 
+/// `SSLSession.getPacketBufferSize()` — MEASURED on HotSpot 25.0.3+9 in every
+/// state (`G25Probe`): fresh engine, TLS 1.3 with AES-128-GCM, TLS 1.3 with
+/// AES-256-GCM. Unlike its neighbour this one really is a constant.
+pub(crate) const JSSE_PACKET_BUFFER_SIZE: i32 = 16709;
+
+/// `SSLSession.getApplicationBufferSize()` for a session that has NOT
+/// negotiated. MEASURED: 16704, which is [`JSSE_PACKET_BUFFER_SIZE`] minus the
+/// 5-byte TLS record header.
+pub(crate) const JSSE_APPLICATION_BUFFER_SIZE_FRESH: i32 = 16704;
+
+/// `SSLSession.getApplicationBufferSize()` after a completed handshake.
+/// MEASURED: 16676 for TLS 1.3 under both `TLS_AES_128_GCM_SHA256` and
+/// `TLS_AES_256_GCM_SHA384` — the value moves when a suite is negotiated but
+/// not between suites, which is why one constant per STATE is enough and a
+/// per-suite table is not needed. See the accessor's comment for the audit
+/// that made raising this from the old 16384 safe.
+pub(crate) const JSSE_APPLICATION_BUFFER_SIZE_NEGOTIATED: i32 = 16676;
+
 /// `ring`'s default `CryptoProvider`, augmented with the T-CBC.1 CBC-mode
 /// TLS1.2 suites (`crate::t27_tls_cbc`) that `ring` itself never implements —
 /// see `fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`.
@@ -4130,7 +4148,34 @@ pub(crate) fn rustls_client_connect(
 /// one of them is genuinely without an accessor.
 pub(crate) const NATIVE_TLS_UNNAMEABLE_SUITE: &str = "UNKNOWN";
 
-pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
+/// Why [`rustls_server_accept_within`] did not return a stream.
+///
+/// **`TimedOut` is not a `Failed("...timed out")`.** `SSLServerSocket.accept()`
+/// turns a failure into `java.io.IOException` and an expiry into
+/// `java.net.SocketTimeoutException`, and an accept loop distinguishes them by
+/// catching the latter and going round again — `RSslLiveSession.serve` is
+/// written exactly that way. Collapsing the two into one string error would
+/// make an ordinary idle tick look like a dead listener.
+pub(crate) enum AcceptFailure {
+    /// The socket's `SO_TIMEOUT` elapsed with no peer. Not an error state:
+    /// the listener is untouched and a later `accept()` works.
+    TimedOut,
+    Failed(String),
+}
+
+/// Accept one TLS connection on `listener_id`, waiting at most `timeout` for a
+/// peer to arrive.
+///
+/// `timeout` is the socket's `SO_TIMEOUT`; `None` means block indefinitely,
+/// which is what `SO_TIMEOUT == 0` means in `java.net.ServerSocket` and what
+/// this function did unconditionally before G25. It bounds only the wait for a
+/// TCP connection — once a peer is accepted the TLS handshake runs under the
+/// stream's own 30 s read/write timeouts, matching JSSE, where `SO_TIMEOUT`
+/// governs `accept()` and not the handshake that follows it.
+pub(crate) fn rustls_server_accept_within(
+    listener_id: i32,
+    timeout: Option<std::time::Duration>,
+) -> Result<i32, AcceptFailure> {
     let debug_hs = crate::nbflags().dbg_tls_hs;
     // Step 1: pop the config + a cloned tcp listener handle + the closed
     // flag, then accept *without* the mutex held so long handshakes (or a
@@ -4138,20 +4183,19 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     // operation, and so `close()` is never blocked behind this wait.
     let (config, tcp_listener, closed) = {
         let reg = sreg().lock();
-        let entry = reg
-            .listeners
-            .get(&listener_id)
-            .ok_or_else(|| format!("no such SSLServerSocket id: {}", listener_id))?;
+        let entry = reg.listeners.get(&listener_id).ok_or_else(|| {
+            AcceptFailure::Failed(format!("no such SSLServerSocket id: {}", listener_id))
+        })?;
         let cloned = entry
             .listener
             .try_clone()
-            .map_err(|e| format!("listener try_clone failed: {e}"))?;
+            .map_err(|e| AcceptFailure::Failed(format!("listener try_clone failed: {e}")))?;
         (entry.config.clone(), cloned, entry.closed.clone())
     };
 
     tcp_listener
         .set_nonblocking(true)
-        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
+        .map_err(|e| AcceptFailure::Failed(format!("listener set_nonblocking failed: {e}")))?;
     // STW-COOPERATION: this loop parks the calling thread for as long as no
     // peer connects — unboundedly, in a native, never returning to the
     // interpreter and so never reaching a safepoint poll. Left unmarked it is
@@ -4166,6 +4210,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     // Rust with no Java in it, and re-entering per tick would deposit a root
     // snapshot and retire the TLAB 50 times a second for a thread that is
     // doing nothing.
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
     let (tcp, _peer) = {
         let _blocked = gc_blocked_syscall();
         loop {
@@ -4173,11 +4218,24 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 Ok(pair) => break pair,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if closed.load(Ordering::SeqCst) {
-                        return Err("listener closed".to_string());
+                        return Err(AcceptFailure::Failed("listener closed".to_string()));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    // The expiry test comes BEFORE the nap and the nap is
+                    // clamped to what is left, so a 5 ms `SO_TIMEOUT` expires
+                    // in about 5 ms rather than being rounded up to the 20 ms
+                    // poll tick. The tick exists to keep `close()` responsive
+                    // (see `closed` above), not to quantise the timeout.
+                    let now = std::time::Instant::now();
+                    let mut nap = std::time::Duration::from_millis(20);
+                    if let Some(deadline) = deadline {
+                        if now >= deadline {
+                            return Err(AcceptFailure::TimedOut);
+                        }
+                        nap = nap.min(deadline - now);
+                    }
+                    std::thread::sleep(nap);
                 }
-                Err(e) => return Err(format!("accept failed: {}", e)),
+                Err(e) => return Err(AcceptFailure::Failed(format!("accept failed: {}", e))),
             }
         }
     };
@@ -5298,26 +5356,95 @@ pub(crate) fn rustls_client_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>>
 // Native method registrations
 // -----------------------------------------------------------------------------
 
-// SSLServerSocket synthetic field layout (4 fields):
-//   0 = listener_id Int (rustls server registry id; -1 after close)
-//   1 = local_port   Int
-//   2 = closed       Int (0/1)
-//   3 = reserved     (Object/null)
-const SSS_LISTENER_ID: usize = 0;
-const SSS_LOCAL_PORT: usize = 1;
-const SSS_CLOSED: usize = 2;
+/// Width handed to `try_alloc_concurrent_synthetic` for an `SSLServerSocket`.
+///
+/// It is the SYNTHETIC width and nothing else. Under `--jdk-only` — and in
+/// every default real-JDK build — `javax.net.ssl.SSLServerSocket` is a real
+/// loaded class and the allocator gives the object the REAL layout, so this
+/// number governs only the fabricated-class build.
+///
+/// **G25 — there are no `SSS_LISTENER_ID` / `SSS_LOCAL_PORT` / `SSS_CLOSED`
+/// slot constants any more, and there must never be again.** MEASURED,
+/// `javap -p java.net.ServerSocket` on JDK 25.0.3+9 (`SSLServerSocket` itself
+/// declares no instance fields, so these ARE the object's slots):
+///
+/// ```text
+///   0 private final    java.net.SocketImpl            impl
+///   1 private volatile boolean                        created
+///   2 private volatile boolean                        bound
+///   3 private volatile boolean                        closed
+///   4 private final    java.lang.Object               socketLock
+///   5 private volatile java.util.Set<SocketOption<?>> options
+/// ```
+///
+/// This file used to write its listener id into slot 0, its local port into
+/// slot 1 and its closed flag into slot 2. Row by row (record
+/// `G25-1-the-int-written-into-a-reference-slot-20260817.md`, and the sweep in
+/// `G16-1-...`):
+///
+/// * `Int(listener_id)` -> `impl`, a REFERENCE field. The field-layout guard
+///   does not let a non-reference land in a reference slot (it warns W7-84 and
+///   boxes it), so `impl` never became the listener id and never became a
+///   `SocketImpl` either — it stayed null, and every inherited
+///   `java.net.ServerSocket` method whose bytecode calls `getImpl()` threw
+///   `NullPointerException`. That is where `RSslLiveSession` died on its FIRST
+///   statement, `ss.setSoTimeout(20000)`.
+/// * `Int(local_port)` -> `created`, so a listener on any non-zero port
+///   reported `created = true`.
+/// * `Int(closed)` -> `bound`, so `close()` made the socket become BOUND:
+///   `isBound()` read `false` while open and `true` after close, the exact
+///   inversion visible in the sweep.
+/// * `Object(None)` -> `closed`, a reference into a boolean slot.
+///
+/// [`SslServerSocketState`] was already the authority for all three values —
+/// every reader consulted it first and only fell back to the field — so the
+/// writes bought nothing and cost the whole inherited surface.
 const SSS_FIELDS: usize = 4;
 
-/// `SSLServerSocket` is a real JDK class, so its loaded instance layout is
-/// not the compact synthetic layout expected by the TLS listener bridge.
-/// Keep the authoritative lifecycle data outside the object: raw field writes
-/// can be dropped or collide with reference-typed JDK fields, which otherwise
-/// makes a newly-bound listener appear closed before its first accept.
-#[derive(Clone, Copy)]
+/// The authoritative, out-of-object state of one `javax.net.ssl.SSLServerSocket`.
+///
+/// `SSLServerSocket` is a real JDK class, so its loaded instance layout is not
+/// the compact synthetic layout the TLS listener bridge wants (see
+/// [`SSS_FIELDS`] for the measured layout and what writing into it did). This
+/// table is now the ONLY record: there is no field fallback left to read,
+/// because every slot a fallback could read belongs to `java.net.ServerSocket`
+/// and means something else.
+///
+/// Keyed by [`gc_stable_objref_key`].
+#[derive(Clone)]
 struct SslServerSocketState {
     listener_id: i32,
     local_port: i32,
     closed: i32,
+    /// Literal host address this listener is bound to — `"0.0.0.0"` for the
+    /// two wildcard `createServerSocket` overloads, otherwise the
+    /// `InetAddress.getHostAddress()` of the address the caller passed.
+    /// Answers `getInetAddress()` / `getLocalSocketAddress()`.
+    bind_address: String,
+    /// `InetAddress.toString()` of the address actually bound, captured at
+    /// creation time from the caller's own object, because that rendering
+    /// (`hostname/literal`, hostname omitted when the address was built from a
+    /// literal) is not reconstructible from the literal alone. Answers
+    /// `toString()`.
+    bind_display: String,
+}
+
+/// A miss in [`ssl_server_socket_states`] — an `SSLServerSocket` this module
+/// did not create, which under `--jdk-only` cannot happen, because all three
+/// `SSLServerSocketFactory.createServerSocket` overloads are intercepted.
+///
+/// The answers are deliberately the pessimistic ones the field fallbacks used
+/// to produce for a totally unknown object (`closed = 1`, no listener), NOT
+/// the ones a real unbound `ServerSocket` gives. A socket this file has no
+/// record of is one it cannot accept on, and saying so is the honest answer.
+fn ssl_server_socket_state_miss() -> SslServerSocketState {
+    SslServerSocketState {
+        listener_id: -1,
+        local_port: 0,
+        closed: 1,
+        bind_address: String::new(),
+        bind_display: String::new(),
+    }
 }
 
 fn ssl_server_socket_states() -> &'static Mutex<HashMap<u64, SslServerSocketState>> {
@@ -5332,7 +5459,7 @@ fn ssl_server_socket_state(
     ssl_server_socket_states()
         .lock()
         .get(&gc_stable_objref_key(ctx, socket))
-        .copied()
+        .cloned()
 }
 
 fn set_ssl_server_socket_state(
@@ -5400,7 +5527,7 @@ fn sss_apply_client_auth(
     }
     let listener_id = ssl_server_socket_state(ctx, this)
         .map(|state| state.listener_id)
-        .unwrap_or_else(|| ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1));
+        .unwrap_or(-1);
     if listener_id < 0 {
         return Err(RuntimeError::IOException {
             message: "SSLServerSocket is closed".into(),
@@ -5664,11 +5791,21 @@ fn legacy_identity_hint(key_pem: &str) -> String {
     }
 }
 
+/// `InetAddress.toString()` for the two `createServerSocket` overloads that
+/// take no address. MEASURED on HotSpot 25.0.3+9 (`G25Probe`,
+/// `ssl.wild.getInetAddress`): a `ServerSocket` bound to the wildcard reports
+/// `0.0.0.0/0.0.0.0`, not `/0.0.0.0` — its address is
+/// `InetAddress.anyLocalAddress()`, whose cached host NAME is the literal
+/// `"0.0.0.0"`, which `InetAddress.getByName("0.0.0.0")` does NOT reproduce.
+const SSS_WILDCARD_BIND: &str = "0.0.0.0";
+const SSS_WILDCARD_DISPLAY: &str = "0.0.0.0/0.0.0.0";
+
 fn create_ssl_server_socket(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     port: i32,
     bind_address: &str,
+    bind_display: &str,
 ) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
     if !(0..=65535).contains(&port) {
         return Err(RuntimeError::IllegalArgumentException {
@@ -5762,6 +5899,11 @@ fn create_ssl_server_socket(
     sss_listener_identities().lock().insert(id, identity);
 
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS)?;
+    // G25: the side table is the WHOLE record. The four `ctx.set_field` calls
+    // that used to stand here wrote into `java.net.ServerSocket`'s real
+    // `impl`/`created`/`bound`/`closed` — see [`SSS_FIELDS`] for the measured
+    // layout, what each write actually did, and why the first of them is the
+    // reason `getImpl()` was null on every inherited method.
     set_ssl_server_socket_state(
         ctx,
         obj,
@@ -5769,26 +5911,83 @@ fn create_ssl_server_socket(
             listener_id: id,
             local_port: local_port as i32,
             closed: 0,
+            bind_address: bind_address.to_string(),
+            bind_display: bind_display.to_string(),
         },
     );
-    ctx.set_field(obj, SSS_LISTENER_ID, Value::Int(id));
-    ctx.set_field(obj, SSS_LOCAL_PORT, Value::Int(local_port as i32));
-    ctx.set_field(obj, SSS_CLOSED, Value::Int(0));
-    ctx.set_field(obj, 3, Value::Object(None));
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// The exact `SSLServerSocket.toString()` for a socket in `state`.
+///
+/// Split out from the registration so the rendering is checkable without a VM
+/// — `sss_to_string_matches_the_oracle` pins both shapes. MEASURED on HotSpot
+/// 25.0.3+9 (`G25Probe`); note the `[SSL: ...]` wrapper, which
+/// `sun.security.ssl.SSLServerSocketImpl` adds by OVERRIDING
+/// `ServerSocket.toString()`.
+fn sss_to_string(state: Option<&SslServerSocketState>) -> String {
+    match state {
+        Some(state) => format!(
+            "[SSL: ServerSocket[addr={},localport={}]]",
+            state.bind_display, state.local_port
+        ),
+        // The exact constant the inherited `java.net.ServerSocket.toString()`
+        // bytecode produces while `isBound()` is false, so a socket this file
+        // has no record of reads the same either way.
+        None => "ServerSocket[unbound]".to_string(),
+    }
+}
+
+/// The state `close()` leaves behind.
+///
+/// MEASURED (`G25Probe`): closing a `ServerSocket` does NOT unbind it — the
+/// bind identity, the local port and the recorded rendering all survive, and
+/// only `isClosed()` moves. Carrying `..state` forward is therefore the
+/// contract, not an optimisation; clearing the bind fields here would make
+/// `getInetAddress()` on a closed socket answer `null` where the oracle
+/// answers `/127.0.0.1`.
+fn sss_closed_state(state: SslServerSocketState) -> SslServerSocketState {
+    SslServerSocketState {
+        listener_id: -1,
+        closed: 1,
+        ..state
+    }
+}
+
+/// The bind address of a `createServerSocket(int, int, InetAddress)` call, as
+/// the pair [`SslServerSocketState`] records: the literal
+/// `getHostAddress()` (what `TcpListener::bind` needs, and what
+/// `getInetAddress()` is rebuilt from) and the caller's own
+/// `InetAddress.toString()` (what `toString()` prints).
+///
+/// **Both, not one.** `InetAddress.toString()` is `hostName + "/" +
+/// getHostAddress()` reading the CACHED name field, so an address the caller
+/// built from a hostname renders `localhost/127.0.0.1` while the same literal
+/// put back through `InetAddress.getByName` renders `/127.0.0.1`. The name
+/// cannot be recovered from the literal, and asking for it later would mean a
+/// reverse DNS lookup inside a `toString()`. Capture it once, here, where the
+/// caller's object is in hand.
 fn ssl_server_bind_address(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     index: usize,
-) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+) -> Result<(String, String), cratonvm_types::error::MethodCallFailed> {
     let address = obj_arg(args, index)?;
     let pin_base = ctx.pin_native_root(address);
     let resolved = ctx.invoke_virtual(address, "getHostAddress", "()Ljava/lang/String;", &[]);
+    let host = match resolved {
+        Ok(Some(Value::Object(Some(value)))) => ctx.read_string(value).unwrap_or_default(),
+        Ok(_) => String::new(),
+        Err(error) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(error);
+        }
+    };
+    let address = ctx.read_native_pin(pin_base, address);
+    let rendered = ctx.invoke_virtual(address, "toString", "()Ljava/lang/String;", &[]);
     ctx.unpin_native_roots(pin_base);
-    let host = match resolved? {
-        Some(Value::Object(Some(value))) => ctx.read_string(value).unwrap_or_default(),
+    let display = match rendered {
+        Ok(Some(Value::Object(Some(value)))) => ctx.read_string(value).unwrap_or_default(),
         _ => String::new(),
     };
     if host.is_empty() {
@@ -5797,7 +5996,15 @@ fn ssl_server_bind_address(
         }
         .into());
     }
-    Ok(host)
+    // A `toString()` that could not be read is not a reason to refuse the
+    // bind; fall back to the rendering `InetAddress` gives an address with no
+    // cached host name, which is what a literal produces anyway.
+    let display = if display.is_empty() {
+        format!("/{host}")
+    } else {
+        display
+    };
+    Ok((host, display))
 }
 
 fn register_sslserversocket(r: &mut NativeMethodRegistry) {
@@ -5825,7 +6032,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "(I)Ljava/net/ServerSocket;",
         |ctx, args| {
             let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-            create_ssl_server_socket(ctx, args, port, "0.0.0.0")
+            create_ssl_server_socket(ctx, args, port, SSS_WILDCARD_BIND, SSS_WILDCARD_DISPLAY)
         },
     );
     // UnboundID's LDAP listener calls these overloads (with backlog 128).
@@ -5838,7 +6045,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "(II)Ljava/net/ServerSocket;",
         |ctx, args| {
             let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
-            create_ssl_server_socket(ctx, args, port, "0.0.0.0")
+            create_ssl_server_socket(ctx, args, port, SSS_WILDCARD_BIND, SSS_WILDCARD_DISPLAY)
         },
     );
     r.register(
@@ -5847,8 +6054,8 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
         |ctx, args| {
             let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
-            let bind_address = ssl_server_bind_address(ctx, args, 3)?;
-            create_ssl_server_socket(ctx, args, port, &bind_address)
+            let (bind_address, bind_display) = ssl_server_bind_address(ctx, args, 3)?;
+            create_ssl_server_socket(ctx, args, port, &bind_address, &bind_display)
         },
     );
     r.register(
@@ -5886,7 +6093,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(
             ssl_server_socket_state(ctx, this)
                 .map(|state| state.local_port)
-                .unwrap_or_else(|| ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0)),
+                .unwrap_or(ssl_server_socket_state_miss().local_port),
         )))
     });
     r.register(sss, "isClosed", "()Z", |ctx, args| {
@@ -5894,16 +6101,12 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(
             ssl_server_socket_state(ctx, this)
                 .map(|state| state.closed)
-                .unwrap_or_else(|| ctx.get_field(this, SSS_CLOSED).as_int().unwrap_or(1)),
+                .unwrap_or(ssl_server_socket_state_miss().closed),
         )))
     });
     r.register(sss, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let state = ssl_server_socket_state(ctx, this).unwrap_or(SslServerSocketState {
-            listener_id: ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1),
-            local_port: ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0),
-            closed: 1,
-        });
+        let state = ssl_server_socket_state(ctx, this).unwrap_or_else(ssl_server_socket_state_miss);
         let id = state.listener_id;
         if id >= 0 {
             rustls_listener_close(id);
@@ -5912,31 +6115,28 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             // bound and a recycled listener id cannot inherit stale key
             // material.
             sss_listener_identities().lock().remove(&id);
-            ctx.set_field(this, SSS_LISTENER_ID, Value::Int(-1));
         }
-        set_ssl_server_socket_state(
-            ctx,
-            this,
-            SslServerSocketState {
-                listener_id: -1,
-                local_port: state.local_port,
-                closed: 1,
-            },
-        );
-        ctx.set_field(this, SSS_CLOSED, Value::Int(1));
+        // MEASURED (`G25Probe`, HotSpot 25.0.3+9): closing a `ServerSocket`
+        // does NOT unbind it. `isBound()`, `getInetAddress()`,
+        // `getLocalPort()`, `getLocalSocketAddress()` and `toString()` all keep
+        // answering exactly what they answered while it was open — only
+        // `isClosed()` moves. So the bind identity is carried forward here
+        // rather than cleared.
+        set_ssl_server_socket_state(ctx, this, sss_closed_state(state));
         Ok(None)
     });
     r.register(sss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = ssl_server_socket_state(ctx, this)
             .map(|state| state.listener_id)
-            .unwrap_or_else(|| ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1));
+            .unwrap_or(ssl_server_socket_state_miss().listener_id);
         if id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLServerSocket is closed".into(),
             }
             .into());
         }
+        let accept_timeout = sss_accept_timeout(ctx, this);
         // `rustls_server_accept` parks this thread — unboundedly in its poll
         // loop, then up to the socket's 30s timeout in the handshake — and
         // marks itself GC-blocked across those waits via `gc_blocked_syscall`,
@@ -5945,7 +6145,26 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // inert and the thread is again a mutator that can never cooperate.
         let stream_id = {
             let _active_ctx = set_active_native_context(ctx);
-            rustls_server_accept(id).map_err(|e| RuntimeError::IOException { message: e })?
+            rustls_server_accept_within(id, accept_timeout)
+        };
+        let stream_id = match stream_id {
+            Ok(stream_id) => stream_id,
+            Err(AcceptFailure::TimedOut) => {
+                // The one place this file must NOT answer `IOException`:
+                // `java.net.SocketTimeoutException` is what a caller catches to
+                // mean "no peer yet, loop again" — `RSslLiveSession.serve` is
+                // written exactly that way — and it is a SUBCLASS of
+                // `InterruptedIOException`, so an `IOException` here is caught
+                // by the same handlers and read as a dead listener.
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/net/SocketTimeoutException",
+                    "Accept timed out",
+                ));
+            }
+            Err(AcceptFailure::Failed(message)) => {
+                return Err(RuntimeError::IOException { message }.into())
+            }
         };
 
         // The id space the STREAM natives key on is the offset one:
@@ -6049,7 +6268,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let closed = ssl_server_socket_state(ctx, this)
             .map(|state| state.closed)
-            .unwrap_or_else(|| ctx.get_field(this, SSS_CLOSED).as_int().unwrap_or(1));
+            .unwrap_or(ssl_server_socket_state_miss().closed);
         if closed != 0 {
             return Err(crate::phases_early::throw_jca_exc(
                 ctx,
@@ -6169,7 +6388,335 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+
+    // ------------------------------------------------------------------
+    // G25 — the four BIND-IDENTITY rows.
+    //
+    // They land TOGETHER or not at all, and the reason is not tidiness.
+    // `java.net.ServerSocket.toString()` is
+    //
+    //     if (!isBound()) return "ServerSocket[unbound]";
+    //     return "ServerSocket[" + impl.toString() + "]";
+    //
+    // and `isBound()` there is an `invokevirtual` on `this`, so it finds a
+    // native registered on the receiver's class. Registering `isBound` alone
+    // — the obvious one-row fix, and the oracle does say `true` — therefore
+    // walks the inherited `toString()` straight into `impl.toString()` on a
+    // null `impl`, converting a row that AGREED with HotSpot into an NPE.
+    // `net_phase_e`'s
+    // `ssl_server_socket_bound_identity_rows_are_not_registered_piecemeal`
+    // is the tripwire on that file's side; `sss_bind_identity_rows_move_together`
+    // in this file's `mod tests` is the tripwire on this one's.
+    //
+    // MEASURED, HotSpot 25.0.3+9 (`G25Probe`), on a socket bound to
+    // 127.0.0.1 and then CLOSED — every row below is unchanged by `close()`,
+    // which is why `close()` carries the bind identity forward:
+    //
+    //     isBound                = true                      (open and closed)
+    //     getInetAddress         = /127.0.0.1                (open and closed)
+    //     getLocalSocketAddress  = /127.0.0.1:<port>         (open and closed)
+    //     toString               = [SSL: ServerSocket[addr=/127.0.0.1,localport=<port>]]
+    //
+    // and on a WILDCARD-bound one, where the rendering differs and is the
+    // reason `SSS_WILDCARD_DISPLAY` exists:
+    //
+    //     getInetAddress         = 0.0.0.0/0.0.0.0
+    //     toString               = [SSL: ServerSocket[addr=0.0.0.0/0.0.0.0,localport=<port>]]
+    //
+    // Note the `[SSL: ...]` wrapper: `sun.security.ssl.SSLServerSocketImpl`
+    // OVERRIDES `toString()`, so the plain `ServerSocket[...]` form an earlier
+    // nomination predicted is not what the oracle prints.
+    r.register(sss, "isBound", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Every socket this module hands out is created already bound (all
+        // three `createServerSocket` overloads open the listener up front and
+        // there is no unbound-construction path — see `bind` below, which
+        // throws "Already bound" for exactly that reason). So "we have a
+        // record of it" IS "it is bound", and a miss is the only `false`.
+        Ok(Some(Value::Int(i32::from(
+            ssl_server_socket_state(ctx, this).is_some(),
+        ))))
+    });
+    r.register(
+        sss,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(state) = ssl_server_socket_state(ctx, this) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let address = match sss_local_socket_address(ctx, &state)? {
+                Some(Value::Object(Some(address))) => address,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let pin = ctx.pin_native_root(address);
+            let address = ctx.read_native_pin(pin, address);
+            let result = ctx.invoke_virtual(address, "getAddress", "()Ljava/net/InetAddress;", &[]);
+            ctx.unpin_native_roots(pin);
+            result
+        },
+    );
+    r.register(
+        sss,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(state) = ssl_server_socket_state(ctx, this) else {
+                // `ServerSocket.getLocalSocketAddress()` answers null, not an
+                // exception, when the socket is not bound.
+                return Ok(Some(Value::Object(None)));
+            };
+            sss_local_socket_address(ctx, &state)
+        },
+    );
+    r.register(sss, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let text = sss_to_string(ssl_server_socket_state(ctx, this).as_ref());
+        let text = ctx.create_string(&text);
+        Ok(Some(Value::Object(Some(text))))
+    });
+
+    // ------------------------------------------------------------------
+    // G25 — the three rows that were `AbstractMethodError`.
+    //
+    // `javax.net.ssl.SSLServerSocket` is ABSTRACT and the object is an
+    // instance of it directly, so a method with no native and no concrete
+    // body raises `AbstractMethodError: ... has no Code attribute`. MEASURED
+    // on both VMs (`G16Sweep`) for `getEnabledCipherSuites`,
+    // `getUseClientMode` and `getEnableSessionCreation`.
+    //
+    // The setters come with them. Each of these is a settable JSSE property
+    // whose getter is a read-back, MEASURED (`G25Probe`):
+    //
+    //     getUseClientMode          = false, then true after setUseClientMode(true)
+    //     getEnableSessionCreation  = true,  then false after set...(false)
+    //     getEnabledCipherSuites   == getSupportedCipherSuites until set,
+    //                                 then exactly what was set
+    //     both survive close()
+    //
+    // Registering only the getters would have made them constants that lie
+    // the moment anybody calls a setter — and the setter would still have
+    // been an `AbstractMethodError`.
+    r.register(
+        sss,
+        "getSupportedCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(
+                crate::phases_late::ssl_security::jsse_supported_suite_name_array(ctx)?,
+            ))))
+        },
+    );
+    r.register(
+        sss,
+        "getEnabledCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // MEASURED: on HotSpot `getEnabledCipherSuites()` equals
+            // `getSupportedCipherSuites()` element-wise until somebody narrows
+            // it — enabled == default == supported, one list (see
+            // `jsse_supported_suite_name_array`'s comment, which measured the
+            // same identity on the socket factory). So the unset answer is the
+            // supported array, not a narrower invented "defaults" set.
+            let Some(list) = lookup_sss_enabled_suites(ctx, this) else {
+                return Ok(Some(Value::Object(Some(
+                    crate::phases_late::ssl_security::jsse_supported_suite_name_array(ctx)?,
+                ))));
+            };
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            let pin = ctx.pin_native_root(arr);
+            for (i, name) in list.iter().enumerate() {
+                let name = ctx.create_string(name);
+                let arr = ctx.read_native_pin(pin, arr);
+                ctx.set_array_element(arr, i, Value::Object(Some(name)));
+            }
+            let arr = ctx.read_native_pin(pin, arr);
+            ctx.unpin_native_roots(pin);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        sss,
+        "setEnabledCipherSuites",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Both messages TRANSCRIBED from HotSpot 25.0.3+9 (`G25Probe`),
+            // not derived — HANDOFF §5. The null check comes first there, and
+            // the order is observable: `setEnabledCipherSuites(null)` reports
+            // "CipherSuites cannot be null", never "Unsupported CipherSuite:
+            // null".
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "CipherSuites cannot be null".into(),
+                }
+                .into());
+            };
+            let mut list: Vec<String> = Vec::new();
+            for i in 0..ctx.array_length(*arr) {
+                let name = match ctx.get_array_element(*arr, i) {
+                    Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if !is_cipher_suite_name(&name) {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("Unsupported CipherSuite: {name}"),
+                    }
+                    .into());
+                }
+                list.push(name);
+            }
+            stash_sss_enabled_suites(ctx, this, list);
+            Ok(None)
+        },
+    );
+    r.register(sss, "getUseClientMode", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(sss_mode_state(ctx, this).0)))
+    });
+    r.register(sss, "setUseClientMode", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = i32::from(args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0);
+        // NOTE: this records the flag and does NOT turn the listener round.
+        // `accept()` still performs a SERVER handshake. Real JSSE would make
+        // the accepted socket start in client mode; nothing in this VM's
+        // rustls listener can do that, and pretending otherwise would be the
+        // silently-disabled-check shape `sss_apply_client_auth` exists to
+        // avoid. Recorded so the read-back is honest about what was asked;
+        // see the record's NOMINATION.
+        let key = gc_stable_objref_key(ctx, this);
+        let mut table = sss_mode_states().lock();
+        let entry = table.entry(key).or_insert(SSS_MODE_DEFAULT);
+        entry.0 = on;
+        Ok(None)
+    });
+    r.register(sss, "getEnableSessionCreation", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(sss_mode_state(ctx, this).1)))
+    });
+    r.register(sss, "setEnableSessionCreation", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = i32::from(args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0);
+        let key = gc_stable_objref_key(ctx, this);
+        let mut table = sss_mode_states().lock();
+        let entry = table.entry(key).or_insert(SSS_MODE_DEFAULT);
+        entry.1 = on;
+        Ok(None)
+    });
     r.set_category(__prev_cat);
+}
+
+/// `(getUseClientMode, getEnableSessionCreation)` on a socket nobody has
+/// configured. MEASURED on HotSpot 25.0.3+9 (`G25Probe`): a server socket is
+/// not in client mode, and session creation is on.
+const SSS_MODE_DEFAULT: (i32, i32) = (0, 1);
+
+/// Per-`SSLServerSocket` `(useClientMode, enableSessionCreation)`, keyed by
+/// [`gc_stable_objref_key`]. Same rationale as `sss_client_auth_states`: the
+/// real `java.net.ServerSocket` layout has no slot that means either of these
+/// (see [`SSS_FIELDS`]), and writing into one that means something else is the
+/// defect this whole block exists to undo.
+fn sss_mode_states() -> &'static Mutex<HashMap<u64, (i32, i32)>> {
+    static T: OnceLock<Mutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sss_mode_state(ctx: &dyn NativeContext, socket: ObjectRef) -> (i32, i32) {
+    let key = gc_stable_objref_key(ctx, socket);
+    sss_mode_states()
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(SSS_MODE_DEFAULT)
+}
+
+/// Per-`SSLServerSocket` `setEnabledCipherSuites` list. Absent means "never
+/// narrowed", which reads back as the full supported list — not as an empty
+/// one, which would say this socket can negotiate nothing.
+fn sss_enabled_suites_table() -> &'static Mutex<HashMap<u64, Vec<String>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn stash_sss_enabled_suites(ctx: &dyn NativeContext, socket: ObjectRef, suites: Vec<String>) {
+    let key = gc_stable_objref_key(ctx, socket);
+    sss_enabled_suites_table().lock().insert(key, suites);
+}
+
+fn lookup_sss_enabled_suites(ctx: &dyn NativeContext, socket: ObjectRef) -> Option<Vec<String>> {
+    let key = gc_stable_objref_key(ctx, socket);
+    sss_enabled_suites_table().lock().get(&key).cloned()
+}
+
+/// A fresh `java.net.InetSocketAddress` for this listener's bind address and
+/// local port — the object `getLocalSocketAddress()` returns and the one
+/// `getInetAddress()` unwraps.
+///
+/// Built through the REAL `InetSocketAddress` constructor bytecode rather than
+/// transcribed, so the `hostname/literal:port` rendering, the IPv6 bracketing
+/// and the resolved/unresolved distinction are the JDK's own.
+fn sss_local_socket_address(
+    ctx: &mut dyn NativeContext,
+    state: &SslServerSocketState,
+) -> Result<Option<Value>, MethodCallFailed> {
+    if state.bind_address == SSS_WILDCARD_BIND {
+        // The `(int)` constructor, deliberately — see `SSS_WILDCARD_DISPLAY`.
+        // `InetSocketAddress("0.0.0.0", port)` renders `/0.0.0.0:port`, and
+        // the oracle renders `0.0.0.0/0.0.0.0:port`.
+        return ctx.new_object_initialized(
+            "java/net/InetSocketAddress",
+            "(I)V",
+            &[Value::Int(state.local_port)],
+        );
+    }
+    let host = ctx.create_string(&state.bind_address);
+    // The constructor runs real bytecode (it calls `InetAddress.getByName`),
+    // so it allocates and can relocate `host` — the same Family-1 shape the
+    // `java.net.Socket.getRemoteSocketAddress` sites in `phases_early` pin for.
+    let pin = ctx.pin_native_root(host);
+    let host = ctx.read_native_pin(pin, host);
+    let result = ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(host)), Value::Int(state.local_port)],
+    );
+    ctx.unpin_native_roots(pin);
+    result
+}
+
+/// The `SO_TIMEOUT` `SSLServerSocket.accept()` must honour, as a `Duration`.
+///
+/// The value lives on `net_phase_e`'s RE.6b delegate — a real, unbound
+/// `java.net.ServerSocket` that `setSoTimeout` forwards to — so it is asked
+/// for through the Java door rather than through a cross-file accessor. That
+/// keeps ONE owner for the value: this file must not register `getSoTimeout`
+/// itself, because `register_t27_natives` runs after
+/// `register_phase_e_networking` and would silently kill all nine of RE.6b's
+/// bodies.
+///
+/// **Dropping the error is safe here, and that is a property of this VM's
+/// calling convention rather than an assumption.** `MethodCallFailed
+/// ::ExceptionThrown` carries the `Throwable` BY VALUE; there is no VM-global
+/// pending-exception slot left dirty by discarding it. So if RE.6b is ever
+/// removed and the inherited `ServerSocket.getSoTimeout()` bytecode runs into
+/// the null `impl`, `accept()` keeps its pre-G25 behaviour — block forever —
+/// instead of acquiring a new way to fail.
+fn sss_accept_timeout(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<std::time::Duration> {
+    let pin = ctx.pin_native_root(this);
+    let answer = ctx.invoke_virtual(this, "getSoTimeout", "()I", &[]);
+    ctx.unpin_native_roots(pin);
+    // 0 is `java.net.ServerSocket`'s spelling of "no timeout", and it is also
+    // what an un-configured socket reports, so it must not become a
+    // zero-length deadline that times out instantly.
+    answer
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_int())
+        .filter(|millis| *millis > 0)
+        .map(|millis| std::time::Duration::from_millis(millis as u64))
 }
 
 /// Side-table storing this `SSLServerSocket`'s `setEnabledProtocols` list.
@@ -10075,6 +10622,236 @@ mod tests {
             assert_eq!(session_cipher_slot(n), Some(0), "width {n} is cipher-first");
             assert_eq!(session_proto_slot(n), Some(1), "width {n} is cipher-first");
         }
+    }
+
+    // =====================================================================
+    // G25 - the int that was written into a reference slot.
+    // Record: docs/known-issues/jdk-only/
+    //         G25-1-the-int-written-into-a-reference-slot-20260817.md
+    // =====================================================================
+
+    fn g25_state(bind_address: &str, bind_display: &str) -> SslServerSocketState {
+        SslServerSocketState {
+            listener_id: 7,
+            local_port: 60553,
+            closed: 0,
+            bind_address: bind_address.to_string(),
+            bind_display: bind_display.to_string(),
+        }
+    }
+
+    /// The whole point of the change: nothing in `SSLServerSocket`'s lifecycle
+    /// is stored in an object slot any more, because none of the six slots
+    /// `java.net.ServerSocket` declares means what this file wanted to put
+    /// there. Slot 0 is `impl` - a REFERENCE - and an `Int` written there was
+    /// never readable, which is why `getImpl()` was null and every inherited
+    /// method NPE'd.
+    ///
+    /// The test reads this file's own source, because the defect is a WRITE
+    /// that compiles, registers and silently does nothing: there is no runtime
+    /// observation of it from inside this crate, only the absence of the call.
+    #[test]
+    fn the_ssl_server_socket_lifecycle_is_never_written_into_an_object_slot() {
+        let source = include_str!("t27_tls.rs");
+        // Assembled from fragments so this test's own source does not contain
+        // the needles it searches for - the same trick, and the same reason, as
+        // `the_only_rustls_suite_spelling_left_is_the_adapters_own`.
+        let write = format!("{}{}", "ctx.set_", "field(");
+        for (receiver, slot) in [
+            ("obj", "SSS_LISTENER_ID"),
+            ("obj", "SSS_LOCAL_PORT"),
+            ("obj", "SSS_CLOSED"),
+            ("this", "SSS_LISTENER_ID"),
+            ("this", "SSS_CLOSED"),
+        ] {
+            let needle = format!("{write}{receiver}, {slot}");
+            assert!(
+                !source.contains(&needle),
+                "`{needle}` is back. Slots 0/1/2/3 of a real \
+                 javax.net.ssl.SSLServerSocket are impl (a REFERENCE) / created / \
+                 bound / closed; `ssl_server_socket_states` is the authority."
+            );
+        }
+    }
+
+    /// `isBound` / `getInetAddress` / `getLocalSocketAddress` / `toString` are
+    /// ONE contract. `java.net.ServerSocket.toString()` short-circuits to the
+    /// constant `"ServerSocket[unbound]"` while `isBound()` is false and
+    /// otherwise dereferences `impl`, so registering `isBound` without
+    /// `toString` walks the inherited body into a null `impl` and converts a
+    /// row that AGREED with HotSpot into an NPE. The mirror of
+    /// `net_phase_e`'s
+    /// `ssl_server_socket_bound_identity_rows_are_not_registered_piecemeal`,
+    /// from the side that now owns them.
+    #[test]
+    fn sss_bind_identity_rows_move_together() {
+        let mut r = NativeMethodRegistry::new();
+        super::register_sslserversocket(&mut r);
+        let rows = [
+            ("isBound", "()Z"),
+            ("getInetAddress", "()Ljava/net/InetAddress;"),
+            ("getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
+            ("toString", "()Ljava/lang/String;"),
+        ];
+        let mut present = 0usize;
+        for (method, descriptor) in rows {
+            if r.find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                .is_some()
+            {
+                present += 1;
+            }
+        }
+        assert_eq!(
+            present,
+            rows.len(),
+            "{present} of {} bind-identity rows registered; they are one contract",
+            rows.len()
+        );
+    }
+
+    /// The three rows measured as `AbstractMethodError` (`G16Sweep`), and the
+    /// setters that make their getters read-backs rather than constants.
+    #[test]
+    fn sss_abstract_method_error_rows_are_registered_with_their_setters() {
+        let mut r = NativeMethodRegistry::new();
+        super::register_sslserversocket(&mut r);
+        for (method, descriptor) in [
+            ("getEnabledCipherSuites", "()[Ljava/lang/String;"),
+            ("getSupportedCipherSuites", "()[Ljava/lang/String;"),
+            ("setEnabledCipherSuites", "([Ljava/lang/String;)V"),
+            ("getUseClientMode", "()Z"),
+            ("setUseClientMode", "(Z)V"),
+            ("getEnableSessionCreation", "()Z"),
+            ("setEnableSessionCreation", "(Z)V"),
+        ] {
+            assert!(
+                r.find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                    .is_some(),
+                "SSLServerSocket.{method}{descriptor} is abstract with no Code \
+                 attribute; without a native it raises AbstractMethodError"
+            );
+        }
+    }
+
+    /// The other half of `net_phase_e`'s
+    /// `ssl_server_socket_option_registrar_leaves_the_t27_owned_names_alone`,
+    /// asserted from this side. `register_t27_natives` runs AFTER
+    /// `register_phase_e_networking` (lib.rs 18731 vs 18688) and `register()`
+    /// is last-write-wins with no unregister API, so a name added here that
+    /// RE.6b already owns does not conflict - it silently deletes RE.6b's
+    /// body, and with it the delegate that makes `setSoTimeout` work at all.
+    /// `accept()` now ASKS one of those nine through `invoke_virtual`, so
+    /// shadowing `getSoTimeout` here would also make the accept timeout read
+    /// its own answer.
+    #[test]
+    fn t27_does_not_shadow_the_re6b_option_surface() {
+        let mut r = NativeMethodRegistry::new();
+        super::register_sslserversocket(&mut r);
+        for (method, descriptor) in [
+            ("getSoTimeout", "()I"),
+            ("setSoTimeout", "(I)V"),
+            ("getReuseAddress", "()Z"),
+            ("setReuseAddress", "(Z)V"),
+            ("getReceiveBufferSize", "()I"),
+            ("setReceiveBufferSize", "(I)V"),
+            ("supportedOptions", "()Ljava/util/Set;"),
+            ("getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;"),
+            (
+                "setOption",
+                "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/ServerSocket;",
+            ),
+        ] {
+            assert!(
+                r.find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                    .is_none(),
+                "SSLServerSocket.{method}{descriptor} belongs to net_phase_e's \
+                 RE.6b; registering it here runs later and kills that body"
+            );
+        }
+    }
+
+    /// Both renderings, transcribed from HotSpot 25.0.3+9 (`G25Probe`).
+    #[test]
+    fn sss_to_string_matches_the_oracle() {
+        assert_eq!(
+            sss_to_string(Some(&g25_state("127.0.0.1", "/127.0.0.1"))),
+            "[SSL: ServerSocket[addr=/127.0.0.1,localport=60553]]"
+        );
+        assert_eq!(
+            sss_to_string(Some(&g25_state(SSS_WILDCARD_BIND, SSS_WILDCARD_DISPLAY))),
+            "[SSL: ServerSocket[addr=0.0.0.0/0.0.0.0,localport=60553]]"
+        );
+        assert_eq!(sss_to_string(None), "ServerSocket[unbound]");
+    }
+
+    /// MEASURED: `close()` moves `isClosed()` and NOTHING else. Every bind row
+    /// answers after close exactly what it answered before.
+    #[test]
+    fn closing_a_server_socket_does_not_unbind_it() {
+        let open = g25_state("127.0.0.1", "/127.0.0.1");
+        let closed = sss_closed_state(open.clone());
+        assert_eq!(closed.closed, 1);
+        assert_eq!(closed.listener_id, -1, "the listener is gone");
+        assert_eq!(closed.local_port, open.local_port);
+        assert_eq!(closed.bind_address, open.bind_address);
+        assert_eq!(closed.bind_display, open.bind_display);
+        assert_eq!(sss_to_string(Some(&closed)), sss_to_string(Some(&open)));
+    }
+
+    /// A socket with no record is not a socket that is merely unconfigured:
+    /// it is one this file cannot accept on, and the miss answers say so.
+    #[test]
+    fn an_unknown_server_socket_reads_closed_and_unbound() {
+        let miss = ssl_server_socket_state_miss();
+        assert_eq!(miss.closed, 1);
+        assert_eq!(miss.listener_id, -1);
+        assert_eq!(miss.local_port, 0);
+        assert_eq!(sss_to_string(None), "ServerSocket[unbound]");
+    }
+
+    /// MEASURED (`G25Probe`) on an `SSLServerSocket` nobody has configured.
+    #[test]
+    fn sss_mode_defaults_are_the_measured_hotspot_values() {
+        assert_eq!(SSS_MODE_DEFAULT.0, 0, "getUseClientMode on a server socket");
+        assert_eq!(SSS_MODE_DEFAULT.1, 1, "getEnableSessionCreation");
+    }
+
+    /// NOM-6. MEASURED, HotSpot 25.0.3+9 (`G25Probe`): the packet size is a
+    /// constant in every state, the application size is not - 16704 before a
+    /// handshake and 16676 after a TLS 1.3 one, under both AES-128-GCM and
+    /// AES-256-GCM. 16384 (the old answer) is neither; it is the RFC 8446
+    /// section 5.1 TLSPlaintext cap.
+    #[test]
+    fn the_session_buffer_sizes_are_two_states_not_one_constant() {
+        assert_eq!(JSSE_PACKET_BUFFER_SIZE, 16709);
+        assert_eq!(JSSE_APPLICATION_BUFFER_SIZE_FRESH, 16704);
+        assert_eq!(JSSE_APPLICATION_BUFFER_SIZE_NEGOTIATED, 16676);
+        assert_eq!(
+            JSSE_APPLICATION_BUFFER_SIZE_FRESH,
+            JSSE_PACKET_BUFFER_SIZE - 5,
+            "the fresh value is the packet size less the 5-byte record header"
+        );
+        assert!(
+            JSSE_APPLICATION_BUFFER_SIZE_NEGOTIATED < JSSE_APPLICATION_BUFFER_SIZE_FRESH,
+            "negotiating a suite costs record expansion, so the app buffer shrinks"
+        );
+        assert_ne!(
+            JSSE_APPLICATION_BUFFER_SIZE_NEGOTIATED, 16384,
+            "16384 is the RFC 8446 plaintext cap, not the JDK's answer"
+        );
+        // The audit that made raising this safe: `do_wrap` never consumes more
+        // than 16384 bytes of plaintext per call whatever the caller offers, so
+        // one record can never exceed the packet buffer.
+        let source = include_str!("t27_tls.rs");
+        // Fragments again: a literal here would match ITSELF and the assertion
+        // would hold whether or not `do_wrap` still caps.
+        let cap = format!("{}{}", "bb_read_into(ctx, *bb, &mut app_bytes, ", "16384)");
+        assert!(
+            source.contains(&cap),
+            "do_wrap's 16384 plaintext cap is what bounds one record below \
+             getPacketBufferSize(); without it the larger app buffer can \
+             livelock a BUFFER_OVERFLOW retry loop"
+        );
     }
 }
 
@@ -17033,12 +17810,42 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // it moves when a suite is negotiated. 16384 is the RFC 8446 §5.1
     // TLSPlaintext cap, i.e. a floor rather than the JDK's answer.
     //
-    // The VALUE is deliberately left at 16384: it is a safe UNDER-report
-    // against this VM's own engine (which never emits more than it advertises),
-    // and raising a buffer-size constant without auditing every
-    // `BUFFER_OVERFLOW` path is how a constant becomes an outage. What is
-    // fixed here is the assertion, not the number. Same correction is owed to
-    // the twin in `tls.rs` — see E22-1's NOMINATION.
+    // G25 — the number is fixed now too, and the audit that comment asked for
+    // was done. RE-MEASURED (`G25Probe`, HotSpot 25.0.3+9), one row per state,
+    // both suites, over a real in-memory TLS 1.3 handshake:
+    //
+    //     never negotiated                     app = 16704   packet = 16709
+    //     TLS 1.3 / TLS_AES_256_GCM_SHA384     app = 16676   packet = 16709
+    //     TLS 1.3 / TLS_AES_128_GCM_SHA256     app = 16676   packet = 16709
+    //
+    // Two states, two answers, and no third: within TLS 1.3 the value does not
+    // move with the suite, so a `negotiated?` predicate is the whole of the
+    // state-dependence and no per-suite table is needed. 16384 was neither
+    // value — it is the RFC 8446 §5.1 TLSPlaintext cap, a floor.
+    //
+    // **Why raising it is safe, which is the part the old comment could not
+    // check.** `do_wrap` reads at most 16384 bytes of plaintext out of `srcs`
+    // per call (`bb_read_into(ctx, *bb, &mut app_bytes, 16384)` and the
+    // `app_bytes.len() >= 16384` break) whatever the caller offers, and then
+    // drains only COMPLETE records that fit the destination. So a caller that
+    // sizes its application buffer from this accessor and fills it hands over
+    // 16704 bytes, this engine consumes 16384 of them, emits one record of at
+    // most 16406 into a `getPacketBufferSize()`-sized destination, and reports
+    // the true `bytesConsumed`. There is no state in which the larger number
+    // makes a record that cannot fit — the livelock the old comment feared
+    // needs the engine to promise a record bigger than its packet buffer, and
+    // the 16384 cap is what stops it. On `unwrap`, a larger destination is
+    // only ever safer.
+    //
+    // The under-report was not free: a caller that sizes a receive buffer from
+    // this accessor and a peer that fills a genuine 16676-byte application
+    // record put 292 bytes more on the wire than the buffer holds, which is a
+    // `BUFFER_OVERFLOW` retry loop against a buffer the caller has already
+    // been told is big enough.
+    //
+    // Same correction is owed to the twin in `tls.rs` — see E22-1's
+    // NOMINATION, and note that the twin is `#[cfg(feature =
+    // "synthetic-jdk")]`-only, so THIS copy is the live one by default.
     //
     // SHADOWING (wave 4 correction — the wave-3 note was wrong): `tls.rs
     // ::register_ssl_session` registers the same two triples, but its registrar
@@ -17047,11 +17854,16 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // DEFAULT real-JDK build THIS copy is the live one and the tls.rs pair does
     // not exist; under `--synthetic-jdk` tls.rs runs later and wins. The values
     // are identical either way — if you change one, change both.
-    r.register(cls, "getApplicationBufferSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16384)))
+    r.register(cls, "getApplicationBufferSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(if session_has_negotiated(ctx, this) {
+            JSSE_APPLICATION_BUFFER_SIZE_NEGOTIATED
+        } else {
+            JSSE_APPLICATION_BUFFER_SIZE_FRESH
+        })))
     });
     r.register(cls, "getPacketBufferSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16709)))
+        Ok(Some(Value::Int(JSSE_PACKET_BUFFER_SIZE)))
     });
     // getId() — Tomcat's request/auth plumbing reads the TLS session id (e.g.
     // for SSL session tracking / client-cert requests). Real JDK returns the
