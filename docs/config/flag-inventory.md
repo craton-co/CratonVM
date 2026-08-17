@@ -820,7 +820,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_LONGROOT` | DBG | `CRATONVM_DBG=longroot` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LOOKUP` | DBG | `CRATONVM_DBG=lookup` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_LOOP_WORK` | DBG | `CRATONVM_DBG=loop-work` | opt-in | off | diag | snapshot | vm |
-| `CRATONVM_DBG_MAPGEN` | GC | `CRATONVM_GC=dbg-mapgen` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_DBG_MAPGEN` | DBG | `CRATONVM_DBG=mapgen` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_MAPPER` | DBG | `CRATONVM_DBG=mapper` | opt-in | off | diag | snapshot | native-builtins |
 | `CRATONVM_DBG_MAP_MISS_AUDIT` | DBG | `CRATONVM_DBG=map-miss-audit` | opt-in | off | diag | snapshot | native-collections |
 | `CRATONVM_DBG_MARK_WHY_CLASS` | DBG | `CRATONVM_DBG=mark-why-class` | opt-in | off | diag | snapshot | vm |
@@ -983,7 +983,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_UNROLL` | DBG | `CRATONVM_DBG=unroll` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_URLCL` | DBG | `CRATONVM_DBG=urlcl` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_UTE` | DBG | `CRATONVM_DBG=ute` | opt-in | off | diag | snapshot | types |
-| `CRATONVM_DBG_VACATED_FRAMES` | GC | `CRATONVM_GC=dbg-vacated-frames` | opt-in | off | behaviour | snapshot | gc |
+| `CRATONVM_DBG_VACATED_FRAMES` | DBG | `CRATONVM_DBG=vacated-frames` | opt-in | off | diag | snapshot | gc |
 | `CRATONVM_DBG_VALIDATE_NEW` | DBG | `CRATONVM_DBG=validate-new` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_VDISP` | DBG | `CRATONVM_DBG=vdisp` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_VERIFY_ERROR` | DBG | `CRATONVM_DBG=verify-error` | opt-in | off | diag | snapshot | vm |

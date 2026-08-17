@@ -701,13 +701,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-54 tokens.
+52 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
-| `dbg-mapgen` | `CRATONVM_DBG_MAPGEN` |
-| `dbg-vacated-frames` | `CRATONVM_DBG_VACATED_FRAMES` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
