@@ -915,7 +915,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "licm", on_key: Some("CRATONVM_JIT_LICM"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "local-liveness", on_key: None, off_key: Some("CRATONVM_NO_LOCAL_LIVENESS"), off_word: None },
-    E { group: Group::GC, token: "unblocked-snapshot-remap", on_key: None, off_key: Some("CRATONVM_NO_UNBLOCKED_SNAPSHOT_REMAP"), off_word: None },
     E { group: Group::JIT, token: "local-regs", on_key: Some("CRATONVM_JIT_LOCAL_REGS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "long-intrinsics", on_key: None, off_key: Some("CRATONVM_JIT_NO_LONG_INTRINSICS"), off_word: None },
     E { group: Group::JIT, token: "longroot-strict", on_key: Some("CRATONVM_LONGROOT_STRICT"), off_key: None, off_word: None },

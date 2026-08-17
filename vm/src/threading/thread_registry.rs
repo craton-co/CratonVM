@@ -2435,53 +2435,26 @@ impl ThreadRegistry {
                 .in_blocked_region
                 .load(Ordering::Acquire)
             {
-                // NOT blocked — but its published SNAPSHOT still has to move.
+                // NOT blocked: the fixup chain and `slot_origins` below are
+                // blocked-region machinery and do not apply.
                 //
-                // The fixup chain and `slot_origins` below are blocked-region
-                // machinery and stay gated on the flag: they exist to heal
-                // frames the owner cannot heal itself. The snapshot is a
-                // different thing. It is what the collector MARKS this thread
-                // from, it lives in the registry rather than in the thread, and
-                // nothing else rewrites it — so after a moving collection every
-                // non-blocked thread's snapshot was left naming addresses this
-                // collection vacated, and the next collection marked from them.
+                // A snapshot remap was tried here on 2026-08-17 — on the theory
+                // that a thread censused as blocked and then leaving the region
+                // is skipped by this fold AND not waited for by the pause, so
+                // its stale snapshot is what the next collection marks from.
+                // The theory is sound and the change is a no-op:
+                // `CRATONVM_DBG_ROOT_REMAP_AUDIT=1`, which re-runs the root scan
+                // at the END of `update_all_roots` and looks for an address this
+                // collection moved (excluding slide destinations), reports ZERO
+                // with the remap and ZERO without it, on the workload that
+                // reproduces the H2 MVStore-writer residual. Every stale
+                // snapshot entry it did find was on a BLOCKED thread and was
+                // already handled below.
                 //
-                // Usually harmless because a thread refreshes its snapshot when
-                // it parks at its next safepoint. Not harmless when a thread is
-                // censused as blocked and then leaves the blocked region: the
-                // fold skips it (flag now clear) and the pause does not wait for
-                // it (it was excluded), so its stale snapshot is what the NEXT
-                // collection marks from — the marker then keeps whatever now
-                // occupies the vacated address and can miss the real object,
-                // which is a live object freed under a frame that still holds
-                // it.
-                //
-                // MEASURED with `CRATONVM_DBG_ROOT_REMAP_AUDIT=1`: 5-27 scanned
-                // roots per collection were left naming an address that same
-                // collection moved an object away from, every one of them from
-                // scan section 11, "Root snapshot (for cross-thread GC
-                // scanning)". Remapping an entry to the address the collector
-                // itself reports is always correct, so this is unconditional.
-                // `CRATONVM_NO_UNBLOCKED_SNAPSHOT_REMAP=1` restores the
-                // pre-fix behaviour in the SAME binary, so the root-remap audit
-                // can be run as a one-binary A/B instead of a rebuild — the
-                // bisection lever this codebase asks every new gate to carry.
-                if cratonvm_types::flags::runtime_var_os(
-                    "CRATONVM_NO_UNBLOCKED_SNAPSHOT_REMAP",
-                )
-                .is_none()
-                {
-                    let mut snapshot = entry.root_snapshot.lock();
-                    for r in snapshot.iter_mut() {
-                        if let Some(&new) = pointer_map.get(&(r.as_ptr() as usize)) {
-                            if new != 0 {
-                                // SAFETY: `new` is a post-move object base the
-                                // collector just published in its pointer map.
-                                *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
-                            }
-                        }
-                    }
-                }
+                // Left unwritten deliberately: an unmeasured behaviour change
+                // in the root set is exactly what this file's history is made
+                // of. If the excluded-thread race is ever observed, the audit
+                // above is how to see it and this is where the fix goes.
                 continue;
             }
             let mut fixup = entry.gc_block_state.fixup.lock();
