@@ -13407,6 +13407,22 @@ unsafe fn try_lambda_site_direct_call(
         crate::runtime::interpreter::lambda_site_bump_no_code();
         return None;
     };
+    // A body that can DEOPT is left to the generic path. The sentinel it
+    // returns is indistinguishable here from a `long` whose value happens to be
+    // `Long.MIN_VALUE`, and the shared sentinel handler cannot rescue this one:
+    // it identifies the trapped callee by the CALL SITE's name
+    // (`try_resume_trapped_callee` compares `info.method_name`), which for a SAM
+    // call is `apply`, never the `lambda$...` body that actually trapped. It
+    // would refuse the resume, re-stash the deopt flag, and the compiled CALLER
+    // would then read the callee's deopt as its own — de-speculating an
+    // innocent method and leaving a frame nobody can claim. The interpreter's
+    // own one-shot path (`execute_jit_call_oneshot`) knows the impl's identity
+    // and handles all of that correctly, so a deopt-capable body simply goes
+    // there instead.
+    if !code.deopt_points.is_empty() || code.can_deopt_resume {
+        crate::runtime::interpreter::lambda_site_bump_refused();
+        return None;
+    }
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
     crate::runtime::interpreter::lambda_jit_site_capture_args(
         vm,
