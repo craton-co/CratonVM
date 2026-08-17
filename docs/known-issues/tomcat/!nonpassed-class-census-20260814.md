@@ -42,28 +42,54 @@ All four are G1-only, all four passed under ZGC, and all four produced **zero by
 
 **Do not investigate these as VM bugs.** Re-run on an idle box; expect PASS. The lesson belongs to the harness, not the VM: 8 concurrent runner invocations x 2 parallel forks x 2 GiB reservations oversubscribed this host's commit limit.
 
-## 3. A failed large allocation aborts the process instead of throwing `OutOfMemoryError` (2 classes)
+## 3. CORRECTED — the two `*LargeHeap` classes are §2 again, not an allocator defect
 
-| class | G1 | ZGC |
-|---|---|---|
-| `org.apache.tomcat.util.buf.TestByteChunkLargeHeap` | CRASH | CRASH |
-| `org.apache.tomcat.util.buf.TestCharChunkLargeHeap` | CRASH | CRASH |
+**This section originally claimed CratonVM aborts where it should throw `OutOfMemoryError`, and read the 12 GiB figure as a 6x miscomputation of a ~2 GiB array. Both halves were wrong.** The correction, 2026-08-17:
+
+| class | G1 | ZGC | at `-Xmx12g` on an idle box |
+|---|---|---|---|
+| `org.apache.tomcat.util.buf.TestByteChunkLargeHeap` | CRASH | CRASH | **`OK (1 test)`, 2.6 s** |
+| `org.apache.tomcat.util.buf.TestCharChunkLargeHeap` | CRASH | CRASH | **`OK (1 test)`** |
+
+Three facts kill the original reading:
+
+1. **12884901888 is not a computed array size — it is the requested heap.** `run-tomcat-suite.ps1` sets `$LargeHeapXmx = '12g'` and hands any class whose name matches `LargeHeap` its own `-Xmx12g`, precisely because the 2 GiB suite default OOMs them on *both* VMs by design. 12884901888 bytes is exactly 12 GiB. The "6x ratio" was a coincidence of round binary numbers (12 GiB really is 8 x 1.5 GiB) and meant nothing.
+2. **The VM already throws a proper catchable OOM.** Run at `-Xmx2g` the same class fails cleanly, exactly as HotSpot would:
+   ```
+   java.lang.OutOfMemoryError: Java heap space (alloc_array length 1610612736)
+     at org.apache.tomcat.util.buf.ByteChunk.makeSpace(ByteChunk.java:571)
+     at org.apache.tomcat.util.buf.TestByteChunkLargeHeap.testAppend(...:41)
+   ...
+   Tests run: 1,  Failures: 1
+   ```
+   `Tests run: 1, Failures: 1` — a FAIL, not a CRASH. Nothing about Java-level allocation is broken.
+3. **Both classes pass at the heap the harness actually asks for**, once the box can supply it. The suite CRASHes are timestamped 15:22:52, 15:22:57, 15:24:03 and 15:24:09 — *inside* the 15:12-15:25 commit-charge window §2 documents. A box that could not reserve 2 GiB at 15:12 could not reserve 12 GiB at 15:22.
+
+**So these two classes belong to §2, and §2 covers 6 classes, not 4.** No VM defect, no harness change needed: the harness was already right to ask for 12 GiB, and asking for it while seven other shards are resident is what failed.
+
+### What IS a defect, and it is the diagnostic
+
+The entire user-facing output for an unsatisfiable heap reservation is the global allocator's abort:
 
 ```
-memory allocation of 12884901888 bytes failed
+$ cratonvm -Xmx400g ...
+memory allocation of 429496729600 bytes failed
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 ```
 
-Both backends, both classes, deterministic, ~4 s in, stdout empty. **This is a different figure from §2** — 12 GiB, not 2 GiB — and it reproduces identically on both backends instead of clustering in the pagefile window, so it is test-driven rather than host-driven.
+Empty stdout, rc=127, and no mention of `-Xmx`, of the heap, or of the machine. HotSpot says *"Could not reserve enough space for object heap"*. **That missing sentence is the whole reason this section was written wrong** — the line names a number and nothing else, so it reads as an internal allocator bug rather than "your `-Xmx` does not fit".
 
-The tests are honest about what they want. `TestByteChunkLargeHeap.testAppend` appends 32 MiB a hundred times and asserts the buffer reaches `AbstractChunk.ARRAY_MAX_SIZE` (`Integer.MAX_VALUE - 8`, about 2 GiB); the class Javadoc says *"require a large heap"*. Under `-Xmx2g` they **cannot** succeed, and on HotSpot they would fail with a catchable `OutOfMemoryError`.
+Fixed by making the reservation fallible (`gc/src/arena.rs::alloc_zeroed_heap`, used by `Arena::new` — the ZGC default, the generational young semi-spaces, `heap.rs` — and by G1's region array), which now reports:
 
-Two things are wrong here, and they are separable:
+```
+# There is insufficient memory for the Java Runtime Environment to continue.
+# Could not reserve enough space for object heap (arena)
+#   requested 429496729600 bytes (409600 MiB) - this size comes from -Xmx
+#   The OS refused the reservation. Either lower -Xmx, or free physical
+#   memory / page-file (commit charge) on this machine and retry.
+```
 
-1. **The failure mode.** A heap allocation that cannot be satisfied must raise `java.lang.OutOfMemoryError` so Java code can catch it. Aborting in the Rust allocator hands the test framework nothing, loses the rest of the class, and reads as CRASH rather than FAIL. This VM already has the right machinery on a neighbouring path — `native_oom` raises "a catchable java.lang.OutOfMemoryError" when a native allocation cannot be met.
-2. **The 12 GiB figure needs explaining.** The array being requested is about 2 GiB and `-Xmx` is 2 GiB, so a **12 GiB** request is six times anything the program asked for. Whatever computes that size is either ignoring `-Xmx` or over-multiplying. That ratio is the lead — start there, not at the abort.
-
-Harness-side, these two classes want their own larger `-MaxHeap`; that is a separate decision and it does not fix the defect above.
+Only the reservation path changed. A Java-level allocation inside an existing heap still raises a catchable `OutOfMemoryError`, per fact 2 above.
 
 ## 4. One interface-dispatch defect: `Annotatable.getAnnotations()` has no Code attribute (3 classes)
 
@@ -81,11 +107,30 @@ java.lang.AbstractMethodError: method org/junit/runners/model/Annotatable.getAnn
   at org.junit.runners.ParentRunner.applyValidators(ParentRunner.java:157)
 ```
 
-`Annotatable` is a JUnit 4 **interface** and `getAnnotations()` is abstract there, so "has no Code attribute" correctly describes the interface method and identifies the wrong method as having been selected. Dispatch resolved the interface declaration instead of an implementation (`FrameworkMethod` / `FrameworkField` / `TestClass`). This is the shape recorded elsewhere in this tree as *`AbstractMethodError: no Code attribute` on an interface means the implementation was never bound* — the same class of defect, on a library interface rather than a JDK one.
+`Annotatable` is a JUnit 4 **interface** and `getAnnotations()` is abstract there, so "has no Code attribute" correctly describes the interface method and identifies the wrong method as having been selected. It fires inside JUnit's **class validator**, before any test body runs, which is why the whole class dies at `Tests run: 1, Failures: 1`.
 
-It fires inside JUnit's **class validator**, before any test body runs, which is why the whole class dies at `Tests run: 1, Failures: 1`. The two `TestDefaultServletEncoding*` classes read HANG under G1 and FAIL under ZGC: same defect, with the §7 wall-clock cap landing on top of it.
+### CORRECTED 2026-08-17: this is a JIT inline-cache miscompile, not a missing registration
 
-This deserves a census rather than three individual fixes — any JUnit4-vintage class in any suite that reaches `AnnotationsValidator` can hit it.
+This section originally attributed it to interface dispatch never binding the implementation. **That was wrong** — it is the JIT, and the bisect is unambiguous. All on `TestMessageBytesConversion`, standalone, one binary:
+
+| arm | result |
+|---|---|
+| default (JIT on) | `AbstractMethodError` |
+| `--nojit` | **`OK (864 tests)`** |
+| `CRATONVM_JIT_DENY=org/junit/validator/AnnotationsValidator$AnnotatableValidator.validateAnnotatable` | **`OK (864 tests)`** |
+| `CRATONVM_JIT_SP_INLINE_MIC=0` | `AbstractMethodError` (still) |
+| `CRATONVM_JIT_SP_INLINE_PIC=0` | **`OK (864 tests)`** |
+| `CRATONVM_JIT_SP_INLINE_MEGA=0` | **`OK (864 tests)`** |
+
+So: the **compiled body of `validateAnnotatable`** is at fault (denying just that one method is sufficient), and within it the **polymorphic / megamorphic inline-cache path** is the mechanism — the monomorphic cache is innocent, since disabling it alone changes nothing.
+
+Interface dispatch itself is fine. A probe calling `getAnnotations()` through the `Annotatable` interface on each of `TestClass`, `FrameworkMethod` and `FrameworkField` returns `OK` for all three on CratonVM, including `FrameworkMethod`/`FrameworkField`, whose implementation is reached past an abstract `FrameworkMember` that implements the interface without declaring the method.
+
+**A minimal synthetic repro does NOT reproduce it** — an interface, an abstract class implementing it without declaring the method, five concrete receivers and a 400k-iteration generic `invokeinterface` loop gives the correct answer on both VMs. So the trigger is narrower than "interface site goes megamorphic", and it has not been isolated.
+
+Leading hypothesis, unproven: the inline PIC/megamorphic cascade's **miss edge** reaches a call bound to the constant-pool target — which for an `invokeinterface` is `Annotatable.getAnnotations()` itself, an abstract method — instead of falling back to the resolving helper. That would explain why disabling either cache fixes it (the site then always uses the helper, which resolves against the receiver) while disabling only the monomorphic one does not. `InlineRefusal::GuardNotEmittable` records that the single-pass backend's "plain direct-call arm emits no receiver guard at all", which is the shape this hypothesis needs.
+
+**Not fixed.** This path is on every interface dispatch in the VM, so a change here without the trigger isolated risks silent miscompiles far beyond these three classes. The safe interim lever is per-method: `CRATONVM_JIT_DENY=org/junit/validator/AnnotationsValidator$AnnotatableValidator.validateAnnotatable` makes all three classes pass.
 
 ## 5. One JMX defect: a JDK-internal virtual-thread scheduler method (2 classes)
 
