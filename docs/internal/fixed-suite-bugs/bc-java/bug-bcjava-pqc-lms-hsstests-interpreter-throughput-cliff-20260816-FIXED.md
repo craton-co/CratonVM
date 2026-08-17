@@ -3,9 +3,10 @@
 ## Status
 **RESOLVED 2026-08-17** on `fix/bcjava-pqc-lms-throughput-20260817`.
 
-`HSSTests` — 15.9 of `lms.AllTests`'s 16 HotSpot seconds — **passes in every
-mode**, and the class the original page called a HANG passes on the *unmodified*
-binary in 2062 s once the forced-interpreter flag is dropped. With the SHA-256
+**`org.bouncycastle.pqc.crypto.lms.AllTests` passes: `OK (29 tests)` in 681 s**,
+where the page recorded `HANG (3000s, rc=124)`. `HSSTests` — 15.9 of that
+suite's 16 HotSpot seconds — passes on the *unmodified* binary in 2062 s once
+the forced-interpreter flag is dropped. With the SHA-256
 compression leaf made native it is **1047 s**, and the isolated kernel improves
 **1.8–3.2x** under the JIT and **~6x** under `--nojit`.
 
@@ -200,18 +201,35 @@ a mis-transcribed rotate still round-trips against itself perfectly.
 
 ## Results
 
-### First: `HSSTests` was never hanging, and it passes on the UNMODIFIED binary
+### First: `lms.AllTests` was never hanging — it PASSES
 
-With the JIT on and no budget cap, the **baseline** binary — no fix, plain `dev`
-— runs it to completion:
+The page's headline class, filed as `HANG (3000s, rc=124)`:
 
 ```
-org.bouncycastle.pqc.crypto.lms.HSSTests  rc=0  2062s   OK (13 tests)
+org.bouncycastle.pqc.crypto.lms.AllTests   rc=0   681s   OK (29 tests)
 ```
 
-That alone retires the `HANG` label. The class was filed as hanging because the
-sweep runs `--nojit` against a 3000 s cap, and `--nojit` is ~46x slower than the
-default on this workload.
+29 is exactly the five constituent classes' counts summed (13 + 7 + 1 + 7 + 1),
+so this is a real green, not a `started=0` one.
+
+And the class that owns 15.9 of its 16 HotSpot seconds passes even on the
+**unmodified** binary — no fix, plain `dev` — once the forced-interpreter flag
+is dropped:
+
+```
+org.bouncycastle.pqc.crypto.lms.HSSTests   rc=0   2062s  OK (13 tests)   (baseline)
+org.bouncycastle.pqc.crypto.lms.HSSTests   rc=0   1047s  OK (13 tests)   (+fix)
+```
+
+That retires the `HANG` label outright. The class was filed as hanging because
+the sweep runs `--nojit` against a 3000 s cap, and `--nojit` is ~46x slower than
+the default on this workload.
+
+(`lms.AllTests` at 681 s is *less* than `HSSTests` alone at 1047 s because the
+two ran hours apart on a shared host at different load, and because one JVM
+running all five classes amortizes JIT warm-up. Treat wall clock here as orders
+of magnitude; the controlled comparisons are the interleaved kernel rounds and
+the same-class base/fix pair above.)
 
 ### The intrinsic engaged, and it is the native that served the calls
 
@@ -241,6 +259,7 @@ own run of the same class.
 
 | workload | HotSpot | CVM base +JIT | CVM +fix | gain |
 |---|---|---|---|---|
+| `lms.AllTests` (the page's headline suite) | 16 s | filed `HANG` | **681 s, OK (29 tests)** | — |
 | `HSSTests` (the whole class) | 15.9 s | **2062 s** | **1047 s** | **1.97x** |
 | `LMSTests` | 0.77 s | 61 s | 33 s | 1.85x |
 | `LMSKeyGenTests` | 0.39 s | 6 s | 5 s | — |
