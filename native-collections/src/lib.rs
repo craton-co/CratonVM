@@ -3895,6 +3895,11 @@ enum AlLayout {
     /// `java/util/Vector` or a subclass (`java/util/Stack`), which carries its
     /// own `elementData`/`elementCount` slots.
     Vector,
+    /// One of the [`MAP_VIEW_CARRIERS`]. Reads and writes exactly like
+    /// [`AlLayout::ArrayList`] — the difference is the slot triple it is paired
+    /// with, which [`view_carrier_slots`] places above the carrier's own
+    /// declared fields instead of at ArrayList's absolute indices.
+    ViewCarrier,
     /// Exactly `java/lang/Object`. CratonVM's own class-id-0 placeholders land
     /// here; a zero-field bare `Object` is not a list. See
     /// [`is_bare_java_lang_object`], whose test this reproduces.
@@ -3924,7 +3929,10 @@ impl AlLayout {
     /// its slot layout anyway.
     #[inline]
     fn rules_out_wrapper_routes(self) -> bool {
-        matches!(self, AlLayout::ArrayList | AlLayout::Vector)
+        matches!(
+            self,
+            AlLayout::ArrayList | AlLayout::Vector | AlLayout::ViewCarrier
+        )
     }
 
     /// The verdict [`al_is_list_layout`] returns for an object of this class.
@@ -3933,7 +3941,9 @@ impl AlLayout {
     #[inline]
     fn accepts(self, n_fields: usize) -> bool {
         match self {
-            AlLayout::ArrayList | AlLayout::Vector | AlLayout::Lenient => true,
+            AlLayout::ArrayList | AlLayout::Vector | AlLayout::ViewCarrier | AlLayout::Lenient => {
+                true
+            }
             // `!is_bare_java_lang_object`: exact `java/lang/Object` with zero
             // fields is rejected; one that carries fields is a CratonVM
             // placeholder list and stays accepted.
@@ -3963,6 +3973,15 @@ fn al_slots_for_uncached(
             return None;
         }
     }
+    // Same argument as Vector, one family over: a `Map.values()` view carrier
+    // is not an ArrayList either, and using ArrayList's ABSOLUTE slots on one
+    // overwrites a field the carrier really declares. See
+    // [`view_carrier_slots`] for the collision this prevents.
+    if let Some(name) = ctx.class_name_arc_of_id(cid) {
+        if is_map_view_carrier(&name) {
+            return Some((view_carrier_slots(ctx, cid)?, AlLayout::ViewCarrier));
+        }
+    }
     let slots = al_slots_resolved(ctx)?;
     // Refuse to CACHE a verdict until `java/util/ArrayList` itself resolves:
     // the arm below this one is the old predicate's lenient "ArrayList not
@@ -3978,11 +3997,11 @@ fn al_slots_for_uncached(
             None => AlLayout::Lenient,
             Some("") => AlLayout::Lenient,
             Some("java/lang/Object") => AlLayout::BareObject,
-            // A map view carries its state in ArrayList's own resolved slots
-            // under its own class — see `MAP_VIEW_CARRIERS`. Without this arm
-            // the guard below rejects it as a named non-list and every view
-            // reads back EMPTY.
-            Some(n) if is_map_view_carrier(n) => AlLayout::ArrayList,
+            // A map view carrier never reaches here: the early return above
+            // answers `AlLayout::ViewCarrier` for every `MAP_VIEW_CARRIERS`
+            // name, with its own slot triple. (Until 2026-08-17 this arm
+            // answered `AlLayout::ArrayList` and the carrier shared
+            // ArrayList's ABSOLUTE slots — the `LinkedValues` collision.)
             Some(_) => AlLayout::Foreign,
         }
     };
@@ -4040,7 +4059,7 @@ fn is_bare_java_lang_object(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// the same as [`al_is_list_layout`] (that one also admits `Vector`).
 fn al_is_arraylist_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     match al_slots_and_layout_for(ctx, obj).1 {
-        AlLayout::ArrayList | AlLayout::Lenient => true,
+        AlLayout::ArrayList | AlLayout::ViewCarrier | AlLayout::Lenient => true,
         AlLayout::BareObject => !is_bare_java_lang_object(ctx, obj),
         AlLayout::Vector | AlLayout::Foreign => false,
     }
@@ -4260,8 +4279,24 @@ fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
 #[inline]
 fn al_mod_count_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let slot = ctx.resolve_field_index("java/util/AbstractList", "modCount")?;
-    let (data_slot, size_slot, _) = al_slots_for(ctx, this);
+    let ((data_slot, size_slot, _), layout) = al_slots_and_layout_for(ctx, this);
     if slot == data_slot || slot == size_slot || slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    // A `MAP_VIEW_CARRIERS` receiver has NO `modCount` slot of its own. It
+    // extends `AbstractCollection`, not `AbstractList`, so `AbstractList`'s
+    // resolved index (0 in the real-JDK layout) does not name a field of this
+    // object at all — it names the carrier's OWN first declared field:
+    // `HashMap$Values.this$0` / `TreeMap$Values.this$0` /
+    // `ConcurrentHashMap$CollectionView.map`, all REFERENCES, and
+    // `LinkedHashMap$LinkedValues.reversed`, a boolean. Bumping a counter there
+    // is a type-punning store into a declared reference slot — the exact hazard
+    // this function's doc block describes for the synthetic layout, and the
+    // reason CratonVM reported `HashMap$Values.this$0 == null` where HotSpot
+    // reports the backing map (G22-1 N2, MEASURED). Views lose comodification
+    // detection, which is the direction this function already documents as
+    // safe.
+    if layout == AlLayout::ViewCarrier {
         return None;
     }
     Some(slot)
@@ -6365,6 +6400,18 @@ pub fn native_al_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // A `values()` view is LIVE, and this was the one element-reading native
+    // that never said so: `native_al_get`, `native_al_contains`,
+    // `native_al_iterator`, `native_al_for_each` and `native_al_stream` all
+    // open with a resync, and `toString` read the capture-time backing array
+    // straight out of `al_state`. MEASURED on all five map families
+    // (`scratchpad/g22/G22Fam.java`, the `.values.live` row): after
+    // `m.put("d","4"); m.remove("a")` on a three-entry map, `v.size()` answered
+    // the live 3 but `v.toString()` answered the captured `[1, 2, 3]` where HotSpot
+    // answers `[2, 3, 4]`. `resync_values_view` returns `list` unchanged for a
+    // receiver with no view marker, so an ordinary `ArrayList.toString()` pays
+    // one `al_state` it was going to pay anyway.
+    let this = resync_values_view(ctx, this)?;
     let (data, size) = al_state(ctx, this);
     let size = size as usize;
     // Pre-size: "[" + N elements averaging ~16 chars each + (N-1) ", " + "]".
@@ -12629,8 +12676,7 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let sync = wants_synchronized_views(&*ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let (_, val_handles) = pin_value_slice(ctx, &values);
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -12641,6 +12687,7 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(this)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, this);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(this_pin);
@@ -12673,8 +12720,7 @@ pub fn make_live_values_list(
     let sync = wants_synchronized_views(&*ctx, source);
     let source_pin = ctx.pin_native_root(source);
     let (_, val_handles) = pin_value_slice(ctx, values);
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -12685,6 +12731,7 @@ pub fn make_live_values_list(
     let source = ctx.read_native_pin(source_pin, source);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, source);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(source_pin);
@@ -13846,6 +13893,59 @@ fn is_map_view_carrier(name: &str) -> bool {
     MAP_VIEW_CARRIERS.contains(&name)
 }
 
+/// The `(elementData, size, n_fields)` triple a [`MAP_VIEW_CARRIERS`] object
+/// keeps its list state in — placed ABOVE every field the carrier class itself
+/// declares, rather than at `java/util/ArrayList`'s absolute indices.
+///
+/// The comment on `MAP_VIEW_CARRIERS` used to argue that ArrayList's absolute
+/// `elementData`/`size` (slots 1 and 2 in the real-JDK layout, with
+/// `AbstractList.modCount` at 0) sit "past the single `this$0` these classes
+/// declare". Five of the six carriers do declare exactly one field. **The sixth
+/// does not**, and `javap -p` on JDK 25.0.3+9 says so:
+///
+/// ```text
+/// final class java.util.LinkedHashMap$LinkedValues … {
+///   final boolean reversed;              -> slot 0
+///   final java.util.LinkedHashMap this$0; -> slot 1
+/// ```
+///
+/// so `al_set_data` wrote the element buffer straight over `this$0`, and
+/// [`values_view_class_source`] — which resolves `this$0` BY NAME, precisely
+/// because `LinkedValues` puts it at slot 1 — read that buffer back and handed
+/// an `Object[]` to `collect_entries_any` as if it were the source map. MEASURED
+/// consequence before this function existed: `LinkedHashMap$LinkedValues.this$0`
+/// reflected as `[Ljava.lang.Object;[len=11]` where HotSpot reports
+/// `java.util.LinkedHashMap`, `values().size()` answered **0** for a
+/// three-entry map in BOTH policy modes, and every element-touching operation
+/// died with `AbstractMethodError: java/util/Map.isEmpty()Z` under `--jdk-only`
+/// (7 of 7 rows; see `docs/known-issues/jdk-only/G22-1-*` and its G13-1
+/// predecessor).
+///
+/// This is the same move [`al_slots_for_uncached`] already makes for
+/// `java/util/Vector`: a receiver that is not an `ArrayList` does not get
+/// `ArrayList`'s slots. For the five one-field carriers the answer is `(1, 2, 3)`
+/// — bit-identical to what they used before, which is why the measured
+/// `HashMap` / `TreeMap` / `Hashtable` / `ConcurrentHashMap` rows (all clean)
+/// stay exactly as they were. Only `LinkedValues` moves, to `(2, 3, 4)`.
+///
+/// `class_num_total_fields` counts INHERITED fields too, which is required:
+/// `ConcurrentHashMap$ValuesView` declares nothing itself and inherits `map`
+/// from `ConcurrentHashMap$CollectionView`.
+///
+/// `None` (or a zero count) means the carrier class is not linked — a
+/// synthetic-JDK build, or a call that runs before the class resolves. There is
+/// then no declared field to collide with, so the historical ArrayList layout is
+/// the right answer, and it is also the one [`alloc_view_carrier`] allocates
+/// for. `None` propagates all the way out of `al_slots_for_uncached` so the
+/// verdict is NOT cached, for the reason [`al_slots_resolved`] gives.
+fn view_carrier_slots(ctx: &dyn NativeContext, cid: ClassId) -> Option<(usize, usize, usize)> {
+    let declared = ctx.class_num_total_fields(cid);
+    if declared == 0 {
+        return al_slots_resolved(ctx);
+    }
+    Some((declared, declared + 1, declared + 2))
+}
+
 /// The carrier classes a map's SET-shaped view (`keySet()`, `entrySet()`) is
 /// minted under — the [`MAP_VIEW_CARRIERS`] argument, one family over.
 ///
@@ -14053,20 +14153,39 @@ fn values_carrier_for(ctx: &dyn NativeContext, source: ObjectRef) -> &'static st
 /// fail — into a `NoClassDefFoundError`. Degrading to the old carrier costs the
 /// `getClass()` fidelity for that run and nothing else, because every
 /// `native_al_*` path still accepts an ArrayList-classed view.
+///
+/// The field count is derived HERE rather than passed in, and that is the
+/// invariant the `LinkedValues` fix rests on: the number of slots allocated and
+/// the slot indices [`al_slots_for`] later reads must both come from
+/// [`view_carrier_slots`] applied to the SAME `ClassId`. Callers used to hand
+/// in `al_slots(ctx).2` — ArrayList's own count — which is one slot short for a
+/// two-field carrier, so `al_set_size` would silently skip its
+/// out-of-bounds write and the view would report size 0.
 fn alloc_view_carrier(
     ctx: &mut dyn NativeContext,
     carrier: &str,
-    n_fields: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    let fallback = al_slots(ctx).2;
+    let is_carrier = is_map_view_carrier(carrier);
     if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
         if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
-            return Ok(ctx.alloc_object(cid, n_fields));
+            let n = if is_carrier {
+                view_carrier_slots(&*ctx, cid).map_or(fallback, |s| s.2)
+            } else {
+                fallback
+            };
+            return Ok(ctx.alloc_object(cid, n));
         }
     }
     if let Some(cid) = ctx.class_id_by_name(carrier) {
-        return Ok(ctx.alloc_object(cid, n_fields));
+        let n = if is_carrier {
+            view_carrier_slots(&*ctx, cid).map_or(fallback, |s| s.2)
+        } else {
+            fallback
+        };
+        return Ok(ctx.alloc_object(cid, n));
     }
-    try_alloc_synthetic(ctx, "java/util/ArrayList", n_fields)
+    try_alloc_synthetic(ctx, "java/util/ArrayList", fallback)
 }
 
 /// Build a `values()` view: an ArrayList-LAYOUT snapshot, under its own carrier
@@ -14089,8 +14208,7 @@ fn make_view_list_of(
     } else {
         elem_base
     };
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -14101,6 +14219,7 @@ fn make_view_list_of(
     let source = ctx.read_native_pin(source_pin, source);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, source);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, vals.len() as i32);
     ctx.unpin_native_roots(first_pin);
@@ -14671,6 +14790,69 @@ fn is_values_view_class(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     receiver_facts(ctx, obj).has(CF_VALUES_VIEW)
 }
 
+/// `true` iff `view` is a [`MAP_VIEW_CARRIERS`] object THIS crate minted —
+/// i.e. one that already carries its elements in its own
+/// [`view_carrier_slots`] `elementData` slot and its source map in the element
+/// buffer's trailing capacity slot ([`values_view_source`]).
+///
+/// Such a receiver must NOT be re-expressed by [`vc_route`], for two reasons.
+/// The decisive one is termination: `vc_route` calls back into the SAME native
+/// entry point that reached it, over a carrier of the same class built by
+/// `make_view_list_of`, and that carrier would satisfy `vc_route`'s own test
+/// again — an unbounded recursion. It stayed latent only because nothing ever
+/// populated `this$0`, so [`values_view_class_source`] answered `None` and the
+/// route was inert; [`store_view_carrier_backref`] populates it, so the guard
+/// has to be explicit rather than accidental. The second reason is that the
+/// reroute would be pure waste: the direct decode is already live (every
+/// element-reading native opens with `resync_values_view`) and already writes
+/// removals through.
+///
+/// `vc_route` therefore keeps exactly the receivers it was written for: a view
+/// object that arrived from somewhere other than this crate's own minting.
+#[inline]
+fn is_own_view_carrier(ctx: &dyn NativeContext, view: ObjectRef) -> bool {
+    values_view_source(ctx, view).is_some()
+}
+
+/// Store the backing map in a [`MAP_VIEW_CARRIERS`] object's OWN declared
+/// enclosing-instance field — `this$0` on the five inner classes, `map` on
+/// `ConcurrentHashMap$ValuesView` (inherited from `CollectionView`) — the way
+/// the JDK's own constructors do.
+///
+/// MEASURED before this existed (`scratchpad/g22/G22Slot.java`, run with
+/// `--add-opens java.base/java.util=ALL-UNNAMED`, on both VMs): HotSpot reports
+/// `HashMap$Values.this$0 -> java.util.HashMap`, `TreeMap$Values.this$0 ->
+/// java.util.TreeMap` and `ConcurrentHashMap$ValuesView.map ->
+/// java.util.concurrent.ConcurrentHashMap`; CratonVM reported `null` for all
+/// three. Nothing had ever written those fields — the source map lived only in
+/// the element buffer's trailing capacity slot ([`values_view_source`]), which
+/// no reflective reader can see. G22-1 N2 / G13-1 N2.
+///
+/// Two guards, both structural rather than defensive:
+///
+/// * only a [`AlLayout::ViewCarrier`] receiver is written at all, so this can
+///   never touch an ordinary `ArrayList`;
+/// * only a slot strictly BELOW the receiver's `elementData` slot is written,
+///   which is exactly the range [`view_carrier_slots`] reserves for the
+///   carrier's own declared fields. This function therefore cannot re-create
+///   the collision it was added alongside, even if a future carrier's layout
+///   changes underneath it.
+fn store_view_carrier_backref(ctx: &mut dyn NativeContext, list: ObjectRef, source: ObjectRef) {
+    let ((data_slot, _, _), layout) = al_slots_and_layout_for(ctx, list);
+    if layout != AlLayout::ViewCarrier {
+        return;
+    }
+    let cid = ctx.class_id_of_object(list);
+    for name in ["this$0", "map"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, name) {
+            if slot < data_slot {
+                ctx.set_field(list, slot, Value::Object(Some(source)));
+                return;
+            }
+        }
+    }
+}
+
 /// The source map a real view-class object was built over.
 ///
 /// Resolved BY NAME, never by slot, and the reason is
@@ -14747,6 +14929,9 @@ fn vc_route(
     if !is_values_view_class(ctx, this) {
         return None;
     }
+    if is_own_view_carrier(ctx, this) {
+        return None;
+    }
     let source = values_view_class_source(ctx, this)?;
     // GC-safety, and the pins go up FIRST — before `collect_entries_any`, not
     // between it and `make_view_list_of`. Two distinct hazards:
@@ -14807,6 +14992,9 @@ fn vc_route(
 /// view over that map must agree with.
 fn vc_route_source_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<MethodCallResult> {
     if !is_values_view_class(ctx, this) {
+        return None;
+    }
+    if is_own_view_carrier(ctx, this) {
         return None;
     }
     let source = values_view_class_source(ctx, this)?;
@@ -51198,12 +51386,7 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     } else {
         elem_base
     };
-    let n_fields = al_slots(ctx).2;
-    let list = alloc_view_carrier(
-        ctx,
-        "java/util/concurrent/ConcurrentHashMap$ValuesView",
-        n_fields,
-    )?;
+    let list = alloc_view_carrier(ctx, "java/util/concurrent/ConcurrentHashMap$ValuesView")?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let arr = alloc_ref_array(ctx, cap);
@@ -51214,6 +51397,7 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_array_element(arr, cap - 1, Value::Object(Some(this)));
     let list = ctx.read_native_pin(list_pin, list);
+    store_view_carrier_backref(ctx, list, this);
     al_set_data(ctx, list, arr);
     al_set_size(ctx, list, vals.len() as i32);
     ctx.unpin_native_roots(first_pin);
@@ -62782,6 +62966,152 @@ mod tests {
         assert!(!super::al_is_arraylist_layout(&ctx, s));
     }
 
+    // --- G22-1 N1/N2: the map-view carrier slot collision ------------------
+    //
+    // MEASURED before this fix (`scratchpad/g22/G22Slot.java`, both VMs,
+    // `--add-opens java.base/java.util=ALL-UNNAMED`):
+    //
+    //     LinkedHashMap$LinkedValues.this$0  HotSpot: java.util.LinkedHashMap
+    //                                       CratonVM: [Ljava.lang.Object;[len=11]
+    //
+    // `LinkedValues` is the ONE carrier of the six that declares two fields
+    // (`reversed` @0, `this$0` @1), so ArrayList's absolute `elementData` slot
+    // 1 landed on `this$0` and `values_view_class_source` read the element
+    // buffer back as the source map.
+
+    /// The mock layout that reproduces the real-JDK one: `AbstractList
+    /// .modCount` @0, `ArrayList.elementData` @1, `ArrayList.size` @2.
+    fn carrier_ctx() -> (lbq_blocking_tests::MockCtx, ClassId, ClassId, ClassId) {
+        let ctx = lbq_blocking_tests::MockCtx::new(11);
+        let al = ClassId::new(4101);
+        let hm_values = ClassId::new(4102);
+        let linked_values = ClassId::new(4103);
+        ctx.define_class(al, "java/util/ArrayList");
+        ctx.define_class(hm_values, "java/util/HashMap$Values");
+        ctx.define_class(linked_values, "java/util/LinkedHashMap$LinkedValues");
+        ctx.define_field(al, "elementData", 1);
+        ctx.define_field(al, "size", 2);
+        // One declared field, `this$0` @0 — five of the six carriers.
+        ctx.define_total_fields(hm_values, 1);
+        ctx.define_field(hm_values, "this$0", 0);
+        // Two declared fields, `reversed` @0 and `this$0` @1 — the sixth.
+        ctx.define_total_fields(linked_values, 2);
+        ctx.define_field(linked_values, "reversed", 0);
+        ctx.define_field(linked_values, "this$0", 1);
+        (ctx, al, hm_values, linked_values)
+    }
+
+    /// The whole fix in one assertion: `LinkedValues`' list slots must clear
+    /// its two declared fields, and the five one-field carriers must keep the
+    /// layout they already had — the measured `HashMap` / `TreeMap` /
+    /// `Hashtable` / `ConcurrentHashMap` rows were all CLEAN and must not move.
+    #[test]
+    fn view_carrier_slots_clear_the_carriers_own_declared_fields() {
+        let (ctx, al, hm_values, linked_values) = carrier_ctx();
+
+        // The reference: a real ArrayList is untouched.
+        assert_eq!(super::al_slots_for_uncached(&ctx, al).unwrap().0, (1, 2, 3));
+
+        // One declared field: identical to ArrayList's absolute slots, which
+        // is why this family never diverged.
+        assert_eq!(
+            super::view_carrier_slots(&ctx, hm_values),
+            Some((1, 2, 3)),
+            "a one-field carrier keeps ArrayList's own slots"
+        );
+        // Two declared fields: elementData must NOT land on `this$0` @1.
+        assert_eq!(
+            super::view_carrier_slots(&ctx, linked_values),
+            Some((2, 3, 4)),
+            "LinkedValues declares reversed@0 and this$0@1; the list state              starts above both"
+        );
+        let (slots, layout) = super::al_slots_for_uncached(&ctx, linked_values).unwrap();
+        assert_eq!(slots, (2, 3, 4));
+        assert_eq!(layout, super::AlLayout::ViewCarrier);
+        assert_ne!(
+            slots.0,
+            super::al_slots_resolved(&ctx).unwrap().0,
+            "the collision is exactly elementData == this$0's slot"
+        );
+    }
+
+    /// A carrier still reads and writes like an ArrayList everywhere else —
+    /// `accepts`, the ArrayList-layout question, and the wrapper-route
+    /// shortcut. A `ViewCarrier` that answered `Foreign` to any of these would
+    /// make every values view read back EMPTY.
+    #[test]
+    fn view_carrier_behaves_as_a_list_everywhere_but_its_slots() {
+        let (ctx, _al, hm_values, linked_values) = carrier_ctx();
+        let hv = ctx.alloc_object_of(hm_values, 3);
+        let lv = ctx.alloc_object_of(linked_values, 4);
+        assert!(super::al_is_list_layout(&ctx, hv));
+        assert!(super::al_is_list_layout(&ctx, lv));
+        assert!(super::al_is_arraylist_layout(&ctx, hv));
+        assert!(super::al_is_arraylist_layout(&ctx, lv));
+        assert!(super::AlLayout::ViewCarrier.rules_out_wrapper_routes());
+        assert!(super::AlLayout::ViewCarrier.accepts(4));
+    }
+
+    /// `AbstractList.modCount` resolves to slot 0, which on a carrier is the
+    /// carrier's OWN first declared field — `this$0`, a REFERENCE. Bumping a
+    /// counter there is a type-punning store; it is why `HashMap$Values
+    /// .this$0` reflected as `null`. A carrier must report no modCount slot.
+    #[test]
+    fn a_view_carrier_has_no_mod_count_slot() {
+        let (ctx, al, hm_values, linked_values) = carrier_ctx();
+        let abstract_list = ClassId::new(4104);
+        ctx.define_class(abstract_list, "java/util/AbstractList");
+        ctx.define_field(abstract_list, "modCount", 0);
+
+        let list = ctx.alloc_object_of(al, 3);
+        assert_eq!(
+            super::al_mod_count_slot(&ctx, list),
+            Some(0),
+            "an ordinary ArrayList keeps its comodification counter"
+        );
+        let hv = ctx.alloc_object_of(hm_values, 3);
+        let lv = ctx.alloc_object_of(linked_values, 4);
+        assert_eq!(super::al_mod_count_slot(&ctx, hv), None);
+        assert_eq!(super::al_mod_count_slot(&ctx, lv), None);
+    }
+
+    /// `store_view_carrier_backref` writes the carrier's own `this$0`/`map`
+    /// and can never reach the list slots — the collision it repairs.
+    #[test]
+    fn the_backref_lands_on_this_dollar_zero_and_nowhere_else() {
+        let (ctx, al, hm_values, linked_values) = carrier_ctx();
+        let mut ctx = ctx;
+        let source = ctx.alloc_object_of(al, 3);
+
+        let hv = ctx.alloc_object_of(hm_values, 3);
+        super::store_view_carrier_backref(&mut ctx, hv, source);
+        assert_eq!(ctx.get_field(hv, 0), Value::Object(Some(source)));
+
+        let lv = ctx.alloc_object_of(linked_values, 4);
+        super::store_view_carrier_backref(&mut ctx, lv, source);
+        assert_eq!(
+            ctx.get_field(lv, 1),
+            Value::Object(Some(source)),
+            "LinkedValues' this$0 is slot 1, not slot 0"
+        );
+        assert_eq!(
+            ctx.get_field(lv, 0),
+            Value::Int(0),
+            "`reversed` @0 must be left alone"
+        );
+        assert_eq!(
+            ctx.get_field(lv, 2),
+            Value::Int(0),
+            "the elementData slot must be left alone"
+        );
+
+        // An ordinary ArrayList is never touched, whatever it declares.
+        let plain = ctx.alloc_object_of(al, 3);
+        super::store_view_carrier_backref(&mut ctx, plain, source);
+        assert_eq!(ctx.get_field(plain, 0), Value::Int(0));
+        assert_eq!(ctx.get_field(plain, 1), Value::Int(0));
+    }
+
     #[test]
     fn al_slots_memo_does_not_cross_wire_two_receiver_classes() {
         let (ctx, al, vec) = memo_ctx();
@@ -64722,6 +65052,12 @@ mod tests {
             /// declared a field for is exactly a fabricated stub, whose slots
             /// are `_f0.._fN`.
             field_indices: HashMap<(ClassId, String), usize>,
+            /// Modelled `class -> total instance field count (inherited
+            /// included)`, so a `MockCtx` can answer `class_num_total_fields`.
+            /// Empty by default, which reproduces the trait's `0` default —
+            /// i.e. "class not loaded", the answer `view_carrier_slots` treats
+            /// as "no declared field to collide with".
+            total_fields: HashMap<ClassId, usize>,
             /// Distinct per `Shared`, so two `MockCtx`s in one process are two
             /// different "VMs".
             ///
@@ -64749,6 +65085,7 @@ mod tests {
                     class_names: HashMap::new(),
                     superclasses: HashMap::new(),
                     field_indices: HashMap::new(),
+                    total_fields: HashMap::new(),
                     vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     next_ptr: 8,
                     monitors: HashMap::new(),
@@ -64843,6 +65180,14 @@ mod tests {
                     .insert((class_id, name.to_string()), index);
             }
 
+            /// Declare `class_id`'s TOTAL instance field count, inherited
+            /// fields included — what `NativeClassAccess::class_num_total_fields`
+            /// reports for a loaded class. Without this the mock answers the
+            /// trait default of `0`, which means "not loaded".
+            pub(super) fn define_total_fields(&self, class_id: ClassId, n: usize) {
+                self.shared.lock().unwrap().total_fields.insert(class_id, n);
+            }
+
             /// Allocate an object of `class_id` with `num_fields` slots.
             pub(super) fn alloc_object_of(
                 &self,
@@ -64869,6 +65214,19 @@ mod tests {
         }
 
         impl cratonvm_native_api::NativeClassAccess for MockCtx {
+            /// Report the TOTAL instance field count a test declared with
+            /// `define_total_fields`. `0` — the trait's own default — means
+            /// "class not loaded", which is exactly what an undeclared class
+            /// is here, so every pre-existing test is unchanged.
+            fn class_num_total_fields(&self, class_id: ClassId) -> usize {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .total_fields
+                    .get(&class_id)
+                    .copied()
+                    .unwrap_or(0)
+            }
             // --- default stubs for everything else ---------------------
             fn load_class(&mut self, _n: &str) -> MethodCallResult {
                 Ok(None)

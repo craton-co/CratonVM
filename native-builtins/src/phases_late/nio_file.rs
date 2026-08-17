@@ -7110,13 +7110,186 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // "out-of-bounds field write dropped ... class_name=java/nio/file/
     // WatchService real_field_count=Some(0)".
 
+    // `FileSystem.getPathMatcher(String)` and the ONE method the returned
+    // interface declares. Until 2026-08-17 the body below was
+    //
+    //     |ctx, _args| { alloc(java/nio/file/PathMatcher, 0 fields) }
+    //
+    // — it ignored the pattern entirely and handed back an object stamped with
+    // the INTERFACE, carrying no state, and `PathMatcher.matches` had no
+    // registration anywhere in the VM. That is an object with zero usable
+    // methods: `0 of 1`. MEASURED consequence (`scratchpad/g22/GlobProbe`-class
+    // census, 292 rows on both VMs): every `matches()` answered
+    // `AbstractMethodError: java/nio/file/PathMatcher.matches(Ljava/nio/file/
+    // Path;)Z has no Code attribute`, and every one of the ~50 rows where
+    // HotSpot REFUSES the pattern (`getPathMatcher(null)`, `"*.txt"` with no
+    // syntax prefix, `"foo:…"`, `glob:[abc`, `glob:{a,b`, `glob:abc\`,
+    // `regex:[a-`) built a matcher happily instead, because nothing parsed.
+    // `RCrypto` reaches it from inside java.base — `JceSecurity.
+    // setupJurisdictionPolicies` -> `Files.newDirectoryStream(dir, glob)`,
+    // whose real JDK bytecode is `matcher.matches(entry.getFileName())`.
+    //
+    // Deleting the registration is NOT the fix, even though the real
+    // `sun.nio.fs.WindowsFileSystem.getPathMatcher` is a complete
+    // implementation: `FileSystems.getDefault()` returns CratonVM's own
+    // synthetic `java/nio/file/FileSystem` (`p57_default_filesystem_singleton`;
+    // its `sun.nio.fs.WindowsFileSystem` getClass() answer is the
+    // `jdk_concrete_getclass_alias` mapping, not its real class), and
+    // `java.nio.file.FileSystem.getPathMatcher` is ABSTRACT — so unregistering
+    // moves the `AbstractMethodError` one call earlier rather than removing it.
+    //
+    // Nor may the fix be to make `newDirectoryStream`'s glob overload skip the
+    // matcher: that is exactly the fabricated success `d378eee51` removed, and
+    // it made `RCrypto` green over a filter that was never invoked.
     r.register(
         fsys,
         "getPathMatcher",
         "(Ljava/lang/String;)Ljava/nio/file/PathMatcher;",
-        |ctx, _args| {
-            let pm = try_alloc_concurrent_synthetic(ctx, "java/nio/file/PathMatcher", 0)?;
+        |ctx, args| {
+            let sai = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                // HotSpot's is a helpful-NPE synthesized by the JVM from
+                // `syntaxAndInput.indexOf(':')`, transcribed verbatim
+                // (MEASURED — it cannot be derived).
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some(
+                            "Cannot invoke \"String.indexOf(int)\" because \
+                             \"syntaxAndInput\" is null"
+                                .into(),
+                        ),
+                    }
+                    .into())
+                }
+            };
+            let sai = ctx.read_string(sai).unwrap_or_default();
+            // `int pos = syntaxAndInput.indexOf(':'); if (pos <= 0) throw` —
+            // note `<= 0`, so a LEADING colon is refused too, and only the
+            // FIRST colon splits (`glob:a:b` is the glob `a:b`).
+            let split = match sai.find(':') {
+                None | Some(0) => None,
+                Some(b) => Some((sai[..b].to_string(), sai[b + 1..].to_string())),
+            };
+            let (syntax, input) = match split {
+                Some(pair) => pair,
+                None => return Err(p57_bare_illegal_argument(ctx)),
+            };
+            // `syntax.equalsIgnoreCase(GLOB_SYNTAX)` — `GLOB:` and `Glob:` are
+            // accepted, ` glob:` and `glob :` are not (no trimming). MEASURED.
+            let expr = if syntax.eq_ignore_ascii_case("glob") {
+                let units: Vec<u16> = input.encode_utf16().collect();
+                match p57_globs_to_regex(&units, cfg!(windows)) {
+                    Ok(u) => String::from_utf16_lossy(&u),
+                    Err((desc, idx)) => {
+                        return Err(p57_throw_pattern_syntax(ctx, desc, &input, idx))
+                    }
+                }
+            } else if syntax.eq_ignore_ascii_case("regex") {
+                // No translation at all: the string goes to `Pattern.compile`
+                // untouched, so the caller owns its own separator escaping.
+                input
+            } else {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("Syntax '{syntax}' not recognized"),
+                }
+                .into());
+            };
+            let expr_obj = ctx.create_string(&expr);
+            // CASE_INSENSITIVE | UNICODE_CASE, applied on Windows to `regex:`
+            // patterns as well as `glob:` ones — MEASURED: `regex:A.TXT`
+            // matches `a.txt`, `regex:(?-i)A\.TXT` does not, and `regex:Ä`
+            // matches `ä`.
+            let pattern = ctx.invoke(
+                "java/util/regex/Pattern",
+                "compile",
+                "(Ljava/lang/String;I)Ljava/util/regex/Pattern;",
+                &[Value::Object(Some(expr_obj)), Value::Int(P57_MATCHER_FLAGS)],
+            )?;
+            let pattern = match pattern {
+                Some(Value::Object(Some(p))) => p,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!("Pattern.compile returned no Pattern for {expr}"),
+                    }
+                    .into())
+                }
+            };
+            // The carrier allocation can move the just-compiled Pattern.
+            let pat_pin = ctx.pin_native_root(pattern);
+            let pm = try_alloc_concurrent_synthetic(ctx, "java/nio/file/PathMatcher", 1)?;
+            let pattern = ctx.read_native_pin(pat_pin, pattern);
+            ctx.set_field(pm, P57_MATCHER_PATTERN_FIELD, Value::Object(Some(pattern)));
+            ctx.unpin_native_roots(pat_pin);
             Ok(Some(Value::Object(Some(pm))))
+        },
+    );
+
+    // The receiver's runtime class IS `java/nio/file/PathMatcher` (see above),
+    // so this registration is what the receiver-own-class lookup finds. A
+    // one-field object stamped with an interface is the same shape the
+    // `Path.iterator` body a few hundred lines up already uses for
+    // `java/util/Iterator`.
+    r.register(
+        "java/nio/file/PathMatcher",
+        "matches",
+        "(Ljava/nio/file/Path;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some(
+                            "Cannot invoke \"java.nio.file.Path.toString()\" \
+                             because \"path\" is null"
+                                .into(),
+                        ),
+                    }
+                    .into())
+                }
+            };
+            let pattern = match ctx.get_field(this, P57_MATCHER_PATTERN_FIELD) {
+                Value::Object(Some(p)) => p,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "PathMatcher carries no compiled Pattern".into(),
+                    }
+                    .into())
+                }
+            };
+            // `pattern.matcher(path.toString()).matches()` — the WHOLE
+            // normalized path string, fully anchored (`Matcher.matches`, plus
+            // the `^`/`$` the glob translation adds). There is no basename-only
+            // mode; `Files.newDirectoryStream(dir, glob)` gets basename
+            // semantics by passing `entry.getFileName()`, not by anything here.
+            let pat_pin = ctx.pin_native_root(pattern);
+            let s = ctx.invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?;
+            let pattern = ctx.read_native_pin(pat_pin, pattern);
+            let s = match s {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => Value::Object(None),
+            };
+            let matcher = ctx.invoke(
+                "java/util/regex/Pattern",
+                "matcher",
+                "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+                &[Value::Object(Some(pattern)), s],
+            );
+            ctx.unpin_native_roots(pat_pin);
+            let matcher = match matcher? {
+                Some(Value::Object(Some(m))) => m,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let verdict = ctx.invoke(
+                "java/util/regex/Matcher",
+                "matches",
+                "()Z",
+                &[Value::Object(Some(matcher))],
+            )?;
+            Ok(Some(Value::Int(match verdict {
+                Some(Value::Int(v)) => i32::from(v != 0),
+                _ => 0,
+            })))
         },
     );
 
@@ -11900,6 +12073,296 @@ pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> R
 /// collections), and the holder's real `<clinit>` never runs because
 /// `FileSystems.getDefault()` is intercepted. Falls back to a fresh
 /// allocation only if the holder class is unavailable.
+// ---------------------------------------------------------------------------
+// FileSystem.getPathMatcher / PathMatcher.matches — the glob and regex syntaxes
+// ---------------------------------------------------------------------------
+
+/// Field 0 of the one-field synthetic `java/nio/file/PathMatcher`: the compiled
+/// `java.util.regex.Pattern`.
+pub(crate) const P57_MATCHER_PATTERN_FIELD: usize = 0;
+
+/// `Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE` = 2 | 64 = 66, the flag
+/// word `sun.nio.fs.WindowsFileSystem.getPathMatcher` compiles with — for the
+/// `regex:` syntax as well as `glob:`. MEASURED on HotSpot 25.0.3+9 (Windows):
+/// `regex:A.TXT` matches `a.txt` and `regex:(?-i)A\.TXT` does not, which is
+/// only possible if the flag is on the compiled Pattern; `regex:Ä` matching
+/// `ä` is the `UNICODE_CASE` half.
+const P57_MATCHER_FLAGS: i32 = 0x02 | 0x40;
+
+/// `sun.nio.fs.Globs.globMetaChars`, verbatim.
+const P57_GLOB_META: &str = "\\*?[{";
+
+/// `sun.nio.fs.Globs.regexMetaChars`, verbatim. Note what is ABSENT and must
+/// stay absent: `*`, `?`, `-`, `}`, `,`, `&`, `:`, `/`, `\` — each is either
+/// handled by its own case below or is not a regex metacharacter outside a
+/// character class. Adding any of them would escape a character HotSpot leaves
+/// bare and change the compiled pattern.
+const P57_REGEX_META: &str = ".^$+{[]|()";
+
+#[inline]
+fn p57_is_glob_meta(c: u16) -> bool {
+    c < 0x80 && P57_GLOB_META.as_bytes().contains(&(c as u8))
+}
+
+#[inline]
+fn p57_is_regex_meta(c: u16) -> bool {
+    c < 0x80 && P57_REGEX_META.as_bytes().contains(&(c as u8))
+}
+
+/// `sun.nio.fs.Globs.next(glob, i)`: the unit at `i`, or `EOL` (0) past the end.
+#[inline]
+fn p57_glob_next(g: &[u16], i: usize) -> u16 {
+    if i < g.len() {
+        g[i]
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn p57_push_ascii(out: &mut Vec<u16>, s: &str) {
+    out.extend(s.as_bytes().iter().map(|b| u16::from(*b)));
+}
+
+/// `sun.nio.fs.Globs.toRegexPattern(globPattern, isDos)`, ported statement for
+/// statement from the JDK 25.0.3+9 source (`lib/src.zip`,
+/// `java.base/sun/nio/fs/Globs.java`).
+///
+/// `Err((desc, index))` is the argument pair of the `PatternSyntaxException`
+/// the JDK raises; [`p57_throw_pattern_syntax`] turns it into the real Java
+/// object so `getMessage()` — which appends `" near index N"`, the pattern and
+/// a caret line, using the platform line separator — is composed by the JDK
+/// itself rather than reproduced here.
+///
+/// Operates on UTF-16 code units, not `char`s, so every index in an error
+/// message is the same index `String.charAt` would have produced. The six
+/// refusals, all MEASURED on HotSpot and all with their quoting exactly as
+/// written (two of them carry an unbalanced apostrophe, which is not a typo
+/// here): `No character to escape`, `Explicit 'name separator' in class`,
+/// `Missing ']`, `Invalid range`, `Cannot nest groups`, `Missing '}`.
+///
+/// The Windows branch (`is_dos`) is the one this VM takes. Its consequences,
+/// each MEASURED: `*` is `[^\\]*` and `?` is `[^\\]`, so neither crosses a
+/// separator; `**` is `.*` and does; a `/` in the PATTERN is the separator
+/// while a lone `\` is the ESCAPE character (so the glob `sub\a.txt` matches
+/// the file name `suba.txt`, not a directory — the single likeliest place a
+/// port goes wrong); and a class is emitted as `[[^\\]&&[...]]`, an
+/// intersection that excludes the separator, which is why the Java regex engine
+/// has to do the matching and a Rust regex crate cannot.
+fn p57_globs_to_regex(glob: &[u16], is_dos: bool) -> Result<Vec<u16>, (&'static str, usize)> {
+    let mut in_group = false;
+    let mut regex: Vec<u16> = Vec::with_capacity(glob.len() * 2 + 2);
+    p57_push_ascii(&mut regex, "^");
+
+    let mut i = 0usize;
+    while i < glob.len() {
+        let c = glob[i];
+        i += 1;
+        // Non-ASCII cannot be any of the cases below; 0xFF is a sentinel that
+        // falls through to the default arm, which reads `c` and not this.
+        let cb = if c < 0x80 { c as u8 } else { 0xFF };
+        match cb {
+            b'\\' => {
+                if i == glob.len() {
+                    return Err(("No character to escape", i - 1));
+                }
+                let next = glob[i];
+                i += 1;
+                if p57_is_glob_meta(next) || p57_is_regex_meta(next) {
+                    p57_push_ascii(&mut regex, "\\");
+                }
+                regex.push(next);
+            }
+            b'/' => {
+                if is_dos {
+                    p57_push_ascii(&mut regex, "\\\\");
+                } else {
+                    regex.push(c);
+                }
+            }
+            b'[' => {
+                // Do not match the name separator inside a class.
+                if is_dos {
+                    p57_push_ascii(&mut regex, "[[^\\\\]&&[");
+                } else {
+                    p57_push_ascii(&mut regex, "[[^/]&&[");
+                }
+                if p57_glob_next(glob, i) == u16::from(b'^') {
+                    // `^` is a LITERAL in a glob class, never negation — it is
+                    // escaped through. `[!…]` is the negation form.
+                    p57_push_ascii(&mut regex, "\\^");
+                    i += 1;
+                } else {
+                    if p57_glob_next(glob, i) == u16::from(b'!') {
+                        p57_push_ascii(&mut regex, "^");
+                        i += 1;
+                    }
+                    // A hyphen is allowed at the start.
+                    if p57_glob_next(glob, i) == u16::from(b'-') {
+                        p57_push_ascii(&mut regex, "-");
+                        i += 1;
+                    }
+                }
+                let mut has_range_start = false;
+                let mut last: u16 = 0;
+                // Seeded with `[` exactly as the JDK's `c` is: an EMPTY class
+                // body leaves it unchanged and the `!= ']'` test below then
+                // reports `Missing '] near index 0` for the glob `[`.
+                let mut cc = c;
+                while i < glob.len() {
+                    cc = glob[i];
+                    i += 1;
+                    if cc == u16::from(b']') {
+                        break;
+                    }
+                    if cc == u16::from(b'/') || (is_dos && cc == u16::from(b'\\')) {
+                        return Err(("Explicit 'name separator' in class", i - 1));
+                    }
+                    // Escape `\`, `[` or `&&` for the regex class.
+                    if cc == u16::from(b'\\')
+                        || cc == u16::from(b'[')
+                        || (cc == u16::from(b'&') && p57_glob_next(glob, i) == u16::from(b'&'))
+                    {
+                        p57_push_ascii(&mut regex, "\\");
+                    }
+                    regex.push(cc);
+
+                    if cc == u16::from(b'-') {
+                        if !has_range_start {
+                            return Err(("Invalid range", i - 1));
+                        }
+                        cc = p57_glob_next(glob, i);
+                        i += 1;
+                        if cc == 0 || cc == u16::from(b']') {
+                            break;
+                        }
+                        if cc < last {
+                            return Err(("Invalid range", i.saturating_sub(3)));
+                        }
+                        regex.push(cc);
+                        has_range_start = false;
+                    } else {
+                        has_range_start = true;
+                        last = cc;
+                    }
+                }
+                if cc != u16::from(b']') {
+                    return Err(("Missing ']", i - 1));
+                }
+                p57_push_ascii(&mut regex, "]]");
+            }
+            b'{' => {
+                if in_group {
+                    return Err(("Cannot nest groups", i - 1));
+                }
+                p57_push_ascii(&mut regex, "(?:(?:");
+                in_group = true;
+            }
+            b'}' => {
+                if in_group {
+                    p57_push_ascii(&mut regex, "))");
+                    in_group = false;
+                } else {
+                    // `}` is not in `regexMetaChars`, so a stray one is a plain
+                    // literal: the glob `a}b` matches the file name `a}b`.
+                    regex.push(c);
+                }
+            }
+            b',' => {
+                if in_group {
+                    p57_push_ascii(&mut regex, ")|(?:");
+                } else {
+                    regex.push(c);
+                }
+            }
+            b'*' => {
+                if p57_glob_next(glob, i) == u16::from(b'*') {
+                    // Crosses directory boundaries.
+                    p57_push_ascii(&mut regex, ".*");
+                    i += 1;
+                } else if is_dos {
+                    p57_push_ascii(&mut regex, "[^\\\\]*");
+                } else {
+                    p57_push_ascii(&mut regex, "[^/]*");
+                }
+            }
+            b'?' => {
+                if is_dos {
+                    p57_push_ascii(&mut regex, "[^\\\\]");
+                } else {
+                    p57_push_ascii(&mut regex, "[^/]");
+                }
+            }
+            _ => {
+                if p57_is_regex_meta(c) {
+                    p57_push_ascii(&mut regex, "\\");
+                }
+                regex.push(c);
+            }
+        }
+    }
+
+    if in_group {
+        return Err(("Missing '}", i - 1));
+    }
+    p57_push_ascii(&mut regex, "$");
+    Ok(regex)
+}
+
+/// The `java.util.regex.PatternSyntaxException` the glob translator refuses
+/// with, built through its real `(String desc, String regex, int index)`
+/// constructor so `getMessage()` is composed by the JDK.
+///
+/// Reproducing that message here would be a transcription with three moving
+/// parts (the `" near index N"` suffix, the platform line separator — CRLF on
+/// this host — and a caret line that is OMITTED when `index == pattern
+/// .length()`); letting the real class compose it removes all three.
+fn p57_throw_pattern_syntax(
+    ctx: &mut dyn NativeContext,
+    desc: &str,
+    pattern: &str,
+    index: usize,
+) -> MethodCallFailed {
+    let d = ctx.create_string(desc);
+    // `create_string` allocates and can move the first string.
+    let d_pin = ctx.pin_native_root(d);
+    let p = ctx.create_string(pattern);
+    let d = ctx.read_native_pin(d_pin, d);
+    let built = ctx.new_object_initialized(
+        "java/util/regex/PatternSyntaxException",
+        "(Ljava/lang/String;Ljava/lang/String;I)V",
+        &[
+            Value::Object(Some(d)),
+            Value::Object(Some(p)),
+            Value::Int(index as i32),
+        ],
+    );
+    ctx.unpin_native_roots(d_pin);
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException {
+            message: format!("{desc} near index {index}"),
+        }
+        .into(),
+    }
+}
+
+/// `throw new IllegalArgumentException()` — the BARE one
+/// `FileSystem.getPathMatcher` raises when the argument carries no syntax
+/// prefix. Its `getMessage()` is **null**, which
+/// `RuntimeError::IllegalArgumentException { message: String }` cannot express,
+/// so the object is built directly. MEASURED: HotSpot reports a null message
+/// for `"*.txt"`, `""`, `":"` and `":glob"` alike.
+fn p57_bare_illegal_argument(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object_initialized("java/lang/IllegalArgumentException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException {
+            message: String::new(),
+        }
+        .into(),
+    }
+}
+
 pub(crate) fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     const HOLDER: &str = "java/nio/file/FileSystems$DefaultFileSystemHolder";
     // `class_id_by_name` is lookup-only and nothing else loads the private
@@ -21175,4 +21638,137 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
     ()
+}
+
+#[cfg(test)]
+mod g22_glob_translation_tests {
+    use super::{p57_globs_to_regex, P57_MATCHER_FLAGS};
+
+    /// Translate a Windows-branch glob, or panic with the refusal.
+    fn dos(glob: &str) -> String {
+        let units: Vec<u16> = glob.encode_utf16().collect();
+        match p57_globs_to_regex(&units, true) {
+            Ok(u) => String::from_utf16_lossy(&u),
+            Err(e) => panic!("unexpected refusal for {glob:?}: {e:?}"),
+        }
+    }
+
+    /// The refusal `(desc, index)` for a glob that must not translate.
+    fn dos_err(glob: &str) -> (&'static str, usize) {
+        let units: Vec<u16> = glob.encode_utf16().collect();
+        match p57_globs_to_regex(&units, true) {
+            Ok(u) => panic!(
+                "{glob:?} translated to {:?} but HotSpot refuses it",
+                String::from_utf16_lossy(&u)
+            ),
+            Err(e) => e,
+        }
+    }
+
+    /// Every expectation here is the regex the JDK's own `Globs
+    /// .toWindowsRegexPattern` produces, cross-checked against the MEASURED
+    /// match/no-match answers of HotSpot 25.0.3+9 on Windows (G22-1 §Glob).
+    #[test]
+    fn windows_translation_matches_the_jdk() {
+        // `*` and `?` stop at the separator; `**` crosses it.
+        assert_eq!(dos("*.txt"), r"^[^\]*\.txt$");
+        assert_eq!(dos("a?c"), r"^a[^\]c$");
+        assert_eq!(dos("**.txt"), r"^.*\.txt$");
+        assert_eq!(dos("**/*.txt"), r"^.*\[^\]*\.txt$");
+        assert_eq!(dos("src/**"), r"^src\.*$");
+        // A `/` in the PATTERN is the separator; a lone `\` is the ESCAPE, so
+        // `sub\a.txt` is the file name `suba.txt` and matches no directory.
+        assert_eq!(dos("sub/a.txt"), r"^sub\a\.txt$");
+        assert_eq!(dos(r"sub\a.txt"), r"^suba\.txt$");
+        assert_eq!(dos(r"sub\a.txt"), r"^sub\a\.txt$");
+        // Alternation, and a stray `}` / `,` outside a group is a literal.
+        assert_eq!(dos("*.{java,class}"), r"^[^\]*\.(?:(?:java)|(?:class))$");
+        assert_eq!(dos("a}b"), "^a}b$");
+        assert_eq!(dos("a,b"), "^a,b$");
+        // Classes: `!` negates, `^` is a LITERAL, a leading `-` is literal.
+        assert_eq!(dos("[abc].txt"), r"^[[^\]&&[abc]]\.txt$");
+        assert_eq!(dos("[!a-z].txt"), r"^[[^\]&&[^a-z]]\.txt$");
+        assert_eq!(dos("[^abc].txt"), r"^[[^\]&&[\^abc]]\.txt$");
+        assert_eq!(dos("[a-]"), r"^[[^\]&&[a-]]$");
+        assert_eq!(dos("[-a]"), r"^[[^\]&&[-a]]$");
+        // `regexMetaChars` is escaped, and nothing outside it is.
+        assert_eq!(dos("a+b"), r"^a\+b$");
+        assert_eq!(dos("a-b"), "^a-b$");
+        assert_eq!(dos("a&b"), "^a&b$");
+        assert_eq!(dos("a(b)c"), r"^a\(b\)c$");
+        // Escaping a non-meta is a no-op; escaping a meta emits it literally.
+        assert_eq!(dos(r"\a"), "^a$");
+        assert_eq!(dos(r"\*.txt"), r"^\*\.txt$");
+        // The empty glob is legal and matches only the empty path.
+        assert_eq!(dos(""), "^$");
+        // `&&` inside a class is escaped so it is not regex-class
+        // intersection; `[` inside a class is escaped too.
+        assert_eq!(dos("[a&&b]"), r"^[[^\\]&&[a\&&b]]$");
+        assert_eq!(dos("[[]"), r"^[[^\\]&&[\[]]$");
+        // A doubled `/` becomes two literal separators — a pattern no path
+        // `Paths.get` produces can ever match, because the parser collapses
+        // separator runs. Faithful, not useful.
+        assert_eq!(dos("a//b"), r"^a\\\\b$");
+        // An empty alternative and an empty group are both legal.
+        assert_eq!(dos("{a,}"), "^(?:(?:a)|(?:))$");
+        assert_eq!(dos("{}"), "^(?:(?:))$");
+        // `***` is `**` followed by `*`, not a third wildcard.
+        assert_eq!(dos("***.txt"), r"^.*[^\\]*\.txt$");
+        assert_eq!(dos("a**b"), "^a.*b$");
+        assert_eq!(dos("C:/**"), r"^C:\\.*$");
+        // A `]` as the first class member closes the class; the next one is a
+        // literal handled by the DEFAULT arm, which escapes it.
+        assert_eq!(dos("[!]"), r"^[[^\\]&&[^]]$");
+        assert_eq!(dos("[]]"), r"^[[^\\]&&[]]\]$");
+    }
+
+    /// The Unix branch differs in exactly the four separator sites.
+    #[test]
+    fn unix_branch_uses_the_forward_slash() {
+        let unix = |g: &str| {
+            let units: Vec<u16> = g.encode_utf16().collect();
+            String::from_utf16_lossy(&p57_globs_to_regex(&units, false).unwrap())
+        };
+        assert_eq!(unix("*.txt"), r"^[^/]*\.txt$");
+        assert_eq!(unix("a?c"), "^a[^/]c$");
+        assert_eq!(unix("a/b"), "^a/b$");
+        assert_eq!(unix("[abc]"), "^[[^/]&&[abc]]$");
+    }
+
+    /// The six refusals `Globs` raises, with the exact `desc` and the exact
+    /// index HotSpot reports. The unbalanced apostrophes in `Missing ']` and
+    /// `Missing '}` are the JDK's, transcribed — not typos.
+    #[test]
+    fn the_six_refusals_carry_the_jdk_text_and_index() {
+        assert_eq!(dos_err(r"abc\"), ("No character to escape", 3));
+        assert_eq!(dos_err(r"\"), ("No character to escape", 0));
+        assert_eq!(dos_err("[/]"), ("Explicit 'name separator' in class", 1));
+        assert_eq!(dos_err("[a/b]"), ("Explicit 'name separator' in class", 2));
+        assert_eq!(dos_err(r"[a\b]"), ("Explicit 'name separator' in class", 2));
+        assert_eq!(dos_err("[abc"), ("Missing ']", 3));
+        assert_eq!(dos_err("["), ("Missing ']", 0));
+        assert_eq!(dos_err("[z-a]"), ("Invalid range", 1));
+        assert_eq!(dos_err("[a-c-e]"), ("Invalid range", 4));
+        assert_eq!(dos_err("{a,{b,c}}.txt"), ("Cannot nest groups", 3));
+        assert_eq!(dos_err("{a,b"), ("Missing '}", 3));
+        assert_eq!(dos_err("{"), ("Missing '}", 0));
+    }
+
+    /// `glob:[]` and `glob:{a}{b}` are NOT refused by `Globs` — the first is
+    /// refused later, by `Pattern.compile`, and the second is legal. Getting
+    /// this wrong would move an exception between two different classes.
+    #[test]
+    fn globs_defers_two_cases_to_the_regex_engine() {
+        // `[]` translates; `Pattern.compile` then reports
+        // "Unclosed character class near index 12" over THIS string.
+        assert_eq!(dos("[]"), r"^[[^\]&&[]]$");
+        // Sequential groups are legal; only NESTING is banned.
+        assert_eq!(dos("{a}{b}"), "^(?:(?:a))(?:(?:b))$");
+    }
+
+    /// `Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE`.
+    #[test]
+    fn matcher_flags_are_case_insensitive_plus_unicode_case() {
+        assert_eq!(P57_MATCHER_FLAGS, 66);
+    }
 }
