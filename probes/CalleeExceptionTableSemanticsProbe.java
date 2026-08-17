@@ -6,34 +6,35 @@
  * (`CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH`). The ban exists because the inline
  * MIC/PIC cascade in `jit/src/x64.rs` CALLs the cached entry directly, with no
  * Rust frame in between to notice the callee's `i64::MIN` trap sentinel and
- * route it through the callee's own handler. If that is still true, every arm
- * below returns the WRONG value with the ban lifted, so this probe is red on a
- * broken build rather than merely slower.
+ * route it through the callee's own handler.
  *
- * Run it BOTH ways on one binary, and against HotSpot, which is the oracle:
+ *   java     CalleeExceptionTableSemanticsProbe                       -- the oracle
+ *   cratonvm CalleeExceptionTableSemanticsProbe                       -- bar kept
+ *   CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1 cratonvm ...                 -- bar lifted
+ *   CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1 CRATONVM_JIT_SP_IC_DEOPT_CHECK=0 cratonvm ...
  *
- *   java                                        CalleeExceptionTableSemanticsProbe
- *   cratonvm ...                                CalleeExceptionTableSemanticsProbe
- *   CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1 cratonvm ... CalleeExceptionTableSemanticsProbe
- *
- * Every arm is reached through an INTERFACE call on a single implementation,
- * which is the shape that populates the monomorphic inline cache; a statically
- * bound call would be direct-bound at compile time and never exercise it. The
- * warm-up loop runs the NON-throwing input so the site is compiled, cached and
- * published before the throwing input arrives — the cache must already hold the
- * callee when the exception happens, or the arm silently tests the cold path.
+ * The last line is the RED PROOF and is the reason this probe is shaped the way
+ * it is. `SP_IC_DEOPT_CHECK=0` deletes `emit_inline_callee_deopt_check` -- the
+ * one instruction sequence that lets a raw machine-code CALL notice the callee
+ * trapped -- so with the bar lifted it removes exactly the mechanism this probe
+ * exists to test, and the probe MUST fail. A first version of this probe put the
+ * throwing call AFTER the warm-up loop instead of inside it; that call ran from
+ * an interpreted frame, so all four arms passed and the probe proved nothing.
+ * Every throwing call below therefore happens INSIDE the hot loop, at the same
+ * call site the warm-up published the cache for.
  */
 public final class CalleeExceptionTableSemanticsProbe {
 
     interface Op { int apply(int i); }
 
-    static int sideEffects;
+    static int bodyRuns;
+    static int BAD;
 
     /** Implicit AIOOBE, caught by the callee's own table. */
     static final class Bounds implements Op {
         static final int[] A = { 10, 11, 12, 13 };
         @Override public int apply(int i) {
-            sideEffects++;                    // exactly ONE per call, thrown or not
+            bodyRuns++;
             try { return A[i]; }
             catch (ArrayIndexOutOfBoundsException e) { return -1; }
         }
@@ -43,7 +44,7 @@ public final class CalleeExceptionTableSemanticsProbe {
     static final class Nulls implements Op {
         static int[] live = { 5 };
         @Override public int apply(int i) {
-            sideEffects++;
+            bodyRuns++;
             int[] a = (i < 0) ? null : live;
             try { return a[0]; }
             catch (NullPointerException e) { return -2; }
@@ -53,7 +54,7 @@ public final class CalleeExceptionTableSemanticsProbe {
     /** Implicit ArithmeticException, caught by the callee's own table. */
     static final class Div implements Op {
         @Override public int apply(int i) {
-            sideEffects++;
+            bodyRuns++;
             try { return 100 / i; }
             catch (ArithmeticException e) { return -3; }
         }
@@ -62,7 +63,7 @@ public final class CalleeExceptionTableSemanticsProbe {
     /** An explicit athrow caught locally. */
     static final class Thrown implements Op {
         @Override public int apply(int i) {
-            sideEffects++;
+            bodyRuns++;
             try {
                 if (i < 0) { throw new IllegalStateException("x"); }
                 return i;
@@ -71,14 +72,14 @@ public final class CalleeExceptionTableSemanticsProbe {
     }
 
     /**
-     * The callee declares a table that does NOT cover the exception it throws.
-     * It must propagate to the CALLER's handler, not be swallowed here and not
-     * be mis-attributed to the caller's own deopt.
+     * The callee declares a table that does NOT cover what it throws, so the
+     * exception must reach the CALLER's handler -- not be swallowed, and not be
+     * mis-attributed to the caller's own deopt.
      */
     static final class Uncovered implements Op {
         static final int[] A = { 1 };
         @Override public int apply(int i) {
-            sideEffects++;
+            bodyRuns++;
             try { return A[i]; }
             catch (NullPointerException e) { return -5; }   // never matches AIOOBE
         }
@@ -89,7 +90,7 @@ public final class CalleeExceptionTableSemanticsProbe {
         static int finallyRuns;
         static final int[] A = { 1 };
         @Override public int apply(int i) {
-            sideEffects++;
+            bodyRuns++;
             try { return A[i]; }
             catch (ArrayIndexOutOfBoundsException e) { return -6; }
             finally { finallyRuns++; }
@@ -105,63 +106,96 @@ public final class CalleeExceptionTableSemanticsProbe {
     }
 
     /**
-     * Warm `op` on `goodInput` until the site compiles and its inline cache
-     * publishes, then run `badInput` once and report the result and how many
-     * times the callee body actually ran.
+     * One in every four calls throws inside the callee. The loop, the call site
+     * and the cache are the same on every iteration, so once the caller is
+     * compiled the throwing iterations go through the published inline cache.
      */
-    static long[] warmThenThrow(Op op, int goodInput, int badInput, int warm) {
+    static long driveCaught(Op op, int n) {
         long acc = 0;
-        for (int i = 0; i < warm; i++) { acc += op.apply(goodInput); }
-        sideEffects = 0;
-        int r = op.apply(badInput);
-        return new long[] { r, sideEffects, acc };
+        for (int i = 0; i < n; i++) { acc += op.apply((i & 3) == 3 ? BAD : (i & 3)); }
+        return acc;
+    }
+
+    /** The uncovered arm: the caller catches, inside the same hot loop. */
+    static long driveUncovered(Op op, int n) {
+        long acc = 0;
+        for (int i = 0; i < n; i++) {
+            try { acc += op.apply((i & 3) == 3 ? 7 : 0); }
+            catch (ArrayIndexOutOfBoundsException e) { acc += 1000; }
+        }
+        return acc;
+    }
+
+    /**
+     * `perRound` is the value one round of `n` iterations must accumulate to;
+     * it is a fixed function of the callee's Java semantics, so a VM that
+     * swallows, duplicates or mis-routes even one exception cannot match it.
+     * Both the smallest and the largest round are checked, so one bad round
+     * among many cannot average away.
+     */
+    static void arm(String name, Op op, int bad, int n, int rounds, long perRound) {
+        BAD = bad;
+        long worstAcc = Long.MIN_VALUE, bestAcc = Long.MAX_VALUE;
+        long worstRuns = Long.MIN_VALUE, bestRuns = Long.MAX_VALUE;
+        for (int r = 0; r < rounds; r++) {
+            bodyRuns = 0;
+            long acc = driveCaught(op, n);
+            worstAcc = Math.max(worstAcc, acc); bestAcc = Math.min(bestAcc, acc);
+            worstRuns = Math.max(worstRuns, bodyRuns); bestRuns = Math.min(bestRuns, bodyRuns);
+        }
+        check(name + ": min round accumulator", bestAcc, perRound);
+        check(name + ": max round accumulator", worstAcc, perRound);
+        check(name + ": min round body runs", bestRuns, n);
+        check(name + ": max round body runs", worstRuns, n);
     }
 
     public static void main(String[] args) {
-        int warm = args.length > 0 ? Integer.parseInt(args[0]) : 200_000;
+        int n      = args.length > 0 ? Integer.parseInt(args[0]) : 200_000;
+        int rounds = args.length > 1 ? Integer.parseInt(args[1]) : 12;
+        n = (n / 4) * 4;
+        int q = n / 4;
 
-        long[] b = warmThenThrow(new Bounds(), 1, 99, warm);
-        check("Bounds: callee catch returns -1", b[0], -1);
-        check("Bounds: callee body ran exactly once", b[1], 1);
+        // 10 + 11 + 12 + (-1) per group of four.
+        arm("Bounds", new Bounds(), 99, n, rounds, (long) q * (10 + 11 + 12 - 1));
+        // 5 + 5 + 5 + (-2); indices 0,1,2 are all >= 0 so all read live[0].
+        arm("Nulls", new Nulls(), -1, n, rounds, (long) q * (5 + 5 + 5 - 2));
+        // i&3==0 divides by zero too: -3 + 100 + 50 + (-3) with BAD == 0.
+        arm("Div", new Div(), 0, n, rounds, (long) q * (-3 + 100 + 50 - 3));
+        // 0 + 1 + 2 + (-4)
+        arm("Thrown", new Thrown(), -1, n, rounds, (long) q * (0 + 1 + 2 - 4));
 
-        long[] n = warmThenThrow(new Nulls(), 1, -1, warm);
-        check("Nulls: callee catch returns -2", n[0], -2);
-        check("Nulls: callee body ran exactly once", n[1], 1);
-
-        long[] d = warmThenThrow(new Div(), 5, 0, warm);
-        check("Div: callee catch returns -3", d[0], -3);
-        check("Div: callee body ran exactly once", d[1], 1);
-
-        long[] t = warmThenThrow(new Thrown(), 3, -1, warm);
-        check("Thrown: callee catch returns -4", t[0], -4);
-        check("Thrown: callee body ran exactly once", t[1], 1);
-
-        // Uncovered: the caller must see the AIOOBE.
+        // Uncovered: 1 + 1 + 1 + 1000 per group of four, the 1000 proving the
+        // CALLER's catch is what ran.
         Op u = new Uncovered();
-        long uacc = 0;
-        for (int i = 0; i < warm; i++) { uacc += u.apply(0); }
-        sideEffects = 0;
-        int caught = 0;
-        try { u.apply(7); }
-        catch (ArrayIndexOutOfBoundsException e) { caught = 1; }
-        catch (Throwable e) { caught = -100; }
-        check("Uncovered: propagates AIOOBE to caller", caught, 1);
-        check("Uncovered: callee body ran exactly once", sideEffects, 1);
+        long uBest = Long.MAX_VALUE, uWorst = Long.MIN_VALUE;
+        long uRunsBest = Long.MAX_VALUE, uRunsWorst = Long.MIN_VALUE;
+        for (int r = 0; r < rounds; r++) {
+            bodyRuns = 0;
+            long acc = driveUncovered(u, n);
+            uBest = Math.min(uBest, acc); uWorst = Math.max(uWorst, acc);
+            uRunsBest = Math.min(uRunsBest, bodyRuns); uRunsWorst = Math.max(uRunsWorst, bodyRuns);
+        }
+        check("Uncovered: min round accumulator", uBest, (long) q * (1 + 1 + 1 + 1000));
+        check("Uncovered: max round accumulator", uWorst, (long) q * (1 + 1 + 1 + 1000));
+        check("Uncovered: min round body runs", uRunsBest, n);
+        check("Uncovered: max round body runs", uRunsWorst, n);
 
+        // Finally: 1 + 1 + 1 + (-6), and the finally block runs on every call.
         Op f = new Finally();
-        long facc = 0;
-        for (int i = 0; i < warm; i++) { facc += f.apply(0); }
-        Finally.finallyRuns = 0;
-        sideEffects = 0;
-        int fr = f.apply(9);
-        check("Finally: callee catch returns -6", fr, -6);
-        check("Finally: finally ran exactly once", Finally.finallyRuns, 1);
-        check("Finally: callee body ran exactly once", sideEffects, 1);
-
-        // The warm loops must have produced the ordinary (non-throwing) values,
-        // or the arms above measured a body that was never really exercised.
-        check("warm accumulators non-degenerate", (uacc == warm && facc == warm) ? 1 : 0, 1);
-        check("Bounds warm accumulator", b[2], 11L * warm);
+        BAD = 9;
+        long fBest = Long.MAX_VALUE, fWorst = Long.MIN_VALUE;
+        long finBest = Long.MAX_VALUE, finWorst = Long.MIN_VALUE;
+        for (int r = 0; r < rounds; r++) {
+            bodyRuns = 0; Finally.finallyRuns = 0;
+            long acc = driveCaught(f, n);
+            fBest = Math.min(fBest, acc); fWorst = Math.max(fWorst, acc);
+            finBest = Math.min(finBest, Finally.finallyRuns);
+            finWorst = Math.max(finWorst, Finally.finallyRuns);
+        }
+        check("Finally: min round accumulator", fBest, (long) q * (1 + 1 + 1 - 6));
+        check("Finally: max round accumulator", fWorst, (long) q * (1 + 1 + 1 - 6));
+        check("Finally: min round finally runs", finBest, n);
+        check("Finally: max round finally runs", finWorst, n);
 
         System.out.println(fails == 0 ? "PROBE PASS" : ("PROBE FAIL fails=" + fails));
         if (fails != 0) { System.exit(1); }
