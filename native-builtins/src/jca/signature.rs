@@ -164,11 +164,14 @@ fn sig_payload_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigK
 /// `PSSParameterSpec`s installed via `Signature.setParameter`, same
 /// `(vm_identity, identity_hash)` key discipline as the tables above and the
 /// same reason: plain Rust data, GC-stable key, no heap refs to scan.
-fn sig_pss_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, PssParams>> {
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — both sites (`get_sig_pss` and
+/// `setParameter`) compute `sig_key(ctx, ..)` first and then do one
+/// `get(..).copied()` / `insert(..)` under a temporary guard.
+fn sig_pss_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, PssParams>>> =
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>>> =
         OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn get_sig_pss(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PssParams> {
@@ -183,13 +186,15 @@ fn get_sig_pss(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PssParams
 /// every operation on this `Signature` is forwarded to the application's own
 /// `SignatureSpi` object (slot `SIG_OFF_SPIOBJ`) rather than to the native
 /// dispatch tables — the whole point of the application having registered it.
-fn sig_user_spi_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, (String, String)>>
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — same shape and the same
+/// key-before-guard discipline as [`sig_pss_table`].
+fn sig_user_spi_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, (String, String)>>
 {
     use std::sync::OnceLock;
     static T: OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, (String, String)>>,
+        cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, (String, String)>>,
     > = OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn get_sig_user_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(String, String)> {

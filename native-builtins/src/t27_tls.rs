@@ -373,11 +373,14 @@ fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<u64, Metho
 ///
 /// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
 #[allow(clippy::type_complexity)]
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — one acquisition site
+/// (`ctx_client_session_store`), an `entry(key).or_insert_with(..)` whose
+/// closure builds a rustls store and touches no `ctx`.
 fn ctx_client_session_store_table(
-) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>> {
-    static T: OnceLock<Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>>> =
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>>> =
         OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Built `ClientConfig`s, keyed by `(SSLContext key, engine shape)`.
@@ -398,9 +401,12 @@ fn ctx_client_session_store_table(
 ///
 /// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
 #[allow(clippy::type_complexity)]
-fn ctx_client_config_table() -> &'static Mutex<HashMap<(u64, String), Arc<ClientConfig>>> {
-    static T: OnceLock<Mutex<HashMap<(u64, String), Arc<ClientConfig>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two acquisition sites, both
+/// temporary guards over an already-built key: a `.get(..).cloned()` inside an
+/// `and_then` closure and an `entry(..).or_insert(config).clone()`.
+fn ctx_client_config_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn ctx_client_session_store(key: u64) -> Arc<dyn rustls::client::ClientSessionStore> {
@@ -478,12 +484,14 @@ impl rustls::client::ClientSessionStore for TracingClientSessionStore {
 }
 
 #[allow(clippy::type_complexity)]
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — the server twin of
+/// `ctx_client_session_store_table`, same single `or_insert_with` site.
 fn ctx_server_session_store_table(
-) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
     static T: OnceLock<
-        Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
     > = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn ctx_server_session_store(
@@ -642,9 +650,11 @@ pub(crate) fn attach_trust_managers_to_ctx(
 ///
 /// Absent = `true`: no application manager is installed, so JSSE's own default
 /// (which this VM stands in for) is the one that identifies.
-fn ctx_jsse_identifies_table() -> &'static Mutex<HashMap<u64, bool>> {
-    static T: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — three sites, all one-statement
+/// `remove` / `insert` / `.get(&key).copied()` over a key built beforehand.
+fn ctx_jsse_identifies_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn ctx_jsse_identifies(ctx_key: Option<u64>) -> bool {
@@ -10972,9 +10982,15 @@ fn peek_server_hello_session_id(buf: &[u8]) -> Option<Vec<u8>> {
 /// Holds a live `ObjectRef`, so it is scanned and remapped by
 /// `gc_scan_tls_ctx_trust_manager_roots` / `gc_update_tls_ctx_trust_manager_refs`
 /// alongside this module's other object-holding tables.
-fn engine_alpn_selector_table() -> &'static Mutex<HashMap<u64, ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<u64, ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Seven sites: four one-statement
+/// `get`/`insert`/`remove`s, the `defer_for_alpn` test (whose key is now
+/// hoisted out of the lock expression — see there), and the GC scan/remap pair,
+/// which `drop` each guard before taking the next. The GC scan runs with the
+/// heap lock (L8) held, which is legal: L0 < L8 is the descending order the
+/// wrapper asserts.
+fn engine_alpn_selector_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Run the installed server-side ALPN selector against the ClientHello sitting
@@ -11826,9 +11842,12 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 /// `gc_scan_tls_ctx_trust_manager_roots` /
 /// `gc_update_tls_ctx_trust_manager_refs` alongside this module's other
 /// object-holding tables.
-fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<(u64, bool), ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Five sites: an `if let` whose body
+/// is a bare `return`, two one-statement `insert`s, and the GC scan/remap pair
+/// (each `drop`s its guard before the next table's).
+fn engine_session_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), ObjectRef>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The client-side session cache: `(SSLContext key, host, port)` → the
@@ -11852,9 +11871,13 @@ fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
 /// Holds live `ObjectRef`s → scanned and remapped alongside
 /// `engine_session_table` (see `gc_scan_tls_ctx_trust_manager_roots`).
 #[allow(clippy::type_complexity)]
-fn client_session_cache() -> &'static Mutex<HashMap<(u64, String, i32), ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<(u64, String, i32), ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), after the resumed-session read in
+/// `engine_session_for` was bound to a local so its guard drops before the body
+/// (see there). The remaining sites are a `contains_key` inside a debug
+/// `eprintln!`, a one-statement `insert`, and the GC scan/remap pair.
+fn client_session_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The cache key for a client engine, or `None` when this engine has no
@@ -11877,9 +11900,12 @@ fn client_session_cache_key(id: i32) -> Option<(u64, String, i32)> {
 /// like `session_wire_id_table` beside it; absent means "never reused", and
 /// `getLastAccessedTime` then answers the creation time, which is what JSSE
 /// reports for a session used exactly once.
-fn session_last_accessed_table() -> &'static Mutex<HashMap<u64, i64>> {
-    static T: OnceLock<Mutex<HashMap<u64, i64>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, both with the key
+/// computed before the guard: `touch_session_access_time`'s `insert`, and a
+/// `get(..).copied()` whose `if let` body is a bare `return`.
+fn session_last_accessed_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn touch_session_access_time(ctx: &mut dyn NativeContext, ses: ObjectRef) {
@@ -11911,9 +11937,11 @@ fn engine_handshake_was_resumed(id: i32) -> bool {
 /// `javax/net/ssl/SSLSession` is a real interface with no fields of its own to
 /// widen into). Keyed by `gc_stable_objref_key` — the same GC-stable identity
 /// `getId` already derives its bytes from.
-fn negotiated_session_keys() -> &'static Mutex<std::collections::HashSet<u64>> {
-    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, a `contains` and an
+/// `insert`, each a single statement over a key built beforehand.
+fn negotiated_session_keys() -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashSet::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Has this session object been through a completed handshake? See
@@ -11959,7 +11987,13 @@ fn engine_session_for(
             );
         }
         if engine_handshake_was_resumed(id) {
-            if let Some(prev) = client_session_cache().lock().get(ck).copied() {
+            // Bound to a local first: as an `if let` scrutinee (edition 2021)
+            // the guard would live for the whole body, which takes
+            // `engine_session_table` and re-enters the VM through
+            // `touch_session_access_time`. `ObjectRef` is `Copy`, so the read
+            // is complete once the guard drops.
+            let prev = client_session_cache().lock().get(ck).copied();
+            if let Some(prev) = prev {
                 engine_session_table().lock().insert(key, prev);
                 touch_session_access_time(ctx, prev);
                 return Ok(prev);
@@ -12033,9 +12067,11 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     if proto == "TLSv1.2" {
         let sid = with_engine(id, |s| s.negotiated_session_id.clone()).unwrap_or_default();
         if !sid.is_empty() {
-            session_wire_id_table()
-                .lock()
-                .insert(gc_stable_objref_key(ctx, ses), sid);
+            // Key computed before the guard: `gc_stable_objref_key` calls
+            // `ctx.identity_hash_code`, and this table's `LockLevel` claims it
+            // is never held across a re-entry into the VM.
+            let wire_key = gc_stable_objref_key(ctx, ses);
+            session_wire_id_table().lock().insert(wire_key, sid);
         }
     }
     // Associate the peer (client) cert chain with this session object so
@@ -12433,10 +12469,12 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         // `engine_apply_alpn_selector`), which is also when a server engine has
         // anything to do — JSSE's server-side `beginHandshake()` cannot produce
         // a byte before it has seen the hello either.
+        // `engine_objref_key` calls `ctx.identity_hash_code`; computing it
+        // BEFORE the guard keeps `engine_alpn_selector_table` off the
+        // re-entrant path, which is what its `LockLevel` claims.
+        let alpn_key = engine_objref_key(ctx, this);
         let defer_for_alpn = with_engine(id, |s| !s.is_client && s.conn.is_none()).unwrap_or(false)
-            && engine_alpn_selector_table()
-                .lock()
-                .contains_key(&engine_objref_key(ctx, this));
+            && engine_alpn_selector_table().lock().contains_key(&alpn_key);
         if defer_for_alpn {
             with_engine(id, |s| {
                 s.alpn_selection_deferred = true;
@@ -14496,9 +14534,13 @@ pub(crate) fn set_engine_trust_ctx_key(
 /// configured with a matcher that refuses every name still completed the
 /// handshake — netty's `SniClientTest.testSniSNIMatcherDoesNotMatchClient`
 /// asserts an `SSLException` and got `AssertionError: expected SSLException`.
-fn engine_sni_matchers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
-    static T: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Five sites: a `remove`, a
+/// remove-or-insert whose guard covers only that choice, a
+/// `match ..get(..).cloned()` that ends before the `ctx.create_string` below
+/// it, and the GC scan/remap pair.
+fn engine_sni_matchers_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
@@ -14842,9 +14884,11 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
 /// The real TLS session id (ServerHello `legacy_session_id`) for a session
 /// object, keyed by `gc_stable_objref_key` like the other session side-tables.
 /// Populated for TLS 1.2 sessions only — see [`peek_server_hello_session_id`].
-fn session_wire_id_table() -> &'static Mutex<HashMap<u64, Vec<u8>>> {
-    static T: OnceLock<Mutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, both of which now
+/// compute their `gc_stable_objref_key` before taking the guard (see there).
+fn session_wire_id_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
@@ -15066,10 +15110,9 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         // per-object pseudo-id can never satisfy it. (Under TLS 1.3 nothing is
         // recorded here and the pseudo-id below stands, which is what the same
         // test's `assertFalse(Arrays.equals(...))` branch wants.)
-        let wire_id = session_wire_id_table()
-            .lock()
-            .get(&gc_stable_objref_key(ctx, this))
-            .cloned();
+        // Key before the guard — see the store site.
+        let wire_key = gc_stable_objref_key(ctx, this);
+        let wire_id = session_wire_id_table().lock().get(&wire_key).cloned();
         if let Some(id) = wire_id {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, id.len());
             for (i, b) in id.iter().enumerate() {

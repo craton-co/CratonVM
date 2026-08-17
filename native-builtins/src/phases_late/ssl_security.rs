@@ -2279,10 +2279,13 @@ pub(crate) fn kmf_keystore_id_by_identity(
 /// two independent id spaces sharing one integer slot is the exact shape that
 /// produced the `KEY_VALUES_MISMATCH` family this page's section A was about —
 /// right only while the two counters happened to be aligned.
-fn kmf_live_km_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
-    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites: a one-statement
+/// `insert` at `init` time, and the `getKeyManagers` read, now bound in a block
+/// so its guard drops before the arm that walks the object through `ctx`.
+fn kmf_live_km_id_by_identity() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>> {
+    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>>> =
         std::sync::OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// FIX (tomcat-clientauth-engine-config): same pattern as
@@ -5476,7 +5479,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
                 crate::x509_manager::set_km_id(ctx, km, km_id);
                 km
-            } else if let Some(km_id) = kmf_live_km_id_by_identity().lock().get(&ih).copied() {
+            } else if let Some(km_id) = {
+                // Bound in a block so the guard drops before the arm's body,
+                // which reads fields through `ctx` — a re-entry into the VM
+                // this table's `LockLevel` promises never happens under it.
+                let live = kmf_live_km_id_by_identity().lock().get(&ih).copied();
+                live
+            } {
                 // A caller's own `KeyStore`, already enumerated at `init` time.
                 // Same mirror class and the same `km_registry` id space as the
                 // branch above, so `getCertificateChain`/`getPrivateKey` are the
