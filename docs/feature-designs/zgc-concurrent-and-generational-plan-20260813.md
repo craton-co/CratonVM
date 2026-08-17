@@ -699,13 +699,124 @@ a young cycle retained without tracing. §3b has the measurement.
   defining trade, not a defect.
 * **A whole-heap sweep on every cycle, including young ones.** See G2.
 
-### G2 — promotion, and a real young space — **NOT BUILT, and re-scoped**
+### G2a — a nursery FLOOR, so a young sweep is O(young) — **BUILT 2026-08-17**
+
+§3b's finding was that the split works and the pause does not move, because
+`sweep` was 182 ms of a 309 ms mean and **walks every registered object whatever
+the split says**. The split decides how much a young cycle *traces*; it says
+nothing about how much it *sweeps*.
+
+**A sweep can only be bounded by address.** The registry is a bitmap over the
+arena indexed from its base, so a lower bound on the address is a lower bound on
+the word index — the scan simply starts later. Everything allocated since the
+last whole-heap collection lies at or above that collection's final cursor, so
+`[gen_young_floor, cursor)` is a nursery in the ordinary bump-allocator sense and
+a young cycle sweeps only that. A whole-heap cycle publishes the floor and the
+old live-byte total; a young cycle sweeps above the floor and adds the total back.
+
+Four things have to hold together, and each alone is satisfiable by something
+broken:
+
+| must hold | what it is satisfiable by otherwise |
+|---|---|
+| the sweep really skips | a floor stuck at 0 makes `for_each_base_from(0, ..)` the unbounded loop and **every test still passes** — that is the state §3b measured. `gen_sweep_skipped` is the engagement counter, and the test was verified by disabling the floor and watching it go red |
+| young garbage above the floor is still reclaimed | a sweep that skips everything is fast and useless |
+| `allocated` still reports the WHOLE live set | the sweep counts only what it visited, so uncorrected the heap reads as nearly empty after every young cycle and the trigger stops firing until an allocation fails. `gen_old_live_bytes` is carried forward; `objects_copied` is deliberately NOT corrected, because it means "survivors this cycle examined" |
+| `conc_bits_known_clear` goes FALSE | objects below the floor keep the mark bit the pre-mark pass set, so the next mark start must not skip its clearing walk — that would hand the sweep a mark set carrying a previous cycle's bits |
+
+**The cost, and it is asserted rather than assumed.** The free list hands out
+space *below* the floor, so an object allocated into a hole left by an earlier
+sweep is inside the old region and a young cycle will not reclaim it until a
+major. That is over-retention, never unsoundness — the test pins **both** halves,
+that it survives the minor and that the major gets it, which is the difference
+between a bounded cost and a leak. Removing it is what needs a real young space,
+i.e. G2 below.
+
+A slide drops the floor and arms `gen_force_major_next`: after a relocation an
+address no longer says which generation an object is in, and re-deriving the
+boundary would be guesswork. A floor left *above* the cursor by a tail retraction
+recovers the same way, and there is a test for it — otherwise it stalls collection
+until an allocation fails, which presents as a slow leak rather than as a bug.
+
+#### It is NOT yet measured against §3b, and here is why not
+
+The re-run was attempted on 2026-08-17 and the host was at **load 25–35 on 8
+cores** for its whole duration (other sessions building and running suites).
+§3b's table was taken on an idle box, so the two are not comparable and no pause
+figure from that run is quoted here. This tree has a standing rule about exactly
+this: a shared host's load invalidates a timing comparison, and one
+un-interleaved run in §2b already said "free" and was noise.
+
+**What IS load-independent, and what to check first on the re-run:** the
+engagement counters. `swept=A/B` on each `[GC] zgc-real:` line and
+`sweep_skipped` on `[GC] zgc-nursery:` are counts, not timings. `A == B`, or
+`sweep_skipped=0` with `young_cycles>0`, means the floor never moved and the whole
+change is inert — and that is the state §3b was in for the split itself, so it is
+the first thing to read, before any pause number.
+
+The comparison to make, once the box is quiet: the same probe and arguments as
+§3b (800k retained, 600 rounds of 30k churn, `-Xmx1200m`, arms interleaved), and
+the number to watch is `sweep` in `[GC] zgc-pause:` — 182 ms of a 309 ms mean
+before, and O(young) is only worth having if that falls.
+
+### G2c — the nursery is where allocation GOES — **BUILT 2026-08-17**
+
+G2a had to document a cost: `Arena::alloc` serves the free list before the bump
+cursor, so an object placed in a hole below the floor is in the old region and no
+young cycle reclaims it — it waits for a major.
+
+That default is right for a non-generational heap and the comment in `alloc` says
+why: after a sweep that could not move survivors, hole reuse is the only thing
+keeping the arena from ratcheting. It is wrong for a nursery, so ZGC now asks the
+arena for **bump-first** (`Arena::set_prefer_bump`) whenever generational mode is
+on, and for nobody else.
+
+**It cannot cause an `OutOfMemoryError`, and that is the property that made it
+shippable.** It skips only the free-list *fast* path; `alloc`'s post-bump retry
+searches both tiers in full and then coalesces and searches again, so once the
+bump tail is exhausted every hole in the arena is still reachable. Turning it on
+can change *which space* serves an allocation, never *whether* one succeeds — and
+on a non-compacting heap the layout policy is the OOM policy, so that had to be
+argued rather than assumed. `Arena::free_list_after_bump` counts the
+fall-throughs, so "the nursery is leaking into the old region because the bump
+tail is exhausted" is a number rather than an inference.
+
+The holes below the floor are recovered by the compacting slide — which is
+default-on, and is also what promotes the nursery's survivors out (G2b). The three
+pieces close on each other: **G2a** bounds the sweep, **G2b** empties the nursery,
+**G2c** fills it.
+
+Both directions are tested, because the ON assertion alone would be satisfied by
+an allocator that happened not to reuse holes: the same fixture with the mode OFF
+must put objects back in the swept holes.
+
+### G2 — what is still missing, and it is smaller than it was
+
+With G2a/b/c in, the young generation is a real address range that allocation
+fills, a bounded sweep reclaims, and a slide promotes out of. What a
+`ZPageAllocator`-based young space would still add:
+
+* **Reclaim with no sweep at all.** A young cycle still walks the nursery's
+  registered objects. A page-based young space frees a whole page by resetting a
+  cursor, so the survivors' cost is the copy and the garbage costs nothing.
+* **A bounded nursery.** Today the nursery is "everything above the floor", so it
+  grows until the next collection. A sized young space is what makes the young
+  cycle's cost predictable rather than proportional to the gap between
+  collections.
+* **Per-page `ZObjectStarts`**, without which `is_object_address` stops being
+  O(1) once the registry is per page.
+
+None of it is blocked on the JIT load barrier (stage (a) landed 2026-08-13), and
+none of it is needed for correctness — it is throughput and predictability. Treat
+the allocator swap as its own change with its own measurement, as this section has
+said from the start.
 
 This item said promotion needs `ZPageAllocator` because "a logical grid cannot
-separate young from old in address space". That is true and it is no longer the
-blocker it was described as, because **G1 does not separate them in address
-space at all** — it separates them by header age, and a non-moving mark-sweep
-collector does not need young and old to be contiguous.
+separate young from old in address space". That is true and it stopped being the
+blocker it was described as twice over: **G1 does not separate them in address
+space at all** — it separates them by header age — and **G2a/b/c now do separate
+them in address space**, using the arena's own cursor rather than a page
+allocator.
 
 What is still missing, and what it would buy:
 
@@ -716,11 +827,12 @@ What is still missing, and what it would buy:
   `sweep_us` — 30–52% of the concurrent pause and the pause floor (§2c) — and it
   is the only one, because a sweep over a flat registry is O(all objects)
   whatever the generation split says.
-* **A young-only sweep.** G1's sweep still walks every registered object,
-  including every old one it has just pre-marked. The pre-mark makes that walk
-  cheap (a flag set, no field enumeration) but it is still O(registry), so a
-  young cycle's *sweep* cost does not fall with the generation split even though
-  its *mark* cost does.
+* ~~**A young-only sweep.**~~ **Done by G2a above, partially.** The sweep is now
+  bounded below by the nursery floor, so it is O(young) for everything the bump
+  cursor served. What a real young space adds is the *other* half: an object the
+  free list placed below the floor is still swept only by a major, and a page-based
+  young space has no free list below anything — it reclaims by resetting a cursor,
+  so there is no sweep at all.
 
 Those two are the same project and it does need the page allocator. Sequence it
 after C5, and treat the allocator swap as its own change with its own
@@ -745,9 +857,58 @@ rather than from "replace `Arena`":
    or `is_object_address` stops being O(1).
 
 Steps 1, 2 and 5 are the allocator swap; 3 and 4 are the generational part and
-cannot be done first. Step 3's dependency on the JIT load barrier is the real
-critical path, and it is a separate design
-([`zgc-jit-load-barrier.md`](zgc-jit-load-barrier.md)).
+cannot be done first.
+
+**CORRECTED 2026-08-17: step 3 is NOT gated on the JIT load barrier.** This
+paragraph said its dependency on that barrier was "the real critical path", and
+the source says otherwise: **stage (a) of
+[`zgc-jit-load-barrier.md`](zgc-jit-load-barrier.md) landed on 2026-08-13.**
+`zgc_codegen_honours_read_barrier()` returns `true`,
+`zgc_read_barrier_blocks_inline_fields()` routes every compact-field access
+through the barriered helpers when a cycle arms the barrier, and
+`zgc_relocation_permitted` therefore permits relocation with the JIT enabled.
+Relocation has been moving objects under the JIT since then — the 2026-08-17
+Phase G run recorded it.
+
+And promotion needs no more than relocation does: it happens at a **safepoint**
+and the collector rewrites every slot itself, so it inherits both of
+`relocate_stw`'s protections (the permitted-configuration gate, and its own
+refusal while a JIT frame is on a stack). A load barrier is what **concurrent**
+relocation needs. The lesson is the tree's own: re-derive a stated blocker from
+the source before pricing work around it — this one had been closed for four
+days.
+
+### G2b — the slide IS the promotion — **BUILT 2026-08-17**
+
+With that blocker gone, the first increment of G2 turned out to be a **deletion
+plus two stores**, because the machinery was already there.
+
+`compact_low_to` packs survivors from the first selected page upward and drops
+the cursor to the end of the compacted region, so after a slide **every live
+object is below the cursor** — the ones on unselected dense pages never moved and
+are below it too. G2a's floor was being *thrown away* at that point, on the
+reasoning that a slide rewrites the low region so an address no longer says which
+generation an object is in. That was backwards: a slide rewrites the low region
+into exactly the shape a nursery wants.
+
+So the floor is now re-established at the post-slide cursor. Three consequences:
+
+* **it is promotion by copy** — survivors are moved out of the young region and
+  the nursery is left EMPTY, which is G2's defining behaviour;
+* **it carries no floating garbage**, because the registry at that point holds
+  live objects only (the sweep pruned the dead a few statements earlier), so
+  declaring everything below the cursor old retains nothing unreachable. That is
+  strictly better than G2a's floor, which inherited whatever the free list had
+  placed below it;
+* **a relocating cycle no longer forces a whole-heap cycle behind it.** It used
+  to arm `gen_force_major_next`, which meant the split was off every other
+  collection whenever relocation was on — i.e. by default.
+
+`gen_promotions_by_slide` is the engagement counter: `compaction_cycles > 0`
+with that at zero is the old behaviour exactly. The test asserts the counter, that
+**no** live base sits at or above the floor, and that the force-major latch stays
+clear — and it was checked for the vacuous case, that the selector really does
+move in its fixture rather than declining and passing through the early return.
 
 ---
 
@@ -907,7 +1068,15 @@ frees live old objects.
    object. A filter works because the question is per *object* and almost no
    object is a `Reference`. The serial marker paid all three too, uncontended,
    which is why they are kept even though they did not close the item.
-2. **G2 — a real young space.** Promoted by §3b from "the answer to `sweep_us`"
+2. **G2 — a real young space.** **G2a and G2b landed** — the nursery floor makes a
+   young sweep O(young) (§3's G2a), and the slide now promotes its survivors into
+   the old region and leaves the nursery empty (§3's G2b), which is promotion by
+   copy. Neither needed the page allocator, and **neither needed the JIT load
+   barrier — stage (a) of that landed 2026-08-13**, which this plan had wrong.
+   What is left is young-space *allocation*: today the nursery is wherever the bump
+   cursor happens to be, so an object the free list places below the floor still
+   waits for a major, and the young region is not reclaimed by a cursor reset but
+   by a bounded sweep. Promoted by §3b from "the answer to `sweep_us`"
    to **the thing that makes Phase G worth having at all**: with the split
    engaged and 4.8M objects skipped per young cycle, the pause did not move,
    because `sweep` is 182 ms of a 309 ms mean pause and is O(registry) whatever

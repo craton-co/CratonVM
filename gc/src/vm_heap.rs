@@ -971,6 +971,16 @@ impl VmHeap {
     // =====================================================================
 
     pub fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        // `CRATONVM_DBG_VACATED_FRAMES`: is the RECEIVER of this read an
+        // address the collector moved an object away from?
+        //
+        // This is the consumption point neither the stack-push nor the
+        // frame-local detector can see, and the one the H2 residual's surviving
+        // witnesses point at: a stale receiver makes every field read off it
+        // return whatever now occupies that memory — a perfectly VALID object
+        // of the wrong class, which is why the value being pushed looks clean
+        // and the `checkcast` one instruction later does not.
+        crate::gc_quiescence::report_vacated_receiver(obj.as_ptr() as usize, "get_field");
         dispatch!(self, get_field(obj, index))
     }
 
@@ -2543,6 +2553,14 @@ impl VmHeap {
                  remembered_roots={remembered} promotions={promoted} \
                  recards_after_relocation={recards}",
                 h.generational_enabled(),
+            );
+            // THE NURSERY, beside the split it bounds. `sweep_skipped` is the
+            // engagement counter: a run with `young_cycles>0` and
+            // `sweep_skipped=0` swept the whole registry on every young cycle, so
+            // the floor never moved and the O(young) sweep is not happening.
+            let (skipped, floor, old_live) = h.nursery_stats();
+            eprintln!(
+                "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
             );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it

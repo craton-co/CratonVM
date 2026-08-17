@@ -115,6 +115,62 @@ at ~260 ns is the same story with fewer rungs.
 **A single-byte `put` already costs ~260-280 ns** — one native call, one stored
 byte. That per-call floor, multiplied by the rung count above, is the finding.
 
+## Two of the four rungs are FIXED (2026-08-17); the class is still over
+
+`Preconditions.checkIndex` and `Reference.reachabilityFence` are now bound to
+thin `*_DIRECT_FN` helpers (`jit_preconditions_check_index_direct`,
+`jit_reachability_fence_direct`) instead of going through the generic native
+funnel. Measured on `probes/HotNativeRungRate.java`, same host, HotSpot 25 for
+scale:
+
+| rung | HotSpot | before | after | ratio |
+|---|---|---|---|---|
+| `Objects.checkIndex` (-> `Preconditions.checkIndex`) | 0.27 ns | 352.41 ns | **19.70 ns** | **18x** |
+| `Reference.reachabilityFence` | 0.28 ns | 360.64 ns | **18.88 ns** | **19x** |
+| both in one loop | 0.34 ns | 1748.61 ns | **45.55 ns** | **38x** |
+
+The invocation census confirms it is the bind and not the timing:
+`Preconditions.checkIndex` 4 000 000 -> **1 174** invocations,
+`Reference.reachabilityFence` 3 200 000 -> **163 090**.
+
+**THREE doors, and only the third one mattered for the fence.** Wiring the
+single-pass ladder and the IR path left the counter at
+`Preconditions.checkIndex=2 Reference.reachabilityFence=0` while the fence's
+cost sat unchanged at 142 ns. `checkIndex` had landed anyway because it is
+reached through `Objects.checkIndex`, a JDK method the method-entry door
+compiles, so the bind happened inside the callee; `reachabilityFence` has no
+such intermediary and a hot loop calls it directly — and a hot loop's body is
+compiled by the **OSR door** in
+`vm/src/runtime/interpreter/jit_bridge.rs::compile_osr_artifact`, which runs its
+own callee-binding loop rather than `jit::try_compile`'s ladder. Only after
+wiring that third door did the fence move 142 -> 18.88 ns.
+`CRATONVM_DBG=jit-method-stats` now prints
+`JIT thin direct-helper binds: ...` unconditionally, including at zero, so this
+is a counter question rather than a timing question.
+
+**End to end, this did not retire the page.** Interleaved, two rounds,
+`NettyZipBombPhases gzip 32`: compress 21389/15653 ms before against
+18508/16580 ms after — inside the noise. `ByteBuffer` accessors improved
+roughly 1.5-2.4x (direct `putLong` ~1400 -> ~1000 ns, heap `put(byte)` ~283 ->
+~114 ns), which is what removing 2 rungs of ~6 predicts, and not enough.
+
+**The census head has moved, and names the remaining work:**
+
+| invocations (800 000 ops) | native |
+|---:|---|
+| 2 400 000 | `java/nio/DirectByteBuffer.session()Ljdk/internal/foreign/MemorySessionImpl;` |
+| 1 600 000 | `jdk/internal/misc/ScopedMemoryAccess.putLongUnaligned(...)` |
+| 800 000 | `ScopedMemoryAccess.getLongUnaligned` / `putIntUnaligned` |
+| 800 000 | `java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;` |
+
+`session()` is the new number one and is `Ok(Some(Value::Object(None)))` — it
+returns the constant `null` — but it is an **`invokevirtual`**, so it cannot use
+the `invoke_kind == 3` bind these two used; it needs the guarded-virtual direct
+call (`JitDirectCall::guard_class_id`) or a receiver-typed variant.
+`ScopedMemoryAccess.*Unaligned` is the actual store and must stay a native, but
+one native per accessor is the floor, and a thin helper would price it at ~15 ns
+rather than ~160.
+
 ## What was ruled out, with the measurement that ruled it out
 
 * **Per-byte storage re-resolution in `servlet.rs`.** `s2_bb_write8` /

@@ -1,6 +1,24 @@
 # `SearchDomainTest` / `DnsNameResolverTest` — regressed from documented-FIXED state
 
-**Status:** OPEN, REGRESSION (2026-08-13). Found on Windows rerunning netty's
+**Status: CLOSED 2026-08-17** — root cause and fix in
+`fixed-suite-bugs/netty/dns-localhost-bind-family-and-datagramsocket-doors-FIXED-20260817.md`.
+`SearchDomainTest` is 7/7 and `DnsNameResolverTest` 224/232 (HotSpot's exact
+score) on Windows.
+
+This page was right that the regression was real and Windows-only, and right to
+hold that line against a green Linux run. Its live hypothesis — the
+`#[cfg(target_os = "linux")]` epoll refresh in
+`native_dc_bind`/`selector_register` having no Windows equivalent — was wrong,
+and a Windows arm for that (`nudge_blocked_poll`) already existed. The actual
+mechanism is a **resolver disagreement**: `dc_socket_addr` handed the OS the
+hostname `"localhost"` instead of the address the JVM had already resolved, and
+Windows `getaddrinfo` orders `::1` first where glibc orders `127.0.0.1` first.
+That is the whole platform split this page recorded, and it has nothing to do
+with selectors.
+
+Kept for the platform-split discipline it demonstrates, not for its hypothesis.
+
+**Historical status below:** OPEN, REGRESSION (2026-08-13). Found on Windows rerunning netty's
 non-passed list against commit `ae2e1d9c8` (`-XX:+UseZGC`), isolated
 (`--shards 1`, no contention) so this is not a shard-flakiness artifact.
 
