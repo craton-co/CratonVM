@@ -1201,7 +1201,7 @@ pub fn update_all_roots(
         let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
         let after = crate::memory::roots::collect_roots(shared, thread);
         let mut reported = 0usize;
-        for r in &after {
+        for (index, r) in after.iter().enumerate() {
             let a = r.as_ptr() as usize;
             if destinations.contains(&a) {
                 continue;
@@ -1215,6 +1215,10 @@ pub fn update_all_roots(
                         moved_to = format!("{new:#x}"),
                         source = crate::memory::native_roots::root_source_of(a)
                             .unwrap_or("<not-attributed>"),
+                        // Which SECTION of the scan produced it. `root_source_of`
+                        // only covers the uniform native-root registry; this
+                        // covers the other forty.
+                        scan_section = crate::memory::roots::scan_section_of(index),
                         "a ROOT this collection just scanned still names the address it moved                          the object away from — the scan inventory contains a source the remap                          inventory does not."
                     );
                 }
