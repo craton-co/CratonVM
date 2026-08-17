@@ -93,6 +93,120 @@ fn disable_udp_connreset(socket: &std::net::UdpSocket) {
 #[cfg(not(target_os = "windows"))]
 fn disable_udp_connreset(_socket: &std::net::UdpSocket) {}
 
+
+/// Open a **dual-stack** UDP socket: AF_INET6 with `IPV6_V6ONLY` off, so one
+/// socket reaches both address families.
+///
+/// This is what `DatagramChannel.open()` gives you on HotSpot — `Net.socket`
+/// picks `INET6` whenever IPv6 is available and clears `IPV6_V6ONLY` — and the
+/// difference is observable from Java the moment a destination of the other
+/// family shows up. CratonVM's channel was AF_INET, so
+/// `DatagramChannel.send(buf, new InetSocketAddress("::1", p))` failed with
+/// Windows `WSAEAFNOSUPPORT` (os error 10047) / Linux `EAFNOSUPPORT`, where
+/// HotSpot sends the datagram. netty's
+/// `DnsNameResolverTest.testTimeoutNotCached` points its resolver at
+/// `NetUtil.LOCALHOST` — `::1` on a dual-stack host — and asserts a
+/// `DnsNameResolverTimeoutException`; an immediate send failure produced a
+/// plain `DnsNameResolverException` instead, so the assertion read as a
+/// "wrong exception type" defect several layers above the socket.
+///
+/// Falls back to AF_INET when IPv6 is unavailable, which is also what the JDK
+/// does. Callers that bind an EXPLICIT address keep whatever family that
+/// address names — the dual-stack choice only applies to the wildcard, exactly
+/// as in `Net.socket`.
+fn open_udp_dual_stack_socket(port: u16) -> Result<std::net::UdpSocket, io::Error> {
+    let v6 = (|| -> Result<std::net::UdpSocket, io::Error> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_only_v6(false)?;
+        let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+        socket.bind(&addr.into())?;
+        Ok(socket.into())
+    })();
+    match v6 {
+        Ok(socket) => Ok(socket),
+        // No IPv6 stack (or the kernel refuses a dual-stack bind). The v4
+        // wildcard is the JDK's own fallback and every existing caller's
+        // previous behaviour, so this cannot be worse than not trying.
+        Err(_) => std::net::UdpSocket::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            port,
+        ))),
+    }
+}
+
+/// Render a datagram address the way the JDK's Java-visible API does:
+/// a v4-mapped v6 address (`::ffff:a.b.c.d`) becomes plain `a.b.c.d`.
+///
+/// A dual-stack socket reports every IPv4 peer in the mapped form, and
+/// `sun.nio.ch.Net` converts it back before it reaches an `InetAddress` —
+/// HotSpot's `DatagramChannel.receive()` from a `127.0.0.1` sender answers
+/// `/127.0.0.1`, never `/0:0:0:0:0:0:0:1%…` or `/::ffff:127.0.0.1`. Without
+/// this, making the channel dual-stack would have changed every local
+/// round-trip's reported peer address, which is a louder regression than the
+/// bug being fixed.
+///
+/// The unspecified v6 address `::` is NOT mapped — HotSpot reports the v6
+/// wildcard as `/[0:0:0:0:0:0:0:0]` for a dual-stack socket, and collapsing it
+/// to `0.0.0.0` would contradict that.
+pub fn unmap_v4_mapped(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    match addr {
+        std::net::SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => std::net::SocketAddr::from((v4, v6.port())),
+            None => addr,
+        },
+        v4 => v4,
+    }
+}
+
+/// The address to hand `sendto`/`connect` on `socket`, given a target the
+/// caller named.
+///
+/// A dual-stack AF_INET6 socket cannot take a bare `AF_INET` sockaddr: the OS
+/// answers `EAFNOSUPPORT`. The kernel wants the v4-mapped form, and producing
+/// it is the caller's job — `sun.nio.ch.Net.translateToSocketAddress` does
+/// exactly this conversion on the JDK's own send path. Returns the target
+/// unchanged when the families already agree.
+fn target_for_socket(
+    socket: &std::net::UdpSocket,
+    target: std::net::SocketAddr,
+) -> std::net::SocketAddr {
+    match (socket.local_addr(), target) {
+        (Ok(std::net::SocketAddr::V6(_)), std::net::SocketAddr::V4(v4)) => {
+            std::net::SocketAddr::from((v4.ip().to_ipv6_mapped(), v4.port()))
+        }
+        _ => target,
+    }
+}
+
+/// Resolve `target` to a single socket address, applying [`target_for_socket`].
+///
+/// Resolution stays in one place so `udp_send` and `udp_connect` cannot drift
+/// about which candidate they pick when a name yields several.
+fn udp_target_addr(
+    socket: &std::net::UdpSocket,
+    target: &str,
+) -> Result<std::net::SocketAddr, io::Error> {
+    use std::net::ToSocketAddrs;
+    let socket_is_v6 = matches!(socket.local_addr(), Ok(std::net::SocketAddr::V6(_)));
+    let mut candidates = target.to_socket_addrs()?.peekable();
+    // Prefer a candidate of the socket's own family; a dual-stack socket takes
+    // either, and everything else can only use its own.
+    let mut fallback = None;
+    for cand in &mut candidates {
+        if socket_is_v6 || cand.is_ipv4() {
+            return Ok(target_for_socket(socket, cand));
+        }
+        fallback.get_or_insert(cand);
+    }
+    fallback
+        .map(|c| target_for_socket(socket, c))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addr resolved"))
+}
+
 /// Connect to `addr`, trying IPv4 candidate addresses before IPv6.
 ///
 /// `std::net::TcpStream::connect(host:port)` resolves the host and tries each
@@ -1460,6 +1574,27 @@ impl FileDescriptorTable {
     /// before calling — this function deliberately does not enforce that, to
     /// avoid duplicating (and potentially conflicting with) the VM's own
     /// sandbox policy.
+    /// Open a **dual-stack** UDP socket on an ephemeral port, the way
+    /// `DatagramChannel.open()` does on HotSpot. See
+    /// [`open_udp_dual_stack_socket`] for why one family is not enough.
+    ///
+    /// Deliberately separate from [`open_udp`]: `java.net.DatagramSocket` and
+    /// `MulticastSocket` reach that one with an explicit address far more
+    /// often, and a multicast join in particular is family-specific. This
+    /// keeps the change to the caller that measurably needed it.
+    pub fn open_udp_dual_stack(&self) -> Result<FdId, io::Error> {
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let socket = open_udp_dual_stack_socket(0)?;
+        disable_udp_connreset(&socket);
+        self.entries
+            .write()
+            .insert(fd, Arc::new(FileEntry::UdpSocket(socket)));
+        Ok(fd)
+    }
+
     pub fn open_udp(&self, bind_addr: Option<&str>) -> Result<FdId, io::Error> {
         // fds only need to be unique, not contiguous — on overflow we
         // simply fail without rolling the counter back (a `fetch_sub`
@@ -1593,7 +1728,13 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp send"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => sock.send_to(data, target),
+            FileEntry::UdpSocket(sock) => {
+                // Not `sock.send_to(data, target)`: that resolves the string
+                // itself and hands the raw result to the OS, which refuses a
+                // v4 sockaddr on a dual-stack v6 socket. See `udp_target_addr`.
+                let addr = udp_target_addr(sock, target)?;
+                sock.send_to(data, addr)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for udp send",
@@ -1611,7 +1752,10 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp connect"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => sock.connect(target),
+            FileEntry::UdpSocket(sock) => {
+                let addr = udp_target_addr(sock, target)?;
+                sock.connect(addr)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for udp connect",
@@ -1690,7 +1834,7 @@ impl FileDescriptorTable {
                         self.wait_ready_close_aware(fd, raw_handle_of(sock), false, deadline)?;
                 }
                 let (n, addr) = sock.recv_from(buf)?;
-                Ok((n, addr.to_string()))
+                Ok((n, unmap_v4_mapped(addr).to_string()))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1721,7 +1865,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => Ok(sock.local_addr()?.to_string()),
+            FileEntry::UdpSocket(sock) => Ok(unmap_v4_mapped(sock.local_addr()?).to_string()),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -2806,7 +2950,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => s.peer_addr().map(|a| a.to_string()),
+            FileEntry::UdpSocket(s) => s.peer_addr().map(|a| unmap_v4_mapped(a).to_string()),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }

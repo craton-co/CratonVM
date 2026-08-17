@@ -1504,19 +1504,21 @@ pub(super) fn compile_osr_artifact(
                                 }
                             };
                             if accessible {
-                                let num_fields = shared
-                                    .classes
-                                    .class_manager
-                                    .read()
-                                    .get_class(target_id)
-                                    .map(|c| c.num_total_fields)
-                                    .unwrap_or(0);
+                                // The REAL flags, not `(true, true)`. See
+                                // `jit_new_site_flags` for what the literal
+                                // cost: `skip_helper` was unreachable from
+                                // this door, so no OSR-compiled loop could
+                                // ever inline-allocate.
+                                let (num_fields, has_prim_init, has_finalizer) = {
+                                    let cm = shared.classes.class_manager.read();
+                                    jit_new_site_flags(&cm, target_id)
+                                };
                                 new_info2.push((
                                     pc_new,
                                     target_id.as_u32(),
                                     num_fields,
-                                    true,
-                                    true,
+                                    has_prim_init,
+                                    has_finalizer,
                                 ));
                             } else {
                                 // Inaccessible at compile time — defer, so the
@@ -2493,8 +2495,66 @@ pub(super) fn resolve_jit_new_site(
             has_finalizer: true,
         });
     };
+    let _ = target;
+    let (num_fields, has_prim_init, has_finalizer) = jit_new_site_flags(cm, target_id);
+    Some(JitNewSite::Resolved {
+        class_id: target_id.as_u32(),
+        num_fields,
+        has_prim_init,
+        has_finalizer,
+    })
+}
+
+/// `(num_fields, has_prim_init, has_finalizer)` for an already-resolved `new`
+/// target — the three values every compile door has to put in its `new_info`
+/// row, computed once here so the doors cannot disagree about them.
+///
+/// # Why this is not just an extract-method
+///
+/// The two flags decide whether the codegen may take the pure inline-TLAB
+/// path: `bytecode_walk`'s `skip_helper = !has_prim_init && !has_finalizer`,
+/// and only that arm emits an allocation with **no call in it**. Everything
+/// else routes through `jit_post_tlab_init`, or — when `can_inline` is false
+/// outright — through the full `jit_new_object` helper.
+///
+/// [`resolve_jit_new_site`] has computed the real flags since it was written.
+/// The other two doors did not call it: the interpreter's first-call compile
+/// path and `compile_osr_artifact` both pushed a literal
+///
+/// ```text
+/// new_info.push((pc_new, target_id.as_u32(), num_fields, true, true));
+/// ```
+///
+/// under a comment promising "a follow-up should extract the real flags from
+/// class metadata to enable the skip path". So on those two doors — which
+/// includes **every OSR-compiled hot loop** — no `new` site could ever be
+/// inline-allocated, whatever the class actually looked like.
+///
+/// That is what made `CRATONVM_JIT_ENABLE_INLINE_NEW=1` look like a dead
+/// lever. The flag forces `can_inline`, but it does not touch `skip_helper`,
+/// so it swapped a `jit_new_object` call for an inline bump plus a
+/// `jit_post_tlab_init` call and measured flat (5 243 769/s vs 5 277 311/s
+/// in 2026-08-12's table, 108.7 vs 108.6 ns/op when re-taken 2026-08-17).
+/// The `fastthreadlocal-2e9-iteration-throughput-wall` page read that flat
+/// result as "the gating flags are not what this loop is paying for" and
+/// filed the in-tree TODO as measured-and-refuted. The A/B was sound; what it
+/// could not show is that the arm never reached the path being tested.
+///
+/// Conservative in exactly the two places the old code was: an unresolvable
+/// class or an unknown superclass reports `(.., true, true)`, which keeps the
+/// helper call.
+pub(super) fn jit_new_site_flags(
+    cm: &crate::classloading::ClassManager,
+    target_id: ClassId,
+) -> (usize, bool, bool) {
+    let Some(target) = cm.get_class(target_id) else {
+        return (0, true, true);
+    };
     let num_fields = target.num_total_fields;
     let has_finalizer = target.has_finalizer;
+    // Mirrors the hierarchy walk in `crate::jit::helpers::jit_init_primitive_fields`:
+    // only long/float/double need a non-zero `Value` tag, so an int-family
+    // field is already correct in a body the codegen has cleared to zero.
     let mut has_prim_init = false;
     let mut cid = Some(target_id);
     while let Some(current) = cid {
@@ -2511,12 +2571,7 @@ pub(super) fn resolve_jit_new_site(
         }
         cid = c.superclass;
     }
-    Some(JitNewSite::Resolved {
-        class_id: target_id.as_u32(),
-        num_fields,
-        has_prim_init,
-        has_finalizer,
-    })
+    (num_fields, has_prim_init, has_finalizer)
 }
 
 /// Would dispatching `class_name.<init>()V` reach a native, rather than the

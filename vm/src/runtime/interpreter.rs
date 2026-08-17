@@ -2750,18 +2750,25 @@ pub fn execute(
                                         }
                                     };
                                     if accessible {
-                                        let num_fields = shared
-                                            .classes.class_manager
-                                            .read()
-                                            .get_class(target_id)
-                                            .map(|c| c.num_total_fields)
-                                            .unwrap_or(0);
+                                        // The REAL flags — see
+                                        // `jit_bridge::jit_new_site_flags`.
+                                        // The `(true, true)` literal that
+                                        // stood here (with a TODO asking for
+                                        // exactly this) forced every `new`
+                                        // compiled through this door onto the
+                                        // `jit_new_object` helper.
+                                        let (num_fields, has_prim_init, has_finalizer) = {
+                                            let cm = shared.classes.class_manager.read();
+                                            crate::runtime::interpreter::jit_bridge::jit_new_site_flags(
+                                                &cm, target_id,
+                                            )
+                                        };
                                         new_info.push((
                                             pc_new,
                                             target_id.as_u32(),
                                             num_fields,
-                                            true,
-                                            true,
+                                            has_prim_init,
+                                            has_finalizer,
                                         ));
                                     } else {
                                         new_deferred_info

@@ -21601,9 +21601,13 @@ fn native_dc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // DUAL-STACK, matching `sun.nio.ch.Net.socket(family, stream=false)`: with
+    // no `ProtocolFamily` argument the JDK opens AF_INET6 with `IPV6_V6ONLY`
+    // off whenever IPv6 is available. An AF_INET channel here refused every
+    // IPv6 destination with `EAFNOSUPPORT` — see `open_udp_dual_stack_socket`.
     let fd_id = ctx
         .fd_table()
-        .open_udp(None)
+        .open_udp_dual_stack()
         .map_err(|e| RuntimeError::IOException {
             message: format!("DatagramChannel.open: {e}"),
         })?;
