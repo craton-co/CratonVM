@@ -83,12 +83,12 @@ defect and not something HotSpot also struggles with.
 This is not new. It was already measured in detail on 2026-08-12/13 and the
 conclusion has not changed on today's commit:
 
-* [`netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`](../../internal/fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md)
+* `fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`
   first filed these three classes' wall-clock timeouts (no assertion
   failures), noting "All of them **pass when run solo**" — meaning given
   enough wall-clock room, not within the suite's 180 s cap — "the gap is 10×
   broadly and ~90× through `AdaptivePoolingAllocator`."
-* [`internal/performance/netty-per-call-throughput-20260813.md`](../../internal/performance/netty-per-call-throughput-20260813.md)
+* `performance/netty-per-call-throughput-20260813.md`
   (RETIRED, kept as a measurement record) sized it exactly:
   `AdaptiveByteBufAllocatorTest` alone executes **826,764,658** `jit_entries`
   (JIT call-boundary crossings) across its 127 tests, at ~667 ns/entry, for a
@@ -125,7 +125,7 @@ current floor.
 
 This class **does** have current FIXED-tagged coverage:
 
-* [`arraylist-native-overhead-and-view-carrier-FIXED-20260813.md`](../../internal/fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md)
+* `fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md`
   fixed the `ArrayList`-native-call-tax defect behind this class's failure and
   reports it **15/15 at 95–105 s wall** on "a reasonably quiet box" — but adds
   its own explicit warning: *"the fix moves the class from ~1.3x OVER the
@@ -133,7 +133,7 @@ This class **does** have current FIXED-tagged coverage:
   quiet box and does not on a busy one. This host was at load 20-29
   throughout this branch's runs."* At that load it measured **14/15** with a
   `TimeoutException` on `testUniqueLen64Substrings`.
-* [`misc-non-tls-residuals-CLOSED-20260813.md`](../../internal/fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md)
+* `fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md`
   independently confirms the same fix and repeats the identical caveat
   verbatim.
 
@@ -182,8 +182,8 @@ cat /proc/loadavg; ps aux | grep -i cratonvm
 
 ## Related
 
-* [`netty-per-call-throughput-20260813.md`](../../internal/performance/netty-per-call-throughput-20260813.md) — RETIRED, the full per-call-cost measurement behind the three `AdaptiveByteBufAllocator*` classes.
-* [`netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`](../../internal/fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md) — first filed these three classes as wall-clock-only timeouts.
-* [`arraylist-native-overhead-and-view-carrier-FIXED-20260813.md`](../../internal/fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md) and
-  [`misc-non-tls-residuals-CLOSED-20260813.md`](../../internal/fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md) — the `SearchProcessorTest` fix and its quiet-box-only caveat.
+* `performance/netty-per-call-throughput-20260813.md` — RETIRED, the full per-call-cost measurement behind the three `AdaptiveByteBufAllocator*` classes.
+* `fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md` — first filed these three classes as wall-clock-only timeouts.
+* `fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md` and
+  `fixed-suite-bugs/netty/misc-non-tls-residuals-CLOSED-20260813.md` — the `SearchProcessorTest` fix and its quiet-box-only caveat.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md) — sibling case: a different class hitting the same class of VM-wide per-call-cost ceiling.

@@ -2527,6 +2527,23 @@ impl VmHeap {
                  concurrent_phase_ms={}",
                 phase_nanos / 1_000_000
             );
+            // PHASE G. `old_retained` is the one that says whether the phase
+            // did anything: it counts the objects a young cycle kept WITHOUT
+            // tracing, i.e. the tracing it did not do. A run with
+            // `young_cycles>0` and `old_retained=0` did full-heap work under a
+            // generational name -- which is precisely the vacuous green a
+            // "generational is on" claim would otherwise be built on. Printed
+            // unconditionally, so a run that never engaged the phase says so
+            // instead of printing nothing.
+            let (young, since_major, retained, remembered, promoted, recards) =
+                h.generational_stats();
+            eprintln!(
+                "[GC] zgc-generational: enabled={} young_cycles={young} \
+                 minors_since_major={since_major} old_retained={retained} \
+                 remembered_roots={remembered} promotions={promoted} \
+                 recards_after_relocation={recards}",
+                h.generational_enabled(),
+            );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it
             // could not size -- i.e. of heap corruption the collector has
@@ -3722,6 +3739,70 @@ mod concurrent_mark_controller_tests {
         );
 
         z.set_mark_active(false);
+    }
+
+    /// **The card barrier is reached through `VmHeap`, by BOTH store channels.**
+    ///
+    /// # Why through the enum and not through `ZgcRealHeap`
+    ///
+    /// The card barrier's whole history is of being wired to something nothing
+    /// calls. Until 2026-08-17 it hung off `GarbageCollector::write_barrier`,
+    /// which this backend's `set_field` never invokes -- so `remembered_roots`
+    /// had no non-test caller and the remembered set was empty on every real
+    /// workload, while the collector-level tests were green. The tests in
+    /// `zgc.rs` cannot see that: they call the accessor directly. This one goes
+    /// through the dispatch the interpreter goes through.
+    ///
+    /// Both channels, because `set_field_suppress_satb` exists to skip the OTHER
+    /// barrier and must not skip this one: SATB is about a reference being LOST,
+    /// a card is about one now being HELD. A single implementation change
+    /// (routing the suppression channel around `set_field_no_satb`) would break
+    /// exactly one of the two assertions below.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_vm_heap_store_channels_both_reach_the_zgc_card_barrier() {
+        let heap = VmHeap::new(GcBackend::Zgc, 64 * 1024 * 1024);
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        z.set_generational_enabled(true);
+        z.set_gen_promotion_age(1);
+        z.set_relocation_enabled(false);
+
+        let plain = heap.alloc_object(ClassId::new(1), 2);
+        let suppressed = heap.alloc_object(ClassId::new(1), 2);
+        let target = heap.alloc_object(ClassId::new(1), 0);
+
+        // Promote all three, then let a young cycle clean the promotion cards --
+        // otherwise the assertions read a set that is dirty for a reason they
+        // did not cause.
+        let mut roots = [plain, suppressed, target];
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { crate::collector::StopTheWorldToken::new() };
+            let _ = z.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+            let _ = z.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+        }
+        let [plain, suppressed, target] = roots;
+        assert!(
+            !z.is_carded_for_test(plain.as_ptr() as usize)
+                && !z.is_carded_for_test(suppressed.as_ptr() as usize),
+            "the young cycle must have cleaned the promotion cards first"
+        );
+
+        heap.set_field(plain, 0, Value::Object(Some(target)));
+        assert!(
+            z.is_carded_for_test(plain.as_ptr() as usize),
+            "an ordinary store through VmHeap must card its receiver"
+        );
+
+        heap.set_field_suppress_satb(suppressed, 0, Value::Object(Some(target)));
+        assert!(
+            z.is_carded_for_test(suppressed.as_ptr() as usize),
+            "...and so must the SATB-suppressed channel: suppressing the \\
+             snapshot barrier must not suppress the card, or every referent \\
+             write silently drops an old-to-young edge"
+        );
     }
 
     /// Every `zgc_*_concurrent_mark` arm of `VmHeap` reaches the collector.
