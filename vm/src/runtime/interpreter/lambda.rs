@@ -138,12 +138,13 @@ pub(crate) mod lambda_jit {
 
     pub(crate) fn report() {
         eprintln!(
-            "[LAMBDA-JIT] eligible={} compiled_hits={} fast_returns={} declines={} nominations={}",
+            "[LAMBDA-JIT] eligible={} compiled_hits={} fast_returns={} declines={} nominations={} {}",
             ELIGIBLE.load(Ordering::Relaxed),
             COMPILED_HITS.load(Ordering::Relaxed),
             FAST_RETURNS.load(Ordering::Relaxed),
             DECLINES.load(Ordering::Relaxed),
             NOMINATIONS.load(Ordering::Relaxed),
+            super::lambda_site_prof::line(),
         );
     }
 }
@@ -1265,6 +1266,424 @@ pub(super) fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef,
     }
 }
 
+// ---------------------------------------------------------------------------
+// The lambda call site's own cached invoke target
+// ---------------------------------------------------------------------------
+//
+// `jit_invoke_virtual_mic` answers a compiled caller's `invokeinterface`. For
+// an ordinary named class it is entered ONCE per call site: it resolves the
+// receiver's compiled body, stores it in the monomorphic inline cache, and
+// from then on the inline cascade emitted in `jit/src/x64.rs` calls the callee
+// straight from machine code without re-entering Rust at all. Measured on
+// `probes/SamHotLoopProbe.java` with `CRATONVM_DBG=mic-prof`: `mic_calls=1`
+// across 2 200 000 dispatches, 11.7 ns/op.
+//
+// A lambda receiver could never reach that. The lambda arm of that helper sits
+// BEFORE the inline cache and returns from inside it, so the slot is never
+// populated and never probed: `mic_calls=2197000`, `lambda=2197000`,
+// `hit_entry=0`, `miss=0` — one full Rust helper round trip, ~819 cycles, on
+// every single SAM call, 352 ns/op. That is the 30x, and it is not "lambdas
+// are slow": it is one early `return` standing between a SAM call site and the
+// same inline cache every other interface call site gets.
+//
+// The inline cache itself cannot hold a lambda: its cascade calls the cached
+// entry with the caller's own argument registers, and a SAM call's registers
+// are not the impl method's — the proxy receiver has to be dropped and the
+// captured values prepended. So this is the next best thing, and it is what
+// known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md
+// section 4 asks for: a cached invoke target belonging to the CALL SITE, so the
+// second and every later invocation of a given proxy skips `try_lambda_dispatch`
+// — the descriptor clones, the coercion walk, the impl-owner memo lookup, the
+// `full_args` Vec, the JIT-cache probe and the entry guard — and goes
+// receiver-fields to registers to compiled body.
+//
+// Everything that makes a lambda dispatch complicated is decided ONCE, when the
+// site is built. A shape that needs any of it is cached as ineligible and never
+// asked again.
+
+/// A lambda call site whose dispatch has been reduced to "read the captures,
+/// call the compiled impl".
+///
+/// Held per proxy `ClassId` in a thread-local, so reading one costs no lock.
+/// `Rc`, not `Arc`: it never leaves the thread that built it.
+pub(crate) struct LambdaJitSite {
+    /// The SAM this site answers. A functional interface may declare
+    /// same-named default overloads, so a call must match BOTH name and
+    /// descriptor before this site may serve it — the same authority rule
+    /// `try_lambda_dispatch` applies.
+    sam_method_name: Arc<str>,
+    sam_descriptor: Arc<str>,
+    /// Captured values live in proxy object fields `0..num_captures`, in
+    /// impl-parameter order.
+    num_captures: usize,
+    /// `num_captures` + the SAM's parameter count == the impl's arity.
+    total_args: usize,
+    /// The impl method, for the JIT-cache probe and the redefinition gate.
+    cached: Arc<CachedBytecodeMethod>,
+    gate: RedefineGate,
+    /// The compiled impl body, re-probed only when `jit_cache_generation()`
+    /// moves. `None` at the current generation means "not compiled yet" — the
+    /// warmup counter in `try_invoke_cached_lambda_impl` is what eventually
+    /// changes that, which is why that counter and this fast path are one
+    /// feature under one kill switch.
+    code: std::cell::RefCell<Option<cratonvm_jit::RetainedCode>>,
+    code_generation: std::cell::Cell<u64>,
+}
+
+impl LambdaJitSite {
+    /// Does this site answer THIS call? Name and descriptor both, never one.
+    pub(crate) fn serves(&self, method_name: &str, descriptor: &str) -> bool {
+        &*self.sam_method_name == method_name && &*self.sam_descriptor == descriptor
+    }
+
+    pub(crate) fn num_captures(&self) -> usize {
+        self.num_captures
+    }
+
+    pub(crate) fn total_args(&self) -> usize {
+        self.total_args
+    }
+}
+
+/// What the shape analysis concluded about a proxy class.
+enum SiteVerdict {
+    /// Serve this call site directly.
+    Eligible(std::rc::Rc<LambdaJitSite>),
+    /// This SHAPE can never be served here (boxing SAM, instance-method
+    /// reference, handler-bearing body). Remember it; never ask again.
+    Never,
+    /// Not yet — something this needs is not resolved at this moment (the impl
+    /// owner is only memoized after one full dispatch has loaded the class and
+    /// run its `<clinit>`, and the body has to be compiled before there is
+    /// anything to call). Do NOT remember: the answer changes.
+    NotYet,
+}
+
+thread_local! {
+    /// `None` is a NEGATIVE entry — this proxy class was examined and found
+    /// permanently ineligible. Caching the refusal matters as much as caching
+    /// the site: without it, every call of a boxing lambda would redo the whole
+    /// shape analysis and then fall through to the generic path anyway, which
+    /// is strictly worse than not having this fast path at all.
+    static LAMBDA_JIT_SITE_CACHE: std::cell::RefCell<
+        rustc_hash::FxHashMap<(usize, u32), Option<std::rc::Rc<LambdaJitSite>>>,
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// Look up — building on first use — the direct-call site for a lambda proxy.
+///
+/// Returns `None` for any shape this fast path may not serve, or any moment at
+/// which it cannot yet.
+pub(crate) fn lambda_jit_site(
+    shared: &SharedVm,
+    proxy_class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<std::rc::Rc<LambdaJitSite>> {
+    if !crate::runtime::env_cache::jit_lambda_tierup() || crate::runtime::env_cache::disable_jit() {
+        return None;
+    }
+    let key = (shared.vm_identity, proxy_class_id.as_u32());
+    let slot = LAMBDA_JIT_SITE_CACHE.with(|cache| cache.borrow().get(&key).cloned());
+    match slot {
+        Some(Some(site)) if !site.gate.is_stale() => {
+            return site.serves(method_name, descriptor).then_some(site);
+        }
+        // Redefined out from under us — drop it and re-derive.
+        Some(Some(_)) => LAMBDA_JIT_SITE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&key);
+        }),
+        // A remembered refusal.
+        Some(None) => return None,
+        None => {}
+    }
+    match build_lambda_jit_site(shared, proxy_class_id) {
+        SiteVerdict::Eligible(site) => {
+            LAMBDA_JIT_SITE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, Some(std::rc::Rc::clone(&site)));
+            });
+            site.serves(method_name, descriptor).then_some(site)
+        }
+        SiteVerdict::Never => {
+            LAMBDA_JIT_SITE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, None);
+            });
+            None
+        }
+        SiteVerdict::NotYet => None,
+    }
+}
+
+/// The shape analysis, run once per proxy class per thread.
+///
+/// Every `Never` here is a shape whose dispatch is not "read the captures, call
+/// the impl" — a boxing SAM, a generic call site needing the `checkcast` the
+/// synthetic bridge would have performed, an instance-method reference, a body
+/// with its own exception table. Those keep the generic path, unchanged.
+fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerdict {
+    let Some(call_site) = shared
+        .classes
+        .lambda_proxies
+        .read()
+        .get(&proxy_class_id)
+        .cloned()
+    else {
+        return SiteVerdict::Never;
+    };
+
+    // Only a static impl. An InvokeVirtual/InvokeInterface impl takes a
+    // captured receiver as arg 0 and re-dispatches virtually on it; binding one
+    // fixed body here would answer for a receiver whose class decides.
+    if !matches!(call_site.impl_handle.kind, MethodHandleKind::InvokeStatic) {
+        return SiteVerdict::Never;
+    }
+
+    // Coercion must be provably the identity, argument by argument. These three
+    // conditions are exactly what makes `coerce_lambda_args` and `coerce_return`
+    // no-ops (`coerce_arg` returns its input unchanged for equal tokens — see
+    // its own "LOAD-BEARING BEYOND THIS FUNCTION" note) and
+    // `checkcast_lambda_instantiated_args` a no-op (nothing to narrow when the
+    // instantiated descriptor IS the erased one).
+    if call_site.instantiated_descriptor != call_site.sam_descriptor {
+        return SiteVerdict::Never;
+    }
+    let (sam_params, sam_ret) = split_method_descriptor_ref(&call_site.sam_descriptor);
+    let (impl_params, impl_ret) = split_method_descriptor_ref(&call_site.impl_handle.descriptor);
+    if sam_ret != impl_ret {
+        return SiteVerdict::Never;
+    }
+    let num_captures = call_site.capture_types.len();
+    if impl_params.len() != num_captures + sam_params.len() {
+        return SiteVerdict::Never;
+    }
+    for (k, sam_tok) in sam_params.iter().enumerate() {
+        if *sam_tok != impl_params[num_captures + k] {
+            return SiteVerdict::Never;
+        }
+    }
+
+    // A loader-local divergence must dispatch on the exact class the generic
+    // path would choose, not on the global copy this site would bind.
+    if lambda_impl_dispatch_override(shared, &call_site).is_some() {
+        return SiteVerdict::Never;
+    }
+    // The impl's owner is memoized only after a full dispatch has loaded the
+    // class and run its `<clinit>` — so a miss here is `NotYet`, not `Never`.
+    let Some(owner) = lambda_global_impl_owner(shared, &call_site) else {
+        return SiteVerdict::NotYet;
+    };
+
+    let Some((cached, gate)) = build_lambda_impl_cached(
+        shared,
+        owner,
+        &call_site.impl_handle.member_name,
+        &call_site.impl_handle.descriptor,
+    ) else {
+        // A native shadow, an abstract or `synchronized` body, an unresolvable
+        // class: all properties of the shape, none of them transient.
+        return SiteVerdict::Never;
+    };
+    // A handler-bearing callee is never entered by a direct compiled call —
+    // the same gate as every other direct-call site in this VM
+    // (`mic_callee_has_exception_table`, `osr_callee_declares_handlers`).
+    if !cached.exception_table.is_empty() || cached.is_synchronized || !cached.is_static {
+        return SiteVerdict::Never;
+    }
+    SiteVerdict::Eligible(std::rc::Rc::new(LambdaJitSite {
+        sam_method_name: Arc::clone(&call_site.sam_method_name),
+        sam_descriptor: Arc::clone(&call_site.sam_descriptor),
+        num_captures,
+        total_args: impl_params.len(),
+        cached,
+        gate,
+        code: std::cell::RefCell::new(None),
+        code_generation: std::cell::Cell::new(u64::MAX),
+    }))
+}
+
+/// The compiled impl body for this site, or `None` while it is still
+/// interpreted.
+///
+/// Epoch-guarded like every other JIT-cache probe in this VM: the string-keyed
+/// `JitCache::get` — a hash, an `ArcSwap` load and a `memcmp`, together 5.6% of
+/// a lambda-shape profile when it ran per invocation — is skipped entirely
+/// while this site's snapshot of `jit_cache_generation()` is still current.
+pub(crate) fn lambda_jit_site_code(
+    shared: &SharedVm,
+    site: &LambdaJitSite,
+) -> Option<cratonvm_jit::RetainedCode> {
+    let generation = cratonvm_jit::jit_cache_generation();
+    if site.code_generation.get() != generation {
+        let found = shared
+            .jit
+            .jit_cache
+            .read()
+            .get(
+                &site.cached.class_name,
+                &site.cached.method_name,
+                &site.cached.method_descriptor,
+                site.cached.declaring_class_id,
+            )
+            .map(cratonvm_jit::RetainedCode::new);
+        *site.code.borrow_mut() = found;
+        site.code_generation.set(generation);
+    }
+    site.code.borrow().clone()
+}
+
+/// Read this site's captured values out of the proxy object, in
+/// impl-parameter order, as raw JIT-ABI registers.
+///
+/// Captures occupy proxy fields `0..num_captures` — the same layout
+/// `try_lambda_dispatch` reads them from, in the same order the impl declares
+/// them.
+pub(crate) fn lambda_jit_site_capture_args(
+    shared: &SharedVm,
+    site: &LambdaJitSite,
+    proxy: ObjectRef,
+    out: &mut [i64],
+) {
+    for (i, slot) in out.iter_mut().enumerate().take(site.num_captures) {
+        *slot = match shared.mem.heap.get_field(proxy, i) {
+            Value::Int(x) => x as i64, // Cast: JIT ABI -- i64 register convention
+            Value::Long(x) => x,
+            Value::Float(x) => x.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+            Value::Double(x) => x.to_bits() as i64, // Cast: JIT ABI -- double bits to i64
+            Value::Object(Some(obj)) => obj.as_ptr() as i64, // Cast: JIT ABI -- pointer to i64
+            _ => 0,
+        };
+    }
+}
+
+/// Engagement census for the direct call site (`CRATONVM_DBG=lambda-jit`).
+///
+/// Same reason as `lambda_jit`'s counters: a flat A/B on this path cannot tell
+/// "the direct call did not help" from "no direct call ever happened".
+pub(crate) mod lambda_site_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static SITE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SITE_DIRECT: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SITE_NO_CODE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SITE_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(crate) fn bump(counter: &AtomicU64) {
+        if super::lambda_jit::on() {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn line() -> String {
+        format!(
+            "site_calls={} site_direct={} site_no_code={} site_refused={}",
+            SITE_CALLS.load(Ordering::Relaxed),
+            SITE_DIRECT.load(Ordering::Relaxed),
+            SITE_NO_CODE.load(Ordering::Relaxed),
+            SITE_REFUSED.load(Ordering::Relaxed),
+        )
+    }
+}
+
+
+/// Census shims for the JIT-side direct call arm (`crate::jit::helpers`), which
+/// lives outside this module and so cannot touch the counters directly.
+#[inline]
+pub(crate) fn lambda_site_bump_calls() {
+    lambda_site_prof::bump(&lambda_site_prof::SITE_CALLS);
+}
+#[inline]
+pub(crate) fn lambda_site_bump_direct() {
+    lambda_site_prof::bump(&lambda_site_prof::SITE_DIRECT);
+}
+#[inline]
+pub(crate) fn lambda_site_bump_no_code() {
+    lambda_site_prof::bump(&lambda_site_prof::SITE_NO_CODE);
+}
+#[inline]
+pub(crate) fn lambda_site_bump_refused() {
+    lambda_site_prof::bump(&lambda_site_prof::SITE_REFUSED);
+}
+
+/// Build (or re-derive) the `CachedBytecodeMethod` for a lambda implementation
+/// method, with the redefinition gate that decides when it goes stale.
+///
+/// Extracted so the two consumers agree by construction: the interpreted
+/// dispatch cache below, and the compiled call site's own direct-call target
+/// (`build_lambda_jit_site`). Both must refuse the same shapes — a native
+/// shadow, a `synchronized` or abstract body, a class that cannot be resolved
+/// — and a second, hand-copied version of these checks is exactly how one of
+/// them would come to admit a body the other refuses.
+fn build_lambda_impl_cached(
+    shared: &SharedVm,
+    receiver_class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<(Arc<CachedBytecodeMethod>, RedefineGate)> {
+        let cm = shared.classes.class_manager.read();
+        let store = cm.class_store();
+        let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
+            receiver_class_id,
+            method_name,
+            descriptor,
+            store,
+        ) else {
+            return None;
+        };
+        let Some(class) = store.get(declaring_id) else {
+            return None;
+        };
+        // Cached bytecode bypasses native dispatch, which must retain precedence.
+        if shared
+            .natives
+            .native_methods
+            .find(&class.name, method_name, descriptor)
+            .is_some()
+        {
+            return None;
+        }
+        // `synchronized` needs the monitor enter/exit this frame builder does
+        // not do, and `native` has no bytecode to cache. `static` used to be
+        // refused here too, which excluded the single most common lambda
+        // shape in Java: javac compiles a NON-capturing lambda body to a
+        // private *static* synthetic method, so every `() -> ...` that
+        // captures nothing missed this fast path and took the generic
+        // by-name invoke on every single call. Statics are cacheable — the
+        // frame builder is receiver-agnostic (`init_locals_pooled` copies
+        // `args` into locals from slot 0, which is already how both shapes
+        // arrive) — provided the class is initialised, which the caller
+        // guarantees by only reaching here after a full dispatch has run.
+        if method.is_synchronized() || method.is_native() {
+            return None;
+        }
+        let Some(code_attr) = method.code() else {
+            return None;
+        };
+        let is_static = method.is_static();
+        let c = Arc::new(CachedBytecodeMethod {
+            declaring_class_id: declaring_id,
+            class_name: Arc::clone(&class.name),
+            method_name: Arc::from(method_name),
+            method_descriptor: Arc::from(descriptor),
+            source_file: class.source_file.as_deref().map(Arc::from),
+            code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+            exception_table: Arc::from(code_attr.exception_table.as_slice()),
+            max_stack: code_attr.max_stack,
+            max_locals: code_attr.max_locals,
+            num_params: count_method_params(descriptor) as u16,
+            is_synchronized: false,
+            is_static,
+            force_native_cache: std::sync::OnceLock::new(),
+        intercept_shape_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        });
+    let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+    Some((c, gate))
+}
+
 pub(super) fn try_invoke_cached_lambda_impl(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -1294,68 +1713,11 @@ pub(super) fn try_invoke_cached_lambda_impl(
         Some(c) if &*c.method_name == method_name && &*c.method_descriptor == descriptor => c,
         Some(_) => return Ok(None),
         None => {
-            let cm = shared.classes.class_manager.read();
-            let store = cm.class_store();
-            let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
-                receiver_class_id,
-                method_name,
-                descriptor,
-                store,
-            ) else {
+            let Some((c, gate)) =
+                build_lambda_impl_cached(shared, receiver_class_id, method_name, descriptor)
+            else {
                 return Ok(None);
             };
-            let Some(class) = store.get(declaring_id) else {
-                return Ok(None);
-            };
-            // Cached bytecode bypasses native dispatch, which must retain precedence.
-            if shared
-                .natives
-                .native_methods
-                .find(&class.name, method_name, descriptor)
-                .is_some()
-            {
-                return Ok(None);
-            }
-            // `synchronized` needs the monitor enter/exit this frame builder does
-            // not do, and `native` has no bytecode to cache. `static` used to be
-            // refused here too, which excluded the single most common lambda
-            // shape in Java: javac compiles a NON-capturing lambda body to a
-            // private *static* synthetic method, so every `() -> ...` that
-            // captures nothing missed this fast path and took the generic
-            // by-name invoke on every single call. Statics are cacheable — the
-            // frame builder is receiver-agnostic (`init_locals_pooled` copies
-            // `args` into locals from slot 0, which is already how both shapes
-            // arrive) — provided the class is initialised, which the caller
-            // guarantees by only reaching here after a full dispatch has run.
-            if method.is_synchronized() || method.is_native() {
-                return Ok(None);
-            }
-            let Some(code_attr) = method.code() else {
-                return Ok(None);
-            };
-            let is_static = method.is_static();
-            let c = Arc::new(CachedBytecodeMethod {
-                declaring_class_id: declaring_id,
-                class_name: Arc::clone(&class.name),
-                method_name: Arc::from(method_name),
-                method_descriptor: Arc::from(descriptor),
-                source_file: class.source_file.as_deref().map(Arc::from),
-                code: crate::runtime::frame::padded_bytecode(&code_attr.code),
-                exception_table: Arc::from(code_attr.exception_table.as_slice()),
-                max_stack: code_attr.max_stack,
-                max_locals: code_attr.max_locals,
-                num_params: count_method_params(descriptor) as u16,
-                is_synchronized: false,
-                is_static,
-                force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
-                native_callback_cache: std::sync::OnceLock::new(),
-                invoc_key: std::sync::OnceLock::new(),
-                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
-                quickened: std::sync::OnceLock::new(),
-            });
-            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
-            drop(cm);
             LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| {
                 cache.borrow_mut().insert(key, (Arc::clone(&c), gate));
             });

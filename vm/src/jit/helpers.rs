@@ -13346,6 +13346,102 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     }
 }
 
+/// A compiled caller's SAM call, served straight from the lambda call site's
+/// own cached target.
+///
+/// This is the arm that gives a lambda call site what every named-class call
+/// site already had. `jit_invoke_virtual_mic` is entered ONCE per named-class
+/// site — after that the inline cascade in `jit/src/x64.rs` calls the callee
+/// from machine code and never returns to Rust (`mic_calls=1` over 2 200 000
+/// dispatches on `probes/SamHotLoopProbe.java`). A lambda receiver is caught by
+/// the arm above this one, which returns before the inline cache is ever
+/// reached, so its site can never be cached: `mic_calls=2197000`,
+/// `hit_entry=0`, ~819 cycles a call.
+///
+/// The inline cache cannot hold a lambda — its cascade passes the caller's own
+/// argument registers straight through, and a SAM call's registers are not the
+/// impl's (the proxy receiver has to go, the captures have to arrive). So the
+/// site is cached one level out, in Rust, and this arm spends it: read the
+/// captures out of the proxy's fields, put the SAM's own already-decoded raw
+/// arguments after them, and call the compiled impl through the same
+/// reentrant primitive the monomorphic hit path uses.
+///
+/// Deliberately identical to the MIC hit path in everything that is not the
+/// argument shuffle — same `try_call_compiled_entry_reentrant_owned`, same
+/// `i64::MIN` deopt-sentinel handling, same "an escaping exception is left in
+/// `jit_pending_exception` for the compiled caller's own post-invoke check".
+/// A `None` from it means the callee's arity exceeds the register tables, and
+/// the caller falls through to the generic path with nothing done.
+///
+/// See known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md.
+unsafe fn try_lambda_site_direct_call(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    receiver_ref: ObjectRef,
+    receiver_class_id: ClassId,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    vm_ptr: i64,
+) -> Option<i64> {
+    const MAX_DIRECT_ARGS: usize = 8;
+    let site = crate::runtime::interpreter::lambda_jit_site(
+        vm,
+        receiver_class_id,
+        info.method_name,
+        info.descriptor,
+    )?;
+    crate::runtime::interpreter::lambda_site_bump_calls();
+    // `args_slice[0]` is the proxy receiver; the SAM's own arguments follow it.
+    if args_slice.is_empty() || site.total_args() > MAX_DIRECT_ARGS {
+        crate::runtime::interpreter::lambda_site_bump_refused();
+        return None;
+    }
+    let sam_args = &args_slice[1..];
+    if site.num_captures() + sam_args.len() != site.total_args() {
+        crate::runtime::interpreter::lambda_site_bump_refused();
+        return None;
+    }
+    let Some(code) = crate::runtime::interpreter::lambda_jit_site_code(vm, &site) else {
+        // Still interpreted. The warmup counter on the generic path is what
+        // gets it compiled; until then this arm has nothing to call.
+        crate::runtime::interpreter::lambda_site_bump_no_code();
+        return None;
+    };
+    let mut jit_args = [0i64; MAX_DIRECT_ARGS];
+    crate::runtime::interpreter::lambda_jit_site_capture_args(
+        vm,
+        &site,
+        receiver_ref,
+        &mut jit_args,
+    );
+    jit_args[site.num_captures()..site.total_args()].copy_from_slice(sam_args);
+    let entry = code.entry_ptr() as usize;
+    let needs_ctx = code.needs_context();
+    let rc = try_call_compiled_entry_reentrant_owned(
+        &code,
+        entry,
+        needs_ctx,
+        vm_ptr,
+        &jit_args[..site.total_args()],
+    )?;
+    crate::runtime::interpreter::lambda_site_bump_direct();
+    if rc == i64::MIN {
+        // A directly-dispatched callee deopts exactly like a monomorphically
+        // dispatched one; returning its sentinel to the compiled caller would
+        // have the caller read it as its OWN deopt. Same handler, same reason.
+        if let Some(v) = handle_compiled_callee_deopt_sentinel(
+            vm,
+            thread,
+            info,
+            receiver_class_id,
+            args_slice,
+        ) {
+            return Some(v);
+        }
+    }
+    Some(rc)
+}
+
 // SAFETY: the JIT invoke metadata and the validated proxy receiver originate
 // from the active interpreted frame; callers fall back to interpretation on a miss.
 unsafe fn try_fast_lambda_int_to_double_apply(
@@ -13881,6 +13977,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         .contains_key(&receiver_class_id)
     {
         mic_prof::bump(&mic_prof::MIC_LAMBDA);
+        // The lambda call site's own cached invoke target. Tried FIRST: it is
+        // the only arm here that does not re-derive the whole dispatch, and
+        // when it declines it has done nothing.
+        if let Some(result) = try_lambda_site_direct_call(
+            vm,
+            thread,
+            receiver_ref,
+            receiver_class_id,
+            info,
+            args_slice,
+            vm_ptr,
+        ) {
+            return result;
+        }
         match try_fast_lambda_int_to_double_apply(
             vm,
             thread,
