@@ -1869,8 +1869,20 @@ mod tests {
 // cycle under GC stress moves hundreds of thousands — and because it answers a
 // question only a run that is already suspected of this defect needs asked.
 
-static VACATED_ADDRS: parking_lot::Mutex<Option<rustc_hash::FxHashSet<usize>>> =
-    parking_lot::Mutex::new(None);
+/// `(vacated -> where the object went, every destination the slide wrote to)`.
+///
+/// The destination set is what keeps this instrument honest. An address can be
+/// BOTH a source and a destination in one compacting cycle: survivors slide
+/// DOWN into the space dead objects vacated, so `ThreadPoolExecutor.runWorker`
+/// holding a perfectly valid `Thread` that happens to live at an address this
+/// cycle also moved something away from is not a defect — and reporting it as
+/// one is how an over-approximate instrument manufactures its own finding.
+type VacatedLedger = (
+    rustc_hash::FxHashMap<usize, usize>,
+    rustc_hash::FxHashSet<usize>,
+);
+
+static VACATED_ADDRS: parking_lot::Mutex<Option<VacatedLedger>> = parking_lot::Mutex::new(None);
 
 /// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
 pub fn vacated_frames_enabled() -> bool {
@@ -1888,17 +1900,26 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     if !vacated_frames_enabled() {
         return;
     }
-    let mut g = VACATED_ADDRS.lock();
-    *g = Some(pointer_map.keys().copied().collect());
+    let from: rustc_hash::FxHashMap<usize, usize> =
+        pointer_map.iter().map(|(k, v)| (*k, *v)).collect();
+    let to: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
+    *VACATED_ADDRS.lock() = Some((from, to));
 }
 
-/// Did the last recorded collection move an object away from `addr`?
-pub fn was_vacated(addr: usize) -> bool {
+/// Did the last recorded collection move an object away from `addr`, and if so
+/// where to?
+///
+/// `None` when the address was not a source, and — deliberately — also when it
+/// was a source but is ALSO a destination this cycle wrote a survivor to: a
+/// slot naming that address may legitimately hold the survivor.
+pub fn was_vacated(addr: usize) -> Option<usize> {
     if !vacated_frames_enabled() {
-        return false;
+        return None;
     }
-    VACATED_ADDRS
-        .lock()
-        .as_ref()
-        .is_some_and(|set| set.contains(&addr))
+    let g = VACATED_ADDRS.lock();
+    let (from, to) = g.as_ref()?;
+    if to.contains(&addr) {
+        return None;
+    }
+    from.get(&addr).copied()
 }

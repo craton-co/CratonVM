@@ -558,7 +558,7 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
             // old address reads back a perfectly valid object of an unrelated
             // class, and every test in this function stays silent. Asked FIRST,
             // and only when armed.
-            if cratonvm_gc::gc_quiescence::was_vacated(a) {
+            if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(a) {
                 static V: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
                     tracing::error!(
@@ -572,6 +572,16 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
                         pc = fr.pc,
                         slot = format!("{what}[{idx}]"),
                         slot_class = %class_name_of(shared, heap.class_id_of(o).as_u32()),
+                        moved_to = format!("{moved_to:#x}"),
+                        class_at_target = %class_name_of(
+                            shared,
+                            // SAFETY: `moved_to` is a post-move object base the
+                            // collector just wrote; its header is mapped.
+                            heap.class_id_of(unsafe {
+                                cratonvm_types::ObjectRef::from_raw(moved_to as *mut u8)
+                            })
+                            .as_u32(),
+                        ),
                         "a LIVE frame slot still names an address the LAST collection moved an \
                          object away from — the frame remap did not reach this slot. \
                          `slot_class` is whatever the slide has since put at that address.",
