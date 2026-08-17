@@ -167,6 +167,48 @@ pub fn user_loader_ancestors(ns: u32, out: &mut [u32; MAX_USER_LOADER_DEPTH]) ->
     n
 }
 
+/// The built-in loader (`0`=Bootstrap, `1`=Extension/Platform, `2`=Application)
+/// `ns`'s delegation chain terminates at, if that chain has been fully
+/// recorded.
+///
+/// `user_loader_ancestors` walks the same `USER_LOADER_PARENTS` chain but
+/// discards exactly this fact once it reaches a value `< 3` — it just stops.
+/// A caller that then falls back to "try the whole built-in chain" loses the
+/// distinction a registered `Extension`/platform parent draws: a
+/// `ModifiedClassPathClassLoader` (parent = platform, specifically to exclude
+/// Application from delegation, e.g. Spring's `@ClassPathExclusions`) has a
+/// terminal parent of `1`, and probing `Application` anyway resolves a
+/// same-named class through the wrong loader — the same defect class as the
+/// `PropertySource`/`EnumerablePropertySource` cross-loader
+/// `ClassCastException` family this function was added to close.
+///
+/// `None` means "unrecorded, or the chain did not bottom out within
+/// `MAX_USER_LOADER_DEPTH`" — callers must keep probing the full built-in
+/// chain in that case; only a POSITIVELY recorded terminal may narrow it.
+pub fn user_loader_builtin_parent(ns: u32) -> Option<u32> {
+    if !has_user_loader_parents() || ns < 3 {
+        return None;
+    }
+    let map = match user_loader_parents().read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let mut cur = ns;
+    let mut seen = 0usize;
+    while seen < MAX_USER_LOADER_DEPTH {
+        let &parent = map.get(&cur)?;
+        if parent < 3 {
+            return Some(parent);
+        }
+        if parent == ns {
+            return None;
+        }
+        cur = parent;
+        seen += 1;
+    }
+    None
+}
+
 /// `CRATONVM_LOADER_PARENT_CHAIN` gate (default ON). Off (`0` or empty)
 /// restores the pre-2026-07-30 behaviour where a user loader's resolution saw
 /// only its own namespace and the built-in chain. Kept as an escape hatch for

@@ -213,6 +213,23 @@ fn singleton_cell(vm: usize) -> &'static Mutex<Option<u64>> {
     per_vm_table(&INSTANCE, vm)
 }
 
+/// Whether this VM has performed the primordial configuration read, per VM.
+///
+/// The JDK's `LogManager.ensureLogManagerInitialized()` finishes by calling
+/// `readPrimordialConfiguration()`, which is what puts the `ConsoleHandler`
+/// from `$java.home/conf/logging.properties` on the root logger. Ours never
+/// did, so a fresh VM had `root.handlers=0` where HotSpot has 1 — and
+/// `Logger.getLogger("x").info("hello")` printed NOTHING, silently, because a
+/// record with no handler anywhere up the parent chain is simply dropped.
+///
+/// Latched so the read happens exactly once per VM, and latched BEFORE the
+/// read runs: `read_configuration_no_arg_impl` instantiates handler classes,
+/// which can re-enter `getLogManager()`.
+fn primordial_config_done(vm: usize) -> &'static Mutex<bool> {
+    static DONE: OnceLock<Mutex<HashMap<usize, &'static Mutex<bool>>>> = OnceLock::new();
+    per_vm_table(&DONE, vm)
+}
+
 /// Name -> `Logger` ObjectRef (as raw u64), per VM. Populated on first
 /// `getLogger`/`addLogger`. Reads are cheap; a lock is acquired only
 /// during mutation.
@@ -1314,6 +1331,9 @@ pub(crate) fn reset_state_for_tests() {
     if let Ok(mut m) = attachments(TEST_VM).lock() {
         m.clear();
     }
+    if let Ok(mut d) = primordial_config_done(TEST_VM).lock() {
+        *d = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,6 +1356,31 @@ fn native_get_log_manager(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     // satisfies every membership test and still has the wrong contents.
     let _ = get_or_create_logger(ctx, "");
     let _ = get_or_create_logger(ctx, "global");
+    // ...and then reads the configuration. `readPrimordialConfiguration` is
+    // the step that installs the `ConsoleHandler` named by
+    // `$java.home/conf/logging.properties`; without it `root.handlers` was 0
+    // against HotSpot's 1, and every `Logger.info(..)` on a default-configured
+    // VM was dropped on the floor with no handler to publish it.
+    //
+    // Latch FIRST. `read_configuration_no_arg_impl` instantiates the handler
+    // classes named by the file, and a handler constructor is free to call
+    // `LogManager.getLogManager()` — which is this function.
+    let first_time = {
+        let mut done = primordial_config_done(ctx.vm_identity())
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = !*done;
+        *done = true;
+        first
+    };
+    if first_time {
+        // A missing or unreadable file is not fatal in the JDK either, and
+        // `read_configuration_no_arg_impl` already returns `Ok(None)` for it.
+        // Swallow a hard error too rather than failing `getLogManager()`: the
+        // JDK's own primordial read is wrapped so that a broken config file
+        // leaves you with a usable (if unconfigured) LogManager.
+        let _ = read_configuration_no_arg_impl(ctx, &[]);
+    }
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1818,12 +1863,70 @@ fn apply_jul_config_entries(
     Ok(None)
 }
 
+/// `LogManager.reset()`.
+///
+/// # It must NOT drop the loggers
+///
+/// This used to `clear()` the logger registry, on the reading that "reset"
+/// means "forget everything". `java.util.logging.LogManager.reset()` says
+/// otherwise, and so does the JDK, measured on HotSpot 25:
+///
+/// ```text
+///   before: names=[, a.b.c, bar, baz, d.e.f, foo, global]
+///           a.level=FINEST  a.handlers=1  root.level=INFO  root.handlers=1
+///   after : names=[, a.b.c, bar, baz, d.e.f, foo, global]   <-- UNCHANGED
+///           a.level=null    a.handlers=0  root.level=INFO   root.handlers=0
+///           Logger.getLogger("reset.probe.a") == the pre-reset object -> true
+/// ```
+///
+/// So `reset()` resets CONFIGURATION — handlers off, levels back to
+/// "inherit", root pinned at INFO — and the registry itself is untouched.
+///
+/// Dropping the registry was not merely an over-broad `getLoggerNames()`. Our
+/// `getLogger` demand-creates any name, so after a `reset()` the next
+/// `Logger.getLogger("x")` minted a DIFFERENT object from the one the
+/// application was still holding. Two live `Logger`s for one name is a silent
+/// split: `setLevel`/`addHandler` on either is invisible to the other, and the
+/// JDK guarantees the identity that makes them the same object. Nothing failed
+/// loudly, which is why a unit test asserting the registry came back EMPTY sat
+/// green over it.
 fn native_reset(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let vm = ctx.vm_identity();
-    // Drop all logger bindings but keep the manager singleton alive.
-    if let Ok(mut r) = logger_registry(vm).lock() {
-        r.clear();
+    // Resolve INFO BEFORE snapshotting: `resolve_standard_level` can run
+    // `Level.<clinit>` and therefore allocate, and the snapshot below holds
+    // raw logger addresses that a collection could invalidate. Nothing in the
+    // loop allocates, so one resolve up front is also the only one needed.
+    let info_level = resolve_standard_level(ctx, "INFO");
+    let loggers: Vec<(String, ObjectRef)> = {
+        let reg = logger_registry(vm)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.iter()
+            .filter(|(_, &addr)| addr != 0)
+            // SAFETY: same singleton-style lifetime `get_or_create_logger`
+            // relies on when it hands these addresses back out.
+            .map(|(name, &addr)| (name.clone(), unsafe { object_from_u64(addr) }))
+            .collect()
+    };
+    for (name, logger) in loggers {
+        // "removes ... all Handlers" — the handler list lives in an
+        // identity-keyed side table, not a slot, so dropping the row is the
+        // removal. NOT ALSO CLOSED: the JDK closes them here, and doing that
+        // means invoking Java `Handler.close()` per handler from inside the
+        // manager, which allocates and re-enters logging. Consequence, stated
+        // rather than hidden: a buffered `StreamHandler` is not flushed by
+        // `reset()` alone. Callers that need the flush call `Handler.close()`
+        // or `flush()` themselves, which is what the JULI and jboss paths in
+        // this module already do.
+        crate::logging_shims::jul_logger_handlers_clear(ctx, logger);
+        // "(except for the root logger) sets the level to null. The root
+        // logger's level is set to Level.INFO."
+        let level = if name.is_empty() { info_level } else { None };
+        ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(level));
     }
+    // The Tomcat JULI mirrors are per-classloader caches of the above rather
+    // than a separate namespace, so they are rebuilt on next use and clearing
+    // them costs no identity.
     if let Ok(mut r) = tomcat_juli_logger_registry(vm).lock() {
         r.clear();
     }
@@ -2585,7 +2688,7 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
             .class_name_of_id(ctx.class_id_of_object(t))
             .unwrap_or_else(|| "java/lang/Throwable".to_string())
             .replace('/', ".");
-        let detail = match ctx.get_field_by_name(t, "detailMessage") {
+        let detail = match crate::lang_misc::throwable_field_get(ctx, t, "detailMessage") {
             Value::Object(Some(s)) => ctx.read_string(s),
             _ => None,
         };
@@ -2621,7 +2724,7 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
 
         // Walk to the cause (named `cause`; `this` is the JDK
         // "uninitialized" sentinel and means no cause).
-        let next = match ctx.get_field_by_name(t, "cause") {
+        let next = match crate::lang_misc::throwable_field_get(ctx, t, "cause") {
             Value::Object(Some(c)) if c != t => Some(c),
             _ => None,
         };
@@ -4023,7 +4126,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             ctx.class_name_of_id(cid)
                 .unwrap_or_else(|| "Throwable".to_string())
         };
-        let detail = match ctx.get_field_by_name(t, "detailMessage") {
+        let detail = match crate::lang_misc::throwable_field_get(ctx, t, "detailMessage") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
@@ -4862,7 +4965,7 @@ fn jul_render_throwable(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
             .unwrap_or_else(|| "java/lang/Throwable".to_string())
             .replace('/', ".")
     };
-    let detail = match ctx.get_field_by_name(t, "detailMessage") {
+    let detail = match crate::lang_misc::throwable_field_get(ctx, t, "detailMessage") {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
@@ -7283,8 +7386,15 @@ mod tests {
         );
     }
 
+    /// `reset()` keeps every logger and resets their CONFIGURATION.
+    ///
+    /// This test used to assert the opposite — that `reset()` empties the
+    /// registry — and passed, because the native did exactly that. HotSpot
+    /// 25 disagrees (see `native_reset`'s doc for the measurement): the name
+    /// list is byte-identical across `reset()`, and
+    /// `Logger.getLogger(name)` still answers the SAME object.
     #[test]
-    fn t19_h3_reset_clears_logger_registry_but_keeps_singleton() {
+    fn t19_h3_reset_keeps_loggers_and_resets_their_configuration() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
@@ -7317,15 +7427,69 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner());
             let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
             names.sort_unstable();
-            assert_eq!(names, ["", "a.b.c", "d.e.f"]);
+            assert_eq!(names, ["", "a.b.c", "d.e.f", "global"]);
         }
+        // Configure two of them, so "reset the configuration" has something
+        // to reset — and configure the ROOT too, so "the root keeps a level"
+        // is distinguishable from "the root was left alone".
+        //
+        // A marker object rather than a real `Level`: this crate's mock
+        // context does not implement `static_field_index_by_name`, so
+        // `resolve_standard_level` answers `None` for every name here. A
+        // `Level.FINEST` assertion would be measuring the mock. Any object is
+        // enough for the property under test, which is that the slot is
+        // OVERWRITTEN.
+        let marker = ctx.create_string("configured-level-marker");
+        let a_before = get_or_create_logger(&mut ctx, "a.b.c").unwrap();
+        ctx.set_field(a_before, LOGGER_FIELD_LEVEL, Value::Object(Some(marker)));
+        let root_before = get_or_create_logger(&mut ctx, "").unwrap();
+        ctx.set_field(root_before, LOGGER_FIELD_LEVEL, Value::Object(Some(marker)));
+
         native_reset(&mut ctx, &[Value::Object(Some(mgr))]).unwrap();
-        assert!(
-            logger_registry(TEST_VM)
+
+        {
+            let reg = logger_registry(TEST_VM)
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty(),
-            "reset() must clear the logger registry"
+                .unwrap_or_else(|e| e.into_inner());
+            let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["", "a.b.c", "d.e.f", "global"],
+                "reset() must NOT drop loggers — HotSpot's name list is unchanged"
+            );
+        }
+        // Identity survives: the application's own reference is still the
+        // registry's. This is the half that made the old behaviour a silent
+        // config split rather than just a short `getLoggerNames()`.
+        let a_after = get_or_create_logger(&mut ctx, "a.b.c").unwrap();
+        assert_eq!(
+            a_before, a_after,
+            "getLogger(name) must answer the same object across reset()"
+        );
+        // A named logger's level goes back to null (inherit).
+        assert_eq!(
+            ctx.get_field(a_after, LOGGER_FIELD_LEVEL),
+            Value::Object(None),
+            "reset() sets a named logger's level to null"
+        );
+        // The root's is re-derived from `Level.INFO` rather than left as the
+        // caller set it. Both halves are asserted: it is no longer the marker
+        // (so reset() did touch the root), and it is exactly what
+        // `resolve_standard_level("INFO")` yields on this context — which is
+        // the same expression `native_reset` uses, so the row stays true on a
+        // real VM where that resolves to the actual `Level.INFO` singleton.
+        let root_after = get_or_create_logger(&mut ctx, "").unwrap();
+        let root_level = ctx.get_field(root_after, LOGGER_FIELD_LEVEL);
+        assert_ne!(
+            root_level,
+            Value::Object(Some(marker)),
+            "reset() must re-derive the root logger's level, not leave it configured"
+        );
+        assert_eq!(
+            root_level,
+            Value::Object(resolve_standard_level(&mut ctx, "INFO")),
+            "reset() sets the root logger's level from Level.INFO"
         );
         // Singleton identity preserved.
         let again = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
@@ -7383,11 +7547,18 @@ mod tests {
         // and real `LogManager.getLoggerNames()` likewise always enumerates
         // the root. These three names have no dots, so "" is the only
         // ancestor added.
+        //
+        // `global` is present because `getLogManager()` registers it, which is
+        // what the JDK does — `LogManager.ensureLogManagerInitialized` adds
+        // both the root and `Logger.global`. Measured on HotSpot 25: a fresh
+        // manager enumerates `[, global]`, and this set enumerates
+        // `[, bar, baz, foo, global]`.
         let mut expected = vec![
             String::new(),
             "bar".to_string(),
             "baz".to_string(),
             "foo".to_string(),
+            "global".to_string(),
         ];
         expected.sort();
         assert_eq!(observed, expected);
@@ -7439,11 +7610,22 @@ mod tests {
             l1, l2,
             "bad names must not be cached (each call allocates a throw-away Logger)"
         );
-        // Registry untouched.
-        assert!(logger_registry(TEST_VM)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        // Registry untouched — it still holds exactly what `getLogManager()`
+        // put there (the root and `global`, as the JDK does), and the rejected
+        // name was not added under any spelling.
+        //
+        // Asserting the CONTENTS rather than `is_empty()` is what keeps this
+        // test meaning what it says now that `getLogManager()` registers
+        // `global`: an emptiness check would have had to be RELAXED to keep
+        // passing, while this one gets stricter.
+        {
+            let reg = logger_registry(TEST_VM)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["", "global"]);
+        }
     }
 
     #[test]

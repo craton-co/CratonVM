@@ -7,6 +7,7 @@
 //! Field types, lock types and lock levels are unchanged; only the
 //! owning struct differs. Access paths are `shared.jit.<field>`.
 
+use crate::classloading::ClassId;
 use crate::jit::profile::ProfileStore;
 use crate::jit::JitCache;
 use parking_lot::RwLock;
@@ -27,6 +28,47 @@ pub struct JitRealm {
     /// T10.9.B: FxHashSet — keys are internal (class, method, desc) triples
     /// from already-loaded class files.
     pub jit_skip_set: parking_lot::RwLock<FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>>,
+
+    /// The POSITIVE half of [`Self::jit_skip_set`]: methods whose static
+    /// JIT-eligibility gate was evaluated and came back **eligible**.
+    ///
+    /// `jit_skip_set` memoizes only the methods that FAIL the gate. That fix
+    /// (2026-07-15) left the mirror case open, and it is the expensive one:
+    /// a method that PASSES is recorded nowhere, so `execute()`'s
+    /// `already_skipped` short-circuit can never fire for it and every later
+    /// entry re-runs the whole gate — including
+    /// `jit_method_calls_native_shadowed`, an O(method-bytecode) decode that
+    /// does a three-string-hash `slot_for_exact` probe per invoke instruction
+    /// in the body. It runs *before* the `JitCache` consult further down, so
+    /// even a fully compiled, hot method pays it on every `execute()` entry.
+    ///
+    /// Measured on netty `AdaptiveByteBufAllocatorTest` (826 M calls): that
+    /// scan reached 2.15% of CPU through `slot_for_exact` alone, against only
+    /// 637 methods ever sealed for the same reason — i.e. it was re-running,
+    /// not running once per method.
+    ///
+    /// The value is `(redefine_epoch, is_interface_default)`. The epoch is the
+    /// invalidation and it is load-bearing in the UNSAFE direction, unlike the
+    /// negative set: a stale *seal* only costs throughput (the method stays
+    /// interpreted), but a stale *pass* would let a redefined body — whose new
+    /// bytecode may call a native-shadowed target — reach the compiler, which
+    /// is exactly what the seal exists to prevent. `bump_redefine_epoch()` is
+    /// already called on every `redefineClass`, beside the `clear_all()` that
+    /// evicts the compiled artifacts, so an entry stamped with an older epoch
+    /// is simply a miss and the gate re-runs.
+    ///
+    /// **Keyed on `ClassId`, NOT on the class name** — and that is the same
+    /// asymmetry again, not a style choice. `jit_skip_set` keys on the name and
+    /// says so safely: `is_jit_bail_listed`'s comment notes that a name-only
+    /// collision between two same-named classes from different loaders is
+    /// benign there, because the worst case is one class's compilable method
+    /// being conservatively skipped. Reuse the name here and the worst case
+    /// inverts — a `PASS` recorded for one loader's class would be redeemed by
+    /// a *different* class of the same name whose own bytecode does call a
+    /// native-shadowed target, compiling exactly what the seal exists to
+    /// refuse. Two same-named classes in different loaders is the ByteBuddy /
+    /// Mockito / servlet-container shape, not a hypothetical.
+    pub jit_gate_pass: RwLock<FxHashMap<(ClassId, Arc<str>, Arc<str>), (u32, bool)>>,
 
     /// Tiered compilation manager — decides when and at which tier to compile.
     pub tiered_manager: crate::jit::tiered::TieredCompilationManager,

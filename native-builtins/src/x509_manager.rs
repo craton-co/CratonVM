@@ -135,6 +135,52 @@ pub struct KeyManagerState {
     pub server_aliases_by_key_type: HashMap<String, Vec<String>>,
     /// keyType -> aliases eligible as a *client* cert.
     pub client_aliases_by_key_type: HashMap<String, Vec<String>>,
+    /// alias -> the LIVE Java `PrivateKey` object this manager must hand back,
+    /// for a key that has no PKCS#8 encoding of its own.
+    ///
+    /// `aliases_to_key` stores key BYTES, which is enough for every key whose
+    /// `getEncoded()` answers. An *opaque* key — a PKCS#11/HSM key, or netty's
+    /// `OpenSslPrivateKey` and `OpenSslPrivateKeyMethod` delegating keys, whose
+    /// whole point is that the private material never leaves its provider —
+    /// answers `null` there, and reconstructing one from bytes is not merely
+    /// lossy but impossible. The caller needs THAT object back:
+    /// `OpenSslKeyMaterialProvider.chooseKeyMaterial` branches on
+    /// `key instanceof OpenSslPrivateKey` to decide whether to hand the key to
+    /// OpenSSL by reference or to PEM-encode it.
+    ///
+    /// Holds live `ObjectRef`s, so `km_registry` is scanned and remapped by
+    /// [`gc_scan_key_manager_roots`] / [`gc_update_key_manager_refs`].
+    pub aliases_to_live_key: HashMap<String, ObjectRef>,
+}
+
+/// GC root scan for the live `PrivateKey` objects a `KeyManagerState` holds —
+/// see [`KeyManagerState::aliases_to_live_key`].
+pub fn gc_scan_key_manager_roots(roots: &mut Vec<ObjectRef>) {
+    for state in km_registry().read().values() {
+        for k in state.aliases_to_live_key.values() {
+            if !k.as_ptr().is_null() {
+                roots.push(*k);
+            }
+        }
+    }
+}
+
+/// Post-move remap companion to [`gc_scan_key_manager_roots`].
+pub fn gc_update_key_manager_refs(map: &cratonvm_types::PointerMap) {
+    if map.is_empty() {
+        return;
+    }
+    for state in km_registry().write().values_mut() {
+        for k in state.aliases_to_live_key.values_mut() {
+            let old = k.as_ptr() as usize;
+            if let Some(&new) = map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: `new` is a live, 8-byte-aligned heap address produced
+                // by the moving collector for the object previously at `old`.
+                *k = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
 }
 
 /// Trust-manager state. A null/default `TrustManagerFactory.init` state is
@@ -275,6 +321,12 @@ pub struct ParsedCert {
     pub ext_key_usage: Vec<Vec<u8>>,
     pub basic_constraints_ca: Option<bool>,
     pub signature_algorithm_oid: Vec<u8>,
+    /// Raw DER of the `signatureAlgorithm` AlgorithmIdentifier's `parameters`
+    /// field — everything after the OID inside that SEQUENCE, empty when
+    /// absent. Only RSASSA-PSS needs it: its digest, MGF digest and salt
+    /// length live there and are NOT derivable from the OID
+    /// ([`parse_rsa_pss_params`]).
+    pub signature_algorithm_params: Vec<u8>,
     pub signature_value: Vec<u8>,
     pub is_v3: bool,
     /// `dNSName` entries from the SubjectAltName extension (lower-cased,
@@ -458,6 +510,32 @@ const GN_TAG_DIRECTORY: u8 = 0xa4;
 const OID_SIG_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 ///   1.2.840.10045.4.3.2 — ecdsa-with-SHA256 (P-256 most common)
 const OID_SIG_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+///   1.2.840.113549.1.1.5 — sha1WithRSAEncryption
+///
+/// **Deliberate widening, recorded as such.** Accepting SHA-1 makes chains
+/// that previously failed CLOSED verifiable. That is the HotSpot-parity
+/// answer — HotSpot's `SunJSSE` validates these chains, and every JDK ships
+/// `SHA1withRSA` — and it is what
+/// `io.netty.handler.ssl.SslContextTrustManagerTest` (all 4 tests) needs: its
+/// test CAs are SHA-1-signed, so CratonVM rejected them with
+/// `signature-algorithm OID at index 0 not implemented`. SHA-1 is
+/// collision-broken for *chosen-prefix* attacks against a CA that still signs
+/// with it; this verifier's job is to agree with the platform it emulates, not
+/// to impose a stricter policy the platform does not (a stricter policy that
+/// only CratonVM enforces reads to an application as "this VM cannot do TLS").
+const OID_SIG_SHA1_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
+///   1.2.840.113549.1.1.12 — sha384WithRSAEncryption
+const OID_SIG_SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+///   1.2.840.113549.1.1.13 — sha512WithRSAEncryption
+const OID_SIG_SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+///   1.2.840.10045.4.3.3 — ecdsa-with-SHA384
+const OID_SIG_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+///   1.2.840.10045.4.3.4 — ecdsa-with-SHA512
+const OID_SIG_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+///   1.2.840.10045.4.3.1 — ecdsa-with-SHA224 (recognised, see below)
+const OID_SIG_ECDSA_SHA224: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x01];
+///   1.2.840.113549.1.1.14 — sha224WithRSAEncryption (recognised, see below)
+const OID_SIG_SHA224_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0e];
 
 // --- Signature-algorithm OIDs we deliberately do NOT support yet. ---
 //
@@ -472,6 +550,10 @@ const OID_SIG_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 
 //     SEQUENCE)
 //   * 1.3.101.112 — id-Ed25519 (pure EdDSA over Curve25519, separate
 //     verify path — no SHA-256 preimage)
+//   * 1.2.840.113549.1.1.14 / 1.2.840.10045.4.3.1 — the SHA-224 pair. Named
+//     here rather than left to the catch-all so the error says "known and
+//     unimplemented"; SHA-224 is the one member of the SHA-2 family this tree
+//     has no engine for, and no CA in the corpus issues with it.
 ///   1.2.840.10040.4.3 — id-dsa-with-sha1
 const OID_SIG_DSA_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x03];
 ///   1.2.840.113549.1.1.10 — id-RSASSA-PSS
@@ -569,6 +651,7 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
     let sig_alg = read_tlv_tagged(after_tbs, TAG_SEQUENCE)?;
     let sig_alg_oid = read_tlv_tagged(sig_alg.content, TAG_OID)?;
     let signature_algorithm_oid = sig_alg_oid.content.to_vec();
+    let signature_algorithm_params = sig_alg_oid.rest.to_vec();
 
     let sig_bs = read_tlv_tagged(sig_alg.rest, TAG_BIT_STRING)?;
     // First byte of BIT STRING is the unused-bits count; skip it.
@@ -817,6 +900,7 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
         ext_key_usage,
         basic_constraints_ca,
         signature_algorithm_oid,
+        signature_algorithm_params,
         signature_value,
         is_v3,
         san_dns_names,
@@ -1198,6 +1282,173 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
     state
 }
 
+/// Build a `KeyManagerState` by ENUMERATING a live Java `KeyStore` object
+/// through its own bytecode, instead of reading this crate's native keystore
+/// registry.
+///
+/// Why a second path exists: `build_key_manager_state` can only see stores
+/// CratonVM itself created, and an application is free to hand
+/// `KeyManagerFactory.init` a `KeyStore` of its own — netty's
+/// `OpenSslX509KeyManagerFactory.newKeyless` does exactly that, with a private
+/// `KeyStore` subclass over a hand-written `KeyStoreSpi` whose entries are
+/// keyless certificate chains. `keystore_id_from_object` answers 0 for such a
+/// store, and the `getKeyManagers()` fallback for that case used to be an
+/// object stamped with the bare `javax/net/ssl/X509KeyManager` INTERFACE id,
+/// every method of which is abstract: netty's
+/// `OpenSslKeyMaterialProvider.chooseKeyMaterial` called
+/// `getCertificateChain(alias)` on it and died with `AbstractMethodError`,
+/// taking out all 27 of `JdkDelegatingPrivateKeyMethodTest` and all 24 of
+/// `OpenSslPrivateKeyMethodTest`.
+///
+/// Enumerating the store through `aliases()` / `getCertificateChain()` /
+/// `getKey()` is what the real `SunX509KeyManagerImpl` constructor does, and it
+/// works for ANY `KeyStore` implementation rather than only for the shapes this
+/// VM knows how to build natively.
+///
+/// The private key is kept BY REFERENCE as well as by bytes — see
+/// [`KeyManagerState::aliases_to_live_key`] for why bytes alone cannot serve an
+/// opaque key.
+pub(crate) fn build_key_manager_state_from_live_keystore(
+    ctx: &mut dyn NativeContext,
+    ks: ObjectRef,
+    password: Option<ObjectRef>,
+) -> KeyManagerState {
+    let mut state = KeyManagerState::default();
+    let base = ctx.pin_native_root(ks);
+    let pw_pin = password.map(|p| ctx.pin_native_root(p));
+
+    // 1. aliases() — bounded, so a misbehaving Enumeration cannot wedge init.
+    let mut aliases: Vec<String> = Vec::new();
+    let ks_now = ctx.read_native_pin(base, ks);
+    if let Ok(Some(Value::Object(Some(en)))) =
+        ctx.invoke_virtual(ks_now, "aliases", "()Ljava/util/Enumeration;", &[])
+    {
+        let en_pin = ctx.pin_native_root(en);
+        for _ in 0..4096 {
+            let en_now = ctx.read_native_pin(en_pin, en);
+            match ctx.invoke_virtual(en_now, "hasMoreElements", "()Z", &[]) {
+                Ok(Some(Value::Int(1))) => {}
+                _ => break,
+            }
+            let en_now = ctx.read_native_pin(en_pin, en);
+            match ctx.invoke_virtual(en_now, "nextElement", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => match ctx.read_string(s) {
+                    Some(a) => aliases.push(a),
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+    }
+
+    // 2. Per alias: the chain (DER) and the key (bytes AND reference).
+    struct Candidate {
+        alias: String,
+        key_type: String,
+        is_server: bool,
+        is_client: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut live_pins: Vec<(String, usize, ObjectRef)> = Vec::new();
+    for alias in &aliases {
+        let a_str = ctx.create_string(alias);
+        let ks_now = ctx.read_native_pin(base, ks);
+        let chain: Vec<Vec<u8>> = match ctx.invoke_virtual(
+            ks_now,
+            "getCertificateChain",
+            "(Ljava/lang/String;)[Ljava/security/cert/Certificate;",
+            &[Value::Object(Some(a_str))],
+        ) {
+            Ok(Some(Value::Object(Some(arr)))) => {
+                let n = ctx.array_length(arr);
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    if let Value::Object(Some(c)) = ctx.get_array_element(arr, i) {
+                        let der = crate::keystore::certificate_der(ctx, c);
+                        if !der.is_empty() {
+                            v.push(der);
+                        }
+                    }
+                }
+                v
+            }
+            _ => Vec::new(),
+        };
+        if chain.is_empty() {
+            continue;
+        }
+        let leaf = match parse_certificate(&chain[0]) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let key_type = classify_key_type(&leaf.spki_algorithm_oid).to_string();
+        let is_server = is_server_cert(&leaf);
+        let is_client = is_client_cert(&leaf);
+
+        let a_str2 = ctx.create_string(alias);
+        let ks_now = ctx.read_native_pin(base, ks);
+        let pw_val = match (pw_pin, password) {
+            (Some(p), Some(orig)) => Value::Object(Some(ctx.read_native_pin(p, orig))),
+            _ => Value::Object(None),
+        };
+        if let Ok(Some(Value::Object(Some(k)))) = ctx.invoke_virtual(
+            ks_now,
+            "getKey",
+            "(Ljava/lang/String;[C)Ljava/security/Key;",
+            &[Value::Object(Some(a_str2)), pw_val],
+        ) {
+            let der = crate::keystore::read_encoded_byte_array(ctx, k);
+            if !der.is_empty() {
+                state.aliases_to_key.insert(alias.clone(), der);
+            }
+            live_pins.push((alias.clone(), ctx.pin_native_root(k), k));
+        }
+        state.aliases_to_chain.insert(alias.clone(), chain);
+        candidates.push(Candidate {
+            alias: alias.clone(),
+            key_type,
+            is_server,
+            is_client,
+        });
+    }
+
+    // 3. Candidate order, matching `build_key_manager_state`'s second pass.
+    let ordered = java_hashmap_iteration_order(
+        &candidates
+            .iter()
+            .map(|c| c.alias.clone())
+            .collect::<Vec<_>>(),
+    );
+    for alias in &ordered {
+        let Some(c) = candidates.iter().find(|c| &c.alias == alias) else {
+            continue;
+        };
+        if c.is_server {
+            state
+                .server_aliases_by_key_type
+                .entry(c.key_type.clone())
+                .or_default()
+                .push(alias.clone());
+        }
+        if c.is_client {
+            state
+                .client_aliases_by_key_type
+                .entry(c.key_type.clone())
+                .or_default()
+                .push(alias.clone());
+        }
+    }
+
+    // 4. Re-read every live key through its pin — the allocations above may
+    // have moved them — then release the whole pin frame.
+    for (alias, pin, orig) in &live_pins {
+        let now = ctx.read_native_pin(*pin, *orig);
+        state.aliases_to_live_key.insert(alias.clone(), now);
+    }
+    ctx.unpin_native_roots(base);
+    state
+}
+
 /// Build a `TrustManagerState` from either a caller-supplied `LoadedKeyStore`
 /// or the system trust store. Non-zero `keystore_id` means an explicit
 /// truststore was configured, so it is restrictive: platform roots are not
@@ -1335,12 +1586,97 @@ fn presented_cert_is_anchor(
     }
 }
 
+/// Is this exact presented certificate one the application installed as a
+/// trust anchor? Used to keep the anchor out of the path-validation steps that
+/// RFC 5280 §6.1 applies only to the certificates ON the path.
+fn cert_is_stored_anchor(trust: &TrustManagerState, der: &[u8], parsed: &ParsedCert) -> bool {
+    anchors_for_subject(trust, &parsed.subject_der)
+        .iter()
+        .any(|a| presented_cert_is_anchor(a, der, parsed))
+}
+
 fn anchors_for_subject<'a>(trust: &'a TrustManagerState, subject_der: &[u8]) -> &'a [AnchorInfo] {
     trust
         .anchors
         .get(subject_der)
         .map(Vec::as_slice)
         .unwrap_or(&[])
+}
+
+/// Order the presented certificates into a PATH from the end entity, dropping
+/// any that are not on it. Returns the indices in path order, starting at 0.
+///
+/// `validate_chain` used to require `parsed[i].issuer == parsed[i+1].subject`
+/// for every `i` and reject anything else as `BrokenChain`. That is path
+/// VALIDATION of an already-built path; what a caller hands
+/// `checkClientTrusted`/`checkServerTrusted` is a certificate SET, and RFC 5280
+/// §6 is explicit that building the path from it comes first. Two shapes that
+/// are legal and were refused:
+///
+/// * a **cross-signed** intermediate — the same subject and key certified by
+///   two different roots, both intermediates supplied so that either root can
+///   be the trust anchor. Only one of them is on the path to any given anchor;
+///   the other is not a break, it is an alternative. This is
+///   `io.netty.pkitesting.CertificateBuilderTest.authenticatingCrossSignedCertificate`,
+///   which supplies `[leaf, crossIssuer, oldIssuer]` (both issuers named
+///   `CN=issuer.netty.io`) and trusts only the root that signed `oldIssuer`;
+/// * a chain sent out of order, which real peers do send.
+///
+/// Selection is deliberately conservative: it only ever REORDERS and DROPS. It
+/// never admits a certificate that the steps after it would have rejected —
+/// every cert on the returned path still goes through the CA, anchor, name
+/// constraint, signature and revocation steps unchanged. Dropping an
+/// off-path certificate is what the JDK's own `SunCertPathBuilder` does.
+///
+/// Where several candidates share the required subject DN, the one whose own
+/// issuer is a configured trust anchor wins, then one that is itself an anchor
+/// subject; ties fall back to the caller's order. That preference is the whole
+/// of the cross-signing fix — both candidates link to the leaf, and only the
+/// anchor test tells them apart.
+fn select_path(parsed: &[ParsedCert], trust: &TrustManagerState) -> Vec<usize> {
+    let mut path = vec![0usize];
+    let mut used = vec![false; parsed.len()];
+    used[0] = true;
+    // Bounded by the input length: a cross-certified pair is a cycle in the
+    // subject/issuer graph, and `used` is what keeps it from being walked
+    // forever.
+    for _ in 1..parsed.len() {
+        let cur = &parsed[*path.last().expect("path is never empty")];
+        // Self-issued root: nothing can follow it.
+        if cur.issuer_der == cur.subject_der {
+            break;
+        }
+        // The path ends as soon as the current certificate's issuer is a
+        // configured anchor — continuing past it would prefer a longer path
+        // over the trusted one.
+        if !anchors_for_subject(trust, &cur.issuer_der).is_empty() {
+            break;
+        }
+        let mut best: Option<(u8, usize)> = None;
+        for (j, cand) in parsed.iter().enumerate() {
+            if used[j] || cand.subject_der != cur.issuer_der {
+                continue;
+            }
+            let rank = if !anchors_for_subject(trust, &cand.issuer_der).is_empty() {
+                0
+            } else if !anchors_for_subject(trust, &cand.subject_der).is_empty() {
+                1
+            } else {
+                2
+            };
+            if best.is_none_or(|(r, _)| rank < r) {
+                best = Some((rank, j));
+            }
+        }
+        match best {
+            Some((_, j)) => {
+                used[j] = true;
+                path.push(j);
+            }
+            None => break,
+        }
+    }
+    path
 }
 
 fn select_trust_anchor<'a>(
@@ -1557,6 +1893,58 @@ impl std::fmt::Display for TrustError {
 /// choose to delegate to a JCE provider. See the OID block above for the
 /// inventory of recognised-but-unimplemented OIDs.
 pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<(), TrustError> {
+    // The presented order is a valid path far more often than not, so try it
+    // first and keep its verdict.
+    let presented = validate_ordered_chain(chain, trust);
+    if presented.is_ok() {
+        return presented;
+    }
+    // PKIX path BUILDING (RFC 5280 §6). What a caller hands
+    // `checkClientTrusted`/`checkServerTrusted` is a certificate SET; the
+    // ordered path has to be built from it, and this function previously
+    // required the caller to have built it already. See `select_path` for the
+    // two legal shapes that were refused — a cross-signed intermediate, and a
+    // chain sent out of order.
+    //
+    // Deliberately structured so that building can only turn a REJECTION into
+    // an ACCEPTANCE: the rebuilt path is put through the very same validation,
+    // and if that does not fully succeed the ORIGINAL error is returned
+    // unchanged. No error variant, index or message moves because of this
+    // block, which is what keeps the existing rejection tests meaningful.
+    if let Some(rebuilt) = rebuild_path(chain, trust) {
+        if validate_ordered_chain(&rebuilt, trust).is_ok() {
+            return Ok(());
+        }
+    }
+    presented
+}
+
+/// Re-order `chain` into a path from the end entity, or `None` when the
+/// presented order is already that path (so the caller has nothing to retry).
+///
+/// Parsing here repeats what `validate_ordered_chain` just did, which is
+/// deliberate: this runs only on the failure path, where one extra parse of a
+/// handful of certificates is not worth threading parsed state through the
+/// success path for.
+fn rebuild_path(chain: &[Vec<u8>], trust: &TrustManagerState) -> Option<Vec<Vec<u8>>> {
+    if chain.len() < 2 {
+        return None;
+    }
+    let mut parsed: Vec<ParsedCert> = Vec::with_capacity(chain.len());
+    for der in chain {
+        parsed.push(parse_certificate(der).ok()?);
+    }
+    let path = select_path(&parsed, trust);
+    if path.len() == chain.len() && path.iter().enumerate().all(|(i, &j)| i == j) {
+        return None;
+    }
+    Some(path.iter().map(|&i| chain[i].clone()).collect())
+}
+
+fn validate_ordered_chain(
+    chain: &[Vec<u8>],
+    trust: &TrustManagerState,
+) -> Result<(), TrustError> {
     if chain.is_empty() {
         return Err(TrustError::EmptyChain);
     }
@@ -1572,8 +1960,30 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Step 2: clock check.
-    for p in &parsed {
+    // Step 2: clock check — for the certificates on the PATH.
+    //
+    // A presented certificate that is itself a stored trust anchor is not on
+    // the path: RFC 5280 §6.1 takes the anchor as an *input* to path
+    // validation and validates `certificate 1..n` against it, so the anchor's
+    // own validity period is never one of the things checked. JSSE agrees by
+    // construction — `PKIXValidator` strips a trailing trusted certificate off
+    // the chain before handing the remainder to `CertPathValidator`, so a
+    // one-element chain that IS an anchor validates as the EMPTY path.
+    //
+    // netty's `testMutualAuthDiffCerts` is exactly that shape and is why this
+    // exists: `test2.crt` is a self-signed certificate that expired in
+    // November 2014 and is installed as the server's only trust anchor, and
+    // the client presents it as its own identity. HotSpot completes that
+    // handshake; this VM answered `checkClientTrusted` with
+    // `CertificateException` and the client saw `certificate_unknown`.
+    //
+    // Scope is deliberately narrow — the certificate must be one the
+    // application PUT in the trust store, compared by full DER. An expired
+    // leaf that merely shares a subject with an anchor is still expired.
+    for (i, p) in parsed.iter().enumerate() {
+        if cert_is_stored_anchor(trust, &chain[i], p) {
+            continue;
+        }
         if now < p.not_before_secs {
             return Err(TrustError::NotYetValid {
                 subject_dn: p.subject_der.clone(),
@@ -1598,11 +2008,29 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
     // Step 4: BasicConstraints CA on intermediates.
     if parsed.len() >= 2 {
         for i in 1..parsed.len() {
-            // Ed25519/Ed448 in earlier extension parsers may return None for
-            // BC; we treat None as "not-a-CA" only when v3 extensions exist
-            // for this cert. The is_v3 check matches what HotSpot's
-            // PKIXValidator does for legacy v1 roots which had no extensions.
-            if parsed[i].is_v3 && parsed[i].basic_constraints_ca == Some(false) {
+            if parsed[i].basic_constraints_ca == Some(false) {
+                return Err(TrustError::NotCa { at: i });
+            }
+            // A certificate that ISSUED another one must SAY it is a CA: RFC
+            // 5280 §6.1.4(k) makes `basicConstraints` with `cA=TRUE` mandatory
+            // for that position, and the JDK enforces it — `PKIXValidator`
+            // answers "basic constraints check failed: this is not a CA
+            // certificate", `SunX509` answers "End user tried to act as a CA".
+            //
+            // The `is_v3` guard this replaces exempted a v1 certificate from
+            // the check entirely, on the reasoning that a legacy v1 ROOT has no
+            // extensions to read. That is true of a root, and only of a root: a
+            // self-signed anchor still gets the exemption below. Applied to an
+            // INTERMEDIATE it inverted the rule — a v1 certificate carries no
+            // `basicConstraints`, which is exactly why it may not be a CA, and
+            // this accepted it as one. netty's `mutual_auth_invalid_client.p12`
+            // is built around that: its v1 intermediate is what makes the
+            // fixture "invalid", and both
+            // `testMutualAuthInvalidIntermediateCAFailWith{Optional,Required}
+            // ClientAuth` assert the handshake is REFUSED. They were passing
+            // only because an unrelated error refused it first.
+            let is_self_issued = parsed[i].issuer_der == parsed[i].subject_der;
+            if !is_self_issued && parsed[i].basic_constraints_ca.is_none() {
                 return Err(TrustError::NotCa { at: i });
             }
         }
@@ -1998,6 +2426,109 @@ fn dir_name_within(constraint: &[u8], presented: &[u8]) -> bool {
     cr.iter().zip(pr.iter()).all(|(a, b)| a == b)
 }
 
+/// `id-mgf1` — the only mask generation function RFC 4055 defines.
+const OID_MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
+
+/// The three things `RSASSA-PSS-params` says that the signature OID does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsaPssParams {
+    pub hash: crate::crypto_impl::PssHash,
+    pub mgf_hash: crate::crypto_impl::PssHash,
+    pub salt_len: usize,
+}
+
+/// Parse the `parameters` of an RSASSA-PSS `AlgorithmIdentifier` (RFC 4055 §3.1):
+///
+/// ```text
+/// RSASSA-PSS-params ::= SEQUENCE {
+///     hashAlgorithm    [0] HashAlgorithm    DEFAULT sha1,
+///     maskGenAlgorithm [1] MaskGenAlgorithm DEFAULT mgf1SHA1,
+///     saltLength       [2] INTEGER          DEFAULT 20,
+///     trailerField     [3] TrailerField     DEFAULT trailerFieldBC }
+/// ```
+///
+/// All four fields are OPTIONAL with defaults, and the defaults are **not**
+/// self-consistent with each other the way the JWA PS256/384/512 convention
+/// is: `saltLength` defaults to 20 whether the digest is SHA-1 or SHA-512.
+/// Absent parameters (or an explicit NULL) therefore mean SHA-1/MGF1-SHA-1/20,
+/// not "same as the OID".
+///
+/// `None` when the DER is malformed, when a digest OID is one we do not
+/// implement, when the MGF is not MGF1, or when `trailerField` is anything but
+/// the default 1 — every one of those is a signature this verifier must not
+/// claim to have checked.
+pub fn parse_rsa_pss_params(params_der: &[u8]) -> Option<RsaPssParams> {
+    use crate::crypto_impl::PssHash;
+
+    let mut out = RsaPssParams {
+        hash: PssHash::Sha1,
+        mgf_hash: PssHash::Sha1,
+        salt_len: 20,
+    };
+    // Absent parameters, or ASN.1 NULL: every default applies.
+    if params_der.is_empty() {
+        return Some(out);
+    }
+    let outer = read_tlv(params_der).ok()?;
+    if outer.tag == TAG_NULL {
+        return Some(out);
+    }
+    if outer.tag != TAG_SEQUENCE {
+        return None;
+    }
+
+    // Each field is EXPLICIT, i.e. a constructed context tag wrapping the
+    // real value.
+    let mut cursor = outer.content;
+    while !cursor.is_empty() {
+        let field = read_tlv(cursor).ok()?;
+        cursor = field.rest;
+        match field.tag {
+            // [0] hashAlgorithm — AlgorithmIdentifier of the digest.
+            0xa0 => {
+                let alg = read_tlv_tagged(field.content, TAG_SEQUENCE).ok()?;
+                let alg_oid = read_tlv_tagged(alg.content, TAG_OID).ok()?;
+                out.hash = PssHash::from_digest_oid(alg_oid.content)?;
+            }
+            // [1] maskGenAlgorithm — AlgorithmIdentifier { id-mgf1, digest }.
+            0xa1 => {
+                let alg = read_tlv_tagged(field.content, TAG_SEQUENCE).ok()?;
+                let alg_oid = read_tlv_tagged(alg.content, TAG_OID).ok()?;
+                if alg_oid.content != OID_MGF1 {
+                    return None;
+                }
+                let inner = read_tlv_tagged(alg_oid.rest, TAG_SEQUENCE).ok()?;
+                let inner_oid = read_tlv_tagged(inner.content, TAG_OID).ok()?;
+                out.mgf_hash = PssHash::from_digest_oid(inner_oid.content)?;
+            }
+            // [2] saltLength — INTEGER.
+            0xa2 => {
+                let int = read_tlv_tagged(field.content, TAG_INTEGER).ok()?;
+                // Non-negative and small: a salt longer than a few hundred
+                // bytes cannot fit any modulus we support, and a negative one
+                // is malformed.
+                if int.content.is_empty() || int.content.len() > 4 || int.content[0] & 0x80 != 0 {
+                    return None;
+                }
+                let mut v: usize = 0;
+                for b in int.content {
+                    v = (v << 8) | (*b as usize);
+                }
+                out.salt_len = v;
+            }
+            // [3] trailerField — INTEGER, only 1 (0xbc) is defined.
+            0xa3 => {
+                let int = read_tlv_tagged(field.content, TAG_INTEGER).ok()?;
+                if int.content != [0x01] {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// Verify cert[i]'s signature against its issuer's SubjectPublicKeyInfo.
 ///
 /// Dispatches on `parsed.signature_algorithm_oid` (the outer
@@ -2011,39 +2542,117 @@ fn verify_one_signature(
     cert: &ParsedCert,
     issuer_spki: &[u8],
 ) -> Result<(), TrustError> {
-    use crate::crypto_impl::{parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256};
+    use crate::crypto_impl::{
+        parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256, Sha384, Sha512,
+    };
+    use cratonvm_native_builtins_crypto::signature::DigestAlgorithm;
 
     let oid = cert.signature_algorithm_oid.as_slice();
     let sig = cert.signature_value.as_slice();
     let tbs = cert.tbs_bytes.as_slice();
 
-    if oid == OID_SIG_SHA256_RSA {
-        // PKCS#1 v1.5 RSA-SHA256: hash(tbs) → EMSA-PKCS1-v1_5 envelope, then
-        // s^e mod n and byte-equality compare.
+    // PKCS#1 v1.5 RSA, digest chosen by OID. The verification core
+    // (`crypto::signature::verify_rsa_pkcs1_v15_checked`) is already
+    // digest-parameterised, so this is a dispatch table rather than a copy per
+    // algorithm — the in-tree `Rsa::pkcs1v15_encode`, whose DigestInfo prefix
+    // IS hard-coded to SHA-256, is not on this path.
+    let rsa_digest = if oid == OID_SIG_SHA256_RSA {
+        Some(DigestAlgorithm::Sha256)
+    } else if oid == OID_SIG_SHA1_RSA {
+        Some(DigestAlgorithm::Sha1)
+    } else if oid == OID_SIG_SHA384_RSA {
+        Some(DigestAlgorithm::Sha384)
+    } else if oid == OID_SIG_SHA512_RSA {
+        Some(DigestAlgorithm::Sha512)
+    } else {
+        None
+    };
+
+    if let Some(digest_alg) = rsa_digest {
         let pk = match parse_rsa_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
-        if Rsa::verify_sha256(&pk, tbs, sig) {
+        if Rsa::verify_pkcs1_v15(&pk, digest_alg, tbs, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
         }
-    } else if oid == OID_SIG_ECDSA_SHA256 {
-        // ECDSA-with-SHA256 over P-256: DER-decoded (r, s), check u1*G +
-        // u2*Q.x ≡ r (mod n). `verify_with_digest` takes a pre-hashed
-        // digest so we hash the TBS once here.
+    } else if oid == OID_SIG_ECDSA_SHA256
+        || oid == OID_SIG_ECDSA_SHA384
+        || oid == OID_SIG_ECDSA_SHA512
+    {
+        // ECDSA: DER-decoded (r, s), check u1*G + u2*Q.x ≡ r (mod n).
+        // `verify_with_digest` takes a PRE-HASHED digest and truncates it to
+        // the curve order's bit length itself (FIPS 186-4 §6.4), which is
+        // exactly why SHA-384/512 need no separate verify path — only the
+        // right hash over the TBS.
         let pk = match parse_ecdsa_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
-        let digest = Sha256::digest(tbs);
+        let digest: Vec<u8> = if oid == OID_SIG_ECDSA_SHA384 {
+            Sha384::digest(tbs).to_vec()
+        } else if oid == OID_SIG_ECDSA_SHA512 {
+            Sha512::digest(tbs).to_vec()
+        } else {
+            Sha256::digest(tbs).to_vec()
+        };
         if Ecdsa::verify_with_digest(&pk, &digest, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
         }
-    } else if oid == OID_SIG_DSA_SHA1 || oid == OID_SIG_RSA_PSS || oid == OID_SIG_ED25519 {
+    } else if oid == OID_SIG_RSA_PSS {
+        // RSASSA-PSS (1.2.840.113549.1.1.10). Unlike every other signature
+        // OID in this table, the OID alone does NOT say which digest was used,
+        // what digest MGF1 runs over, or how long the salt is — those live in
+        // the `RSASSA-PSS-params` AlgorithmIdentifier parameters, so they have
+        // to be parsed (`parse_rsa_pss_params`).
+        //
+        // Guessing them does not work, which is what the previous
+        // trial-three-digests-at-salt-length-hLen version measured: netty's
+        // `rsapss-ca-cert.cert` and the two `rsaValidation*.p12` fixtures are
+        // SHA-256 / MGF1-SHA-256 with a **20-byte** salt — RFC 4055 §3.1's
+        // DEFAULT saltLength, which is 20 whatever the digest is, not hLen.
+        // Every trial therefore failed and the chain came back
+        // `BadSignature`, i.e. a REJECTED chain and a `certificate_unknown`
+        // alert (`testRSASSAPSS`).
+        let params = match parse_rsa_pss_params(&cert.signature_algorithm_params) {
+            Some(p) => p,
+            // Unparseable or naming a digest we do not implement: structural,
+            // not cryptographic, so callers can still choose to delegate.
+            None => {
+                return Err(TrustError::NotImplemented {
+                    at,
+                    oid: oid.to_vec(),
+                })
+            }
+        };
+        let pk = match parse_rsa_public_key(issuer_spki) {
+            Some(k) => k,
+            None => return Err(TrustError::BadSignature { at }),
+        };
+        let n = pk.n.to_bytes_be();
+        let e = pk.e.to_bytes_be();
+        if crate::crypto_impl::rsa_verify_pss_ex(
+            &n,
+            &e,
+            params.hash,
+            params.mgf_hash,
+            params.salt_len,
+            tbs,
+            sig,
+        ) {
+            Ok(())
+        } else {
+            Err(TrustError::BadSignature { at })
+        }
+    } else if oid == OID_SIG_DSA_SHA1
+        || oid == OID_SIG_ED25519
+        || oid == OID_SIG_SHA224_RSA
+        || oid == OID_SIG_ECDSA_SHA224
+    {
         // Known-but-unimplemented. See OID const block for the rationale —
         // each of these needs additional parsing (PSS parameters) or a
         // distinct primitive (DSA, EdDSA) we don't expose at this layer yet.
@@ -3052,7 +3661,7 @@ pub fn check_endpoint_identity(
 // TrustManagerFactoryImpl$SimpleFactory: slot 0 = i32 tm_id.
 
 pub(crate) const FQN_SUN_X509_KM: &str = "sun/security/ssl/SunX509KeyManagerImpl";
-const FQN_X509_KM: &str = "sun/security/ssl/X509KeyManagerImpl";
+pub(crate) const FQN_X509_KM: &str = "sun/security/ssl/X509KeyManagerImpl";
 pub(crate) const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
 const FQN_PKIX_VALIDATOR: &str = "sun/security/validator/PKIXValidator";
 const FQN_KMF_SUN_X509: &str = "sun/security/ssl/KeyManagerFactoryImpl$SunX509";
@@ -3125,6 +3734,34 @@ fn register_trust_manager(r: &mut NativeMethodRegistry, fqn: &'static str) {
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
         check_server_trusted,
     );
+    // The `X509ExtendedTrustManager` overloads. `X509TrustManagerImpl` extends
+    // that class, so real bytecode — and, since 2026-08-13, this crate's own
+    // `t27_tls::engine_run_trust_check` — reaches these four rather than the
+    // two above whenever the manager is used with an `SSLEngine` or `Socket`.
+    //
+    // Registering only the two-argument pair left the object half-shimmed: the
+    // objects this module hands out are built with
+    // `try_alloc_concurrent_synthetic`, so no constructor ever ran and every
+    // instance field is null. The moment a three-argument call fell through to
+    // the real JDK body it died on
+    // `NullPointerException: Cannot invoke "ReentrantLock.lock()" because
+    // "this.validatorLock" is null`, which the caller then reported as
+    // `SSLHandshakeException: TrustManager rejected the peer certificate
+    // chain` — measured on netty's `SniHandlerTest.testSniWithAlpnHandler`,
+    // whose `X509TrustManagerWrapper` delegates the engine-flavoured overload
+    // straight through.
+    //
+    // The extra `Socket`/`SSLEngine` argument is advisory in JSSE (it exists so
+    // an implementation CAN consult the connection); the chain and authType are
+    // the whole input to the decision this module makes, so both overloads
+    // share the two-argument handlers, which ignore any surplus argument.
+    for desc in [
+        "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",
+        "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",
+    ] {
+        r.register(fqn, "checkClientTrusted", desc, check_client_trusted);
+        r.register(fqn, "checkServerTrusted", desc, check_server_trusted);
+    }
     r.register(
         fqn,
         "getAcceptedIssuers",
@@ -3815,9 +4452,13 @@ fn make_private_key_mirror(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let pk = try_alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4)?;
     // Same packing convention keystore.rs uses so the TLS path can decode
-    // the (km_id, alias_hash) pair.
+    // the (km_id, alias_hash) pair — plus [`KM_PROXY_TAG`], which says WHICH
+    // registry the high half indexes. Without the tag the two conventions are
+    // indistinguishable and `keystore::private_key_der_from_proxy` read this
+    // `km_id` as a KEYSTORE id.
     let alias_hash = fnv1a_32(alias.as_bytes());
-    let composite = ((km_id as i64 & 0xFFFF_FFFF) << 32) | (alias_hash as i64 & 0xFFFF_FFFF);
+    let composite =
+        KM_PROXY_TAG | ((km_id as i64 & 0xFFFF_FFFF) << 32) | (alias_hash as i64 & 0xFFFF_FFFF);
     let algo_idx = match classify_key_type_from_pkcs8(key_der) {
         "RSA" => 6,
         "EC" => 7,
@@ -3843,9 +4484,56 @@ fn make_private_key_mirror(
 /// `null` or a differently-shaped object).
 pub(crate) fn km_id_from_private_key_mirror(ctx: &dyn NativeContext, pk: ObjectRef) -> Option<i32> {
     match ctx.get_field(pk, 3) {
-        Value::Long(composite) => Some((composite >> 32) as i32),
+        Value::Long(composite) => Some(km_id_of_composite(composite)),
         _ => None,
     }
+}
+
+/// Marks a four-slot `java/security/PrivateKey` proxy whose field-3 composite
+/// indexes [`km_registry`] — a `KeyManager` id — rather than the keystore
+/// registry that `keystore::private_key_der_from_proxy` was written for.
+///
+/// Both producers pack `(id << 32) | alias_hash` into the same slot of the same
+/// class, and the two id spaces are independent counters, so the reader had no
+/// way to tell them apart and always chose the keystore. That is not a
+/// hypothetical: `KeyManager.getPrivateKey(alias).getEncoded()` returned the
+/// right DER only while `km_id` happened to name a live keystore holding an
+/// alias with the same FNV hash, and an EMPTY array as soon as the counters
+/// drifted apart. netty's `OpenSslCachingX509KeyManagerFactory.newProvider`
+/// calls `getKeyManagers()` twice, which was enough to drift them: every
+/// `chooseKeyMaterial` after it built a PEM with no body, and BoringSSL's
+/// `PEM_read_bio_PrivateKey` returned NULL without queueing an error, so
+/// tcnative reported the uninformative `Unable to load certificate key
+/// (error:00000000:invalid library (0))`.
+///
+/// Bit 62: no id counter reaches it, and it leaves the value positive so the
+/// `Long` round-trips through Java unchanged.
+const KM_PROXY_TAG: i64 = 1 << 62;
+
+/// The `km_id` half of a composite, with [`KM_PROXY_TAG`] removed.
+pub(crate) fn km_id_of_composite(composite: i64) -> i32 {
+    ((composite & !KM_PROXY_TAG) >> 32) as i32
+}
+
+/// Is this field-3 composite one of `make_private_key_mirror`'s — i.e. does its
+/// high half index [`km_registry`] rather than the keystore registry?
+pub(crate) fn is_km_proxy_composite(composite: i64) -> bool {
+    composite & KM_PROXY_TAG != 0
+}
+
+/// The PKCS#8 DER `km_id` holds for the alias whose FNV-1a hash is
+/// `alias_hash`. The proxy carries only the hash, so the alias is recovered by
+/// scanning this manager's own alias set — the same shape
+/// `keystore::private_key_der_from_proxy` uses, and bounded by the number of
+/// entries one `KeyManagerFactory` was initialised with.
+pub(crate) fn km_key_der_by_alias_hash(km_id: i32, alias_hash: u32) -> Option<Vec<u8>> {
+    let registry = km_registry().read();
+    let state = registry.get(&km_id)?;
+    state
+        .aliases_to_key
+        .iter()
+        .find(|(alias, _)| fnv1a_32(alias.as_bytes()) == alias_hash)
+        .map(|(_, der)| der.clone())
 }
 
 /// Look up the DER cert chain (leaf first) and PKCS#8 private-key DER
@@ -3923,8 +4611,58 @@ fn fnv1a_32(b: &[u8]) -> u32 {
     h
 }
 
-fn cert_exception(message: String) -> MethodCallFailed {
-    RuntimeError::IOException { message }.into()
+/// Throw a REAL `java.security.cert.CertificateException` for a failed PKIX
+/// check, rather than an `IOException` whose *message* merely names one.
+///
+/// `X509TrustManager.checkServerTrusted`/`checkClientTrusted` declare
+/// `throws CertificateException`, and **callers discriminate on the TYPE**:
+/// a TLS stack catches `CertificateException` to turn a validation failure
+/// into a handshake alert, and a test catches it to assert that an untrusted
+/// chain was in fact rejected. An `IOException` matches neither, so it sails
+/// straight through the `catch` that exists to handle exactly this.
+///
+/// `io.netty.handler.ssl.SslContextTrustManagerTest` is the witness: its two
+/// mixed-expectation tests (`testUsingCAsOneAandB`, `testUsingCAsOneAandTwo`)
+/// call `checkServerTrusted` inside `catch (CertificateException)` and assert
+/// the negative case was rejected. With an `IOException` the negative case
+/// escaped the catch and failed the test, while the two all-positive tests
+/// passed — so the symptom looked like "some chains do not validate" when the
+/// validation verdict was right and only its exception class was wrong.
+///
+/// Falls back to the historic `IOException` when the class cannot be
+/// constructed, so no configuration loses the failure entirely — the one
+/// thing that must never happen here is a silently-trusted connection.
+fn cert_exception(ctx: &mut dyn NativeContext, message: String) -> MethodCallFailed {
+    cert_exception_of(ctx, "java/security/cert/CertificateException", message)
+}
+
+/// [`cert_exception`] for a specific exception class — `CertPathValidatorException`
+/// on the `PKIXValidator.engineValidate` path, which declares that type rather
+/// than `CertificateException`.
+/// `pub(crate)` re-export of [`cert_exception`] for `tls.rs`'s
+/// `checkServerTrusted` path, so both trust-check entry points raise the same
+/// exception CLASS rather than agreeing only on the message text.
+pub(crate) fn cert_exception_external(
+    ctx: &mut dyn NativeContext,
+    message: String,
+) -> MethodCallFailed {
+    cert_exception(ctx, message)
+}
+
+fn cert_exception_of(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    message: String,
+) -> MethodCallFailed {
+    let msg = ctx.create_string(&message);
+    match ctx.new_object_initialized(
+        class_name,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IOException { message }.into(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4008,6 +4746,18 @@ fn get_private_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let id = get_km_id(ctx, this);
     let alias = read_string_at(ctx, args, 1).unwrap_or_default();
 
+    // A key with no encoding of its own is served BY REFERENCE — the caller
+    // asked for the `PrivateKey` object, and for an opaque key (PKCS#11, or
+    // netty's `OpenSslPrivateKey`) that object is the only usable answer. See
+    // `KeyManagerState::aliases_to_live_key`.
+    if let Some(live) = km_registry()
+        .read()
+        .get(&id)
+        .and_then(|s| s.aliases_to_live_key.get(&alias))
+        .copied()
+    {
+        return Ok(Some(Value::Object(Some(live))));
+    }
     let key_der = {
         let registry = km_registry().read();
         match registry.get(&id).and_then(|s| s.aliases_to_key.get(&alias)) {
@@ -4084,7 +4834,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let chain = read_chain_arg(ctx, &chain_val);
     if chain.is_empty() {
-        return Err(cert_exception("certificate chain is empty".into()));
+        return Err(cert_exception(ctx, "certificate chain is empty".into()));
     }
 
     let (trust, hit) = {
@@ -4113,7 +4863,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     match validate_chain(&chain, &trust) {
         Ok(()) => Ok(None),
-        Err(e) => Err(cert_exception(format!("CertificateException: {}", e))),
+        Err(e) => Err(cert_exception(ctx, e.to_string())),
     }
 }
 
@@ -4136,10 +4886,40 @@ fn get_accepted_issuers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let cls_id = ctx
         .ensure_class_initialized("java/security/cert/X509Certificate")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, ders.len());
+    let arr0 = ctx.new_ref_array(cls_id, ders.len());
+    // GC: `make_x509_mirror` allocates (a mirror object, its strings, its DER
+    // byte[]), so a moving young collection can relocate `arr` INSIDE this
+    // loop. Held raw, every `set_array_element` after that point wrote into
+    // the vacated slots and the live array kept whatever the collector put
+    // there — nulls, or unrelated objects the mirror building itself made.
+    //
+    // netty saw both faces of it on one call site
+    // (`ReferenceCountedOpenSslServerContext.newSessionContext` →
+    // `toBIO(alloc, manager.getAcceptedIssuers())`): intermittently
+    // `IllegalArgumentException: Null element in chain: [null × 32]`, and
+    // intermittently `NoSuchMethodError: sun.security.util.DerValue
+    // .getEncoded()` — a `DerValue` left in a vacated slot by the very
+    // certificate parsing this loop had just done. Same family as
+    // `t27_tls::attach_trust_managers_to_ctx`'s documented GC fix: a native
+    // local held live across an allocation.
+    let pin = ctx.pin_native_root(arr0);
+    let mut arr = arr0;
+    let mut failure = None;
     for (i, der) in ders.iter().enumerate() {
-        let mirror = make_x509_mirror(ctx, "trust-anchor", der);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
+        match make_x509_mirror(ctx, "trust-anchor", der) {
+            Ok(mirror) => {
+                arr = ctx.read_native_pin(pin, arr0);
+                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    if let Some(e) = failure {
+        return Err(e);
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -4154,7 +4934,7 @@ fn pkix_engine_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let _this = this_arg(args)?;
     let chain_val = match args.get(1) {
         Some(v) => v.clone(),
-        None => return Err(cert_exception("null chain".into())),
+        None => return Err(cert_exception(ctx, "null chain".into())),
     };
     let chain = read_chain_arg(ctx, &chain_val);
     let trust = build_trust_manager_state(0);
@@ -4168,7 +4948,11 @@ fn pkix_engine_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             };
             Ok(Some(Value::Object(Some(chain_arr))))
         }
-        Err(e) => Err(cert_exception(format!("CertPathValidatorException: {}", e))),
+        Err(e) => Err(cert_exception_of(
+            ctx,
+            "java/security/cert/CertPathValidatorException",
+            e.to_string(),
+        )),
     }
 }
 
@@ -4207,17 +4991,51 @@ fn kmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Object(None)))
 }
 
+/// Which `KeyManager` implementation class a `KeyManagerFactory` of this
+/// algorithm hands out.
+///
+/// The JDK has two, and the difference is observable: `SunX509` yields
+/// `sun.security.ssl.SunX509KeyManagerImpl`, while `PKIX` and its alias
+/// `NewSunX509` yield `sun.security.ssl.X509KeyManagerImpl`. CratonVM returned
+/// the `SunX509` class for every algorithm.
+///
+/// This is not cosmetic. Netty's `OpenSslCachingX509KeyManagerFactory.newProvider`
+/// branches on exactly this class name — `X509KeyManagerImpl` means "aliases are
+/// not stable and will change between invocations", so it must NOT cache key
+/// material against them. Reporting the `SunX509` class for a PKIX factory made
+/// netty cache where the JDK's own contract says it may not.
+///
+/// Both classes are already fully registered by `register_key_manager`, so this
+/// only decides which one to stamp on the mirror.
+pub(crate) fn km_mirror_class_for_algorithm(algorithm: &str) -> &'static str {
+    if algorithm.eq_ignore_ascii_case("PKIX") || algorithm.eq_ignore_ascii_case("NewSunX509") {
+        FQN_X509_KM
+    } else {
+        FQN_SUN_X509_KM
+    }
+}
+
 fn kmf_engine_get_key_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_km_id(ctx, this);
 
-    // Return a 1-element KeyManager[] holding a SunX509KeyManagerImpl mirror
-    // wired to the same id.
+    // Return a 1-element KeyManager[] holding the mirror class this factory's
+    // algorithm calls for. On the SPI route the algorithm is not a field — it
+    // is the SPI's own class (`KeyManagerFactoryImpl$SunX509` vs `$X509`), so
+    // read it from there.
+    let spi_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    let mirror = if spi_class.ends_with("$X509") || spi_class.ends_with("$PKIX") {
+        FQN_X509_KM
+    } else {
+        FQN_SUN_X509_KM
+    };
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/KeyManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
-    let km = try_alloc_concurrent_synthetic(ctx, FQN_SUN_X509_KM, 2)?;
+    let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
     set_km_id(ctx, km, id);
     ctx.set_array_element(arr, 0, Value::Object(Some(km)));
     Ok(Some(Value::Object(Some(arr))))
@@ -4675,6 +5493,49 @@ mod tests {
     }
 
     #[test]
+    fn validate_chain_accepts_an_expired_certificate_that_is_the_anchor_itself() {
+        // netty's `testMutualAuthDiffCerts` shape: a self-signed certificate
+        // that expired long ago, installed as the ONLY trust anchor and then
+        // presented by the peer as its own identity. RFC 5280 §6.1 validates
+        // the certificates on the path against the anchor; the anchor is not
+        // on the path, so its validity period is not one of the inputs. JSSE
+        // completes this handshake.
+        let expired_anchor = mk_cert(&CertSpec {
+            not_before_utc: "990101000000Z",
+            not_after_utc: "000101000000Z", // expired in 2000
+            subject_cn: "self-signed-and-trusted",
+            issuer_cn: "self-signed-and-trusted",
+            spki_alg: OID_RSA,
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH],
+            basic_constraints_ca: Some(false),
+            subject_alt_dns: &[],
+        });
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, expired_anchor.clone());
+        validate_chain(&[expired_anchor.clone()], &trust)
+            .expect("a presented certificate that IS the anchor is not path-validated");
+
+        // The exemption is by full DER, not by subject: a DIFFERENT expired
+        // certificate with the same subject is still expired.
+        let impostor = mk_cert(&CertSpec {
+            not_before_utc: "990101000000Z",
+            not_after_utc: "000101000000Z",
+            subject_cn: "self-signed-and-trusted",
+            issuer_cn: "self-signed-and-trusted",
+            spki_alg: OID_EC, // different SPKI => different DER
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH],
+            basic_constraints_ca: Some(false),
+            subject_alt_dns: &[],
+        });
+        match validate_chain(&[impostor], &trust) {
+            Err(TrustError::Expired { .. }) => {}
+            other => panic!("a same-subject impostor must still be Expired, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn validate_chain_rejects_when_no_trust_anchor() {
         let leaf = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
@@ -4933,6 +5794,12 @@ mod tests {
     /// produce the bytes the issuer signs and (after the signature is
     /// computed) to assemble the final SEQUENCE { tbs, sigAlg, sigValue }.
     fn build_tbs(spec: &SignedCertSpec) -> Vec<u8> {
+        build_tbs_with_alg(spec, &sig_alg_seq(spec.sig_alg_oid))
+    }
+
+    /// `build_tbs` with the whole `AlgorithmIdentifier` supplied, for the
+    /// algorithms whose parameters are not ASN.1 NULL (RSASSA-PSS).
+    fn build_tbs_with_alg(spec: &SignedCertSpec, sig_alg_der: &[u8]) -> Vec<u8> {
         let mut tbs: Vec<u8> = Vec::new();
         // version [0] EXPLICIT INTEGER 2 (v3)
         tbs.extend_from_slice(&der_context_explicit(0, &der_int(2)));
@@ -4940,7 +5807,7 @@ mod tests {
         tbs.extend_from_slice(&der_int(1));
         // signature alg (this MUST match the outer sigAlg byte-for-byte;
         // RFC 5280 §4.1.1.2 requires it)
-        let sig_alg_seq = der_seq([der_oid(spec.sig_alg_oid), der_tlv(TAG_NULL, &[])].concat());
+        let sig_alg_seq = sig_alg_der.to_vec();
         tbs.extend_from_slice(&sig_alg_seq);
         // issuer
         tbs.extend_from_slice(&name_with_cn(spec.issuer_cn));
@@ -4986,7 +5853,11 @@ mod tests {
     /// Assemble Certificate ::= SEQUENCE { tbs, sigAlgorithm, signatureValue }
     /// once `tbs` and `signature` bytes are known.
     fn assemble_cert(tbs: &[u8], sig_alg_oid: &[u8], signature: &[u8]) -> Vec<u8> {
-        let outer_sig_alg = sig_alg_seq(sig_alg_oid);
+        assemble_cert_with_alg(tbs, &sig_alg_seq(sig_alg_oid), signature)
+    }
+
+    fn assemble_cert_with_alg(tbs: &[u8], sig_alg_der: &[u8], signature: &[u8]) -> Vec<u8> {
+        let outer_sig_alg = sig_alg_der.to_vec();
         let sig_bs = der_bit_string(0, signature);
         let mut outer = Vec::with_capacity(tbs.len() + outer_sig_alg.len() + sig_bs.len());
         outer.extend_from_slice(tbs);
@@ -5072,6 +5943,84 @@ mod tests {
         let mut trust = TrustManagerState::default();
         insert_anchor(&mut trust, root.clone());
         validate_chain(&[leaf, root], &trust).expect("real RSA chain must validate");
+    }
+
+    /// A CROSS-SIGNED intermediate: the same subject and the same key
+    /// certified by two different roots, both supplied so that either root can
+    /// be the trust anchor. Only one of them is on the path to the configured
+    /// anchor; the other is an alternative, not a break — and this was refused
+    /// as `BrokenChain` until path building landed.
+    /// `io.netty.pkitesting.CertificateBuilderTest
+    /// .authenticatingCrossSignedCertificate` is the real-world case.
+    #[test]
+    fn validate_chain_builds_a_path_past_a_cross_signed_intermediate() {
+        let (trusted_pk, trusted_sk) = shared_rsa_root();
+        let trusted_spki = Rsa::public_key_to_der(trusted_pk);
+        let (other_pk, other_sk) = Rsa::generate_keypair(1024);
+        let other_spki = Rsa::public_key_to_der(&other_pk);
+        let (issuer_pk, issuer_sk) = Rsa::generate_keypair(1024);
+        let issuer_spki = Rsa::public_key_to_der(&issuer_pk);
+
+        let ca = |subject: &'static str, issuer: &'static str, spki: &[u8], sk: &RsaPrivateKey| {
+            mk_rsa_signed_cert(
+                &SignedCertSpec {
+                    not_before_utc: "200101000000Z",
+                    not_after_utc: "300101000000Z",
+                    subject_cn: subject,
+                    issuer_cn: issuer,
+                    spki_der: spki,
+                    sig_alg_oid: OID_SIG_SHA256_RSA,
+                    key_usage_bits: Some(KU_KEY_CERT_SIGN),
+                    ext_key_usages: &[],
+                    basic_constraints_ca: Some(true),
+                },
+                sk,
+            )
+        };
+
+        let trusted_root = ca("Trusted Root", "Trusted Root", &trusted_spki, trusted_sk);
+        // Same subject, same key, two different issuing roots.
+        let issuer_by_trusted = ca("Cross Issuer", "Trusted Root", &issuer_spki, trusted_sk);
+        let issuer_by_other = ca("Cross Issuer", "Other Root", &issuer_spki, &other_sk);
+        let leaf = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "300101000000Z",
+                subject_cn: "leaf.example.com",
+                issuer_cn: "Cross Issuer",
+                spki_der: &other_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[OID_KP_SERVER_AUTH],
+                basic_constraints_ca: Some(false),
+            },
+            &issuer_sk,
+        );
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, trusted_root);
+
+        // Presented with the intermediate that does NOT lead to the anchor
+        // first — the order netty's cross-signing test produces.
+        let r = validate_chain(
+            &[
+                leaf.clone(),
+                issuer_by_other.clone(),
+                issuer_by_trusted.clone(),
+            ],
+            &trust,
+        );
+        assert!(r.is_ok(), "cross-signed path must validate, got {r:?}");
+
+        // Already a valid path: must still validate, by the untouched
+        // presented-order route.
+        let r = validate_chain(&[leaf.clone(), issuer_by_trusted, issuer_by_other.clone()], &trust);
+        assert!(r.is_ok(), "already-ordered path must still validate, got {r:?}");
+
+        // Path building must NOT rescue a set with no path to the anchor:
+        // dropping the untrusted intermediate leaves a leaf with no issuer.
+        let r = validate_chain(&[leaf, issuer_by_other], &trust);
+        assert!(r.is_err(), "no path to the anchor must stay rejected, got {r:?}");
     }
 
     #[test]
@@ -5289,11 +6238,12 @@ mod tests {
 
     #[test]
     fn validate_chain_unknown_signature_oid_reports_not_implemented() {
-        // Build a chain where the leaf is signed with id-RSASSA-PSS — an OID
-        // the verifier knows but explicitly does not implement (no PSS
-        // parameter parsing today). The anchor is still RSA-SHA256-signed
-        // so the chain reaches Step 6 cleanly; the rejection comes from the
-        // leaf's OID dispatch.
+        // Build a chain where the leaf claims id-Ed25519 — an OID the
+        // verifier knows by name but does not implement (no EdDSA primitive
+        // at this layer). The anchor is RSA-SHA256-signed so the chain
+        // reaches Step 6 cleanly; the rejection comes from the leaf's OID
+        // dispatch, and must be structural (NotImplemented) rather than
+        // cryptographic, so callers can decide to delegate instead.
         let (root_pk, root_sk) = shared_rsa_root();
         let root_spki = Rsa::public_key_to_der(root_pk);
 
@@ -5312,11 +6262,74 @@ mod tests {
             root_sk,
         );
 
-        // Build the leaf's TBS with PSS OID, then sign with PKCS#1 v1.5
-        // anyway — the *signature bytes* don't matter; we only need the
-        // outer sigAlg OID to route to NotImplemented before we touch the
-        // cryptographic verifier.
+        // The *signature bytes* don't matter; we only need the outer sigAlg
+        // OID to route to NotImplemented before the cryptographic verifier.
         let tbs = build_tbs(&SignedCertSpec {
+            not_before_utc: "200101000000Z",
+            not_after_utc: "300101000000Z",
+            subject_cn: "ed25519-leaf",
+            issuer_cn: "Real RSA Root",
+            spki_der: &root_spki,
+            sig_alg_oid: OID_SIG_ED25519,
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH],
+            basic_constraints_ca: Some(false),
+        });
+        let fake_sig = Rsa::sign_sha256(root_sk, &tbs);
+        let leaf = assemble_cert(&tbs, OID_SIG_ED25519, &fake_sig);
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+        match validate_chain(&[leaf, root], &trust) {
+            Err(TrustError::NotImplemented { at, oid }) => {
+                assert_eq!(at, 0);
+                assert_eq!(oid, OID_SIG_ED25519.to_vec());
+            }
+            other => panic!("expected NotImplemented for Ed25519, got {:?}", other),
+        }
+    }
+
+    /// `AlgorithmIdentifier` for RSASSA-PSS with SHA-256, MGF1-SHA-256 and an
+    /// explicit salt length — the shape netty's `rsapss-ca-cert.cert` and the
+    /// two `rsaValidation*.p12` fixtures carry.
+    fn pss_sha256_alg_id(salt_len: u8) -> Vec<u8> {
+        const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+        let sha256 = der_seq([der_oid(OID_SHA256), der_tlv(TAG_NULL, &[])].concat());
+        let mgf = der_seq([der_oid(OID_MGF1), sha256.clone()].concat());
+        let params = der_seq(
+            [
+                der_tlv(0xa0, &sha256),
+                der_tlv(0xa1, &mgf),
+                der_tlv(0xa2, &der_int(salt_len)),
+            ]
+            .concat(),
+        );
+        der_seq([der_oid(OID_SIG_RSA_PSS), params].concat())
+    }
+
+    #[test]
+    fn validate_chain_rsa_pss_uses_the_params_salt_length_not_hlen() {
+        use crate::crypto_impl::{rsa_sign_pss_ex, PssHash};
+
+        let (root_pk, root_sk) = shared_rsa_root();
+        let root_spki = Rsa::public_key_to_der(root_pk);
+
+        let root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Real RSA Root",
+                issuer_cn: "Real RSA Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            root_sk,
+        );
+
+        let leaf_spec = SignedCertSpec {
             not_before_utc: "200101000000Z",
             not_after_utc: "300101000000Z",
             subject_cn: "pss-leaf",
@@ -5326,19 +6339,60 @@ mod tests {
             key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
             ext_key_usages: &[OID_KP_SERVER_AUTH],
             basic_constraints_ca: Some(false),
-        });
-        let fake_sig = Rsa::sign_sha256(root_sk, &tbs);
-        let leaf = assemble_cert(&tbs, OID_SIG_RSA_PSS, &fake_sig);
+        };
+        // saltLength 20 with a SHA-256 digest: RFC 4055's default, and what
+        // the netty fixtures use. The salt length is NOT hLen.
+        let alg = pss_sha256_alg_id(20);
+        let tbs = build_tbs_with_alg(&leaf_spec, &alg);
+
+        let sig20 = rsa_sign_pss_ex(root_sk, PssHash::Sha256, PssHash::Sha256, 20, &tbs);
+        let leaf = assemble_cert_with_alg(&tbs, &alg, &sig20);
 
         let mut trust = TrustManagerState::default();
         insert_anchor(&mut trust, root.clone());
-        match validate_chain(&[leaf, root], &trust) {
-            Err(TrustError::NotImplemented { at, oid }) => {
-                assert_eq!(at, 0);
-                assert_eq!(oid, OID_SIG_RSA_PSS.to_vec());
-            }
-            other => panic!("expected NotImplemented for PSS, got {:?}", other),
+        validate_chain(&[leaf, root.clone()], &trust)
+            .expect("PSS chain with saltLength=20 must validate");
+
+        // The regression this pins: a verifier that assumes salt == hLen
+        // accepts THIS signature and rejects the one above. Both directions
+        // are checked, so neither assumption can be reintroduced silently.
+        let sig32 = rsa_sign_pss_ex(root_sk, PssHash::Sha256, PssHash::Sha256, 32, &tbs);
+        let leaf_wrong_salt = assemble_cert_with_alg(&tbs, &alg, &sig32);
+        match validate_chain(&[leaf_wrong_salt, root], &trust) {
+            Err(TrustError::BadSignature { at }) => assert_eq!(at, 0),
+            other => panic!("saltLength mismatch must be BadSignature, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_rsa_pss_params_defaults_and_explicit_fields() {
+        use crate::crypto_impl::PssHash;
+
+        // Absent parameters => RFC 4055 defaults, which are NOT internally
+        // consistent: SHA-1 with a 20-byte salt.
+        let d = parse_rsa_pss_params(&[]).expect("absent params are the defaults");
+        assert_eq!(d.hash, PssHash::Sha1);
+        assert_eq!(d.mgf_hash, PssHash::Sha1);
+        assert_eq!(d.salt_len, 20);
+        // An explicit NULL means the same thing.
+        assert_eq!(parse_rsa_pss_params(&der_tlv(TAG_NULL, &[])), Some(d));
+
+        // The netty shape: SHA-256 / MGF1-SHA-256 / salt 20.
+        let alg = pss_sha256_alg_id(20);
+        let inner = read_tlv_tagged(&alg, TAG_SEQUENCE).unwrap();
+        let oid = read_tlv_tagged(inner.content, TAG_OID).unwrap();
+        let p = parse_rsa_pss_params(oid.rest).expect("netty-shaped params parse");
+        assert_eq!(p.hash, PssHash::Sha256);
+        assert_eq!(p.mgf_hash, PssHash::Sha256);
+        assert_eq!(p.salt_len, 20);
+
+        // A digest we do not implement is a refusal, not a silent default.
+        const OID_SHA3_256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08];
+        let bad = der_seq(der_tlv(
+            0xa0,
+            &der_seq([der_oid(OID_SHA3_256), der_tlv(TAG_NULL, &[])].concat()),
+        ));
+        assert_eq!(parse_rsa_pss_params(&bad), None);
     }
 
     // ====================================================================

@@ -1228,7 +1228,7 @@ pub(crate) fn create_string_or_oom(
     if let Some(obj) = try_new_string(shared, text) {
         return Ok(obj);
     }
-    g1_force_full_cycle(shared, thread);
+    last_ditch_reclaim(shared, thread);
     if let Some(obj) = try_new_string(shared, text) {
         return Ok(obj);
     }
@@ -1260,7 +1260,7 @@ pub(crate) fn create_string_from_units_or_oom(
     if let Some(obj) = try_new_string(shared, units) {
         return Ok(obj);
     }
-    g1_force_full_cycle(shared, thread);
+    last_ditch_reclaim(shared, thread);
     if let Some(obj) = try_new_string(shared, units) {
         return Ok(obj);
     }
@@ -1722,7 +1722,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // Eden evacuation. Finish the G1 mark/remark/cleanup synchronously so
         // dead old regions, weak loaders, and their metadata are observable
         // before System.gc() returns.
-        g1_force_full_cycle(shared, thread);
+        last_ditch_reclaim(shared, thread);
     }
     // Run pending finalizers
     run_finalizers(shared, thread);
@@ -1865,12 +1865,20 @@ fn run_cleaner_actions_impl(shared: &SharedVm, thread: &mut JvmThread, force: bo
         // See `native_phantom_ref_init` for why these arrive here at all.
         {
             let class_id = shared.mem.heap.class_id_of(cleanable);
-            let is_jdk_cleaner = shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(class_id)
-                .is_some_and(|c| c.name.as_ref() == "jdk/internal/ref/Cleaner");
+            let (is_jdk_cleaner, shaped) = {
+                let cm = shared.classes.class_manager.read();
+                (
+                    cm.get_class(class_id)
+                        .is_some_and(|c| c.name.as_ref() == "jdk/internal/ref/Cleaner"),
+                    is_cleanable_shaped(&cm, shared, cleanable),
+                )
+            };
+            // See `is_cleanable_shaped`. The submit side screens too, but the
+            // queue survives collections between the two, so the write site
+            // checks for itself rather than trusting an older verdict.
+            if !shaped {
+                continue;
+            }
             if is_jdk_cleaner {
                 // Errors are swallowed per the Cleaner contract, exactly as for
                 // the `Cleanable` arm below.
@@ -2011,6 +2019,37 @@ pub(super) fn gc_reference_next_slot(shared: &SharedVm) -> usize {
         // Reference object exists to enqueue; this fallback only guards
         // against that invariant somehow not holding.
         .unwrap_or(2)
+}
+
+/// True when the object at `cleanable` still has a shape a pending Cleaner
+/// action can legitimately have.
+///
+/// Two shapes reach the cleaner queue, and both are checked because both are
+/// registered: the real JDK's `jdk.internal.ref.Cleaner` and
+/// `jdk.internal.ref.PhantomCleanable` are `java.lang.ref.Reference` subclasses
+/// (discovered from the `PhantomReference.<init>` native), and the synthetic
+/// Cleanable that `phases_late`/`servlet` build implements
+/// `java.lang.ref.Cleaner$Cleanable`. Anything else at the address means the
+/// address was reclaimed and its slot reused.
+///
+/// Why it matters, and it is not the same bug as the queue-head one:
+/// `run_cleaner_actions_impl` WRITES slot 1 (the cleaned flag) and NULLS slot 0
+/// (the action) before it invokes anything. Through a reused address that is a
+/// field-0 null on an innocent object — on a `java.lang.String` it nulls
+/// `value`, and the `byte[]` that vanishes surfaces far away, in a frame with no
+/// connection to the GC, as H2 `TestMultiThread.testViews`'
+/// `NullPointerException: Cannot read the array length because "<local4>" is
+/// null`. Measured 2026-08-16: that NPE outlived the `ReferenceQueue` fixes in
+/// this file and was still reproducible under `-XX:+UseGenerationalGC`, which is
+/// how this second producer was separated from the first.
+fn is_cleanable_shaped(
+    cm: &crate::classloading::ClassManager,
+    shared: &SharedVm,
+    cleanable: ObjectRef,
+) -> bool {
+    let cid = shared.mem.heap.class_id_of(cleanable);
+    cm.is_assignable_to_name(cid, "java/lang/ref/Reference")
+        || cm.is_assignable_to_name(cid, "java/lang/ref/Cleaner$Cleanable")
 }
 
 /// Process weak/soft references after a GC cycle.
@@ -2178,6 +2217,15 @@ pub(super) fn process_references_after_gc(
     // ClassManager is rank L10 and the reference processor is L7, so resolve
     // the JDK field before acquiring the lower-ranked processor lock.
     let reference_next_slot = gc_reference_next_slot(shared);
+    // Same rank rule, one step further: the shape guard below asks the class
+    // hierarchy a question per entry, so its read guard is taken HERE — L10
+    // before L7 — and held across the two loops rather than reacquired inside
+    // them. Nothing between this line and the `drop` after the enqueue loop
+    // touches the ClassManager for writing; the mirror/loader reconciliation
+    // that does is all above, before this point.
+    let class_manager = shared.classes.class_manager.read();
+    let reference_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/Reference");
+    let queue_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/ReferenceQueue");
     let mut ref_proc = shared.mem.ref_processor.lock();
 
     // An object is "marked" (survived GC) if:
@@ -2266,6 +2314,46 @@ pub(super) fn process_references_after_gc(
                 .watched_pre_gc_addr_survived(addr, pointer_map)
     };
 
+    // SHAPE GUARD (H2 `TestMultiThread`, 2026-08-16). Everything on the
+    // processor's cleared / to-enqueue lists is a `java.lang.ref.Reference` and
+    // a `java.lang.ref.ReferenceQueue` by construction — so if the object now
+    // sitting at the recorded address is neither, the address no longer names
+    // what the processor recorded and every write below would land on an
+    // innocent occupant.
+    //
+    // `num_fields >= 2` was the only shape test the two loops had, and it is a
+    // coincidence rather than a check: a `java.lang.String` has four
+    // (`value`, `coder`, `hash`, `hashIsZero`) and passes it, as does almost
+    // every other class. Both failure modes were measured, one run apart, from
+    // concurrent `DriverManager.getConnection` on this suite:
+    //
+    // * the ENQUEUE loop published the reusing object as the queue head and
+    //   `ReferenceQueue.poll()` handed it straight back —
+    //   `ClassCastException: class java.lang.String cannot be cast to class
+    //   org.h2.util.CloseWatcher` out of `CloseWatcher.pollUnclosed`, and the
+    //   same cast against `sun.nio.ch.FileLockTable$FileLockReference` out of
+    //   `FileLockTable.removeStaleEntries` — two unrelated JDK/app call sites,
+    //   one bug;
+    // * the CLEARED loop nulled field 0, which on a `String` is `value`, a
+    //   `byte[]` — surfacing far away as `NullPointerException: Cannot read the
+    //   array length because "<local4>" is null`.
+    //
+    // `None` (the class not loaded) means no Reference object can exist yet, so
+    // the guard has nothing to judge and admits — it must never be the thing
+    // that silently stops reference processing on a stripped image.
+    let is_reference_shaped = |obj: ObjectRef| -> bool {
+        match reference_cid {
+            Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
+            None => true,
+        }
+    };
+    let is_queue_shaped = |obj: ObjectRef| -> bool {
+        match queue_cid {
+            Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
+            None => true,
+        }
+    };
+
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
     // `cleared_ref_objects()` re-emitted every ever-cleared Reference on
@@ -2278,7 +2366,22 @@ pub(super) fn process_references_after_gc(
         // address absent from the pointer map did NOT survive this GC —
         // writing the `Object(None)` clear through it would corrupt the
         // memory's new occupant (the PROVEN bc-math-ec 0x4 writer).
-        if is_stale_young(ref_addr) {
+        // Test the RELOCATED address, not the pre-GC one.
+        //
+        // The write below already goes through `pointer_map`-relocated
+        // `actual_addr`; this guard used to test `ref_addr`, so for a survivor
+        // that MOVED the two disagreed about which object they meant. Under a
+        // non-moving collector they are the same address and it never
+        // mattered; ZGC began compacting on 2026-08-13, and from then every
+        // Reference the slide moved was judged dead here and silently never
+        // cleared or enqueued — no `WeakReference` delivery and no `Cleaner`
+        // action for it, which on netty is how a direct `ByteBuf`'s native
+        // memory stops being freed.
+        //
+        // A no-op wherever the map is empty, i.e. every non-moving cycle on
+        // every backend.
+        let relocated = pointer_map.get(&ref_addr).copied().unwrap_or(ref_addr);
+        if is_stale_young(relocated) {
             if straystack_enabled() {
                 eprintln!("[refproc] SKIP dead CLEARED ref @0x{ref_addr:x} (young, not in map)");
             }
@@ -2302,6 +2405,14 @@ pub(super) fn process_references_after_gc(
             }
             continue;
         }
+        // See `is_reference_shaped`: the field-count test above cannot tell a
+        // reclaimed-and-reused slot from the Reference that used to be there.
+        if !is_reference_shaped(obj_ref) {
+            if straystack_enabled() {
+                eprintln!("[refproc] SKIP reshaped CLEARED ref @0x{actual_addr:x} (not a Reference)");
+            }
+            continue;
+        }
         shared.mem.heap.set_field(obj_ref, 0, Value::Object(None));
     }
 
@@ -2313,7 +2424,13 @@ pub(super) fn process_references_after_gc(
         // enqueue when either the Reference or its queue did not survive —
         // the head/size/next writes below through a stale address are the
         // same proven corruption class as the cleared-referent write.
-        if is_stale_young(*ref_addr) || is_stale_young(*queue_addr) {
+        // Relocated addresses, for the reason on the cleared loop above: the
+        // enqueue writes below resolve through the map, so the guard has to as
+        // well or a moved Reference (or a moved ReferenceQueue) is declined as
+        // dead.
+        let ref_reloc = pointer_map.get(ref_addr).copied().unwrap_or(*ref_addr);
+        let q_reloc = pointer_map.get(queue_addr).copied().unwrap_or(*queue_addr);
+        if is_stale_young(ref_reloc) || is_stale_young(q_reloc) {
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP dead ENQUEUE ref@0x{ref_addr:x}/q@0x{queue_addr:x} (young, not in map)"
@@ -2356,6 +2473,18 @@ pub(super) fn process_references_after_gc(
                     actual_ref,
                     shared.mem.heap.num_fields(ref_obj),
                     actual_q,
+                );
+            }
+            continue;
+        }
+        // See `is_reference_shaped`: this is the loop that published a
+        // `java.lang.String` as a `ReferenceQueue` head. Both participants are
+        // checked — a reused QUEUE slot would take the head/size writes just as
+        // wrongly, and a live Reference linked into it would be stranded there.
+        if !is_reference_shaped(ref_obj) || !is_queue_shaped(q_obj) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reshaped ENQUEUE ref @0x{actual_ref:x} into q@0x{actual_q:x} (not Reference/ReferenceQueue)"
                 );
             }
             continue;
@@ -2438,6 +2567,21 @@ pub(super) fn process_references_after_gc(
             .get(action_addr)
             .copied()
             .unwrap_or(*action_addr);
+        // SAFETY: `actual` is the post-relocation address of an object the
+        // processor is holding live for this submission.
+        let action_obj = unsafe { ObjectRef::from_raw(actual as *mut u8) };
+        // See `is_cleanable_shaped`: `run_cleaner_actions` NULLS slot 0 of
+        // whatever it dequeues, so a reused address costs an innocent object its
+        // first field. Screening at submit keeps the dead address out of a queue
+        // that outlives this collection.
+        if !is_cleanable_shaped(&class_manager, shared, action_obj) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reshaped CLEANER action @0x{actual:x} (not a Reference/Cleanable)"
+                );
+            }
+            continue;
+        }
         shared.mem.cleaner_thread.submit_action(actual);
     }
 
@@ -2459,10 +2603,19 @@ pub(super) fn process_references_after_gc(
     // null slot. Runs before `update_after_gc` so processor addresses are still
     // the pre-collection (pointer-map key) view.
     if weakref_clear_enabled() {
-        let active = ref_proc.weak_phantom_active_pairs();
+        let mut active = ref_proc.weak_phantom_active_pairs();
+        // SOFT-CLEAR GAP (2026-08-15): the pre-collection pass also nulled the
+        // referent slot of every soft entry its LRU policy condemned. The ones
+        // still active here are the condemned entries whose referent turned
+        // out to be strongly reachable anyway, so `process_soft_refs` kept
+        // them -- and their slot 0 must be written back for exactly the reason
+        // a surviving weak referent's must be. The loop below is already
+        // generic over `(reference_obj, referent)` pairs, so they ride it.
+        active.extend(ref_proc.soft_pre_nulled_active_pairs());
         if dbg_weakref() && !active.is_empty() {
             eprintln!(
-                "[weakref] post-gc restore pass: {} surviving weak/phantom referent(s)",
+                "[weakref] post-gc restore pass: {} surviving referent(s) \
+                 (weak/phantom + policy-kept soft)",
                 active.len()
             );
         }
@@ -2509,7 +2662,7 @@ pub(super) fn process_references_after_gc(
             // the memory's new occupant, and writing slot 0 of it corrupts an
             // unrelated object (or trips the `gen_heap` OOB guard, which is how
             // this was found).
-            if shared.mem.heap.num_fields(ro) < 2 {
+            if shared.mem.heap.num_fields(ro) < 2 || !is_reference_shaped(ro) {
                 if straystack_enabled() {
                     eprintln!(
                         "[refproc] SKIP stale weak/phantom RESTORE ref @0x{:x} (num_fields={})",
@@ -2548,10 +2701,12 @@ pub(super) fn process_references_after_gc(
             // live (relocated target, or unmoved and in a live region), so its
             // object header is mapped and readable.
             let o = unsafe { ObjectRef::from_raw(cur as *mut u8) };
-            shared.mem.heap.num_fields(o) >= 2
+            shared.mem.heap.num_fields(o) >= 2 && is_reference_shaped(o)
         };
         ref_proc.retain_shaped_weak_phantom(&still_a_reference);
     }
+    // Every shape guard above is done; release the L10 read guard.
+    drop(class_manager);
 
     // Relocate all addresses in the ref processor to match the new heap layout
     ref_proc.update_after_gc(pointer_map);
@@ -3242,8 +3397,13 @@ pub(super) fn tlab_alloc_shaped_inner(
     }
     if let Some((buf, size)) = refill {
         shared.mem.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
+        // Read the outgoing TLAB's running per-thread allocation total before
+        // the struct is replaced — `Tlab::new` starts a fresh one at zero, and
+        // `getThreadAllocatedBytes` must not go backwards at a refill.
+        let carried = thread.tlab.thread_allocated_bytes();
         // SAFETY: buf and size were just returned by the arena allocator and the memory is zeroed.
         thread.tlab = unsafe { cratonvm_gc::Tlab::new(buf, size) };
+        thread.tlab.adopt_allocation_total(carried);
         // Start the new refill-window timer so `next_refill_size`
         // measures this TLAB's lifetime from the moment we installed it.
         thread.tlab.begin_refill(size);
@@ -3326,6 +3486,10 @@ pub(crate) fn alloc_object_shared(
             .mem
             .bytes_allocated_total
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        // Same bytes, per thread — the counter behind
+        // `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`. It cannot
+        // come from the TLAB cursor here, because this object never touched it.
+        thread.tlab.note_external_allocation(total_size);
         return Ok(obj);
     }
     // Retire TLAB before GC — its memory is in the arena that will be collected
@@ -3358,12 +3522,13 @@ pub(crate) fn alloc_object_shared(
             .bytes_allocated_total
             // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        thread.tlab.note_external_allocation(total_size);
         return Ok(obj);
     }
     // G1 last-ditch: see `gc_alloc_array` — dead Old/humongous spans need a
     // completed mark cycle's cleanup; run one synchronously and retry once.
-    g1_force_full_cycle(shared, thread);
-    shared
+    last_ditch_reclaim(shared, thread);
+    let obj = shared
         .mem
         .heap
         .try_alloc_object_full(class_id, num_fields)
@@ -3380,7 +3545,9 @@ pub(crate) fn alloc_object_shared(
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
             }))
-        })
+        })?;
+    thread.tlab.note_external_allocation(total_size);
+    Ok(obj)
 }
 
 /// T1.7.7 — write an HPROF heap dump when allocation fails and the
@@ -3520,11 +3687,19 @@ pub(super) fn gc_alloc_array(
     if let Some(arr) = tlab_alloc_array(thread, shared, class_id, element_type, length) {
         return Ok(arr);
     }
+    // Everything below this line bypasses the TLAB, so the thread's allocation
+    // counter (`Tlab::thread_allocated_bytes`, read by
+    // `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`) sees none of
+    // it from the cursor. Record it explicitly — arrays are precisely the
+    // shape that skips the TLAB, so an unrecorded array path would make the
+    // counter report a small fraction of a buffer-allocating workload.
+    let external_bytes = external_array_bytes(element_type, length);
     if let Some(arr) = shared
         .mem
         .heap
         .try_alloc_array_full(class_id, element_type, length)
     {
+        thread.tlab.note_external_allocation(external_bytes);
         return Ok(arr);
     }
     // Retire TLAB before GC
@@ -3545,13 +3720,14 @@ pub(super) fn gc_alloc_array(
         .heap
         .try_alloc_array_full(class_id, element_type, length)
     {
+        thread.tlab.note_external_allocation(external_bytes);
         return Ok(arr);
     }
     // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
     // spans — only a completed mark cycle's cleanup can. Run one
     // synchronously and retry once before surfacing OOM.
-    g1_force_full_cycle(shared, thread);
-    shared
+    last_ditch_reclaim(shared, thread);
+    let arr = shared
         .mem
         .heap
         .try_alloc_array_full(class_id, element_type, length)
@@ -3560,7 +3736,23 @@ pub(super) fn gc_alloc_array(
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
             }))
-        })
+        })?;
+    thread.tlab.note_external_allocation(external_bytes);
+    Ok(arr)
+}
+
+/// Footprint, in bytes, of an array that is about to be allocated outside the
+/// TLAB — header plus payload, computed the same way [`tlab_alloc_array`]
+/// computes `total_size`.
+///
+/// Saturating rather than checked: this feeds a monitoring counter, and an
+/// array whose data size overflows `usize` is about to fail its allocation
+/// anyway. Reporting the clamped figure keeps this off the error path.
+#[inline]
+fn external_array_bytes(element_type: ArrayElementType, length: usize) -> usize {
+    use cratonvm_gc::heap::ARRAY_DATA_OFFSET;
+    let data = cratonvm_gc::heap::array_data_size_checked(length, element_type).unwrap_or(0);
+    ARRAY_DATA_OFFSET.saturating_add(data)
 }
 
 /// Update the thread's root snapshot with current frame ObjectRefs.
@@ -4997,7 +5189,14 @@ pub(super) fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread
         // SATB activation must reach the global queue before the
         // marker starts consuming it.
         shared.mem.heap.flush_thread_satb();
-        shared.mem.heap.g1_start_concurrent_mark();
+        // SAFETY (I-17): `stw_take_over_and_wait` above has parked every other
+        // mutator at a safepoint (or forcibly stopped and conservatively
+        // scanned it), and `taken` is still held, so this thread is the only
+        // mutator for the whole initial-mark block below. G1's mark-cycle entry
+        // points now require this witness for the same reason `collect_garbage`
+        // does: they reclassify and free regions.
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+        shared.mem.heap.g1_start_concurrent_mark(&stw);
         // INT-8: publish the referent-slot skip set for this cycle —
         // the Weak/Soft/Phantom Reference OBJECT addresses currently
         // registered. Inside this STW the snapshot is consistent (no
@@ -5018,7 +5217,7 @@ pub(super) fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread
             // INT-3 — frozen in-JIT peers' conservative register/stack roots.
             .chain(xt_roots.into_iter())
             .collect();
-        shared.mem.heap.g1_mark_roots(&all_roots);
+        shared.mem.heap.g1_mark_roots(&stw, &all_roots);
         tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
@@ -5125,10 +5324,14 @@ pub(super) fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread)
         let mut process = |is_live: &dyn Fn(usize) -> bool| -> Vec<usize> {
             g1_remark_process_references(shared, is_live)
         };
+        // SAFETY (I-17): same pause as above — `stw_take_over_and_wait` parked
+        // every other mutator and `taken` is still held. The remark drain and
+        // cleanup that follow are STW phases; the token is their witness.
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let completed = shared
             .mem
             .heap
-            .g1_final_remark_and_cleanup(&all_roots, Some(&mut process));
+            .g1_final_remark_and_cleanup(&stw, &all_roots, Some(&mut process));
         tracing::debug!(
             "[G1] Final remark: {} roots, cycle_completed={}",
             all_roots.len(),
@@ -5212,6 +5415,24 @@ pub(super) fn g1_remark_process_references(
     // See `process_references_after_gc`: ClassManager must be consulted
     // before taking the lower-ranked reference-processor lock.
     let reference_next_slot = gc_reference_next_slot(shared);
+    // See `process_references_after_gc`: same L10-before-L7 acquisition, same
+    // shape guard, for the same reason — `is_marked` says the ADDRESS survived,
+    // not that the object at it is still the Reference the processor recorded.
+    let class_manager = shared.classes.class_manager.read();
+    let reference_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/Reference");
+    let queue_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/ReferenceQueue");
+    let is_reference_shaped = |obj: ObjectRef| -> bool {
+        match reference_cid {
+            Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
+            None => true,
+        }
+    };
+    let is_queue_shaped = |obj: ObjectRef| -> bool {
+        match queue_cid {
+            Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
+            None => true,
+        }
+    };
     let mut ref_proc = shared.mem.ref_processor.lock();
     let result = ref_proc.process_references(is_marked, free_mb, 0);
 
@@ -5227,7 +5448,7 @@ pub(super) fn g1_remark_process_references(
         // SAFETY: `ref_addr` is a registry address kept current by the
         // per-pause `update_after_gc`; nothing has been freed since.
         let obj_ref = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-        if shared.mem.heap.num_fields(obj_ref) < 2 {
+        if shared.mem.heap.num_fields(obj_ref) < 2 || !is_reference_shaped(obj_ref) {
             continue; // belt-and-suspenders, mirrors the post-GC path
         }
         // SATB-suppressed: the clear is a decided verdict, not a semantic
@@ -5251,7 +5472,11 @@ pub(super) fn g1_remark_process_references(
         // SAFETY: registry addresses, current as above; both marked live.
         let ref_obj = unsafe { ObjectRef::from_raw(*ref_addr as *mut u8) };
         let q_obj = unsafe { ObjectRef::from_raw(*queue_addr as *mut u8) };
-        if shared.mem.heap.num_fields(q_obj) < 2 || shared.mem.heap.num_fields(ref_obj) < 2 {
+        if shared.mem.heap.num_fields(q_obj) < 2
+            || shared.mem.heap.num_fields(ref_obj) < 2
+            || !is_reference_shaped(ref_obj)
+            || !is_queue_shaped(q_obj)
+        {
             continue;
         }
         // Same linked-list protocol as the post-GC path: head/size on the
@@ -5275,6 +5500,8 @@ pub(super) fn g1_remark_process_references(
         shared.mem.heap.set_field(q_obj, 1, Value::Int(size + 1));
         shared.mem.heap.set_field(ref_obj, 1, Value::Int(1)); // enqueued sentinel
     }
+    // Shape guards done; see the post-GC path.
+    drop(class_manager);
 
     // Everything handed out below must survive this cycle's cleanup — the
     // caller marks these and re-drains the closure before any region is
@@ -5349,6 +5576,48 @@ pub(super) fn g1_remark_process_references(
 /// marker never quiesces or the STW races never resolve — the caller then
 /// proceeds to OOM; this can delay an inevitable OOM slightly but never
 /// hangs the allocation path.
+/// The whole final rung of the allocation-failure ladder: everything the VM
+/// can still do to satisfy an allocation that has already failed once, before
+/// the caller is entitled to throw `OutOfMemoryError`.
+///
+/// Two steps, in order, because they reclaim disjoint things:
+///
+/// 1. [`g1_force_full_cycle`] — dead Old and humongous regions, which only a
+///    completed mark cycle's cleanup reclaims. G1 only.
+/// 2. [`last_ditch_clear_soft_refs`] — every softly-reachable object, on every
+///    collector. `java.lang.ref`'s guarantee is unconditional: all soft
+///    references to softly-reachable objects are cleared before the VM throws
+///    `OutOfMemoryError`. CratonVM honoured only the LRU half of the soft-ref
+///    policy, which by construction never fires for the reference the failing
+///    program is itself reading in a loop.
+pub(crate) fn last_ditch_reclaim(shared: &SharedVm, thread: &mut JvmThread) {
+    g1_force_full_cycle(shared, thread);
+    last_ditch_clear_soft_refs(shared, thread);
+}
+
+/// Collect once with every SoftReference condemned — see
+/// `ReferenceProcessor::condemn_all_soft_refs` for the rule and
+/// `with_last_ditch_soft_clear` for why the arming is thread-local.
+///
+/// Skipped outright when the application holds no live soft references, which
+/// is the common case; a heap that is genuinely full then pays no extra GC on
+/// its way to `OutOfMemoryError`.
+fn last_ditch_clear_soft_refs(shared: &SharedVm, thread: &mut JvmThread) {
+    if !weakref_clear_enabled() {
+        // The opt-out restores the legacy never-clearing behaviour wholesale;
+        // that has to include this rule, or `CRATONVM_WEAKREF_CLEAR=0` would
+        // no longer be the byte-identical safety net it is documented to be.
+        return;
+    }
+    if !shared.mem.ref_processor.lock().has_active_soft_refs() {
+        return;
+    }
+    thread.tlab.retire();
+    crate::runtime::interpreter::with_last_ditch_soft_clear(|| {
+        maybe_gc_forced(shared, thread);
+    });
+}
+
 pub(crate) fn g1_force_full_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     if !shared.mem.heap.is_g1() {
         return;

@@ -446,6 +446,12 @@ struct Compiler {
     /// as [`Self::emitted_alloc_oom_check`]); without the dispatch-aware
     /// entry the helper silently degrades to the legacy null-return.
     emitted_checkcast_throw: bool,
+    /// Set when an `aastore` site emitted the element-type check call.
+    /// `jit_aastore_type_check` builds the `ArrayStoreException` through the
+    /// JIT_THREAD TLS and bails with the `i64::MIN` sentinel, so the method
+    /// must be entered through the dispatch-aware path — same requirement,
+    /// and the same reason, as `emitted_checkcast_throw`.
+    emitted_aastore_throw: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -2290,6 +2296,7 @@ impl Compiler {
             synthetic_guard_span: None,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
+            emitted_aastore_throw: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),

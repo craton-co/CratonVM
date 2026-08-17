@@ -40,6 +40,20 @@
 //!  * `FlightRecorder::new_recording` / `start_recording` have **zero callers
 //!    outside `#[cfg(test)]`**, so [`set_enabled`] is never flipped and
 //!    [`is_enabled`] is permanently `false`.
+//!
+//!    **CORRECTION (2026-08-13): that bullet is stale, and it was already stale
+//!    when the audit was written.** `NativeContext::jfr_begin_java_recording`
+//!    (`vm/src/vm/vm_exec.rs`) calls both, and it is reached from real
+//!    application bytecode — `jdk.jfr.Recording.start()` and
+//!    `jdk.jfr.consumer.RecordingStream.startAsync()`/`start()`, both wired in
+//!    `native_builtins::jfr`. So on a run that opens a `Recording` or a
+//!    `RecordingStream`, `refresh_running_ids` DOES flip the gate, every
+//!    `emit_*` above goes live, and `FlightRecorder::dump_recording` writes a
+//!    real file. That is observable: a `Recording` opened around a few lines of
+//!    Java dumps the VM's own `jdk.ClassLoad` events alongside the
+//!    application's. The rest of this block — no CLI option, no jcmd host — is
+//!    still accurate, and remains why a run that touches no `jdk.jfr` class
+//!    records nothing.
 //!  * The `JFR.start` / `JFR.stop` / `JFR.dump` jcmd verbs in
 //!    `vm/src/runtime/serviceability.rs` never touched the recorder (they
 //!    returned canned success strings; the audit replaced them with honest
@@ -56,10 +70,16 @@
 //!
 //! To make JFR real, in dependency order: add the CLI option and/or bind the
 //! jcmd verbs to `SharedVm::debug.flight_recorder`; call `new_recording` +
-//! `start_recording`; and call `FlightRecorder::dump_recording` on stop. Note
-//! that the produced file is still **not JMC / `jfr print` loadable** — see
-//! the FORMAT-FIDELITY GAP block on `write_metadata_section` in
-//! [`dump`] — and that no event carries a real captured stack trace.
+//! `start_recording`; and call `FlightRecorder::dump_recording` on stop.
+//!
+//! The produced file **is** JMC / `jfr print` loadable as of 2026-08-13:
+//! `dump_recording` writes the JDK's own chunk format ([`jdk_chunk`]), verified
+//! against `RecordingFile`, `jfr summary` and `jfr print`. It used not to be,
+//! and the FORMAT-FIDELITY GAP block on `write_metadata_section` in [`dump`]
+//! describes the format that is still what [`dump::dump_to_file`] writes and
+//! what [`read_events`] reads. What remains true is that **no event carries a
+//! real captured stack trace**, and that a JDK-format chunk from this writer
+//! declares no `eventThread`/`stackTrace` field at all.
 //!
 //! ## Memory bounds (audited)
 //!
@@ -87,9 +107,9 @@
 //! registers no built-in event type, has its own flag, and does not consult
 //! [`is_enabled`] — a flight recording and a wall-clock partition are
 //! different questions. Its JFR sink is standalone (it builds its own registry
-//! and calls [`dump_to_file`] directly), so a phase report can be produced by
-//! a run that never started a recording — which, per the LIVENESS block above,
-//! is every run today.
+//! and calls [`jdk_chunk::dump_to_file`] directly), so a phase report can be
+//! produced by a run that never started a recording — which, per the LIVENESS
+//! block above, is every run that touches no `jdk.jfr` class.
 //!
 //! ## JDK-only mode telemetry
 //!
@@ -107,6 +127,7 @@
 pub mod builtin;
 pub mod dump;
 pub mod event;
+pub mod jdk_chunk;
 pub mod jdk_only;
 pub mod phase;
 pub mod recording;
@@ -115,6 +136,12 @@ pub mod stream;
 
 pub use dump::{dump_to_file, read_events, read_jfr_header, JfrDumpError, JfrFileHeader};
 pub use event::*;
+// The JDK-format chunk writer. Reached through `jdk_chunk::` rather than
+// re-exported flat, because its `dump_to_file` is deliberately the same shape
+// as [`dump::dump_to_file`] and the two write DIFFERENT formats — a flat
+// re-export would make the two indistinguishable at a call site, which is
+// exactly the confusion the module docs warn about.
+pub use jdk_chunk::{JDK_HEADER_SIZE, JDK_MAJOR, JDK_MINOR};
 // JDK-only counters. Named re-exports rather than a glob: the module's public
 // surface is mostly `const` label vocabularies whose names (`NATIVE_KINDS`,
 // `GENERATORS`) are generic enough to collide with a future JFR export, and a

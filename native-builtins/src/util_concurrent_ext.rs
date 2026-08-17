@@ -925,6 +925,61 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
 /// native that wanted the shape, not this one forwarding line — see the
 /// matching note on `NativeContext::try_ensure_synthetic_class`. This funnel has
 /// ~2,000 call sites, so without it the census cannot name a single one.
+/// Build a Java reference array whose elements come from an ALLOCATING
+/// producer, keeping the array rooted across every one of those allocations.
+///
+/// **The bug this exists to stop.** `let arr = ctx.new_ref_array(..); for i {
+/// let el = <allocates>; ctx.set_array_element(arr, i, el) }` is wrong: `arr`
+/// is a raw `ObjectRef`, the producer can trigger a moving young collection,
+/// and every `set_array_element` after that point writes through a stale
+/// reference — silently DROPPED by the heap guard. The live array keeps
+/// whatever the collector left in those slots.
+///
+/// It is not a theoretical hazard. Both `getAcceptedIssuers` implementations
+/// had exactly this shape, and netty's `ParameterizedSslHandlerTest` saw both
+/// of its faces intermittently through
+/// `ReferenceCountedOpenSslServerContext.newSessionContext`:
+/// `IllegalArgumentException: Null element in chain: [null × 32]`, and
+/// `NoSuchMethodError: sun.security.util.DerValue.getEncoded()` — a `DerValue`
+/// left in a vacated slot by the certificate parsing the producer had just
+/// done.
+///
+/// `make` is handed the context and the index and must return the element; if
+/// IT allocates after building the element, IT must pin the element (see
+/// `keystore::make_x509_mirror`, which does). An `Err` stops the fill and
+/// propagates, after the array is unpinned.
+pub(crate) fn build_rooted_ref_array<F>(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    len: usize,
+    mut make: F,
+) -> Result<ObjectRef, MethodCallFailed>
+where
+    F: FnMut(&mut dyn NativeContext, usize) -> Result<ObjectRef, MethodCallFailed>,
+{
+    let arr0 = ctx.new_ref_array(class_id, len);
+    let pin = ctx.pin_native_root(arr0);
+    let mut arr = arr0;
+    let mut failure = None;
+    for i in 0..len {
+        match make(ctx, i) {
+            Ok(element) => {
+                arr = ctx.read_native_pin(pin, arr0);
+                ctx.set_array_element(arr, i, cratonvm_types::Value::Object(Some(element)));
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(arr),
+    }
+}
+
 #[track_caller]
 pub(crate) fn try_alloc_concurrent_synthetic(
     ctx: &mut dyn NativeContext,
@@ -1107,6 +1162,55 @@ pub(crate) fn refused_class(
     }
 }
 
+/// The synthetic `java.util.concurrent.CyclicBarrier` surface.
+///
+/// Registered from TWO places, because two different conditions need it and
+/// neither can see the other:
+///
+///  * [`register_concurrent_natives`], when `CRATONVM_SYNTHETIC_AQS` is set —
+///    the real `CyclicBarrier` bytecode is present but its `ReentrantLock` /
+///    `Condition` are being served synthetically, so the barrier is served
+///    synthetically too;
+///  * `vm_init`'s synthetic-JDK arm, where there IS no real bytecode. This one
+///    was missing. `67c5e048c` narrowed the whole surface to the env flag, on
+///    the reasoning that the default real-JDK build should run the real class —
+///    correct for that build, but synthetic-JDK mode has only a 3-field
+///    compatibility STUB for `CyclicBarrier` (`class_manager`'s
+///    `synthetic_stub_fields`) and no method bodies at all, so it lost the
+///    constructor outright: all four `JucComplete` barrier fixtures went to
+///    `NoSuchMethodError: java.util.concurrent.CyclicBarrier.<init>(I)V` while
+///    the TCK table still listed them as passing. A flag is not a mode
+///    ([`crate::nbflags`] cannot see the JDK mode; `vm_init` can), which is
+///    exactly why the call lives there and not behind another `nbflags` test.
+///
+/// Deleting these natives instead — the standing preference for synthetic
+/// shadows of pure-Java JDK classes — is not available for the same reason:
+/// synthetic-JDK mode has nothing to fall back to.
+pub fn register_cyclic_barrier_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let cb = "java/util/concurrent/CyclicBarrier";
+    registry.register(cb, "<init>", "(I)V", native_cb_init);
+    registry.register(
+        cb,
+        "<init>",
+        "(ILjava/lang/Runnable;)V",
+        native_cb_init_action,
+    );
+    registry.register(cb, "await", "()I", native_cb_await);
+    registry.register(
+        cb,
+        "await",
+        "(JLjava/util/concurrent/TimeUnit;)I",
+        native_cb_await_timeout,
+    );
+    registry.register(cb, "getParties", "()I", native_cb_get_parties);
+    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
+    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
+    registry.register(cb, "reset", "()V", native_cb_reset);
+    registry.set_category(__prev_cat);
+}
+
 pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // Real AQS is now the DEFAULT: skip the synthetic ReentrantLock/Lock/
     // Condition natives so the REAL java.util.concurrent AQS bytecode runs
@@ -1171,25 +1275,21 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // alongside the lock ones; both are registered together above.
 
     // --- CyclicBarrier ---
-    let cb = "java/util/concurrent/CyclicBarrier";
-    registry.register(cb, "<init>", "(I)V", native_cb_init);
-    registry.register(
-        cb,
-        "<init>",
-        "(ILjava/lang/Runnable;)V",
-        native_cb_init_action,
-    );
-    registry.register(cb, "await", "()I", native_cb_await);
-    registry.register(
-        cb,
-        "await",
-        "(JLjava/util/concurrent/TimeUnit;)I",
-        native_cb_await_timeout,
-    );
-    registry.register(cb, "getParties", "()I", native_cb_get_parties);
-    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
-    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
-    registry.register(cb, "reset", "()V", native_cb_reset);
+    //
+    // Synthetic-AQS mode only HERE. With real AQS (the default) the real JDK
+    // `CyclicBarrier` — ReentrantLock + Condition + an identity-compared
+    // `Generation` — is correct and needs no help, exactly as for
+    // ReentrantLock/Lock/Condition and Semaphore above. The constructors are
+    // gated with the rest, not separately: `native_cb_init` stores its state
+    // holder in the receiver's slot 0, which is the real layout's `lock` field,
+    // so registering only the constructors while `await()` runs real bytecode
+    // would hand that bytecode a barrier whose `lock` is an array.
+    //
+    // Synthetic-JDK mode registers the same set from `vm_init`, where the mode
+    // is known — see [`register_cyclic_barrier_natives`].
+    if !real_aqs {
+        register_cyclic_barrier_natives(registry);
+    }
     registry.set_category(__prev_cat);
 
     // --- CopyOnWriteArrayList (M18) ---
@@ -2208,7 +2308,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -2593,7 +2693,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3298,7 +3398,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3640,7 +3740,7 @@ pub(crate) fn native_rl_try_lock_timeout(
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord);
@@ -3850,7 +3950,7 @@ pub(crate) fn native_cond_await_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_raw, unit_ordinal).max(0) as u64;
@@ -4517,7 +4617,7 @@ pub(crate) fn native_sem_try_acquire_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2, // MILLISECONDS
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -5192,7 +5292,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord).max(0) as u64;
@@ -7522,6 +7622,38 @@ pub(crate) fn native_sync_collection_to_array(
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(empty))))
         }
+    }
+}
+
+/// Forward one `Collections$Synchronized{Collection,Set}` method to the wrapped
+/// collection, unchanged.
+///
+/// The named-method stubs above cover the surface the wrapper needed while
+/// `Collections.synchronizedCollection(…)` was its only source. Since
+/// 2026-08-13 `Hashtable`/`Properties` views are wrapped too — the JDK's own
+/// `Hashtable.keySet()` is `Collections.synchronizedSet(new KeySet(), this)`, so
+/// matching `getClass()` means returning the wrapper — and those views are asked
+/// for the whole `Collection` contract (`toString`, `stream`, `forEach`,
+/// `containsAll`, …). In real-JDK mode the class's own bytecode answers all of
+/// it and these are dropped as `SyntheticStub`s; in synthetic-JDK mode they are
+/// the only implementation there is, and a MISSING one is worse than a slow one:
+/// the call falls through to an interface-level native that reads the wrapper as
+/// if it were the collection and reports it EMPTY.
+///
+/// `fallback` is what to answer when the wrapper has no `c` — a shape that
+/// cannot arise from either constructor, so it is chosen per method only to keep
+/// the return type honest rather than to encode behaviour.
+pub(crate) fn sync_collection_delegate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+    fallback: Option<Value>,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match sync_collection_backing(ctx, this) {
+        Some(c) => ctx.invoke_virtual(c, method, descriptor, &args[1..]),
+        None => Ok(fallback),
     }
 }
 

@@ -212,12 +212,41 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 /// `true`) will opt INTO the multi-threaded evacuator once it is built; unset or
 /// any other value keeps evacuation single-threaded.
 ///
-/// Nothing gates on it yet — the parallel work_list / CAS-forwarding machinery
-/// is a deliberate follow-up: the single-threaded evacuator must be memory-safe
-/// across the gauntlet first (cf. the open gpu-bench-cpu G1 SIGSEGV). The
-/// behaviour-identical groundwork that *does* land now is the `evacuate_object`
-/// freshness signal that removes the `pointer_map.contains_key` evacuation
-/// TOCTOU at the ref-scan sites.
+/// DEFAULT FLIPPED 2026-08-13: parallel evacuation is now ON unless
+/// `CRATONVM_G1_PARALLEL_EVAC=0` (or `CRATONVM_GC=-g1-parallel-evac`).
+///
+/// The flag was an opt-in for as long as G1-9 was open. G1-9 turned out to be a
+/// compact-layout scan divergence in this evacuator's own object walk — not a
+/// race, and reproducing identically at one worker — which is fixed and
+/// covered by `parallel_evacuation_scans_compact_object_reference_fields`.
+/// What the flag now selects is a throughput decision, and `=0` is the
+/// bisection lever for any suspected parallel-evacuation regression.
+///
+/// What this flip does NOT claim: it is not a gauntlet result. Mixed
+/// collections still dispatch to the parallel path only through the same flag,
+/// the worker pool is still spawned per collection rather than persistent, and
+/// the G1-as-default-collector question is untouched and separate.
+/// Object budget for the post-evacuation CSet verification pass in a build
+/// where it is not already unbounded (audit §9 item 2).
+///
+/// `CRATONVM_G1_VERIFY_BUDGET=<n>`; `0` disables the pass. The default is
+/// deliberately small enough to be affordable on every pause rather than large
+/// enough to feel thorough: the pass is a SAMPLER whose start region rotates,
+/// so its value comes from running always and accumulating coverage, not from
+/// any single pause being complete. A 4096-object budget is on the order of a
+/// hundred microseconds of pointer chasing, against pauses measured in
+/// milliseconds.
+fn verify_budget() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_G1_VERIFY_BUDGET") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(4096),
+            Err(_) => 4096,
+        }
+    })
+}
+
 fn parallel_evac_enabled() -> bool {
     gc_flags().g1_parallel_evac
 }
@@ -427,6 +456,24 @@ impl Tlab {
             offset: 0,
         }
     }
+}
+
+/// One evacuation worker's private results, merged by the driver after the
+/// completion barrier.
+///
+/// Kept per-worker rather than behind a shared lock because `forwards` is
+/// appended to for every single object copied — the hottest write in the
+/// pause — and a shared destination would serialise exactly the work the
+/// parallel evacuator exists to spread.
+#[derive(Default)]
+struct EvacShard {
+    objs: usize,
+    bytes: usize,
+    /// `(from_space_addr, to_space_addr)` for every object this worker copied.
+    forwards: Vec<(usize, usize)>,
+    /// Evacuation-failed (self-forwarded) objects this worker saw; scanned
+    /// serially by the driver once all workers have stopped.
+    deferred: Vec<usize>,
 }
 
 /// Each worker holds one Survivor TLAB (young survivors) and one Old TLAB
@@ -735,10 +782,8 @@ impl<'a> SharedEvac<'a> {
         deferred_self_forwarded: &mut Vec<usize>,
         defer_self_forwarded: bool,
     ) {
-        let (kind, etype, alen, nslots) = {
-            let h = &*(obj_ptr as *const ObjectHeader);
-            (h.kind(), h.element_type(), h.array_length(), h.num_slots())
-        };
+        let header = &*(obj_ptr as *const ObjectHeader);
+        let (kind, etype, alen) = (header.kind(), header.element_type(), header.array_length());
         if kind == ObjectKind::Array {
             if etype == ArrayElementType::Reference {
                 for i in 0..alen as usize {
@@ -769,32 +814,58 @@ impl<'a> SharedEvac<'a> {
                 }
             }
         } else {
-            for slot_idx in 0..nslots as usize {
-                let slot_ptr = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
-                let value = std::ptr::read(slot_ptr as *const Value);
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
-                        if self.cset.contains(&ridx) {
-                            if let Some((new_ptr, fresh)) =
-                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
-                            {
-                                let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
-                                std::ptr::write(slot_ptr as *mut Value, nv);
-                                if fresh {
-                                    Self::record_fresh_child(
-                                        ref_ptr,
-                                        new_ptr,
-                                        defer_self_forwarded,
-                                        children,
-                                        deferred_self_forwarded,
-                                    );
-                                }
+            // COMPACT-LAYOUT PARITY (G1-9). This used to stride
+            // `HEADER_SIZE + slot_idx * SLOT_SIZE` over `num_slots()` and decode
+            // each 16 bytes as a `Value`, i.e. it assumed the LEGACY uniform
+            // cell layout for every object. Every other reference walk in this
+            // file — the serial evacuator, the Phase-4 remap, the mark scan,
+            // the V7b verifier — goes through `for_each_flat_object_reference`,
+            // which dispatches on `is_compact_object` and walks the registered
+            // `CompactLayout::field_offsets`. The parallel evacuator did not,
+            // and that is a real divergence, not a stylistic one:
+            //
+            //   * a compact object's reference fields live at PACKED offsets,
+            //     so the legacy stride visits neither of them. Their referents
+            //     are never evacuated and their slots are never rewritten — the
+            //     holder survives into to-space still pointing into a region
+            //     Phase 5 then frees. That is exactly the
+            //     `[g1][SECURITY V7b] post-evacuation dangling reference` this
+            //     path was reported to produce;
+            //   * `num_slots()` is the hierarchy-wide FIELD COUNT, so the
+            //     legacy stride also runs off the end of a compact body — a
+            //     19-field compact object occupies 152 bytes but this loop
+            //     addressed `16 + 19*16 = 320` of them, reading and, on a
+            //     decode that happened to look like `Value::Object`, WRITING
+            //     over whatever followed it in the region.
+            //
+            // Neither symptom is a race: it reproduces identically with
+            // `CRATONVM_G1_WORKERS=1`. It stayed hidden because a compact
+            // object requires a registered `CompactLayout`, which only a real
+            // class does — the gc unit tests allocate through
+            // `alloc_object(ClassId, n)` with no layout registered, so their
+            // objects are legacy-layout and this loop was accidentally correct
+            // for every one of them.
+            for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                let ref_ptr = raw as *mut u8;
+                if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
+                    if self.cset.contains(&ridx) {
+                        if let Some((new_ptr, fresh)) =
+                            self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                        {
+                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                            if fresh {
+                                Self::record_fresh_child(
+                                    ref_ptr,
+                                    new_ptr,
+                                    defer_self_forwarded,
+                                    children,
+                                    deferred_self_forwarded,
+                                );
                             }
                         }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -893,33 +964,33 @@ impl<'a> SharedEvac<'a> {
                     }
                 }
             } else {
-                for slot_idx in 0..nslots as usize {
-                    let slot_ptr = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
-                    let value = std::ptr::read(slot_ptr as *const Value);
-                    if let Value::Object(Some(ref_obj)) = value {
-                        let ref_ptr = ref_obj.as_ptr();
-                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize)
-                        {
-                            if self.cset.contains(&ridx) {
-                                if let Some((new_ptr, fresh)) =
-                                    self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
-                                {
-                                    let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
-                                    std::ptr::write(slot_ptr as *mut Value, nv);
-                                    if fresh {
-                                        Self::record_fresh_child(
-                                            ref_ptr,
-                                            new_ptr,
-                                            true,
-                                            &mut newly,
-                                            deferred_self_forwarded,
-                                        );
-                                    }
+                // COMPACT-LAYOUT PARITY (G1-9) — same divergence and same fix
+                // as `process_object`; see the long note there. This is the
+                // seed walk, so a compact holder missed here is a
+                // remembered-set source whose CSet-bound edges are never
+                // rewritten at all.
+                let header = &*(obj_ptr as *const ObjectHeader);
+                for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                    let ref_ptr = raw as *mut u8;
+                    if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
+                        if self.cset.contains(&ridx) {
+                            if let Some((new_ptr, fresh)) =
+                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                            {
+                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                                if fresh {
+                                    Self::record_fresh_child(
+                                        ref_ptr,
+                                        new_ptr,
+                                        true,
+                                        &mut newly,
+                                        deferred_self_forwarded,
+                                    );
                                 }
                             }
                         }
                     }
-                }
+                });
             }
 
             offset += obj_size;
@@ -1512,6 +1583,12 @@ pub struct G1Collector {
     /// after (empty on every normal cycle) — the G1 counterpart of
     /// [`crate::gen_heap::GenerationalHeap::set_jit_tlab_skip_regions`].
     jit_tlab_skip_regions: Mutex<Vec<(usize, usize)>>,
+    /// Rotating start region for the BUDGETED post-evacuation CSet
+    /// verification (audit §9 item 2). Only read/written by that pass, which
+    /// runs on the collecting thread under the regions lock, so `Relaxed` is
+    /// the whole ordering requirement: a torn or stale value costs coverage
+    /// fairness for one pause, never correctness.
+    cset_verify_cursor: AtomicUsize,
 
     /// Adaptive `needs_gc` Free-fraction threshold, in percent (baseline 25).
     /// Raised (up to 50) after any collection that recorded an evacuation
@@ -1775,6 +1852,38 @@ pub struct G1Collector {
     /// identical reason (see `GenerationalHeap::is_object_address`).
     arena_base: usize,
     arena_end: usize,
+
+    /// This pause was entered through
+    /// [`Self::collect_garbage_with_finalizers`], i.e. some object registered
+    /// for finalization is unreachable-but-not-yet-finalized.
+    ///
+    /// Separate from `pending_finalizer_roots` because that list is CONSUMED by
+    /// Phase 3.5 (`std::mem::take`), so by Phase 5 — where
+    /// [`Self::eager_reclaim_humongous_locked`] runs — it is empty on every
+    /// path and testing it there would silently always pass. The distinction
+    /// matters for exactly one shape: a humongous object with a finalizer.
+    /// Phase 3.5 resurrects dead finalizable objects out of the CSet, and a
+    /// humongous object is never IN the CSet, so it is never resurrected and
+    /// never lands in `resurrected_finalizers` either — it would just be freed
+    /// out from under a `finalize()` that has not run yet.
+    finalizer_pause: AtomicBool,
+
+    /// Persistent parallel-evacuation worker threads (see [`crate::evac_pool`]).
+    ///
+    /// Created on the FIRST parallel pause rather than in [`G1Collector::new`],
+    /// and deliberately so: a `G1Collector` is cheap and short-lived in the
+    /// unit suite (hundreds are constructed and dropped), most of those never
+    /// evacuate anything in parallel, and eagerly spawning
+    /// `gc_worker_threads - 1` OS threads for each would cost far more than the
+    /// per-pause spawn this pool exists to remove. A collector that does
+    /// evacuate pays the spawn exactly once and reuses the threads for the rest
+    /// of its life; the pool is joined when the collector drops.
+    ///
+    /// Sized from `parallel_worker_count()` at first use. That value is fixed
+    /// for the process (config plus a `OnceLock` flag), so the pool is never
+    /// the wrong width — and if it ever were, `EvacPool::scope` clamps rather
+    /// than over-dispatching.
+    evac_pool: std::sync::OnceLock<crate::evac_pool::EvacPool>,
 }
 
 // SAFETY: All fields are either atomic, behind Mutex, or Arc. Raw pointers
@@ -1851,6 +1960,7 @@ impl G1Collector {
             arena,
             regions: Mutex::new(regions),
             jit_tlab_skip_regions: Mutex::new(Vec::new()),
+            cset_verify_cursor: AtomicUsize::new(0),
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
             needs_gc_free_percent: AtomicUsize::new(25),
@@ -1884,6 +1994,8 @@ impl G1Collector {
             region_lookup,
             arena_base,
             arena_end,
+            finalizer_pause: AtomicBool::new(false),
+            evac_pool: std::sync::OnceLock::new(),
         }
     }
 
@@ -2566,7 +2678,12 @@ impl G1Collector {
         }
 
         // Phase 4/5 equivalents against the drain map.
-        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        //
+        // No eager humongous reclaim here. This path exists to drain regions a
+        // previous pause could not evacuate, so it runs with a heap the
+        // collector has already declined to reason about normally — exactly the
+        // state in which a death certificate should not be issued.
+        let _census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
@@ -2579,6 +2696,7 @@ impl G1Collector {
         }
 
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -2933,10 +3051,24 @@ impl G1Collector {
         );
 
         // Phase 4: Update forwarding pointers in non-CSet regions
-        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         // Phase 5: Free evacuated regions
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
+
+        // Humongous spans are never evacuated, so this is the only point in a
+        // young/mixed pause that can free one. It must come after Phase 5: the
+        // census it consumes is only a death certificate once the CSet is gone
+        // and the pause's to-space has been walked. See
+        // `eager_reclaim_humongous_locked` for the full ordering argument.
+        let bytes_freed = bytes_freed
+            + self.eager_reclaim_humongous_locked(
+                &mut regions,
+                roots,
+                &pointer_map,
+                &census,
+                &jit_pinned_regions,
+            );
 
         // SECURITY FIX (V7b): after the CSet is freed, scan survivors for
         // any slot still pointing into a freed CSet region with no
@@ -2951,9 +3083,11 @@ impl G1Collector {
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
         self.dbg_verify_reachable_integrity(&regions, roots, "young-serial");
 
-        // Young and mixed evacuation leave humongous spans in place. Their
-        // reachability is decided by the concurrent-mark cleanup phase, which
-        // can see the whole heap and reclaims unmarked, unpinned spans there.
+        // Young and mixed evacuation leave humongous spans IN PLACE — they are
+        // never evacuated — but they are no longer left ALIVE unconditionally:
+        // `eager_reclaim_humongous_locked` above frees any span this pause can
+        // prove nothing references. Anything it declines to judge falls through
+        // to the concurrent-mark cleanup phase as before.
 
         // Reset current eden if it was in the CSet
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -2965,6 +3099,7 @@ impl G1Collector {
         // Relaxed ordering: this is a statistics counter read only by IHOP heuristics;
         // exact inter-thread visibility ordering is not required.
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         // Remap monitors
         monitors.remap_after_gc(&pointer_map);
@@ -3368,9 +3503,23 @@ impl G1Collector {
         );
 
         // Update references and free evacuated regions
-        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
+
+        // Humongous spans are never evacuated, so this is the only point in a
+        // young/mixed pause that can free one. It must come after Phase 5: the
+        // census it consumes is only a death certificate once the CSet is gone
+        // and the pause's to-space has been walked. See
+        // `eager_reclaim_humongous_locked` for the full ordering argument.
+        let bytes_freed = bytes_freed
+            + self.eager_reclaim_humongous_locked(
+                &mut regions,
+                roots,
+                &pointer_map,
+                &census,
+                &jit_pinned_regions,
+            );
 
         // SECURITY FIX (V7b): mixed GC frees old regions as well as young
         // ones, where a stale/incomplete rset is most likely. Verify no
@@ -3391,6 +3540,7 @@ impl G1Collector {
 
         // Relaxed ordering: statistics counter for IHOP heuristics only.
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -3476,6 +3626,16 @@ impl G1Collector {
             .unwrap_or(1)
             .max(1);
         cfg.min(avail)
+    }
+
+    /// The persistent evacuation worker pool, created on first use.
+    ///
+    /// See the `evac_pool` field for why this is lazy rather than built in
+    /// [`G1Collector::new`].
+    fn evac_pool(&self) -> &crate::evac_pool::EvacPool {
+        self.evac_pool.get_or_init(|| {
+            crate::evac_pool::EvacPool::new(self.parallel_worker_count().saturating_sub(1))
+        })
     }
 
     /// Shared seed + parallel transitive-closure core used by both
@@ -3609,60 +3769,67 @@ impl G1Collector {
         }
 
         // Phase 3: parallel transitive closure.
+        //
+        // The helper threads are PERSISTENT (see [`crate::evac_pool`]). This
+        // used to open a `std::thread::scope` and spawn them here, which put
+        // thread creation inside every pause; `EvacPool::scope` keeps the same
+        // shape — dispatch, driver participates, barrier — with the spawn paid
+        // once for the collector's life instead. The barrier is what replaces
+        // scope's join as the synchronisation point after which the driver may
+        // dereference the regions guard again, so everything the module's
+        // SAFETY MODEL note says about that boundary still holds verbatim.
         let nworkers = self.parallel_worker_count();
-        let (extra_objs, extra_bytes, worker_forwards, worker_deferred): (
-            usize,
-            usize,
-            Vec<Vec<(usize, usize)>>,
-            Vec<Vec<usize>>,
-        ) = std::thread::scope(|s| {
-            let mut handles = Vec::new();
-            for _ in 1..nworkers {
-                let shared_ref = &shared;
-                handles.push(s.spawn(move || {
-                    let mut tlab = TlabSet::default();
-                    let mut o = 0usize;
-                    let mut b = 0usize;
-                    let mut f: Vec<(usize, usize)> = Vec::new();
-                    let mut d: Vec<usize> = Vec::new();
-                    unsafe {
-                        shared_ref.run_worker(&mut tlab, &mut o, &mut b, &mut f, &mut d);
-                    }
-                    (o, b, f, d)
-                }));
-            }
-            // The driver participates as a worker, reusing its seeded TLAB
-            // and accumulators.
-            unsafe {
-                shared.run_worker(
-                    &mut main_tlab,
-                    &mut objs,
-                    &mut bytes,
-                    &mut main_forwards,
-                    &mut main_deferred_self_forwarded,
-                );
-            }
-            let mut to = 0usize;
-            let mut tb = 0usize;
-            let mut allf: Vec<Vec<(usize, usize)>> = Vec::new();
-            let mut alld: Vec<Vec<usize>> = Vec::new();
-            for h in handles {
-                let (o, b, f, d) = h.join().expect("g1 parallel-evac worker panicked");
-                to += o;
-                tb += b;
-                allf.push(f);
-                alld.push(d);
-            }
-            (to, tb, allf, alld)
-        });
-        objs += extra_objs;
-        bytes += extra_bytes;
-
-        for f in worker_forwards {
-            main_forwards.extend(f);
+        let pool = self.evac_pool();
+        let helpers = nworkers.saturating_sub(1).min(pool.helpers());
+        // Per-helper output shards, one lock each. Taken exactly once per
+        // helper per pause (uncontended by construction), and using a lock
+        // rather than raw slots is what lets the dispatched body be a plain
+        // `Fn` — the pool's erased dispatch requires that — with no additional
+        // unsafe on top of the one `run_worker` already needs.
+        let shards: Vec<Mutex<EvacShard>> = (0..helpers)
+            .map(|_| Mutex::new(EvacShard::default()))
+            .collect();
+        {
+            let shared_ref = &shared;
+            let shards_ref = &shards;
+            let body = move |i: usize| {
+                let mut tlab = TlabSet::default();
+                let mut shard = EvacShard::default();
+                // SAFETY: identical contract to the driver's own `run_worker`
+                // call below — the regions guard is held by the driver for the
+                // whole dispatch and the disjointness discipline in the module
+                // SAFETY MODEL note governs every region access inside.
+                unsafe {
+                    shared_ref.run_worker(
+                        &mut tlab,
+                        &mut shard.objs,
+                        &mut shard.bytes,
+                        &mut shard.forwards,
+                        &mut shard.deferred,
+                    );
+                }
+                *shards_ref[i].lock() = shard;
+            };
+            pool.scope(helpers, &body, || {
+                // The driver participates as a worker, reusing its seeded TLAB
+                // and accumulators.
+                unsafe {
+                    shared.run_worker(
+                        &mut main_tlab,
+                        &mut objs,
+                        &mut bytes,
+                        &mut main_forwards,
+                        &mut main_deferred_self_forwarded,
+                    );
+                }
+            });
         }
-        for d in worker_deferred {
-            main_deferred_self_forwarded.extend(d);
+        for shard in shards {
+            let shard = shard.into_inner();
+            objs += shard.objs;
+            bytes += shard.bytes;
+            main_forwards.extend(shard.forwards);
+            main_deferred_self_forwarded.extend(shard.deferred);
         }
 
         // The identity forward itself is the authoritative signal that an
@@ -3800,6 +3967,34 @@ impl G1Collector {
             .map(|(i, _)| i)
             .collect();
         if cset.is_empty() {
+            // OBSERVABILITY PARITY with the serial driver (G1-7). A pause that
+            // declines to collect because every young region was pinned out is
+            // still a pause, and the serial path records it with
+            // `EMPTY_COLLECTION_SET` plus whichever pin excluded the regions.
+            // The parallel path returned here silently, so under parallel
+            // evacuation an operator watching G1 fail to reclaim saw NO cycle
+            // at all rather than one saying why — the exact blindness
+            // `record_g1_cycle` exists to remove. Surfaced by
+            // `a_pinned_region_is_never_evacuated` the moment parallel
+            // evacuation became the default.
+            let (jni_pinned_out, jit_pinned_out) =
+                count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+            let mut degraded = crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
+                | crate::gc_metrics::g1_degraded::PARALLEL_EVACUATOR;
+            if jni_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JNI_PINNED_REGIONS_EXCLUDED;
+            }
+            if jit_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JIT_PINNED_REGIONS_EXCLUDED;
+            }
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::YOUNG,
+                0,
+                0,
+                (jni_pinned_out + jit_pinned_out) as u32,
+                0,
+                degraded,
+            );
             return GcResult {
                 stats: GcStats {
                     objects_copied: 0,
@@ -3866,10 +4061,24 @@ impl G1Collector {
         };
 
         // Phase 4: update interior refs in non-CSet regions.
-        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         // Phase 5: free evacuated regions.
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
+
+        // Humongous spans are never evacuated, so this is the only point in a
+        // young/mixed pause that can free one. It must come after Phase 5: the
+        // census it consumes is only a death certificate once the CSet is gone
+        // and the pause's to-space has been walked. See
+        // `eager_reclaim_humongous_locked` for the full ordering argument.
+        let bytes_freed = bytes_freed
+            + self.eager_reclaim_humongous_locked(
+                &mut regions,
+                roots,
+                &pointer_map,
+                &census,
+                &jit_pinned_regions,
+            );
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
@@ -3890,6 +4099,7 @@ impl G1Collector {
         }
 
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -4006,6 +4216,34 @@ impl G1Collector {
         }
 
         if cset.is_empty() {
+            // OBSERVABILITY PARITY with the serial driver (G1-7). A pause that
+            // declines to collect because every young region was pinned out is
+            // still a pause, and the serial path records it with
+            // `EMPTY_COLLECTION_SET` plus whichever pin excluded the regions.
+            // The parallel path returned here silently, so under parallel
+            // evacuation an operator watching G1 fail to reclaim saw NO cycle
+            // at all rather than one saying why — the exact blindness
+            // `record_g1_cycle` exists to remove. Surfaced by
+            // `a_pinned_region_is_never_evacuated` the moment parallel
+            // evacuation became the default.
+            let (jni_pinned_out, jit_pinned_out) =
+                count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+            let mut degraded = crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
+                | crate::gc_metrics::g1_degraded::PARALLEL_EVACUATOR;
+            if jni_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JNI_PINNED_REGIONS_EXCLUDED;
+            }
+            if jit_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JIT_PINNED_REGIONS_EXCLUDED;
+            }
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::MIXED,
+                0,
+                0,
+                (jni_pinned_out + jit_pinned_out) as u32,
+                0,
+                degraded,
+            );
             return GcResult {
                 stats: GcStats {
                     objects_copied: 0,
@@ -4047,9 +4285,23 @@ impl G1Collector {
             )
         };
 
-        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
+
+        // Humongous spans are never evacuated, so this is the only point in a
+        // young/mixed pause that can free one. It must come after Phase 5: the
+        // census it consumes is only a death certificate once the CSet is gone
+        // and the pause's to-space has been walked. See
+        // `eager_reclaim_humongous_locked` for the full ordering argument.
+        let bytes_freed = bytes_freed
+            + self.eager_reclaim_humongous_locked(
+                &mut regions,
+                roots,
+                &pointer_map,
+                &census,
+                &jit_pinned_regions,
+            );
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_reachable_integrity(&regions, roots, "mixed-parallel");
 
@@ -4066,6 +4318,7 @@ impl G1Collector {
         }
 
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -4171,6 +4424,8 @@ impl G1Collector {
     ) -> (GcResult, Vec<usize>) {
         *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
         self.resurrected_finalizers.lock().clear();
+        self.finalizer_pause
+            .store(!finalizer_addrs.is_empty(), Ordering::Relaxed);
         let result = <Self as crate::collector::GarbageCollector>::collect_garbage(
             self, stw, roots, monitors,
         );
@@ -4178,6 +4433,7 @@ impl G1Collector {
         // (e.g. an empty-CSet early return) so a later plain collection
         // never sees stale candidates.
         self.pending_finalizer_roots.lock().clear();
+        self.finalizer_pause.store(false, Ordering::Relaxed);
         let mut dead = std::mem::take(&mut *self.resurrected_finalizers.lock());
         // `retry_after_evacuation_failure` (run inside collect_garbage,
         // after Phase 3.5) can relocate objects AGAIN via the kept-region
@@ -4406,17 +4662,19 @@ impl G1Collector {
     /// `pointer_map.contains_key(...)` dedup pre-check below is a
     /// plain-`HashMap` operation that is correct ONLY because young/mixed
     /// evacuation runs single-threaded under STW with the calling thread
-    /// holding `self.regions.lock()` for the entire collection. The
-    /// `gc_worker_threads` config field (default 4) exists for a future
-    /// parallel evacuator; the dedup will become a TOCTOU the moment the
-    /// `work_list`/`pointer_map` is shared between worker threads: two
-    /// workers can sample `contains_key == false` for the same source addr,
-    /// both call `evacuate_object`, one wins the insert, and the loser's
-    /// freshly-copied Survivor allocation is leaked while still being
-    /// pushed onto a worklist for double-scan. Before enabling parallel
-    /// evacuation, convert `pointer_map` to a `DashMap` (or per-worker
-    /// shards) and use `entry().or_insert_with(...)` so the dedup signal
-    /// is the entry's vacancy state, not a separate `contains_key` call.
+    /// holding `self.regions.lock()` for the entire collection.
+    ///
+    /// The TOCTOU this paragraph used to warn about — two workers sampling
+    /// `contains_key == false` for the same address, both copying, one leaking
+    /// its copy and both scanning — is real, and it is why the PARALLEL
+    /// evacuator does not share this map at all. It took the "per-worker
+    /// shards" half of the advice and dropped the `contains_key` half
+    /// entirely: `SharedEvac::evacuate` decides the winner with a CAS on the
+    /// from-space object's own mark word, each worker records its winning
+    /// `(old, new)` pairs into a thread-local `Vec`, and those shards are
+    /// merged into one `pointer_map` only after `thread::scope` joins. So no
+    /// `DashMap` is owed here; this map stays plain because it stays
+    /// single-threaded. See the module note above `RegionsBase`.
     ///
     /// The caller is documented to hold the regions lock; we cannot
     /// `debug_assert!` directly on lock ownership (parking_lot Mutex offers
@@ -5087,14 +5345,35 @@ impl G1Collector {
     }
 
     /// Update interior references in all non-CSet regions using the pointer map.
+    ///
+    /// Returns the [`HumongousCensus`] this walk produced, which is the only
+    /// evidence an evacuation pause has about humongous liveness (see
+    /// [`Self::eager_reclaim_humongous_locked`]). Piggybacking it here rather
+    /// than walking the heap a second time is the whole reason eager reclaim is
+    /// affordable per pause: this pass already visits every reference slot in
+    /// every non-CSet region.
     fn update_references_in_regions(
         &self,
         regions: &mut Vec<G1Region>,
         cset: &std::collections::HashSet<usize>,
         pointer_map: &cratonvm_types::PointerMap,
-    ) {
-        if pointer_map.is_empty() {
-            return;
+    ) -> HumongousCensus {
+        let mut census = HumongousCensus::default();
+        let rewrite = !pointer_map.is_empty();
+        // An empty forwarding map means nothing moved, so there is nothing to
+        // rewrite — but the census still has to be taken, because "no object was
+        // copied this pause" says nothing at all about whether a humongous span
+        // is dead. So the walk runs either way when eager reclaim is on, with
+        // only the per-object *rewrite* skipped.
+        //
+        // When it is OFF, nothing consumes the census and this reverts exactly
+        // to the previous behaviour — return immediately, walk nothing. That
+        // keeps `CRATONVM_G1_EAGER_HUMONGOUS=0` a COMPLETE off-switch for this
+        // feature rather than one that leaves the extra walk running, which is
+        // what a bisection lever has to be to be worth anything.
+        let want_census = gc_flags().g1_eager_humongous;
+        if !rewrite && !want_census {
+            return census;
         }
 
         // RSet rebuild (CORRECTNESS — remembered-set completeness for GC-internal
@@ -5124,6 +5403,7 @@ impl G1Collector {
         let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
         let jit_skips = self.jit_tlab_skip_spans();
         let dbg_walk = gc_flags().g1_dbg_reach;
+        let mut walk_aborted = false;
 
         for i in 0..regions.len() {
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
@@ -5190,6 +5470,11 @@ impl G1Collector {
                             regions[i].bump_trail.render(),
                         );
                     }
+                    // The rest of this region was never inspected, so any
+                    // reference it holds into a humongous span is unseen. Say
+                    // so: `eager_reclaim_humongous_locked` must not read the
+                    // resulting `referenced` set as a death certificate.
+                    walk_aborted = true;
                     break;
                 }
                 if dbg_walk {
@@ -5201,13 +5486,16 @@ impl G1Collector {
                     );
                 }
 
-                update_object_refs(obj_ptr, header, pointer_map);
+                if rewrite {
+                    update_object_refs(obj_ptr, header, pointer_map);
+                }
                 self.collect_outgoing_cross_region_edges(
                     regions,
                     i,
                     obj_ptr,
                     header,
                     &mut new_rset_edges,
+                    want_census.then_some(&mut census),
                 );
                 offset += obj_size;
             }
@@ -5222,6 +5510,9 @@ impl G1Collector {
                 .rset
                 .add_reference_in_generation(source_region, generation);
         }
+
+        census.complete = want_census && !walk_aborted;
+        census
     }
 
     /// Record (into `out`) every cross-region reference from `obj` (which lives
@@ -5245,7 +5536,27 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         out: &mut Vec<(usize, usize)>,
+        mut census: Option<&mut HumongousCensus>,
     ) {
+        let holder_span = humongous_span_start(regions, holder).unwrap_or(holder);
+        let mut note = |target: usize| {
+            if let Some(span) = humongous_span_start(regions, target) {
+                // A humongous target: NOT an rset edge (a humongous region can
+                // never enter a collection set, so no pause would ever consult
+                // the entry) but it is the one fact eager reclaim runs on.
+                // References from a span INTO ITSELF are ignored — a
+                // self-referential dead object must not be its own reason to
+                // survive.
+                if span != holder_span {
+                    if let Some(c) = census.as_mut() {
+                        c.referenced.insert(span);
+                    }
+                }
+            } else if target != holder && is_collectable_region_type(regions[target].region_type) {
+                out.push((target, holder));
+            }
+        };
+
         let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
         if header.kind() == ObjectKind::Array {
             if header.element_type() == ArrayElementType::Reference {
@@ -5255,18 +5566,14 @@ impl G1Collector {
                         continue;
                     }
                     if let Some(j) = self.lookup_region_for_addr(raw as usize) {
-                        if j != holder && is_collectable_region_type(regions[j].region_type) {
-                            out.push((j, holder));
-                        }
+                        note(j);
                     }
                 }
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
                 if let Some(j) = self.lookup_region_for_addr(raw) {
-                    if j != holder && is_collectable_region_type(regions[j].region_type) {
-                        out.push((j, holder));
-                    }
+                    note(j);
                 }
             });
         }
@@ -5302,10 +5609,55 @@ impl G1Collector {
         cset: &std::collections::HashSet<usize>,
         pointer_map: &cratonvm_types::PointerMap,
     ) {
-        let verify = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
-        if !verify {
+        // I-6 COVERAGE (audit §9 item 2). This is the only direct check that
+        // the remembered set was complete enough for the pause that just ran,
+        // and it is the check that caught G1-9. It used to run ONLY under
+        // `debug_assertions` or the verify flag — i.e. never in a shipping
+        // build — so the invariant it guards was a review claim everywhere it
+        // actually mattered.
+        //
+        // It now always runs, at one of two budgets:
+        //
+        //   * UNBOUNDED, when `debug_assertions` or the verify flag is on:
+        //     every object of every surviving region, exactly as before. Tests
+        //     and verify runs keep their whole-heap guarantee.
+        //   * BUDGETED otherwise: at most `verify_budget()` objects, starting
+        //     from a cursor that ROTATES across pauses, so consecutive pauses
+        //     sweep different regions and coverage accumulates over a run
+        //     instead of re-checking the same prefix forever.
+        //
+        // The budgeted pass is a sampler, and the metrics say so: a pause that
+        // stops on its budget is counted as `truncated`, and the objects it
+        // did walk are published, because "no dangling references found" is
+        // only meaningful against the number of objects that statement covers.
+        // Set `CRATONVM_G1_VERIFY_BUDGET=0` to opt out entirely.
+        let unbounded = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
+        let budget = if unbounded { usize::MAX } else { verify_budget() };
+        if budget == 0 {
             return;
         }
+        self.verify_no_dangling_into_cset_within(regions, cset, pointer_map, budget);
+    }
+
+    /// The walk itself, with the object budget as a PARAMETER rather than a
+    /// build-configuration decision.
+    ///
+    /// Split out so the budgeted arm is testable. The wrapper's budget is
+    /// `usize::MAX` under `debug_assertions`, which is every unit-test build,
+    /// so a test that goes through the wrapper can only ever exercise the
+    /// unbounded sweep — it would assert on the sampler's rotation without
+    /// running the sampler. Tests call this directly with a small budget.
+    fn verify_no_dangling_into_cset_within(
+        &self,
+        regions: &[G1Region],
+        cset: &std::collections::HashSet<usize>,
+        pointer_map: &cratonvm_types::PointerMap,
+        budget: usize,
+    ) {
+        let unbounded = budget == usize::MAX;
+        let mut objects_walked = 0usize;
+        let mut dangling_found = 0u64;
+        let mut truncated = false;
 
         // Closure: classify a referent address. Returns true if `addr`
         // is a dangling pointer into a (now-freed) CSet region.
@@ -5324,9 +5676,24 @@ impl G1Collector {
         };
 
         let jit_skips = self.jit_tlab_skip_spans();
-        for i in 0..regions.len() {
+        // Rotate the starting region so a budgeted run does not verify the same
+        // low-numbered regions every pause and call the heap checked. The
+        // cursor advances by whatever this pass consumed, so over enough pauses
+        // the sampler sweeps the whole heap.
+        let nregions = regions.len();
+        let start = if unbounded {
+            0
+        } else {
+            self.cset_verify_cursor.load(Ordering::Relaxed) % nregions.max(1)
+        };
+        for step in 0..nregions {
+            let i = (start + step) % nregions;
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
                 continue;
+            }
+            if objects_walked >= budget {
+                truncated = true;
+                break;
             }
 
             let cursor = regions[i].cursor;
@@ -5361,21 +5728,52 @@ impl G1Collector {
                             let slot_ptr = unsafe { data_start.add(k * 8) };
                             let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                             if is_dangling(raw as usize) {
+                                dangling_found += 1;
                                 self.report_dangling_cset_ref(i, obj_ptr as usize, raw as usize);
                             }
                         }
                     }
                 } else {
+                    let mut found = 0u64;
                     for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
                         if is_dangling(raw) {
+                            found += 1;
                             self.report_dangling_cset_ref(i, obj_ptr as usize, raw);
                         }
                     });
+                    dangling_found += found;
                 }
 
+                objects_walked += 1;
                 offset += obj_size;
+                // Budget is counted in OBJECTS, not regions: one humongous
+                // reference array can hold more slots than a thousand ordinary
+                // objects, so a region-granular budget would have wildly
+                // different costs per unit. Break mid-region rather than
+                // overrun — the cursor below resumes at the next region, so
+                // the unscanned tail is picked up by a later pause.
+                if objects_walked >= budget {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                // Resume past this region next pause.
+                self.cset_verify_cursor
+                    .store(i.wrapping_add(1), Ordering::Relaxed);
+                break;
             }
         }
+        if !truncated {
+            // A complete sweep: restart the rotation so the next budgeted pass
+            // does not begin mid-heap for no reason.
+            self.cset_verify_cursor.store(0, Ordering::Relaxed);
+        }
+        crate::gc_metrics::record_g1_cset_verify(
+            objects_walked as u64,
+            dangling_found,
+            truncated,
+        );
     }
 
     /// SECURITY FIX (V7b): report a detected dangling-into-CSet slot.
@@ -6076,7 +6474,20 @@ impl G1Collector {
     ///
     /// Audit fix (HIGH-3): also clears the mark worklist so a previous
     /// aborted cycle doesn't leak gray pointers into the new cycle.
-    pub fn start_concurrent_mark(&self) {
+    ///
+    /// # Stop-the-world
+    ///
+    /// I-17 (audit §7). This phase is STW and had no mechanical enforcement of
+    /// it — every other mutating-by-`&self` entry point on this collector takes
+    /// a [`StopTheWorldToken`], and the three mark-cycle entry points
+    /// (`start_concurrent_mark`, `remark`, `cleanup`) did not, so the one
+    /// invariant in the table with nothing but a comment behind it was the one
+    /// governing the phase that reclassifies and frees regions. The token is a
+    /// zero-sized witness: it costs nothing at run time and makes the
+    /// requirement a signature rather than a convention.
+    ///
+    /// [`StopTheWorldToken`]: crate::collector::StopTheWorldToken
+    pub fn start_concurrent_mark(&self, _stw: &crate::collector::StopTheWorldToken) {
         self.gc_state.set_phase(ConcurrentGcPhase::InitialMark);
         self.satb_queue.activate();
         // Round-2 fix (HIGH — GC #5): clear every per-region bitmap so a
@@ -6694,7 +7105,15 @@ impl G1Collector {
     /// empty. Callers who want a true STW final-remark should follow
     /// up with `concurrent_mark_step(usize::MAX)` to drain the worklist
     /// before transitioning to sweep.
-    pub fn remark(&self, roots: &[ObjectRef]) {
+    ///
+    /// # Stop-the-world
+    ///
+    /// Requires a [`StopTheWorldToken`] — see
+    /// [`Self::start_concurrent_mark`] for why the mark cycle takes the witness
+    /// (I-17).
+    ///
+    /// [`StopTheWorldToken`]: crate::collector::StopTheWorldToken
+    pub fn remark(&self, _stw: &crate::collector::StopTheWorldToken, roots: &[ObjectRef]) {
         self.gc_state.set_phase(ConcurrentGcPhase::Remark);
 
         let regions = self.regions.lock();
@@ -6801,7 +7220,15 @@ impl G1Collector {
 
     /// Cleanup phase: compute per-region live_bytes and gc_efficiency,
     /// free completely empty old regions.
-    pub fn cleanup(&self) {
+    ///
+    /// # Stop-the-world
+    ///
+    /// Requires a [`StopTheWorldToken`] — see
+    /// [`Self::start_concurrent_mark`] for why the mark cycle takes the witness
+    /// (I-17).
+    ///
+    /// [`StopTheWorldToken`]: crate::collector::StopTheWorldToken
+    pub fn cleanup(&self, _stw: &crate::collector::StopTheWorldToken) {
         let mut regions = self.regions.lock();
         // SECURITY FIX (V7a): cleanup recycles completely-empty Old
         // regions (reset to Free below). Invalidate every mutator's RSet
@@ -7126,6 +7553,7 @@ impl G1Collector {
         // `g1_should_start_marking` immediately re-fire a pointless
         // back-to-back mark cycle against stale occupancy.
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         // Audit fix (HIGH-3): clear any stragglers from the gray set and
         // deactivate the SATB write barrier — the cycle is fully done.
@@ -7187,10 +7615,16 @@ impl G1Collector {
 
     /// Reclaim dead humongous spans after a mark cycle.
     ///
-    /// Young and mixed evacuation cannot infer humongous reachability from a
-    /// partial collection set. Cleanup runs after whole-heap marking, so an
-    /// unmarked `HumongousStart` with no pinned slice is safe to recycle along
-    /// with each contiguous continuation region.
+    /// Cleanup runs after whole-heap marking, so an unmarked `HumongousStart`
+    /// with no pinned slice is safe to recycle along with each contiguous
+    /// continuation region.
+    ///
+    /// This is no longer the only humongous reclaimer: since 2026-08-13
+    /// evacuation pauses run [`Self::eager_reclaim_humongous_locked`], which
+    /// reaches the same conclusion from the Phase-4 reference walk instead of
+    /// the bitmap. The two are complementary rather than redundant — this one
+    /// works during a mark cycle and after an evacuation failure, which are
+    /// exactly the cases the pause path refuses.
     fn reclaim_dead_humongous_spans_locked(&self, regions: &mut [G1Region]) -> usize {
         let region_size = self.config.region_size;
         if region_size == 0 {
@@ -7258,6 +7692,280 @@ impl G1Collector {
         }
 
         reclaimed
+    }
+
+    /// Reclaim humongous spans that THIS PAUSE can prove nothing points at
+    /// (`CRATONVM_G1_EAGER_HUMONGOUS`, default on).
+    ///
+    /// # Why an evacuation pause can decide this at all
+    ///
+    /// Humongous spans are never evacuated, so until now the only thing that
+    /// ever freed one was [`Self::cleanup`] — the end of a whole concurrent
+    /// mark cycle. For a program whose humongous garbage is short-lived (a
+    /// `new byte[4 MiB]` per request, discarded immediately) that is the
+    /// difference between reclaiming on every pause and reclaiming when IHOP
+    /// happens to fire, which on a heap sized for the live set may be never.
+    ///
+    /// Cleanup decides liveness from the mark bitmap. A pause has no bitmap,
+    /// but it does have something the bitmap is a compressed form of: Phase 4
+    /// has just walked every reference slot of every non-CSet region, and Phase
+    /// 5 has just freed the CSet. So immediately after Phase 5, "no walked
+    /// object referenced span H, and no root does" IS "nothing in the heap
+    /// references H" — provided the walk really did cover the whole live heap.
+    /// Every gate below exists to establish that proviso, and each one
+    /// corresponds to a way the walk could have missed a live edge:
+    ///
+    /// * **`census.complete`** — a Phase-4 region walk that aborted on an
+    ///   implausible object size never inspected the rest of that region.
+    /// * **no mark cycle in flight** — under SATB, liveness is measured against
+    ///   the mark-start snapshot, and the gray set and SATB log hold raw
+    ///   addresses that Phase 4 does not walk. An object unreferenced *now* may
+    ///   still be snapshot-live, and freeing it unmarks its whole subtree.
+    /// * **no pending finalizer roots** — `resurrect_dead_finalizers` holds
+    ///   addresses of objects that are unreachable and must nevertheless stay
+    ///   allocated until `finalize()` has run.
+    /// * **no evacuation failure** — a self-forwarded object stays in its CSet
+    ///   region, so Phase 5 KEEPS that region. Phase 4 skips CSet regions, so a
+    ///   live evacuation-failed object holding the only reference to H was
+    ///   never walked. `pointer_map` containing an identity forward is the
+    ///   exact signal (it is what Phase 5 itself reads to decide to keep).
+    ///
+    /// # The ordering this depends on
+    ///
+    /// It must run AFTER Phase 4, and Phase 4 must have walked the pause's
+    /// to-space. Consider a young object Y in Eden holding the only reference
+    /// to humongous H: the mutator barrier recorded source=Eden in H's
+    /// remembered set, and this pause copies Y to Survivor and frees Eden. Ask
+    /// the remembered set now and it names a region that no longer holds
+    /// anything — a stale entry pointing at freed Eden — while the live
+    /// Survivor copy is unaccounted for. That is why liveness here comes from
+    /// the Phase-4 walk (which visits the Survivor copy, because to-space
+    /// regions are typed and cursor-committed before Phase 4 runs) and NOT from
+    /// the remembered set. Reversing the order, or substituting the rset for
+    /// the census, frees a live H.
+    ///
+    /// Returns bytes reclaimed.
+    fn eager_reclaim_humongous_locked(
+        &self,
+        regions: &mut Vec<G1Region>,
+        roots: &[ObjectRef],
+        pointer_map: &cratonvm_types::PointerMap,
+        census: &HumongousCensus,
+        jit_pinned: &std::collections::HashSet<usize>,
+    ) -> usize {
+        if !gc_flags().g1_eager_humongous {
+            // Disabled, not declined: the pause did not decline to answer a
+            // question it was asked. Counting these as declines would make the
+            // metric read as a fail-safe firing.
+            return 0;
+        }
+
+        let declined = |why: &str| -> usize {
+            if gc_flags().g1_dbg_reach {
+                eprintln!("[g1][HUMONGOUS] eager reclaim declined: {why}");
+            }
+            crate::gc_metrics::record_g1_eager_humongous(0, 0, true);
+            0
+        };
+
+        if !census.complete {
+            return declined("a phase-4 region walk aborted, so the census under-counts live edges");
+        }
+        if self.gc_state.phase() != ConcurrentGcPhase::Idle || self.satb_queue.is_active() {
+            return declined("a concurrent mark cycle is in flight (SATB snapshot liveness applies)");
+        }
+        if !self.mark_worklist.lock().is_empty() {
+            return declined("the gray set is non-empty");
+        }
+        if self.finalizer_pause.load(Ordering::Relaxed) {
+            // NOT `pending_finalizer_roots.is_empty()`: Phase 3.5 has already
+            // taken that list by the time this runs, so the obvious test passes
+            // unconditionally. See the `finalizer_pause` field.
+            return declined("an object registered for finalization is awaiting finalize()");
+        }
+        if pointer_map.iter().any(|(old, new)| old == new) {
+            return declined("evacuation failure kept cset regions phase 4 never walked");
+        }
+
+        // Everything the pause can see a reference from.
+        let mut live = census.referenced.clone();
+        let mut note_addr = |live: &mut std::collections::HashSet<usize>, addr: usize| {
+            if let Some(idx) = self.lookup_region_for_addr(addr) {
+                if let Some(span) = humongous_span_start(regions, idx) {
+                    live.insert(span);
+                }
+            }
+        };
+        for root in roots {
+            note_addr(&mut live, root.as_ptr() as usize);
+        }
+        // Post-copy addresses of objects resurrected for finalization this
+        // pause: unreachable by definition, and exactly why they need naming.
+        for &addr in self.resurrected_finalizers.lock().iter() {
+            note_addr(&mut live, addr);
+        }
+        // A conservatively-discovered JIT root can name a region without naming
+        // an object (that is the whole reason this set exists), so treat any
+        // humongous span it covers as referenced.
+        for &idx in jit_pinned {
+            if let Some(span) = humongous_span_start(regions, idx) {
+                live.insert(span);
+            }
+        }
+
+        // Select the doomed spans before mutating anything.
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return 0;
+        }
+        let mut doomed: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, bytes)
+        let mut i = 0usize;
+        while i < regions.len() {
+            if regions[i].region_type != RegionType::HumongousStart {
+                i += 1;
+                continue;
+            }
+            let total_size = regions[i].cursor;
+            let regions_needed = total_size.div_ceil(region_size).max(1);
+            let Some(end) = i
+                .checked_add(regions_needed)
+                .filter(|&end| end <= regions.len())
+            else {
+                i += 1;
+                continue;
+            };
+            // Same span validation cleanup applies (G1MAT-2): the extent comes
+            // from a cursor, so refuse to reset regions the region table does
+            // not agree belong to this span.
+            let well_formed = regions[i + 1..end]
+                .iter()
+                .all(|r| r.region_type == RegionType::HumongousContinuation);
+            let pinned = regions[i..end]
+                .iter()
+                .enumerate()
+                .any(|(k, r)| r.pinned || jit_pinned.contains(&(i + k)));
+            if well_formed && !pinned && !live.contains(&i) {
+                doomed.push((i, end, total_size));
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+
+        if doomed.is_empty() {
+            crate::gc_metrics::record_g1_eager_humongous(0, 0, false);
+            return 0;
+        }
+
+        // An independent oracle, debug builds only. The census is derived from
+        // the Phase-4 walk and therefore shares its region FILTER (skip CSet,
+        // skip Free) — which is where the subtle mistakes live, and where the
+        // evacuation-failure hole above would have been. This re-derives the
+        // answer after Phase 5 over every region that is not Free, so a span
+        // held only by a region the filter wrongly excluded fails here rather
+        // than becoming a use-after-free in a shipped build.
+        #[cfg(debug_assertions)]
+        {
+            let condemned: std::collections::HashSet<usize> = doomed
+                .iter()
+                .flat_map(|&(start, end, _)| start..end)
+                .collect();
+            self.debug_assert_no_reference_into_spans(regions, roots, &condemned);
+        }
+
+        let generation = self.rset_generation();
+        let mut bytes = 0usize;
+        let spans = doomed.len();
+        for (start, end, total_size) in doomed {
+            if gc_flags().g1_dbg_reach {
+                eprintln!(
+                    "[g1][HUMONGOUS] eager reclaim span start={start} regions={} bytes={total_size}",
+                    end - start
+                );
+            }
+            bytes = bytes.saturating_add(total_size);
+            for region in &mut regions[start..end] {
+                region.reset(generation);
+            }
+        }
+        crate::gc_metrics::record_g1_eager_humongous(spans as u64, bytes as u64, false);
+        bytes
+    }
+
+    /// Debug oracle for [`Self::eager_reclaim_humongous_locked`]: abort if any
+    /// live region or root still references a span about to be freed.
+    ///
+    /// Walks every non-Free region that is not itself condemned. A walk that
+    /// cannot make sense of an object stops covering that region, which is
+    /// exactly the case the caller has already refused to act on — the
+    /// condition is checked there, so reaching one here means the census and
+    /// this pass disagree, and the assertion below is the point.
+    #[cfg(debug_assertions)]
+    fn debug_assert_no_reference_into_spans(
+        &self,
+        regions: &[G1Region],
+        roots: &[ObjectRef],
+        condemned: &std::collections::HashSet<usize>,
+    ) {
+        let mut offend = |addr: usize, from: &str| {
+            if let Some(idx) = self.lookup_region_for_addr(addr) {
+                assert!(
+                    !condemned.contains(&idx),
+                    "g1 eager humongous reclaim would free a live span: {from} \
+                     references {addr:#x} in region {idx}"
+                );
+            }
+        };
+
+        for root in roots {
+            offend(root.as_ptr() as usize, "a GC root");
+        }
+
+        let jit_skips = self.jit_tlab_skip_spans();
+        for (i, region) in regions.iter().enumerate() {
+            if region.region_type == RegionType::Free || condemned.contains(&i) {
+                continue;
+            }
+            let base = region.data.as_ptr() as *mut u8;
+            let cursor = region.cursor;
+            let mut offset = 0usize;
+            while offset < cursor {
+                let obj_ptr = unsafe { base.add(offset) };
+                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                    offset += skip;
+                    continue;
+                }
+                if let Some(gap) = gap_filler_len(obj_ptr) {
+                    offset += gap;
+                    continue;
+                }
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let obj_size = object_total_size(header);
+                if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                    break;
+                }
+                let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+                if header.kind() == ObjectKind::Array {
+                    if header.element_type() == ArrayElementType::Reference {
+                        for k in 0..header.array_length() as usize {
+                            let raw: u64 =
+                                unsafe { std::ptr::read(data_start.add(k * 8) as *const u64) };
+                            if raw != 0 {
+                                offend(raw as usize, "a surviving array");
+                            }
+                        }
+                    }
+                } else {
+                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                        offend(raw, "a surviving object");
+                    });
+                }
+                offset += obj_size;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7663,6 +8371,42 @@ impl G1Collector {
     /// A `HumongousStart` region's `cursor` is the FULL object size (its
     /// continuations carry `cursor = 0`), so summing both types counts each
     /// humongous object exactly once.
+    /// Publish the occupancy denominators the normalized `gc_metrics` view
+    /// divides by (audit §9 item 5).
+    ///
+    /// Item 5 says the rset question is decided on `rset_bytes_per_live_byte`
+    /// and that "nothing has measured it yet". The reason is narrower than
+    /// "nobody ran the workload": `record_heap_occupancy` had exactly one
+    /// caller in the tree, `GenerationalHeap`, so under `-XX:+UseG1GC` the
+    /// DENOMINATOR was never published and every per-live-byte ratio was
+    /// structurally `0.000000` no matter what ran. The number could not be
+    /// measured, not merely had not been.
+    ///
+    /// `live` here is the post-pause occupancy of the surviving regions — the
+    /// sum of their bump cursors — which is an over-estimate of live bytes by
+    /// whatever garbage survived this pause uncollected. That is the honest
+    /// denominator available at a young pause: true liveness is only known
+    /// after a mark cycle, and a ratio that appears only after marking would
+    /// leave the young-only runs exactly as unmeasured as they are now. It is
+    /// an over-estimate, so `rset_bytes_per_live_byte` reads LOW, which is the
+    /// fail-safe direction for a number used to argue the set is small enough.
+    fn publish_occupancy_metrics(&self, regions: &[G1Region]) {
+        let live: usize = regions
+            .iter()
+            .filter(|r| r.region_type != RegionType::Free)
+            .map(|r| r.cursor)
+            .sum();
+        // G1 keeps no allocated-object/byte totals of its own, so those two
+        // stay at whatever they were rather than being clobbered with a zero
+        // that would read as "nothing was allocated".
+        let raw = crate::gc_metrics::gc_metrics_raw();
+        crate::gc_metrics::record_heap_occupancy(
+            raw.allocated_objects,
+            raw.allocated_bytes,
+            live as u64,
+        );
+    }
+
     fn recompute_old_gen_bytes(&self, regions: &[G1Region]) {
         let old_bytes: usize = regions
             .iter()
@@ -8015,6 +8759,22 @@ impl G1Collector {
     fn live_rset_sources(regions: &[G1Region], cset: &[usize]) -> std::collections::HashSet<usize> {
         let mut set = std::collections::HashSet::new();
         for &cset_idx in cset {
+            // COARSENED (audit §9 item 5): this rset stopped naming individual
+            // sources when it hit `rset_source_cap`, so it now asserts only
+            // "some region points into me". The sound reading is every region
+            // that could hold such an edge — which is what makes coarsening a
+            // memory/scan-time trade and not a correctness one. Getting this
+            // wrong in the cheap direction (treating a coarsened rset as empty)
+            // would drop exactly the live objects the set exists to find.
+            if regions[cset_idx].rset.is_coarsened() {
+                for (i, r) in regions.iter().enumerate() {
+                    if r.region_type != RegionType::Free && !cset.contains(&i) {
+                        set.insert(i);
+                    }
+                }
+                // Nothing another CSet region can add to a whole-heap set.
+                return set;
+            }
             // `sources_with_generations()` snapshots under the per-rset mutex
             // and returns owned pairs, so the lock is not held across the body.
             for (source, generation) in regions[cset_idx].rset.sources_with_generations() {
@@ -10357,10 +11117,67 @@ fn gap_filler_len(ptr: *const u8) -> Option<usize> {
 
 /// True iff a region of this type can be a member of a collection set —
 /// `Eden`/`Survivor` (every young or mixed CSet) or `Old` (a mixed CSet). The
+/// What a Phase-4 walk learned about which humongous spans are still referenced.
+///
+/// Humongous spans are never evacuated, so nothing in a young or mixed pause
+/// otherwise forms an opinion about whether they are alive. This is that
+/// opinion, and it is deliberately shaped as a **death certificate that has to
+/// be earned**: `complete` starts `false` (via `Default`), so any path that
+/// fails to produce a full census — an early return, a region walk that aborted
+/// on an implausible object size — leaves the collector unable to free
+/// anything. An incomplete `referenced` set is an UNDER-approximation of what
+/// is live, and acting on one frees a reachable object.
+#[derive(Default)]
+struct HumongousCensus {
+    /// `HumongousStart` region indices reached by a reference from some walked
+    /// object. Over-approximates liveness: a reference from a dead holder still
+    /// counts, which costs one extra cycle of retention and never a UAF.
+    referenced: std::collections::HashSet<usize>,
+    /// Every region the walk was supposed to cover ran to its natural end.
+    complete: bool,
+}
+
+/// The `HumongousStart` index of the span containing `idx`, if any.
+///
+/// A reference always names an object's base address, which for a humongous
+/// object lives in its `HumongousStart` region — so the backward scan is
+/// defensive rather than load-bearing. It exists because
+/// `lookup_region_for_addr` is a pure address-range query with no idea what a
+/// span is, and a single interior address treated as its own region would make
+/// a live span look unreferenced.
+fn humongous_span_start(regions: &[G1Region], idx: usize) -> Option<usize> {
+    match regions.get(idx)?.region_type {
+        RegionType::HumongousStart => Some(idx),
+        RegionType::HumongousContinuation => {
+            let mut i = idx;
+            while i > 0 {
+                i -= 1;
+                match regions[i].region_type {
+                    RegionType::HumongousStart => return Some(i),
+                    RegionType::HumongousContinuation => continue,
+                    // A continuation run that does not begin at a start is a
+                    // corrupt region table. Report nothing rather than guess:
+                    // the caller reads `None` as "not a humongous target",
+                    // which can only over-retain.
+                    _ => return None,
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Phase-4 rset rebuild records cross-region edges into these region types so a
 /// later young/mixed GC scans the holder as a remembered-set source; edges into
 /// non-collectable regions (`Free`, `HumongousStart`/`HumongousContinuation`)
 /// are never consulted and so carry no rebuilt rset entry.
+///
+/// Humongous targets are not simply dropped, though: they are recorded in the
+/// [`HumongousCensus`] instead, which is what an evacuation pause reads to
+/// decide whether a span can be reclaimed eagerly. The rset is the wrong home
+/// for them precisely because a humongous region can never enter a collection
+/// set, so nothing would ever consult the entry.
 #[inline]
 fn is_collectable_region_type(region_type: RegionType) -> bool {
     matches!(
@@ -11003,7 +11820,6 @@ mod tests {
         assert_eq!(r.cursor, 192);
     }
 
-    #[test]
     /// A TLAB carve must end 8-aligned, because `Tlab::new` rounds its `end`
     /// DOWN to 8 while `bump_alloc` commits the full size to `region.cursor`.
     /// Any gap between those two is heap no man's land — see
@@ -11183,6 +11999,259 @@ mod tests {
         assert!(gc.count_regions(RegionType::HumongousStart) >= 1);
     }
 
+    // -----------------------------------------------------------------------
+    // Eager humongous reclaim (`CRATONVM_G1_EAGER_HUMONGOUS`)
+    //
+    // A humongous span is never evacuated, so before this the only thing that
+    // ever freed one was a concurrent-mark cleanup. These pin the pause-time
+    // reclaim: what it frees, and — far more important — every case in which it
+    // must refuse to.
+    // -----------------------------------------------------------------------
+
+    /// The point of the feature: an unreferenced span goes away at the next
+    /// pause rather than waiting for a mark cycle that may never come.
+    #[test]
+    fn a_young_pause_reclaims_a_humongous_span_nothing_references() {
+        let gc = make_collector();
+        let dead = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        assert!(gc.is_humongous(dead));
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+
+        // Give the pause something to actually collect, so this exercises a
+        // real evacuation rather than the empty-CSet early return.
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            0,
+            "an evacuation pause must reclaim a humongous span nothing points at"
+        );
+    }
+
+    /// A root is not something the Phase-4 heap walk can see, so it has to be
+    /// consulted separately. Forgetting it frees the object a thread is using.
+    #[test]
+    fn a_humongous_span_named_by_a_root_survives_the_pause() {
+        let gc = make_collector();
+        let live = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        gc.set_array_element(live, 99_999, Value::Long(0x5EED)).unwrap();
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![live];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+        assert_eq!(
+            gc.get_array_element(roots[0], 99_999).unwrap(),
+            Value::Long(0x5EED)
+        );
+    }
+
+    /// THE ordering hazard, and the reason liveness here comes from the Phase-4
+    /// walk rather than from the remembered set.
+    ///
+    /// Y lives in Eden and holds the only reference to humongous H, so H's rset
+    /// names Eden. This pause copies Y to Survivor and frees Eden — at which
+    /// point H's only remembered-set entry names a region that has just been
+    /// zero-filled, and the live Survivor copy of Y is in no rset at all. A
+    /// reclaim that asked the remembered set would free H here. Asking the
+    /// Phase-4 walk (which visits the Survivor copy, because to-space is typed
+    /// and cursor-committed before Phase 4 runs) gets it right.
+    #[test]
+    fn a_humongous_span_held_only_by_an_evacuated_young_object_survives() {
+        let gc = make_collector();
+        let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        gc.set_array_element(h, 99_999, Value::Long(0xFEED)).unwrap();
+
+        let holder = gc.alloc_object(ClassId::new(1), 1);
+        let holder_before = holder.as_ptr();
+        gc.set_field(holder, 0, Value::Object(Some(h)));
+
+        let mut roots: Vec<ObjectRef> = vec![holder];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_ne!(
+            roots[0].as_ptr(),
+            holder_before,
+            "the holder must actually have been evacuated, or this test proves nothing"
+        );
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "the span is still reachable through the evacuated holder"
+        );
+        match gc.get_field(roots[0], 0) {
+            Value::Object(Some(r)) => assert_eq!(
+                gc.get_array_element(r, 99_999).unwrap(),
+                Value::Long(0xFEED),
+                "the span survived but its contents did not"
+            ),
+            other => panic!("the holder lost its reference to the span: {other:?}"),
+        }
+    }
+
+    /// Under SATB, "unreferenced right now" is not "dead": an object dropped
+    /// after the mark-start snapshot is still snapshot-live, and freeing it
+    /// unmarks its whole unscanned subtree. The pause must decline outright
+    /// while a cycle is open.
+    #[test]
+    fn an_open_mark_cycle_suppresses_eager_humongous_reclaim() {
+        let gc = make_collector();
+        let _dead = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+
+        gc.start_concurrent_mark(&stw());
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "an open mark cycle must suppress eager reclaim: SATB snapshot \
+             liveness applies and the gray set holds addresses this pause \
+             never walked"
+        );
+    }
+
+    /// A JNI pin is a promise the object will not move OR go away. Cleanup
+    /// already honours it; the pause path must too.
+    #[test]
+    fn a_pinned_humongous_span_is_never_eagerly_reclaimed() {
+        let gc = make_collector();
+        let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        let idx = gc.lookup_region_for_addr(h.as_ptr() as usize).unwrap();
+        gc.pin_region(idx);
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "a pinned span must survive even with nothing referencing it"
+        );
+    }
+
+    /// A dead object must not be its own reason to live. Without the
+    /// self-reference exclusion in `collect_outgoing_cross_region_edges`, any
+    /// humongous object holding a pointer into itself would be immortal.
+    #[test]
+    fn a_self_referential_dead_humongous_span_is_still_reclaimed() {
+        let gc = make_collector();
+        let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, 100_000);
+        assert!(gc.is_humongous(h));
+        gc.set_array_element(h, 0, Value::Object(Some(h))).unwrap();
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            0,
+            "a span that only points at itself is unreachable"
+        );
+    }
+
+    /// A span reachable only from another humongous span is still reachable.
+    /// Both are dead here, so this also documents the deliberate
+    /// over-approximation: the holder goes this pause, the held one goes the
+    /// next.
+    #[test]
+    fn a_humongous_span_held_by_another_humongous_span_survives_the_pause() {
+        let gc = make_collector();
+        let target = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        gc.set_array_element(target, 0, Value::Long(0xB0B)).unwrap();
+        let holder = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, 100_000);
+        gc.set_array_element(holder, 0, Value::Object(Some(target)))
+            .unwrap();
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 2);
+
+        let mut roots: Vec<ObjectRef> = vec![holder];
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            2,
+            "a span referenced from another span must not be freed under it"
+        );
+        assert_eq!(
+            gc.get_array_element(target, 0).unwrap(),
+            Value::Long(0xB0B)
+        );
+    }
+
+    /// A humongous object with an unrun finalizer must survive the pause.
+    ///
+    /// This one nearly got away. The obvious gate — "are there pending
+    /// finalizer roots?" — is useless where the reclaim runs, because Phase 3.5
+    /// consumes that list with `std::mem::take` long before Phase 5, so the
+    /// test passes unconditionally. And the mechanism that normally protects
+    /// finalizable garbage does not apply here either: Phase 3.5 resurrects
+    /// dead finalizable objects *out of the CSet*, and a humongous object is
+    /// never in a CSet, so it is never resurrected and never appears in
+    /// `resurrected_finalizers`. Without the pause-scoped flag this frees the
+    /// object out from under a `finalize()` that has not run.
+    #[test]
+    fn a_humongous_span_awaiting_finalization_is_not_eagerly_reclaimed() {
+        let gc = make_collector();
+        let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        let addr = h.as_ptr() as usize;
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        let _ = gc.collect_garbage_with_finalizers(&stw(), &mut roots, &[addr], &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "a span awaiting finalize() must not be freed"
+        );
+
+        // ...and the flag is per-pause, so the NEXT ordinary collection does
+        // reclaim it. A latch that never cleared would disable eager reclaim
+        // for the rest of the process after one finalizer pause.
+        let _churn2 = gc.alloc_object(ClassId::new(1), 1);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            0,
+            "the finalizer gate must be scoped to its own pause"
+        );
+    }
+
+    /// Same guarantee on the mixed driver, which frees Old regions as well as
+    /// young ones and reaches the reclaim through a different call site.
+    #[test]
+    fn a_mixed_pause_reclaims_and_preserves_humongous_spans_the_same_way() {
+        let gc = make_collector();
+        let live = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        gc.set_array_element(live, 0, Value::Long(0xA11AE)).unwrap();
+        let _dead = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 2);
+
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots: Vec<ObjectRef> = vec![live];
+        gc.mixed_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "the mixed driver must reclaim the unreferenced span and keep the rooted one"
+        );
+        assert_eq!(
+            gc.get_array_element(roots[0], 0).unwrap(),
+            Value::Long(0xA11AE)
+        );
+    }
+
     #[test]
     fn cleanup_reclaims_dead_humongous_span_and_keeps_marked_span() {
         let gc = make_collector();
@@ -11194,10 +12263,10 @@ mod tests {
         assert_eq!(gc.count_regions(RegionType::HumongousStart), 2);
         assert_eq!(gc.count_regions(RegionType::HumongousContinuation), 2);
 
-        gc.start_concurrent_mark();
-        gc.remark(&[live]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[live]);
         assert!(gc.concurrent_mark_step(usize::MAX));
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
         assert_eq!(gc.count_regions(RegionType::HumongousContinuation), 1);
@@ -12352,14 +13421,14 @@ mod tests {
         let gc = make_collector();
         assert_eq!(gc.gc_phase(), ConcurrentGcPhase::Idle);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         assert_eq!(gc.gc_phase(), ConcurrentGcPhase::ConcurrentMark);
 
         let done = gc.concurrent_mark_step(1000);
         assert!(done); // no objects to mark, should complete immediately
 
         let obj = gc.alloc_object(ClassId::new(1), 0);
-        gc.remark(&[obj]);
+        gc.remark(&stw(), &[obj]);
         assert_eq!(gc.gc_phase(), ConcurrentGcPhase::Remark);
     }
 
@@ -12401,7 +13470,7 @@ mod tests {
             }
         }
 
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         // The region containing our marked object must report non-zero
         // live_bytes (was always 0 under the buggy global bitmap). The
@@ -12460,10 +13529,10 @@ mod tests {
         let h = gc.alloc_object(ClassId::new(2), 0);
         gc.set_field(g, 0, Value::Object(Some(h)));
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         // Seed G gray (as the initial-mark root scan would); do NOT drain —
         // the young pause interrupts marking mid-cycle.
-        gc.remark(&[g]);
+        gc.remark(&stw(), &[g]);
 
         let mut roots: Vec<ObjectRef> = vec![];
         let result = gc.young_collection(&mut roots, &NoopMonitors);
@@ -12502,7 +13571,7 @@ mod tests {
         let gc = make_collector();
         let x = gc.alloc_object(ClassId::new(7), 0);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         // A mutator overwrites the last reference to X mid-cycle: the SATB
         // pre-barrier logs X. Flush the thread-local buffer immediately so
         // a concurrent test's registry-wide flush cannot steal the entry
@@ -12557,8 +13626,8 @@ mod tests {
         // A NEW marking cycle overlaps the post-cleanup mixed sequence
         // (reachable in production: start_concurrent_mark does not clear
         // marking_complete).
-        gc.start_concurrent_mark();
-        gc.remark(&[obj]); // OBJ gray, unscanned
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[obj]); // OBJ gray, unscanned
         gc.marking_complete.store(true, Ordering::Relaxed);
         gc.mixed_gc_remaining.store(1, Ordering::Relaxed);
 
@@ -12621,8 +13690,8 @@ mod tests {
         let g = gc.alloc_object(ClassId::new(2), 1);
         gc.set_field(g, 0, Value::Object(Some(x)));
 
-        gc.start_concurrent_mark();
-        gc.remark(&[g]); // G gray, unscanned; X reachable ONLY through G
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[g]); // G gray, unscanned; X reachable ONLY through G
 
         // Mid-cycle young pause with no roots: the evacuation closure
         // reaches neither G nor X. Pre-fix: G dropped → X never marked →
@@ -12631,7 +13700,7 @@ mod tests {
         gc.young_collection(&mut no_roots, &NoopMonitors);
 
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -12668,10 +13737,10 @@ mod tests {
         // snapshot and its region wholly garbage at mark start.
         roots.clear();
 
-        gc.start_concurrent_mark();
-        gc.remark(&[]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -12710,14 +13779,14 @@ mod tests {
         // Filler object whose address saturates the worklist.
         let x = gc.alloc_object(ClassId::new(2), 0);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.mark_worklist
             .lock()
             .extend(std::iter::repeat(x.as_ptr() as usize).take(MARK_WORKLIST_CAP));
 
         // Pre-fix: y's push is dropped (worklist at cap) and nothing ever
         // marks it — cleanup frees its region while it is a remark root.
-        gc.remark(&[y]);
+        gc.remark(&stw(), &[y]);
         assert!(
             gc.mark_worklist_overflowed.load(Ordering::Relaxed),
             "cap hit must set the overflow flag"
@@ -12731,7 +13800,7 @@ mod tests {
         }
 
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -12776,12 +13845,12 @@ mod tests {
         assert_eq!(garbage_addr & 0x7, 0);
         unsafe { std::ptr::write_bytes(garbage_addr as *mut u8, 0xFF, 32) };
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.mark_worklist.lock().push(garbage_addr);
-        gc.remark(&[]);
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
 
-        gc.cleanup();
+        gc.cleanup(&stw());
         {
             let regions = gc.regions.lock();
             assert_eq!(
@@ -12796,10 +13865,10 @@ mod tests {
         );
 
         // A clean follow-up cycle reclaims the wholly-dead region.
-        gc.start_concurrent_mark();
-        gc.remark(&[]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
         let regions = gc.regions.lock();
         assert_eq!(
             regions[x_region].region_type,
@@ -12839,13 +13908,13 @@ mod tests {
             let r = gc.alloc_object(ClassId::new(2), 2);
             gc.set_field(r, 0, Value::Object(Some(x)));
 
-            gc.start_concurrent_mark();
+            gc.start_concurrent_mark(&stw());
             if hide {
                 gc.set_reference_skip_set(&[r.as_ptr() as usize]);
             }
-            gc.remark(&[r]);
+            gc.remark(&stw(), &[r]);
             while !gc.concurrent_mark_step(usize::MAX) {}
-            gc.cleanup();
+            gc.cleanup(&stw());
 
             let regions = gc.regions.lock();
             regions[x_region].region_type
@@ -12872,7 +13941,7 @@ mod tests {
 
         // Survivor case: R is rooted through the pause.
         let r = gc.alloc_object(ClassId::new(2), 2);
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_reference_skip_set(&[r.as_ptr() as usize]);
         let mut roots = vec![r];
         gc.young_collection(&mut roots, &NoopMonitors);
@@ -12887,7 +13956,7 @@ mod tests {
 
         // Casualty case: R2 is unrooted and dies in the young CSet.
         let r2 = gc.alloc_object(ClassId::new(2), 2);
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_reference_skip_set(&[r2.as_ptr() as usize]);
         let mut no_roots: Vec<ObjectRef> = vec![];
         gc.young_collection(&mut no_roots, &NoopMonitors);
@@ -12910,14 +13979,14 @@ mod tests {
             let old_val = gc.alloc_object(ClassId::new(2), 0);
             gc.set_field(holder, 0, Value::Object(Some(old_val)));
 
-            gc.start_concurrent_mark();
+            gc.start_concurrent_mark(&stw());
             if suppress {
                 gc.set_field_no_satb(holder, 0, Value::Object(None));
             } else {
                 gc.set_field(holder, 0, Value::Object(None));
             }
             // remark flushes every thread-local SATB buffer into the gray set.
-            gc.remark(&[]);
+            gc.remark(&stw(), &[]);
             let grayed = gc.dbg_is_grayed_or_marked(old_val.as_ptr() as usize);
             gc.abort_concurrent_mark();
             grayed
@@ -12952,8 +14021,8 @@ mod tests {
         gc.young_collection(&mut roots, &NoopMonitors);
         let (live, dead) = (roots[0], roots[1]);
 
-        gc.start_concurrent_mark();
-        gc.remark(&[live]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[live]);
         while !gc.concurrent_mark_step(usize::MAX) {}
 
         // Post-mark-start allocation: TAMS says live despite no mark bit.
@@ -12993,13 +14062,13 @@ mod tests {
         };
         roots.clear(); // D is dead at mark start
 
-        gc.start_concurrent_mark();
-        gc.remark(&[]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
         assert!(!gc.is_live_after_mark(d.as_ptr() as usize));
 
         gc.resurrect_after_remark(&[d.as_ptr() as usize]);
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -14751,6 +15820,411 @@ mod tests {
         arr
     }
 
+    /// Audit §9 item 2: the post-evacuation CSet verification must run in a
+    /// build that ships, and must SAY how much of the heap it looked at.
+    ///
+    /// The unit-test build has `debug_assertions`, so the pass here is the
+    /// unbounded one — which is the point of this test: it pins that the
+    /// metering happens on the path tests actually take, so a future change
+    /// that stops publishing coverage fails here rather than silently making
+    /// the release sampler's numbers the only ones anybody sees.
+    #[test]
+    fn cset_verification_publishes_its_coverage() {
+        let before = crate::gc_metrics::gc_metrics_raw();
+        let gc = make_collector();
+
+        // A small live graph in a surviving region, so the verifier has
+        // something to walk after the pause.
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, 32);
+        for i in 0..32 {
+            let o = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(o, 0, Value::Int(i as i32));
+            gc.set_array_element(arr, i, Value::Object(Some(o))).unwrap();
+        }
+        let mut roots = vec![arr];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        let after = crate::gc_metrics::gc_metrics_raw();
+        assert!(
+            after.cset_verify_pauses > before.cset_verify_pauses,
+            "the pause must record a verification pass"
+        );
+        assert!(
+            after.cset_verify_objects > before.cset_verify_objects,
+            "the pass must publish the number of objects it walked — a zero \
+             `dangling` is not a claim about anything without it"
+        );
+        assert_eq!(
+            after.cset_verify_dangling, before.cset_verify_dangling,
+            "a correct collection leaves no dangling reference into a freed CSet region"
+        );
+    }
+
+    /// The budgeted (release-shaped) pass must stop AT its budget and leave a
+    /// cursor, so coverage accumulates across pauses instead of re-walking the
+    /// same prefix of the heap forever.
+    ///
+    /// Calls the inner walk directly with a small budget: the wrapper's budget
+    /// is `usize::MAX` under `debug_assertions`, so going through it would
+    /// assert on the sampler's behaviour while running the unbounded sweep.
+    /// An empty CSet is deliberate -- nothing was freed, so there is nothing to
+    /// report, and what is under test is the budget and the cursor.
+    #[test]
+    fn budgeted_cset_verification_stops_at_its_budget_and_leaves_a_cursor() {
+        let gc = make_collector();
+        for i in 0..64 {
+            let o = gc.alloc_object(ClassId::new(1), 2);
+            gc.set_field(o, 0, Value::Int(i));
+        }
+
+        let regions = gc.regions.lock();
+        let empty_cset: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let empty_map = cratonvm_types::PointerMap::default();
+
+        let before = crate::gc_metrics::gc_metrics_raw();
+        gc.cset_verify_cursor.store(0, Ordering::Relaxed);
+        gc.verify_no_dangling_into_cset_within(&regions, &empty_cset, &empty_map, 4);
+        let after = crate::gc_metrics::gc_metrics_raw();
+
+        let walked = after.cset_verify_objects - before.cset_verify_objects;
+        assert!(walked <= 4, "the budget is a ceiling on objects walked, got {walked}");
+        assert_eq!(
+            after.cset_verify_truncated - before.cset_verify_truncated,
+            1,
+            "a pass that stopped on its budget must be counted as truncated, or a              partial sweep reads like a whole-heap verification"
+        );
+
+        // A budget large enough to reach the end resets the rotation, so the
+        // next pass does not begin mid-heap for no reason.
+        gc.verify_no_dangling_into_cset_within(&regions, &empty_cset, &empty_map, usize::MAX);
+        assert_eq!(gc.cset_verify_cursor.load(Ordering::Relaxed), 0);
+    }
+
+    /// G1-9 regression: the parallel evacuator must scan a COMPACT object's
+    /// reference fields.
+    ///
+    /// This is the coverage gap that let G1-9 hide for months. Every other gc
+    /// unit test allocates through `alloc_object(ClassId, n)` with no
+    /// `CompactLayout` registered for that class, so its objects take the
+    /// legacy uniform 16-byte-cell body — and the parallel evacuator's old
+    /// `HEADER_SIZE + slot_idx * SLOT_SIZE` stride is accidentally CORRECT for
+    /// exactly those objects. A compact body needs a registered layout, which
+    /// only a real loaded class produced, so the defect was reachable only from
+    /// a full VM run: `-XX:+UseG1GC` + parallel evacuation reported
+    /// `[g1][SECURITY V7b] post-evacuation dangling reference` on the first
+    /// pause, deterministically, including at `CRATONVM_G1_WORKERS=1`.
+    ///
+    /// Registering the layout here closes that gap. Under the pre-fix scan the
+    /// holders' reference fields are never visited, so their referents are
+    /// never evacuated and the assertions below fail.
+    ///
+    /// # This test writes PROCESS-GLOBAL state, deliberately and narrowly
+    ///
+    /// `register_class_layout` publishes into the same kind of process-wide
+    /// table that `narrow_oop::enable` does, and `cargo test` runs this
+    /// binary's tests on parallel threads — the hazard that produced this
+    /// session's original flake (see `narrow_oop::disable_for_test`). The blast
+    /// radius is bounded here in a way it was not there: a registration only
+    /// affects objects allocated with THIS `(class_id, field_count)` pair, and
+    /// `COMPACT_HOLDER_CLASS` is an id no other test in this crate uses. It is
+    /// also never unregistered, so the state it publishes is monotone — a
+    /// second run of this test finds its own layout already present rather than
+    /// racing a teardown.
+    #[test]
+    fn parallel_evacuation_scans_compact_object_reference_fields() {
+        use cratonvm_types::field_layout::{CompactLayout, FieldStorageKind};
+
+        // An id no other gc test allocates with; see the note above.
+        const COMPACT_HOLDER_CLASS: u32 = 4242;
+
+        // Four fields: int, ref, int, ref — references at PACKED offsets that
+        // the legacy 16-byte stride cannot land on. Body is 32 bytes where the
+        // legacy layout would be 4 * 16 = 64, so the old loop also addressed
+        // twice the object's length.
+        let layout = CompactLayout {
+            field_offsets: vec![0, 8, 16, 24],
+            is_ref: vec![false, true, false, true],
+            field_kinds: vec![
+                FieldStorageKind::Int,
+                FieldStorageKind::Reference,
+                FieldStorageKind::Int,
+                FieldStorageKind::Reference,
+            ],
+            ref_offsets: vec![8, 24],
+            body_size: 32,
+        };
+
+        let gc = G1Collector::new(parallel_config(8, 32));
+        cratonvm_types::register_class_layout(
+            gc.layout_domain(),
+            COMPACT_HOLDER_CLASS,
+            std::sync::Arc::new(layout),
+        );
+
+        let holders = 200usize;
+        let shared = 40usize;
+
+        let children: Vec<ObjectRef> = (0..shared)
+            .map(|j| {
+                let c = gc.alloc_object(ClassId::new(9), 1);
+                gc.set_field(c, 0, Value::Int(7_000 + j as i32));
+                c
+            })
+            .collect();
+
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, holders);
+        for i in 0..holders {
+            let h = gc.alloc_object(ClassId::new(COMPACT_HOLDER_CLASS), 4);
+            assert!(
+                cratonvm_types::is_compact_object(&gc.get_header(h)),
+                "holder {i} must be COMPACT — otherwise this test proves nothing \
+                 (is the layout registered under the collector's domain?)"
+            );
+            gc.set_field(h, 0, Value::Int(i as i32));
+            gc.set_field(h, 1, Value::Object(Some(children[i % shared])));
+            gc.set_field(h, 2, Value::Int(-(i as i32)));
+            gc.set_field(h, 3, Value::Object(Some(children[(i * 3 + 1) % shared])));
+            gc.set_array_element(arr, i, Value::Object(Some(h))).unwrap();
+        }
+
+        let mut roots = vec![arr];
+        let res = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        // 1 array + holders + shared children, each copied exactly once. Under
+        // the pre-fix scan the children are never reached, so this count is
+        // short by `shared` before it is short by anything else.
+        assert_eq!(
+            res.stats.objects_copied,
+            1 + holders + shared,
+            "every live object — including the compact holders' referents — is copied once"
+        );
+
+        let mut child_addrs = std::collections::HashSet::new();
+        for i in 0..holders {
+            let h = match gc.get_array_element(roots[0], i).unwrap() {
+                Value::Object(Some(o)) => o,
+                other => panic!("holder {i} lost -> {other:?}"),
+            };
+            assert_eq!(gc.get_field(h, 0).as_int(), Some(i as i32), "holder {i} int 0");
+            assert_eq!(
+                gc.get_field(h, 2).as_int(),
+                Some(-(i as i32)),
+                "holder {i} int 2"
+            );
+            for (slot, j) in [(1usize, i % shared), (3usize, (i * 3 + 1) % shared)] {
+                let child = match gc.get_field(h, slot) {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("holder {i} slot {slot} lost -> {other:?}"),
+                };
+                assert_eq!(
+                    gc.get_field(child, 0).as_int(),
+                    Some(7_000 + j as i32),
+                    "holder {i} slot {slot} points at the wrong child"
+                );
+                child_addrs.insert(child.as_ptr() as usize);
+            }
+        }
+        assert_eq!(
+            child_addrs.len(),
+            shared,
+            "the shared children must be evacuated to one copy each"
+        );
+    }
+
+    /// Shape for the repeated-collection oracle below: an array of `p` parents,
+    /// each holding an identity int and TWO references into a pool of `s`
+    /// shared children, each of which holds an identity int and a reference
+    /// into a pool of `l` shared leaves.
+    ///
+    /// Two levels of sharing, not one, and two reference slots per parent
+    /// rather than one: the CAS-forwarding loser arm in `SharedEvac::evacuate`
+    /// is only reachable when two workers race on the SAME object, so a tree
+    /// never exercises it — that is why the original decode bug there needed a
+    /// diamond to surface at all. A second level means a worker can lose a race
+    /// on a child while another worker is still copying that child's referent.
+    fn build_shared_graph(gc: &G1Collector, p: usize, s: usize, l: usize) -> ObjectRef {
+        let leaves: Vec<ObjectRef> = (0..l)
+            .map(|k| {
+                let o = gc.alloc_object(ClassId::new(11), 1);
+                gc.set_field(o, 0, Value::Int(20_000 + k as i32));
+                o
+            })
+            .collect();
+        let children: Vec<ObjectRef> = (0..s)
+            .map(|j| {
+                let o = gc.alloc_object(ClassId::new(10), 2);
+                gc.set_field(o, 0, Value::Int(10_000 + j as i32));
+                gc.set_field(o, 1, Value::Object(Some(leaves[j % l])));
+                o
+            })
+            .collect();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, p);
+        for i in 0..p {
+            let parent = gc.alloc_object(ClassId::new(9), 3);
+            gc.set_field(parent, 0, Value::Int(i as i32));
+            gc.set_field(parent, 1, Value::Object(Some(children[i % s])));
+            gc.set_field(parent, 2, Value::Object(Some(children[(i * 7 + 3) % s])));
+            gc.set_array_element(arr, i, Value::Object(Some(parent)))
+                .unwrap();
+        }
+        arr
+    }
+
+    /// Walk the whole graph and assert every property a correct evacuation
+    /// preserves: nothing lost, nothing duplicated, no two objects sharing an
+    /// address, every identity int intact.
+    ///
+    /// The duplication and overlap checks are the ones a value-multiset
+    /// comparison misses. A shared child copied TWICE still yields the right
+    /// value through both parents — it is visible only as two distinct
+    /// addresses carrying one identity. Two objects copied to the SAME address
+    /// is likewise value-plausible until one address is seen carrying two
+    /// identities.
+    fn verify_shared_graph(
+        gc: &G1Collector,
+        arr: ObjectRef,
+        round: usize,
+        p: usize,
+        s: usize,
+        l: usize,
+    ) {
+        use std::collections::{HashMap, HashSet};
+        let mut addr_of_identity: HashMap<i32, usize> = HashMap::new();
+        let mut identity_of_addr: HashMap<usize, i32> = HashMap::new();
+        let mut leaf_addrs: HashSet<usize> = HashSet::new();
+
+        for i in 0..p {
+            let parent = match gc.get_array_element(arr, i).unwrap() {
+                Value::Object(Some(o)) => o,
+                other => panic!("round {round}: parent {i} lost -> {other:?}"),
+            };
+            assert_eq!(
+                gc.get_field(parent, 0).as_int(),
+                Some(i as i32),
+                "round {round}: parent {i} identity"
+            );
+            let mut note = |identity: i32, addr: usize| {
+                let canonical = *addr_of_identity.entry(identity).or_insert(addr);
+                assert_eq!(
+                    canonical, addr,
+                    "round {round}: object {identity} exists at TWO addresses ({canonical:#x} and {addr:#x}) - evacuated twice"
+                );
+                let owner = *identity_of_addr.entry(addr).or_insert(identity);
+                assert_eq!(
+                    owner, identity,
+                    "round {round}: address {addr:#x} carries TWO identities ({owner} and {identity}) - overlapping copies"
+                );
+            };
+            note(i as i32, parent.as_ptr() as usize);
+
+            for (slot, j) in [(1usize, i % s), (2usize, (i * 7 + 3) % s)] {
+                let child = match gc.get_field(parent, slot) {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("round {round}: parent {i} slot {slot} lost -> {other:?}"),
+                };
+                let child_id = 10_000 + j as i32;
+                assert_eq!(
+                    gc.get_field(child, 0).as_int(),
+                    Some(child_id),
+                    "round {round}: parent {i} slot {slot} points at the wrong child"
+                );
+                note(child_id, child.as_ptr() as usize);
+
+                let leaf = match gc.get_field(child, 1) {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("round {round}: child {j} leaf lost -> {other:?}"),
+                };
+                let leaf_id = 20_000 + (j % l) as i32;
+                assert_eq!(
+                    gc.get_field(leaf, 0).as_int(),
+                    Some(leaf_id),
+                    "round {round}: child {j} points at the wrong leaf"
+                );
+                note(leaf_id, leaf.as_ptr() as usize);
+                leaf_addrs.insert(leaf.as_ptr() as usize);
+            }
+        }
+        assert_eq!(
+            leaf_addrs.len(),
+            l,
+            "round {round}: the shared leaves collapsed or multiplied"
+        );
+        assert_eq!(
+            addr_of_identity.len(),
+            p + s + l,
+            "round {round}: reachable object count changed"
+        );
+    }
+
+    /// G1-9 oracle at unit level.
+    ///
+    /// Every other parallel-evacuation test runs ONE collection over a graph
+    /// built moments earlier, so it only ever exercises Eden -> Survivor with
+    /// every object at age 0. The audit's corruption is reported from sustained
+    /// churn, where the same objects are re-evacuated pause after pause, age
+    /// past `promotion_age` into the Old TLAB, and are reached through a heap
+    /// whose region types keep changing under them.
+    ///
+    /// So: hold one graph across repeated 8-worker parallel pauses, allocate
+    /// real garbage between them, and re-verify the WHOLE graph — structure and
+    /// identity, not just a value multiset — after every pause.
+    #[test]
+    fn repeated_parallel_young_collections_never_lose_duplicate_or_corrupt() {
+        let gc = G1Collector::new(parallel_config(8, 32));
+        let (p, s, l) = (300usize, 60usize, 20usize);
+        let arr = build_shared_graph(&gc, p, s, l);
+        let mut roots = vec![arr];
+
+        for round in 0..8usize {
+            // Garbage the pause has to walk past and reclaim.
+            for g in 0..200i32 {
+                let junk = gc.alloc_object(ClassId::new(99), 2);
+                gc.set_field(junk, 0, Value::Int(g));
+            }
+            let res = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+            if round == 0 {
+                // Everything live is young and in the CSet on the first pause.
+                assert_eq!(
+                    res.stats.objects_copied,
+                    1 + p + s + l,
+                    "round 0: exactly the live set is copied, once each"
+                );
+            }
+            verify_shared_graph(&gc, roots[0], round, p, s, l);
+        }
+    }
+
+    /// The same oracle with a mark cycle OPEN across the pauses.
+    ///
+    /// A young pause under an active cycle takes paths the quiescent one never
+    /// does: `marking_keepalive_roots` evacuates CSet-resident gray/SATB
+    /// objects as extra roots, the survivors are re-grayed after Phase 5, and
+    /// the mark worklist is remapped through the same `pointer_map` the roots
+    /// were. That interaction is where a lost or double-copied object would
+    /// show up not as a value divergence but as a stale gray entry.
+    #[test]
+    fn repeated_parallel_young_collections_under_an_open_mark_cycle() {
+        let gc = G1Collector::new(parallel_config(8, 32));
+        let (p, s, l) = (200usize, 40usize, 15usize);
+        let arr = build_shared_graph(&gc, p, s, l);
+        let mut roots = vec![arr];
+
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &roots);
+
+        for round in 0..6usize {
+            for g in 0..150i32 {
+                let junk = gc.alloc_object(ClassId::new(99), 2);
+                gc.set_field(junk, 0, Value::Int(g));
+            }
+            // Drive some marking between pauses so the gray set is genuinely
+            // non-empty when the next evacuation starts.
+            gc.concurrent_mark_step(64);
+            gc.young_collection_parallel(&mut roots, &NoopMonitors);
+            verify_shared_graph(&gc, roots[0], round, p, s, l);
+        }
+    }
+
     fn reachable_ints(gc: &G1Collector, root_arr: ObjectRef, n: usize) -> Vec<i32> {
         let mut vals = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -15232,7 +16706,7 @@ mod tests {
             assert!(regions[idx].mark_bitmap.try_mark(above_addr));
         });
 
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let (live_bytes, cursor, efficiency) = {
             let regions = gc.regions.lock();
@@ -15280,7 +16754,7 @@ mod tests {
         force_mark_snapshot(&gc, idx, tams);
         // Nothing marked: `dead` is unreachable in the snapshot, `fresh` is
         // implicitly live because it postdates it.
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let (live_bytes, cursor, region_type) = {
             let regions = gc.regions.lock();
@@ -15380,7 +16854,7 @@ mod tests {
         );
 
         // Marking active: the overwritten referent must be logged.
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_array_element(arr, 0, Value::Object(Some(new)))
             .unwrap();
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
@@ -15408,7 +16882,7 @@ mod tests {
 
         gc.set_array_element(arr, 0, Value::Object(Some(referent)))
             .unwrap();
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
         let _ = gc.satb_queue().drain();
 
@@ -15453,7 +16927,7 @@ mod tests {
 
         // No mark-start snapshot: cleanup keeps the pure-bitmap verdict and
         // performs no in-place frees, so this isolates the rset pruning.
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let sources = {
             let regions = gc.regions.lock();
@@ -15702,11 +17176,11 @@ mod tests {
         };
 
         check("idle");
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         check("after start_concurrent_mark");
         assert!(gc.gc_state.is_marking_active() && gc.satb_queue.is_active());
 
-        gc.remark(&[]);
+        gc.remark(&stw(), &[]);
         check("after remark");
 
         gc.abort_concurrent_mark();
@@ -15725,7 +17199,7 @@ mod tests {
     #[test]
     fn abort_leaves_the_marking_phase_before_closing_the_satb_queue() {
         let gc = make_collector();
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         assert!(gc.gc_state.is_marking_active());
         assert!(gc.satb_queue.is_active());
         gc.abort_concurrent_mark();
@@ -15747,7 +17221,7 @@ mod tests {
         let new = gc.alloc_object(ClassId::new(3), 0);
         gc.set_field(holder, 0, Value::Object(Some(old)));
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_field(holder, 0, Value::Object(Some(new)));
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
 
@@ -15773,7 +17247,7 @@ mod tests {
         gc.set_array_element(arr, 0, Value::Object(Some(old)))
             .expect("in bounds");
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_array_element(arr, 0, Value::Object(Some(new)))
             .expect("in bounds");
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
@@ -15818,9 +17292,9 @@ mod tests {
         let obj = gc.alloc_object(ClassId::new(1), 1);
         let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         assert!(gc.mark_worklist.lock().is_empty());
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(
             gc.regions.lock()[idx].region_type,
@@ -15840,11 +17314,11 @@ mod tests {
         let obj = gc.alloc_object(ClassId::new(1), 1);
         let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         // One gray entry the marker never got to. Its address is irrelevant —
         // what matters is that the closure is not at a fixed point.
         gc.mark_worklist.lock().push(obj.as_ptr() as usize);
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(
             gc.regions.lock()[idx].region_type,
@@ -15879,9 +17353,9 @@ mod tests {
             RegionType::HumongousStart
         );
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.mark_worklist.lock().push(big.as_ptr() as usize);
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(
             gc.regions.lock()[start].region_type,
@@ -15927,6 +17401,219 @@ mod tests {
     /// enter a collection set, because Phase 5 zero-fills and re-types every
     /// CSet region that holds no self-forwarded object. That is what lets
     /// `pin_region_for_addr` promise a JNI critical section a stable address.
+    /// Audit §9 item 5 — the remembered set is bounded, and bounding it does
+    /// not lose objects.
+    ///
+    /// The bound is coarsening: past `rset_source_cap()` distinct sources an
+    /// rset stops naming them and asserts only "some region points into me".
+    /// That is a memory/scan-time trade, and it is only sound if the scan side
+    /// reads a coarsened set as the SUPERSET — every plausible source — rather
+    /// than as the empty set it now physically contains. Reading it the cheap
+    /// way would drop exactly the live objects the remembered set exists to
+    /// find, which is why the second half of this test runs a real collection
+    /// rather than stopping at the flag.
+    #[test]
+    fn a_coarsened_remembered_set_still_finds_every_live_edge() {
+        let gc = make_collector();
+
+        // --- the flag, and what it does to the source set ----------------
+        let target = 1usize;
+        {
+            let regions = gc.regions.lock();
+            // Cap of 2: the third DISTINCT source coarsens.
+            regions[target].rset.add_reference_in_generation_within(3, 0, 2);
+            regions[target].rset.add_reference_in_generation_within(4, 0, 2);
+            assert!(!regions[target].rset.is_coarsened(), "still under the cap");
+            regions[target].rset.add_reference_in_generation_within(5, 0, 2);
+            assert!(
+                regions[target].rset.is_coarsened(),
+                "exceeding the cap must coarsen rather than grow"
+            );
+            assert_eq!(
+                regions[target].rset.source_count(),
+                0,
+                "coarsening releases the precise set — that is the whole point \
+                 of the bound"
+            );
+
+            let sources = G1Collector::live_rset_sources(&regions, &[target]);
+            for (i, r) in regions.iter().enumerate() {
+                if i != target && r.region_type != RegionType::Free {
+                    assert!(
+                        sources.contains(&i),
+                        "a coarsened rset must be read as EVERY plausible \
+                         source; region {i} is missing"
+                    );
+                }
+            }
+        }
+
+        // --- and the behaviour: no object is lost by the bound -----------
+        //
+        // P -> Q across regions, with the recorded entry then destroyed by
+        // coarsening. Nothing names P any more, so Q survives only if the
+        // coarsened read is the superset.
+        let gc2 = make_collector();
+        let p = gc2.alloc_object(ClassId::new(1), 1);
+        let p_region = gc2.lookup_region_for_addr(p.as_ptr() as usize).unwrap();
+        gc2.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let q = gc2.alloc_object(ClassId::new(2), 1);
+        let q_region = gc2.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
+        assert_ne!(p_region, q_region);
+        gc2.set_field(q, 0, Value::Int(9191));
+        gc2.set_field(p, 0, Value::Object(Some(q)));
+        // Hold P's region out of the CSet so it is a source rather than a
+        // collection target, exactly as a JNI pin would.
+        gc2.pin_region(p_region);
+
+        {
+            // Coarsen Q's rset, which destroys the entry that named P. A cap of
+            // 1 coarsens on the second distinct source.
+            let regions = gc2.regions.lock();
+            regions[q_region]
+                .rset
+                .add_reference_in_generation_within(999_999, 0, 1);
+            regions[q_region]
+                .rset
+                .add_reference_in_generation_within(999_998, 0, 1);
+            assert!(regions[q_region].rset.is_coarsened());
+            assert!(
+                !regions[q_region].rset.sources().contains(&p_region),
+                "the entry naming P is gone — this test would pass vacuously otherwise"
+            );
+        }
+
+        let q_addr = q.as_ptr() as usize;
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc2.young_collection(&mut roots, &NoopMonitors);
+        let q_new = result
+            .pointer_map
+            .get(&q_addr)
+            .copied()
+            .expect("a coarsened remembered set must still reach Q through the wholesale walk");
+        match gc2.get_field(p, 0) {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr() as usize, q_new),
+            other => panic!("P's reference was lost under coarsening: {other:?}"),
+        }
+        assert_eq!(gc2.get_field(q_new_ref(q_new), 0).as_int(), Some(9191));
+    }
+
+    /// Helper: rebuild an `ObjectRef` from a post-GC address.
+    fn q_new_ref(addr: usize) -> ObjectRef {
+        // SAFETY: `addr` came out of this pause's pointer map, so it names a
+        // live, 8-byte-aligned to-space object.
+        unsafe { ObjectRef::from_raw(addr as *mut u8) }
+    }
+
+    /// Audit §9 item 6 — the JNI-pinned-source policy, stated and pinned.
+    ///
+    /// There are two no-relocation pin vocabularies and they are covered
+    /// DIFFERENTLY as remembered-set sources. Until now that difference lived in
+    /// a comment, which is what the audit item objects to:
+    ///
+    /// * a **JNI-pinned** region (`G1Region::pinned` / `pin_count`, JEP 423) is
+    ///   held out of the collection set but is an ORDINARY remembered-set
+    ///   source. A CSet object referenced only from it survives because the
+    ///   post-write barrier recorded that edge. Nothing walks the region
+    ///   wholesale.
+    /// * a **JIT-pinned** region is additionally walked WHOLESALE (see
+    ///   `a_jit_pinned_region_is_a_wholesale_rset_source_on_the_parallel_path_too`),
+    ///   because `jit_pinned_region_set()` also contains every region holding a
+    ///   published un-retired TLAB tail — memory no barrier ever saw.
+    ///
+    /// THE POLICY, stated: the JNI half is barrier-covered, the JIT half is
+    /// walk-covered, and the asymmetry is deliberate. It is sound exactly while
+    /// every store that can install a reference out of a JNI-pinned region
+    /// fires the barrier — which is what G1-2 was about, and G1-2 is closed:
+    /// under a backend that publishes no live region bounds (G1, ZGC) every
+    /// inline JIT reference store bails to `jit_putfield_object`, which fires
+    /// the collector's own barrier. If that ever stops being true, this test's
+    /// second half is the one that starts lying, and the fix is to promote
+    /// JNI-pinned regions to wholesale sources too.
+    #[test]
+    fn a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one() {
+        // --- the barrier-covered case: the edge is recorded, so Q survives ---
+        let gc = make_collector();
+        let p = gc.alloc_object(ClassId::new(1), 1);
+        let p_region = gc.lookup_region_for_addr(p.as_ptr() as usize).unwrap();
+        // Retire the current Eden so Q lands in a different region.
+        gc.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let q = gc.alloc_object(ClassId::new(2), 1);
+        let q_region = gc.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
+        assert_ne!(p_region, q_region, "Q must be cross-region from P");
+        gc.set_field(q, 0, Value::Int(2424));
+        gc.set_field(p, 0, Value::Object(Some(q))); // fires the post-write barrier
+
+        gc.pin_region(p_region);
+        assert!(gc.is_pinned(p_region));
+        assert!(
+            !gc.jit_pinned_region_set().contains(&p_region),
+            "a JNI pin must NOT put the region in the JIT-pinned set — the two \
+             vocabularies are separate, and conflating them is what would make \
+             this policy vacuous"
+        );
+
+        // The mechanism: P's region is reachable as an ORDINARY rset source of
+        // the CSet, i.e. because the barrier recorded the edge.
+        {
+            let regions = gc.regions.lock();
+            let sources = G1Collector::live_rset_sources(&regions, &[q_region]);
+            assert!(
+                sources.contains(&p_region),
+                "the JNI-pinned holder must appear as a remembered-set source \
+                 of the region it points into"
+            );
+        }
+
+        let q_addr = q.as_ptr() as usize;
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        let q_new = result
+            .pointer_map
+            .get(&q_addr)
+            .copied()
+            .expect("Q is live through the pinned region's remembered set");
+        match gc.get_field(p, 0) {
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr() as usize,
+                q_new,
+                "P's slot must be rewritten to Q's new address"
+            ),
+            other => panic!("P's reference was lost: {other:?}"),
+        }
+
+        // --- the dependency, made explicit -------------------------------
+        //
+        // Same shape, but with the barrier's record erased: the JNI-pinned
+        // region then covers NOTHING. Asserted at the source-set level rather
+        // than by running a pause, deliberately — actually collecting with the
+        // record erased drops a live object and leaves P pointing into a freed
+        // region, which is precisely the `[g1][SECURITY V7b]` condition the
+        // post-evacuation verifier exists to catch, and it does catch it. A
+        // test should not have to corrupt the heap to state where a region's
+        // coverage comes from.
+        let gc2 = make_collector();
+        let p2 = gc2.alloc_object(ClassId::new(1), 1);
+        let p2_region = gc2.lookup_region_for_addr(p2.as_ptr() as usize).unwrap();
+        gc2.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let q2 = gc2.alloc_object(ClassId::new(2), 1);
+        let q2_region = gc2.lookup_region_for_addr(q2.as_ptr() as usize).unwrap();
+        assert_ne!(p2_region, q2_region);
+        gc2.set_field(p2, 0, Value::Object(Some(q2)));
+        gc2.pin_region(p2_region);
+        gc2.regions.lock()[q2_region].rset.clear();
+
+        let regions = gc2.regions.lock();
+        assert!(
+            !G1Collector::live_rset_sources(&regions, &[q2_region]).contains(&p2_region),
+            "with the entry erased the pinned holder is no longer a source"
+        );
+        assert!(
+            !gc2.jit_pinned_region_set().contains(&p2_region),
+            "and nothing else would walk it: a JNI pin is not a JIT pin, so the              remembered set is the WHOLE of a JNI-pinned region's coverage. If              this ever stops holding, the policy above needs rewriting rather              than this assertion"
+        );
+    }
+
     #[test]
     fn a_pinned_region_is_never_evacuated() {
         let gc = make_collector();
@@ -16099,8 +17786,8 @@ mod tests {
         assert!(gc.regions.lock()[source].rset.sources().is_empty());
 
         // ...and cleanup prunes the now-dangling entry naming it.
-        gc.start_concurrent_mark();
-        gc.cleanup();
+        gc.start_concurrent_mark(&stw());
+        gc.cleanup(&stw());
         assert!(
             !gc.regions.lock()[target].rset.sources().contains(&source),
             "an entry naming a Free source must be pruned, not carried forever"
@@ -16168,8 +17855,8 @@ mod tests {
 
         // And cleanup drops the entry outright, so it stops costing memory and
         // a per-pause lookup.
-        gc.start_concurrent_mark();
-        gc.cleanup();
+        gc.start_concurrent_mark(&stw());
+        gc.cleanup(&stw());
         assert!(
             !gc.regions.lock()[target].rset.sources().contains(&source),
             "cleanup must prune an entry whose source was recycled, not only \
@@ -16228,8 +17915,8 @@ mod tests {
             );
         }
 
-        gc.start_concurrent_mark();
-        gc.cleanup();
+        gc.start_concurrent_mark(&stw());
+        gc.cleanup(&stw());
         let sources = gc.regions.lock()[target].rset.sources();
         assert!(sources.contains(&fresh));
         assert!(sources.contains(&unstamped));

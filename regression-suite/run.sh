@@ -161,7 +161,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # fail, the exact defect this file's guards exist to catch) or fail every run
 # for all eight lanes. The design constraints for landing one are in
 # docs/known-issues/jdk-only/W8-E9-1-three-broken-oracles-and-the-suite-denominator.md.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -491,6 +491,36 @@ compile_suite() {
 # run.sh's own CPSEP is computed BEFORE the source and still wins;
 # harness-guard.sh defaults CPSEP only when the caller left it unset, so there
 # is exactly one value either way.
+#
+# MERGE 2026-08-16 — one arm arrived here from mainline AFTER the deletion, and
+# it is NOT lost, it is RELOCATED. Mainline added `RClassUnloadSweepGen)
+# printf '%s' "-XX:+UseGenerationalGC"` to its copy of class_cv_args while this
+# branch was deleting that copy. Re-adding a copy to carry one arm is exactly
+# what the paragraph above forbids, and it would not merely be untidy: the
+# shared class_cv_args has grown RJdkForeign and RJdkSqlPackage arms that
+# mainline's copy never had, so a copy here would DISAGREE with the shared
+# definition and harness-guard.sh's H1 drift check would fire on every
+# selfcheck. The arm belongs in harness-guard.sh's class_cv_args, beside
+# RPriorityQueueGc and RTreeRangeGc, with mainline's reasoning:
+#
+#   The COLLECTOR is a variable this suite otherwise never moves: every other
+#   vector runs on whatever the default happens to be, and that default changed
+#   (Generational -> ZGC) on 2026-08-10 with nothing scheduled to notice.
+#   `RClassUnloadSweepGen` is `RClassUnloadSweep`'s own probe run against the
+#   generational young sweep, where the last surviving arm of
+#   `TestDefaultInstanceManager`'s fourth recurrence lived. CratonVM-only by
+#   construction: `$cvextra` never reaches the HotSpot oracle, which is correct
+#   here — the claim is "a real JVM unloads this class", not "under a named
+#   collector".
+#
+# UNTIL THAT ARM IS IN harness-guard.sh, RClassUnloadSweepGen RUNS UNDER THE
+# DEFAULT COLLECTOR, which makes it a byte-for-byte re-run of
+# RClassUnloadSweep — a scheduled vector that cannot fail for its own reason.
+# That is the "gate that manufactures green" this file's guards exist to catch,
+# so it is written down here rather than left to be noticed.
+#
+# The same mainline commit also added RClassUnloadSweepGen to CORE_CLASSES
+# above; that half needed no relocation and is already in the merged list.
 
 # Can $1 (a javac) actually target `--release $2`? Probed with a throwaway
 # compile rather than by parsing --help: javac accepts the option and then

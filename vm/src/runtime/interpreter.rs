@@ -160,6 +160,46 @@ fn weakref_clear_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// Armed by the allocation-failure escalation ladder immediately before the
+    /// collection it runs as its final attempt, so that collection clears every
+    /// SoftReference rather than only the idle ones — the `java.lang.ref`
+    /// last-ditch guarantee (see
+    /// `ReferenceProcessor::condemn_all_soft_refs`).
+    ///
+    /// Thread-local rather than a process-global flag for two reasons. It is
+    /// armed and read on ONE thread: `last_ditch_reclaim` arms it, calls
+    /// `maybe_gc_forced`, and that function either initiates the collection on
+    /// this same thread — running `weakref_null_referents_pre_gc` here, where
+    /// the flag is visible — or declines because another thread is already
+    /// collecting, in which case no collection of ours happens and the flag
+    /// must not affect anyone else's. And a process can host more than one VM,
+    /// which a `static AtomicBool` would silently share; nothing about
+    /// "this thread is out of memory" belongs to a sibling VM.
+    static LAST_DITCH_SOFT_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the last-ditch soft-clear rule armed for any collection it
+/// initiates. Restores the previous value on the way out, including on unwind,
+/// so a panic inside the collection cannot leave the rule latched on for every
+/// later GC on this thread.
+pub(crate) fn with_last_ditch_soft_clear<R>(f: impl FnOnce() -> R) -> R {
+    struct Disarm(bool);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            LAST_DITCH_SOFT_CLEAR.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Disarm(LAST_DITCH_SOFT_CLEAR.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether the collection about to run is the allocation failure's last
+/// attempt. See [`with_last_ditch_soft_clear`].
+fn last_ditch_soft_clear_armed() -> bool {
+    LAST_DITCH_SOFT_CLEAR.with(|c| c.get())
+}
+
 /// `CRATONVM_DBG_WEAKREF` — trace the Weak/Phantom referent null/restore passes.
 fn dbg_weakref() -> bool {
     use std::sync::OnceLock;
@@ -174,13 +214,60 @@ fn dbg_weakref() -> bool {
 /// immediately before `collect_garbage` (the Reference objects are still at
 /// their pre-collection addresses and no mutator can observe the transient
 /// null). No-op when the gate is off or no Weak/Phantom references exist.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     if !weakref_clear_enabled() {
         return;
     }
-    let pairs = {
-        let rp = shared.mem.ref_processor.lock();
-        rp.weak_phantom_active_pairs()
+    // Heap headroom for the soft-reference LRU policy below. Read BEFORE the
+    // reference-processor lock is taken -- the heap's own locks rank above L7.
+    let soft_free_mb = shared.mem.heap.soft_ref_policy_free_mb();
+    let (pairs, soft_pairs) = {
+        let mut rp = shared.mem.ref_processor.lock();
+        let weak_phantom = rp.weak_phantom_active_pairs();
+        // SOFT-CLEAR GAP (2026-08-15). This is the measured answer to the
+        // residual left by the retired `zgc-resourceleakdetector-corpse-read`
+        // write-up: "the marker traces referents as strong edges; whether the
+        // VM-level pass compensates is not established". It compensates for
+        // WEAK and PHANTOM -- that is what the loop below does. It did NOT for
+        // SOFT, on any collector: `process_soft_refs` skips an entry whose
+        // referent `is_marked`, and a soft referent is always marked through
+        // its own `SoftReference`'s slot 0, so the LRU policy beneath that
+        // check could never fire. In a 64 MiB heap HotSpot cleared the soft
+        // reference and allocated 30 MiB past it while CratonVM threw
+        // `OutOfMemoryError` under both ZGC and G1.
+        //
+        // `condemn_idle_soft_refs` applies the policy here instead, and only
+        // the entries it condemns join the null pass; the rest stay traced
+        // strongly and are retained exactly as before. `0` for the clock is
+        // the same convention `process_references_after_gc` uses -- the
+        // processor substitutes the mutator clock it has observed.
+        //
+        // The clock is a real `SystemTime` reading, not the `0` that
+        // `process_references_after_gc` passes. `0` means "use the last value a
+        // mutator handed `touch_soft_reference`", which is the moment of the
+        // most recent `SoftReference.get()` in the process — so the idle window
+        // of the reference that made that call is zero, and a program looping
+        // on its own soft-referenced cache never opens one. This caller is
+        // ordinary VM code and has a clock; `SoftReference.<init>` and `.get()`
+        // stamp entries from the same `SystemTime` epoch, so the two are
+        // directly comparable.
+        let soft = if last_ditch_soft_clear_armed() {
+            // The allocation has already failed and this is the last
+            // collection before `OutOfMemoryError`. The specification requires
+            // every softly-reachable object to be released first, whatever the
+            // LRU policy thinks.
+            rp.condemn_all_soft_refs()
+        } else {
+            rp.condemn_idle_soft_refs(soft_free_mb, now_ms())
+        };
+        (weak_phantom, soft)
     };
     // RandomizedContext WeakHashMap<Thread,...> fix: publish this cycle's
     // referent addresses so the non-moving young sweep can recognize a
@@ -231,16 +318,18 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         );
     }
     cratonvm_gc::gc_quiescence::set_watched_referents(&watch_addrs);
-    if pairs.is_empty() {
+    if pairs.is_empty() && soft_pairs.is_empty() {
         return;
     }
     if dbg_weakref() {
         eprintln!(
-            "[weakref] pre-gc null pass: {} weak/phantom referent(s)",
-            pairs.len()
+            "[weakref] pre-gc null pass: {} weak/phantom referent(s), \
+             {} policy-condemned soft referent(s)",
+            pairs.len(),
+            soft_pairs.len()
         );
     }
-    for (ref_obj_addr, _referent) in pairs {
+    for (ref_obj_addr, _referent) in pairs.into_iter().chain(soft_pairs) {
         // The Reference object is live (or dead-but-not-yet-collected) at this
         // point, so its memory is valid; writing its referent slot is safe.
         // SAFETY: `ref_obj_addr` is a current Reference-object address held by
@@ -1637,8 +1726,45 @@ pub fn execute(
         // this process (mirrors the `mark_jit_bail_listed` invariant this
         // same session's other fix relies on), so none of this is needed
         // when `already_skipped` is true — skip straight to cheap defaults.
+        // The POSITIVE half of the same short-circuit. `already_skipped` covers
+        // methods that FAIL this gate; a method that PASSES was recorded
+        // nowhere, so it re-ran the whole computation on every `execute()`
+        // entry — forever, and *before* the `JitCache` consult in the `else`
+        // branch below, so a fully compiled hot method paid it too. The
+        // expensive term is `jit_method_calls_native_shadowed`: an
+        // O(method-bytecode) decode with a three-string-hash `slot_for_exact`
+        // probe per invoke instruction in the body. Measured on netty
+        // `AdaptiveByteBufAllocatorTest`, that scan reached 2.15% of CPU
+        // through `slot_for_exact` alone while only 637 methods were ever
+        // sealed for the reason it computes — it was re-running, not running
+        // once per method.
+        //
+        // Stamped with `redefine_epoch()` because a stale PASS is unsafe in a
+        // way a stale seal is not: see `JitRealm::jit_gate_pass`.
+        // Keyed on `ClassId`, not on the class name the negative set uses — see
+        // `JitRealm::jit_gate_pass` for why the name is safe there and unsafe
+        // here. The two `Arc` clones are refcount bumps, not allocations.
+        let gate_pass_key = (skip_key.1.clone(), skip_key.2.clone());
+        let gate_pass_memo = if already_skipped || !crate::runtime::env_cache::jit_gate_pass_memo() {
+            None
+        } else {
+            let epoch = cratonvm_jit::redefine_epoch();
+            shared
+                .jit
+                .jit_gate_pass
+                .read()
+                .get(&(class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()))
+                .copied()
+                .and_then(|(e, iface)| (e == epoch).then_some(iface))
+        };
         let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped {
             (false, None, false, false)
+        } else if let Some(is_interface_default) = gate_pass_memo {
+            // Recorded eligible under the current redefine epoch: all three
+            // skip reasons were false when it was recorded, and each is a pure
+            // function of this method's static bytecode and metadata.
+            cratonvm_jit::note_jit_gate_pass_hit();
+            (is_interface_default, None, false, false)
         } else {
             // Static eligibility check — see vm/src/jit/skip_list.rs for the full
             // policy mapping (each entry is documented against a roadmap item in
@@ -1722,6 +1848,23 @@ pub fn execute(
                     code_attr.code.len(),
                 )
             };
+            // Record the ELIGIBLE verdict so the next entry short-circuits.
+            // Scoped to exactly the three static per-method facts the seal
+            // block below scopes itself to — `env_disable_jit` /
+            // `redefine_jit_quiesced` / `gpu_gate_skip` / `clinit_skip` are
+            // runtime or call-site-dependent and are deliberately NOT folded
+            // in, in either direction.
+            if crate::runtime::env_cache::jit_gate_pass_memo()
+                && static_skip_reason.is_none()
+                && !fjp_skip
+                && !native_skip
+            {
+                cratonvm_jit::note_jit_gate_pass_fill();
+                shared.jit.jit_gate_pass.write().insert(
+                    (class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()),
+                    (cratonvm_jit::redefine_epoch(), is_interface_default),
+                );
+            }
             (
                 is_interface_default,
                 static_skip_reason,
@@ -2392,6 +2535,13 @@ pub fn execute(
                     // freshly zeroed object if the elision somehow did not fire —
                     // is identical to running `C.<init>`.)
                     let dbg_ctor = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CTOR_FIX").is_some();
+                    // Pcs whose `<init>()V` target `is_elidable_construction` PROVED empty. The
+                    // backend may elide only these; a no-arg constructor that is NOT proven empty
+                    // keeps both its allocation and its call, because eliding it would drop
+                    // whatever the body writes to global state (see
+                    // docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md).
+                    let mut elidable_init_pcs: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     for (pc, tclass, pcount) in pending_ctor_sites {
                         let elidable = shared
                             .load_class_concurrent(&tclass)
@@ -2401,6 +2551,9 @@ pub fn execute(
                                 is_elidable_construction(shared, &cm2, tid)
                             })
                             .unwrap_or(false);
+                        if elidable {
+                            elidable_init_pcs.insert(pc);
+                        }
                         if dbg_ctor {
                             eprintln!(
                                 "[ctor-fix] {}.{}{} ctor site pc={} target={} elidable={}",
@@ -2883,6 +3036,7 @@ pub fn execute(
                         // de-spec consult (inert in production).
                         &format!("{class_name_arc}.{method_name_arc}:{descriptor_arc}"),
                         indy_info,
+                        Some(elidable_init_pcs),
                     )?;
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;

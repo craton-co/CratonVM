@@ -6728,6 +6728,10 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
             let counter_arr = bc_sic_object_field(ctx, this, "counter")?;
             let iv_arr = bc_sic_object_field(ctx, this, "IV")?;
             bc_sic_write_reset_counter(ctx, this, counter_arr, iv_arr)?;
+            // `reset()` clears the advance-since-init accumulator and the sticky
+            // out-of-range flag. Omitting this made the range bound un-clearable
+            // rather than merely unenforced.
+            bc_sic_reset_range(ctx, this);
             ctx.invoke_virtual(cipher, "reset", "()V", &[])?;
             Ok(None)
         },
@@ -6758,10 +6762,23 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
                 return Err(bc_sic_bad_state("SICBlockCipher: zero block size"));
             }
             let mut counter = bc_sic_write_reset_counter(ctx, this, counter_arr, iv_arr)?;
+            // Java `seekTo` is `reset()` then `skip(position)`, and `reset()`
+            // clears the range state before the seek re-derives it.
+            bc_sic_reset_range(ctx, this);
             let blocks = (position as u64) / (bs as u64);
             let byte_count = ((position as u64) % (bs as u64)) as i32;
             bc_sic_add_blocks(&mut counter, blocks);
-            bc_sic_check_counter_prefix(ctx, &counter, iv_arr)?;
+            // `checkCounter`, not just the partial-IV prefix half of it — the
+            // full-block-IV branch is the one that bounds the advance at 2^64
+            // blocks and resyncs `used`.
+            let iv_len = ctx.array_length(iv_arr);
+            let mut iv = vec![0u8; iv_len];
+            ctx.read_byte_array_into(iv_arr, 0, &mut iv);
+            let mut range = BcSicRange::read(ctx, this);
+            let mut delta = vec![0u8; bs];
+            let verdict = range.check_counter(&counter, &iv, &mut delta);
+            range.write_back(ctx, this);
+            verdict?;
             ctx.write_byte_array_from(counter_arr, 0, &counter);
             ctx.set_field_by_name(this, "byteCount", Value::Int(byte_count));
             bc_sic_encrypt_counter(ctx, cipher, counter_arr, counter_out_arr, &counter)?;
@@ -6814,8 +6831,26 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
                 ctx.write_byte_array_from(iv_copy, 0, &iv);
             }
             ctx.set_field_by_name(this, "IV", Value::Object(Some(iv_copy)));
+            // The two derived fields the full-block-IV range bound is built on.
+            // `fullBlockIV` read back FALSE for a 16-byte IV on a 16-byte block
+            // because nothing here wrote it, which disarmed the `used`
+            // wrap-around detection for every block size of 8 or less.
+            let full_block_iv = iv_len == bs;
+            ctx.set_field_by_name(this, "fullBlockIV", Value::Int(i32::from(full_block_iv)));
+            let lane_off = match ctx.get_field_by_name(this, "laneOff") {
+                Value::Int(v) => v.max(0) as usize,
+                _ => 0,
+            };
+            if full_block_iv && lane_off > 0 {
+                let guard = match ctx.get_array_element(iv_copy, lane_off - 1) {
+                    Value::Int(v) => (v as u8).wrapping_add(1),
+                    _ => 0,
+                };
+                ctx.set_field_by_name(this, "guardByte", Value::Int(guard as i8 as i32));
+            }
             let counter_arr = bc_sic_object_field(ctx, this, "counter")?;
             bc_sic_write_reset_counter(ctx, this, counter_arr, iv_copy)?;
+            bc_sic_reset_range(ctx, this);
             ctx.invoke_virtual(cipher, "reset", "()V", &[])?;
             Ok(None)
         },
@@ -8846,6 +8881,180 @@ pub(crate) fn bc_sic_check_counter_prefix(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// SICBlockCipher's 2^64-block range bound
+// ---------------------------------------------------------------------------
+//
+// `SICBlockCipher` enforces two DIFFERENT bounds, and the shims below used to
+// implement one of them.
+//
+// * **Partial IV** (`IV.length < blockSize`): the counter may only occupy the
+//   low `blockSize - IV.length` bytes, so the IV prefix must still match. That
+//   is `bc_sic_check_counter_prefix`, and it was implemented.
+// * **Full-block IV**: there is no prefix to compare, so the class tracks the
+//   ADVANCE SINCE INIT instead and refuses at 2^64 blocks — `fullBlockIV`,
+//   `guardByte`, `used` and the sticky `overflow` flag, checked per block by
+//   `checkLastIncrement` and per skip/seekTo by `checkCounter`. Every one of
+//   those four fields was invisible to these natives: `init` never wrote
+//   `fullBlockIV`/`guardByte`, `reset` never cleared `used`/`overflow`, and
+//   `processBytes`' inline `checkLastIncrement` carried the comment
+//   "no-op when the IV fills the block", which is the branch it is not.
+//
+// The visible consequence, measured against HotSpot with the same bc-java jar
+// (`SICPositionTest`, in `crypto.test.AllTests`): after `skip` correctly threw
+// `Counter in CTR/SIC mode out of range.` — `skip` is Java and calls
+// `checkCounter` — the very next `processBytes` produced KEYSTREAM instead of
+// re-throwing, because the sticky flag the Java had just set was one this
+// native never read. A CTR keystream reused past its bound is a two-time-pad,
+// so this is a silent-wrong-crypto shape, not only a missing exception.
+//
+// The helpers below mirror `populateDelta`, `checkLastIncrement`,
+// `checkCounter` and `incrementCounter` arm-for-arm. Cost per block is one byte
+// compare against `guardByte`; `populateDelta` runs only when that matches.
+
+/// Mirror of `SICBlockCipher.populateDelta`: big-endian modular subtraction of
+/// the IV (zero-padded on the right) from `counter` into `res`, carrying the
+/// borrow across every byte. True when any byte ABOVE the low 8-byte lane is
+/// non-zero — the counter has advanced 2^64 blocks or more since init, or has
+/// moved below its starting value.
+fn bc_sic_populate_delta(counter: &[u8], iv: &[u8], lane_off: usize, res: &mut [u8]) -> bool {
+    let mut borrow = 0i32;
+    for i in (0..res.len()).rev() {
+        let mut v = counter[i] as i32 - borrow;
+        if i < iv.len() {
+            v -= iv[i] as i32;
+        }
+        if v < 0 {
+            v += 256;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        res[i] = v as u8;
+    }
+    res[..lane_off.min(res.len())].iter().any(|&b| b != 0)
+}
+
+/// The four range-bound fields of a `SICBlockCipher`, read once per native call
+/// and written back only when they changed.
+pub(crate) struct BcSicRange {
+    pub lane_off: usize,
+    pub guard_byte: u8,
+    pub full_block_iv: bool,
+    pub overflow: bool,
+    pub used: u64,
+    dirty: bool,
+}
+
+impl BcSicRange {
+    pub(crate) fn read(ctx: &dyn NativeContext, this: ObjectRef) -> Self {
+        let int_field = |name: &str| match ctx.get_field_by_name(this, name) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        BcSicRange {
+            lane_off: int_field("laneOff").max(0) as usize,
+            guard_byte: int_field("guardByte") as u8,
+            full_block_iv: int_field("fullBlockIV") != 0,
+            overflow: int_field("overflow") != 0,
+            used: match ctx.get_field_by_name(this, "used") {
+                Value::Long(v) => v as u64,
+                _ => 0,
+            },
+            dirty: false,
+        }
+    }
+
+    pub(crate) fn write_back(&self, ctx: &mut dyn NativeContext, this: ObjectRef) {
+        if !self.dirty {
+            return;
+        }
+        ctx.set_field_by_name(this, "overflow", Value::Int(i32::from(self.overflow)));
+        ctx.set_field_by_name(this, "used", Value::Long(self.used as i64));
+    }
+
+    /// Mirror of `SICBlockCipher.checkLastIncrement`, run before each keystream
+    /// block is produced.
+    fn check_last_increment(
+        &mut self,
+        counter: &[u8],
+        iv: &[u8],
+        delta: &mut [u8],
+    ) -> Result<(), MethodCallFailed> {
+        let out_of_range = || bc_sic_bad_state("Counter in CTR/SIC mode out of range.");
+        if iv.len() < counter.len() {
+            if counter[iv.len() - 1] != iv[iv.len() - 1] {
+                return Err(out_of_range());
+            }
+        } else if self.lane_off > 0 {
+            if self.overflow
+                || (counter[self.lane_off - 1] == self.guard_byte
+                    && bc_sic_populate_delta(counter, iv, self.lane_off, delta))
+            {
+                self.overflow = true;
+                self.dirty = true;
+                return Err(out_of_range());
+            }
+        } else if self.overflow {
+            return Err(out_of_range());
+        }
+        Ok(())
+    }
+
+    /// Mirror of the `used`/`overflow` half of `SICBlockCipher.incrementCounter`.
+    /// The counter bytes themselves are advanced by `bc_sic_increment_counter`.
+    fn note_increment(&mut self) {
+        if self.lane_off == 0 {
+            self.used = self.used.wrapping_add(1);
+            if self.used == 0 && self.full_block_iv {
+                self.overflow = true;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Mirror of `SICBlockCipher.checkCounter`, run per `skip`/`seekTo`.
+    fn check_counter(
+        &mut self,
+        counter: &[u8],
+        iv: &[u8],
+        delta: &mut [u8],
+    ) -> Result<(), MethodCallFailed> {
+        let out_of_range = || bc_sic_bad_state("Counter in CTR/SIC mode out of range.");
+        if iv.len() < counter.len() {
+            for i in (0..iv.len()).rev() {
+                if counter[i] != iv[i] {
+                    return Err(out_of_range());
+                }
+            }
+        } else {
+            if self.overflow || bc_sic_populate_delta(counter, iv, self.lane_off, delta) {
+                self.overflow = true;
+                self.dirty = true;
+                return Err(out_of_range());
+            }
+            if self.lane_off == 0 {
+                let n = delta.len();
+                let mut acc = 0u64;
+                for &b in &delta[n - 8..] {
+                    acc = (acc << 8) | b as u64;
+                }
+                self.used = acc;
+                self.dirty = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `reset()`'s share of the range state: `used = 0`, `overflow = false`.
+/// Written unconditionally — this is the only path that CLEARS a sticky flag,
+/// so it must not be elided by the dirty check.
+fn bc_sic_reset_range(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    ctx.set_field_by_name(this, "used", Value::Long(0));
+    ctx.set_field_by_name(this, "overflow", Value::Int(0));
+}
+
 pub(crate) fn bc_sic_encrypt_counter(
     ctx: &mut dyn NativeContext,
     cipher: ObjectRef,
@@ -8968,6 +9177,20 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
 
             let mut counter = vec![0u8; bs];
             ctx.read_byte_array_into(counter_arr, 0, &mut counter);
+            // `processBlock` calls `checkLastIncrement` before producing a
+            // block, exactly as `processBytes` does — this native did not, so a
+            // counter past its bound still yielded keystream through this door
+            // even after the sibling one was fixed. Same predicate, both doors.
+            let iv_arr = obj_field("IV").ok_or_else(|| bc_sic_bad_state("SIC: null IV"))?;
+            let iv_len = ctx.array_length(iv_arr);
+            let mut iv = vec![0u8; iv_len];
+            ctx.read_byte_array_into(iv_arr, 0, &mut iv);
+            let mut range = BcSicRange::read(ctx, this);
+            let mut delta = vec![0u8; bs];
+            if let Err(e) = range.check_last_increment(&counter, &iv, &mut delta) {
+                range.write_back(ctx, this);
+                return Err(e);
+            }
             bc_sic_encrypt_counter(ctx, cipher, counter_arr, counter_out_arr, &counter)?;
             let mut counter_out = vec![0u8; bs];
             ctx.read_byte_array_into(counter_out_arr, 0, &mut counter_out);
@@ -8978,7 +9201,9 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
             }
             ctx.write_byte_array_from(out_arr, out_off_i as usize, &input);
             bc_sic_increment_counter(&mut counter);
+            range.note_increment();
             ctx.write_byte_array_from(counter_arr, 0, &counter);
+            range.write_back(ctx, this);
             Ok(Some(Value::Int(bs as i32)))
         },
     );
@@ -9051,6 +9276,12 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
             let mut in_buf = vec![0u8; len];
             ctx.read_byte_array_into(in_arr, in_off as usize, &mut in_buf);
             let mut out_buf = vec![0u8; len];
+            // The full-block-IV range state. `iv_last` above covers only the
+            // partial-IV branch of `checkLastIncrement`; see `BcSicRange`.
+            let mut iv = vec![0u8; iv_len];
+            ctx.read_byte_array_into(iv_arr, 0, &mut iv);
+            let mut range = BcSicRange::read(ctx, this);
+            let mut delta = vec![0u8; bs];
 
             // AES fast path: produce the keystream block natively from WorkingKey.
             let is_aes = ctx
@@ -9067,12 +9298,16 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
             };
             let use_aes = kw.len() >= 2;
 
+            let _ = iv_last;
             for i in 0..len {
                 let next;
                 if byte_count == 0 {
-                    // checkLastIncrement (no-op when IV fills the block)
-                    if iv_len < bs && counter[iv_len - 1] != iv_last {
-                        return Err(ise("Counter in CTR/SIC mode out of range."));
+                    // checkLastIncrement — BOTH branches. Anything already
+                    // produced into `out_buf` is discarded on the throw, exactly
+                    // as the Java loop's partial output is.
+                    if let Err(e) = range.check_last_increment(&counter, &iv, &mut delta) {
+                        range.write_back(ctx, this);
+                        return Err(e);
                     }
                     if use_aes {
                         crate::bc_aes::encrypt_block(&kw, &counter, &mut keystream);
@@ -9107,6 +9342,9 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
                                 break;
                             }
                         }
+                        // …and its `used`/`overflow` half, which is what
+                        // detects the wrap for a block size of 8 or less.
+                        range.note_increment();
                     }
                 }
                 out_buf[i] = next;
@@ -9116,6 +9354,7 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
             ctx.write_byte_array_from(counter_arr, 0, &counter);
             ctx.write_byte_array_from(counter_out_arr, 0, &keystream);
             ctx.set_field_by_name(this, "byteCount", Value::Int(byte_count));
+            range.write_back(ctx, this);
             ctx.write_byte_array_from(out_arr, out_off as usize, &out_buf);
             Ok(Some(Value::Int(len as i32)))
         },
@@ -10527,6 +10766,59 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
     r.set_category(__prev_cat);
 }
 
+/// Which PRF does this `PKCS5S2ParametersGenerator` actually carry?
+///
+/// PKCS#5 v2.0 is parameterised by an HMAC: `new PKCS5S2ParametersGenerator()`
+/// is HMAC-SHA1, but `new PKCS5S2ParametersGenerator(new SHA256Digest())` — the
+/// form BouncyCastle's own `PBE$Util.makePBEGenerator` uses for every non-SHA1
+/// PRF — is not. The three `generateDerived*` intrinsics below used to pass a
+/// hardcoded `1` (SHA-1) to `pbkdf2_derive_for` regardless, so **every**
+/// non-SHA1 PBKDF2 through BouncyCastle silently derived the wrong key.
+///
+/// Measured 2026-08-13 against HotSpot 25 with the same jars: netty's
+/// `SslContextBuilderTest`/`JdkSsl*ContextTest` `testPkcs8Des3EncryptedRsa`
+/// reads `rsa_pkcs8_des3_encrypted.key`, PBES2 with PBKDF2-HMAC-**SHA256** and
+/// DESede-CBC. `PBE$Util.makePBEMacParameters(spec, PKCS5S2_UTF8, SHA256, 192)`
+/// returned `992951E4…` (the SHA-1 answer) instead of `9559B2B3…`, the DESede
+/// decrypt then failed `BadPaddingException: pad block corrupted`, netty fell
+/// back to the JDK PBES2 parser, and the test surfaced the JDK's own
+/// `IOException: PBE parameter parsing error: expecting the object identifier
+/// for AES cipher` — an error message three layers away from the defect.
+///
+/// Reads the generator's `hMac` field and asks it its own name
+/// (`HMac.getAlgorithmName()` is `"<digest>/HMAC"`). Returns `None` for any
+/// digest this VM's `pbkdf2_derive_for` does not implement (GOST3411, SM3,
+/// SHA3-*, RIPEMD160, Whirlpool, …) so the caller can fall back to
+/// BouncyCastle's own bytecode instead of substituting a PRF of our choosing —
+/// substituting is exactly what produced the defect above.
+fn bc_pkcs5s2_prf_code(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let hmac = match ctx.get_field_by_name(this, "hMac") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let name = match ctx.invoke_virtual(hmac, "getAlgorithmName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => return None,
+    };
+    // "SHA-256/HMAC" -> "SHA256"; also tolerates BC's older "SHA-256" spellings.
+    let norm: String = name
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match norm.as_str() {
+        "SHA1" => Some(1),
+        "SHA224" => Some(224),
+        "SHA256" => Some(256),
+        "SHA384" => Some(384),
+        "SHA512" => Some(512),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -10545,9 +10837,17 @@ pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegis
                 }
                 _ => 0,
             };
+            let Some(prf) = bc_pkcs5s2_prf_code(ctx, this) else {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            };
             let (password, salt, iteration_count) = bc_pkcs5s2_read_state(ctx, this)?;
             let key = crate::phases_early::pbkdf2_derive_for(
-                1,
+                prf,
                 &password,
                 &salt,
                 iteration_count,
@@ -10577,9 +10877,20 @@ pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegis
                 }
                 _ => 0,
             };
+            let Some(prf) = bc_pkcs5s2_prf_code(ctx, this) else {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(II)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[
+                        args.get(1).copied().unwrap_or(Value::Int(0)),
+                        args.get(2).copied().unwrap_or(Value::Int(0)),
+                    ],
+                );
+            };
             let (password, salt, iteration_count) = bc_pkcs5s2_read_state(ctx, this)?;
             let derived = crate::phases_early::pbkdf2_derive_for(
-                1,
+                prf,
                 &password,
                 &salt,
                 iteration_count,
@@ -10606,9 +10917,17 @@ pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegis
                 }
                 _ => 0,
             };
+            let Some(prf) = bc_pkcs5s2_prf_code(ctx, this) else {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedMacParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            };
             let (password, salt, iteration_count) = bc_pkcs5s2_read_state(ctx, this)?;
             let key = crate::phases_early::pbkdf2_derive_for(
-                1,
+                prf,
                 &password,
                 &salt,
                 iteration_count,

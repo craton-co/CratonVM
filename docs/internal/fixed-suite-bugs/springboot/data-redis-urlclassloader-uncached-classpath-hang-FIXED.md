@@ -1,5 +1,13 @@
 # `module/spring-boot-data-redis` HANG cluster — uncached `URLClassLoader` classpath rescan — FIXED 2026-07-23
 
+**Re-verified end to end on 2026-08-13, on BOTH platforms: 214 Windows class-runs
+(2916 tests, zero failures, three collectors, up to 20-way contention) plus an
+Azure Linux arm on the fixture that actually exposes a difference. CratonVM
+matches HotSpot everywhere in this cluster.
+See [the re-verification section](#2026-08-13-re-verified-end-to-end-on-current-dev-every-claim-above-holds)
+at the foot of this page, which supersedes the platform and collector every
+older table here was taken on.**
+
 ## Symptom
 
 Four `module/spring-boot-data-redis` classes HANG (300s suite timeout, zero
@@ -553,3 +561,166 @@ same worktree with the changes stashed.
 Debug binary built with `cargo build --profile hc0053dbg`, frozen as
 `target/hc0053dbg/cratonvm-tcclgdb-20260726` (this worktree's `target/`
 was removed after this pass; rebuild with the same profile to resume).
+
+---
+
+## 2026-08-13: re-verified end to end on current `dev`; every claim above holds
+
+This page had accumulated claims verified across three weeks, on two operating
+systems, against binaries as old as `origin/dev` @ `3be41785e` (2026-07-27) —
+and its own advice was to "re-verify against a full suite run rather than
+assuming this stays fixed as `dev` continues to move". Two things had moved
+since: `dev` gained ~4 weeks of unrelated work, and **the shipped default
+collector changed from Generational to ZGC on 2026-08-10**, so every
+verification recorded above was taken under a collector that is no longer the
+default. This pass re-took all of it under one protocol.
+
+- **Where:** local Windows box, JDK 25 (`Eclipse Adoptium jdk-25.0.3.9-hotspot`),
+  **and** the Azure Linux host `20.80.105.49` — see "Linux, and the run that
+  looked like a regression" below. The first pass of this section was written
+  from the Windows arm alone, while the Azure hosts were thought unreachable;
+  that was incomplete evidence and the Linux arm was added before this page was
+  retired.
+- **Binary:** `cratonvm-redisdoc-20260813.exe`, built in worktree
+  `C:\craton\CratonVM-redisdoc-20260813`, branch `fix/redis-doc-residuals-20260813`,
+  forked from `origin/dev` @ `79d5b40ad`.
+- **Oracle:** HotSpot, same JDK, same fixture, same runner, run first.
+
+### Result: 214 CratonVM class-runs, 2916 tests, 0 failed, 0 aborted, 0 skipped
+
+Every class matches its HotSpot test count exactly. No status differs from
+HotSpot's anywhere in the tables below.
+
+| Arm | Classes | Result |
+|---|---:|---|
+| Idle baseline, the 4 HANG-cluster classes + both residual classes | 6 | 6/6 PASS |
+| Repeat of the same, serial | 6 | 6/6 PASS |
+| 10-way contention: 3 rounds x 3 streams x `-Parallel 3`, 900s | 54 | 54/54 PASS |
+| 20-way contention at the **real 300s suite budget**: 2 rounds x 5 streams x `-Parallel 4` | 60 | 60/60 PASS |
+| `-XX:+UseGenerationalGC` (the collector every older verification used) | 6 | 6/6 PASS |
+| `-XX:+UseG1GC` | 6 | 6/6 PASS |
+| This page's own regression sweep: every `@ClassPathExclusions`/`@ClassPathOverrides` user in the checkout | 58 | 58/58 PASS, 365/365 tests — identical to HotSpot's 58/58 |
+| Whole `data-redis` + `data-jpa` + `websocket` modules | 18 | 17 PASS + 1 EMPTY; the EMPTY is `AbstractDataJpaRepositoriesAutoConfigurationTests`, EMPTY on HotSpot too (it is the abstract base class) |
+
+Per-class, idle, against the HotSpot oracle:
+
+| Class | HotSpot | CratonVM | tests |
+|---|---:|---:|---:|
+| `DataRedisAutoConfigurationTests` | 6.4s | 62.5s | 56/56 |
+| `DataRedisAutoConfigurationJedisTests` | 4.6s | 59.7s | 23/23 |
+| `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests` | 3.7s | 5.6s | 1/1 |
+| `DataRedisHealthContributorAutoConfigurationTests` | 2.8s | 7.0s | 2/2 |
+| `DataJpaRepositoriesAutoConfigurationTests` | 7.3s | 54.0s | 9/9 |
+| `WebSocketMessagingAutoConfigurationTests` | 5.9s | 32.6s | 13/13 |
+
+### The dominant bug is closed on its own terms, not just by the classes passing
+
+Bug 1's cost was never bounded by the test classes — it was ~90x on a
+microbenchmark. That benchmark is now committed as `apps/ucl_scan_bench`
+(`UclScanBench.java`): 100 iterations of 4 hit + 4 miss `Class.forName` calls
+through one `URLClassLoader` over the 122-entry `spring-boot-data-redis` test
+classpath, i.e. the `ClassUtils.isPresent()` shape that drove the original
+hang.
+
+| | 2026-07-23, pre-fix | 2026-07-23, post-fix | **2026-08-13** |
+|---|---:|---:|---:|
+| CratonVM | ~12000ms | 176ms | **101ms** |
+| HotSpot | 126ms | 126ms | **87ms** |
+
+CratonVM is now within 16% of HotSpot on the exact path this page was opened
+for. This is the check worth repeating if the cluster ever regresses: it
+isolates the classloading cost from the general interpreter gap, runs in
+seconds, and does not need the suite fixture beyond one
+`cratonvm-test-cp.txt`.
+
+### All seven code fixes are present and intact on `dev`
+
+Confirmed by inspection at `79d5b40ad`, not inferred from the tests passing:
+
+1. `cached_class_path_for_paths` — `native-builtins/src/classloader.rs`
+2. `jar_entry_bytes_cached` / metadata-only `JarEntryRec` — `native-builtins/src/phases_late/jar_manifest.rs`
+3. `resolve_nestmate_via_defining_loader`, used by both `native_class_get_nest_members` and `native_class_get_permitted_subclasses` — `native-builtins/src/lang_class.rs`
+4. `NativeContext::class_id_by_name_delegated` — `native-api/src/registry.rs`, `vm/src/vm/vm_exec.rs`, consumed by `resolve_class_id_with_nested_retry` in `native-builtins/src/spring_startup_bootstrap.rs`
+5. The double-checked `find_loaded_class_for_loader` probe under the per-`(loader, name)` define lock, plus the `define_class_full` lost-the-race backstop — `native-builtins/src/classloader.rs`
+6. `"cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"]` in `jdk_interfaces()` — `classloading/src/class_manager.rs`
+7. `native_parameter_is_name_present` reading the by-name `"name"` field before synthetic slot 0 — `native-builtins/src/lang_reflect.rs`
+
+### What is left, and why it does not keep this page open
+
+A general interpreter/startup performance gap of 3-24x versus HotSpot. It is
+worst on exactly the classes this page tracks (`Jedis` 13x idle, 24x under
+load) because they are `ApplicationContextRunner`-dense — but it is not this
+page's bug, and the microbenchmark above shows it is no longer classloading:
+that path is at parity. The gap is the same one the suite-wide timing survey
+records across unrelated clusters (jOOQ 11-14x, `ConfigData` 13x).
+
+It matters here only as **margin**. This page's original symptom was a HANG at
+the runner's 300s default, and its last open residual was
+`DataRedisAutoConfigurationTests` at ~349s. Worst case measured this pass,
+with 20 VMs competing on a 32-thread box:
+
+| Class | worst of 60 runs at the 300s budget |
+|---|---:|
+| `DataRedisAutoConfigurationTests` | 211.4s |
+| `DataRedisAutoConfigurationJedisTests` | 186.5s |
+| `DataJpaRepositoriesAutoConfigurationTests` | 171.5s |
+| `WebSocketMessagingAutoConfigurationTests` | 127.1s |
+
+~30% headroom at the worst point, and no run of the 214 came near the budget.
+That is a pass, but it is a thinner pass than the 93s Azure number this page
+recorded when it closed the residual — so if these classes ever go red again,
+**check the wall-clock before assuming a correctness regression**: the failure
+mode this page describes and a budget overrun look identical in a results
+table (both land as `HANG`), and only one of them is a bug in the code this
+page changed.
+
+### Linux, and the run that looked like a regression
+
+A 2026-08-12 Azure Linux run (`regression96-verify-gen-20260812`, binary
+`cratonvm-envfix-linux-20260812`) had three of this page's classes red —
+`DataRedisAutoConfigurationTests` HANG at 1044s,
+`DataRedisAutoConfigurationJedisTests` FAIL 21/23,
+`DataRedisHealthContributorAutoConfigurationTests` FAIL 2/2 — which reads
+exactly like this cluster coming back. It is not. Re-taken on current `dev`
+(`05fff8409`, worktree `/data/wt-redisdoc-20260813`, binary
+`cratonvm-redisdoc-linux-20260813`) against the same shared fixture at
+`/data/cratonvm/apps/spring-boot`:
+
+| Class | HotSpot (same fixture) | CratonVM, current dev | 
+|---|---|---|
+| `DataRedisAutoConfigurationTests` | 56 tests, 1 failed | 56 tests, 1 failed — **64s** default collector, **73s** Generational |
+| `DataRedisAutoConfigurationJedisTests` | 23 tests, 21 failed | 23 tests, 21 failed |
+| `DataRedisHealthContributorAutoConfigurationTests` | 2 tests, 2 failed | 2 tests, 2 failed |
+
+Two separate things were stacked in those rows:
+
+1. **The HANG is gone.** 1044s on the 08-12 binary, 64s on current `dev` —
+   under the default collector *and* under `-XX:+UseGenerationalGC`, which is
+   what that run used.
+2. **The remaining failures are the fixture, not the VM.** HotSpot fails the
+   same tests with the same counts. The host's `spring-data-redis-4.2.0-SNAPSHOT`
+   calls `DefaultJedisClientConfig.autoNegotiateProtocol(boolean)`,
+   which the pinned `jedis-7.4.1.jar` does not have; Windows resolves
+   `spring-data-redis-4.1.0-RC1`, which does not call it, which is the whole
+   reason this cluster is green there and red here. Tracked separately as
+   `data-redis-fixture-jedis-snapshot-skew-20260813.md` under
+   `known-issues/springboot/`.
+
+**So CratonVM diverges from HotSpot nowhere in this cluster, on either
+platform.** That is the claim this page needed before it could retire, and the
+Windows-only arm could not have made it — the Linux fixture is the one that
+exposes the difference.
+
+One real CratonVM defect was found *inside* that shared failure: our
+`NoSuchMethodError` message named the class dotted but then printed the raw
+descriptor, with no return type and no quotes
+(`…Builder.autoNegotiateProtocol(Z)L…Builder;` against HotSpot's
+`'…Builder ….autoNegotiateProtocol(boolean)'`). Fixed 2026-08-13 in
+`vm/src/runtime/exceptions.rs`, oracle committed as `apps/nsme_probe`. Worth
+remembering as a method: **both VMs failing is not the end of the triage — diff
+the message too.**
+
+### Retired
+
+Nothing above is open. Moved from `known-issues/springboot/` to
+`fixed-suite-bugs/springboot/` on 2026-08-13.

@@ -2313,6 +2313,39 @@ impl Rsa {
         matches!(Self::try_verify_sha256(key, message, signature), Ok(true))
     }
 
+    /// PKCS#1 v1.5 verification for an arbitrary digest, **fail-closed
+    /// `bool`** — [`Self::verify_sha256`] generalised.
+    ///
+    /// The certificate-chain verifier (`x509_manager::verify_one_signature`)
+    /// dispatches on the signature-algorithm OID, and every
+    /// `sha*WithRSAEncryption` differs from the next ONLY in which digest goes
+    /// into the DigestInfo. The core it delegates to has taken a
+    /// [`DigestAlgorithm`] all along, so the whole RSA family is this one
+    /// function rather than four near-copies — and in particular nothing here
+    /// touches the in-tree [`Self::pkcs1v15_encode`], whose DigestInfo prefix
+    /// is hard-coded to SHA-256.
+    ///
+    /// Same fail-closed collapse and the same reason as `verify_sha256`: the
+    /// caller (chain validation) has no exception channel, and a refusal and a
+    /// mismatch both mean "do not trust this chain".
+    pub fn verify_pkcs1_v15(
+        key: &RsaPublicKey,
+        digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+        message: &[u8],
+        signature: &[u8],
+    ) -> bool {
+        matches!(
+            cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15_checked(
+                &key.n.to_bytes_be(),
+                &key.e.to_bytes_be(),
+                digest,
+                message,
+                signature,
+            ),
+            Ok(true)
+        )
+    }
+
     /// Build the PKCS#1 v1.5 EMSA encoding (DigestInfo for SHA-256 wrapped in
     /// `00 01 FF.. 00 || T`).
     ///
@@ -2323,11 +2356,72 @@ impl Rsa {
     /// multi-exabyte `repeat(0xff).take(..)` allocation → abort) — a DoS
     /// reachable from a malicious certificate chain.
     fn pkcs1v15_encode(hash: &[u8], k: usize) -> Option<Vec<u8>> {
-        // DigestInfo DER prefix for SHA-256
-        let digest_info_prefix: &[u8] = &[
-            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
-            0x01, 0x05, 0x00, 0x04, 0x20,
-        ];
+        Self::pkcs1v15_encode_digest(
+            cratonvm_native_builtins_crypto::signature::DigestAlgorithm::Sha256,
+            hash,
+            k,
+        )
+    }
+
+    /// PKCS#1 v1.5 SHA-256 signature over an already-computed digest, with the
+    /// DigestInfo prefix of the digest that produced it.
+    ///
+    /// The verify side has been digest-parameterised all along
+    /// ([`Self::verify_pkcs1_v15`]); the SIGN side was SHA-256 only, so
+    /// `Signature.getInstance("SHA1withRSA"|"SHA384withRSA"|"SHA512withRSA")`
+    /// reached `sign()` and then refused with "this VM has no native
+    /// implementation for that algorithm". netty's
+    /// `JdkDelegatingPrivateKeyMethod` asks for exactly those three by name.
+    pub fn sign_pkcs1_v15(
+        key: &RsaPrivateKey,
+        digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+        message: &[u8],
+    ) -> Vec<u8> {
+        use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
+        let hash: Vec<u8> = match digest {
+            D::Sha1 => {
+                use sha1::Digest;
+                let mut h = sha1::Sha1::new();
+                h.update(message);
+                h.finalize().to_vec()
+            }
+            D::Sha256 => Sha256::digest(message).to_vec(),
+            D::Sha384 => Sha384::digest(message).to_vec(),
+            D::Sha512 => Sha512::digest(message).to_vec(),
+        };
+        let k = (key.n.bit_length() + 7) / 8;
+        let Some(em) = Self::pkcs1v15_encode_digest(digest, &hash, k) else {
+            return Vec::new();
+        };
+        let m = BigUint::from_bytes_be(&em);
+        rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n).to_bytes_be_padded(k)
+    }
+
+    fn pkcs1v15_encode_digest(
+        digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+        hash: &[u8],
+        k: usize,
+    ) -> Option<Vec<u8>> {
+        use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
+        // DigestInfo DER prefixes (RFC 8017 §9.2 note 1).
+        let digest_info_prefix: &[u8] = match digest {
+            D::Sha1 => &[
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+                0x14,
+            ],
+            D::Sha256 => &[
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x01, 0x05, 0x00, 0x04, 0x20,
+            ],
+            D::Sha384 => &[
+                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x02, 0x05, 0x00, 0x04, 0x30,
+            ],
+            D::Sha512 => &[
+                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x03, 0x05, 0x00, 0x04, 0x40,
+            ],
+        };
         let t_len = digest_info_prefix.len() + hash.len();
         // Need: 00 01 || PS(>=8 bytes of FF) || 00 || T  => k >= t_len + 11.
         // `ps_len = k - t_len - 3` must be >= 8, equivalently k >= t_len + 11.
@@ -2340,6 +2434,74 @@ impl Rsa {
         em.extend_from_slice(digest_info_prefix);
         em.extend_from_slice(hash);
         Some(em)
+    }
+
+    /// Build the PKCS#1 v1.5 **block type 1** encoding with NO DigestInfo:
+    /// `00 01 FF..FF 00 || M`.
+    ///
+    /// This is what `NONEwithRSA` signs. The algorithm takes the caller's bytes
+    /// as the already-computed digest and does NOT wrap them in a DigestInfo —
+    /// the caller who chose `NONEwithRSA` is the one who decides what the
+    /// payload means, which is the whole point of the algorithm and also why it
+    /// is the one RSA signature scheme SunJCE serves rather than SunRsaSign
+    /// (SunJCE implements it by encrypting under the private key through
+    /// `com.sun.crypto.provider.RSACipherAdaptor`, i.e. exactly this padding).
+    ///
+    /// `None` for a payload that cannot fit: RFC 8017 §9.2 wants at least eight
+    /// `FF` bytes, so `k >= m.len() + 11`. Returning `None` rather than
+    /// underflowing `k - m_len - 3` is the same guard, and for the same reason,
+    /// as [`Self::pkcs1v15_encode`].
+    fn pkcs1v15_encode_raw(m: &[u8], k: usize) -> Option<Vec<u8>> {
+        let ps_len = k.checked_sub(m.len() + 3).filter(|&ps| ps >= 8)?;
+        let mut em = Vec::with_capacity(k);
+        em.push(0x00);
+        em.push(0x01);
+        em.extend(std::iter::repeat(0xff).take(ps_len));
+        em.push(0x00);
+        em.extend_from_slice(m);
+        Some(em)
+    }
+
+    /// `NONEwithRSA` sign — PKCS#1 v1.5 block type 1 over the raw payload.
+    ///
+    /// `None` when the payload is too long for the modulus, which is the
+    /// condition SunJCE reports as `SignatureException`; every caller here has
+    /// that channel.
+    pub fn sign_none(key: &RsaPrivateKey, data: &[u8]) -> Option<Vec<u8>> {
+        let k = (key.n.bit_length() + 7) / 8;
+        let em = Self::pkcs1v15_encode_raw(data, k)?;
+        let m = BigUint::from_bytes_be(&em);
+        // Blinded, for the same VULN(2) reason `sign_sha256` is blinded: the
+        // variable-time `modpow` otherwise leaks a message-dependent timing
+        // signal, and `NONEwithRSA` payloads are frequently attacker-chosen.
+        let sig = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
+        Some(sig.to_bytes_be_padded(k))
+    }
+
+    /// `NONEwithRSA` verify.
+    ///
+    /// `Some(bool)` is the genuine answer; `None` means the question was never
+    /// asked — a signature of the wrong length for the modulus, or a payload
+    /// that cannot be encoded under it. The same three-valued contract
+    /// [`Self::try_verify_sha256`] carries, and for the same reason: collapsing
+    /// a refusal to `false` reports "forged" where nothing was checked.
+    ///
+    /// The comparison is against the RE-ENCODED expected block, so a signature
+    /// whose recovered block has the right payload but malformed padding is
+    /// rejected — the Bleichenbacher'06 signature-forgery shape. Nothing here
+    /// parses the recovered bytes.
+    pub fn verify_none(key: &RsaPublicKey, data: &[u8], signature: &[u8]) -> Option<bool> {
+        let k = (key.n.bit_length() + 7) / 8;
+        if signature.len() != k {
+            return None;
+        }
+        let expected = Self::pkcs1v15_encode_raw(data, k)?;
+        let c = BigUint::from_bytes_be(signature);
+        if c.cmp(&key.n) != std::cmp::Ordering::Less {
+            return None;
+        }
+        let m = c.modpow(&key.e, &key.n);
+        Some(m.to_bytes_be_padded(k) == expected)
     }
 
     /// Serialize public key to DER (SubjectPublicKeyInfo).
@@ -2954,14 +3116,32 @@ pub fn rsa_key_get_priv(id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PssHash {
+    /// Only reachable through `RSASSA-PSS-params`, whose `hashAlgorithm` and
+    /// `maskGenAlgorithm` both DEFAULT to SHA-1 (RFC 4055 §3.1). No signer in
+    /// this tree emits it.
+    Sha1,
     Sha256,
     Sha384,
     Sha512,
 }
 
 impl PssHash {
-    fn hlen(self) -> usize {
+    /// The digest OIDs `RSASSA-PSS-params` can name, as they appear in a
+    /// certificate's `signatureAlgorithm` parameters.
+    pub fn from_digest_oid(oid: &[u8]) -> Option<PssHash> {
+        // 1.3.14.3.2.26 sha1, 2.16.840.1.101.3.4.2.{1,2,3} sha256/384/512
+        match oid {
+            [0x2b, 0x0e, 0x03, 0x02, 0x1a] => Some(PssHash::Sha1),
+            [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01] => Some(PssHash::Sha256),
+            [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02] => Some(PssHash::Sha384),
+            [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03] => Some(PssHash::Sha512),
+            _ => None,
+        }
+    }
+
+    pub fn hlen(self) -> usize {
         match self {
+            PssHash::Sha1 => 20,
             PssHash::Sha256 => 32,
             PssHash::Sha384 => 48,
             PssHash::Sha512 => 64,
@@ -2970,6 +3150,12 @@ impl PssHash {
 
     fn hash(self, data: &[u8]) -> Vec<u8> {
         match self {
+            PssHash::Sha1 => {
+                use sha1::Digest;
+                let mut h = sha1::Sha1::new();
+                h.update(data);
+                h.finalize().to_vec()
+            }
             PssHash::Sha256 => Sha256::digest(data).to_vec(),
             PssHash::Sha384 => Sha384::digest(data).to_vec(),
             PssHash::Sha512 => Sha512::digest(data).to_vec(),
@@ -2996,6 +3182,18 @@ fn pss_mgf1(hash: PssHash, seed: &[u8], len: usize) -> Vec<u8> {
 /// salt (RFC 8017 §8.1.1 / §9.1). Returns an empty vector when the modulus is
 /// too small for the chosen digest or secure OS entropy is unavailable.
 pub fn rsa_sign_pss(key: &RsaPrivateKey, hash: PssHash, message: &[u8]) -> Vec<u8> {
+    rsa_sign_pss_ex(key, hash, hash, hash.hlen(), message)
+}
+
+/// RSASSA-PSS sign with an explicit MGF1 digest and salt length, the
+/// counterpart of [`rsa_verify_pss_ex`].
+pub fn rsa_sign_pss_ex(
+    key: &RsaPrivateKey,
+    hash: PssHash,
+    mgf_hash: PssHash,
+    slen: usize,
+    message: &[u8],
+) -> Vec<u8> {
     let mod_bits = key.n.bit_length();
     if mod_bits <= 1 {
         return Vec::new();
@@ -3004,7 +3202,6 @@ pub fn rsa_sign_pss(key: &RsaPrivateKey, hash: PssHash, message: &[u8]) -> Vec<u
     let em_bits = mod_bits - 1;
     let em_len = (em_bits + 7) / 8;
     let hlen = hash.hlen();
-    let slen = hlen;
     if em_len < hlen + slen + 2 {
         return Vec::new();
     }
@@ -3024,7 +3221,7 @@ pub fn rsa_sign_pss(key: &RsaPrivateKey, hash: PssHash, message: &[u8]) -> Vec<u
     let mut db = vec![0u8; ps_len];
     db.push(0x01);
     db.extend_from_slice(&salt);
-    let db_mask = pss_mgf1(hash, &h, db.len());
+    let db_mask = pss_mgf1(mgf_hash, &h, db.len());
     let mut masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
     let zero_bits = 8 * em_len - em_bits;
     masked_db[0] &= 0xFFu8 >> zero_bits;
@@ -3036,9 +3233,32 @@ pub fn rsa_sign_pss(key: &RsaPrivateKey, hash: PssHash, message: &[u8]) -> Vec<u
     rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n).to_bytes_be_padded(k)
 }
 
-/// RSASSA-PSS verify with MGF1 and salt length == hLen (the JWA convention for
-/// PS256/PS384/PS512). Returns `false` for any malformed/invalid signature.
+/// RSASSA-PSS verify with MGF1 over the same digest and salt length == hLen
+/// (the JWA convention for PS256/PS384/PS512, and what TLS 1.3 mandates for
+/// `rsa_pss_*` handshake signatures). Returns `false` for any
+/// malformed/invalid signature.
+///
+/// **X.509 certificates are not on this convention.** `RSASSA-PSS-params`
+/// carries its own `saltLength`, defaulting to 20 whatever the digest is
+/// (RFC 4055 §3.1), and its own MGF digest — use [`rsa_verify_pss_ex`] with
+/// the parsed parameters there. netty's `rsapss-ca-cert.cert` is exactly this
+/// case: SHA-256 with a 20-byte salt, which `slen == hlen` cannot verify.
 pub fn rsa_verify_pss(n: &[u8], e: &[u8], hash: PssHash, message: &[u8], signature: &[u8]) -> bool {
+    rsa_verify_pss_ex(n, e, hash, hash, hash.hlen(), message, signature)
+}
+
+/// RSASSA-PSS verify with an explicit MGF1 digest and salt length
+/// (RFC 8017 §9.1.2, EMSA-PSS-VERIFY). Returns `false` for any
+/// malformed/invalid signature.
+pub fn rsa_verify_pss_ex(
+    n: &[u8],
+    e: &[u8],
+    hash: PssHash,
+    mgf_hash: PssHash,
+    slen: usize,
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
     let n_big = BigUint::from_bytes_be(n);
     let e_big = BigUint::from_bytes_be(e);
     let mod_bits = n_big.bit_length();
@@ -3050,7 +3270,6 @@ pub fn rsa_verify_pss(n: &[u8], e: &[u8], hash: PssHash, message: &[u8], signatu
         return false;
     }
     let hlen = hash.hlen();
-    let slen = hlen; // JWA: salt length equals the hash length.
 
     // RSAVP1: s^e mod n (reject s >= n).
     let s = BigUint::from_bytes_be(signature);
@@ -3082,7 +3301,7 @@ pub fn rsa_verify_pss(n: &[u8], e: &[u8], hash: PssHash, message: &[u8], signatu
         return false;
     }
 
-    let db_mask = pss_mgf1(hash, h, em_len - hlen - 1);
+    let db_mask = pss_mgf1(mgf_hash, h, em_len - hlen - 1);
     let mut db: Vec<u8> = masked_db
         .iter()
         .zip(db_mask.iter())
@@ -3124,6 +3343,37 @@ pub fn rsa_verify_pss_by_id(
 ) -> Option<bool> {
     let (n, e) = rsa_key_get_pub(id)?;
     Some(rsa_verify_pss(&n, &e, hash, message, signature))
+}
+
+/// [`rsa_verify_pss_by_id`] with an explicit MGF digest and salt length — what
+/// a `PSSParameterSpec` supplied through `Signature.setParameter` names.
+pub fn rsa_verify_pss_ex_by_id(
+    id: u64,
+    hash: PssHash,
+    mgf_hash: PssHash,
+    slen: usize,
+    message: &[u8],
+    signature: &[u8],
+) -> Option<bool> {
+    let (n, e) = rsa_key_get_pub(id)?;
+    Some(rsa_verify_pss_ex(
+        &n, &e, hash, mgf_hash, slen, message, signature,
+    ))
+}
+
+/// [`rsa_sign_pss_by_id`] with an explicit MGF digest and salt length.
+pub fn rsa_sign_pss_ex_by_id(
+    id: u64,
+    hash: PssHash,
+    mgf_hash: PssHash,
+    slen: usize,
+    message: &[u8],
+) -> Option<Vec<u8>> {
+    let guard = RSA_KEY_STORE.read();
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| rsa_sign_pss_ex(&kp.private_key, hash, mgf_hash, slen, message))
 }
 
 /// RSASSA-PSS sign against a stored key id. `None` only when the key id is
@@ -4597,6 +4847,78 @@ pub fn rsa_sign(id: u64, message: &[u8]) -> Option<Vec<u8>> {
         .map(|kp| Rsa::sign_sha256(&kp.private_key, message))
 }
 
+/// Is `id` a key this VM actually holds? `Signature.initSign`/`initVerify`
+/// need the answer *at init time*: HotSpot refuses a key it cannot use with
+/// `InvalidKeyException` there, which is what makes a caller that iterates
+/// providers (netty's `JdkDelegatingPrivateKeyMethod.findCompatibleSignature`)
+/// move on to the next one. Accepting the key and failing at `sign()` instead
+/// makes the caller commit to a provider that can never work.
+pub fn rsa_key_registered(id: u64) -> bool {
+    if id == 0 {
+        return false;
+    }
+    let guard = RSA_KEY_STORE.read();
+    guard.as_ref().is_some_and(|m| m.contains_key(&id))
+}
+
+/// [`rsa_sign`] for an arbitrary PKCS#1 v1.5 digest.
+pub fn rsa_sign_digest(
+    id: u64,
+    digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+    message: &[u8],
+) -> Option<Vec<u8>> {
+    let guard = RSA_KEY_STORE.read();
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| Rsa::sign_pkcs1_v15(&kp.private_key, digest, message))
+}
+
+/// `Signature.verify()`'s RSA backend for an arbitrary PKCS#1 v1.5 digest.
+/// Same `Option` contract as [`rsa_verify`]: `None` means the question was
+/// never asked.
+pub fn rsa_verify_digest(
+    id: u64,
+    digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+    message: &[u8],
+    signature: &[u8],
+) -> Option<bool> {
+    let (n, e) = rsa_key_get_pub(id)?;
+    match cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15_checked(
+        &n, &e, digest, message, signature,
+    ) {
+        Ok(v) => Some(v),
+        // A rejected key or a wrong-length signature is "never checked", not
+        // "did not verify" — the distinction `rsa_verify` exists to keep.
+        Err(_) => None,
+    }
+}
+
+/// `MD5andSHA1withRSA` — the TLS 1.0/1.1 CertificateVerify signature, and the
+/// JDK name netty maps `SSL_SIGN_RSA_PKCS1_MD5_SHA1` to.
+///
+/// The signed value is the 36-byte `MD5(m) || SHA1(m)` concatenation placed in
+/// a PKCS#1 v1.5 block type 1 with **no DigestInfo** — there is no OID for the
+/// pair, which is why SunJSSE rather than SunRsaSign implements it.
+pub fn rsa_md5_sha1_digest(message: &[u8]) -> Vec<u8> {
+    let mut out = crate::real_md5(message);
+    {
+        use sha1::Digest;
+        let mut h = sha1::Sha1::new();
+        h.update(message);
+        out.extend_from_slice(&h.finalize());
+    }
+    out
+}
+
+pub fn rsa_sign_md5_sha1(id: u64, message: &[u8]) -> Option<Vec<u8>> {
+    rsa_sign_none(id, &rsa_md5_sha1_digest(message))
+}
+
+pub fn rsa_verify_md5_sha1(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
+    rsa_verify_none(id, &rsa_md5_sha1_digest(message), signature)
+}
+
 /// `Signature.verify()`'s RSA backend.
 ///
 /// The `Option` is load-bearing and is the contract `jca::signature`'s
@@ -4619,6 +4941,21 @@ pub fn rsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
     let guard = RSA_KEY_STORE.read();
     let key_pair = guard.as_ref().and_then(|m| m.get(&id))?;
     Rsa::try_verify_sha256(&key_pair.public_key, message, signature).ok()
+}
+
+/// `NONEwithRSA` sign, by `crypto_impl` key handle.
+pub fn rsa_sign_none(id: u64, data: &[u8]) -> Option<Vec<u8>> {
+    let guard = RSA_KEY_STORE.read();
+    let key_pair = guard.as_ref().and_then(|m| m.get(&id))?;
+    Rsa::sign_none(&key_pair.private_key, data)
+}
+
+/// `NONEwithRSA` verify, by `crypto_impl` key handle. Same `None`-is-a-refusal
+/// contract as [`rsa_verify`].
+pub fn rsa_verify_none(id: u64, data: &[u8], signature: &[u8]) -> Option<bool> {
+    let guard = RSA_KEY_STORE.read();
+    let key_pair = guard.as_ref().and_then(|m| m.get(&id))?;
+    Rsa::verify_none(&key_pair.public_key, data, signature)
 }
 
 /// Maps a *real* RSA key object's GC-stable `identityHashCode` to its
@@ -6959,11 +7296,40 @@ mod tests {
     /// test above cannot see any of it, because a round trip never fails.
     #[test]
     fn rsa_cipher_failures_carry_the_class_sunjce_raises() {
-        let (pk, sk) = Rsa::generate_keypair(2048);
+        // ORDER THE TWO MODULI, and the reason is a measured 1-in-8 flake.
+        //
+        // The wrong-key row below encrypts under the first key and decrypts
+        // under the second, and asserts a PADDING failure. Both moduli are
+        // 2048-bit and otherwise unrelated, so roughly half the time the second
+        // is the smaller of the two — and then the ciphertext integer (uniform
+        // below the FIRST modulus) is sometimes at or above the second, where
+        // `RSACore.parseMsg`'s guard rejects it as
+        // `BadPaddingException("Message is larger than modulus")` BEFORE any
+        // unpadding runs. Same class, different message, and the message is
+        // what the VULN(1) oracle repair pins:
+        //
+        // ```text
+        // assertion `left == right` failed: Pkcs1
+        //   left: "Message is larger than modulus"
+        //  right: "Padding error in decryption"
+        // ```
+        //
+        // Sorting the pair so the ENCRYPTING modulus is the smaller one makes
+        // `ct < n <= other_n` hold by construction, so the ciphertext is always
+        // a decryptable representative under the wrong key and the failure is
+        // always the unpadding one the test is about. Relaxing the assertion
+        // instead would retire the oracle regression it exists for.
+        let (a_pk, a_sk) = Rsa::generate_keypair(2048);
+        let (b_pk, b_sk) = Rsa::generate_keypair(2048);
+        let ((pk, sk), (other_pk, other_sk)) =
+            if a_pk.n.cmp(&b_pk.n) == std::cmp::Ordering::Less {
+                ((a_pk, a_sk), (b_pk, b_sk))
+            } else {
+                ((b_pk, b_sk), (a_pk, a_sk))
+            };
         let n = pk.n.to_bytes_be();
         let e = pk.e.to_bytes_be();
         let d = sk.d.to_bytes_be();
-        let (other_pk, other_sk) = Rsa::generate_keypair(2048);
         let other_n = other_pk.n.to_bytes_be();
         let other_d = other_sk.d.to_bytes_be();
 

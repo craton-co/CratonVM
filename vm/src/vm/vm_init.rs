@@ -1497,7 +1497,7 @@ impl SharedVm {
         // information. `None` here means the same thing it always did: this
         // wiring did not happen.
         let enum_impl_id =
-            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 2);
+            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 5);
         // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
         // does `Enumeration<URL> e = classLoader.getResources(...)` (e.g.
         // `org.apache.commons.logging.LogFactory.getResources`) can perform
@@ -1996,6 +1996,21 @@ impl SharedVm {
                 // on `use_synthetic_jdk`, not on the Cargo feature, so a
                 // feature-enabled binary running real-JDK mode is unaffected.
                 cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(
+                    &mut native_methods,
+                );
+                // Same shape, same reason, one class further on: the
+                // `CyclicBarrier` natives are gated on `CRATONVM_SYNTHETIC_AQS`
+                // inside `register_concurrent_natives` because the default
+                // real-JDK build should run the real class. Synthetic mode has
+                // no real class — `CyclicBarrier` is a 3-field compatibility
+                // stub with no method bodies — so that gate left `new
+                // CyclicBarrier(2)` at `NoSuchMethodError: <init>(I)V` and all
+                // four `JucComplete` barrier fixtures red, with the TCK table
+                // still listing them as passing. Runtime-gated on
+                // `use_synthetic_jdk` (this arm), not on the flag and not on
+                // the Cargo feature, so a feature-enabled binary running
+                // real-JDK mode is unaffected.
+                cratonvm_native_builtins::util_concurrent_ext::register_cyclic_barrier_natives(
                     &mut native_methods,
                 );
             } else {
@@ -3395,24 +3410,34 @@ impl SharedVm {
         // our ReentrantLock native when nested inside deep I/O call chains.
         sys_props.insert("jdk.io.useMonitors".to_string(), "true".to_string());
 
-        // JEP 498 — `sun.misc.Unsafe` memory-access methods (getObject,
-        // putOrderedLong, …) call `Unsafe.beforeMemoryAccess()` on entry.
-        // Under the JDK 25 default (`warn`) the *first* call drops into
-        // `beforeMemoryAccessSlow()`, which runs a `StackWalker.walk()` and
-        // unconditionally dereferences `frames.get(1)` to name the caller.
-        // CratonVM's StackWalker can return fewer than two frames for some
-        // native/JIT-spliced call chains, so `List.get(1)` throws
-        // ArrayIndexOutOfBoundsException — surfacing in jctools'
-        // MpscUnboundedArrayQueue (Netty's per-NioEventLoop task queue) as
-        // "failed to create a child event loop". Setting the documented
-        // escape-hatch property to `allow` makes `beforeMemoryAccess()`
-        // return at its first check (`MEMORY_ACCESS_OPTION == ALLOW`),
-        // bypassing the warning machinery entirely — exactly what a real
-        // JVM does when run with `-Dsun.misc.unsafe.memory.access=allow`.
-        sys_props.insert(
-            "sun.misc.unsafe.memory.access".to_string(),
-            "allow".to_string(),
-        );
+        // NOT seeded here: `sun.misc.unsafe.memory.access`.
+        //
+        // It used to be pinned to `allow` unconditionally, as a workaround for
+        // JEP 498: under the JDK 25 default (`warn`) the first legacy
+        // `sun.misc.Unsafe` memory access drops into
+        // `Unsafe.beforeMemoryAccessSlow()`, which walks the stack and
+        // dereferences `frames.get(1)`; CratonVM's StackWalker was reported to
+        // return fewer than two frames for some native/JIT-spliced chains, and
+        // that surfaced in jctools' `MpscUnboundedArrayQueue` (netty's
+        // per-`NioEventLoop` task queue) as "failed to create a child event
+        // loop". Pinning `allow` makes `beforeMemoryAccess()` return at its
+        // first check and bypasses the warning machinery.
+        //
+        // The cost was much larger than the fix. HotSpot sets this property
+        // ONLY for `--sun-misc-unsafe-memory-access=<mode>`; a default JDK 25
+        // run leaves it unset. netty 4.2 keys its entire Unsafe-vs-FFM
+        // decision on exactly that (`PlatformDependent0.explicitNoUnsafeCause0`
+        // disables Unsafe on Java 25+ unless the property is set), so pinning
+        // it put netty — and every other Unsafe-aware library — on a different
+        // code path than a stock JDK 25 run, and made every "CratonVM vs
+        // HotSpot" netty comparison a comparison of two different code paths.
+        //
+        // The property is now the user's to set: `vm-cli` rewrites
+        // `--sun-misc-unsafe-memory-access=<mode>` to the `-D` form and nothing
+        // else writes it, so a default run answers `null` exactly as HotSpot
+        // does. The `sun/misc/Unsafe` post-clinit repair in `vm_util.rs` reads
+        // the same property and falls back to `WARN` — the JDK's own default —
+        // rather than to a forced `ALLOW`.
 
         // Allow dynamic agents to attach to *this* running VM in-process.
         // Tools that ship as a `java.lang.instrument` agent but are launched
@@ -3908,6 +3933,7 @@ impl SharedVm {
                 matcher_leaf_admission: std::array::from_fn(|_| {
                     std::sync::atomic::AtomicU64::new(0)
                 }),
+                netty_tcnative_real: std::sync::atomic::AtomicBool::new(false),
             },
 
             threads: crate::vm::realms::ThreadRealm {
@@ -3950,12 +3976,14 @@ impl SharedVm {
                 swallow_counter: std::sync::atomic::AtomicU64::new(0),
                 stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
                 stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
+                stack_dump_acked_tids: parking_lot::Mutex::new(Vec::new()),
                 stack_sample_mode: std::sync::atomic::AtomicBool::new(false),
             },
             jit: crate::vm::realms::JitRealm {
                 jit_cache: JitCache::new(),
                 profile_store: ProfileStore::new(),
                 jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
+                jit_gate_pass: parking_lot::RwLock::new(FxHashMap::default()),
                 // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.
@@ -4054,6 +4082,19 @@ impl SharedVm {
         cratonvm_classloading::install_class_load_hook(class_load_adapter);
         cratonvm_classloading::install_class_prepare_hook(class_prepare_adapter);
 
+        // CRATONVM_DBG_ROOT_SOURCE: let the collector ask the root inventory
+        // "who handed me this address?".
+        //
+        // The registry lives in this crate and the question is asked in the
+        // GC crate, which cannot call back the other way -- so the GC owns a
+        // doorway and we install the lookup through it, exactly as the
+        // quiescence flag is arranged. Installed unconditionally; the lookup
+        // itself short-circuits to `None` unless the flag is on, so this costs
+        // one `OnceLock` write per VM.
+        cratonvm_gc::gc_quiescence::install_root_source_hook(
+            crate::memory::native_roots::root_source_of,
+        );
+
         // T10.5 — register the class loader's vtable-install hook so each
         // class-link emits its descriptor vec into `shared.classes.vtable_manager`.
         //
@@ -4093,6 +4134,14 @@ impl SharedVm {
         // adapter iterates `live_hook_vms()`, which is empty until the first
         // VM is registered, so it falls through to a no-op.
         cratonvm_classloading::install_resolution_invalidate_hook(resolution_invalidate_adapter);
+
+        // Give the GC crate a way to turn a `ClassId` into a name for its
+        // failure-path reports. Same bridge, same reason: the gc crate cannot
+        // name a `Class`. Without it the ZGC fragmentation report can only say
+        // `class_id=418`, and the second run needed to decode that is a
+        // different process with a different heap layout — so the answer does
+        // not carry over. See `cratonvm_gc::collector::set_class_namer`.
+        cratonvm_gc::collector::set_class_namer(class_name_adapter);
 
         // Found while investigating the guarded-inline-getfield SIGSEGV
         // cluster (that SIGSEGV's actual cause was a separate, already-fixed
@@ -4238,6 +4287,24 @@ pub fn zgc_relocation_permitted(requested: bool) -> bool {
     if crate::runtime::env_cache::disable_jit() {
         return true;
     }
+    // Stage (a) of `zgc-jit-load-barrier.md` LANDED 2026-08-13, so the JIT is
+    // no longer automatically disqualifying.
+    //
+    // The refusal below exists because JIT-compiled code baked raw 8-byte
+    // reference loads at compile-time offsets and would read a coloured word
+    // as a pointer. `x64::zgc_read_barrier_blocks_inline_fields` now routes
+    // every compact-field access through `jit_getfield` / `jit_putfield_object`
+    // whenever the read barrier is armed, and those go through the heap's own
+    // accessors, which barrier. That is the same mechanism compressed oops has
+    // used for the same reason since before this gate existed.
+    //
+    // The CAPABILITY, not the runtime state: this runs at VM init, long
+    // before any cycle arms a barrier, so asking "is the barrier armed" here
+    // would answer no forever and refuse relocation permanently. The question
+    // is whether the code this JIT emits will respect a barrier armed later.
+    if cratonvm_jit::x64::zgc_codegen_honours_read_barrier() {
+        return true;
+    }
     // Reported on stderr, not just through `tracing`, for the reason the
     // compressed-oops gate states: a silent fallback would look identical to a
     // successful run, and the operator must see which one they got. The stakes
@@ -4331,6 +4398,30 @@ pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
     if !already {
         reg.push(weak);
     }
+}
+
+/// The `set_class_namer` adapter: `ClassId` -> binary name, for GC
+/// diagnostics only.
+///
+/// `try_read` rather than `read`, and this is load-bearing. Every caller is a
+/// failure-path report, and at least one of them (the ZGC fragmentation
+/// report) runs on a thread that has just failed an allocation — a thread that
+/// may well be the one holding the class-manager write lock further up its own
+/// stack. Blocking there would convert a diagnostic into a hang, which is
+/// strictly worse than an unnamed class id. A contended lock therefore falls
+/// back to the id, which is exactly what the caller prints when no namer is
+/// installed at all.
+fn class_name_adapter(class_id: u32) -> Option<String> {
+    let cid = crate::classloading::ClassId::new(class_id);
+    for shared in live_hook_vms() {
+        let Some(cm) = shared.classes.class_manager.try_read() else {
+            continue;
+        };
+        if let Some(class) = cm.get_class(cid) {
+            return Some(class.name.to_string());
+        }
+    }
+    None
 }
 
 /// The `ResolutionInvalidateHook` adapter handed to
@@ -7210,9 +7301,26 @@ impl SharedVm {
         // watchdog. They wake, emit their park-site snapshot / current
         // frames, and the process aborts right after.
         self.threads.thread_registry.unpark_all_for_stack_dump();
-        // Summarize every registered thread (incl. those with no dumpable
-        // interpreter frames — blocked in a native lock, or never started).
-        self.threads.thread_registry.dump_thread_summary_to_stderr();
+        // The per-thread summary is NOT printed here. It used to be, and that
+        // made its most load-bearing column a lie: printed at request time, it
+        // cannot know which threads went on to answer, so it labelled every
+        // RUNNING thread "read the live stack dump above" — including threads
+        // that never produced one. The watchdog now calls
+        // [`Self::dump_thread_summary_after_dumps`] once the grace period has
+        // closed, when the ack set is complete.
+    }
+
+    /// T19.H1 — print the per-thread summary once the watchdog's grace period
+    /// has closed, so it can distinguish a RUNNING thread that dumped from one
+    /// that stayed silent (i.e. is in JIT-compiled code or a long native call).
+    ///
+    /// Summarizes every registered thread, including those with no dumpable
+    /// interpreter frames — blocked in a native lock, or never started.
+    pub fn dump_thread_summary_after_dumps(&self) {
+        let acked = self.debug.stack_dump_acked_tids.lock().clone();
+        self.threads
+            .thread_registry
+            .dump_thread_summary_to_stderr(&acked);
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -7379,6 +7487,9 @@ impl SharedVm {
         self.debug
             .stack_dump_ack_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // Record WHICH thread answered, not just how many did — see
+        // `stack_dump_acked_tids`.
+        self.debug.stack_dump_acked_tids.lock().push(tid);
     }
 
     /// T19.H1 — count of threads that have completed their dump.
@@ -9297,6 +9408,85 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod zgc_relocation_gate_tests {
+    use super::zgc_relocation_permitted;
+
+    /// **Relocation is permitted only where a reference load is barriered.**
+    ///
+    /// The original rule was "refused whenever the JIT is enabled", because
+    /// JIT-compiled code baked raw 8-byte reference loads at compile-time
+    /// offsets and would read a coloured word as a pointer -- a use-after-free
+    /// with no error path. That is still the hazard; what changed on
+    /// 2026-08-13 is that stage (a) of `zgc-jit-load-barrier.md` landed, so
+    /// the JIT no longer does that: `x64::zgc_read_barrier_blocks_inline_fields`
+    /// routes every compact-field access through `jit_getfield` /
+    /// `jit_putfield_object` whenever the barrier is armed, and those go
+    /// through the heap accessors, which barrier.
+    ///
+    /// So the predicate is now a disjunction, and both arms are asserted here
+    /// rather than one being assumed. **If inline reference emission is ever
+    /// re-enabled under an armed barrier, `zgc_codegen_honours_read_barrier`
+    /// must go back to `false` and this test must go red** -- that is what it
+    /// is for.
+    #[test]
+    fn relocation_is_permitted_only_where_reference_loads_are_barriered() {
+        let jit_off = crate::runtime::env_cache::disable_jit();
+        let codegen_ok = cratonvm_jit::x64::zgc_codegen_honours_read_barrier();
+        assert_eq!(
+            zgc_relocation_permitted(true),
+            jit_off || codegen_ok,
+            "requested relocation must be permitted IF AND ONLY IF every \
+             reference load is barriered -- either because there is no JIT \
+             code, or because the JIT routes reference loads through the \
+             barriered helpers when the barrier is armed"
+        );
+    }
+
+    /// The hazard the gate exists for, stated so it cannot be lost: with the
+    /// JIT on and codegen NOT honouring the barrier, relocation must refuse.
+    ///
+    /// Asserted as an implication rather than by forcing the state, because
+    /// neither input is settable from a test in this process -- `disable_jit`
+    /// is latched and `zgc_codegen_honours_read_barrier` is a build property.
+    /// The value is that the rule is written down as an executable claim: if
+    /// someone makes the predicate permissive in a way that drops one of the
+    /// two arms, the assertion above fails.
+    #[test]
+    fn relocation_refuses_when_neither_arm_holds() {
+        let jit_off = crate::runtime::env_cache::disable_jit();
+        let codegen_ok = cratonvm_jit::x64::zgc_codegen_honours_read_barrier();
+        if !jit_off && !codegen_ok {
+            assert!(
+                !zgc_relocation_permitted(true),
+                "unbarriered JIT reference loads plus a moving cycle is a \
+                 use-after-free; the gate must refuse"
+            );
+        }
+    }
+
+    /// Not requested is not permitted — the branch `vm_init` actually takes
+    /// today (`RELOCATION_REQUESTED = false`).
+    ///
+    /// **Weaker than it looks, and saying so is the point.** In a test process
+    /// with the JIT enabled the `!requested` early return and the JIT refusal
+    /// both answer `false`, so this assertion cannot distinguish them:
+    /// deleting the early return leaves it passing. It is kept as a statement
+    /// of the contract, not as a mutation detector, and the detector for the
+    /// branch that matters is
+    /// [`relocation_is_permitted_only_when_the_jit_is_off`] — verified to fail
+    /// when the gate is short-circuited to always permit. A `--nojit` test
+    /// process is what would separate these two, and this crate's suite does
+    /// not run one.
+    #[test]
+    fn relocation_that_was_not_requested_is_never_permitted() {
+        assert!(
+            !zgc_relocation_permitted(false),
+            "the gate must never permit relocation nobody asked for"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

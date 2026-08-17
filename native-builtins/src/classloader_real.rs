@@ -1053,16 +1053,32 @@ pub(crate) fn no_class_def_found_error(
     if let Some(cause) = cause {
         let cause_pin = ctx.pin_native_root(cause);
         let ncdfe_msg = ctx.create_string(missing_internal);
-        let cause = ctx.read_native_pin(cause_pin, cause);
+        // `NoClassDefFoundError` declares only `()V` and `(String)V` — there is
+        // NO `(String,Throwable)` constructor on it in JDK 25 (measured). This
+        // used to call that descriptor and it only ever worked because CratonVM
+        // fabricated it for every throwable-family class; the JDK's own
+        // `ClassLoader` builds the same object the same way this does now,
+        // message-only plus `initCause`.
         let result = ctx.new_object_initialized(
             "java/lang/NoClassDefFoundError",
-            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-            &[Value::Object(Some(ncdfe_msg)), Value::Object(Some(cause))],
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(ncdfe_msg))],
         );
-        ctx.unpin_native_roots(cause_pin);
         if let Ok(Some(Value::Object(Some(exc)))) = result {
+            let exc_pin = ctx.pin_native_root(exc);
+            let cause = ctx.read_native_pin(cause_pin, cause);
+            let _ = ctx.invoke_virtual(
+                exc,
+                "initCause",
+                "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+                &[Value::Object(Some(cause))],
+            );
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            ctx.unpin_native_roots(exc_pin);
+            ctx.unpin_native_roots(cause_pin);
             return Ok(exc);
         }
+        ctx.unpin_native_roots(cause_pin);
     }
     // Fallback (constructor dispatch unavailable for some reason): reuse the
     // same message-only idiom the sibling `ClassNotFoundException` throw

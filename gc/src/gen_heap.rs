@@ -414,6 +414,32 @@ pub static SWEEP_WALK_OVERSHOOT_HITS: AtomicU64 = AtomicU64::new(0);
 /// live memory).
 pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Zero runs a young walk recognised as a run of EMPTY objects and stepped
+/// over on-grid, instead of treating as a desync — see
+/// [`zero_run_empty_object_resume`]. Summed across the three walks that ask:
+/// the sequential sweep, the parallel [`sweep_chunk`], and
+/// [`clear_all_mark_bits_in_arena`]. Deliberately a SEPARATE counter from
+/// [`SWEEP_ZERO_SPAN_HITS`], which now counts only the runs that still take the
+/// unwind: this shape is normal and frequent (147 per young cycle on the
+/// hibernate-reactive repro), so folding the two together would turn its
+/// arrival into apparent corruption. Like its siblings above it has no printer
+/// — it is read from a debugger or an instrumented repro build.
+pub static SWEEP_ZERO_SPAN_EMPTY_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes in the runs [`SWEEP_ZERO_SPAN_EMPTY_RUNS`] counts, accumulated for the
+/// CURRENT cycle by whichever walkers covered the arena (the sequential walk
+/// and the parallel chunks partition it, so both add).
+static EMPTY_RUN_BYTES_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+/// [`EMPTY_RUN_BYTES_CYCLE`] as of the end of the last completed sweep — the
+/// standing retention, because every cycle re-skips the same runs. A
+/// cumulative total would just multiply this by the cycle count.
+pub static EMPTY_RUN_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// Young `used` at the end of the last sweep, so the figure above can be read
+/// as a fraction without a second run.
+pub static EMPTY_RUN_YOUNG_USED_LAST: AtomicU64 = AtomicU64::new(0);
+
 /// `CRATONVM_DBG_MARK_WHY_CLASS` straddle reports emitted — the sweep walk
 /// striding OVER the watched base, inside some earlier object's computed
 /// extent. Bounds the log: a desynced grid can straddle one watched address on
@@ -501,6 +527,39 @@ pub static PAR_SWEEP_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 /// H2-CID0 — companion to [`PAR_SWEEP_ATTEMPTS`]: attempts that were accepted.
 pub static PAR_SWEEP_ACCEPTS: AtomicU64 = AtomicU64::new(0);
 
+/// Which check abandoned a parallel sweep chunk, by reason.
+///
+/// [`PAR_SWEEP_ACCEPTS`] is a per-CYCLE verdict and one `None` from any chunk
+/// discards the whole attempt, so a shortfall there says only "something
+/// disagreed with the grid somewhere". The seven reasons mean entirely
+/// different things — a hole-crossing extent is a free-list/grid disagreement,
+/// a phantom extent is the corruption family, and a chain that misses its
+/// anchor is an anchor that was never an object start — and picking the wrong
+/// one to chase costs a whole investigation.
+///
+/// Index: `0` free-block overshoot, `1` malformed GAP filler, `2` unlisted zero
+/// span (the ones [`zero_run_empty_object_resume`] refuses), `3` implausible
+/// header size, `4` extent crosses a free hole, `5` phantom extent (subsumes a
+/// live object), `6` the chain did not land exactly on the next anchor.
+pub static PAR_CHUNK_BAILS: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Count a [`PAR_CHUNK_BAILS`] reason and abandon the chunk. Every `return
+/// None` in `sweep_chunk` goes through here so a new bail cannot be added
+/// without choosing a reason for it.
+#[inline]
+fn chunk_bail(reason: usize) -> Option<SweepChunkResult> {
+    PAR_CHUNK_BAILS[reason].fetch_add(1, Ordering::Relaxed);
+    None
+}
+
 /// H2-CID0 — bounded report counter for the off-grid-anchor warning.
 static ANCHOR_OFF_GRID_REPORTS: AtomicU64 = AtomicU64::new(0);
 
@@ -530,6 +589,31 @@ pub static SWEEP_PHANTOM_EXTENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Bounded report counter for [`SWEEP_PHANTOM_EXTENTS`].
 static SWEEP_PHANTOM_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// Marks subsumed by a reported phantom extent that may NOT be object bases.
+///
+/// [`SWEEP_PHANTOM_EXTENTS`] rests on "`side_sorted` holds object BASES, and
+/// live objects never nest". The first half has one documented exception: when
+/// no anchor interval resolves a CONSERVATIVE candidate, `mark_young`'s
+/// fallback side-marks the RAW candidate address, which is a base only if the
+/// candidate happened to be one. A conservative candidate is frequently an
+/// object-INTERIOR word (a field address, a derived pointer, a spilled register
+/// mid-object), and the late-resolution pass that marks the real base cannot
+/// unmark the raw address — so `side_sorted` can carry both.
+///
+/// An interior mark of a perfectly VALID object satisfies the phantom check's
+/// premise exactly, which would make the verdict a false positive that unwinds
+/// every reclamation since the last anchor: a throughput cost, not a
+/// correctness one (`live_in_dead` stayed 0 throughout the 2026-08-13 finding).
+///
+/// This counter does not change the verdict — it says whether that explanation
+/// is the right one. `unresolved_snapshot` is exactly the set of marks that may
+/// not be bases; everything else came from a precise ref-slot value (a base by
+/// construction) or from `resolve_candidate_bases`. Read it beside
+/// `phantom_extents`: equal counts say the guard is firing on interior marks,
+/// zero says the subsumed marks were real bases and the walk really did leave
+/// the object grid.
+pub static SWEEP_PHANTOM_INTERIOR_MARKS: AtomicU64 = AtomicU64::new(0);
 
 /// H2-CID0 — reclaim spans the sweep refused to publish because they already
 /// overlapped a free block. Publishing one is a double free: the allocator can
@@ -8649,6 +8733,7 @@ impl GenerationalHeap {
             // each header before any write lands on it.
             let mut age_bumps: Vec<usize> = Vec::new();
             {
+                YOUNG_WALK_ENTRIES[0].fetch_add(1, Ordering::Relaxed);
                 // PERF: reuse the once-computed sorted free-block snapshot.
                 let mut free_iter = sweep_free_blocks.iter().peekable();
                 let used = sweep_used;
@@ -8671,6 +8756,8 @@ impl GenerationalHeap {
                 ) {
                     age_bumps.truncate(age_wm);
                     if fwd_installs.len() > fwd_wm {
+                        EVAC_UNWIND_CANDIDATES
+                            .fetch_add((fwd_installs.len() - fwd_wm) as u64, Ordering::Relaxed);
                         let n = SWEEP_PROMOTION_ABORT_HITS.fetch_add(1, Ordering::Relaxed);
                         if n < 8 {
                             tracing::warn!(
@@ -8693,6 +8780,7 @@ impl GenerationalHeap {
                             // mis-sized: candidates since the last anchor are
                             // suspect. The cursor now sits at the block end —
                             // a fresh anchor.
+                            EVAC_UNWIND_REASONS[0].fetch_add(1, Ordering::Relaxed);
                             unwind_evac(
                                 &mut fwd_installs,
                                 &mut evacuated,
@@ -8742,7 +8830,30 @@ impl GenerationalHeap {
                             .unwrap_or(used)
                             .min(used);
                         let run_end = zero_run_end(from_base, cursor, limit);
-                        if run_end - cursor >= HEADER_SIZE {
+                        let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                        if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                            // A run of EMPTY objects is not a desync. Stepping
+                            // over it is doubly safe here: an empty object has
+                            // no fields, so there is nothing in the run to
+                            // promote and nothing to age. Unwinding instead
+                            // discards every promotion candidate collected
+                            // since the last anchor — 69 194 of them in one
+                            // measured run at `--Xmx 320m` — and under a
+                            // permanent non-moving sweep promotion is the young
+                            // generation's ONLY exit for live data.
+                            if let Some(resume) = zero_run_empty_object_resume(
+                                from_base,
+                                cursor,
+                                run_end,
+                                used,
+                                &side_sorted,
+                            ) {
+                                SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                                EMPTY_RUN_BYTES_CYCLE
+                                    .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                                cursor = resume;
+                                continue;
+                            }
                             anomaly = true;
                         }
                     }
@@ -8752,6 +8863,8 @@ impl GenerationalHeap {
                         gen_object_total_size(header)
                     };
                     if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                        EVAC_UNWIND_REASONS[if anomaly { 1 } else { 2 }]
+                            .fetch_add(1, Ordering::Relaxed);
                         unwind_evac(
                             &mut fwd_installs,
                             &mut evacuated,
@@ -8772,6 +8885,7 @@ impl GenerationalHeap {
                     // last anchor are suspect.
                     if let Some(&&(foff, _fsz)) = free_iter.peek() {
                         if foff > cursor && foff < cursor + total_size {
+                            EVAC_UNWIND_REASONS[3].fetch_add(1, Ordering::Relaxed);
                             unwind_evac(
                                 &mut fwd_installs,
                                 &mut evacuated,
@@ -9021,6 +9135,7 @@ impl GenerationalHeap {
                 // robust traversal; on an (unexpected) anomaly, re-anchor at
                 // the next free block and keep fixing up rather than break.
                 {
+                    YOUNG_WALK_ENTRIES[1].fetch_add(1, Ordering::Relaxed);
                     // PERF: reuse the once-computed sorted free-block snapshot.
                     let mut free_iter = sweep_free_blocks.iter().peekable();
                     let used = sweep_used;
@@ -9081,7 +9196,28 @@ impl GenerationalHeap {
                                 .unwrap_or(used)
                                 .min(used);
                             let run_end = zero_run_end(from_base, cursor, limit);
-                            if run_end - cursor >= HEADER_SIZE {
+                            let vouched_live =
+                                side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                            if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                                // Same as the evacuation pre-pass above, and
+                                // with the same second reason: an empty object
+                                // has no reference slots, so a run of them
+                                // holds nothing for this pass to rewrite. The
+                                // anomaly arm instead hands the whole stretch
+                                // to `rewrite_stretch`'s conservative rewrite.
+                                if let Some(resume) = zero_run_empty_object_resume(
+                                    from_base,
+                                    cursor,
+                                    run_end,
+                                    used,
+                                    &side_sorted,
+                                ) {
+                                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                                    EMPTY_RUN_BYTES_CYCLE
+                                        .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                                    cursor = resume;
+                                    continue;
+                                }
                                 anomaly = true;
                             }
                         }
@@ -9566,6 +9702,7 @@ impl GenerationalHeap {
         // grid — re-deriving it is exactly the desync hazard documented on
         // `mark_young_to_old_refs`.
         let mut young_survivors: Vec<usize> = Vec::new();
+        EMPTY_RUN_BYTES_CYCLE.store(0, Ordering::Relaxed);
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
         // Index into `dead_regions` at the last trustworthy walk anchor
@@ -9860,6 +9997,26 @@ impl GenerationalHeap {
                 // header below, instead of unwinding every reclaim decision
                 // taken since the last anchor for an ordinary live object.
                 let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                // A run of EMPTY objects is not a desync — step over it on-grid
+                // and keep every reclaim decision behind it. See
+                // `zero_run_empty_object_resume` for the measurement that
+                // separates this shape from the corruption the unwind below
+                // exists for. Still never parsed and never freed: over-retention
+                // is always safe here.
+                let empty_resume = if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                    zero_run_empty_object_resume(from_base, cursor, run_end, used, &side_sorted)
+                } else {
+                    None
+                };
+                if let Some(resume) = empty_resume {
+                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                    // `resume <= run_end <= limit` (the next free block's
+                    // offset), so the run never crosses a free block and
+                    // `free_iter` is already positioned correctly.
+                    cursor = resume;
+                    continue;
+                }
                 if run_end - cursor >= HEADER_SIZE && !vouched_live {
                     let n = SWEEP_ZERO_SPAN_HITS.fetch_add(1, Ordering::Relaxed);
                     if n < 8 {
@@ -10214,6 +10371,25 @@ impl GenerationalHeap {
                     .is_some_and(|&a| a < abs + total_size)
                 {
                     let victim = side_sorted[live_probe];
+                    // Are the subsumed marks object BASES? See
+                    // `SWEEP_PHANTOM_INTERIOR_MARKS` — this classifies, it does
+                    // not gate. Bounded by the marks inside this one extent.
+                    let mut nonbase_inside = 0u64;
+                    let mut probe = live_probe;
+                    while let Some(&a) = side_sorted.get(probe) {
+                        if a >= abs + total_size {
+                            break;
+                        }
+                        if unresolved_snapshot.binary_search(&a).is_ok() {
+                            nonbase_inside += 1;
+                        }
+                        probe += 1;
+                    }
+                    if nonbase_inside != 0 {
+                        SWEEP_PHANTOM_INTERIOR_MARKS.fetch_add(nonbase_inside, Ordering::Relaxed);
+                    }
+                    let victim_is_unresolved_raw =
+                        unresolved_snapshot.binary_search(&victim).is_ok();
                     SWEEP_PHANTOM_EXTENTS.fetch_add(1, Ordering::Relaxed);
                     if SWEEP_PHANTOM_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
                         tracing::error!(
@@ -10230,6 +10406,14 @@ impl GenerationalHeap {
                             num_slots = header.num_slots(),
                             victim = format!("{victim:#x}"),
                             victim_interior_offset = victim - abs,
+                            // The discriminator: `true` means this "live
+                            // object" is an unresolved RAW conservative
+                            // candidate, i.e. possibly an interior word of the
+                            // very object being sized here, and the verdict is
+                            // then a false positive. See
+                            // `SWEEP_PHANTOM_INTERIOR_MARKS`.
+                            victim_is_unresolved_raw,
+                            nonbase_marks_inside = nonbase_inside,
                             // Where the walk last stood on ground truth, and the
                             // stride that took it from there to here. The break is
                             // upstream of the detection: if `prev_*` sizes an object
@@ -11437,9 +11621,14 @@ impl GenerationalHeap {
         // both the normal-completion and the `break` arm because it sits
         // after the `while` loop. Now hole-aware: the dead spans are on the
         // free list (published above), so the re-walk skips them.
-        clear_all_mark_bits_in_arena(&mut young_from);
+        clear_all_mark_bits_in_arena(&mut young_from, &side_sorted);
         report_phase("clear-marks");
 
+        EMPTY_RUN_BYTES_LAST.store(
+            EMPTY_RUN_BYTES_CYCLE.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        EMPTY_RUN_YOUNG_USED_LAST.store(young_from.used() as u64, Ordering::Relaxed);
         let live_bytes = bytes_before.saturating_sub(bytes_swept);
         tracing::debug!(
             "non-moving young sweep: {} live objects ({} bytes), {} dead \
@@ -12415,6 +12604,7 @@ impl GenerationalHeap {
         young_skips: &[(usize, usize)],
         worklist: &mut Vec<*mut u8>,
     ) {
+        YOUNG_WALK_ENTRIES[2].fetch_add(1, Ordering::Relaxed);
         // Skip the zeroed holes the non-moving sweep leaves in from-space.
         // Without this, this linear walk strides into a reclaimed hole, decodes
         // its zeroed bytes as a `num_slots=0` (40-byte) object, and desyncs off
@@ -12519,6 +12709,37 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
+                    // A run of EMPTY objects is not a desync, and here the
+                    // second half of the argument is what carries it: an empty
+                    // object has NO FIELDS, so a run of them contains no
+                    // young->old reference for this pass to find. Stepping over
+                    // it cannot miss a ref.
+                    //
+                    // That matters because this walk has no young live set to
+                    // hand the predicate — a major cycle retains young
+                    // conservatively and deliberately walks live and dead
+                    // objects alike, so there is nothing to pass but `&[]` and
+                    // the no-marked-base-inside condition is vacuous. The
+                    // alignment and plausible-next-header conditions still
+                    // apply, and they are the two that establish that `resume`
+                    // is on-grid.
+                    //
+                    // The anomaly arm below is not free: it re-anchors at the
+                    // next free block and falls back to a CONSERVATIVE scan of
+                    // the skipped stretch, marking every word that looks like an
+                    // old-gen base. Measured on `probes/GcWalkProbe.java`, it
+                    // fired on 4 of 4 entries — i.e. every major cycle seeded
+                    // young->old from a conservative scan rather than a parse.
+                    if let Some(resume) =
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                    {
+                        SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                        EMPTY_RUN_BYTES_CYCLE
+                            .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                        cursor = resume;
+                        continue;
+                    }
+                    LATE_WALK_ZERO_RUNS[0].fetch_add(1, Ordering::Relaxed);
                     anomaly = true;
                 }
             }
@@ -12549,7 +12770,7 @@ impl GenerationalHeap {
                         base,
                         stretch_lo,
                         stretch_hi,
-                        cratonvm_types::narrow_oop::narrow_oops_enabled(),
+                        active_narrow_geometry(),
                         |_slot, _width, value| mark_if_old_base(value),
                     );
                 }
@@ -12672,6 +12893,7 @@ impl GenerationalHeap {
         compact_map: &cratonvm_types::PointerMap,
         young_skips: &[(usize, usize)],
     ) {
+        YOUNG_WALK_ENTRIES[3].fetch_add(1, Ordering::Relaxed);
         // Skip non-moving-sweep holes — same rationale as `mark_young_to_old_refs`:
         // a linear from-space walk must not stride into a reclaimed zeroed hole
         // (it would desync off the object grid and misread a live object's
@@ -12742,7 +12964,7 @@ impl GenerationalHeap {
         // compressible range, so a slot is only ever rewritten to a value that
         // round-trips; the guard keeps a non-encodable destination from
         // silently becoming a null.
-        let narrow = cratonvm_types::narrow_oop::narrow_oops_enabled();
+        let narrow = active_narrow_geometry();
         let rewrite_stretch_conservatively = |lo: usize, hi: usize| {
             // SAFETY: `[base+lo, base+hi)` is mapped from-space memory, and
             // each `slot` handed back is a location this scan just read.
@@ -12804,6 +13026,35 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
+                    // A run of EMPTY objects is not a desync, and the second
+                    // half of the argument is what carries it here, exactly as
+                    // in `mark_young_to_old_refs`: an empty object has NO
+                    // FIELDS, so a run of them holds no reference into old gen
+                    // for this pass to rewrite. Stepping over it cannot strand
+                    // one at a stale pre-compaction address.
+                    //
+                    // There is no young live set to hand the predicate — this
+                    // walk is given a from-space, not a mark result — so `&[]`
+                    // is all there is and the no-marked-base-inside condition
+                    // is vacuous. The alignment and plausible-next-header
+                    // conditions still establish that `resume` is on-grid.
+                    //
+                    // The arm below is not free: it re-anchors at the next free
+                    // block and falls back to `rewrite_stretch_conservatively`
+                    // over everything skipped, which rewrites any aligned word
+                    // that merely EQUALS a moved object's old address — a
+                    // primitive included — and gives up the precise parse of
+                    // every real object in the stretch.
+                    if let Some(resume) =
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                    {
+                        SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                        EMPTY_RUN_BYTES_CYCLE
+                            .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                        cursor = resume;
+                        continue;
+                    }
+                    LATE_WALK_ZERO_RUNS[1].fetch_add(1, Ordering::Relaxed);
                     anomaly = true;
                 }
             }
@@ -14062,6 +14313,7 @@ impl GenerationalHeap {
     /// Returns a Vec of (raw pointer, total byte size) for each object.
     /// Must be called during a GC safepoint (all mutator threads paused).
     pub fn walk_young_objects(&self) -> Vec<(*mut u8, usize)> {
+        YOUNG_WALK_ENTRIES[4].fetch_add(1, Ordering::Relaxed);
         let mut result = Vec::new();
 
         // Walk young generation (from-space only — to-space is GC scratch).
@@ -14141,6 +14393,38 @@ impl GenerationalHeap {
                         .min(used);
                     let run_end = zero_run_end(base, offset, limit);
                     if run_end - offset >= HEADER_SIZE {
+                        // A run of EMPTY objects is not a desync. This walk has
+                        // no live set either (it enumerates a from-space, live
+                        // and dead alike), so what carries it is again that an
+                        // empty object has NO FIELDS.
+                        //
+                        // That is exactly what this walk's callers consume.
+                        // `collect_young_to_old_roots` reads REF SLOTS to build
+                        // the concurrent old-gen marker's young->old roots,
+                        // which the call site calls mandatory — "a missed mark
+                        // root here = cleanup frees a live object" — and a run
+                        // of empty objects contributes none. Whereas the arm
+                        // below re-anchors at the next free block and so drops
+                        // every REAL object between the run and that anchor
+                        // from the enumeration, roots and all. Resuming on-grid
+                        // strictly reduces what is lost.
+                        //
+                        // The run's own members are skipped rather than emitted
+                        // as HEADER_SIZE entries: `hprof::dump_heap` is the
+                        // other caller, and a multi-megabyte run of dead empty
+                        // objects would balloon the dump for no fidelity a
+                        // consumer relies on. Today's arm omits them too, along
+                        // with everything after them.
+                        if let Some(resume) =
+                            zero_run_empty_object_resume(base, offset, run_end, used, &[])
+                        {
+                            SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                            EMPTY_RUN_BYTES_CYCLE
+                                .fetch_add((resume - offset) as u64, Ordering::Relaxed);
+                            offset = resume;
+                            continue;
+                        }
+                        LATE_WALK_ZERO_RUNS[2].fetch_add(1, Ordering::Relaxed);
                         anomaly = true;
                     }
                 }
@@ -15662,7 +15946,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
         let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
         if overshot {
             // The grid and the free list disagree — sequential recovery only.
-            return None;
+            return chunk_bail(0);
         }
         if resynced {
             continue;
@@ -15686,31 +15970,58 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
                 cursor += gap;
                 continue;
             }
-            return None;
+            return chunk_bail(1);
         }
 
-        // Unlisted all-zero span: never parseable, and its presence is
-        // evidence the grid broke. Sequential path owns the recovery.
+        // Unlisted all-zero span. Only SOME of these are evidence the grid
+        // broke: a run of EMPTY objects is the ordinary post-HEADER_SIZE-16
+        // shape (see `zero_run_empty_object_resume`), and a marked object at
+        // the run start is simply a live `ClassId(0)` container whose header
+        // legitimately reads zero. Bailing on either was expensive out of all
+        // proportion — one `None` makes `parallel_sweep_walk` discard EVERY
+        // chunk and re-run the whole arena sequentially, and on the
+        // hibernate-reactive repro that happened on every cycle
+        // (`par_attempts=5 par_fails=5`, all five the zero-run branch, so
+        // `par_prefix_end` was 0 for the entire run). Anything the predicate
+        // does not vouch for still bails; the sequential path still owns the
+        // report and the unwind/re-anchor policy.
         // SAFETY: in-bounds 8-byte header read, as above.
         if unsafe { *(obj_ptr as *const u64) } == 0 {
             let limit = free_iter
                 .peek()
                 .map(|&&(off, _)| off)
                 .unwrap_or(ctx.used)
-                .min(ctx.used);
-            if zero_run_end(from_base, cursor, limit) - cursor >= HEADER_SIZE {
-                return None;
+                .min(ctx.used)
+                // Never step over `hi`: the chain must land exactly on the
+                // next anchor or the chunk is discarded anyway.
+                .min(hi);
+            let run_end = zero_run_end(from_base, cursor, limit);
+            let vouched_live = ctx.side_sorted.binary_search(&(from_base + cursor)).is_ok();
+            if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                if let Some(resume) = zero_run_empty_object_resume(
+                    from_base,
+                    cursor,
+                    run_end,
+                    ctx.used,
+                    ctx.side_sorted,
+                ) {
+                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                    cursor = resume;
+                    continue;
+                }
+                return chunk_bail(2);
             }
         }
 
         let total_size = gen_object_total_size(header);
         if total_size < HEADER_SIZE || cursor + total_size > ctx.used {
-            return None;
+            return chunk_bail(3);
         }
         // An object can never span a pre-existing free hole.
         if let Some(&&(foff, _)) = free_iter.peek() {
             if foff > cursor && foff < cursor + total_size {
-                return None;
+                return chunk_bail(4);
             }
         }
 
@@ -15728,7 +16039,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             .get(live_probe)
             .is_some_and(|&a| a < abs + total_size)
         {
-            return None;
+            return chunk_bail(5);
         }
 
         if header.is_forwarded() {
@@ -15760,7 +16071,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
     // The chain must land EXACTLY on the next anchor; anything else means the
     // anchor was not a real object start after all.
     if cursor != hi {
-        return None;
+        return chunk_bail(6);
     }
     Some(out)
 }
@@ -15862,6 +16173,12 @@ fn parallel_sweep_walk(
 ///   * `width == 4` — an aligned 32-bit half DECODED as a narrow oop. Only
 ///     produced when compressed oops are on, and never for a zero (null) slot.
 ///
+/// `narrow` is `Some((base, shift))` — the geometry to decode halves under —
+/// or `None` for wide-only. It is passed EXPLICITLY rather than read from
+/// `narrow_oop`'s process-globals so that a test can exercise the narrow arm
+/// without publishing a geometry every other test in the binary would then
+/// read its own heap under (see `narrow_oop::disable_for_test`).
+///
 /// Both widths are visited rather than one or the other. Only reference FIELDS
 /// and reference ARRAY ELEMENTS are narrowed, so an unparseable stretch can
 /// still hold full-width pointers (legacy 16-byte `Value` cells, internal
@@ -15883,7 +16200,7 @@ unsafe fn for_each_conservative_ref_slot(
     base: usize,
     lo: usize,
     hi: usize,
-    narrow: bool,
+    narrow: Option<(u64, usize)>,
     mut visit: impl FnMut(usize, usize, usize),
 ) {
     let mut w = lo & !7;
@@ -15891,18 +16208,32 @@ unsafe fn for_each_conservative_ref_slot(
         let addr = base + w;
         // SAFETY: caller guarantees `[base+lo, base+hi)` is mapped.
         visit(addr, 8, unsafe { *(addr as *const u64) } as usize);
-        if narrow {
+        if let Some((nbase, nshift)) = narrow {
             for half in 0..2 {
                 let slot = addr + half * 4;
                 // SAFETY: within the same mapped 8 bytes.
                 let encoded = unsafe { *(slot as *const u32) };
                 if encoded != 0 {
-                    visit(slot, 4, cratonvm_types::narrow_oop::decode(encoded) as usize);
+                    visit(
+                        slot,
+                        4,
+                        cratonvm_types::narrow_oop::decode_with(nbase, nshift, encoded) as usize,
+                    );
                 }
             }
         }
         w += 8;
     }
+}
+
+/// The published narrow-oop geometry, or `None` when compression is off.
+/// The one place the conservative walks read the globals; everything below
+/// takes the geometry as an argument.
+#[inline]
+fn active_narrow_geometry() -> Option<(u64, usize)> {
+    use cratonvm_types::narrow_oop;
+    narrow_oop::narrow_oops_enabled()
+        .then(|| (narrow_oop::narrow_base(), narrow_oop::narrow_shift()))
 }
 
 #[inline]
@@ -16411,6 +16742,227 @@ fn next_grid_anchor(anchors: &[usize], after: usize) -> Option<usize> {
     anchors.get(anchors.partition_point(|&a| a <= after)).copied()
 }
 
+/// Is the all-zero run `[cursor, run_end)` a run of EMPTY objects rather than
+/// evidence that the walk left the object grid?
+///
+/// An empty object — `ClassId(0)`, `kind = Object` (tag 0), `num_slots = 0`,
+/// identity hash not yet minted — is HEADER_SIZE all-zero bytes, and
+/// [`gen_object_total_size`] sizes it at exactly HEADER_SIZE. That has been an
+/// ordinary, common allocation ever since HEADER_SIZE shrank 24 -> 16 made the
+/// mark word the second header word and the JIT's `new Object()` fast path left
+/// it zero (`jit/src/x64/objects.rs`; the interpreter mints the hash eagerly,
+/// which is why `--nojit` never saw this). A DEAD one is unmarked, so the
+/// sweep's `side_sorted` cannot vouch for it, and it used to fall into the
+/// unlisted-zero-span anomaly path — which unwinds every reclaim decision taken
+/// since the last grid anchor.
+///
+/// Measured on `org.hibernate.reactive.BatchingConnectionTest` under
+/// `-XX:+UseGenerationalGC` (a live JIT frame forces the non-moving sweep, so
+/// every young cycle takes that walk): 147 such spans per cycle, EVERY one
+/// exactly 16 bytes, 2352 bytes in total — and they discarded 40 724 dead
+/// regions, leaving 22. The sweep reclaimed 789 KB of a 187 MB young
+/// generation, `live` never fell back under the collection trigger, and the
+/// collector ran continuously until the test's 120 s cap fired. No other
+/// desync guard fired on those cycles (phantom extents 0, implausible sizes 0,
+/// free-hole overlaps 0) — which is what says these runs were the benign shape
+/// and not evidence of anything.
+///
+/// The three conditions are exactly what makes resuming at `run_end` on-grid:
+///
+/// 1. the run is a whole number of HEADER_SIZE object slots;
+/// 2. no marked object BASE starts strictly inside it (one at `cursor` is the
+///    caller's `vouched_live` case, which parses normally instead);
+/// 3. the header at `run_end` itself sizes plausibly, or the run ends the
+///    arena.
+///
+/// Anything else — notably a long unlisted zeroed span, the shape that
+/// abandoned 233 MB of a 256 MB young generation in
+/// `jit-young-heap-exhaustion-after-header-16-FIXED-20260807` — still takes the
+/// unwind. This says nothing about whether the run is garbage: the caller
+/// STEPS OVER it and never frees it, because the span may equally be a live
+/// allocation whose header a stale register-held reference clobbered.
+///
+/// # Safety contract
+///
+/// `[base + cursor, base + used)` must be mapped from-space, and `run_end` must
+/// be the end of an all-zero run starting at `cursor` (so `run_end <= used`).
+/// Why [`zero_run_verdict`] answered as it did.
+///
+/// A boolean here was not enough: once the parallel chunk walker's seven bail
+/// reasons collapsed onto "the zero run", the only remaining question was which
+/// of the three conditions had rejected, and every one of them means something
+/// different — misaligned is a run that cannot be whole objects, a live base
+/// inside is the walk being somewhere it should not be, and an implausible
+/// following header is the run not ending where an object starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroRunVerdict {
+    /// A run of empty objects ending at `resume`, an on-grid offset. `resume`
+    /// is the run's end rounded DOWN to a whole HEADER_SIZE slot, which is not
+    /// always the run's end — see the truncation note in `zero_run_verdict`.
+    EmptyObjects { resume: usize },
+    /// The run does not contain even one whole HEADER_SIZE slot.
+    Misaligned,
+    /// A marked object BASE starts strictly inside the run.
+    LiveInside,
+    /// The header at `run_end` does not size plausibly, so `run_end` is not a
+    /// believable object start.
+    ImplausibleNext,
+}
+
+/// Refusals by [`ZeroRunVerdict`], index = discriminant order minus the
+/// accepting variant: `0` Misaligned, `1` LiveInside, `2` ImplausibleNext.
+/// Printed beside the chunk-bail split; see `PAR_CHUNK_BAILS`.
+/// Entries to each young from-space walk that still treats an all-zero run as
+/// a desync (the five `zero_run_end` callers left over after the 2026-08-13
+/// work). A zero anomaly count means one of two opposite things — the walk ran
+/// and the shape was absent, or the walk never ran — and only this separates
+/// them. One relaxed increment per WALK, not per object.
+///
+/// Index: `0` selective-promotion evacuation pre-pass, `1` the (3a) survivor
+/// fixup pass, `2` `mark_young_to_old_refs`, `3` `fixup_young_old_refs`,
+/// `4` `walk_young_objects`.
+/// Why the selective-promotion evacuation pre-pass unwound its candidates.
+/// Index: `0` free-block overshoot, `1` unlisted zero span, `2` implausible
+/// header size, `3` extent crosses a free hole. The aggregate
+/// [`SWEEP_PROMOTION_ABORT_HITS`] cannot say, and the four mean different
+/// things — only `1` is the benign-shape family, the rest are grid evidence.
+pub static EVAC_UNWIND_REASONS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Candidates dropped by those unwinds, summed. The count per event is what
+/// makes this expensive (37 354 in one, measured), not the number of events.
+pub static EVAC_UNWIND_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
+/// Zero-run anomaly hits at the three walks that still carry the old rule,
+/// indexed as [`YOUNG_WALK_ENTRIES`] `2`..`4`: `0` `mark_young_to_old_refs`,
+/// `1` `fixup_young_old_refs`, `2` `walk_young_objects`. Separate from the
+/// entry counts because "ran and did not see the shape" and "never ran" are
+/// different answers and both are worth being able to prove.
+pub static LATE_WALK_ZERO_RUNS: [AtomicU64; 3] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub static YOUNG_WALK_ENTRIES: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub static ZERO_RUN_REFUSALS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn zero_run_verdict(
+    base: usize,
+    cursor: usize,
+    run_end: usize,
+    used: usize,
+    side_sorted: &[usize],
+) -> ZeroRunVerdict {
+    // Truncate to the last whole slot, and judge THAT boundary.
+    //
+    // Requiring the run itself to be a multiple of HEADER_SIZE looked like the
+    // conservative choice and is wrong about what ends a zero run. The walk is
+    // word-granular, so a run can only be ragged by 8 bytes, and that happens
+    // whenever the object AFTER the empty ones has a zero first word — i.e. it
+    // is itself a `ClassId(0)` empty object (`class_id` and `shape` both zero)
+    // whose MARK word is not zero. `MARK_NEUTRAL` is 0 and `ObjectKind::Object`
+    // and `ArrayElementType::Reference` are both 0, so a freshly built empty
+    // object is wholly zero; something has to have written that second word.
+    // A one-off probe over six runs classified every ragged tail as neither
+    // side-marked, nor header-marked, nor aged — so in practice it is a minted
+    // identity hash or a lock word, i.e. a DEAD empty object that was used
+    // before it died. `zero_run_end` stops 8 bytes INSIDE that header, so
+    // `run_end` is not an object start — but `cursor + n * HEADER_SIZE` is, and
+    // it is exactly that object's base, which is both on-grid and the next
+    // thing the walk wants to reclaim.
+    //
+    // Measured: on `org.hibernate.reactive.BatchingConnectionTest` under
+    // `-XX:+UseGenerationalGC`, after the earlier zero-run fixes, EVERY
+    // remaining parallel-chunk bail was the zero run and EVERY zero-run refusal
+    // was this alignment test.
+    //
+    // Read that census carefully, though: the alignment test used to run FIRST
+    // and return immediately, so `live_inside=0` did not mean no live base was
+    // inside — it meant the check never got to ask. Ordering a cheap test in
+    // front of an informative one makes the informative one's zero unreadable.
+    // Truncating first fixes that too: the live-base and plausible-next-header
+    // checks below now judge the truncated end, and a live base AT that end is
+    // the expected case rather than a veto (it is where the walk resumes).
+    let run_end = cursor + ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+    if run_end - cursor < HEADER_SIZE {
+        ZERO_RUN_REFUSALS[0].fetch_add(1, Ordering::Relaxed);
+        return ZeroRunVerdict::Misaligned;
+    }
+    // No marked base strictly inside `(cursor, run_end)`. `side_sorted` is
+    // ascending, so the only candidate is the last entry below `run_end`.
+    let hi = base + run_end;
+    let i = side_sorted.partition_point(|&a| a < hi);
+    if i > 0 && side_sorted[i - 1] > base + cursor {
+        ZERO_RUN_REFUSALS[1].fetch_add(1, Ordering::Relaxed);
+        return ZeroRunVerdict::LiveInside;
+    }
+    if run_end >= used {
+        return ZeroRunVerdict::EmptyObjects { resume: run_end };
+    }
+    // SAFETY: `run_end < used` and the run is HEADER_SIZE-aligned from an
+    // on-grid `cursor`, so `base + run_end` is a header-aligned address inside
+    // the mapped from-space region the caller guarantees.
+    let next = unsafe { &*((base + run_end) as *const ObjectHeader) };
+    let size = gen_object_total_size(next);
+    if size >= HEADER_SIZE && run_end + size <= used {
+        ZeroRunVerdict::EmptyObjects { resume: run_end }
+    } else {
+        ZERO_RUN_REFUSALS[2].fetch_add(1, Ordering::Relaxed);
+        ZeroRunVerdict::ImplausibleNext
+    }
+}
+
+/// `CRATONVM_GC_NO_EMPTY_OBJECT_RUN=1` — treat every all-zero run as a walk
+/// desync again, i.e. restore the pre-2026-08-12 behaviour in which a run of
+/// EMPTY objects took the unwind-and-resync path.
+///
+/// This exists because the empty-object-run recovery is the kind of fix whose
+/// ABSENCE is invisible: without it the sweep still completes, still reports a
+/// walk that ran to `used`, and simply throws away almost every reclaim
+/// decision it made — 40 724 of 40 746 in the case it was written for. Two
+/// separate investigations (`young-sweep-empty-object-run-unwind-20260812`, and
+/// `TestDefaultInstanceManager`'s fourth recurrence) spent rounds on symptoms of
+/// exactly that, and neither could A/B the mechanism in one binary because
+/// there was no way to turn it off. Now there is, and the cross-run comparison
+/// that "prices the box" instead of the change is not the only option.
+///
+/// NOT `OnceLock`-cached: this is read once per zero RUN, not per object, and
+/// caching it would make the flag racy against whichever sweep runs first.
+fn empty_object_run_recovery_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_EMPTY_OBJECT_RUN").is_some()
+}
+
+/// `Some(resume)` when the run is a run of EMPTY objects and the walk may step
+/// to `resume`; `None` when it is evidence the walk left the object grid.
+fn zero_run_empty_object_resume(
+    base: usize,
+    cursor: usize,
+    run_end: usize,
+    used: usize,
+    side_sorted: &[usize],
+) -> Option<usize> {
+    if empty_object_run_recovery_disabled() {
+        return None;
+    }
+    match zero_run_verdict(base, cursor, run_end, used, side_sorted) {
+        ZeroRunVerdict::EmptyObjects { resume } => Some(resume),
+        _ => None,
+    }
+}
+
 fn zero_run_end(base: usize, start: usize, limit: usize) -> usize {
     let mut r = start;
     // SAFETY: (caller contract) the scanned range is mapped arena memory.
@@ -16462,7 +17014,12 @@ fn resync_to_next_free_block(
     false
 }
 
-fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
+/// `side_sorted` is this collection's live set (marked object bases, ascending)
+/// — the same slice the sweep walk used. It is what lets this walk tell an
+/// ordinary run of dead EMPTY objects apart from a desync; without it every
+/// such run costs a re-anchor and leaves stale marks behind (see the note at
+/// the zero-run branch).
+fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
     let base = arena.base_ptr() as usize;
     let used = arena.used();
     let free_blocks = arena.free_blocks_sorted();
@@ -16504,6 +17061,17 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
         // is not parseable — re-anchor at the next free block (carries no
         // mark bits to clear) instead of striding it as phantom objects and
         // writing the mark-clear byte into live-object interiors.
+        //
+        // …but a run of EMPTY objects is not that (`zero_run_empty_object_resume`),
+        // and re-anchoring on one is not free HERE in a way it is nowhere else:
+        // the marks in the skipped stretch are LEFT SET, and the next
+        // non-moving sweep treats a set `GC_FLAG_MARKED` as live regardless of
+        // reachability (the bug-C5 note at the call site). So the false
+        // positive feeds itself — measured at ~800 re-anchors per young cycle
+        // on the hibernate-reactive repro. Step over the run instead: it can
+        // hold no mark to clear, because a header carrying `GC_FLAG_MARKED` is
+        // by definition not all-zero, and the predicate refuses any run with a
+        // marked base inside it.
         // SAFETY: reads the first header word at `obj_ptr` (`cursor < used`),
         // already dereferenced in-bounds as a header above.
         let word0 = unsafe { *(obj_ptr as *const u64) };
@@ -16515,7 +17083,18 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
                 .unwrap_or(used)
                 .min(used);
             let run_end = zero_run_end(base, cursor, limit);
-            if run_end - cursor >= HEADER_SIZE {
+            // A marked base AT the run start is a live `ClassId(0)` container
+            // that DOES carry a mark bit — parse it normally below.
+            let vouched_live = side_sorted.binary_search(&(base + cursor)).is_ok();
+            if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                if let Some(resume) =
+                    zero_run_empty_object_resume(base, cursor, run_end, used, side_sorted)
+                {
+                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                    cursor = resume;
+                    continue;
+                }
                 anomaly = true;
             }
         }
@@ -16718,6 +17297,165 @@ impl GarbageCollector for GenerationalHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `h` into `buf` at `off` bytes and return the buffer's base
+    /// address. `Vec<u64>` gives the 8-byte alignment `ObjectHeader` needs.
+    fn put_header(buf: &mut [u64], off: usize, h: ObjectHeader) -> usize {
+        let base = buf.as_mut_ptr() as usize;
+        // SAFETY: `off + HEADER_SIZE <= buf.len() * 8` is the caller's job in
+        // these tests; `base + off` is 8-aligned.
+        unsafe { std::ptr::write((base + off) as *mut ObjectHeader, h) };
+        base
+    }
+
+    /// A plausible legacy object header: `HEADER_SIZE + num_slots * SLOT_SIZE`.
+    fn plain_object(num_slots: u32) -> ObjectHeader {
+        ObjectHeader::new(
+            ClassId::new(7),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            num_slots,
+        )
+    }
+
+    /// The whole point of the predicate: ONE empty object's worth of zeros,
+    /// followed by a real header, is the benign shape.
+    ///
+    /// This is the regression guard for the retired
+    /// `young-sweep-empty-object-run-unwind-20260812-FIXED` write-up:
+    /// answering `false` here is what made the young non-moving sweep unwind
+    /// 40 724 reclaim decisions per cycle and wedge the collector.
+    #[test]
+    fn one_empty_object_of_zeros_is_not_a_desync() {
+        let mut buf = vec![0u64; 8]; // 64 bytes
+        let base = put_header(&mut buf, HEADER_SIZE, plain_object(2));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            Some(HEADER_SIZE)
+        );
+    }
+
+    /// An empty object whose mark word is NOT zero — the interpreter shape,
+    /// which mints the identity hash eagerly. Its `class_id` and `shape` are
+    /// still zero, so its FIRST WORD is zero and a zero run running into it
+    /// stops 8 bytes inside its header.
+    fn empty_object_with_a_mark_word() -> ObjectHeader {
+        let h = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+        );
+        // `MARK_NEUTRAL`, `ObjectKind::Object` and `ArrayElementType::Reference`
+        // are ALL zero, so the constructor alone yields a wholly zero header —
+        // the JIT-allocated shape. A collector-visible bit is what separates the
+        // two; a bumped `gc_age` stands in for the mark/hash/lock family.
+        h.set_gc_age(1);
+        h
+    }
+
+    /// The fixture the truncation test rests on: this header's first word must
+    /// be zero and its second must not, or the test below is testing nothing.
+    /// This assertion has already earned its keep once — the first version of
+    /// the fixture used the bare constructor and produced a wholly zero header,
+    /// so the run it was meant to make ragged was not ragged at all.
+    #[test]
+    fn the_interpreter_empty_object_has_a_zero_first_word_and_a_live_second() {
+        let mut buf = vec![0u64; 4];
+        let base = put_header(&mut buf, 0, empty_object_with_a_mark_word());
+        // SAFETY: `buf` is 8-aligned and 32 bytes long; both words are in bounds.
+        let (w0, w1) = unsafe { (*(base as *const u64), *((base + 8) as *const u64)) };
+        assert_eq!(w0, 0, "class_id|shape must both be zero for ClassId(0)");
+        assert_ne!(w1, 0, "the mark word must be non-zero, or no run is ragged");
+    }
+
+    /// The residual this predicate was left with: a dead empty object followed
+    /// by an empty object carrying a collector bit makes a 24-byte zero run —
+    /// ragged by exactly one word, because the run ends inside the second
+    /// object's header. Rounding down to the last whole slot is what makes
+    /// `resume` an object start, and it lands exactly on that second object's
+    /// base — which is where the walk wants to resume anyway.
+    #[test]
+    fn a_ragged_zero_run_resumes_at_the_last_whole_slot() {
+        let mut buf = vec![0u64; 8]; // 64 bytes
+        let base = put_header(&mut buf, HEADER_SIZE, empty_object_with_a_mark_word());
+        // The run really is ragged: 16 zero bytes + the second object's zero
+        // first word.
+        assert_eq!(zero_run_end(base, 0, 64), HEADER_SIZE + 8);
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE + 8, 64, &[]),
+            Some(HEADER_SIZE),
+            "must resume at the empty object's end, not at the ragged run's end"
+        );
+    }
+
+    /// A run with no whole slot in it at all is not a run of objects.
+    #[test]
+    fn a_zero_run_shorter_than_one_slot_is_still_a_desync() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 8, plain_object(1));
+        assert_eq!(zero_run_empty_object_resume(base, 0, 8, 64, &[]), None);
+    }
+
+    /// Several empty objects in a row are still empty objects.
+    #[test]
+    fn several_empty_objects_of_zeros_are_not_a_desync() {
+        let mut buf = vec![0u64; 16]; // 128 bytes
+        let base = put_header(&mut buf, 3 * HEADER_SIZE, plain_object(1));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 3 * HEADER_SIZE, 128, &[]),
+            Some(3 * HEADER_SIZE)
+        );
+    }
+
+    /// A marked object starting INSIDE the run means the run is not a sequence
+    /// of whole dead objects — the walk is somewhere it should not be.
+    #[test]
+    fn a_live_base_inside_the_run_is_still_a_desync() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
+        let live = base + HEADER_SIZE;
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live]),
+            None
+        );
+    }
+
+    /// A live base AT the run start is the caller's `vouched_live` case and
+    /// never reaches here; a live base at or before `cursor` must not veto.
+    #[test]
+    fn a_live_base_before_the_run_does_not_veto() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
+        assert_eq!(
+            zero_run_empty_object_resume(base, HEADER_SIZE, 2 * HEADER_SIZE, 64, &[base]),
+            Some(2 * HEADER_SIZE)
+        );
+    }
+
+    /// A run that reaches the end of the used region has no following header to
+    /// check, and nothing after it to resynchronise with.
+    #[test]
+    fn a_zero_run_to_the_end_of_used_is_not_a_desync() {
+        let mut buf = vec![0u64; 4];
+        let base = buf.as_mut_ptr() as usize;
+        assert_eq!(zero_run_empty_object_resume(base, 0, 32, 32, &[]), Some(32));
+    }
+
+    /// If the header the run lands on does not size plausibly, `run_end` is not
+    /// a believable object start and the unwind path must keep it.
+    #[test]
+    fn an_implausible_header_after_the_run_is_still_a_desync() {
+        let mut buf = vec![0u64; 8];
+        // 4096 slots = 32 KiB, far past the 64-byte `used` bound.
+        let base = put_header(&mut buf, HEADER_SIZE, plain_object(4096));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            None
+        );
+    }
 
     /// H2-CID0 (2026-08-05) — "nobody looked" must not read as "nothing found".
     ///
@@ -17209,6 +17947,61 @@ mod tests {
     fn small_gen_heap() -> GenerationalHeap {
         // 4KB young semi-space, 8KB old gen
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    /// A run of swept empty objects must not hide the objects AFTER it.
+    ///
+    /// This is the behavioural half of the `zero_run_empty_object_resume`
+    /// unit tests, at the one call site that is `pub` and so can be driven
+    /// directly. Without the predicate, `word0 == 0` over a stretch at least
+    /// `HEADER_SIZE` long is read as a walk desync, and the recovery arm
+    /// re-anchors at the next FREE BLOCK — dropping every real object between
+    /// the run and that anchor from the returned enumeration.
+    ///
+    /// What makes that a correctness bug rather than a diagnostic wart is who
+    /// consumes the enumeration: `collect_young_to_old_roots` turns it into
+    /// the concurrent old-gen marker's young->old roots, which its call site
+    /// in `maybe_concurrent_gc` calls mandatory — "a missed mark root here =
+    /// cleanup frees a live object".
+    #[test]
+    fn a_run_of_swept_empty_objects_does_not_hide_the_young_objects_after_it() {
+        let heap = small_gen_heap();
+
+        let first = heap.alloc_object(ClassId::new(1), 1);
+        // Four objects that a non-moving sweep has reclaimed. Zeroed is
+        // exactly what a dead `new Object()` looks like afterwards, and it is
+        // also what a LIVE one looks like before its mark word is written:
+        // ClassId(0), shape 0, MARK_NEUTRAL, ObjectKind::Object and
+        // ArrayElementType::Reference are all the all-zero encoding.
+        let holes: Vec<_> = (0..4)
+            .map(|_| heap.alloc_object(ClassId::new(7), 0))
+            .collect();
+        let last = heap.alloc_object(ClassId::new(2), 1);
+
+        for h in &holes {
+            // SAFETY: each `h` is a live young object of exactly HEADER_SIZE
+            // bytes (`num_slots == 0`), so this writes only its own header.
+            unsafe { std::ptr::write_bytes(h.as_ptr(), 0, HEADER_SIZE) };
+        }
+
+        let walked: Vec<usize> = heap
+            .walk_young_objects()
+            .into_iter()
+            .map(|(p, _)| p as usize)
+            .collect();
+
+        assert!(
+            walked.contains(&(first.as_ptr() as usize)),
+            "the object BEFORE the run must still be walked (walked {} objects)",
+            walked.len(),
+        );
+        assert!(
+            walked.contains(&(last.as_ptr() as usize)),
+            "a run of swept empty objects must not hide the object after it — \
+             this enumeration is the concurrent marker's mandatory young→old \
+             root set (walked {} objects)",
+            walked.len(),
+        );
     }
 
     /// fork6 GC_STRESS fix — a young object's reference to an old-gen object
@@ -21777,17 +22570,35 @@ mod tests {
 #[cfg(test)]
 mod conservative_narrow_scan_tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// The narrow-oop base/shift are process-global, so these tests serialise
-    /// against each other and restore the disabled state on the way out.
-    static NARROW_CFG: Mutex<()> = Mutex::new(());
-
+    /// The geometry these tests decode under. Passed EXPLICITLY to every call;
+    /// `narrow_oop::enable` is deliberately never used here.
+    ///
+    /// It used to be published to the process-global narrow-oop config, with a
+    /// local `Mutex` serialising these five tests against each other. That
+    /// mutex bounded the wrong thing. `narrow_oop::ENABLED` is read by
+    /// `element_byte_size(ArrayElementType::Reference)` on EVERY reference
+    /// array access in the process, and `cargo test` runs the whole binary's
+    /// tests on parallel threads — so for as long as one of these tests held
+    /// the flag on, every other test's reference arrays were read back at a
+    /// 4-byte element stride they were never written at. Element `2k+1` then
+    /// decoded the high 32 bits of pointer `k` as a whole reference, which
+    /// surfaced as `ObjectRef pointer not 8-byte aligned: 0x1d1` (a Win64
+    /// pointer's high half) in `g1::tests::parallel_matches_serial_no_loss_or_dup`
+    /// — a G1 parallel-evacuation flake that was neither G1's nor a race — and
+    /// as `assert_region_encodable` firing in the `gen_heap` tests against the
+    /// window `0x20000000..0x81ffffff8`, which is exactly the `BASE`/`SHIFT`
+    /// below. See `narrow_oop::disable_for_test`.
     const BASE: u64 = 0x2000_0000;
     const SHIFT: usize = 3;
+    const GEOM: Option<(u64, usize)> = Some((BASE, SHIFT));
+
+    fn enc(addr: u64) -> u32 {
+        cratonvm_types::narrow_oop::encode_with(BASE, SHIFT, addr)
+    }
 
     /// Collect `(slot_offset_from_base, width, value)` over a buffer.
-    fn scan(buf: &[u64], narrow: bool) -> Vec<(usize, usize, usize)> {
+    fn scan(buf: &[u64], narrow: Option<(u64, usize)>) -> Vec<(usize, usize, usize)> {
         let base = buf.as_ptr() as usize;
         let mut out = Vec::new();
         // SAFETY: the whole slice is mapped, and `hi` is its byte length.
@@ -21801,21 +22612,15 @@ mod conservative_narrow_scan_tests {
 
     #[test]
     fn a_narrow_oop_pair_is_invisible_to_the_word_scan_and_visible_with_narrow_on() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         let a = BASE + (0x100 << SHIFT);
         let b = BASE + (0x200 << SHIFT);
-        let (ea, eb) = (
-            cratonvm_types::narrow_oop::encode(a),
-            cratonvm_types::narrow_oop::encode(b),
-        );
+        let (ea, eb) = (enc(a), enc(b));
         assert_ne!(ea, 0, "test address must be encodable");
         assert_ne!(eb, 0, "test address must be encodable");
         // Two 4-byte references packed into one 8-byte word, little-endian.
         let buf = vec![(ea as u64) | ((eb as u64) << 32)];
 
-        let wide = scan(&buf, false);
+        let wide = scan(&buf, None);
         assert_eq!(wide.len(), 1, "one 8-byte word");
         assert!(
             !wide.iter().any(|&(_, _, v)| v == a as usize || v == b as usize),
@@ -21823,7 +22628,7 @@ mod conservative_narrow_scan_tests {
             wide[0].2
         );
 
-        let narrow = scan(&buf, true);
+        let narrow = scan(&buf, GEOM);
         let values: Vec<usize> = narrow.iter().map(|&(_, _, v)| v).collect();
         assert!(values.contains(&(a as usize)), "first narrow oop decoded");
         assert!(values.contains(&(b as usize)), "second narrow oop decoded");
@@ -21831,41 +22636,31 @@ mod conservative_narrow_scan_tests {
         // back at the width it read.
         assert!(narrow.contains(&(0, 4, a as usize)), "{:x?}", narrow);
         assert!(narrow.contains(&(4, 4, b as usize)), "{:x?}", narrow);
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 
     #[test]
     fn full_width_pointers_are_still_scanned_when_narrow_is_on() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         // A legacy 16-byte `Value` cell or an internal pointer is NOT narrowed,
         // so turning narrow oops on must not stop the 8-byte scan from seeing
         // it. Both widths, not one or the other.
         let raw = 0xdead_beef_0000_1000u64;
         let buf = vec![raw];
-        let got = scan(&buf, true);
+        let got = scan(&buf, GEOM);
         assert!(
             got.iter().any(|&(off, w, v)| off == 0 && w == 8 && v == raw as usize),
             "the full-width word must still be visited: {:x?}",
             got
         );
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 
     #[test]
     fn null_halves_produce_no_narrow_candidate() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         // encode(0) is 0 and decode(0) is 0; a null slot must not be offered as
         // a candidate address, or every zeroed word would decode to `base`.
         let a = BASE + (0x100 << SHIFT);
-        let ea = cratonvm_types::narrow_oop::encode(a);
+        let ea = enc(a);
         let buf = vec![ea as u64, 0u64];
-        let got = scan(&buf, true);
+        let got = scan(&buf, GEOM);
         assert_eq!(
             got.iter().filter(|&&(_, w, _)| w == 4).count(),
             1,
@@ -21873,17 +22668,12 @@ mod conservative_narrow_scan_tests {
             got
         );
         assert!(got.contains(&(0, 4, a as usize)));
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 
     #[test]
     fn narrow_off_visits_exactly_the_aligned_words() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        cratonvm_types::narrow_oop::disable_for_test();
-
         let buf = vec![1u64, 2, 3, 4];
-        let got = scan(&buf, false);
+        let got = scan(&buf, None);
         assert_eq!(
             got,
             vec![(0, 8, 1), (8, 8, 2), (16, 8, 3), (24, 8, 4)],
@@ -21893,23 +22683,18 @@ mod conservative_narrow_scan_tests {
 
     #[test]
     fn a_relocated_narrow_reference_round_trips_through_encode() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         // What the rewrite walk does: decode, look the old base up, re-encode
         // the new base at the SAME width. If that round trip were lossy the
         // fallback would write a corrupt reference rather than a stale one.
         for n in [1u64, 2, 0x100, 0xffff, 0x10_0000] {
             let addr = BASE + (n << SHIFT);
-            let e = cratonvm_types::narrow_oop::encode(addr);
+            let e = enc(addr);
             assert_ne!(e, 0, "{addr:#x} must be encodable");
             assert_eq!(
-                cratonvm_types::narrow_oop::decode(e),
+                cratonvm_types::narrow_oop::decode_with(BASE, SHIFT, e),
                 addr,
                 "{addr:#x} must round-trip"
             );
         }
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 }

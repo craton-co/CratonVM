@@ -71,6 +71,7 @@ pub mod collector;
 pub mod compact_header;
 pub mod compressed_oops;
 pub mod concurrent_mark;
+pub mod evac_pool;
 pub mod external_roots;
 pub mod g1;
 pub mod g1_concurrent;

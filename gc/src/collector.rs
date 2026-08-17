@@ -101,6 +101,33 @@ pub fn displaced_identity_hash(mark: u64) -> i32 {
     }
 }
 
+/// Resolve a `ClassId` to its binary name, for **diagnostics only**.
+///
+/// Same shape and the same reason as [`DISPLACED_HASH_RESOLVER`] above: class
+/// names live in the VM's class manager, a type this crate cannot name. The VM
+/// installs the hook once at start-up.
+///
+/// Every consumer is a failure-path or debug-flag report. A GC diagnostic that
+/// can only say `class_id=418` makes the reader do a second run with a
+/// different flag to learn what 418 is — and on the report that matters most
+/// here (the objects walling a fragmented heap) that second run is a different
+/// process with a different heap layout, so the answer does not carry over.
+static CLASS_NAMER: std::sync::OnceLock<fn(u32) -> Option<String>> = std::sync::OnceLock::new();
+
+/// Install the diagnostic class-name resolver. Idempotent; first install wins.
+pub fn set_class_namer(namer: fn(u32) -> Option<String>) {
+    let _ = CLASS_NAMER.set(namer);
+}
+
+/// Binary name of `class_id`, or `class_id=<n>` when no resolver is installed
+/// (gc-only tests, or a report raised before start-up finished).
+pub fn class_name_for_diagnostics(class_id: u32) -> String {
+    match CLASS_NAMER.get().and_then(|f| f(class_id)) {
+        Some(name) => name,
+        None => format!("class_id={class_id}"),
+    }
+}
+
 /// Trait for monitor table cleanup after GC relocation.
 ///
 /// The VM implements this for its `MonitorTable` so the gc crate does not
@@ -277,6 +304,56 @@ impl std::fmt::Debug for StopTheWorldToken {
 #[cfg(doctest)]
 #[allow(dead_code)]
 struct _StopTheWorldTokenCompileFailDocs;
+
+/// I-17: G1's three mark-cycle entry points require the same witness.
+///
+/// `start_concurrent_mark`, `remark` and `cleanup` are all STW phases —
+/// `cleanup` reclassifies and frees regions — and until 2026-08-13 they were
+/// the only such entry points on the collector taking no [`StopTheWorldToken`],
+/// i.e. the one invariant in the G1 audit's §7 table enforced by nothing but a
+/// comment. These doctests keep it a signature: a future refactor that drops
+/// the parameter to "simplify" the call sites turns the suite red instead of
+/// silently un-enforcing the phase.
+///
+/// ```compile_fail
+/// use cratonvm_gc::{G1Collector, G1CollectorConfig};
+///
+/// let gc = G1Collector::new(G1CollectorConfig::default());
+/// // Missing &StopTheWorldToken — should fail to compile.
+/// gc.cleanup();
+/// ```
+///
+/// ```compile_fail
+/// use cratonvm_gc::{G1Collector, G1CollectorConfig};
+///
+/// let gc = G1Collector::new(G1CollectorConfig::default());
+/// // Missing &StopTheWorldToken — should fail to compile.
+/// gc.start_concurrent_mark();
+/// ```
+///
+/// ```compile_fail
+/// use cratonvm_gc::{G1Collector, G1CollectorConfig};
+///
+/// let gc = G1Collector::new(G1CollectorConfig::default());
+/// // Missing &StopTheWorldToken — should fail to compile.
+/// gc.remark(&[]);
+/// ```
+///
+/// With the token threaded through, the cycle compiles:
+///
+/// ```
+/// use cratonvm_gc::{G1Collector, G1CollectorConfig, StopTheWorldToken};
+///
+/// let gc = G1Collector::new(G1CollectorConfig::default());
+/// // SAFETY: this doctest has no other mutator threads.
+/// let stw = unsafe { StopTheWorldToken::new() };
+/// gc.start_concurrent_mark(&stw);
+/// gc.remark(&stw, &[]);
+/// gc.cleanup(&stw);
+/// ```
+#[cfg(doctest)]
+#[allow(dead_code)]
+struct _G1MarkCycleStwCompileFailDocs;
 
 /// Trait abstracting a garbage-collected heap.
 ///

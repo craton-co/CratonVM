@@ -1123,24 +1123,30 @@ pub struct JitRuntimeHelpers {
     /// behaviour. Appended at the END of the struct so all prior golden
     /// offsets stay stable.
     pub ldc_class_cp: usize,
-    /// JVMS §6.5 *aastore* covariance check ONLY — `extern "C" fn(vm_ptr: i64,
-    /// array_ptr: i64, val: i64) -> i64`. Returns `i64::MIN` when the store
-    /// must be refused and an `ArrayStoreException` has been published on this
-    /// thread, `0` when it may proceed. NOT the store: the caller keeps the
-    /// inline `MOV`, the SATB pre-write barrier and the card mark.
+
+    /// `aastore` element-type check — the JVMS §6.5 *aastore* covariance rule
+    /// and NOTHING else: no null check, no bounds check, no barrier, no store.
     ///
-    /// Exists so the `0x53` lowering can keep the inline
-    /// `MOV [array + index*8 + HEADER_SIZE], val` and call out only for the
-    /// type check, instead of routing the whole opcode through
-    /// [`Self::aastore`] (W7-38 restored correctness that way and paid one
-    /// call per reference array store for it).
+    /// `extern "C" fn(vm_ptr: i64, array_ptr: i64, val: i64) -> i64`. Returns
+    /// `0` when the store is legal and the `i64::MIN` deopt sentinel when it is
+    /// not, having stashed a real `ArrayStoreException` through the JIT_THREAD
+    /// TLS. The sentinel is a *defined* return value on purpose: a `-> ()`
+    /// helper leaves RAX undefined, so an `emit_post_invoke_exception_check`
+    /// after it would be testing garbage.
     ///
-    /// `0` = not wired (hand-built test tables) → the backend must fall back
-    /// to calling [`Self::aastore`], which is the complete opcode. It must NOT
-    /// fall back to the bare inline store: that is the heap-type-confusion
-    /// defect W7-38 fixed. Appended at the END of the struct so all prior
-    /// golden offsets stay stable.
-    pub aastore_check: usize,
+    /// The x64 emitter lowers `aastore` inline (null check, bounds check, SATB
+    /// pre-write barrier, store, card mark) and so never reaches
+    /// [`Self::aastore`]; this is the one piece of that helper the inline path
+    /// cannot do for itself, because the answer needs the class manager. On a
+    /// refusal the caller must skip the store, the SATB pre-write barrier and
+    /// the card mark.
+    ///
+    /// Required, not optional: a `0` slot would leave the inline lowering
+    /// storing with no check, which is the heap-type-confusion defect
+    /// (`Object[] a = new String[1]; a[0] = anInteger;` leaving an `Integer`
+    /// inside a `String[]`) this slot exists to close. Appended at the END of
+    /// the struct so all prior golden offsets stay stable.
+    pub aastore_type_check: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1314,9 +1320,9 @@ helper_fields! {
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site
     // and bail the compile — the pre-fix behaviour.
     (ldc_class_cp,                   FieldKind::OptionalPtr),
-    // Optional: 0 makes the `0x53` lowering call `aastore` (the complete
-    // opcode) instead of inline-store-plus-check. Never the bare inline store.
-    (aastore_check,                  FieldKind::OptionalPtr),
+    // Required: the `0x53` lowering is inline and calls this for the JVMS §6.5
+    // covariance check; 0 would mean a reference store with no check at all.
+    (aastore_type_check,             FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1735,7 +1741,7 @@ mod tests {
             monitor_enter: 0x11A8,
             monitor_exit: 0x11B0,
             ldc_class_cp: 0x11B8,
-            aastore_check: 0x11C0,
+            aastore_type_check: 0x11C0,
         }
     }
 
@@ -1971,7 +1977,7 @@ mod tests {
             monitor_enter: 0,
             monitor_exit: 0,
             ldc_class_cp: 0,
-            aastore_check: 0,
+            aastore_type_check: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2463,8 +2469,8 @@ mod tests {
             ),
             (
                 63,
-                "aastore_check",
-                std::mem::offset_of!(JitRuntimeHelpers, aastore_check),
+                "aastore_type_check",
+                std::mem::offset_of!(JitRuntimeHelpers, aastore_type_check),
             ),
         ];
 
@@ -2519,7 +2525,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::OptionalPtr)
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 42, "required-pointer count drifted");
+        assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 12, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
@@ -2563,7 +2569,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 42);
+        assert_eq!(names.len(), 43);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -2609,7 +2615,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 42, "expected 42 required pointers");
+        assert_eq!(required.len(), 43, "expected 43 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
@@ -2724,6 +2730,7 @@ mod tests {
             "jit_drem" => h.jit_drem = 0,
             "ldc_string" => h.ldc_string = 0,
             "set_throw_bci" => h.set_throw_bci = 0,
+            "aastore_type_check" => h.aastore_type_check = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

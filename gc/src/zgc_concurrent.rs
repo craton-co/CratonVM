@@ -93,23 +93,42 @@
 //! **Not** real yet, and this must not be overclaimed — stale ZGC docs are
 //! how this tree got into trouble the first time:
 //!
-//! * **No [`ZMarkContext`](crate::zgc::mark::ZMarkContext) implementation for
-//!   [`ZgcRealHeap`](crate::zgc::ZgcRealHeap) exists.** That implementation
-//!   lives in `gc/src/zgc.rs` (which this module does not own) and is the
-//!   wiring step; see "What the wiring step must provide" below. Until it
-//!   lands, the only context in the tree is
-//!   [`TestMarkContext`](crate::zgc::mark::TestMarkContext) and
-//!   `ZgcRealHeap::collect_garbage` remains the single-threaded
-//!   stop-the-world mark-sweep it has always been. Nothing in this module is
-//!   on a production code path.
-//! * **The load barrier is not wired into field reads.** Nothing calls
-//!   [`ZMarkHandle::mark_live_offset`] from a `getfield`, so the mutator ingress is
-//!   empty in practice, so [`try_end_mark`](ZMarkCoordinator::try_end_mark)
-//!   will answer [`Complete`](ZMarkEndResult::Complete) on the first pass
-//!   every time. **The restart loop is therefore untaken in production
-//!   today.** It is implemented and tested anyway because the moment the
-//!   barrier does land, a missing restart loop is a use-after-free: a live
-//!   object a mutator touched at the end of the cycle would be swept.
+//! * ~~**No `ZMarkContext` implementation for `ZgcRealHeap` exists.**~~
+//!   **Landed since this was written.** `impl mark::ZMarkContext for
+//!   ZgcRealHeap` is in `gc/src/zgc.rs` and satisfies the requirements listed
+//!   under "What the wiring step must provide" below, including the atomic
+//!   `try_mark` (it goes through `ObjectHeader::try_add_gc_flags`, a CAS
+//!   loop). What is still missing is not the context but the **owner**: no
+//!   coordinator is pointed at a `ZgcRealHeap`, because `ZMarkCoordinator`
+//!   takes an `Arc<dyn ZMarkContext>` and the heap is held by value inside
+//!   `VmHeap`. `ZgcRealHeap::collect_garbage` therefore remains the
+//!   single-threaded stop-the-world mark-sweep it has always been.
+//! * **The mutator ingress is wired, and it is a WRITE barrier, not the load
+//!   barrier this module's design assumes.** Nothing calls
+//!   [`ZMarkHandle::mark_live_offset`] from a `getfield` and nothing is
+//!   planned to: `VmHeap::satb_barrier` is already called before every
+//!   reference store in this VM for G1's sake, its ZGC arm was empty, and
+//!   since 2026-08-13 it reaches `ZgcRealHeap::satb_pre_barrier`, which
+//!   publishes the overwritten reference into that heap's own
+//!   [`ZMarkIngress`](crate::zgc::mark::ZMarkIngress) when a cycle is armed.
+//!
+//!   **That substitution changes what the restart loop is for, and the
+//!   difference must not be papered over.** This module's termination design
+//!   is built on ZGC's read-barrier discipline, where every mutator is a
+//!   producer until it is stopped and "all queues empty" is a fixed point
+//!   rather than a completion. Under snapshot-at-the-beginning the producer
+//!   set really *is* bounded, so
+//!   [`try_end_mark`](ZMarkCoordinator::try_end_mark) is expected to answer
+//!   [`Complete`](ZMarkEndResult::Complete) after the mark-end flush rather
+//!   than restarting indefinitely. The loop stays correct and stays required
+//!   — the flush can still produce work — but a `Restart` under SATB means
+//!   the flush found buffered work, not that a mutator raced the marker.
+//!   SATB is also *conservative*: an object that dies mid-cycle survives to
+//!   the next one. That is a throughput cost, not a correctness one.
+//!
+//!   `mark_active` is never set by production code today, so the barrier's
+//!   slow path is unreachable in a real run and its fast path is one relaxed
+//!   load.
 //! * The relocation half of ZGC (forwarding, remap, compaction) is not this
 //!   module's business and is not driven from here.
 //!

@@ -1287,12 +1287,53 @@ pub(super) fn execute_invoke_kind(
                                     }
                                 }
                             }
+                            // A bare `new Object()` IS all-zero, legitimately.
+                            //
+                            // `ObjectHeader::new` documents the mark word as
+                            // "no identity hash installed", `MARK_NEUTRAL`,
+                            // `ObjectKind::Object` and `ArrayElementType::
+                            // Reference` are all `0`, and a no-field `Object`
+                            // has `class_id = 0` and `shape = 0` — so every one
+                            // of the 16 bytes this detector reads is zero for a
+                            // healthy, freshly allocated `java.lang.Object`.
+                            // The comment on `init_object_header` still claims
+                            // a fix that made this impossible ("identity_hash_
+                            // code is now eagerly assigned at allocation time,
+                            // caller passes next_identity_hash()"), but the
+                            // 2026-08-06/07 header shrink folded the hash into
+                            // the mark word and left `ObjectHeader::new` with no
+                            // hash parameter at all, so the fast path cannot
+                            // assign one and the false positive is back.
+                            //
+                            // It fires on `new Object()` used as a lock or
+                            // sentinel — six lines of Java reproduce it, on all
+                            // four collectors — and the cost is not the log
+                            // line: this warning is the tripwire for the
+                            // reclaimed-live-receiver family (CRATONVM_DBG_BUG03
+                            // / _SWEEP_ZERO / _STALE_RECV all hang off it), and
+                            // a tripwire that fires on healthy code is one
+                            // nobody reads.
+                            //
+                            // Demoted, not deleted, and only when the CP class
+                            // is `java/lang/Object` itself — i.e. an
+                            // `Object`-declared call site (hashCode/equals/
+                            // toString/...), where the fallback the detector
+                            // takes is the CORRECT dispatch for a real bare
+                            // `Object` anyway. The trade is explicit: a
+                            // genuinely stale receiver at an `Object`-declared
+                            // site now logs at debug instead of warn. That is
+                            // worth it against a 100% false-positive rate here,
+                            // and it is exactly the call already made two lines
+                            // below for `java/lang/ClassLoader`.
+                            //
                             // WildFly / JBoss Modules often hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
                             // receiver lost its header but CP resolution is
                             // already `java/lang/ClassLoader`; the CP fallback
                             // succeeds and a WARN was mostly noise.
-                            if method_class_name.as_ref() == "java/lang/ClassLoader" {
+                            if method_class_name.as_ref() == "java/lang/Object"
+                                || method_class_name.as_ref() == "java/lang/ClassLoader"
+                            {
                                 tracing::debug!(
                                     "Stale pointer detected in invokevirtual receiver \
                                      (ptr={:p}, all-zero header) — falling back to CP class {}",
@@ -2493,8 +2534,46 @@ pub(super) fn execute_invoke_kind(
 /// is a single descriptor token such as "I", "J", "Ljava/lang/Integer;", or
 /// "[Ljava/lang/String;".
 pub fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
+    let (params, ret) = split_method_descriptor_ref(descriptor);
+    (
+        params.into_iter().map(str::to_string).collect(),
+        ret.to_string(),
+    )
+}
+
+/// Borrowing twin of [`split_method_descriptor`]: the parameter tokens and the
+/// return token as slices of `descriptor`, so a caller that only reads them
+/// pays one `Vec` allocation instead of one `String` per parameter plus one for
+/// the return type.
+///
+/// Use this on any per-call path. The lambda dispatcher reached
+/// `split_method_descriptor` four to six times per lambda INVOCATION — twice in
+/// `try_lambda_dispatch` purely to read a return-type character, twice more in
+/// `coerce_lambda_args`, again in `checkcast_lambda_instantiated_args` — and
+/// `mi_malloc`/`mi_free`/`__memmove` were ~36% of a lambda-only `perf` profile
+/// before those sites moved here.
+/// The return-type token of a method descriptor, without parsing (or
+/// allocating for) the parameter list.
+///
+/// A descriptor has exactly one `')'`, so the return type is everything after
+/// it. Two of the lambda dispatcher's `split_method_descriptor` calls wanted
+/// only this and paid a full parameter walk plus a `Vec` for it on every lambda
+/// invocation. Returns `""` for a descriptor with no `')'` (malformed), which
+/// every consumer already treats as "not `V`, not a match".
+#[inline]
+pub fn descriptor_return_ref(descriptor: &str) -> &str {
+    match descriptor.as_bytes().iter().position(|&b| b == b')') {
+        Some(close) => &descriptor[close + 1..],
+        None => "",
+    }
+}
+
+pub fn split_method_descriptor_ref(descriptor: &str) -> (Vec<&str>, &str) {
     let bytes = descriptor.as_bytes();
-    let mut params: Vec<String> = Vec::new();
+    // Pre-size from the `(...)` span: one token is at least one byte, and no
+    // real descriptor holds more than a handful. Without this the per-call Vec
+    // reallocated through `RawVec::grow_one` on the lambda path.
+    let mut params: Vec<&str> = Vec::with_capacity(8);
     let mut i = 1; // skip '('
     while i < bytes.len() && bytes[i] != b')' {
         let start = i;
@@ -2516,14 +2595,13 @@ pub fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
                 i += 1; // single-char primitive
             }
         }
-        params.push(descriptor[start..i].to_string());
+        params.push(&descriptor[start..i]);
     }
     // Skip ')'
     if i < bytes.len() && bytes[i] == b')' {
         i += 1;
     }
-    let ret = descriptor[i..].to_string();
-    (params, ret)
+    (params, &descriptor[i..])
 }
 
 /// Non-allocating equivalent of `split_method_descriptor(d).0[n].as_bytes().first()`:
@@ -2669,6 +2747,11 @@ pub(super) fn coerce_arg(
     impl_tok: &str,
     v: Value,
 ) -> Result<Value, MethodCallFailed> {
+    // LOAD-BEARING BEYOND THIS FUNCTION: `coerce_lambda_args` skips its whole
+    // body — descriptor walks, pin pushes, the `checkcast` replay — for a
+    // non-capturing lambda whose three descriptors are identical, and that
+    // shortcut is only equivalent because equal tokens coerce to the identity
+    // HERE. If this arm ever has to do work, drop that fast path with it.
     if sam_tok == impl_tok {
         return Ok(v);
     }
@@ -2902,6 +2985,14 @@ pub(super) fn try_stackless_invoke(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     use crate::runtime::frame::padded_bytecode;
     use crate::vm::{coerce_value_for_return, native_return_pushed_to_stack, safe_native_call};
+
+    // The denominator of the per-invoke lookup count — see
+    // `cratonvm_native_api::registry::lookup_census`. This is the every-invoke
+    // entry point, so it is what a "one lookup per invoke" restructuring would
+    // be dividing the registry probes by.
+    cratonvm_native_api::registry::lookup_census::probe(
+        cratonvm_native_api::registry::lookup_census::INVOKE_STACKLESS,
+    );
 
     // Memo for the constant `DowncallHandle.type()` triple resolved in the
     // receiver-class-gated arm below (native-dispatch-memoization §3, B4).

@@ -1341,9 +1341,19 @@ fn make_hashtable_enumeration(
     for (i, v) in snapshot.into_iter().enumerate() {
         ctx.set_array_element(arr, i, v);
     }
-    // FIX: allocate 3 fields (was 2) so the type marker in field 2 has a
-    // backing slot; fields 0/1 (array, cursor) keep the layout that
-    // `register_enumeration_impl_natives` reads.
+    // FIX: allocate the FULL `Enumeration$Impl` width so the type marker in
+    // field 2 has a backing slot; fields 0/1 (array, cursor) keep the layout
+    // that `register_enumeration_impl_natives` reads.
+    //
+    // The width is 5, not the 3 this site used to ask for. `getResources` grew
+    // slots 3 and 4 (element-decoding mode / lazy-scan cursor — see
+    // `classloader::ENUM_ELEMENTS_AS_IS` and the `nextElement` body), and
+    // `classloader::make_snapshot_enumeration` — the other producer of exactly
+    // this shape — allocates 5. Asking for 3 here would leave `nextElement`'s
+    // `get_field(this, 3)` reading off the end of the object. Slot 3 is left
+    // unwritten on purpose: `ENUM_ELEMENTS_AS_IS` is 0, which is what a
+    // zero-initialized instance already holds.
+    //
     // `--jdk-only` refuses `Enumeration$Impl` — no JDK image declares it — and
     // the bare `?` here turned that correct refusal into a
     // `NoClassDefFoundError` at the application's `Hashtable.keys()` call site.
@@ -1373,11 +1383,10 @@ fn make_hashtable_enumeration(
     // nothing below changed.
     //
     // The `type_marker` is dropped on the real carrier, which is safe because
-    // nothing reads field 2: `register_enumeration_impl_natives`
-    // (`classloader.rs:6104`) reads slots 0 and 1 only, and `classloader.rs`
-    // documents the class as "2-field (array=0, index=1)". It is a write-only
-    // slot — which is also why the 2-field boot declaration never lost a write.
-    let en = match try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3) {
+    // nothing reads field 2: `register_enumeration_impl_natives` reads slots
+    // 0, 1, 3 and 4, and never 2. It is a write-only slot — which is also why
+    // the narrower boot declaration never lost a write.
+    let en = match try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 5) {
         Ok(en) => {
             ctx.set_field(en, 0, Value::Object(Some(arr)));
             ctx.set_field(en, 1, Value::Int(0));

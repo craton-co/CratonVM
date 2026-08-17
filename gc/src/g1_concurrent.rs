@@ -19,7 +19,7 @@
 //!
 //! 3. **STW remark** — `request_stop_and_join` waits for the worker to
 //!    quiesce, the caller re-acquires the STW token, drains any remaining
-//!    SATB log via `g1.remark(roots)`, and finishes with `g1.cleanup()`.
+//!    SATB log via `g1.remark(stw, roots)`, and finishes with `g1.cleanup(stw)`.
 //!
 //! ## Termination
 //!
@@ -341,6 +341,15 @@ mod tests {
     use super::*;
     use crate::collector::{GarbageCollector, MonitorCleanup};
     use crate::g1::{G1Collector, G1CollectorConfig};
+
+    /// Test-only `StopTheWorldToken` (I-17). These tests drive the mark cycle
+    /// single-threaded, so the STW invariant the token witnesses is trivially
+    /// satisfied.
+    #[inline]
+    fn stw() -> crate::collector::StopTheWorldToken {
+        // SAFETY: single-threaded test harness; no mutator is running.
+        unsafe { crate::collector::StopTheWorldToken::new() }
+    }
     use cratonvm_types::{ClassId, Value};
     use std::collections::HashMap;
 
@@ -367,7 +376,7 @@ mod tests {
         // well-formed environment (otherwise the worklist is empty and
         // the worker parks immediately — which is fine, but we want to
         // exercise the SATB activation path too).
-        g1.start_concurrent_mark();
+        g1.start_concurrent_mark(&stw());
 
         let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
         assert!(controller.is_running(), "worker thread must be alive");
@@ -398,7 +407,7 @@ mod tests {
         let b_addr = b.as_ptr() as usize;
 
         // Initial-mark STW: activate SATB barrier + clear bitmap.
-        g1.start_concurrent_mark();
+        g1.start_concurrent_mark(&stw());
         assert!(
             g1.satb_queue().is_active(),
             "SATB must be active during concurrent mark"
@@ -476,7 +485,7 @@ mod tests {
         // buffer only — one entry is far below the 256-entry spill threshold, so
         // it never reaches a shard. The shard drain alone (pre-fix remark) would
         // miss it.
-        g1.start_concurrent_mark();
+        g1.start_concurrent_mark(&stw());
         g1.satb_pre_barrier(addr);
         assert!(
             g1.satb_queue().is_empty(),
@@ -485,7 +494,7 @@ mod tests {
 
         // remark must drain the thread-local buffer into the gray set; drain the
         // worklist so the gray entry is actually marked.
-        g1.remark(&[]);
+        g1.remark(&stw(), &[]);
         g1.concurrent_mark_step(usize::MAX);
 
         g1.with_regions_mut(|regions| {
@@ -519,8 +528,8 @@ mod tests {
         let b_class = g1.class_id_of(b);
 
         // Phase 1 — initial-mark STW: prep the cycle and seed roots.
-        g1.start_concurrent_mark();
-        g1.remark(&[a, b]);
+        g1.start_concurrent_mark(&stw());
+        g1.remark(&stw(), &[a, b]);
 
         // Phase 2 — concurrent mark, mutators conceptually live.
         let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
@@ -529,10 +538,10 @@ mod tests {
         // Phase 3 — STW remark: stop worker, drain stragglers,
         // transition to cleanup.
         controller.request_stop_and_join().expect("worker joined");
-        g1.remark(&[a, b]);
+        g1.remark(&stw(), &[a, b]);
         // Drain whatever the remark just pushed onto the worklist.
         let _ = g1.concurrent_mark_step(usize::MAX);
-        g1.cleanup();
+        g1.cleanup(&stw());
 
         // Live-data assertions: field values, class IDs, reference chain
         // must all be intact. Marking is read-only: it must not have
@@ -578,8 +587,8 @@ mod tests {
         g1.set_field(b, 0, Value::Object(Some(c)));
 
         // Initial-mark STW + seed roots.
-        g1.start_concurrent_mark();
-        g1.remark(&[a]);
+        g1.start_concurrent_mark(&stw());
+        g1.remark(&stw(), &[a]);
 
         // Run the worker until it quiesces.
         let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
@@ -624,7 +633,7 @@ mod tests {
     fn worker_stops_promptly_when_parked() {
         let g1 = small_collector();
         // Don't seed roots → worklist is empty → worker parks immediately.
-        g1.start_concurrent_mark();
+        g1.start_concurrent_mark(&stw());
         let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
 
         // Give it time to park.
@@ -654,8 +663,8 @@ mod tests {
         let b = g1.alloc_object(ClassId::new(2), 0);
         g1.set_field(a, 0, Value::Object(Some(b)));
 
-        g1.start_concurrent_mark();
-        g1.remark(&[a]);
+        g1.start_concurrent_mark(&stw());
+        g1.remark(&stw(), &[a]);
 
         let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
         std::thread::sleep(Duration::from_millis(10));

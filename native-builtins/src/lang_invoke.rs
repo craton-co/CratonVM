@@ -714,7 +714,12 @@ pub(crate) fn mirror_to_descriptor(
 /// and the return token, so MethodHandle combinators can add/drop parameters
 /// while preserving the exact JVM type spellings. Returns None on malformed
 /// input.
-fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
+///
+/// `pub(crate)` since 2026-08-13: `phases_late`'s Quarkus logging mirror needs
+/// the same split to fill an argument vector from a descriptor it reads off
+/// the class rather than one it writes down, and a second copy of this walk is
+/// a second place for the `[`/`L…;`/primitive rules to drift.
+pub(crate) fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
     let b = desc.as_bytes();
     if b.first() != Some(&b'(') {
         return None;
@@ -2802,6 +2807,41 @@ fn varhandle_coordinate_types(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// `byteArrayViewVarHandle` get — distinct from an array-element access (which
 /// would return a single signed byte). CratonVM stores `byte[]` elements as
 /// signed `Value::Int`.
+/// Bounds-check a byte-array-view `VarHandle` access, JDK-style.
+///
+/// `MethodHandles.byteArrayViewVarHandle` checks the START index against
+/// `array.length - (width - 1)` — the number of positions a `width`-byte
+/// element can start at — and reports it that way:
+/// `Index -1 out of bounds for length 15` for a `short` view over a 16-byte
+/// array, not "for length 16". `RuntimeError::aioobe` formats the JDK's
+/// `Preconditions.checkIndex` wording, so the message matches character for
+/// character.
+///
+/// There was no check at all here. Both `get` and `set` took the raw `int`
+/// coordinate as `*i as usize`, so a negative index wrapped to an enormous
+/// `usize` and the per-byte loop below simply read zeros or dropped the writes
+/// — an out-of-bounds **write** that reported success. Nothing in the corpus
+/// caught it because netty only takes this path when `sun.misc.Unsafe` is
+/// unavailable, and CratonVM pinned `sun.misc.unsafe.memory.access` so netty
+/// never did; on stock HotSpot 25, which does not pin it, netty's heap
+/// `ByteBuf` reads and writes go through exactly this VarHandle.
+fn byte_view_check_index(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    index: i32,
+    elem: u8,
+) -> Result<usize, MethodCallFailed> {
+    let width = i64::from(byte_view_width(elem) as u32);
+    let length = ctx.array_length(arr) as i64;
+    // Saturating at 0: an array shorter than one element has no valid start,
+    // and the JDK reports the (clamped) count, never a negative length.
+    let limit = (length - (width - 1)).max(0);
+    if i64::from(index) < 0 || i64::from(index) >= limit {
+        return Err(RuntimeError::aioobe(index, limit as i32).into());
+    }
+    Ok(index as usize)
+}
+
 fn byte_view_get(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, le: bool) -> Value {
     let w = byte_view_width(elem);
     let mut raw: u64 = 0;
@@ -2910,7 +2950,82 @@ fn byte_view_encode(elem: u8, le: bool, value: &Value) -> [u8; 8] {
     bytes
 }
 
+/// Bounds-check a byte-BUFFER-view `VarHandle` access.
+///
+/// The sibling of [`byte_view_check_index`]. HotSpot's contract differs in the
+/// exception TYPE: a buffer view raises plain `IndexOutOfBoundsException` where
+/// an array view raises `ArrayIndexOutOfBoundsException`. Both use
+/// `Preconditions.checkIndex`'s wording and both bound the START index by
+/// `length - (width - 1)` — for a buffer that length is its **limit**.
+/// Measured on JDK 25: `IndexOutOfBoundsException: Index -1 out of bounds for
+/// length 15` for a `short` view over a 16-byte buffer.
+///
+/// There was no check. Both call sites clamped a negative coordinate to `0`
+/// instead, so `get(buf, -1)` silently read element 0 and `set(buf, -1, v)`
+/// silently overwrote it — a wrong answer where the JDK throws, and on the
+/// `set` side a write to memory the caller never named.
+fn byte_buffer_view_check_index(
+    ctx: &mut dyn NativeContext,
+    bb: ObjectRef,
+    index: i32,
+    elem: u8,
+) -> Result<usize, MethodCallFailed> {
+    let width = i64::from(byte_view_width(elem) as u32);
+    let limit = match ctx.get_field_by_name(bb, "limit") {
+        Value::Int(l) => i64::from(l),
+        _ => 0,
+    };
+    let bound = (limit - (width - 1)).max(0);
+    if i64::from(index) < 0 || i64::from(index) >= bound {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(cratonvm_types::error::out_of_bounds_message::check_index(
+                i64::from(index),
+                bound,
+            )),
+        }
+        .into());
+    }
+    Ok(index as usize)
+}
+
+/// Is this `ByteBuffer` a read-only view?
+///
+/// `VarHandle.set` through a byte-buffer view must raise
+/// `ReadOnlyBufferException`; CratonVM performed the write instead, so a
+/// `asReadOnlyBuffer()` handed to code that mutates it was not read-only at
+/// all. Two signals, because the field is not present on every buffer shape
+/// this VM can produce: the `isReadOnly` field when there is one, and
+/// otherwise the JDK's own naming — the read-only views are exactly
+/// `HeapByteBufferR` and `DirectByteBufferR`.
+fn byte_buffer_view_is_read_only(ctx: &mut dyn NativeContext, bb: ObjectRef) -> bool {
+    if let Value::Int(flag) = ctx.get_field_by_name(bb, "isReadOnly") {
+        if flag != 0 {
+            return true;
+        }
+    }
+    ctx.class_name_of_id(ctx.class_id_of_object(bb))
+        .map_or(false, |name| name.ends_with("ByteBufferR"))
+}
+
+/// The native address of a **direct** buffer's byte `idx`, or `None`.
+///
+/// The `hb == null` test is the whole point. `java.nio.Buffer.address` is NOT
+/// zero for a heap buffer on JDK 21+ — it holds the array base offset (16 on
+/// this platform) so that `Unsafe` accesses can use one code path for both
+/// kinds. Reading it as an absolute pointer therefore dereferenced address
+/// `16 + idx` for every heap buffer, which is a hard SIGSEGV, and the
+/// heap-array fallback below it was unreachable:
+///
+/// ```text
+/// SIGSEGV at pc=…, addr=0x10        # 0x10 == 16
+/// ```
+///
+/// `hb` (the backing `byte[]`) is the field that actually distinguishes the
+/// two: null on a direct buffer, non-null on a heap one.
 fn byte_buffer_view_addr(ctx: &mut dyn NativeContext, bb: ObjectRef, idx: usize) -> Option<i64> {
+    if matches!(ctx.get_field_by_name(bb, "hb"), Value::Object(Some(_))) {
+        return None;
+    }
     let base = match ctx.get_field_by_name(bb, "address") {
         Value::Long(a) if a > 0 => a,
         _ => return None,
@@ -3590,10 +3705,11 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let idx = match args.get(2) {
-            Some(Value::Int(i)) => *i as usize,
+        let index = match args.get(2) {
+            Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        let idx = byte_view_check_index(ctx, arr, index, elem)?;
         let value = byte_view_get(ctx, arr, idx, elem, le);
         // CANONICAL — measured `vh.byteViewInt` = true and `vh.byteViewLong`
         // = true. `byte_view_get` and `byte_view_desc` switch on the same
@@ -3605,10 +3721,11 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(b))) => *b,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let idx = match args.get(2) {
-            Some(Value::Int(i)) if *i >= 0 => *i as usize,
+        let index = match args.get(2) {
+            Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        let idx = byte_buffer_view_check_index(ctx, bb, index, elem)?;
         let value = byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None));
         // CANONICAL — the `ByteBuffer` twin of the `byte[]` view above; same
         // measurement. Note the `unwrap_or(Value::Object(None))` on the line
@@ -3830,10 +3947,11 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // SHA3/SHAKE-zeros bug.)
     if let Some((elem, le)) = byte_view_kind(meta.as_deref()) {
         if let Some(Value::Object(Some(arr))) = args.get(1) {
-            let idx = match args.get(2) {
-                Some(Value::Int(i)) => *i as usize,
+            let index = match args.get(2) {
+                Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            let idx = byte_view_check_index(ctx, *arr, index, elem)?;
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_view_set(ctx, *arr, idx, elem, le, &value);
         }
@@ -3841,10 +3959,14 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
         if let Some(Value::Object(Some(bb))) = args.get(1) {
-            let idx = match args.get(2) {
-                Some(Value::Int(i)) if *i >= 0 => *i as usize,
+            let index = match args.get(2) {
+                Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            if byte_buffer_view_is_read_only(ctx, *bb) {
+                return Err(RuntimeError::ReadOnlyBufferException.into());
+            }
+            let idx = byte_buffer_view_check_index(ctx, *bb, index, elem)?;
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_buffer_view_set(ctx, *bb, idx, elem, le, &value);
         }
@@ -12680,13 +12802,39 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // afterward); pin it and re-read the forwarded reference before use.
     let member_name_pin = ctx.pin_native_root(member_name);
     // Ensure the class is loaded
-    let _ = ctx.ensure_class_initialized(&class_name);
+    let resolved_class_id = ctx.ensure_class_initialized(&class_name).ok();
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
 
     // Mark as resolved with the non-zero vmindex sentinel — on our fabricated
     // layout only. See `mn_set_vmindex`: a real `MemberName` has no vmindex
     // field, and slot 4 there is `method`.
     mn_set_vmindex(ctx, member_name, 1);
+
+    // The `ACC_*` half of `flags`, which resolution is what fills in.
+    //
+    // `MemberName.flags` is `refKind<<24 | IS_METHOD/IS_FIELD/IS_CONSTRUCTOR |
+    // ACC_*`. The Java-side constructors set the kind and the reference kind
+    // and pass `0` for the modifiers, exactly because HotSpot's
+    // `MHN_resolve_Mem` overwrites them with the resolved member's real access
+    // flags. CratonVM's resolve never did, so **every** MemberName resolved
+    // through this native reported `isStatic() == false`:
+    //
+    //     public MethodType getInvocationType() {
+    //         MethodType itype = getMethodOrFieldType();
+    //         ...
+    //         if (!isStatic())  return itype.insertParameterTypes(0, clazz);
+    //
+    // — a phantom receiver parameter prepended to every static method's type.
+    // Nothing read it back with assertions off, which is why it survived; with
+    // `-ea` the very first `NamedFunction` built this way trips
+    // `LambdaForm$Name`'s constructor during `java.lang.invoke` boot:
+    //
+    //     AssertionError: arity mismatch: arguments.length=1 ==
+    //       function.arity()=2 in t851:L=DirectMethodHandle.allocateInstance(a0:L)
+    //
+    // OR-ed in rather than assigned: the kind bit and reference kind already in
+    // `flags` are the caller's request and must survive resolution.
+    let mut resolved_access: Option<u16> = None;
 
     // If this is a method reference (refKind 5-9), verify the method exists
     if ref_kind >= 5 && ref_kind <= 9 {
@@ -12695,7 +12843,7 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
             let desc = descriptor_from_method_type(ctx, mt);
             if !name.is_empty() && !desc.is_empty() {
                 let exists = ctx.method_exists(&class_name, &name, &desc);
-                if !exists && !name.is_empty() {
+                if !exists {
                     // Method not found — for speculative resolve, return null
                     let speculative = matches!(args.get(3), Some(Value::Int(1)));
                     if speculative {
@@ -12703,12 +12851,111 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
                         return Ok(Some(Value::Object(None)));
                     }
                 }
+                // Not gated on `exists`. `method_exists` matches the exact
+                // descriptor, which a signature-polymorphic member never has —
+                // `MethodHandle.linkToSpecial` is declared `(Object...)Object`
+                // and the MemberName carries the call site's `(L,L)V`. Gating
+                // the modifier lookup on `exists` therefore skipped exactly the
+                // members that need the polymorphic fallback inside
+                // `declared_method_access_flags`, and left `linkToSpecial`
+                // without its `ACC_STATIC`.
+                if let Some(cid) = resolved_class_id {
+                    resolved_access = declared_method_access_flags(ctx, cid, &name, &desc);
+                }
             }
+        }
+    } else if (1..=4).contains(&ref_kind) {
+        // Field kinds. A field name is unique within its declaring class, so
+        // no descriptor match is needed — and `type` here is a Class mirror,
+        // not a MethodType, so there is no descriptor to read anyway.
+        if let Some(cid) = resolved_class_id {
+            if !name.is_empty() {
+                resolved_access = declared_field_access_flags(ctx, cid, &name);
+            }
+        }
+    }
+
+    // `declared_methods`/`declared_fields` allocate, so re-read through the pin
+    // before the write.
+    let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    if let Some(access) = resolved_access {
+        let merged = flags | (i32::from(access) & 0xFFFF);
+        if merged != flags {
+            mn_set(ctx, member_name, "flags", MN_FLAGS, Value::Int(merged));
         }
     }
 
     ctx.unpin_native_roots(member_name_pin);
     Ok(Some(Value::Object(Some(member_name))))
+}
+
+/// Declared access flags of `name`+`descriptor`, searched from `class_id` up
+/// the superclass chain.
+///
+/// Superclasses only, no interface step: a `REF_invokeInterface` member names
+/// the interface itself as its declaring class, so the first hop already covers
+/// it, and a default method inherited from an interface is not something this
+/// native is asked to resolve against a class receiver.
+///
+/// Bounded, so a self-referential hierarchy in a fabricated/synthetic class
+/// cannot spin here.
+fn declared_method_access_flags(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+    descriptor: &str,
+) -> Option<u16> {
+    let mut cur = Some(class_id);
+    for _ in 0..64 {
+        let cid = cur?;
+        let by_name: Vec<_> = ctx
+            .declared_methods(cid)
+            .into_iter()
+            .filter(|m| m.name == name)
+            .collect();
+        if let Some(m) = by_name.iter().find(|m| m.descriptor == descriptor) {
+            return Some(m.access_flags);
+        }
+        // Signature-polymorphic methods (`MethodHandle.invoke`, `invokeExact`,
+        // `invokeBasic`, `linkToStatic`, `linkToSpecial`, …) are DECLARED as
+        // `(Object...)Object`, but a `MemberName` for one carries the *call
+        // site's* type — `(L,L)V` and the like. There is no descriptor to match
+        // on, so the exact search above finds nothing, which left `linkToSpecial`
+        // without its `ACC_STATIC` and produced the second `arity mismatch`
+        // assertion after `allocateInstance`.
+        //
+        // A name declared exactly once in the class is unambiguous, so take it.
+        // Guarded on uniqueness deliberately: with real overloads present,
+        // "some overload's flags" would be a guess, and no flags at all is
+        // better than confidently wrong ones.
+        if by_name.len() == 1 {
+            return Some(by_name[0].access_flags);
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
+}
+
+/// Declared access flags of the field `name`, searched from `class_id` up the
+/// superclass chain. See [`declared_method_access_flags`].
+fn declared_field_access_flags(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+) -> Option<u16> {
+    let mut cur = Some(class_id);
+    for _ in 0..64 {
+        let cid = cur?;
+        if let Some(f) = ctx
+            .declared_fields(cid)
+            .into_iter()
+            .find(|f| f.name == name)
+        {
+            return Some(f.access_flags);
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
 }
 
 /// `MethodHandleNatives.init(MemberName self, Object ref)`
@@ -13023,14 +13270,74 @@ pub(crate) fn native_mhn_get_member_vm_info(
 ) -> MethodCallResult {
     let member_name = crate::obj_arg(args, 0)?;
     let vmindex = mn_get_vmindex(ctx, member_name);
+
+    // The shape is dictated by the ONE caller in the whole JDK —
+    // `MemberName.vminfoIsConsistent`, which runs only under `assert`:
+    //
+    //     long vmindex = (Long) ((Object[])vminfo)[0];
+    //     Object vmtarget = ((Object[])vminfo)[1];
+    //     if (refKindIsField(refKind)) { assert(vmindex >= 0);
+    //                                    assert(vmtarget instanceof Class); }
+    //     else { assert(refKindDoesDispatch(refKind) ? vmindex >= 0
+    //                                                : vmindex < 0);
+    //            assert(vmtarget instanceof MemberName); }
+    //
+    // Because that is the only reader and it was unreachable while `-ea` was
+    // being discarded by the launcher, this native's answer was never checked
+    // by anything: it boxed an `Integer` where the cast demands a `Long`, and
+    // returned the MemberName as `vmtarget` for field kinds too. Both surfaced
+    // the moment `-ea` started working — a `ClassCastException: java.lang.Integer
+    // cannot be cast to java.lang.Long` out of `MemberName$Factory.resolve`,
+    // which killed the VM during `java.lang.invoke` boot.
+    let flags = match mn_get(ctx, member_name, "flags", MN_FLAGS) {
+        Value::Int(f) => f,
+        _ => 0,
+    };
+    // `MethodHandleNatives.Constants.MN_REFERENCE_KIND_SHIFT` / `_MASK`.
+    let ref_kind = (flags >> 24) & 0x0F;
+    // REF_getField(1) .. REF_putStatic(4) are the field kinds; REF_invokeVirtual(5)
+    // and REF_invokeInterface(9) are the two that dispatch.
+    let is_field = (1..=4).contains(&ref_kind);
+    let does_dispatch = ref_kind == 5 || ref_kind == 9;
+
+    // CratonVM resolves by name+descriptor and keeps no vtable/itable, so it has
+    // no index of HotSpot's kind to report. What it CAN report truthfully is the
+    // sign the encoding gives meaning to: "has a dispatch slot" (non-negative)
+    // versus "resolved to a single target" (negative). Reporting a non-negative
+    // index for an `invokestatic`-kind member would be the actively wrong
+    // answer; -1 is the same "no dispatch slot" HotSpot writes there.
+    let reported_index: i64 = if is_field || does_dispatch {
+        i64::from(vmindex.max(0))
+    } else {
+        -1
+    };
+
+    // For a field the JDK wants the DECLARING CLASS as `vmtarget`, not the
+    // MemberName — `clazz` is exactly that, and it is already a mirror.
+    let field_target = if is_field {
+        match mn_get(ctx, member_name, "clazz", MN_CLAZZ) {
+            Value::Object(Some(c)) => Some(c),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
     // GC-safety: `box_value` below can trigger a collection that relocates
-    // `arr`/`member_name` (both captured/produced above and read again
-    // afterward); pin them and re-read the forwarded references before use.
+    // `arr`/`member_name`/`field_target` (all captured or produced above and
+    // read again afterward); pin them and re-read the forwarded references
+    // before use. `boxed` is the last allocation, so nothing can move it.
     let arr_pin = ctx.pin_native_root(arr);
     let member_name_pin = ctx.pin_native_root(member_name);
-    // Box vmindex as Integer — `box_value`, i.e. FRESH, and NOT the cached
-    // sibling every other boxing site in this file was switched to.
+    let field_target_pin = field_target.map(|t| (ctx.pin_native_root(t), t));
+    // WIDTH is `J`, not `I`: `MemberName$Factory.resolve`'s assertion casts
+    // slot 0 to `Long`, which is the bug the comment block above records. That
+    // half of this line is settled and must not be reverted to `Value::Int`.
+    //
+    // ALLOCATOR is `box_value`, i.e. FRESH, and NOT the cached sibling every
+    // other boxing site in this file was switched to. That half is a separate,
+    // separately-checked decision and it survives the width fix unchanged:
     //
     // This is the one site here whose HotSpot counterpart is not a `valueOf`
     // adapter. `MethodHandleNatives.getMemberVMInfo` is a VM native that fills
@@ -13039,18 +13346,26 @@ pub(crate) fn native_mhn_get_member_vm_info(
     // measured FRESH on both VMs (`array.int` = false, `array.selfid` = false).
     // The slot is JDK-internal plumbing that no Java code identity-compares,
     // so there is no observable to conform to and no reason to put a
-    // per-`vmindex` entry into a process-global cache.
+    // per-`reported_index` entry into a process-global cache. (The `Long`
+    // cache is also the narrower of the two — `-128..=127` — so a `vmindex`
+    // outside that window would not be shared anyway.)
     //
-    // If a later lane "finishes the job" by switching this line, the thing it
-    // will have changed is which of two indistinguishable objects a JDK
-    // internal receives — and the thing it will have lost is the annotation
-    // saying the difference was checked. Leave it.
-    let boxed = crate::lang_class::box_value(ctx, Value::Int(vmindex), "I");
+    // If a later lane "finishes the job" by switching this to the cached
+    // sibling, the thing it will have changed is which of two
+    // indistinguishable objects a JDK internal receives — and the thing it
+    // will have lost is the annotation saying the difference was checked.
+    // Leave it.
+    let boxed = crate::lang_class::box_value(ctx, Value::Long(reported_index), "J");
     let arr = ctx.read_native_pin(arr_pin, arr);
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    let field_target = field_target_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
     ctx.unpin_native_roots(arr_pin);
     ctx.set_array_element(arr, 0, boxed);
-    ctx.set_array_element(arr, 1, Value::Object(Some(member_name)));
+    ctx.set_array_element(
+        arr,
+        1,
+        Value::Object(Some(field_target.unwrap_or(member_name))),
+    );
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -13197,6 +13512,79 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
     let _ = args;
     let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "NFI", "()V");
     Ok(Some(Value::Object(Some(mn?))))
+}
+
+/// `MethodHandles.byteArrayViewVarHandle` bounds.
+///
+/// Measured against HotSpot JDK 25 with the same three-line probe: a `short`
+/// view over a 16-byte array reports `Index -1 out of bounds for length 15` —
+/// `15`, not `16`, because the length in the message is the number of valid
+/// START positions. CratonVM checked nothing at all, so `set(m, -1, v)` was an
+/// out-of-bounds write that reported success.
+#[cfg(test)]
+mod byte_array_view_bounds_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::NativeHeapAccess;
+
+    /// `(width, valid start positions)` for a 16-byte array.
+    const CASES: &[(u8, i32)] = &[
+        (b'S', 15),
+        (b'C', 15),
+        (b'I', 13),
+        (b'F', 13),
+        (b'J', 9),
+        (b'D', 9),
+    ];
+
+    #[test]
+    fn a_negative_index_is_refused_with_the_jdk_message() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for (elem, limit) in CASES {
+            let err = byte_view_check_index(&ctx, arr, -1, *elem)
+                .expect_err("a negative index must be refused");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains(&format!("Index -1 out of bounds for length {limit}")),
+                "elem {}: {text}",
+                *elem as char
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_valid_start_is_accepted_and_the_next_one_is_not() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for (elem, limit) in CASES {
+            assert!(
+                byte_view_check_index(&ctx, arr, limit - 1, *elem).is_ok(),
+                "elem {}: index {} must fit",
+                *elem as char,
+                limit - 1
+            );
+            assert!(
+                byte_view_check_index(&ctx, arr, *limit, *elem).is_err(),
+                "elem {}: index {} must not fit",
+                *elem as char,
+                limit
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_too_short_for_one_element_admits_no_index() {
+        let mut ctx = mock_ctx();
+        // Four bytes cannot hold a long; the JDK reports "for length 0"
+        // rather than a negative length.
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        let err = byte_view_check_index(&ctx, arr, 0, b'J').expect_err("no index can fit");
+        assert!(
+            format!("{err:?}").contains("Index 0 out of bounds for length 0"),
+            "{err:?}"
+        );
+    }
 }
 
 #[cfg(test)]

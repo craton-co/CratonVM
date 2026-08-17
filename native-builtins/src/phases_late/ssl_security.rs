@@ -186,6 +186,29 @@ pub(crate) fn mac_state_evict_if_needed(
     }
 }
 
+/// The application `MacSpi` a `javax.crypto.Mac` wraps, if it wraps one.
+///
+/// Every `Mac` built by `mac_get_instance`'s own path keeps its state in
+/// `mac_state_table` and leaves the real `spi` field null; one built through
+/// the JDK's own `(MacSpi, Provider, String)` constructor — which is what
+/// `provider_chain::build_real_mac` does for a third-party provider — always
+/// has it. So the field IS the discriminator, the same one
+/// `skf_receiver_is_ours` uses for `SecretKeyFactory` and `kf_delegate_spi`
+/// for `KeyFactory`.
+///
+/// Every native registered on `javax/crypto/Mac` consults this first. Without
+/// it they shadowed the real bytecode for a receiver they did not build, so a
+/// `Mac` obtained from BouncyCastle computed an HMAC of this VM's choosing —
+/// and for the BC-only MACs (`CMAC`, `Poly1305`, `GOST28147MAC`, the
+/// `*-CMAC`/`*-GMAC` families) `getInstance` refused a name the provider
+/// implements.
+fn mac_delegate_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "spi") {
+        Value::Object(Some(spi)) => Some(spi),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -206,6 +229,16 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             };
+            // An `Alg.Alias.Mac.<oid>` spelling resolves to the primary name
+            // first — see `provider_chain::canonical_service_algorithm`. The
+            // anonymous overload searches the chain in chain order.
+            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
+                None,
+                "Mac",
+                &algo,
+                &mac_algorithm_supported,
+            )
+            .unwrap_or(algo);
             // W4-3: refuse BEFORE allocating a receiver. An unimplemented name
             // used to yield a working-looking Mac that computed HMAC-SHA-256
             // under whatever name the caller asked for — see
@@ -292,14 +325,59 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 &algo,
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
+            // Resolve against the NAMED provider's own alias rows before the
+            // engine's name gate — see the anonymous overload above.
+            let requested_provider =
+                crate::jca::provider_chain::provider_arg_name(ctx, args, algo_idx + 1);
+            let requested_algo = algo.clone();
+            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
+                requested_provider.as_deref(),
+                "Mac",
+                &algo,
+                &mac_algorithm_supported,
+            )
+            .unwrap_or(algo);
+            // A caller that NAMED a third-party provider gets THAT provider's
+            // `MacSpi`, in a genuine `javax.crypto.Mac` — see
+            // `mac_delegate_spi`. This is both an attribution fix (HotSpot
+            // answers `BC`, this VM answered `SunJCE`) and a capability one:
+            // the BC-only MAC families have no arm in `mac_compute_hmac` at
+            // all, so `getInstance` refused names the named provider
+            // implements.
+            if let Some(provider) = requested_provider.as_deref() {
+                if let Some(obj) = crate::jca::provider_chain::build_real_mac(
+                    ctx,
+                    provider,
+                    &requested_algo,
+                    &algo,
+                )? {
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
+            // No provider named and this engine cannot serve the name: fall to
+            // the chain, whose only candidates for a name we do not implement
+            // are third-party providers. `1.3.14.3.2.26` (SHA-1 HMAC by OID,
+            // bc-java's `pkcs` suite) is the shape.
+            if requested_provider.is_none() && !mac_algorithm_supported(&algo) {
+                if let Some(p) = crate::jca::provider_chain::find_service_provider("Mac", &algo) {
+                    if let Some(obj) = crate::jca::provider_chain::build_real_mac(
+                        ctx,
+                        &p,
+                        &requested_algo,
+                        &algo,
+                    )? {
+                        return Ok(Some(Value::Object(Some(obj))));
+                    }
+                }
+            }
             if !mac_algorithm_supported(&algo) {
                 // Once a provider has been named, HotSpot reports the failure
                 // against THAT provider: `no such algorithm: X for provider Y`.
-                let provider = match args.get(algo_idx + 1) {
-                    Some(Value::Object(Some(p))) => ctx.read_string(*p),
-                    _ => None,
-                };
-                return Err(mac_no_such_algorithm(ctx, &algo, provider.as_deref()));
+                return Err(mac_no_such_algorithm(
+                    ctx,
+                    &algo,
+                    requested_provider.as_deref(),
+                ));
             }
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
             let id = ctx.identity_hash_code(obj);
@@ -469,6 +547,15 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     );
     r.register(mac, "init", "(Ljava/security/Key;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            return ctx.invoke_virtual(
+                spi,
+                "engineInit",
+                "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+                &[key, Value::Object(None)],
+            );
+        }
         let key_bytes = match args.get(1) {
             Some(Value::Object(Some(k))) => mac_extract_key_bytes(ctx, *k),
             _ => Vec::new(),
@@ -488,6 +575,18 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // update([B)V — append byte array to accumulator
     r.register(mac, "update", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let (arr, len) = match args.get(1) {
+                Some(Value::Object(Some(a))) => (Some(*a), ctx.array_length(*a) as i32),
+                _ => (None, 0),
+            };
+            return ctx.invoke_virtual(
+                spi,
+                "engineUpdate",
+                "([BII)V",
+                &[Value::Object(arr), Value::Int(0), Value::Int(len)],
+            );
+        }
         if let Some(Value::Object(Some(arr))) = args.get(1) {
             let bytes = mac_read_byte_array(ctx, *arr);
             let id = ctx.identity_hash_code(this);
@@ -504,6 +603,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // update([BII)V — append byte range to accumulator
     r.register(mac, "update", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            return ctx.invoke_virtual(
+                spi,
+                "engineUpdate",
+                "([BII)V",
+                &[Value::Object(arr), Value::Int(off), Value::Int(len)],
+            );
+        }
         if let Some(Value::Object(Some(arr))) = args.get(1) {
             // Validate signed off/len against the array length BEFORE casting to
             // usize. A negative len would sign-extend into a huge usize and
@@ -542,6 +655,10 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // update(B)V — append single byte to accumulator
     r.register(mac, "update", "(B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let b = args.get(1).copied().unwrap_or(Value::Int(0));
+            return ctx.invoke_virtual(spi, "engineUpdate", "(B)V", &[b]);
+        }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         let id = ctx.identity_hash_code(this);
         mac_state_table()
@@ -556,6 +673,11 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // doFinal()[B — compute HMAC, return result, reset accumulator
     r.register(mac, "doFinal", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let out = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[])?;
+            ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
+            return Ok(out);
+        }
         let id = ctx.identity_hash_code(this);
         // PERF: single lock acquisition, no full-state clones. Previously this
         // cloned algo (String) + key (Vec) + the entire accumulated data (Vec)
@@ -606,6 +728,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // doFinal([B)[B — update with input bytes, then compute HMAC
     r.register(mac, "doFinal", "([B)[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            if let Some(Value::Object(Some(a))) = args.get(1) {
+                let len = ctx.array_length(*a) as i32;
+                ctx.invoke_virtual(
+                    spi,
+                    "engineUpdate",
+                    "([BII)V",
+                    &[Value::Object(Some(*a)), Value::Int(0), Value::Int(len)],
+                )?;
+            }
+            let out = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[])?;
+            ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
+            return Ok(out);
+        }
         let id = ctx.identity_hash_code(this);
         // Read the input bytes via ctx BEFORE taking the lock (ctx access must
         // not happen while the state mutex is held).
@@ -669,6 +805,41 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // on iteration 2 of 4096 — after `doFinal()` had already succeeded once.
     r.register(mac, "doFinal", "([BI)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let out = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Cannot store MAC in output buffer".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            let pin = ctx.pin_native_root(out);
+            let produced = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[]);
+            let out = ctx.read_native_pin(pin, out);
+            ctx.unpin_native_roots(pin);
+            let bytes = match produced? {
+                Some(Value::Object(Some(a))) => {
+                    let n = ctx.array_length(a);
+                    let mut b = vec![0u8; n];
+                    ctx.read_byte_array_into(a, 0, &mut b);
+                    b
+                }
+                _ => Vec::new(),
+            };
+            if off + bytes.len() > ctx.array_length(out) {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/crypto/ShortBufferException",
+                    "Cannot store MAC in output buffer",
+                ));
+            }
+            ctx.write_byte_array_from(out, off, &bytes);
+            ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
+            return Ok(None);
+        }
         let id = ctx.identity_hash_code(this);
         let out = match args.get(1) {
             Some(Value::Object(Some(arr))) => *arr,
@@ -775,6 +946,13 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // path; reading `hb` directly would silently no-op on a direct buffer.
     r.register(mac, "update", "(Ljava/nio/ByteBuffer;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let buf = args.get(1).copied().unwrap_or(Value::Object(None));
+            if matches!(buf, Value::Object(None)) {
+                return Ok(None);
+            }
+            return ctx.invoke_virtual(spi, "engineUpdate", "(Ljava/nio/ByteBuffer;)V", &[buf]);
+        }
         let Some(Value::Object(Some(buf))) = args.get(1).cloned() else {
             // JDK: a null ByteBuffer is a silent no-op (`if (input == null) …`).
             return Ok(None);
@@ -812,11 +990,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // come from, which is what `Security.getProviders()` advertises them under.
     r.register(mac, "getProvider", "()Ljava/security/Provider;", |ctx, args| {
         let _this = obj_arg(args, 0)?;
+        if let Value::Object(Some(p)) = ctx.get_field_by_name(_this, "provider") {
+            let pid = ctx.class_id_by_name("java/security/Provider");
+            if pid.is_some_and(|pid| ctx.is_subclass(ctx.class_id_of_object(p), pid)) {
+                return Ok(Some(Value::Object(Some(p))));
+            }
+        }
         Ok(Some(Value::Object(Some(jce_provider_object(ctx)?))))
     });
     // reset()V — clear the accumulator
     r.register(mac, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            return ctx.invoke_virtual(spi, "engineReset", "()V", &[]);
+        }
         let id = ctx.identity_hash_code(this);
         if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
             st.data.clear();
@@ -825,6 +1012,9 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     });
     r.register(mac, "getMacLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            return ctx.invoke_virtual(spi, "engineGetMacLength", "()I", &[]);
+        }
         let id = ctx.identity_hash_code(this);
         let algo = mac_state_table()
             .lock()
@@ -847,6 +1037,16 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     });
     r.register(mac, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if mac_delegate_spi(ctx, this).is_some() {
+            if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "algorithm") {
+                if ctx
+                    .class_name_of_id(ctx.class_id_of_object(a))
+                    .is_some_and(|n| n == "java/lang/String")
+                {
+                    return Ok(Some(Value::Object(Some(a))));
+                }
+            }
+        }
         let id = ctx.identity_hash_code(this);
         let algo = mac_state_table()
             .lock()
@@ -858,6 +1058,27 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     });
     r.register(mac, "clone", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // A delegated Mac clones by cloning ITS spi and re-wrapping — the
+        // synthetic clone below would silently hand back an unrelated,
+        // natively-served Mac carrying none of the provider's state.
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let cloned = ctx.invoke_virtual(spi, "clone", "()Ljava/lang/Object;", &[])?;
+            let Some(Value::Object(Some(cloned))) = cloned else {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/CloneNotSupportedException",
+                    "MacSpi is not cloneable",
+                ));
+            };
+            let provider = ctx.get_field_by_name(this, "provider");
+            let algorithm = ctx.get_field_by_name(this, "algorithm");
+            let built = ctx.new_object_initialized(
+                "javax/crypto/Mac",
+                "(Ljavax/crypto/MacSpi;Ljava/security/Provider;Ljava/lang/String;)V",
+                &[Value::Object(Some(cloned)), provider, algorithm],
+            )?;
+            return Ok(built);
+        }
         let src_state = mac_state_table()
             .lock()
             .unwrap()
@@ -1735,9 +1956,34 @@ pub(crate) fn new13_build_connector(
     extra_root_ders: &[Vec<u8>],
     danger_skip_native_verify: bool,
     max_protocol: Option<native_tls::Protocol>,
+    jsse_default_roots: Option<&[Vec<u8>]>,
 ) -> Result<native_tls::TlsConnector, String> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+    // FIX (tls-client-trust-is-openssl-seclevel): the application named its
+    // own trust store with `javax.net.ssl.trustStore`, and this connection's
+    // `SSLContext` configured nothing of its own — so JSSE's rule applies:
+    // that store REPLACES cacerts, it does not add to it. Handing the anchors
+    // to the backend (rather than verifying separately afterwards) keeps
+    // OpenSSL's path building, name constraints and hostname check exactly as
+    // they are; the only thing that changes is which roots it trusts.
+    if let Some(roots) = jsse_default_roots {
+        builder.disable_built_in_roots(true);
+        for der in roots {
+            match native_tls::Certificate::from_der(der) {
+                Ok(cert) => {
+                    builder.add_root_certificate(cert);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "phases_late::tls",
+                        "javax.net.ssl.trustStore: skipping unparseable anchor DER: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
     // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): honour a
     // version-pinned `SSLContext.getInstance(...)`. Before this, the protocol
     // string was validated, stored on the SSLContext object, and then never
@@ -2287,6 +2533,26 @@ pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) 
     Ok(session)
 }
 
+/// Turn a failed TLS stream read/write into the exception JSSE raises for it.
+///
+/// A socket whose handshake never completed reports that at its FIRST I/O,
+/// as `javax.net.ssl.SSLHandshakeException` — the accepted-but-unhandshaked
+/// case is the server side of a rejected connection, and it reaches here
+/// because `SSLServerSocket.accept()` must not throw for it (see
+/// `t27_tls::TlsServerStream::HandshakeFailed`). Every other I/O error is an
+/// ordinary `IOException`, as before.
+fn tls_io_failure(ctx: &mut dyn NativeContext, tls_id: i32, e: std::io::Error) -> MethodCallFailed {
+    match crate::servlet::s2_tls_handshake_failure(tls_id) {
+        Some(reason) => {
+            crate::phases_early::throw_jca_exc(ctx, "javax/net/ssl/SSLHandshakeException", &reason)
+        }
+        None => RuntimeError::IOException {
+            message: e.to_string(),
+        }
+        .into(),
+    }
+}
+
 /// Resolve an `InetAddress` argument without depending on its implementation
 /// class.  Real JSSE factories expose all of the `SocketFactory` overloads;
 /// our P68 bridge must do the same because its synthetic factory is allocated
@@ -2378,8 +2644,68 @@ pub(crate) fn new13_connect_and_handshake_on(
             .and_then(|cert| cert.public_key().ok())
             .is_some_and(|key| key.dsa().is_ok())
     });
-    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some(), max_protocol)
-        .map_err(|msg| RuntimeError::IOException { message: msg })?;
+    // JSSE's default trust store, and ONLY for a connection whose own
+    // `SSLContext` configured no trust material: an explicit TrustManager or
+    // an explicit set of roots is already the answer, and must not be widened
+    // by a process-wide property.
+    //
+    // Deliberately computed AFTER `legacy_dsa_context`, which scans
+    // `extra_root_ders` for a DSA key: these anchors are NOT merged into that
+    // slice, so a DSA root that happens to sit in the application's trust
+    // store cannot switch an unrelated connection onto the legacy OpenSSL
+    // path (which runs at security level 0).
+    let jsse_default_trust: Option<crate::x509_manager::TrustManagerState> =
+        if extra_root_ders.is_empty() && java_tm_key.is_none() {
+            match crate::tls::explicit_trust_store_keystore_id(ctx) {
+                0 => None,
+                id => {
+                    let state = crate::x509_manager::build_trust_manager_state(id);
+                    (!state.anchor_ders.is_empty()).then_some(state)
+                }
+            }
+        } else {
+            None
+        };
+    let jsse_default_roots: Option<&[Vec<u8>]> = jsse_default_trust
+        .as_ref()
+        .map(|s| s.anchor_ders.as_slice());
+    // Handing OpenSSL the right anchors is necessary and NOT sufficient, and
+    // the measurement says so precisely. With the application's own trust
+    // store supplied as the connector's roots, `TlsProbe3` still got
+    //
+    //   SSLHandshakeException: … certificate verify failed … (EE certificate
+    //   key too weak)
+    //
+    // where HotSpot completes the handshake. That is not a trust verdict: it
+    // is OpenSSL's SECURITY LEVEL, which at its default of 2 requires a
+    // ≥2048-bit RSA key of every peer certificate. The JDK's equivalent knob,
+    // `jdk.certpath.disabledAlgorithms`, draws the line at 1024 bits and
+    // exempts a trust anchor from the signature-algorithm check entirely — so
+    // a 1024-bit MD5-self-signed certificate the application has explicitly
+    // installed as its trust anchor is something JSSE accepts and OpenSSL, at
+    // this level, cannot be told to.
+    //
+    // native-tls exposes no security-level control (that needs a raw
+    // `SslConnector`, as `s2_legacy_dsa_tls_connect_on` uses), so for THIS
+    // case — and only this one — the verdict moves to the validator that
+    // already implements the JDK's rules, exactly as the Java-TrustManager
+    // path above does: native verification stands down and the captured chain
+    // is checked against the configured anchors immediately after connect,
+    // failing closed.
+    //
+    // The blast radius is deliberately the set of connections that are
+    // MISCONFIGURED today: an application that named a trust store and was
+    // being validated against the platform roots regardless. A connection
+    // with no `javax.net.ssl.trustStore` keeps OpenSSL as its verifier,
+    // untouched.
+    let verify_against_default_roots = jsse_default_roots.is_some();
+    let connector = new13_build_connector(
+        extra_root_ders,
+        java_tm_key.is_some() || verify_against_default_roots,
+        max_protocol,
+        jsse_default_roots,
+    )
+    .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
     // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
     // client createSocket, which already announces this — see its "T19.H1"
@@ -2466,6 +2792,33 @@ pub(crate) fn new13_connect_and_handshake_on(
         if let Err(e) = crate::t27_tls::run_client_trust_check_for_chain(ctx, tm_key, chain) {
             let _ = crate::servlet::s2_tls_close(tls_id);
             return Err(e);
+        }
+    }
+
+    // The `javax.net.ssl.trustStore` arm of the same fail-closed rule: native
+    // verification was stood down for it above, so these anchors are now the
+    // ONLY verifier and a missing or unvalidatable chain must abort the
+    // socket. `validate_chain` is the same RFC 5280 validator the Java
+    // TrustManager shim runs, and the same one that answered exactly as
+    // HotSpot did on both arms of `TmProbe` — including accepting a
+    // self-signed certificate installed as the anchor itself.
+    if let Some(trust) = jsse_default_trust.as_ref() {
+        let chain = crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default();
+        if chain.is_empty() {
+            let _ = crate::servlet::s2_tls_close(tls_id);
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                "no peer certificate available for javax.net.ssl.trustStore verification",
+            ));
+        }
+        if let Err(e) = crate::x509_manager::validate_chain(&chain, trust) {
+            let _ = crate::servlet::s2_tls_close(tls_id);
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                &format!("PKIX path validation failed: {e}"),
+            ));
         }
     }
     Ok(tls_id)
@@ -2562,6 +2915,21 @@ pub(crate) fn kmf_keystore_id_by_identity(
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// Sibling of `kmf_keystore_id_by_identity` for the case where the `KeyStore`
+/// handed to `init` is NOT one of this VM's own: the `KeyManagerState` was
+/// built by enumerating that store live, so what is recorded here is an
+/// `x509_manager::km_registry` id, not a keystore id.
+///
+/// Deliberately a SEPARATE map rather than a sentinel value in the one above:
+/// two independent id spaces sharing one integer slot is the exact shape that
+/// produced the `KEY_VALUES_MISMATCH` family this page's section A was about —
+/// right only while the two counters happened to be aligned.
+fn kmf_live_km_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 /// FIX (tomcat-clientauth-engine-config): same pattern as
 /// `kmf_keystore_id_by_identity` immediately above, for
 /// `javax/net/ssl/TrustManagerFactory` — maps the TMF object to the
@@ -2582,6 +2950,38 @@ pub(crate) fn tmf_tm_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash:
     static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Is `this` the synthetic default factory THIS module's `getInstance` built,
+/// rather than a caller's own `TrustManagerFactory`/`KeyManagerFactory`
+/// subclass?
+///
+/// Every native on these two classes is dispatched by the interpreter for
+/// SUBCLASS receivers too, and the synthetic layout these handlers assume
+/// (`provider`, `factorySpi`, `algorithm` — the real JDK field order) belongs
+/// to an object a real subclass never went through. Writing a slot on such a
+/// receiver overwrites a field the real constructor already filled.
+///
+/// Measured 2026-08-13 (netty `handler.ssl` batch 10): `TrustManagerFactory.
+/// init(KeyStore)` did `set_field(this, 1, keystore)` unconditionally, and
+/// field 1 of the REAL class is `factorySpi`. netty's
+/// `SimpleTrustManagerFactory` (the base of `InsecureTrustManagerFactory` and
+/// of every per-test factory in this suite) is a real subclass constructed
+/// with a real SPI, so `SslContext.buildTrustManagerFactory`'s `tmf.init(ks)`
+/// replaced its SPI with the `KeyStore`, and the very next
+/// `getTrustManagers()` — which correctly delegates to the real bytecode for a
+/// subclass — died on
+/// `NoSuchMethodError: java.security.KeyStore.engineGetTrustManagers()`.
+/// `init((KeyStore) null)` was the same defect with a null: it nulled
+/// `factorySpi` and the real `getTrustManagers()` then NPE'd.
+///
+/// The runtime class is the whole test: `TrustManagerFactory`'s and
+/// `KeyManagerFactory`'s constructors are `protected`, so the only way to hold
+/// an instance whose class is EXACTLY the base class is to have got it from
+/// `getInstance` — i.e. from the handler right here.
+fn jsse_factory_is_ours(ctx: &mut dyn NativeContext, this: ObjectRef, base: &str) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(this))
+        .is_some_and(|n| n == base)
 }
 
 /// Build and throw a real `java.security.NoSuchAlgorithmException` carrying
@@ -2854,6 +3254,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 extra_roots.as_deref().unwrap_or(&[]),
                 false,
                 init_max_protocol,
+                // Buildability check only — the JSSE default store is
+                // resolved per connection, not here.
+                None,
             ) {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
@@ -4698,10 +5101,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     .map(|b| b as i32)
                     .unwrap_or(-1),
             ))),
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
+            Err(e) => Err(tls_io_failure(ctx, tls_id, e)),
         }
     }
     fn ssl_stream_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4757,10 +5157,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
+            Err(e) => Err(tls_io_failure(ctx, tls_id, e)),
         }
     }
     fn ssl_stream_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4892,9 +5289,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ctx.begin_blocking_region();
         let write_result = crate::servlet::s2_tls_write(tls_id, &[b]);
         ctx.end_blocking_region();
-        write_result.map_err(|e| RuntimeError::IOException {
-            message: e.to_string(),
-        })?;
+        if let Err(e) = write_result {
+            return Err(tls_io_failure(ctx, tls_id, e));
+        }
         Ok(None)
     }
     fn ssl_stream_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4954,23 +5351,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // marked blocked (the mirror-image failure: a live mutator the
         // barrier stops waiting for).
         ctx.begin_blocking_region();
-        let mut write_err: Option<String> = None;
+        let mut write_err: Option<std::io::Error> = None;
         while written < buf.len() {
             match crate::servlet::s2_tls_write(tls_id, &buf[written..]) {
                 Ok(0) => {
-                    write_err = Some("SSLSocketOutputStream.write: peer closed".into());
+                    write_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "SSLSocketOutputStream.write: peer closed",
+                    ));
                     break;
                 }
                 Ok(n) => written += n,
                 Err(e) => {
-                    write_err = Some(e.to_string());
+                    write_err = Some(e);
                     break;
                 }
             }
         }
         ctx.end_blocking_region();
-        if let Some(message) = write_err {
-            return Err(RuntimeError::IOException { message }.into());
+        if let Some(e) = write_err {
+            return Err(tls_io_failure(ctx, tls_id, e));
         }
         Ok(None)
     }
@@ -5192,27 +5592,41 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     "peer not authenticated",
                 ));
             }
-            let arr = ctx.new_ref_array(ClassId::new(0), chain.len());
-            for (i, der) in chain.iter().enumerate() {
-                // Allocate a 4-field X509Certificate: the extra field 3
-                // carries the raw DER bytes so `Certificate.getEncoded()`
-                // can return them without relying on legacy-synthetic-crypto.
-                let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
-                let (subject, issuer) = basic_der_extract_names(der)
-                    .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
-                let sub_str = ctx.create_string(&subject);
-                let iss_str = ctx.create_string(&issuer);
-                ctx.set_field(cert, 0, Value::Object(Some(sub_str)));
-                ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
-                ctx.set_field(cert, 2, Value::Long(0));
-                // Copy DER bytes into a Java byte[] stored at field 3.
-                let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
-                for (j, &b) in der.iter().enumerate() {
-                    ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
-                }
-                ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
-                ctx.set_array_element(arr, i, Value::Object(Some(cert)));
-            }
+            let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+                ctx,
+                ClassId::new(0),
+                chain.len(),
+                |ctx, i| {
+                    let der = &chain[i];
+                    // Allocate a 4-field X509Certificate: the extra field 3
+                    // carries the raw DER bytes so `Certificate.getEncoded()`
+                    // can return them without relying on
+                    // legacy-synthetic-crypto.
+                    let cert0 =
+                        try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
+                    // `cert` is live across `create_string`/`new_array` below,
+                    // both of which allocate — pin and re-read, same discipline
+                    // `build_rooted_ref_array` applies to the array itself.
+                    let cert_pin = ctx.pin_native_root(cert0);
+                    let (subject, issuer) = basic_der_extract_names(der)
+                        .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
+                    let sub_str = ctx.create_string(&subject);
+                    let iss_str = ctx.create_string(&issuer);
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 0, Value::Object(Some(sub_str)));
+                    ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
+                    ctx.set_field(cert, 2, Value::Long(0));
+                    // Copy DER bytes into a Java byte[] stored at field 3.
+                    let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
+                    for (j, &b) in der.iter().enumerate() {
+                        ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
+                    }
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
+                    ctx.unpin_native_roots(cert_pin);
+                    Ok(cert)
+                },
+            )?;
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -5242,6 +5656,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // no-mTLS client session), so the original client behaviour is
             // unchanged.
             let this = obj_arg(args, 0)?;
+            if crate::t27_tls::in_client_trust_check() {
+                return Ok(Some(Value::Object(None)));
+            }
             let chain = crate::t27_tls::local_certs_for_session(ctx, this);
             let Some(leaf) = chain.first() else {
                 return Ok(Some(Value::Object(None)));
@@ -5272,15 +5689,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // for where the chain is actually populated (client sessions with no
             // configured identity correctly still get an empty chain here).
             let this = obj_arg(args, 0)?;
+            // Inside a client-side `checkServerTrusted`, JSSE has not yet sent
+            // the client's own certificate — see `in_client_trust_check`.
+            if crate::t27_tls::in_client_trust_check() {
+                return Ok(Some(Value::Object(None)));
+            }
             let chain = crate::t27_tls::local_certs_for_session(ctx, this);
             if chain.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
-            for (i, der) in chain.iter().enumerate() {
-                let mirror = crate::keystore::make_x509_mirror(ctx, "local", der)?;
-                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
-            }
+            let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+                ctx,
+                cratonvm_types::ClassId::new(0),
+                chain.len(),
+                |ctx, i| crate::keystore::make_x509_mirror(ctx, "local", &chain[i]),
+            )?;
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -5403,9 +5826,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     &format!("{algo_str} TrustManagerFactory not available"),
                 ));
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 2)?;
-            ctx.set_field(obj, 0, args.get(0).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, Value::Object(None));
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 3)?;
+            // Field order is the REAL `javax.net.ssl.TrustManagerFactory`
+            // declaration order (`javap -p`: provider, factorySpi, algorithm),
+            // exactly as the sibling `KeyManagerFactory.getInstance` below
+            // already does. The previous layout put the algorithm String at
+            // slot 0, so the un-overridden real `getProvider()` bytecode
+            // returned a `String` where a `Provider` belongs — the same defect
+            // that fix records for KMF, still live here.
+            let provider_name = crate::jca::provider_chain::find_service_provider(
+                "TrustManagerFactory",
+                &algo_str,
+            )
+            .unwrap_or_else(|| "SunJSSE".to_string());
+            let provider =
+                crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name)?;
+            ctx.set_field(obj, 0, Value::Object(Some(provider)));
+            ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
+            ctx.set_field(obj, 2, args.get(0).copied().unwrap_or(Value::Object(None)));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5420,8 +5858,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(tmf, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            Ok(Some(ctx.get_field(this, 0)))
+        // A caller's own subclass carries a real `algorithm` its constructor
+        // set; reading OUR slot off it returns whatever happens to live there
+        // (a `Provider`, for a real receiver). See `jsse_factory_is_ours`.
+        if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/TrustManagerFactory") {
+            return ctx.invoke_virtual_bytecode_only(this, "getAlgorithm", "()Ljava/lang/String;", &[]);
+        }
+        if ctx.object_num_fields(this) > 2 {
+            Ok(Some(ctx.get_field(this, 2)))
         } else {
             let s = ctx.create_string("PKIX");
             Ok(Some(Value::Object(Some(s))))
@@ -5429,12 +5873,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     });
     r.register(tmf, "init", "(Ljava/security/KeyStore;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 1 {
-            // Stash the KeyStore reference so the emitted TrustManager can
-            // walk it at verification time. A null here is legitimate and
-            // means "use platform default trust store".
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        }
+        let ours = jsse_factory_is_ours(ctx, this, "javax/net/ssl/TrustManagerFactory");
+        // NOTHING is written to a field here. Slot 1 of the real class is
+        // `factorySpi`; the write that used to live here destroyed a real
+        // subclass's SPI (see `jsse_factory_is_ours` for the measured
+        // failure), and for OUR synthetic the keystore is not read back from
+        // a field at all — `getTrustManagers()` below resolves it through
+        // `tmf_tm_id_by_identity`, which the staging block just after this
+        // populates for both receiver kinds.
         // FIX (es-restclient-https): this `TrustManagerFactory.init(KeyStore)`
         // is the one that actually wins (registered last in the lib.rs wiring,
         // shadowing `tls.rs::register_trust_manager_factory`'s otherwise
@@ -5482,6 +5928,63 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     tmf_tm_id_by_identity().lock().insert(ih, tm_id);
                 }
             }
+        } else if ours {
+            // A NULL KeyStore is not "no trust store" — it is JSSE's DEFAULT
+            // one, and that is the platform roots only when the application
+            // has not named its own via `javax.net.ssl.trustStore`. Nothing
+            // read the property, so a caller that pinned its trust to one
+            // private CA was silently given the whole public root set AND
+            // still had its own certificate rejected. See
+            // `tls::default_trust_store_keystore_id` for the measurement.
+            //
+            // Same staging as the non-null branch above, deliberately: once
+            // the property names a store, JSSE scopes every default context
+            // to it, so the `SSLContext.init` that follows must see it too.
+            let explicit = crate::tls::explicit_trust_store_keystore_id(ctx);
+            let ks_id = if explicit != 0 {
+                explicit
+            } else {
+                crate::tls::default_trust_store_keystore_id(ctx)
+            };
+            if crate::nbflags().dbg_tls_auth_ok {
+                eprintln!(
+                    "[dbg-tls-auth] tmf(phases_late).init(null) this_ih={} ks_id={} explicit={}",
+                    ctx.identity_hash_code(this),
+                    ks_id,
+                    explicit
+                );
+            }
+            if ks_id != 0 {
+                let state = crate::x509_manager::build_trust_manager_state(ks_id);
+                // Staged for the next `SSLContext.init` ONLY when the
+                // application named the store. Staging `cacerts` would push
+                // ~118 anchors into `extra_root_ders`, which the connector
+                // adds to the platform set (a union, not JSSE's replace) and
+                // which `legacy_dsa_context` then scans for a DSA key — so one
+                // DSA root anywhere in the JDK's own trust store could divert
+                // unrelated connections onto the legacy OpenSSL path at
+                // security level 0. Not a trade worth making for a default.
+                if explicit != 0 && !state.anchor_ders.is_empty() {
+                    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
+                }
+                let tm_id = crate::x509_manager::register_trust_manager_state(state);
+                let ih = ctx.identity_hash_code(this);
+                if ih != 0 {
+                    tmf_tm_id_by_identity().lock().insert(ih, tm_id);
+                }
+            }
+        }
+        if !ours {
+            // A real subclass's `init` means "call MY spi's engineInit" —
+            // netty's `SimpleTrustManagerFactory` routes it back to the
+            // subclass's own `engineInit(KeyStore)`. Swallowing it left the
+            // caller's factory uninitialised while reporting success.
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "init",
+                "(Ljava/security/KeyStore;)V",
+                &[args.get(1).copied().unwrap_or(Value::Object(None))],
+            );
         }
         Ok(None)
     });
@@ -5491,9 +5994,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) > 1 {
-                ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            }
+            let ours = jsse_factory_is_ours(ctx, this, "javax/net/ssl/TrustManagerFactory");
+            // No field write, for the reason `jsse_factory_is_ours` records:
+            // slot 1 is the real class's `factorySpi`.
             // FIX (tomcat-clientauth-engine-config): this overload — used
             // whenever `sslHostConfig.getTruststoreAlgorithm()` is `"PKIX"`
             // (Tomcat's default; see `SSLUtilBase.getTrustManagers()`,
@@ -5524,6 +6027,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let ih = ctx.identity_hash_code(this);
             if ih != 0 {
                 tmf_tm_id_by_identity().lock().insert(ih, tm_id);
+            }
+            if !ours {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "init",
+                    "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+                    &[args.get(1).copied().unwrap_or(Value::Object(None))],
+                );
             }
             Ok(None)
         },
@@ -5708,6 +6219,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(kmf, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+            return ctx.invoke_virtual_bytecode_only(this, "getAlgorithm", "()Ljava/lang/String;", &[]);
+        }
         if ctx.object_num_fields(this) > 2 {
             Ok(Some(ctx.get_field(this, 2)))
         } else {
@@ -5751,6 +6265,40 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 &key_password,
             );
             let ks_id = crate::keystore::keystore_id_from_object(ctx, *ks);
+            if ks_id == 0 {
+                // A `KeyStore` this VM has no native record of — an application's
+                // own `KeyStore` subclass over its own `KeyStoreSpi`. netty's
+                // `OpenSslX509KeyManagerFactory.newKeyless` is exactly that, and
+                // it reaches THIS shim because netty's own factory SPI builds a
+                // default `KeyManagerFactory` and inits it with that store.
+                // Enumerating the store through its own bytecode is the only way
+                // to serve it; see
+                // `x509_manager::build_key_manager_state_from_live_keystore` for
+                // what the previous bare-interface fallback cost.
+                let this = obj_arg(args, 0)?;
+                let ih = ctx.identity_hash_code(this);
+                let pw_obj = match args.get(2) {
+                    Some(Value::Object(Some(p))) => Some(*p),
+                    _ => None,
+                };
+                if ih != 0 {
+                    let state = crate::x509_manager::build_key_manager_state_from_live_keystore(
+                        ctx, *ks, pw_obj,
+                    );
+                    if crate::nbflags().dbg_tls_auth {
+                        eprintln!(
+                            "[dbg-tls-auth] kmf(phases_late).init(live KeyStore) this_ih={} aliases={}",
+                            ih,
+                            state.aliases_to_chain.len()
+                        );
+                    }
+                    if !state.aliases_to_chain.is_empty() {
+                        let km_id = crate::x509_manager::next_km_id();
+                        crate::x509_manager::km_registry().write().insert(km_id, state);
+                        kmf_live_km_id_by_identity().lock().insert(ih, km_id);
+                    }
+                }
+            }
             if ks_id != 0 {
                 let this = obj_arg(args, 0)?;
                 // `set_field_by_name` would silently no-op here: this KMF
@@ -5770,6 +6318,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
             }
         }
+        if let Ok(this) = obj_arg(args, 0) {
+            if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "init",
+                    "(Ljava/security/KeyStore;[C)V",
+                    &[
+                        args.get(1).copied().unwrap_or(Value::Object(None)),
+                        args.get(2).copied().unwrap_or(Value::Object(None)),
+                    ],
+                );
+            }
+        }
         Ok(None)
     });
     // STUB-REMOVAL (wave 2): this used to return normally without doing
@@ -5787,7 +6348,22 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         kmf,
         "init",
         "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
-        |ctx, _args| {
+        |ctx, args| {
+            // Only the synthetic default factory is unable to serve this
+            // overload. A caller's own subclass (netty's
+            // `SimpleKeyManagerFactory`, and every per-test factory built on
+            // it) has a real SPI that implements it — refusing on its behalf
+            // turned a working provider into a hard failure.
+            if let Ok(this) = obj_arg(args, 0) {
+                if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "init",
+                        "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+                        &[args.get(1).copied().unwrap_or(Value::Object(None))],
+                    );
+                }
+            }
             Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "java/security/InvalidAlgorithmParameterException",
@@ -5841,6 +6417,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // call with no preceding `init(KeyStore, char[])`, which is not
             // a real/expected call shape for this API but shouldn't panic.
             let this = obj_arg(args, 0)?;
+            // Sibling of the `TrustManagerFactory.getTrustManagers` guard just
+            // above: a concrete provider factory (netty's
+            // `SimpleKeyManagerFactory`, e.g. `SniClientJava8TestUtil`'s
+            // per-host key manager) implements its policy through the real
+            // bytecode and its own SPI. Answering with OUR keystore-derived
+            // manager silently replaces the caller's.
+            if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getKeyManagers",
+                    "()[Ljavax/net/ssl/KeyManager;",
+                    &[],
+                );
+            }
             let ih = ctx.identity_hash_code(this);
             let ks_id = if ih != 0 {
                 kmf_keystore_id_by_identity()
@@ -5852,16 +6442,61 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 0
             };
             let km = if ks_id != 0 {
+                // Slot 2 is the algorithm this factory was created with (see
+                // `KeyManagerFactory.getInstance` above). It decides WHICH
+                // KeyManager class the JDK hands out, and callers branch on
+                // that name — see `km_mirror_class_for_algorithm`.
+                let algorithm = if ctx.object_num_fields(this) > 2 {
+                    match ctx.get_field(this, 2) {
+                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                let mirror = crate::x509_manager::km_mirror_class_for_algorithm(&algorithm);
                 let state = crate::x509_manager::build_key_manager_state(ks_id);
                 let km_id = crate::x509_manager::next_km_id();
                 crate::x509_manager::km_registry()
                     .write()
                     .insert(km_id, state);
-                let km = try_alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_SUN_X509_KM, 2)?;
+                let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
+                crate::x509_manager::set_km_id(ctx, km, km_id);
+                km
+            } else if let Some(km_id) = kmf_live_km_id_by_identity().lock().get(&ih).copied() {
+                // A caller's own `KeyStore`, already enumerated at `init` time.
+                // Same mirror class and the same `km_registry` id space as the
+                // branch above, so `getCertificateChain`/`getPrivateKey` are the
+                // real natives rather than abstract interface methods.
+                let algorithm = if ctx.object_num_fields(this) > 2 {
+                    match ctx.get_field(this, 2) {
+                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                let mirror = crate::x509_manager::km_mirror_class_for_algorithm(&algorithm);
+                let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
                 crate::x509_manager::set_km_id(ctx, km, km_id);
                 km
             } else {
-                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 0)?
+                // Nothing was ever `init`-ed with a usable store. Still answer
+                // with the natively-backed mirror rather than a bare-interface
+                // object: an EMPTY registry entry makes `getCertificateChain`
+                // return null, which is a contract-legal answer, where
+                // `AbstractMethodError` is not.
+                let km_id = crate::x509_manager::next_km_id();
+                crate::x509_manager::km_registry()
+                    .write()
+                    .insert(km_id, Default::default());
+                let km = try_alloc_concurrent_synthetic(
+                    ctx,
+                    crate::x509_manager::km_mirror_class_for_algorithm(""),
+                    2,
+                )?;
+                crate::x509_manager::set_km_id(ctx, km, km_id);
+                km
             };
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(km)));
@@ -7016,6 +7651,22 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 &args[1..2],
             );
             if matches!(provider, Ok(Some(Value::Object(Some(_))))) {
+                // The NAMED provider's own factory first — the one-argument form
+                // below walks the chain and answers `SUN` for `X.509` no matter
+                // who was asked. See
+                // `provider_chain::try_build_real_certificate_factory_for`.
+                let type_name = cf_type_arg(ctx, args).unwrap_or_default();
+                if !type_name.is_empty() {
+                    if let Ok(Some(real_cf)) =
+                        crate::jca::provider_chain::try_build_real_certificate_factory_for(
+                            ctx,
+                            Some(&provider_name),
+                            &type_name,
+                        )
+                    {
+                        return Ok(Some(Value::Object(Some(real_cf))));
+                    }
+                }
                 return ctx.invoke(
                     "java/security/cert/CertificateFactory",
                     "getInstance",
@@ -7185,6 +7836,39 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             }
             ctx.set_field(al, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(al))))
+        },
+    );
+
+    // `sun.security.util.DerValue.getEncoded()` — an ALIAS for the method the
+    // real class actually declares, `toByteArray()`.
+    //
+    // **This is a symptom fix and is deliberately recorded as one.** JDK 25's
+    // `DerValue` has no `getEncoded()` (verified with `javap --module
+    // java.base`), so the `NoSuchMethodError` netty's
+    // `PemX509Certificate.append` raises is not a missing method — it is the
+    // first place a WRONG OBJECT becomes visible: something on the
+    // `CertificateFactory` path hands back a `DerValue` where an
+    // `X509Certificate` was expected, and `append` is simply the first caller
+    // to ask it for something only a certificate has.
+    //
+    // The alias is nevertheless correct for the value it returns: a `DerValue`
+    // produced by parsing a certificate wraps that certificate's whole DER
+    // SEQUENCE, and `toByteArray()` is exactly the encoding
+    // `X509Certificate.getEncoded()` is contracted to produce. So the PEM
+    // netty builds from it is the right PEM.
+    //
+    // What it does NOT do is fix the identity. Any other `X509Certificate`
+    // method asked of that object — `getSubjectX500Principal`,
+    // `checkValidity`, `getPublicKey` — still fails, and will fail with the
+    // same shape of error. The producer is the real fix; see the
+    // `openssl-key-material-and-engine-residuals` page.
+    r.register(
+        "sun/security/util/DerValue",
+        "getEncoded",
+        "()[B",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.invoke_virtual(this, "toByteArray", "()[B", &[])
         },
     );
 
@@ -8170,7 +8854,7 @@ pub(crate) mod new13_tests {
         // NEW-13.2 DoD: the default connector build (no custom KM/TM) must
         // succeed on every platform supported by native-tls, otherwise
         // SSLContext.init would fail even for the trivial null-TM path.
-        let c = new13_build_connector(&[], false, None);
+        let c = new13_build_connector(&[], false, None, None);
         assert!(c.is_ok(), "connector build failed: {:?}", c.err());
     }
 
@@ -8180,7 +8864,7 @@ pub(crate) mod new13_tests {
         // unexpected TrustManager) must be skipped rather than failing the
         // whole connector build — `new13_build_connector` logs and continues.
         let garbage = vec![0xFFu8, 0x00, 0x01, 0x02];
-        let c = new13_build_connector(&[garbage], false, None);
+        let c = new13_build_connector(&[garbage], false, None, None);
         assert!(
             c.is_ok(),
             "connector build must tolerate an unparseable extra root: {:?}",

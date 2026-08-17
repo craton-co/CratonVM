@@ -2287,30 +2287,43 @@ fn liquibase_checksum_force_native_covers_status_hotpath_intrinsics() {
     ));
 }
 
+/// `group.shutdownGracefully()` must keep Netty's own semantics.
+///
+/// The MongoDB Reactive Streams lifecycle needs a zero quiet period, and gets
+/// one by calling `native_netty_event_executor_group_shutdown_gracefully`
+/// directly from the `destroy()` bridge that replaces the bean method. It was
+/// ALSO registered against `EventExecutorGroup`,
+/// `AbstractEventExecutorGroup` and `MultiThreadIoEventLoopGroup` and forced
+/// over their bytecode, on the stated premise that this restricted it to "that
+/// concrete Netty 4.2 group" — but `MultiThreadIoEventLoopGroup` is the group
+/// every Netty 4.2 application builds, so the premise was false and every
+/// shutdown in the process ran with quiet period 0.
+///
+/// A zero quiet period does not drain the event loop, and Netty runs channel
+/// deregistration — hence `handlerRemoved` — as a queued task. That silently
+/// truncated `PcapWriteHandler`'s capture (522 bytes of 732: every close
+/// packet missing) and would truncate any other graceful-shutdown-dependent
+/// teardown the same way.
 #[test]
-fn netty_mongodb_event_loop_shutdown_bridge_is_forced_at_each_resolved_owner() {
-    let descriptor = "()Lio/netty/util/concurrent/Future;";
+fn netty_group_shutdown_gracefully_is_not_forced_to_a_zero_quiet_period() {
     for class_name in [
         "io/netty/util/concurrent/EventExecutorGroup",
         "io/netty/util/concurrent/AbstractEventExecutorGroup",
         "io/netty/channel/MultiThreadIoEventLoopGroup",
+        "io/netty/channel/nio/NioEventLoopGroup",
     ] {
-        assert!(is_netty_event_executor_group_shutdown_native_override(
-            class_name,
-            "shutdownGracefully",
-            descriptor
-        ));
-        assert!(force_native_over_real_jdk_bytecode(
-            class_name,
-            "shutdownGracefully",
-            descriptor
-        ));
+        for descriptor in [
+            "()Lio/netty/util/concurrent/Future;",
+            "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;",
+        ] {
+            assert!(
+                !force_native_over_real_jdk_bytecode(class_name, "shutdownGracefully", descriptor),
+                "{class_name}.shutdownGracefully{descriptor} must run Netty's own bytecode, \
+                 with Netty's own quiet period — a zero quiet period drops the queued \
+                 deregistration task that fires handlerRemoved"
+            );
+        }
     }
-    assert!(!is_netty_event_executor_group_shutdown_native_override(
-        "io/netty/util/concurrent/AbstractEventExecutorGroup",
-        "shutdownGracefully",
-        "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;"
-    ));
 }
 
 #[test]
@@ -3243,7 +3256,7 @@ fn lambda_proxy_captures_read_correctly() {
         .classes
         .lambda_proxies
         .write()
-        .insert(proxy_class_id, call_site);
+        .insert(proxy_class_id, std::sync::Arc::new(call_site));
 
     // Allocate a proxy object with 3 captured values
     let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 3);

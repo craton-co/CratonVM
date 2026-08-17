@@ -634,6 +634,12 @@ class_cv_args() {
   case "$1" in
     RPriorityQueueGc) printf '%s' "--nojit --Xmx 64m" ;;
     RTreeRangeGc)     printf '%s' "--Xmx 64m" ;;
+    # RClassUnloadSweepGen is RClassUnloadSweep re-run on the generational
+    # collector. Without the flag it runs on the default (ZGC since
+    # 2026-08-10) and is a byte-for-byte re-run of its twin -- a scheduled
+    # vector that cannot fail for its own reason. It does not redden the
+    # suite, which is precisely why the omission survives unnoticed.
+    RClassUnloadSweepGen) printf '%s' "-XX:+UseGenerationalGC" ;;
     # CratonVM's Panama gate is default-CLOSED (NATIVE_ACCESS_POLICY in
     # native-builtins/src/panama.rs; only --enable-native-access opens it).
     # Without this every downcall in RJdkForeign raises IllegalCallerException

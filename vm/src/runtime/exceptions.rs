@@ -1094,6 +1094,63 @@ fn trace_already_captured_at_current_depth(
     )
 }
 
+/// HotSpot's `NoSuchMethodError` message for a failed method resolution:
+/// `'<return> <class>.<name>(<params>)'` — source spelling throughout, params
+/// comma-space separated, and **the single quotes are part of the message**.
+///
+/// Measured on JDK 25 (`apps/nsme_probe`, compile against a class then run
+/// against one with the methods removed):
+///
+/// ```text
+/// 'Lib Lib.widen(boolean)'
+/// 'long Lib.calc(int, java.lang.String[], double[][])'
+/// 'void Lib.plain()'
+/// ```
+///
+/// We used to emit `Lib.widen(Z)LLib;` — the dotted class name (fixed earlier
+/// for Spring Boot's `NoSuchMethodFailureAnalyzer`, which embeds this message
+/// verbatim in its `FailureAnalysis` description) followed by the **raw
+/// descriptor**, with no return type and no quotes. That is not a spelling
+/// anything on the Java side can parse: Spring's analyzer splits the message on
+/// `(` to recover the method name, and tools that diff a linkage failure across
+/// JVMs see a different string for an identical defect. Found while triaging
+/// `module/spring-boot-data-redis` on Linux, where a fixture whose
+/// `spring-data-redis` classes were compiled against a newer Jedis than the
+/// `jedis-7.4.1.jar` on its classpath makes both VMs raise this error for
+/// `DefaultJedisClientConfig$Builder.autoNegotiateProtocol` — the failure was
+/// shared, but only the *message* differed, which is exactly the shape a
+/// "both VMs fail, so it is not our bug" triage hides.
+///
+/// The array/primitive spelling is [`helpful_npe::class_external`]'s (`int[]`,
+/// `java.lang.Object[]`) — **not** [`hotspot_external_name`]'s descriptor form,
+/// which `ClassCastException` uses; the two are deliberately different and the
+/// oracle above pins which one belongs here. `shorten_jlang` is *not* applied:
+/// HotSpot prints `java.lang.String[]` in full for this message.
+fn nsme_message(class_name: &str, method_name: &str, method_descriptor: &str) -> String {
+    let (params, ret) =
+        crate::runtime::interpreter::invoke::split_method_descriptor_ref(method_descriptor);
+    let rendered: Vec<String> = params
+        .iter()
+        .map(|p| helpful_npe::class_external(p))
+        .collect();
+    // `class_external` is built for *field/parameter* types, where `V` cannot
+    // occur, so it passes `V` through unchanged. A return type can be void, and
+    // HotSpot spells it `void` — handle it here rather than teaching the JEP 358
+    // renderer about a type its own messages never name.
+    let ret_rendered = if ret == "V" {
+        "void".to_string()
+    } else {
+        helpful_npe::class_external(ret)
+    };
+    format!(
+        "'{} {}.{}({})'",
+        ret_rendered,
+        class_name.replace('/', "."),
+        method_name,
+        rendered.join(", ")
+    )
+}
+
 /// HotSpot's `Klass::external_name()` for an already-loaded class: the internal
 /// name with `/` → `.`, **arrays left in descriptor form**.
 ///
@@ -2347,23 +2404,7 @@ fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
             method_descriptor,
         } => (
             "java/lang/NoSuchMethodError",
-            // Real JDK's NoSuchMethodError message names the class in
-            // source (dotted) form, not internal (slash) form — e.g.
-            // `'void com.example.Foo.bar()'`. Spring Boot's
-            // `NoSuchMethodFailureAnalyzer` embeds this message verbatim in
-            // its `FailureAnalysis` description, and
-            // `NoSuchMethodFailureAnalyzerTests.
-            // whenAnInheritedMethodIsMissingThenNoSuchMethodErrorIsAnalyzed`
-            // asserts the description contains the fully-qualified DOTTED
-            // class+method (`R2dbcMappingContext.class.getName() +
-            // ".setForceQuote("`), which a slash-separated class name can
-            // never satisfy.
-            format!(
-                "{}.{}{}",
-                class_name.replace('/', "."),
-                method_name,
-                method_descriptor
-            ),
+            nsme_message(class_name, method_name, method_descriptor),
         ),
         LinkageError::IncompatibleClassChangeError { message } => {
             ("java/lang/IncompatibleClassChangeError", message.clone())
@@ -3245,6 +3286,7 @@ mod tests {
 #[cfg(test)]
 mod helpful_npe_tests {
     use super::helpful_npe::{self, CpRef, CpResolver, Producer};
+    use super::nsme_message;
     use std::collections::HashMap;
 
     /// Map-backed resolver: cp-index -> CpRef, mirroring what the live
@@ -3340,6 +3382,60 @@ mod helpful_npe_tests {
         assert_eq!(
             helpful_npe::class_external("[Ljava/lang/Object;"),
             "java.lang.Object[]"
+        );
+    }
+
+    /// `NoSuchMethodError`'s message, pinned to the JDK 25 output of
+    /// `apps/nsme_probe` (compile against a class, run against one with the
+    /// methods removed). Every character matters: the quotes are part of the
+    /// message, the return type leads, params are `, `-separated, and arrays
+    /// use source spelling rather than descriptor form.
+    #[test]
+    fn nsme_message_matches_hotspot() {
+        // 'Lib Lib.widen(boolean)'
+        assert_eq!(nsme_message("Lib", "widen", "(Z)LLib;"), "'Lib Lib.widen(boolean)'");
+        // 'long Lib.calc(int, java.lang.String[], double[][])'
+        assert_eq!(
+            nsme_message("Lib", "calc", "(I[Ljava/lang/String;[[D)J"),
+            "'long Lib.calc(int, java.lang.String[], double[][])'"
+        );
+        // 'void Lib.plain()' — void return, and an empty parameter list must
+        // not leave a stray separator.
+        assert_eq!(nsme_message("Lib", "plain", "()V"), "'void Lib.plain()'");
+    }
+
+    /// The internal owner name is dotted, and the message still contains the
+    /// fully-qualified `Class.method(` substring Spring Boot's
+    /// `NoSuchMethodFailureAnalyzer` looks for — the property the previous
+    /// (raw-descriptor) spelling was written to satisfy, which the HotSpot
+    /// spelling satisfies too. This is what keeps
+    /// `NoSuchMethodFailureAnalyzerTests` green across the change.
+    #[test]
+    fn nsme_message_keeps_the_dotted_class_and_method_prefix() {
+        let msg = nsme_message(
+            "org/springframework/data/r2dbc/mapping/R2dbcMappingContext",
+            "setForceQuote",
+            "(Z)V",
+        );
+        assert!(
+            msg.contains("org.springframework.data.r2dbc.mapping.R2dbcMappingContext.setForceQuote("),
+            "analyzer-visible prefix missing from {msg}"
+        );
+    }
+
+    /// The real Linux `spring-boot-data-redis` failure this spelling was fixed
+    /// for: a fixture compiled against a newer Jedis than the jar on its
+    /// classpath. HotSpot reports exactly this string.
+    #[test]
+    fn nsme_message_matches_hotspot_for_the_jedis_fixture_skew() {
+        assert_eq!(
+            nsme_message(
+                "redis/clients/jedis/DefaultJedisClientConfig$Builder",
+                "autoNegotiateProtocol",
+                "(Z)Lredis/clients/jedis/DefaultJedisClientConfig$Builder;"
+            ),
+            "'redis.clients.jedis.DefaultJedisClientConfig$Builder \
+             redis.clients.jedis.DefaultJedisClientConfig$Builder.autoNegotiateProtocol(boolean)'"
         );
     }
 

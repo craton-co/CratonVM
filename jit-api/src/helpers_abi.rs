@@ -681,11 +681,11 @@ helper_fn_slots! {
     // shape as `new_object_cp` and for the same reason; see
     // `JitRuntimeHelpers::ldc_class_cp`.
     HelperFnLdcClassCp, ldc_class_cp, ldc_class_cp_fn, (i64, i64, i64) -> i64;
-    // JVMS §6.5 aastore covariance check only — (vm_ptr, array_ptr, val) ->
+    // JVMS §6.5 aastore covariance check ONLY — (vm_ptr, array_ptr, val) ->
     // `i64::MIN` = refused (ArrayStoreException published) / `0` = proceed.
     // NOT the store: the caller keeps the inline MOV, the SATB pre-write
-    // barrier and the card mark.
-    HelperFnAastoreCheck, aastore_check, aastore_check_fn, (i64, i64, i64) -> i64;
+    // barrier and the card mark. See `JitRuntimeHelpers::aastore_type_check`.
+    HelperFnAastoreTypeCheck, aastore_type_check, aastore_type_check_fn, (i64, i64, i64) -> i64;
 }
 
 // ---------------------------------------------------------------------
@@ -799,9 +799,10 @@ helper_field_table! {
     (monitor_exit,                   Function, false),
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site.
     (ldc_class_cp,                   Function, false),
-    // Optional: 0 makes the `0x53` lowering route the whole opcode to
-    // `aastore` instead. Not `required`: the fallback is correct, just slower.
-    (aastore_check,                  Function, false),
+    // Required: the x64 `0x53` lowering is inline and calls this for the JVMS
+    // §6.5 covariance check, so a `0` slot would be a reference store with no
+    // check at all — the heap-type-confusion defect the slot exists to close.
+    (aastore_type_check,             Function, true),
 }
 
 // ---------------------------------------------------------------------
@@ -882,7 +883,7 @@ const _: () = {
          alias (or vice versa) — add it to helper_fn_slots! in helpers_abi.rs",
     );
     assert!(
-        required == 42,
+        required == 43,
         "the required-slot count changed — a helper was promoted or demoted; \
          confirm the backend really does (not) CALL it unconditionally",
     );
@@ -990,7 +991,7 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("monitor_enter", 480),
     ("monitor_exit", 488),
     ("ldc_class_cp", 496),
-    ("aastore_check", 504),
+    ("aastore_type_check", 504),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1078,8 +1079,10 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         num_fields: 63,
         size: 504,
     },
-    // v5 — appended `aastore_check`, so the `0x53` lowering can keep its
-    // inline store and call out only for the JVMS §6.5 covariance check.
+    // v5 — appended `aastore_type_check`, so that a JIT-compiled `aastore`
+    // throws `ArrayStoreException` at all. The x64 emitter lowers `aastore`
+    // inline and therefore never calls `aastore`; the covariance check is the
+    // one part of that helper the inline path cannot do for itself.
     HelperAbiRevision {
         version: 5,
         num_fields: 64,
@@ -1305,7 +1308,7 @@ const _: () = {
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
     );
-    assert!(required == 42, "required-slot count changed");
+    assert!(required == 43, "required-slot count changed");
     assert!(
         optional_fns == 13,
         "the optional-callable count changed — every optional slot MUST have a \
@@ -1651,7 +1654,7 @@ mod tests {
             ("monitor_enter", offset_of!(H, monitor_enter)),
             ("monitor_exit", offset_of!(H, monitor_exit)),
             ("ldc_class_cp", offset_of!(H, ldc_class_cp)),
-            ("aastore_check", offset_of!(H, aastore_check)),
+            ("aastore_type_check", offset_of!(H, aastore_type_check)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1715,7 +1718,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "aastore_check");
+        assert_eq!(last_name, "aastore_type_check");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1922,8 +1925,8 @@ mod tests {
         assert_eq!(functions, 55, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
         assert_eq!(constants, 5, "baked-address slots");
-        assert_eq!(required, 42, "required slots");
-        assert_eq!(functions - required, 13, "optional callable slots");
+        assert_eq!(required, 43, "required slots");
+        assert_eq!(functions - required, 12, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
     }
 
@@ -2077,9 +2080,9 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `aastore_check`
-        // since the aastore check-only helper was appended.
-        h.aastore_check = 2;
+        // The LAST field, whatever it currently is — `aastore_type_check`
+        // since the aastore element-type check was appended.
+        h.aastore_type_check = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");

@@ -904,7 +904,9 @@ pub(crate) fn load_pkcs12_ex(
     let mut keys_by_local_id: IndexMap<Vec<u8>, (Option<String>, Vec<u8>)> = IndexMap::new();
     let mut certs_by_local_id: IndexMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>> = IndexMap::new();
     let mut orphan_certs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
-    let mut secret_keys: Vec<(String, Vec<u8>, String)> = Vec::new();
+    // `Option<String>` for the alias: a bag with no `friendlyName` is numbered
+    // from the load-wide counter below, not named here.
+    let mut secret_keys: Vec<(Option<String>, Vec<u8>, String)> = Vec::new();
 
     for bag in &bags {
         let friendly = bag.friendly_name();
@@ -1010,17 +1012,39 @@ pub(crate) fn load_pkcs12_ex(
                         .ok()
                     });
                 if let Some((algorithm, key_bytes)) = secret {
-                    let alias = friendly.unwrap_or_else(|| hex_lower(&local_id));
-                    secret_keys.push((alias, key_bytes, secret_alg_name(&algorithm)));
+                    // `friendly` stays an `Option` here: an un-named bag's alias
+                    // is assigned below, from the load-wide counter that has to
+                    // number every entry kind in one sequence.
+                    secret_keys.push((friendly, key_bytes, secret_alg_name(&algorithm)));
                 }
             }
             _ => {}
         }
     }
 
+    // Aliases for bags that carry NO `friendlyName`.
+    //
+    // The old rule here was "hex of the localKeyId, like keytool does". That is
+    // what keytool PRINTS, and it is not what `sun.security.pkcs12.PKCS12KeyStore`
+    // — the reader every `KeyStore.getInstance("PKCS12")` actually uses — does.
+    // Its `getUnfriendlyName()` is `counter++; return String.valueOf(counter)`,
+    // so an un-named bag is called "1", "2", … in bag order, and the counter is
+    // shared by every entry kind in one load.
+    //
+    // Measured on jdk-25.0.3.9-hotspot against netty's own
+    // `mutual_auth_server.p12` (a `localKeyID` and no `friendlyName`): HotSpot
+    // reports alias `1`; CratonVM reported
+    // `70e4faffe3f82e2db1c949282bf86a7c17348838`. Any caller that looks an entry
+    // up by the alias its own test data documents then missed —
+    // `OpenSslKeyMaterialProviderTest` asks for `"1"` and got null key material
+    // (found while closing the retired `ssl-suite-test-discovery-undercounts`
+    // write-up, whose fix made the OpenSSL half of those classes run at all).
+    let mut unfriendly_counter: u32 = 0;
+
     let mut entries: IndexMap<String, KeyStoreEntry> = IndexMap::new();
 
-    for (alias, key_bytes, algorithm) in secret_keys {
+    for (friendly, key_bytes, algorithm) in secret_keys {
+        let alias = friendly.unwrap_or_else(|| unfriendly_alias(&mut unfriendly_counter));
         entries.insert(
             alias.clone(),
             KeyStoreEntry {
@@ -1057,11 +1081,10 @@ pub(crate) fn load_pkcs12_ex(
         }
         extend_chain_by_issuer(&mut chain, &mut certs_by_local_id, &mut orphan_certs);
 
-        let alias = key_friendly.or(chain_friendly).unwrap_or_else(|| {
-            // Fallback: use the hex of the localKeyId, like keytool does
-            // when no friendlyName was specified.
-            hex_lower(&local_id)
-        });
+        let _ = &local_id;
+        let alias = key_friendly
+            .or(chain_friendly)
+            .unwrap_or_else(|| unfriendly_alias(&mut unfriendly_counter));
 
         entries.insert(
             alias.clone(),
@@ -1080,7 +1103,8 @@ pub(crate) fn load_pkcs12_ex(
         .collect::<Vec<_>>();
     walk.extend(orphan_certs);
     for (idx, (friendly, der)) in walk.into_iter().enumerate() {
-        let alias = friendly.unwrap_or_else(|| format!("cert_{}", idx));
+        let _ = idx;
+        let alias = friendly.unwrap_or_else(|| unfriendly_alias(&mut unfriendly_counter));
         entries.insert(
             alias.clone(),
             KeyStoreEntry {
@@ -1961,6 +1985,18 @@ impl<'a> JksReader<'a> {
     }
 }
 
+/// The alias `sun.security.pkcs12.PKCS12KeyStore` gives a bag that carries no
+/// `friendlyName`: `getUnfriendlyName()`, i.e. `++counter` rendered as a
+/// decimal string, shared across every entry kind in one load.
+///
+/// See the call sites in `parse_pkcs12` for why the previous "hex of the
+/// localKeyId" rule (what *keytool* prints, not what the reader assigns) made
+/// every alias in netty's `mutual_auth_server.p12` unfindable.
+fn unfriendly_alias(counter: &mut u32) -> String {
+    *counter += 1;
+    counter.to_string()
+}
+
 fn hex_lower(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
@@ -2536,11 +2572,25 @@ pub(crate) fn private_key_der_from_proxy(
         Value::Long(value) => value,
         _ => return None,
     };
+    let alias_hash = composite as u32;
+    // The other producer of this layout is
+    // `x509_manager::make_private_key_mirror`, whose high half is a
+    // `KeyManager` id from a DIFFERENT counter. It tags itself so the two are
+    // distinguishable; untagged composites are keystore ids as before. Reading
+    // a tagged one as a store id is what made
+    // `KeyManager.getPrivateKey(alias).getEncoded()` return an empty array
+    // whenever the two counters were not coincidentally aligned.
+    if crate::x509_manager::is_km_proxy_composite(composite) {
+        let km_id = crate::x509_manager::km_id_of_composite(composite);
+        if km_id <= 0 {
+            return None;
+        }
+        return crate::x509_manager::km_key_der_by_alias_hash(km_id, alias_hash);
+    }
     let store_id = (composite >> 32) as i32;
     if store_id <= 0 {
         return None;
     }
-    let alias_hash = composite as u32;
     let store = keystore_lookup(store_id)?;
     store.entries.values().find_map(|entry| {
         if fnv1a_32(entry.alias.as_bytes()) != alias_hash {
@@ -2621,11 +2671,12 @@ pub(crate) fn engine_get_certificate_chain(
             crate::util_concurrent_ext::refused_class(ctx, "java/security/cert/X509Certificate", 8)?
         }
     };
-    let arr = ctx.new_ref_array(cls_id, chain.len());
-    for (i, der) in chain.iter().enumerate() {
-        let mirror = make_x509_mirror(ctx, &alias, der);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
-    }
+    let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+        ctx,
+        cls_id,
+        chain.len(),
+        |ctx, i| make_x509_mirror(ctx, &alias, &chain[i]),
+    )?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -2649,11 +2700,12 @@ pub(crate) fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // is not a recovery, it is a second failure wearing the first one's name.
         Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/String", 8)?,
     };
-    let arr = ctx.new_ref_array(cls_id, aliases.len());
-    for (i, a) in aliases.iter().enumerate() {
-        let s = ctx.create_string(a);
-        ctx.set_array_element(arr, i, Value::Object(Some(s)));
-    }
+    let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+        ctx,
+        cls_id,
+        aliases.len(),
+        |ctx, i| Ok(ctx.create_string(&aliases[i])),
+    )?;
 
     // Under `--jdk-only` this fabrication is refused; fall back to an
     // enumeration the JDK builds itself (`Arrays$ArrayList` +
@@ -3448,7 +3500,7 @@ fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
 
 /// Invoke `getEncoded()[B` on `obj` and copy the result out. Empty vec when the
 /// call fails, returns null, or returns a zero-length array.
-fn read_encoded_byte_array(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u8> {
+pub(crate) fn read_encoded_byte_array(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u8> {
     match ctx.invoke_virtual(obj, "getEncoded", "()[B", &[]) {
         Ok(Some(Value::Object(Some(arr)))) => read_byte_array(ctx, arr),
         _ => Vec::new(),
@@ -3470,7 +3522,7 @@ fn read_encoded_byte_array(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u
 /// The fallback is deliberately narrow — it fires only for objects whose exact
 /// class is the synthetic mirror — so it can never misread an unrelated field
 /// of a real `sun.security.x509.X509CertImpl`.
-fn certificate_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Vec<u8> {
+pub(crate) fn certificate_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Vec<u8> {
     let der = read_encoded_byte_array(ctx, cert);
     if !der.is_empty() {
         return der;

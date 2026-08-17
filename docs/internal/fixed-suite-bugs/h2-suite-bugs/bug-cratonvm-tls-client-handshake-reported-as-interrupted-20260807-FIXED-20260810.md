@@ -123,6 +123,27 @@ HotSpot's text is PKIX-flavoured and CratonVM's is OpenSSL-flavoured; the
 divergence that mattered (type, and 30 s) is gone. Both VMs reject the same
 certificate at the same point.
 
+> **AMENDED 2026-08-16, twice — read this before citing the paragraph above.**
+>
+> 1. **There was a SECOND cause of the same 30 s `WouldBlock`, and this page's
+>    fixture could not see it.** `TlsBoth` makes exactly ONE client connection.
+>    `SSLServerSocket.accept()` ran the handshake inline and threw its failure
+>    out of `accept()`, so the FIRST failed handshake killed the server's accept
+>    loop — and H2 supplies one before any real client, because
+>    `TcpServer.isRunning()` connects and closes without I/O. With a probe that
+>    connects three times before the real client (`TlsProbe2`), pristine `dev`
+>    still gave `30 162 ms` + "the handshake process was interrupted" as late as
+>    2026-08-16. Fixed by deferring the failure to the accepted socket, as JSSE
+>    does; the retired
+>    `bug-h2-suite-fail-cluster-pgserver-tools-memoryunmapper-filelock-timer-20260807`
+>    page carries the measurements. `TestTools`: 38 s → 4.9 s.
+> 2. **"Both VMs reject the same certificate" is only true as H2 configures
+>    it.** With H2's keystore ALSO installed as the trust store, HotSpot
+>    completes the handshake (197 ms) and CratonVM still refuses it
+>    ("EE certificate key too weak", 50 ms): the client applies OpenSSL's
+>    SECLEVEL where HotSpot applies the JDK's trust-anchor rules. Filed as
+>    `docs/known-issues/tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816.md`.
+
 ## Reproducer
 
 `TlsBoth.java` — H2's `NetUtils` on both ends in one process, timestamped:

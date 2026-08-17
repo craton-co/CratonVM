@@ -670,6 +670,57 @@ pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
 /// it's used to cross-match against `sk_table` rows in cancel /
 /// interest-op updates without dereferencing `key_obj` (which may have
 /// been relocated by the GC between registration and the next lookup).
+/// Re-point every live registration for `net_fd` at the channel's CURRENT
+/// socket.
+///
+/// Called after `DatagramChannel.bind()` swaps a channel's socket (see
+/// `FdTable::udp_rebind`). The registration keeps its `net_fd` key, its
+/// interest ops and its `SelectionKey` object — only the polled handle
+/// changes — so a `SelectionKey` netty is already holding stays valid and
+/// starts reporting readiness on the bound socket.
+///
+/// A channel with no registration (the ordinary `DatagramChannel.open();
+/// bind()` sequence) matches nothing and this is a no-op.
+pub fn selector_refresh_udp(net_fd: i32, fresh: &UdpSocket) {
+    let ids: Vec<i32> = {
+        let regs = selectors().read();
+        regs.iter()
+            .filter(|(_, s)| {
+                let st = s.lock();
+                st.open && st.keys.get(&net_fd).is_some_and(|k| !k.cancelled)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in ids {
+        let previous = {
+            let regs = selectors().read();
+            regs.get(&id).and_then(|s| {
+                let st = s.lock();
+                st.keys
+                    .get(&net_fd)
+                    .map(|k| (k.interest_ops, k.key_obj, k.key_hash))
+            })
+        };
+        let Some((interest_ops, key_obj, key_hash)) = previous else {
+            continue;
+        };
+        let Ok(clone) = fresh.try_clone() else {
+            continue;
+        };
+        // Re-run the ordinary registration path rather than reaching into the
+        // state: it is what keeps the epoll set in step with the new fd.
+        let _ = selector_register(
+            id,
+            net_fd,
+            interest_ops,
+            key_obj,
+            key_hash,
+            Some(SelectableKind::Udp(clone)),
+        );
+    }
+}
+
 pub fn selector_register(
     id: i32,
     net_fd: i32,
@@ -853,15 +904,34 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
         // already published the new mask, so the `epoll_wait` that thread is
         // about to enter evaluates it. The nudge exists only for a select that
         // is ALREADY parked.
-        if st.in_flight_selects != 0 {
-            if let Some(wfd) = st.wakeup_pipe_write {
-                let byte: u8 = b'I';
-                // SAFETY: `wfd` is this selector's own pipe write end, held live by
-                // `st`; the pointer is to a one-byte stack local and the length says
-                // one byte.
-                let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
-            }
-        }
+        // REMOVED (netty ParameterizedSslHandlerTest selector spin, 2026-08-15).
+        //
+        // The nudge above was written on the premise that "epoll_ctl(MOD) does
+        // not reliably interrupt an already-blocked epoll_wait". On Linux that
+        // premise is false: `ep_modify()` re-evaluates the file's readiness
+        // against the NEW event mask and wakes the epoll waiters itself, which
+        // is precisely why `epoll_ctl` is safe to call from another thread while
+        // one is parked. The `epoll_ctl(EPOLL_CTL_MOD)` immediately above is
+        // therefore already the wakeup.
+        //
+        // What the extra byte bought instead was a guaranteed ZERO-KEY return:
+        // it lands on the wakeup fd, phase 3 sets `woken` and counts nothing, so
+        // `select(timeout)` comes back at once having selected nothing. A Netty
+        // event loop sets interest ops between every select, so this fires
+        // continuously — `NioIoHandler` logs "Selector.select() returned
+        // prematurely 512 times in a row; rebuilding Selector", rebuilds (which
+        // re-registers every channel, which sets more interest ops, which queues
+        // more nudges) and never converges: 687 rebuilds in one
+        // `ParameterizedSslHandlerTest` run, which then never finished at all.
+        //
+        // Gating it on `in_flight_selects != 0` (the previous fix) bounded the
+        // storm for a client with a handful of connections but not for an event
+        // loop, because between-selects IS the steady state there.
+        //
+        // The worst case without it is a readiness change that the kernel does
+        // not deliver until the current wait times out — latency, not a stall —
+        // and Linux does deliver it. The non-Linux branch below keeps its own
+        // nudge: WSAPoll genuinely cannot observe an interest change mid-wait.
     }
     // Windows/non-Linux equivalent of the epoll self-pipe nudge above: a
     // thread already blocked in WSAPoll cannot observe this interest_ops

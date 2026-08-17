@@ -72,32 +72,74 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     // W7-44-numberformat-enum-and-double-tostring.md for that finding and
     // W7-54-strictmath-fdlibm-family.md for the rest.
     //
-    // `Math` keeps libm on purpose. Do NOT "simplify" this by pointing both
-    // classes at the fdlibm bodies: that would be slower for the overwhelmingly
-    // more common caller and would not fix anything, since libm already
-    // satisfies `Math`'s contract.
+    // WHICH CLASS GETS WHICH BACKING — measured, not reasoned (2026-08-16).
+    //
+    // The paragraph that used to stand here said `Math` keeps libm across the
+    // board because libm already satisfies `Math`'s 1-ULP contract. That is
+    // true of the *specification* and false of the *oracle*. In JDK 25 every
+    // one of these `Math` bodies is a one-line `return StrictMath.f(a);` — so
+    // `Math.f` and `StrictMath.f` are the same function on HotSpot EXCEPT
+    // where HotSpot substitutes an intrinsic. Reproducing HotSpot therefore
+    // needs a three-way split, not a two-way one.
+    //
+    // `probes/MathCensus.java` replayed a HotSpot JDK 25 oracle (5400 inputs
+    // per function, six generators from [-1,1] through raw bit patterns)
+    // against both candidate backings. Columns are "rows where the backing
+    // disagrees with HotSpot's `Math.f`", out of 5400:
+    //
+    //   function   libm   fdlibm        function   libm   fdlibm
+    //   asin         52     0  <--      sin           9    134
+    //   acos         90     0  <--      cos           9    137
+    //   atan         65     0  <--      tan          20    158
+    //   atan2       884     0  <--      exp           4    181
+    //   hypot       405     0  <--      log           0     78
+    //   sinh         77     0  <--      log10       116    125
+    //   cosh        128     0  <--      pow           1     89
+    //   expm1         1     0  <--      cbrt         11    435
+    //   log1p         0     0  <--      tanh        543    543
+    //
+    // The left column is exactly the set of these functions HotSpot does NOT
+    // intrinsify, and for every one of them fdlibm is not merely closer, it is
+    // EXACT — so those rows are registered once, shared by both classes. The
+    // right column is HotSpot's intrinsic set (`_dsin`, `_dcos`, `_dtan`,
+    // `_dexp`, `_dlog`, `_dlog10`, `_dpow`, `_dcbrt`, `_dtanh`): its answers
+    // come from Intel LIBM assembly stubs that match NEITHER candidate, and
+    // there the host libm is one to two orders of magnitude closer than
+    // fdlibm, so those stay split and `Math` keeps libm.
+    //
+    // The cost of getting this wrong was four real test failures, not a last-
+    // ULP curiosity: commons-math's `GaussNewtonOptimizerWith*Test`
+    // `testMaxEvaluations` drives an optimizer whose convergence checker is set
+    // to a 1e-30 tolerance so that it can NEVER converge and must instead trip
+    // the 100-evaluation budget. `CircleVectorial`'s model calls
+    // `Vector2D.distance`, i.e. `Math.hypot`. One ULP of difference in one of
+    // five residuals moved the iteration onto a trajectory that reached an
+    // exact fixed point in nine evaluations, the checker reported convergence,
+    // and `TooManyEvaluationsException` was never thrown. See
+    // docs/known-issues/commons-math/bug-commonsmath-gaussnewton-testmaxevaluations-no-exception-20260816.md.
     let strict = class == "java/lang/StrictMath";
+
+    // --- Shared fdlibm rows (left column above): NOT a `Math`-vs-`StrictMath`
+    // choice at all, because HotSpot runs the same Java body for both.
+    registry.register(class, "asin", "(D)D", native_fdlibm_asin);
+    registry.register(class, "acos", "(D)D", native_fdlibm_acos);
+    registry.register(class, "atan", "(D)D", native_fdlibm_atan);
+    registry.register(class, "atan2", "(DD)D", native_fdlibm_atan2);
+    // --- Split rows (right column above): HotSpot intrinsifies these, so
+    // neither backing is exact and libm is the closer approximation.
     if strict {
-        registry.register(class, "pow", "(DD)D", native_strict_math_pow);
-        registry.register(class, "sin", "(D)D", native_strict_math_sin);
-        registry.register(class, "cos", "(D)D", native_strict_math_cos);
-        registry.register(class, "tan", "(D)D", native_strict_math_tan);
-        registry.register(class, "asin", "(D)D", native_strict_math_asin);
-        registry.register(class, "acos", "(D)D", native_strict_math_acos);
-        registry.register(class, "atan", "(D)D", native_strict_math_atan);
-        registry.register(class, "atan2", "(DD)D", native_strict_math_atan2);
-        registry.register(class, "log", "(D)D", native_strict_math_log);
-        registry.register(class, "log10", "(D)D", native_strict_math_log10);
-        registry.register(class, "exp", "(D)D", native_strict_math_exp);
+        registry.register(class, "pow", "(DD)D", native_fdlibm_pow);
+        registry.register(class, "sin", "(D)D", native_fdlibm_sin);
+        registry.register(class, "cos", "(D)D", native_fdlibm_cos);
+        registry.register(class, "tan", "(D)D", native_fdlibm_tan);
+        registry.register(class, "log", "(D)D", native_fdlibm_log);
+        registry.register(class, "log10", "(D)D", native_fdlibm_log10);
+        registry.register(class, "exp", "(D)D", native_fdlibm_exp);
     } else {
         registry.register(class, "pow", "(DD)D", native_math_pow);
         registry.register(class, "sin", "(D)D", native_math_sin);
         registry.register(class, "cos", "(D)D", native_math_cos);
         registry.register(class, "tan", "(D)D", native_math_tan);
-        registry.register(class, "asin", "(D)D", native_math_asin);
-        registry.register(class, "acos", "(D)D", native_math_acos);
-        registry.register(class, "atan", "(D)D", native_math_atan);
-        registry.register(class, "atan2", "(DD)D", native_math_atan2);
         registry.register(class, "log", "(D)D", native_math_log);
         registry.register(class, "log10", "(D)D", native_math_log10);
         registry.register(class, "exp", "(D)D", native_math_exp);
@@ -113,7 +155,7 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     registry.register(class, "signum", "(D)D", native_math_signum_double);
     registry.register(class, "signum", "(F)F", native_math_signum_float);
     if strict {
-        registry.register(class, "cbrt", "(D)D", native_strict_math_cbrt);
+        registry.register(class, "cbrt", "(D)D", native_fdlibm_cbrt);
     } else {
         registry.register(class, "cbrt", "(D)D", native_math_cbrt);
     }
@@ -203,40 +245,40 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     );
 
     // --- Advanced functions (Phase 13 Step 3) ---
-    // Same Math/StrictMath split as the block above, and for the same reason:
-    // `sinh` and `cosh` are the second- and third-worst rows in the census
-    // (28.08% and 28.55% of sampled inputs disagreed with fdlibm on the libm we
-    // link), because both are defined in terms of `expm1`/`exp` and inherit
-    // those functions' deviation on top of their own.
+    // `hypot`, `log1p`, `expm1`, `sinh` and `cosh` are shared for the reason
+    // given above `let strict`: HotSpot has no intrinsic for any of them, so
+    // its `Math.f` IS the fdlibm body and a libm backing here is a measured
+    // divergence from the oracle (hypot 405/5400, cosh 128, sinh 77). `tanh`
+    // stays split: HotSpot's `_dtanh` intrinsic agrees with neither backing.
+    registry.register(class, "hypot", "(DD)D", native_fdlibm_hypot);
+    registry.register(class, "log1p", "(D)D", native_fdlibm_log1p);
+    registry.register(class, "expm1", "(D)D", native_fdlibm_expm1);
+    registry.register(class, "sinh", "(D)D", native_fdlibm_sinh);
+    registry.register(class, "cosh", "(D)D", native_fdlibm_cosh);
     if strict {
-        registry.register(class, "hypot", "(DD)D", native_strict_math_hypot);
-        registry.register(class, "log1p", "(D)D", native_strict_math_log1p);
-        registry.register(class, "expm1", "(D)D", native_strict_math_expm1);
-        registry.register(class, "sinh", "(D)D", native_strict_math_sinh);
-        registry.register(class, "cosh", "(D)D", native_strict_math_cosh);
-        registry.register(class, "tanh", "(D)D", native_strict_math_tanh);
+        registry.register(class, "tanh", "(D)D", native_fdlibm_tanh);
     } else {
-        registry.register(class, "hypot", "(DD)D", native_math_hypot);
-        registry.register(class, "log1p", "(D)D", native_math_log1p);
-        registry.register(class, "expm1", "(D)D", native_math_expm1);
-        registry.register(class, "sinh", "(D)D", native_math_sinh);
-        registry.register(class, "cosh", "(D)D", native_math_cosh);
         registry.register(class, "tanh", "(D)D", native_math_tanh);
     }
-    // `Math.copySign` and `StrictMath.copySign` DIFFER on a NaN sign argument,
-    // and this registrar serves both classes with one body. MEASURED
-    // 2026-08-13 (scratchpad/orch/Two.java) on 25.0.3+9-LTS:
+    // `copySign` is the one row where `Math` and `StrictMath` differ BY
+    // SPECIFICATION rather than by intrinsic: `StrictMath.copySign` is defined
+    // as `Math.copySign(magnitude, isNaN(sign) ? 1.0 : sign)` — it treats a NaN
+    // sign argument as POSITIVE, where `Math.copySign` copies the NaN's actual
+    // sign bit. Registering one body for both made `StrictMath.copySign` return
+    // a negative magnitude for 12 of 6000 sampled pairs where HotSpot returns a
+    // positive one. Note the direction: here the STRICT class is the looser of
+    // the two, which is why sharing looked safe.
+    //
+    // MEASURED 2026-08-13 on 25.0.3+9-LTS, the two-line demonstration:
     //
     //   StrictMath.copySign(1.0, -NaN) = 3ff0000000000000  (+1.0)
     //   Math.copySign(1.0, -NaN)       = bff0000000000000  (-1.0)
     //
-    // StrictMath specifies that a NaN sign argument is ALWAYS treated as
-    // positive; Math is explicitly permitted to propagate the raw sign bit for
-    // speed, and its answer already matched. So only the strict form is wrong,
-    // and only for NaN -- `copySign(1.0, -0.0)` is -1.0 in BOTH and must stay.
-    if class == "java/lang/StrictMath" {
-        registry.register(class, "copySign", "(DD)D", native_strictmath_copy_sign_double);
-        registry.register(class, "copySign", "(FF)F", native_strictmath_copy_sign_float);
+    // `Math`'s answer already matched, so only the strict form was wrong, and
+    // only for NaN — `copySign(1.0, -0.0)` is -1.0 in BOTH and must stay.
+    if strict {
+        registry.register(class, "copySign", "(DD)D", native_strict_copy_sign_double);
+        registry.register(class, "copySign", "(FF)F", native_strict_copy_sign_float);
     } else {
         registry.register(class, "copySign", "(DD)D", native_math_copy_sign_double);
         registry.register(class, "copySign", "(FF)F", native_math_copy_sign_float);
@@ -1436,7 +1478,7 @@ pub(crate) fn native_math_max_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Float(java_math_max_f32(a, b))))
+    Ok(Some(Value::Float(java_max_float(a, b))))
 }
 
 #[inline(always)]
@@ -1452,86 +1494,7 @@ pub(crate) fn native_math_max_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Double(java_math_max_f64(a, b))))
-}
-
-// --- Java min/max semantics for the floating widths ---
-//
-// Rust's `f64::min`/`f32::min` are IEEE `minNum`: they RETURN THE NON-NaN
-// OPERAND, and `<`/`==` cannot see the sign of a zero. Java specifies the
-// opposite on both counts — NaN propagates, and `-0.0` sorts strictly below
-// `+0.0`.
-//
-// Measured 2026-08-12 against HotSpot 25.0.3+9, same host, same class file:
-//
-//                             HotSpot   CratonVM (before)
-//     Math.min(1.0, NaN)      NaN       1.0
-//     Math.max(1.0, NaN)      NaN       1.0
-//     Math.min(-0.0, 0.0)     -0.0      0.0
-//     Math.min(1.0f, NaNf)    NaN       1.0
-//     StrictMath.min(1.0,NaN) NaN       1.0
-//
-// while `min(II)I` and `min(JJ)J` were correct — the pass/fail boundary is per
-// DESCRIPTOR, below the granularity any census reports.
-//
-// `register_math_natives` is called for BOTH `java/lang/Math` and
-// `java/lang/StrictMath`, so four bodies were eight wrong triples, and
-// `Float.min`/`max` inherit these with no registration of their own.
-//
-// Why nothing caught it: the enclosing registrar opens with
-// `set_category(NativeKind::Intrinsic)`, and `Intrinsic` is exempt from shadow
-// retirement AND is not the census's `native-shadows-bytecode` kind — so a
-// `--jdk-only-report` run of a program calling `Math.min` four times yields
-// ZERO `java/lang/Math` rows. The correct tree already existed in-tree as
-// `phases_late::streams::p56_java_math_min`, whose doc comment describes this
-// exact trap, with one caller: the positive half fixed, the twin left.
-
-/// `java.lang.Math.min(double,double)` — NOT Rust's `f64::min`.
-#[inline(always)]
-pub(crate) fn java_math_min_f64(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        return f64::NAN;
-    }
-    if a == 0.0 && b == 0.0 {
-        return if a.is_sign_negative() { a } else { b };
-    }
-    if a <= b { a } else { b }
-}
-
-/// `java.lang.Math.max(double,double)` — the mirror of [`java_math_min_f64`].
-#[inline(always)]
-pub(crate) fn java_math_max_f64(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        return f64::NAN;
-    }
-    if a == 0.0 && b == 0.0 {
-        return if a.is_sign_negative() { b } else { a };
-    }
-    if a >= b { a } else { b }
-}
-
-/// `java.lang.Math.min(float,float)` — same contract, `f32` width.
-#[inline(always)]
-pub(crate) fn java_math_min_f32(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        return f32::NAN;
-    }
-    if a == 0.0 && b == 0.0 {
-        return if a.is_sign_negative() { a } else { b };
-    }
-    if a <= b { a } else { b }
-}
-
-/// `java.lang.Math.max(float,float)` — the mirror of [`java_math_min_f32`].
-#[inline(always)]
-pub(crate) fn java_math_max_f32(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        return f32::NAN;
-    }
-    if a == 0.0 && b == 0.0 {
-        return if a.is_sign_negative() { b } else { a };
-    }
-    if a >= b { a } else { b }
+    Ok(Some(Value::Double(java_max_double(a, b))))
 }
 
 // --- min ---
@@ -1574,7 +1537,7 @@ pub(crate) fn native_math_min_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Float(java_math_min_f32(a, b))))
+    Ok(Some(Value::Float(java_min_float(a, b))))
 }
 
 #[inline(always)]
@@ -1590,7 +1553,7 @@ pub(crate) fn native_math_min_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Double(java_math_min_f64(a, b))))
+    Ok(Some(Value::Double(java_min_double(a, b))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,10 +1579,12 @@ macro_rules! strict_math_unary {
         $(
             #[doc = concat!(
                 "`StrictMath.", stringify!($fdlibm_fn), "(double)` — fdlibm, not platform libm. ",
-                "Separate from the `Math` body on purpose: `Math`'s contract is an accuracy ",
-                "bound (1 ULP, semi-monotonic) that libm meets, while `StrictMath`'s is \"the ",
-                "fdlibm result, on every platform and every VM\". Sharing one body made the ",
-                "strict class no stricter than the loose one."
+                "`StrictMath`'s contract is \"the fdlibm result, on every platform and every ",
+                "VM\", so this body is mandatory there. Whether `java.lang.Math` ALSO gets it ",
+                "is a per-function question answered by the census above `let strict` in ",
+                "`register_math_natives`: HotSpot's `Math.f` is a one-line delegation to ",
+                "`StrictMath.f`, so the two differ only where HotSpot substitutes an ",
+                "intrinsic. Where it does not, `Math` is registered here too."
             )]
             #[inline]
             pub(crate) fn $rust_name(
@@ -1641,7 +1606,8 @@ macro_rules! strict_math_binary {
         $(
             #[doc = concat!(
                 "`StrictMath.", stringify!($fdlibm_fn), "(double, double)` — fdlibm, not ",
-                "platform libm. See the note on the unary family."
+                "platform libm, and for `atan2`/`hypot` `java.lang.Math` as well. See the ",
+                "note on the unary family."
             )]
             #[inline]
             pub(crate) fn $rust_name(
@@ -1662,22 +1628,24 @@ macro_rules! strict_math_binary {
     };
 }
 
+// These bodies back `StrictMath` unconditionally and `Math` for every row
+// HotSpot does not intrinsify — see the census above `let strict`.
 strict_math_unary! {
-    native_strict_math_sin => sin,
-    native_strict_math_cos => cos,
-    native_strict_math_tan => tan,
-    native_strict_math_asin => asin,
-    native_strict_math_acos => acos,
-    native_strict_math_atan => atan,
-    native_strict_math_exp => exp,
-    native_strict_math_log => log,
-    native_strict_math_log10 => log10,
-    native_strict_math_cbrt => cbrt,
-    native_strict_math_log1p => log1p,
-    native_strict_math_expm1 => expm1,
-    native_strict_math_sinh => sinh,
-    native_strict_math_cosh => cosh,
-    native_strict_math_tanh => tanh,
+    native_fdlibm_sin => sin,
+    native_fdlibm_cos => cos,
+    native_fdlibm_tan => tan,
+    native_fdlibm_asin => asin,
+    native_fdlibm_acos => acos,
+    native_fdlibm_atan => atan,
+    native_fdlibm_exp => exp,
+    native_fdlibm_log => log,
+    native_fdlibm_log10 => log10,
+    native_fdlibm_cbrt => cbrt,
+    native_fdlibm_log1p => log1p,
+    native_fdlibm_expm1 => expm1,
+    native_fdlibm_sinh => sinh,
+    native_fdlibm_cosh => cosh,
+    native_fdlibm_tanh => tanh,
 }
 
 // Argument order here is load-bearing and is NOT the alphabetical one: the JDK
@@ -1687,9 +1655,213 @@ strict_math_unary! {
 // both plausible angles; only the quadrant is wrong. The golden vectors in
 // `types/src/fdlibm.rs` cross the full sign matrix, which is what catches it.
 strict_math_binary! {
-    native_strict_math_atan2 => atan2,
-    native_strict_math_pow => pow,
-    native_strict_math_hypot => hypot,
+    native_fdlibm_atan2 => atan2,
+    native_fdlibm_pow => pow,
+    native_fdlibm_hypot => hypot,
+}
+
+/// `Math.max`/`Math.min` are NOT `f64::max`/`f64::min`.
+///
+/// Rust's IEEE-754-2019 `maxNum` semantics deliberately IGNORE a NaN operand
+/// and return the other one; Java's `Math.max` PROPAGATES it. They also
+/// disagree on signed zero, which Rust leaves unspecified and Java pins
+/// (`max(+0.0, -0.0)` is `+0.0`, `min(+0.0, -0.0)` is `-0.0`).
+///
+/// The NaN half is not a corner case anybody has to go looking for: it is how
+/// a `Double.NaN` sentinel travels through a fold. commons-math's
+/// `StatUtilsTest.testMax` asserts `NaN` for an array containing one, and got
+/// `-Infinity` — the fold's identity element — because every `max` step
+/// silently dropped the NaN. The census that found it replayed a HotSpot
+/// oracle over raw bit patterns; a generator that only draws finite values
+/// cannot see this at all.
+///
+/// Bodies are transcribed from `java.lang.Math` in JDK 25, including the
+/// return-`a`-not-`NAN` detail (it preserves the NaN payload) and the
+/// asymmetry between `max` testing `a`'s sign bit and `min` testing `b`'s.
+#[inline]
+pub(crate) fn java_max_double(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 && a.to_bits() == NEGATIVE_ZERO_DOUBLE_BITS {
+        return b;
+    }
+    if a >= b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline]
+pub(crate) fn java_min_double(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 && b.to_bits() == NEGATIVE_ZERO_DOUBLE_BITS {
+        return b;
+    }
+    if a <= b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline]
+pub(crate) fn java_max_float(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 && a.to_bits() == NEGATIVE_ZERO_FLOAT_BITS {
+        return b;
+    }
+    if a >= b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline]
+pub(crate) fn java_min_float(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 && b.to_bits() == NEGATIVE_ZERO_FLOAT_BITS {
+        return b;
+    }
+    if a <= b {
+        a
+    } else {
+        b
+    }
+}
+
+// --- W7-94: how wide the min/max rule actually is, and why nothing saw it ---
+//
+// Measured 2026-08-12 against HotSpot 25.0.3+9, same host, same class file,
+// before the four helpers above existed:
+//
+//                             HotSpot   CratonVM (before)
+//     Math.min(1.0, NaN)      NaN       1.0
+//     Math.max(1.0, NaN)      NaN       1.0
+//     Math.min(-0.0, 0.0)     -0.0      0.0
+//     Math.min(1.0f, NaNf)    NaN       1.0
+//     StrictMath.min(1.0,NaN) NaN       1.0
+//
+// while `min(II)I` and `min(JJ)J` were correct — the pass/fail boundary is per
+// DESCRIPTOR, below the granularity any census reports.
+//
+// `register_math_natives` is called for BOTH `java/lang/Math` and
+// `java/lang/StrictMath`, so four bodies were eight wrong triples, and
+// `Float.min`/`max` inherit these with no registration of their own.
+// `Double.min`/`max` do NOT — they carry their own bodies in `phases_early`,
+// which is why that file calls the two aliases below.
+//
+// Why nothing caught it: the enclosing registrar opens with
+// `set_category(NativeKind::Intrinsic)`, and `Intrinsic` is exempt from shadow
+// retirement AND is not the census's `native-shadows-bytecode` kind — so a
+// `--jdk-only-report` run of a program calling `Math.min` four times yields
+// ZERO `java/lang/Math` rows. The correct tree already existed in-tree as
+// `phases_late::streams::p56_java_math_min`, whose doc comment describes this
+// exact trap, with one caller: the positive half fixed, the twin left.
+
+/// `java.lang.Math.max(double,double)` under the name `phases_early`'s
+/// `Double.max` body already calls. One rule, one implementation — see
+/// [`java_max_double`], which this forwards to verbatim.
+#[inline(always)]
+pub(crate) fn java_math_max_f64(a: f64, b: f64) -> f64 {
+    java_max_double(a, b)
+}
+
+/// `java.lang.Math.min(double,double)` — the mirror of [`java_math_max_f64`],
+/// forwarding to [`java_min_double`].
+#[inline(always)]
+pub(crate) fn java_math_min_f64(a: f64, b: f64) -> f64 {
+    java_min_double(a, b)
+}
+
+/// Raw bits of `-0.0`, matching `Math`'s own `negativeZeroDoubleBits`.
+const NEGATIVE_ZERO_DOUBLE_BITS: u64 = 0x8000_0000_0000_0000;
+/// Raw bits of `-0.0f`, matching `Math`'s own `negativeZeroFloatBits`.
+const NEGATIVE_ZERO_FLOAT_BITS: u32 = 0x8000_0000;
+
+/// `Double.doubleToLongBits` semantics: every NaN collapses to one pattern.
+///
+/// This is the difference between `doubleToLongBits` and `doubleToRawLongBits`,
+/// and `Double.compare`, `Double.equals` and `Double.hashCode` are all specified
+/// in terms of the FORMER. Using raw bits makes two NaNs with different payloads
+/// unequal, which is not an exotic case: `Math.sqrt(-1.0)` is `fff8…` on x86 —
+/// on HotSpot too — while the `Double.NaN` constant is `7ff8…`, so a test that
+/// asserts `assertEquals(Double.NaN, Math.sqrt(-1.0), 0.0)` passes on HotSpot
+/// and failed here, printing "expected: Double<NaN> but was: Double<NaN>".
+#[inline]
+pub(crate) fn double_to_long_bits_canonical(v: f64) -> u64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        v.to_bits()
+    }
+}
+
+/// `Float.floatToIntBits` semantics — see the double version.
+#[inline]
+pub(crate) fn float_to_int_bits_canonical(v: f32) -> u32 {
+    if v.is_nan() {
+        0x7fc0_0000
+    } else {
+        v.to_bits()
+    }
+}
+
+/// `Double.compare`, transcribed.
+///
+/// `f64::total_cmp` is NOT this function. It implements IEEE 754 totalOrder,
+/// which deliberately ORDERS NaNs by sign and payload (`-NaN < -inf < … < +inf
+/// < +NaN`); Java canonicalizes first, so all NaNs are equal to each other and
+/// greater than everything else. The two agree on `-0.0 < +0.0` and on
+/// NaN-versus-number, which is why the substitution looked right.
+#[inline]
+pub(crate) fn java_compare_double(a: f64, b: f64) -> i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    let ab = double_to_long_bits_canonical(a);
+    let bb = double_to_long_bits_canonical(b);
+    match ab.cmp(&bb) {
+        std::cmp::Ordering::Equal => 0,
+        // Signed comparison: the bit patterns are read as long, so the negative
+        // zero / negative number ordering falls out of the sign bit.
+        _ => {
+            if (ab as i64) < (bb as i64) {
+                -1
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// `Float.compare`, transcribed — see the double version.
+#[inline]
+pub(crate) fn java_compare_float(a: f32, b: f32) -> i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    let ab = float_to_int_bits_canonical(a) as i32;
+    let bb = float_to_int_bits_canonical(b) as i32;
+    match ab.cmp(&bb) {
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Greater => 1,
+    }
 }
 
 // --- trig and math functions ---
@@ -1800,46 +1972,6 @@ pub(crate) fn native_math_tan(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0.0,
     };
     Ok(Some(Value::Double(v.tan())))
-}
-
-#[inline]
-pub(crate) fn native_math_asin(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(v.asin())))
-}
-
-#[inline]
-pub(crate) fn native_math_acos(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(v.acos())))
-}
-
-#[inline]
-pub(crate) fn native_math_atan(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(v.atan())))
-}
-
-#[inline]
-pub(crate) fn native_math_atan2(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    let b = match args.get(1) {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(a.atan2(b))))
 }
 
 #[inline]
@@ -2078,14 +2210,16 @@ pub(crate) fn native_math_signum_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let result = if v.is_nan() {
-        f64::NAN
+    // `Math.signum` is `(d == 0.0 || Double.isNaN(d)) ? d : copySign(1.0, d)`
+    // — it returns the ARGUMENT for NaN, not a fresh canonical NaN, so the
+    // payload and sign bit survive. Returning `f64::NAN` here turned every NaN
+    // into `7ff8000000000000`; HotSpot hands back the bits it was given.
+    let result = if v.is_nan() || v == 0.0 {
+        v
     } else if v > 0.0 {
         1.0
-    } else if v < 0.0 {
-        -1.0
     } else {
-        v
+        -1.0
     };
     Ok(Some(Value::Double(result)))
 }
@@ -2099,14 +2233,14 @@ pub(crate) fn native_math_signum_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    let result = if v.is_nan() {
-        f32::NAN
+    // See `native_math_signum_double`: the argument comes back unchanged for
+    // NaN and for both zeroes.
+    let result = if v.is_nan() || v == 0.0 {
+        v
     } else if v > 0.0 {
         1.0
-    } else if v < 0.0 {
-        -1.0
     } else {
-        v
+        -1.0
     };
     Ok(Some(Value::Float(result)))
 }
@@ -2588,55 +2722,6 @@ pub(crate) fn native_math_unsigned_multiply_high(
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub(crate) fn native_math_hypot(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let a = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    let b = match args.get(1) {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(a.hypot(b))))
-}
-
-#[inline]
-pub(crate) fn native_math_log1p(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(v.ln_1p())))
-}
-
-#[inline]
-pub(crate) fn native_math_expm1(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(v.exp_m1())))
-}
-
-#[inline]
-pub(crate) fn native_math_sinh(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(v.sinh())))
-}
-
-#[inline]
-pub(crate) fn native_math_cosh(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(v.cosh())))
-}
-
-#[inline]
 pub(crate) fn native_math_tanh(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -2646,44 +2731,6 @@ pub(crate) fn native_math_tanh(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 #[inline]
-
-/// `StrictMath.copySign` — identical to [`native_math_copy_sign_double`] except
-/// that a NaN sign argument is ALWAYS treated as positive (JDK spec). Rust's
-/// `f64::copysign` copies the raw sign bit, which is the `Math` behaviour.
-pub(crate) fn native_strictmath_copy_sign_double(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let mag = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    let sign = match args.get(1) {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    let sign = if sign.is_nan() { 1.0 } else { sign };
-    Ok(Some(Value::Double(mag.copysign(sign))))
-}
-
-/// The `float` half of the same rule; both were wrong, and a family fix that
-/// took only the `double` form would have left the `(FF)F` row red.
-pub(crate) fn native_strictmath_copy_sign_float(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let mag = match args.first() {
-        Some(Value::Float(v)) => *v,
-        _ => 0.0,
-    };
-    let sign = match args.get(1) {
-        Some(Value::Float(v)) => *v,
-        _ => 0.0,
-    };
-    let sign = if sign.is_nan() { 1.0 } else { sign };
-    Ok(Some(Value::Float(mag.copysign(sign))))
-}
-
 pub(crate) fn native_math_copy_sign_double(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2712,6 +2759,45 @@ pub(crate) fn native_math_copy_sign_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
+    Ok(Some(Value::Float(mag.copysign(sign))))
+}
+
+/// `StrictMath.copySign(double, double)` — a NaN sign argument counts as
+/// positive. See the registration comment in `register_math_natives`.
+#[inline]
+pub(crate) fn native_strict_copy_sign_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mag = match args.first() {
+        Some(Value::Double(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = match args.get(1) {
+        Some(Value::Double(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = if sign.is_nan() { 1.0 } else { sign };
+    Ok(Some(Value::Double(mag.copysign(sign))))
+}
+
+/// `StrictMath.copySign(float, float)` — see the double overload. Both widths
+/// were wrong: a family fix that took only the `double` form would have left
+/// the `(FF)F` row red.
+#[inline]
+pub(crate) fn native_strict_copy_sign_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mag = match args.first() {
+        Some(Value::Float(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = match args.get(1) {
+        Some(Value::Float(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = if sign.is_nan() { 1.0 } else { sign };
     Ok(Some(Value::Float(mag.copysign(sign))))
 }
 
@@ -2823,15 +2909,20 @@ pub(crate) fn native_math_ulp_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // W7-95(C1). The JDK's own `Math.ulp` answers `Math.abs(d)` for the whole
-    // `MAX_EXPONENT + 1` case — NaN and both infinities — which for a NaN
-    // PRESERVES ITS PAYLOAD and only clears the sign. Measured on HotSpot 25:
-    // `Math.ulp(0x7ff0000000000001)` is `0x7ff0000000000001`, not the canonical
-    // `0x7ff8000000000000` that `f64::NAN` would have produced, and
-    // `Math.ulp(0xfff8000000000000)` is `0x7ff8000000000000`. Only "is NaN" is
-    // specified, so this is fidelity rather than a contract — but `v.abs()` is
-    // both the JDK's expression and strictly closer to it, so there is no
-    // reason to write anything else.
+    // W7-95(C1). `Math.ulp` switches on the exponent and returns `Math.abs(d)`
+    // for the whole `MAX_EXPONENT + 1` case — NaN and both infinities under one
+    // arm. For a NaN that means the argument with its sign bit cleared and its
+    // payload INTACT, not the canonical quiet NaN `f64::NAN` would have
+    // produced. Measured on HotSpot 25:
+    //
+    //   Math.ulp(0x7ff0000000000001) = 0x7ff0000000000001   (payload kept)
+    //   Math.ulp(0xfff8000000000000) = 0x7ff8000000000000   (sign cleared)
+    //   Math.ulp(0xffc8ae0a)         = 0x7fc8ae0a           (float width; was
+    //                                                        0x7fc00000 here)
+    //
+    // Only "is NaN" is specified, so the payload half is fidelity rather than a
+    // contract — but `v.abs()` is both the JDK's own expression and strictly
+    // closer to it, so there is no reason to write anything else.
     let result = if v.is_nan() || v.is_infinite() {
         v.abs()
     } else {
@@ -2861,14 +2952,15 @@ pub(crate) fn native_math_ulp_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    // See `native_math_ulp_double`: `Math.abs(d)` is the JDK's answer for NaN
-    // and for both infinities, and it keeps a NaN payload.
+    // See `native_math_ulp_double`: one `Math.abs` arm covers NaN and both
+    // infinities, and it keeps a NaN payload.
     //
     // EXHAUSTIVELY VERIFIED, this width: all 4,294,967,296 `float` bit patterns
     // were run through this algorithm and through `Math.ulp` on HotSpot 25 and
     // compared as `floatToRawIntBits`. Every non-NaN pattern — 4,278,190,082 of
     // them — already matched; the 16,777,212 that did not were exactly the
-    // non-canonical NaNs this change fixes.
+    // non-canonical NaNs this change fixes. There is no residual defect at this
+    // width: do not "fix" it again.
     let result = if v.is_nan() || v.is_infinite() {
         v.abs()
     } else {
@@ -3318,10 +3410,7 @@ pub fn gc_scan_value_of_cache_roots(vm_identity: usize, out: &mut Vec<cratonvm_t
 
 /// GC post-compaction hook — called from `vm/src/memory/gc.rs::update_all_roots`.
 /// Remaps every cached entry for the active VM through the GC's pointer map.
-pub fn gc_update_value_of_cache_refs(
-    vm_identity: usize,
-    pointer_map: &cratonvm_types::PointerMap,
-) {
+pub fn gc_update_value_of_cache_refs(vm_identity: usize, pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -5722,10 +5811,13 @@ pub(crate) fn native_wrapper_float_hash_code(
         Value::Float(v) => v,
         _ => 0.0,
     };
-    Ok(Some(Value::Int(val.to_bits() as i32)))
+    Ok(Some(Value::Int(float_to_int_bits_canonical(val) as i32)))
 }
 
-// hashCode for Double wrapper: bits = doubleToLongBits; (bits ^ (bits >>> 32)) as i32
+// hashCode for Double wrapper: bits = doubleToLongBits; (bits ^ (bits >>> 32)) as i32.
+// `doubleToLongBits`, not the raw one: `equals` canonicalizes, so `hashCode`
+// must too, or two NaNs that are `equals` land in different hash buckets and a
+// `HashMap` keyed on a NaN sentinel silently misses.
 pub(crate) fn native_wrapper_double_hash_code(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5738,7 +5830,7 @@ pub(crate) fn native_wrapper_double_hash_code(
         Value::Double(v) => v,
         _ => 0.0,
     };
-    let bits = val.to_bits() as i64;
+    let bits = double_to_long_bits_canonical(val) as i64;
     Ok(Some(Value::Int(
         (bits ^ ((bits as u64 >> 32) as i64)) as i32,
     )))
@@ -5875,14 +5967,19 @@ pub(crate) fn native_wrapper_float_equals(
         Value::Float(v) => v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(if a.to_bits() == b.to_bits() {
-        1
-    } else {
-        0
-    })))
+    Ok(Some(Value::Int(
+        if float_to_int_bits_canonical(a) == float_to_int_bits_canonical(b) {
+            1
+        } else {
+            0
+        },
+    )))
 }
 
-// equals for Double wrapper (NaN == NaN is true per Double.equals spec, using to_bits)
+// `Double.equals` is `doubleToLongBits(value) == doubleToLongBits(other.value)`.
+// It is the CANONICALIZING conversion, so `NaN.equals(NaN)` is true for any two
+// NaNs — not only for two copies of the same bit pattern, which is all that raw
+// `to_bits` gave. See `double_to_long_bits_canonical`.
 pub(crate) fn native_wrapper_double_equals(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5906,11 +6003,13 @@ pub(crate) fn native_wrapper_double_equals(
         Value::Double(v) => v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(if a.to_bits() == b.to_bits() {
-        1
-    } else {
-        0
-    })))
+    Ok(Some(Value::Int(
+        if double_to_long_bits_canonical(a) == double_to_long_bits_canonical(b) {
+            1
+        } else {
+            0
+        },
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -6981,8 +7080,7 @@ pub(crate) fn native_float_compare(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    // total_cmp matches Java semantics: -0.0 < +0.0, NaN > everything
-    Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+    Ok(Some(Value::Int(java_compare_float(a, b))))
 }
 
 pub(crate) fn native_double_compare(
@@ -6997,7 +7095,7 @@ pub(crate) fn native_double_compare(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+    Ok(Some(Value::Int(java_compare_double(a, b))))
 }
 
 // --- Byte ---
@@ -7150,10 +7248,276 @@ pub(crate) fn native_long_compare_to(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
-    use crate::test_utils::mock_ctx;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
+    // -----------------------------------------------------------------------
+    // java.lang.Math backing: which rows are fdlibm, and Math.max/min on NaN.
+    //
+    // These assert on the REGISTRY, not on the Rust helpers directly. The bug
+    // they cover was never a wrong body — `fdlibm::hypot` was correct and
+    // present the whole time — it was a wrong REGISTRATION, so a test that
+    // calls the helper it wants would have passed throughout.
+    // -----------------------------------------------------------------------
+
+    /// The operand pair that cost four commons-math tests.
+    ///
+    /// `GaussNewtonOptimizerWith{Cholesky,LU,QR,SVD}Test.testMaxEvaluations`
+    /// sets a convergence tolerance of 1e-30 so the optimizer can never
+    /// converge and must instead exceed its 100-evaluation budget. Its model
+    /// measures point-to-centre distance with `Vector2D.distance`, i.e.
+    /// `Math.hypot`. Backed by libm, `Math.hypot` returned the naively-rounded
+    /// `sqrt(x*x + y*y)` — one ULP below fdlibm here — the fifth residual came
+    /// out one ULP off, the iteration reached an exact fixed point in nine
+    /// evaluations, the checker called that convergence, and
+    /// `TooManyEvaluationsException` was never thrown.
+    #[test]
+    fn math_hypot_is_registered_to_fdlibm_not_naive_sqrt() {
+        let x = f64::from_bits(0xc049_89b7_291d_9512);
+        let y = f64::from_bits(0x4048_6eb2_d16f_96cb);
+        // What `sqrt(x*x + y*y)` — and the libm this links — return instead.
+        // Asserted so the test names the wrong answer it guards against.
+        assert_eq!((x * x + y * y).sqrt().to_bits(), 0x4051_abe8_7778_2c30);
+        // Captured from Temurin 25.0.4 `Math.hypot`.
+        let hotspot = 0x4051_abe8_7778_2c31_u64;
+
+        let mut ctx = mock_ctx();
+        for class in ["java/lang/Math", "java/lang/StrictMath"] {
+            let mut registry = NativeMethodRegistry::new();
+            register_math_natives(&mut registry, class);
+            let cb = registry
+                .find(class, "hypot", "(DD)D")
+                .expect("hypot must be registered");
+            match cb(&mut ctx, &[Value::Double(x), Value::Double(y)]) {
+                Ok(Some(Value::Double(v))) => {
+                    assert_eq!(v.to_bits(), hotspot, "{class}.hypot")
+                }
+                other => panic!("{class}.hypot returned {other:?}"),
+            }
+        }
+    }
+
+    /// Every row HotSpot does NOT intrinsify must answer identically from
+    /// `Math` and `StrictMath`, because in JDK 25 the former is a one-line
+    /// delegation to the latter and nothing substitutes a different body.
+    ///
+    /// This is the rule itself, not a sample of its consequences: an edit that
+    /// re-points one of these at platform libm "because `Math` only owes 1 ULP"
+    /// fails here rather than in three app suites a week later.
+    #[test]
+    fn math_and_strictmath_agree_on_non_intrinsified_rows() {
+        let mut math = NativeMethodRegistry::new();
+        register_math_natives(&mut math, "java/lang/Math");
+        let mut strict = NativeMethodRegistry::new();
+        register_math_natives(&mut strict, "java/lang/StrictMath");
+
+        let samples = [
+            0.1_f64, -0.1, 0.5, -0.75, 0.9999, 1.0, -1.0, 2.5, -3.25, 17.0, 1e-8, 1e8,
+        ];
+        let mut ctx = mock_ctx();
+
+        let call = |reg: &NativeMethodRegistry,
+                    ctx: &mut MockNativeContext,
+                    class: &str,
+                    name: &str,
+                    desc: &str,
+                    args: &[Value]|
+         -> u64 {
+            let cb = reg
+                .find(class, name, desc)
+                .unwrap_or_else(|| panic!("{class}.{name} not registered"));
+            match cb(ctx, args) {
+                Ok(Some(Value::Double(v))) => v.to_bits(),
+                other => panic!("{class}.{name} returned {other:?}"),
+            }
+        };
+
+        for name in ["asin", "acos", "atan", "expm1", "log1p", "sinh", "cosh"] {
+            for &x in &samples {
+                let args = [Value::Double(x)];
+                let m = call(&math, &mut ctx, "java/lang/Math", name, "(D)D", &args);
+                let sm = call(
+                    &strict,
+                    &mut ctx,
+                    "java/lang/StrictMath",
+                    name,
+                    "(D)D",
+                    &args,
+                );
+                assert_eq!(m, sm, "Math.{name}({x}) != StrictMath.{name}({x})");
+            }
+        }
+        for name in ["atan2", "hypot", "IEEEremainder"] {
+            for &x in &samples {
+                for &y in &samples {
+                    let args = [Value::Double(x), Value::Double(y)];
+                    let m = call(&math, &mut ctx, "java/lang/Math", name, "(DD)D", &args);
+                    let sm = call(
+                        &strict,
+                        &mut ctx,
+                        "java/lang/StrictMath",
+                        name,
+                        "(DD)D",
+                        &args,
+                    );
+                    assert_eq!(m, sm, "Math.{name}({x}, {y}) mismatch");
+                }
+            }
+        }
+    }
+
+    /// `signum` and `ulp` hand back the NaN they were given; `StrictMath.copySign`
+    /// treats a NaN sign as positive and `Math.copySign` does not.
+    ///
+    /// All three came out of the second census pass, over the float overloads
+    /// and the exactly-specified bit-level rows. None is a last-ULP question:
+    /// each is a straight transcription of `java.lang.Math` that had been
+    /// written as "produce a NaN" instead of "produce THIS NaN".
+    #[test]
+    fn math_signum_ulp_and_copysign_follow_the_jdk_on_nan() {
+        let mut math = NativeMethodRegistry::new();
+        register_math_natives(&mut math, "java/lang/Math");
+        let mut strict = NativeMethodRegistry::new();
+        register_math_natives(&mut strict, "java/lang/StrictMath");
+        let mut ctx = mock_ctx();
+
+        // A NaN with a payload, and its negative counterpart.
+        let nan_f = f32::from_bits(0x7fd2_7d42);
+        let neg_nan_f = f32::from_bits(0xffc8_ae0a);
+        let nan_d = f64::from_bits(0x7ff9_bd92_d9d4_2c64);
+
+        let f1 = |ctx: &mut MockNativeContext, name: &str, x: f32| -> u32 {
+            let cb = math.find("java/lang/Math", name, "(F)F").unwrap();
+            match cb(ctx, &[Value::Float(x)]) {
+                Ok(Some(Value::Float(v))) => v.to_bits(),
+                other => panic!("Math.{name} returned {other:?}"),
+            }
+        };
+        let d1 = |ctx: &mut MockNativeContext, name: &str, x: f64| -> u64 {
+            let cb = math.find("java/lang/Math", name, "(D)D").unwrap();
+            match cb(ctx, &[Value::Double(x)]) {
+                Ok(Some(Value::Double(v))) => v.to_bits(),
+                other => panic!("Math.{name} returned {other:?}"),
+            }
+        };
+
+        // signum returns the argument unchanged, sign bit and payload included.
+        assert_eq!(f1(&mut ctx, "signum", nan_f), 0x7fd2_7d42);
+        assert_eq!(f1(&mut ctx, "signum", neg_nan_f), 0xffc8_ae0a);
+        assert_eq!(d1(&mut ctx, "signum", nan_d), 0x7ff9_bd92_d9d4_2c64);
+        // ...and is still signum for ordinary values, including signed zero.
+        assert_eq!(f1(&mut ctx, "signum", -7.5), (-1.0_f32).to_bits());
+        assert_eq!(d1(&mut ctx, "signum", 7.5), 1.0_f64.to_bits());
+        assert_eq!(d1(&mut ctx, "signum", -0.0), (-0.0_f64).to_bits());
+        assert_eq!(d1(&mut ctx, "signum", 0.0), 0.0_f64.to_bits());
+
+        // ulp is `Math.abs` on the NaN/infinity arm: payload kept, sign cleared.
+        assert_eq!(f1(&mut ctx, "ulp", neg_nan_f), 0x7fc8_ae0a);
+        assert_eq!(d1(&mut ctx, "ulp", nan_d), 0x7ff9_bd92_d9d4_2c64);
+        assert_eq!(
+            d1(&mut ctx, "ulp", f64::NEG_INFINITY),
+            f64::INFINITY.to_bits()
+        );
+        // ...and unchanged for finite values.
+        assert_eq!(d1(&mut ctx, "ulp", 1.0), (2.0_f64.powi(-52)).to_bits());
+
+        // copySign: StrictMath reads a NaN sign as +, Math copies its sign bit.
+        let magnitude = -3.5_f64;
+        let nan_sign = f64::from_bits(0xfff8_0000_0000_0000); // NaN, sign bit SET
+        let m = math.find("java/lang/Math", "copySign", "(DD)D").unwrap();
+        let sm = strict
+            .find("java/lang/StrictMath", "copySign", "(DD)D")
+            .unwrap();
+        let call = |ctx: &mut MockNativeContext, cb: cratonvm_native_api::NativeCallback| -> f64 {
+            match cb(ctx, &[Value::Double(magnitude), Value::Double(nan_sign)]) {
+                Ok(Some(Value::Double(v))) => v,
+                other => panic!("copySign returned {other:?}"),
+            }
+        };
+        assert_eq!(
+            call(&mut ctx, m),
+            -3.5,
+            "Math.copySign copies the NaN's sign"
+        );
+        assert_eq!(
+            call(&mut ctx, sm),
+            3.5,
+            "StrictMath.copySign reads NaN as +"
+        );
+        // A non-NaN sign is treated identically by both.
+        for cb in [m, sm] {
+            match cb(&mut ctx, &[Value::Double(3.5), Value::Double(-0.0)]) {
+                Ok(Some(Value::Double(v))) => assert_eq!(v, -3.5),
+                other => panic!("copySign returned {other:?}"),
+            }
+        }
+    }
+
+    /// The census that found the `hypot` row found this too: `Math.max`/`min`
+    /// were `f64::max`/`f64::min`, whose IEEE-754-2019 `maxNum` semantics
+    /// deliberately IGNORE a NaN operand where Java's PROPAGATE it. commons-math's
+    /// `StatUtilsTest.testMax` expects `NaN` from an array containing one and
+    /// got `-Infinity` — the fold's identity element — because every step
+    /// silently dropped the NaN.
+    #[test]
+    fn math_max_min_propagate_nan_and_pin_signed_zero() {
+        let mut registry = NativeMethodRegistry::new();
+        register_math_natives(&mut registry, "java/lang/Math");
+        let mut ctx = mock_ctx();
+
+        let d = |ctx: &mut MockNativeContext, name: &str, a: f64, b: f64| -> f64 {
+            let cb = registry.find("java/lang/Math", name, "(DD)D").unwrap();
+            match cb(ctx, &[Value::Double(a), Value::Double(b)]) {
+                Ok(Some(Value::Double(v))) => v,
+                other => panic!("Math.{name} returned {other:?}"),
+            }
+        };
+        let f = |ctx: &mut MockNativeContext, name: &str, a: f32, b: f32| -> f32 {
+            let cb = registry.find("java/lang/Math", name, "(FF)F").unwrap();
+            match cb(ctx, &[Value::Float(a), Value::Float(b)]) {
+                Ok(Some(Value::Float(v))) => v,
+                other => panic!("Math.{name} returned {other:?}"),
+            }
+        };
+
+        // NaN wins from either position, in both directions.
+        assert!(d(&mut ctx, "max", f64::NAN, f64::NEG_INFINITY).is_nan());
+        assert!(d(&mut ctx, "max", f64::NEG_INFINITY, f64::NAN).is_nan());
+        assert!(d(&mut ctx, "min", f64::NAN, f64::INFINITY).is_nan());
+        assert!(d(&mut ctx, "min", f64::INFINITY, f64::NAN).is_nan());
+        assert!(d(&mut ctx, "max", 3.0, f64::NAN).is_nan());
+        assert!(d(&mut ctx, "min", 3.0, f64::NAN).is_nan());
+
+        // Signed zero: max prefers +0.0, min prefers -0.0, either order.
+        assert_eq!(d(&mut ctx, "max", 0.0, -0.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(d(&mut ctx, "max", -0.0, 0.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(
+            d(&mut ctx, "min", 0.0, -0.0).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(
+            d(&mut ctx, "min", -0.0, 0.0).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+
+        // Ordinary ordering is untouched.
+        assert_eq!(d(&mut ctx, "max", 2.0, 7.5), 7.5);
+        assert_eq!(d(&mut ctx, "min", 2.0, 7.5), 2.0);
+
+        // Same contract on the float overloads.
+        assert!(f(&mut ctx, "max", f32::NAN, f32::NEG_INFINITY).is_nan());
+        assert!(f(&mut ctx, "min", 1.0, f32::NAN).is_nan());
+        assert_eq!(f(&mut ctx, "max", -0.0, 0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            f(&mut ctx, "min", 0.0, -0.0).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Wrapper equals(Object) — the argument's TYPE is part of the contract
@@ -7829,7 +8193,13 @@ mod tests {
     #[test]
     fn math_max_double_with_nan() {
         let mut ctx = mock_ctx();
-        // f64::max(1.0, NaN) returns 1.0 in Rust (propagates non-NaN)
+        // The NaN-vs-finite case this comment used to describe — "f64::max(1.0,
+        // NaN) returns 1.0 in Rust" — was a correct account of a real
+        // divergence from `Math.max`, written next to a call that passes NaN
+        // TWICE and so cannot observe it. It cost commons-math's
+        // `StatUtilsTest.testMax`. The mixed cases now live in
+        // `math_max_min_propagate_nan_and_pin_signed_zero`; this one keeps the
+        // degenerate pair.
         let r = native_math_max_double(
             &mut ctx,
             &[Value::Double(f64::NAN), Value::Double(f64::NAN)],
@@ -8551,13 +8921,11 @@ mod radix_native_entrypoint_tests {
                 threw.push(native_short_parse_short_radix(&mut ctx, &args).is_err());
             }
             // …and the legal radices still parse.
-            let ok = [2i32, 10, 36]
-                .iter()
-                .all(|&r| {
-                    let args = [Value::Object(Some(s)), Value::Int(r)];
-                    // "5" is not a base-2 digit string, so only 10 and 36 parse.
-                    native_integer_parse_int_radix(&mut ctx, &args).is_ok() == (r != 2)
-                });
+            let ok = [2i32, 10, 36].iter().all(|&r| {
+                let args = [Value::Object(Some(s)), Value::Int(r)];
+                // "5" is not a base-2 digit string, so only 10 and 36 parse.
+                native_integer_parse_int_radix(&mut ctx, &args).is_ok() == (r != 2)
+            });
             let _ = tx.send((threw, ok));
         });
         let (threw, ok) = rx
@@ -8567,7 +8935,10 @@ mod radix_native_entrypoint_tests {
             threw.iter().all(|&t| t),
             "every out-of-range radix must throw NumberFormatException, got {threw:?}"
         );
-        assert!(ok, "legal radices must still parse (and base 2 must reject \"5\")");
+        assert!(
+            ok,
+            "legal radices must still parse (and base 2 must reject \"5\")"
+        );
         worker.join().expect("worker thread panicked");
     }
 }

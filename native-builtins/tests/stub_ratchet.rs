@@ -519,18 +519,71 @@ use cratonvm_types::compat::CompatibilityMode;
 ///
 ///    Derived, NOT measured — this lane may not run `cargo`. So **+2 is a
 ///    prediction to check against the printed line, not a number to paste**, and
-///    it composes with the +6/+8 of (a) rather than replacing it. Predicted
-///    totals: no-management 1261 + 2 = **1263**, management 1271 + 2 = **1273**.
+///    it composes with the +6/+8 of (a) rather than replacing it. (The totals
+///    this paragraph originally named were computed against the pre-re-freeze
+///    constants and are superseded by the merge note at the bottom; the +2
+///    itself is unchanged, because it is a delta and not a total.)
 ///    F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md
 ///
-/// Anything the run reports beyond (a) and (d) is a finding to attribute, not
-/// slack to absorb: 182 commits separate the freeze from HEAD.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1263;
+/// Anything the run reports beyond (a), (d) and the re-freeze below is a
+/// finding to attribute, not slack to absorb: 182 commits separate the freeze
+/// from HEAD.
+///
+/// ## Re-frozen 2026-08-13: 1263 -> 1287, and 1253 -> 1277
+///
+/// **+24 in BOTH configurations, from ONE change**, which is why both constants
+/// move by the same delta in one commit: twelve `Collection` methods forwarded
+/// on each of `java/util/Collections$SynchronizedCollection` and
+/// `$SynchronizedSet` (`register_synchronized_collection_wrapper_natives`,
+/// bodies in `util_concurrent_ext::sync_collection_delegate`).
+///
+/// **Attributed, not absorbed.** The wrapper had seven methods —
+/// `add`/`contains`/`remove`/`size`/`isEmpty`/`iterator`/`toArray` — which was
+/// the whole surface `Collections.synchronizedCollection(…)` had ever been asked
+/// for. Since 2026-08-13 the wrapper is also what `Hashtable`/`Properties` hand
+/// back for `keySet()`/`entrySet()`/`values()` (the JDK's own answer: those
+/// accessors are `Collections.synchronizedSet(new KeySet(), this)`), so it is
+/// now asked for `stream`, `forEach`, `toString`, `containsAll`, `retainAll`,
+/// `removeAll`, `addAll`, `removeIf`, `clear`, `spliterator` and the two typed
+/// `toArray` overloads as well.
+///
+/// **`SyntheticStub` is the right kind here, and `Bridge` would be wrong.** In
+/// real-JDK mode all 24 are DROPPED — the strict census in this same file
+/// reports every stub row dropped — and the real
+/// `Collections$SynchronizedCollection` bytecode runs, `synchronized (mutex)`
+/// included. They exist for synthetic-JDK mode, where the class has no bytecode
+/// at all and an UNDECLARED method falls through to an interface-level native
+/// that reads the WRAPPER as the collection and reports it EMPTY. Registering
+/// them `Bridge` would make them win over the real class and silently drop the
+/// synchronization. See
+/// `fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`.
+///
+/// ## Merge 2026-08-16: the constants below are the re-freeze, and (d) is NOT in them
+///
+/// The `--jdk-only` branch and mainline reached this constant from two
+/// different trees and neither number is the merged tree's number:
+///
+///  * the re-freeze above (1263 → **1287**, 1253 → **1277**) was MEASURED, on a
+///    tree that did not yet contain (d)'s `shared_secrets_bridge.rs` change;
+///  * (d)'s **+2** was DERIVED, on a tree that did not yet contain the 24
+///    `SynchronizedCollection`/`SynchronizedSet` rows.
+///
+/// The two touch disjoint populations — `jdk/internal/access/SharedSecrets`
+/// factories and `java/security/AccessController$1` on one side, the
+/// `Collections$Synchronized*` wrappers on the other — so the merged census
+/// should be their SUM: no-management **1279**, management **1289**.
+///
+/// That sum is arithmetic, not a measurement, so it is deliberately NOT pasted.
+/// The constants stay at the two numbers that were actually measured. Read a
+/// first post-merge run this way: **exactly +2 over these constants is (d)
+/// landing and is the expected result — re-freeze to 1289 / 1279 and delete
+/// this section. Any other delta is a finding to attribute.**
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1287;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1253;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1277;
 
 // Both constants are compiled in both configurations on purpose: a reader
 // re-freezing one can see the other, and neither can be edited by accident

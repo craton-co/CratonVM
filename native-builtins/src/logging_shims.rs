@@ -3811,6 +3811,45 @@ fn slf4j_level_enabled(ctx: &mut dyn NativeContext, level: i32) -> MethodCallRes
     })))
 }
 
+/// Render one `{}` argument the way SLF4J does: `String.valueOf(arg)`, i.e.
+/// the argument's own `toString()`.
+///
+/// This used to be `read_string(obj).unwrap_or_else(|| format!("Object@{:x}",
+/// param_idx))` — a String argument printed its text and EVERYTHING ELSE
+/// printed the literal text `Object@` followed by its **argument index**. Not
+/// an identity hash, not a class name: three different objects logged in the
+/// same run all render as `Object@2` because they were all the first `{}`.
+///
+/// The cost is not cosmetic. Every diagnostic whose payload is not already a
+/// String loses its payload, and those are the ones worth logging — a `Path`,
+/// a policy object, a config value. Testcontainers' startup log on this VM
+/// read `Image pull policy will be performed by: Object@2` and `you must set
+/// 'testcontainers.reuse.enable=true' in a file located at Object@2`, which is
+/// how a Docker-transport investigation lost its evidence trail (2026-08-14).
+///
+/// Falls back to `Object.toString()`'s own shape (`ClassName@hash`) if the
+/// virtual dispatch cannot answer, so a broken `toString()` degrades to
+/// HotSpot's default rather than to a placeholder.
+fn slf4j_render_arg(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+    if let Some(s) = ctx.read_string(obj) {
+        return s;
+    }
+    let pin = ctx.pin_native_root(obj);
+    let via_to_string = match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    };
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.unpin_native_roots(pin);
+    via_to_string.unwrap_or_else(|| {
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(obj))
+            .unwrap_or_else(|| "java/lang/Object".to_string())
+            .replace('/', ".");
+        format!("{cls}@{:x}", ctx.identity_hash_code(obj))
+    })
+}
+
 fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (Logger), args[1] = format string, args[2..] = params
     let logger_name = match args.first() {
@@ -3826,14 +3865,53 @@ fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(None),
     };
 
+    // Render every object argument BEFORE substituting, because rendering one
+    // of them re-enters Java (`toString()`) and a collection during that call
+    // moves the others. Pin them all for the duration.
+    let mut pins: Vec<Option<(usize, ObjectRef)>> = Vec::new();
+    let mut base_pin: Option<usize> = None;
+    for a in args.iter().skip(2) {
+        match a {
+            Value::Object(Some(o)) => {
+                let p = ctx.pin_native_root(*o);
+                if base_pin.is_none() {
+                    base_pin = Some(p);
+                }
+                pins.push(Some((p, *o)));
+            }
+            _ => pins.push(None),
+        }
+    }
+    let mut rendered: Vec<Option<String>> = Vec::with_capacity(pins.len());
+    for i in 0..pins.len() {
+        let Some((p, o)) = pins[i] else {
+            rendered.push(None);
+            continue;
+        };
+        let o = ctx.read_native_pin(p, o);
+        pins[i] = Some((p, o));
+        let text = slf4j_render_arg(ctx, o);
+        // `slf4j_render_arg` may have collected; refresh every other pin.
+        for j in 0..pins.len() {
+            if let Some((pj, oj)) = pins[j] {
+                pins[j] = Some((pj, ctx.read_native_pin(pj, oj)));
+            }
+        }
+        rendered.push(Some(text));
+    }
+    if let Some(bp) = base_pin {
+        ctx.unpin_native_roots(bp);
+    }
+
     // Substitute {} placeholders with parameter values
     let mut result = format_str.clone();
     let mut param_idx = 2;
     while let Some(pos) = result.find("{}") {
         let replacement = match args.get(param_idx) {
-            Some(Value::Object(Some(obj))) => ctx
-                .read_string(*obj)
-                .unwrap_or_else(|| format!("Object@{:x}", param_idx)),
+            Some(Value::Object(Some(_))) => match rendered.get(param_idx - 2) {
+                Some(Some(t)) => t.clone(),
+                _ => "null".to_string(),
+            },
             Some(Value::Object(None)) => "null".to_string(),
             Some(Value::Int(v)) => v.to_string(),
             Some(Value::Long(v)) => v.to_string(),

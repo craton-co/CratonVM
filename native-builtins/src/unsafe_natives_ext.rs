@@ -4332,10 +4332,56 @@ mod unsafe_arena {
             Self::locate(&inner, addr).is_some()
         }
 
+        /// The REAL, dereferenceable address of the byte that arena handle
+        /// `addr` names, plus how many bytes remain in its block.
+        ///
+        /// Every other accessor on this store copies, because every other
+        /// caller is Rust and can. JNI cannot: a native library that calls
+        /// `GetDirectBufferAddress` is handed a `void*` and dereferences it
+        /// itself, so a handle — whose whole point is that it is NOT a real
+        /// pointer — is a guaranteed SIGSEGV the moment it reaches C. Handing
+        /// out the backing pointer is what makes that call answerable at all;
+        /// see `jni_get_direct_buffer_address`.
+        ///
+        /// The pointer is into the block's `Vec<u8>`, so writes through it land
+        /// in the arena with no copy-back, which is the aliasing a direct
+        /// buffer is supposed to have. It stays valid until that block is
+        /// freed or reallocated — `Vec`'s heap buffer does not move when the
+        /// `BTreeMap` rebalances around it, only when `reallocate` resizes it.
+        /// That is the same lifetime a real `malloc`'d direct buffer gives a
+        /// native under HotSpot, and it is the caller's (the JNI spec's)
+        /// contract not to outlive it.
+        pub(super) fn real_ptr(&self, addr: i64) -> Option<(*mut u8, usize)> {
+            if addr & ARENA_TAG == 0 {
+                return None;
+            }
+            let mut inner = self.inner.write();
+            let (base, offset) = Self::locate(&inner, addr)?;
+            let arena = inner.get_mut(&base)?;
+            let remaining = arena.bytes.len().checked_sub(offset)?;
+            // SAFETY: `locate` established `offset < arena.bytes.len()`, so the
+            // offset is in bounds of the block's own allocation.
+            let ptr = unsafe { arena.bytes.as_mut_ptr().add(offset) };
+            Some((ptr, remaining))
+        }
+
         /// Copy `out.len()` bytes OUT of the arena (arena → `out`). Returns
         /// false if the `[addr, addr+len)` range is not fully inside one live
         /// arena block.
         pub(super) fn copy_out(&self, addr: i64, out: &mut [u8]) -> bool {
+            // A ZERO-LENGTH copy reads no bytes, so it cannot be out of
+            // bounds -- and it is legal at exactly one past the end of the
+            // block. `locate` is an EXCLUSIVE range test, so without this
+            // it reports "not in any live block" for `base + len` and the
+            // caller turns that into a spurious exception. Every direct
+            // `ByteBuffer` bulk `get`/`put` of an empty range while
+            // positioned at the buffer's limit lands here -- netty's
+            // `AbstractByteBufTest.writerIndexBoundaryCheck4` does exactly
+            // that (`writeBytes(ByteBuffer.wrap(EMPTY_BYTES))` on a full
+            // direct buffer) and threw `IllegalStateException`.
+            if out.is_empty() {
+                return true;
+            }
             let inner = self.inner.read();
             let (base, offset) = match Self::locate(&inner, addr) {
                 Some(v) => v,
@@ -4359,6 +4405,11 @@ mod unsafe_arena {
         /// Copy `data` INTO the arena (`data` → arena). Symmetric to
         /// [`Self::copy_out`].
         pub(super) fn copy_in(&self, addr: i64, data: &[u8]) -> bool {
+            // Zero-length write: see `copy_out` above. Writes nothing, so it
+            // is in bounds anywhere, including one past the end of a block.
+            if data.is_empty() {
+                return true;
+            }
             let mut inner = self.inner.write();
             let (base, offset) = match Self::locate(&inner, addr) {
                 Some(v) => v,
@@ -4446,6 +4497,20 @@ pub fn unsafe_arena_contains(addr: i64) -> bool {
 /// AND rather than an `RwLock` read plus a `BTreeMap` range probe.
 pub fn unsafe_arena_addr_is_tagged(addr: i64) -> bool {
     addr & unsafe_arena::ARENA_TAG != 0
+}
+
+/// Translate a live arena handle into a REAL pointer a native library can
+/// dereference, together with the bytes remaining in its block. `None` for an
+/// untagged address (already a real pointer — nothing to translate) and for a
+/// freed or out-of-bounds handle.
+///
+/// This is the one place the arena's backing store is exposed rather than
+/// copied, and it exists for the JNI boundary alone: `GetDirectBufferAddress`
+/// must answer with something C can dereference. Every in-VM consumer should
+/// keep using [`unsafe_arena_copy_out`] / [`unsafe_arena_copy_in`], which are
+/// bounds-checked on every access.
+pub fn unsafe_arena_real_ptr(addr: i64) -> Option<(*mut u8, usize)> {
+    unsafe_arena::store().real_ptr(addr)
 }
 
 /// Copy bytes out of the Unsafe arena (arena → `out`). Returns false if the
@@ -4877,6 +4942,82 @@ pub(crate) fn native_unsafe_compare_and_exchange_reference(
     Ok(Some(Value::Object(None)))
 }
 
+/// The arena handle → real pointer translation that `GetDirectBufferAddress`
+/// depends on. Written against the *observable* the JNI boundary needs: a
+/// pointer that can be dereferenced from C, that aliases the arena rather than
+/// copying it, and that refuses a handle no live block owns.
+#[cfg(test)]
+mod unsafe_arena_real_ptr_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_handle_translates_to_a_pointer_that_aliases_the_arena() {
+        let handle = unsafe_arena_allocate(64);
+        assert!(
+            unsafe_arena_addr_is_tagged(handle),
+            "handle {handle:#x} must carry the arena tag — the whole classification rests on it"
+        );
+
+        let (ptr, remaining) = unsafe_arena_real_ptr(handle).expect("live handle translates");
+        assert_eq!(remaining, 64);
+        assert!(
+            !unsafe_arena_addr_is_tagged(ptr as i64),
+            "the translated pointer must be a real address, not the handle again"
+        );
+
+        // Native-side write, arena-side read: this is the direction that was
+        // SIGSEGV-ing, and the aliasing is the point — a copy would pass the
+        // write test and still leave the buffer's contents wrong.
+        // SAFETY: `remaining` says 64 bytes are owned by this block.
+        unsafe {
+            std::ptr::write(ptr.add(3), 0xAB);
+        }
+        assert_eq!(unsafe_arena_get_byte(handle + 3), 0xAB);
+
+        // Arena-side write, native-side read: the other direction.
+        assert!(unsafe_arena_put_byte(handle + 5, 0xCD));
+        // SAFETY: same block, offset 5 < 64.
+        assert_eq!(unsafe { std::ptr::read(ptr.add(5)) }, 0xCD);
+
+        unsafe_arena_free(handle);
+    }
+
+    #[test]
+    fn a_mid_block_handle_translates_to_the_matching_interior_pointer() {
+        let handle = unsafe_arena_allocate(32);
+        let (base, base_len) = unsafe_arena_real_ptr(handle).expect("base translates");
+        let (mid, mid_len) = unsafe_arena_real_ptr(handle + 8).expect("interior translates");
+        assert_eq!(base_len, 32);
+        assert_eq!(mid_len, 24, "remaining must count from the interior offset");
+        assert_eq!(mid as usize - base as usize, 8);
+        unsafe_arena_free(handle);
+    }
+
+    #[test]
+    fn a_real_pointer_and_a_dead_handle_both_refuse() {
+        // Untagged: already a real pointer (a native's own NewDirectByteBuffer
+        // allocation). Nothing to translate, and translating would be wrong.
+        let mut real = [0u8; 8];
+        assert!(unsafe_arena_real_ptr(real.as_mut_ptr() as i64).is_none());
+
+        // Freed: a use-after-free must not be handed a pointer into whatever
+        // the allocator reused, so it resolves to None and JNI answers NULL.
+        let handle = unsafe_arena_allocate(16);
+        assert!(unsafe_arena_real_ptr(handle).is_some());
+        unsafe_arena_free(handle);
+        assert!(unsafe_arena_real_ptr(handle).is_none());
+
+        // Past the end of a live block: same refusal, so a native cannot walk
+        // off one buffer into the next. Size 8 on purpose — `allocate` rounds
+        // the address bump to 16, so `live + 8 .. live + 15` is guaranteed to
+        // belong to no block at all, even though this arena is process-global
+        // and other tests allocate into it concurrently.
+        let live = unsafe_arena_allocate(8);
+        assert!(unsafe_arena_real_ptr(live + 8).is_none());
+        unsafe_arena_free(live);
+    }
+}
+
 #[cfg(test)]
 mod unsafe_static_field_offset_tests {
     #[allow(unused_imports)]
@@ -5169,6 +5310,43 @@ mod unsafe_static_field_offset_tests {
         assert_eq!(
             ctx.get_static_field(class_id, 0),
             Value::Object(Some(replacement))
+        );
+    }
+}
+
+#[cfg(test)]
+mod arena_zero_length_copy_tests {
+    use super::{unsafe_arena_allocate, unsafe_arena_copy_in, unsafe_arena_copy_out};
+
+    /// A zero-length copy is a no-op and must succeed at ANY offset in the
+    /// block, INCLUDING one past the last byte -- that is where a direct
+    /// `ByteBuffer` sitting at its own limit points. Before the fix,
+    /// `locate`'s exclusive range test rejected `base + size` and the
+    /// ByteBuffer natives raised `IllegalStateException: ByteBuffer.put:
+    /// direct destination write failed`.
+    #[test]
+    fn zero_length_copy_at_end_of_block_succeeds() {
+        let base = unsafe_arena_allocate(16);
+        assert!(base > 0, "arena allocate returned {base}");
+        let end = base + 16;
+        assert!(
+            unsafe_arena_copy_in(end, &[]),
+            "0-byte write one past the end must succeed"
+        );
+        let mut empty: [u8; 0] = [];
+        assert!(
+            unsafe_arena_copy_out(end, &mut empty),
+            "0-byte read one past the end must succeed"
+        );
+        // Interior offsets keep working, and a NON-empty copy past the end is
+        // still refused.
+        assert!(unsafe_arena_copy_in(base + 8, &[1, 2, 3, 4]));
+        let mut got = [0u8; 4];
+        assert!(unsafe_arena_copy_out(base + 8, &mut got));
+        assert_eq!(got, [1, 2, 3, 4]);
+        assert!(
+            !unsafe_arena_copy_in(end, &[9]),
+            "a 1-byte write past the end must still be refused"
         );
     }
 }

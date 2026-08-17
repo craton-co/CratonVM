@@ -39,6 +39,9 @@ unconditional.
   unit-tested but has no non-doc callers; no `ZMarkContext`-backed coordinator
   is ever spawned for `ZgcRealHeap`. See
   [`zgc-production-implementation-plan.md`](zgc-production-implementation-plan.md).
+- **G1 parallel evacuation has no gauntlet-scale soak.** It is on by default since 2026-08-13 on
+  the strength of unit coverage and a differential checksum probe; the large-heap soak and the
+  throughput measurement that would justify the flip on performance grounds have not been run.
 - **G1 is not the default** and is not proposed as one here. Flipping it would
   change behaviour for every application and every test that assumes
   Generational, so it must be its own change with a full suite re-run.
@@ -263,8 +266,19 @@ distinct phase so the collector is *correct and selectable* before it is *fast*,
 
 **Sequencing caveat (hard):** parallel evacuation must NOT land — even gated — on a base with an
 open moving-GC memory-safety bug. The single-threaded evacuator must first be proven memory-safe
-across the gauntlet; the **gpu-bench-cpu G1 SIGSEGV** (Step 8 finding, `task_b53503fd`) is the
-current blocker.
+across the gauntlet; the **gpu-bench-cpu G1 SIGSEGV** (Step 8 finding, `task_b53503fd`) was named
+here as the current blocker.
+
+**Status of that blocker, 2026-08-13 — NOT reproduced, and NOT confirmed fixed.** Two things are
+now true and neither is "it is gone". First, the internal record tree's `gaps/README.md` records `gpu-bench-cpu`
+as PASS/PASS in three separate suite runs, which is inconsistent with the line above being current.
+Second, an attempt to reproduce it directly failed for a different reason: `GpuDotBench` under
+`-XX:+UseG1GC -Xmx512m` panics in `jit_thread_mut: aliasing &mut JvmThread borrow detected`
+(`vm/src/jit/helpers.rs`) — and it panics identically under the DEFAULT generational collector, so
+whatever that is, it is not a moving-GC memory-safety bug and not this blocker. The class the
+finding names, `CpuOnlyBench`, does not exist in the tree, so the original harness could not be
+re-run. Re-establishing this blocker's status needs that harness; until then it should not be cited
+as gating anything, and the JIT aliasing panic is its own defect.
 
 **Foundation already landed (Step 9, behaviour-identical):** `evacuate_object` now returns
 `(new_ptr, fresh)`, where `fresh` is the dedup signal — `true` iff this call performed the copy.
@@ -298,11 +312,30 @@ is declared (read-once `OnceLock`, default off) per §7.
    pushes on `fresh` (today they push unconditionally — fine single-threaded, redundant in
    parallel).
 
+**All four landed, and the flag is now default-ON with a `=0` opt-out (2026-08-13).** The default
+flip is a separate decision from the four pieces and rests on G1-9 being root-caused rather than
+worked around: it was a compact-layout scan divergence in the parallel evacuator's own object walk,
+reproducing identically at one worker, not a race. Piece 2 was never owed a `DashMap` — per-worker
+shards merged after the barrier is the other half of the same advice.
+
+**Fifth piece, not in the original list: a persistent worker pool** (`gc/src/evac_pool.rs`,
+2026-08-13). The four pieces above left thread creation inside every pause, which is overhead
+charged against `max_gc_pause_ms` for threads that are identical from one pause to the next. The
+pool creates them once per collector and parks them on a condvar; `EvacPool::scope` keeps the
+dispatch/participate/barrier shape so the module SAFETY MODEL note is unchanged. What a persistent
+pool cannot inherit from `std::thread::scope` is the *type-level* proof that no worker outlives the
+borrowed job, so that argument is written out and turns on one property — `scope` does not return
+until every worker has decremented, and a worker decrements after its call returns INCLUDING on an
+unwind. A panicking worker that skipped its decrement would hang the driver on the condvar while it
+holds the regions lock, with the panic never surfacing; both panic directions are tested.
+
 **Validation (§4 step 9 / §5):** differential — the deterministic benches (e.g. `bintrees18@8g`)
-under `CRATONVM_G1_PARALLEL_EVAC=1` must produce **byte-identical checksums** vs serial G1 vs
-HotSpot, across worker counts; plus a parallel-evac soak with no leak/corruption. Parallel evac
-stays **opt-in** until soak-clean; flipping it on (with a demonstrated large-heap throughput win) is
-part of Step 10.
+under parallel evacuation must produce **byte-identical checksums** vs serial G1 vs HotSpot, across
+worker counts; plus a parallel-evac soak with no leak/corruption. The checksum half is met at the
+probe scale used for G1-9 (byte-identical to a real JDK run of the same class, 0/10 corrupt after
+the fix, serial arm clean throughout). **The gauntlet-scale soak and the large-heap throughput
+number are still owed** — the default flip was taken on correctness evidence, not on a measured
+win, and this document should not be read as claiming one.
 
 ---
 
@@ -316,7 +349,9 @@ sound.
    runs if explicitly asked.)
 2. **Doc truth-up.** Reconcile `ARCHITECTURE.md` vs `README.md`/`CONTRIBUTING.md`: describe
    Generational as default, G1 as opt-in/experimental-but-real, and ZGC-real as built and
-   dispatched but compiled in only behind the default-off `zgc` Cargo feature.
+   dispatched but compiled in only behind the `zgc` Cargo feature — which was
+   default-off when this was written and has been **default-ON since
+   2026-08-10**, because the default `GcAlgorithm` is now the variant it gates.
    (Docs-only; full-review docs-governance row.) This is the only step that may touch files outside
    the design doc, and is pure documentation.
 

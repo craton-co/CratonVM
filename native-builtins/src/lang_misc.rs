@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -46,6 +46,10 @@ use crate::obj_arg;
 const UNRESOLVED_FIELD_INDEX: usize = usize::MAX;
 static THROWABLE_DETAIL_MESSAGE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
 static THROWABLE_CAUSE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_SUPPRESSED_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_BACKTRACE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_DEPTH_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_STACK_TRACE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
 
 /// Sentinel meaning "STE class id not yet resolved." `ClassId::new(0)` is
 /// the legacy fallback (java/lang/Object) — using it as a sentinel would
@@ -104,6 +108,92 @@ fn synthetic_throwable_slot(field_name: &str) -> Option<usize> {
     }
 }
 
+/// The slot `java/lang/Throwable` itself declares for `field_name`, returned
+/// ONLY when the receiver's own class declares a DIFFERENT field of the same
+/// name — i.e. when the receiver SHADOWS one of `Throwable`'s fields.
+///
+/// A `Throwable` subclass may legally declare a field whose name collides with
+/// one of `Throwable`'s own, and real code does: H2 1.2's
+/// `org.h2.jdbc.JdbcSQLException` declares `private final Throwable cause` and
+/// assigns it in its constructor on the line before it calls `initCause(cause)`.
+///
+/// Javac resolves `getfield`/`putfield` against the class named in the constant
+/// pool, so `Throwable.initCause`'s own bytecode always reaches
+/// `Throwable.cause` no matter what a subclass declares. A name-keyed lookup on
+/// the RECEIVER does not — it answers the most-derived declaration. That is a
+/// different slot from the one the writers in this file target:
+/// `write_throwable_field_cached` resolves its index against
+/// `java/lang/Throwable` explicitly (see `cached_throwable_field_index`). So the
+/// two halves of every read/write pair addressed different memory the moment a
+/// subclass shadowed the name.
+///
+/// The visible consequence: `native_exc_init_message` wrote the `cause = this`
+/// sentinel into `Throwable`'s slot, `native_throwable_init_cause` read H2's
+/// slot, saw the value H2's constructor had just stored there, and refused the
+/// call with `IllegalStateException: Can't overwrite cause with ...`. Every
+/// `JdbcSQLException` H2 built then failed to construct, each refusal wrapped by
+/// the next JDBC layer — the five-deep cascade `org.h2.test.unit.TestUpgrade`
+/// died on (found 2026-08-14).
+///
+/// Returning `None` for a receiver that merely INHERITS the field keeps every
+/// existing path byte-identical; only the shadowing case is redirected.
+fn shadowed_throwable_slot(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+) -> Option<usize> {
+    let cache = throwable_field_cache(field_name)?;
+    let declared = cached_throwable_field_index(ctx, cache, field_name)?;
+    let own = ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(this), field_name)?;
+    if own == declared {
+        return None;
+    }
+    (declared < ctx.object_num_fields(this)).then_some(declared)
+}
+
+/// Per-name cache cell for [`shadowed_throwable_slot`]. `None` for a name
+/// `java/lang/Throwable` does not declare — there is nothing to shadow.
+fn throwable_field_cache(field_name: &str) -> Option<&'static AtomicUsize> {
+    match field_name {
+        "cause" => Some(&THROWABLE_CAUSE_INDEX),
+        "detailMessage" => Some(&THROWABLE_DETAIL_MESSAGE_INDEX),
+        "suppressedExceptions" => Some(&THROWABLE_SUPPRESSED_INDEX),
+        "backtrace" => Some(&THROWABLE_BACKTRACE_INDEX),
+        "depth" => Some(&THROWABLE_DEPTH_INDEX),
+        "stackTrace" => Some(&THROWABLE_STACK_TRACE_INDEX),
+        _ => None,
+    }
+}
+
+/// Read a field `java/lang/Throwable` declares, from the slot `Throwable`
+/// declares it in rather than whatever the receiver's class resolves the name
+/// to. See [`shadowed_throwable_slot`].
+pub(crate) fn throwable_field_get(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+) -> Value {
+    if let Some(idx) = shadowed_throwable_slot(ctx, this, field_name) {
+        return ctx.get_field(this, idx);
+    }
+    ctx.get_field_by_name(this, field_name)
+}
+
+/// Write-side companion to [`throwable_field_get`]. Keeps a shadowing
+/// receiver's reads and writes on the same slot.
+pub(crate) fn throwable_field_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+    value: Value,
+) {
+    if let Some(idx) = shadowed_throwable_slot(ctx, this, field_name) {
+        ctx.set_field(this, idx, value);
+        return;
+    }
+    ctx.set_field_by_name(this, field_name, value);
+}
+
 /// Write a Throwable field by name, falling back to
 /// [`synthetic_throwable_slot`] when the receiver has no field names.
 /// Companion to [`read_throwable_field`].
@@ -113,8 +203,8 @@ fn write_throwable_field(
     field_name: &str,
     value: Value,
 ) {
-    ctx.set_field_by_name(this, field_name, value);
-    if ctx.get_field_by_name(this, field_name) != value {
+    throwable_field_set(ctx, this, field_name, value);
+    if throwable_field_get(ctx, this, field_name) != value {
         if let Some(slot) = synthetic_throwable_slot(field_name) {
             if slot < ctx.object_num_fields(this) {
                 ctx.set_field(this, slot, value);
@@ -126,7 +216,7 @@ fn write_throwable_field(
 /// Read a Throwable field by name, falling back to
 /// [`synthetic_throwable_slot`] when the receiver has no field names.
 fn read_throwable_field(ctx: &mut dyn NativeContext, this: ObjectRef, field_name: &str) -> Value {
-    let by_name = ctx.get_field_by_name(this, field_name);
+    let by_name = throwable_field_get(ctx, this, field_name);
     if !matches!(by_name, Value::Object(None)) {
         return by_name;
     }
@@ -176,10 +266,10 @@ fn write_throwable_field_cached(
             return;
         }
     }
-    ctx.set_field_by_name(this, field_name, value);
+    throwable_field_set(ctx, this, field_name, value);
     // A synthetic receiver resolves neither the cached index nor the name, so
     // the write above was a no-op. See `synthetic_throwable_slot`.
-    if ctx.get_field_by_name(this, field_name) != value {
+    if throwable_field_get(ctx, this, field_name) != value {
         if let Some(slot) = synthetic_throwable_slot(field_name) {
             if slot < ctx.object_num_fields(this) {
                 ctx.set_field(this, slot, value);
@@ -422,8 +512,8 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
     // park a self-reference as the non-null marker (the real frame data lives
     // in the identity-hash-keyed trace store).
-    ctx.set_field_by_name(this, "backtrace", Value::Object(Some(this)));
-    ctx.set_field_by_name(this, "depth", Value::Int(depth));
+    throwable_field_set(ctx, this, "backtrace", Value::Object(Some(this)));
+    throwable_field_set(ctx, this, "depth", Value::Int(depth));
     // Mirror the JDK field initializer `suppressedExceptions = SUPPRESSED_SENTINEL`.
     init_suppressed_sentinel(ctx, this);
 }
@@ -462,7 +552,7 @@ fn init_suppressed_sentinel(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // Only mirror once `Throwable.<clinit>` has populated the sentinel; before
     // that (bootstrap-era throwables) leave the field as-is.
     if let Some(v @ Value::Object(Some(_))) = sentinel {
-        ctx.set_field_by_name(this, "suppressedExceptions", v);
+        throwable_field_set(ctx, this, "suppressedExceptions", v);
     }
 }
 
@@ -496,7 +586,7 @@ fn suppression_disabled(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
         return false;
     }
     if !matches!(
-        ctx.get_field_by_name(this, "suppressedExceptions"),
+        throwable_field_get(ctx, this, "suppressedExceptions"),
         Value::Object(None)
     ) {
         return false;
@@ -594,6 +684,254 @@ pub(crate) fn native_exc_init_cause(
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// The constructors the blanket four-descriptor set did not cover
+// ---------------------------------------------------------------------------
+//
+// Every message below is the string JDK 25 actually produces, measured by
+// constructing the real exception and reading `getMessage()`
+// (`probes/ThrowableCtorCensusProbe.java`'s sibling run) — not inferred from
+// the javadoc. Where the JDK's message is a format ("Index out of range: 3"),
+// reproducing it matters: these are the strings that end up in a user's log.
+
+/// `AssertionError(Object)` — the single most reachable constructor in the
+/// census, and the one that was missing everywhere.
+///
+/// `AssertionError`'s `(String)V` is **private** in the JDK, so BOTH
+/// `throw new AssertionError(msg)` and `assert cond : msg` compile to
+/// `<init>:(Ljava/lang/Object;)V`. Neither the registry nor the synthetic stub
+/// declared it, so in synthetic-JDK mode the error path of anything using
+/// `assert` raised `NoSuchMethodError` — replacing the assertion's own message
+/// with a dispatch failure at exactly the moment the program was trying to
+/// report what went wrong.
+///
+/// JDK semantics (`AssertionError(Object detailMessage)`):
+/// ```text
+///     this(String.valueOf(detailMessage));
+///     if (detailMessage instanceof Throwable)
+///         initCause((Throwable) detailMessage);
+/// ```
+/// Measured: `new AssertionError((Object) null)` → message `null` (the JDK
+/// stores `String.valueOf(null)`, i.e. the four-character string "null" —
+/// `getMessage()` reports it as such), and a `Throwable` argument yields both
+/// `getMessage() == cause.toString()` and `getCause() == cause`.
+pub(crate) fn native_assertion_error_init_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(mut this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let mut detail = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `String.valueOf(Object)` — through the JDK so a custom `toString()` is
+    // honoured, exactly as the real constructor does.
+    //
+    // GC-safety: this is the `assert` failure path, so it runs at whatever
+    // allocation pressure the program had reached, and the `toString()`
+    // bytecode below allocates and can relocate BOTH `this` and the argument.
+    // Pin the two across the call and REBIND them to the forwarded references —
+    // every write below targets `this`, and the Throwable-cause test below
+    // reads `detail`, so a stale local here corrupts the object it is building.
+    let message = match detail {
+        Value::Object(Some(obj)) => {
+            let this_pin = ctx.pin_native_root(this);
+            let detail_pin = ctx.pin_native_root(obj);
+            let rendered = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
+            this = ctx.read_native_pin(this_pin, this);
+            detail = Value::Object(Some(ctx.read_native_pin(detail_pin, obj)));
+            // Releases from `this_pin` onward, i.e. both handles.
+            ctx.unpin_native_roots(this_pin);
+            match rendered {
+                Ok(Some(v @ Value::Object(Some(_)))) => v,
+                _ => Value::Object(None),
+            }
+        }
+        // `String.valueOf((Object) null)` is the STRING "null", not a null ref.
+        _ => Value::Object(Some(ctx.create_string("null"))),
+    };
+    write_throwable_detail_message(ctx, this, message);
+    // A Throwable argument becomes the cause as well as the message.
+    let cause_is_throwable = match detail {
+        Value::Object(Some(obj)) => {
+            let obj_class = ctx.class_id_of_object(obj);
+            ctx.class_id_by_name("java/lang/Throwable")
+                .is_some_and(|throwable| {
+                    obj_class == throwable || ctx.is_subclass(obj_class, throwable)
+                })
+        }
+        _ => false,
+    };
+    if cause_is_throwable {
+        write_throwable_cause(ctx, this, detail);
+    } else {
+        // Self-sentinel, so a later `initCause()` still succeeds — the same
+        // contract `native_exc_init_message` maintains.
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+    }
+    capture_throwable_trace(ctx, this);
+    Ok(None)
+}
+
+/// Which primitive an `AssertionError(<primitive>)` overload was handed, so the
+/// message is `String.valueOf` of the RIGHT type: the interpreter delivers a
+/// `boolean`, a `char` and an `int` all as `Value::Int`, and
+/// `String.valueOf(true)` is "true" where `String.valueOf(1)` is "1".
+#[derive(Clone, Copy)]
+pub(crate) enum ScalarKind {
+    Boolean,
+    Char,
+    Int,
+    Long,
+    Float,
+    Double,
+}
+
+fn scalar_to_string(kind: ScalarKind, value: Option<&Value>) -> String {
+    match (kind, value) {
+        (ScalarKind::Boolean, Some(Value::Int(v))) => (*v != 0).to_string(),
+        (ScalarKind::Char, Some(Value::Int(v))) => char::from_u32(*v as u32)
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        (ScalarKind::Int, Some(Value::Int(v))) => v.to_string(),
+        (ScalarKind::Long, Some(Value::Long(v))) => v.to_string(),
+        (ScalarKind::Long, Some(Value::Int(v))) => (*v as i64).to_string(),
+        // Java's float/double text rules are NOT Rust's `to_string`:
+        // `Float.toString(0.1f)` is "0.1", but widening that f32 to f64 and
+        // printing gives "0.10000000149011612", and `Double.toString(1e7)` is
+        // "1.0E7" where Rust prints "10000000". `format_float`/`format_double`
+        // in `lang_string` ARE the in-tree implementations of Java's rules
+        // (both delegate to the shared `cratonvm_types` formatter); a second
+        // local copy here would drift away from them.
+        (ScalarKind::Float, Some(Value::Float(v))) => crate::lang_string::format_float(*v),
+        (ScalarKind::Double, Some(Value::Double(v))) => crate::lang_string::format_double(*v),
+        _ => String::new(),
+    }
+}
+
+fn assertion_error_init_scalar(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    kind: ScalarKind,
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let text = scalar_to_string(kind, args.get(1));
+        // Uninterned, like every `String.valueOf` native in `lang_string`: the
+        // JDK hands back a fresh String, so `new AssertionError(42).getMessage()
+        // == "42"` is false, and interning one object per distinct value would
+        // pin an unbounded set of messages in the intern table forever.
+        let message = ctx.create_string_uninterned(&text);
+        write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        capture_throwable_trace(ctx, this);
+    }
+    Ok(None)
+}
+
+/// `IndexOutOfBoundsException(int|long)` and its two subclasses, whose messages
+/// differ by one word each — measured on JDK 25:
+///
+/// ```text
+///   new IndexOutOfBoundsException(3)        Index out of range: 3
+///   new ArrayIndexOutOfBoundsException(3)   Array index out of range: 3
+///   new StringIndexOutOfBoundsException(3)  String index out of range: 3
+/// ```
+fn index_exception_init_index(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    prefix: &str,
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let index = match args.get(1) {
+            Some(Value::Int(v)) => i64::from(*v),
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
+        // Uninterned: one distinct message per index, and the JDK's is a fresh
+        // String built by concatenation, never an interned constant.
+        let message = ctx.create_string_uninterned(&format!("{prefix}{index}"));
+        write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        capture_throwable_trace(ctx, this);
+    }
+    Ok(None)
+}
+
+/// `UncheckedIOException(IOException)` — message is the cause's `toString()`,
+/// and a null cause is a `NullPointerException` (`Objects.requireNonNull`),
+/// not a silently message-less exception. Measured.
+pub(crate) fn native_unchecked_io_init_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("cause".to_string()),
+        }
+        .into());
+    }
+    native_exc_init_cause(ctx, args)
+}
+
+/// `UncheckedIOException(String, IOException)` — same null-cause refusal, with
+/// the caller's own message.
+pub(crate) fn native_unchecked_io_init_message_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if !matches!(args.get(2), Some(Value::Object(Some(_)))) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("cause".to_string()),
+        }
+        .into());
+    }
+    native_exc_init_message_cause(ctx, args)
+}
+
+/// `ParseException(String, int)` — message is the string; the offset also goes
+/// to the JDK's `errorOffset` field.
+///
+/// NOTE the boundary: this constructor is what was missing, and it is what this
+/// change fixes. `getErrorOffset()` is a separate method on a separate surface —
+/// the write below reaches it only if the class model declares the field, and
+/// nothing here fabricates the accessor.
+pub(crate) fn native_parse_exception_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+        write_throwable_detail_message(ctx, this, msg);
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        if let Some(offset @ Value::Int(_)) = args.get(2) {
+            ctx.set_field_by_name(this, "errorOffset", *offset);
+        }
+        capture_throwable_trace(ctx, this);
+    }
+    Ok(None)
+}
+
+/// `MissingResourceException(String s, String className, String key)` — the
+/// message is `s`; `className`/`key` are the JDK's own named fields. Same
+/// accessor boundary as `ParseException` above.
+pub(crate) fn native_missing_resource_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+        write_throwable_detail_message(ctx, this, msg);
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        if let Some(class_name) = args.get(2) {
+            ctx.set_field_by_name(this, "className", *class_name);
+        }
+        if let Some(key) = args.get(3) {
+            ctx.set_field_by_name(this, "key", *key);
+        }
+        capture_throwable_trace(ctx, this);
+    }
+    Ok(None)
+}
+
 /// InvocationTargetException(Throwable) — store the wrapped throwable in the
 /// JDK `target` field rather than the inherited Throwable `cause` field.
 pub(crate) fn native_invocation_target_exception_init_target(
@@ -642,7 +980,7 @@ pub(crate) fn native_invocation_target_exception_get_target(
         Value::Object(Some(target_obj)) if target_obj == this => Ok(Some(Value::Object(None))),
         Value::Object(_) => Ok(Some(target)),
         _ => {
-            let cause = ctx.get_field_by_name(this, "cause");
+            let cause = throwable_field_get(ctx, this, "cause");
             match cause {
                 Value::Object(Some(cause_obj)) if cause_obj == this => {
                     Ok(Some(Value::Object(None)))
@@ -935,7 +1273,7 @@ pub(crate) fn native_throwable_get_message(
         .class_name_of_id(ctx.class_id_of_object(this))
         .and_then(|cn| ctx.resolve_field_index(&cn, "detailMessage"))
         .is_some();
-    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    let by_name = throwable_field_get(ctx, this, "detailMessage");
     let detail = match by_name {
         Value::Object(Some(_)) => by_name,
         // `detailMessage` resolved by name but is null/absent: that is a
@@ -1204,6 +1542,27 @@ pub(crate) fn native_throwable_init_cause(
         // An unset reference slot reads back as `Int(0)` — no verdict.
         _ => false,
     };
+    if crate::nbflags().dbg_cause {
+        let this_cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        let raw = throwable_field_get(ctx, this, "cause");
+        let idx = ctx.resolve_field_index_by_class_id(class_id, "cause");
+        let nf = ctx.object_num_fields(this);
+        let frames = ctx.capture_throwable_stack_trace(this);
+        let top: Vec<String> = frames
+            .iter()
+            .take(8)
+            .map(|f| format!("{}.{}:{}", f.class_name, f.method_name, f.line_number))
+            .collect();
+        eprintln!(
+            "CAUSE_DBG_INIT this={this_cls} hash={} raw={raw:?} is_self={} declares={declares_cause} idx={idx:?} nfields={nf} already_set={already_set} arg={:?} frames=[{}]",
+            ctx.identity_hash_code(this),
+            matches!(raw, Value::Object(Some(c)) if c == this),
+            cause_val,
+            top.join(" <- ")
+        );
+    }
     if already_set {
         // `"Can't overwrite cause with " + Objects.toString(cause, "a null")`.
         // Rendering the argument re-enters Java (`toString()`), so the receiver
@@ -1280,7 +1639,7 @@ fn throwable_detail_message_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> O
         .class_name_of_id(ctx.class_id_of_object(t))
         .and_then(|cn| ctx.resolve_field_index(&cn, "detailMessage"))
         .is_some();
-    let detail = match ctx.get_field_by_name(t, "detailMessage") {
+    let detail = match throwable_field_get(ctx, t, "detailMessage") {
         v @ Value::Object(Some(_)) => v,
         _ if has_named_detail_message => Value::Object(None),
         _ => match ctx.get_field(t, 0) {
@@ -1328,7 +1687,7 @@ fn throwable_to_string_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> (Objec
 /// Read the cause field, returning None if missing or self-referential
 /// (the JDK `cause = this` "uninitialized" sentinel).
 fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRef> {
-    let by_name = ctx.get_field_by_name(t, "cause");
+    let by_name = throwable_field_get(ctx, t, "cause");
     if let Value::Object(Some(c)) = by_name {
         if c == t {
             return None;
@@ -1395,7 +1754,7 @@ fn throwable_frame_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<String
 /// while CratonVM's native `addSuppressed` replaces it with a Throwable array;
 /// only the latter represents user-visible suppressed exceptions.
 fn throwable_suppressed(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<ObjectRef> {
-    let Value::Object(Some(array)) = ctx.get_field_by_name(t, "suppressedExceptions") else {
+    let Value::Object(Some(array)) = throwable_field_get(ctx, t, "suppressedExceptions") else {
         return Vec::new();
     };
     if ctx.heap_kind_of(array) != cratonvm_types::ObjectKind::Array {
@@ -1796,7 +2155,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     // ES-suite failures). The JDK sentinel `UNASSIGNED_STACK` is a zero-length
     // array, so a non-empty `stackTrace` field means it was set (or cached) and
     // must be returned verbatim instead of re-deriving from the backtrace.
-    if let Value::Object(Some(set_arr)) = ctx.get_field_by_name(this, "stackTrace") {
+    if let Value::Object(Some(set_arr)) = throwable_field_get(ctx, this, "stackTrace") {
         if ctx.array_length(set_arr) > 0 {
             if crate::nbflags().dbg_sttrace {
                 let n = ctx.array_length(set_arr);
@@ -1884,7 +2243,7 @@ pub(crate) fn native_throwable_set_stack_trace(
         _ => return Ok(None),
     };
     let stack = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field_by_name(this, "stackTrace", stack);
+    throwable_field_set(ctx, this, "stackTrace", stack);
     Ok(None)
 }
 
@@ -2450,507 +2809,52 @@ pub(crate) fn register_p60_record(r: &mut NativeMethodRegistry) {
 // behavior is uniform across the family — `register` is last-write-wins
 // and the new closure is a strict superset of the existing native (it
 // reads slot 0, validates it's a string, and falls back to null).
-/// Pick the native body for one `(class, <init> descriptor)` of the
-/// Throwable-family table in `register_throwable_subclass_natives`.
+/// The throwable-family classes whose Throwable surface this file bridges.
 ///
-/// Split out from the table so the DATA (which descriptors exist, derived from
-/// the JDK) and the BEHAVIOUR (what each descriptor does) can be checked
-/// separately. Returning `Option` rather than a default keeps a descriptor that
-/// nothing implements from being registered to the wrong body: the caller
-/// asserts instead.
-///
-/// Every non-default arm mirrors a JDK 25 constructor body whose effect is more
-/// than "store message and/or cause". All of them were MEASURED on
-/// Microsoft OpenJDK 25.0.3+9-LTS (`scratchpad/e34/Msgs34.java`); the message
-/// texts below are quoted from that run, not guessed.
-fn throwable_ctor_native(
-    cls: &str,
-    descriptor: &str,
-) -> Option<cratonvm_native_api::NativeCallback> {
-    match (cls, descriptor) {
-        // InvocationTargetException stores the wrapped throwable in its own
-        // `target` field, not the inherited `cause`.
-        ("java/lang/reflect/InvocationTargetException", "(Ljava/lang/Throwable;)V") => {
-            Some(native_invocation_target_exception_init_target)
-        }
-        (
-            "java/lang/reflect/InvocationTargetException",
-            "(Ljava/lang/Throwable;Ljava/lang/String;)V",
-        ) => Some(native_invocation_target_exception_init_target_message),
-        // AssertionError: every overload is `this(String.valueOf(x))`, and the
-        // (Object) one additionally adopts a Throwable argument as its cause.
-        ("java/lang/AssertionError", "(Ljava/lang/Object;)V") => {
-            Some(native_assertion_error_init_object)
-        }
-        ("java/lang/AssertionError", "(Z)V") => Some(native_assertion_error_init_boolean),
-        ("java/lang/AssertionError", "(C)V") => Some(native_assertion_error_init_char),
-        ("java/lang/AssertionError", "(I)V") => Some(native_assertion_error_init_int),
-        ("java/lang/AssertionError", "(J)V") => Some(native_assertion_error_init_long),
-        ("java/lang/AssertionError", "(F)V") => Some(native_assertion_error_init_float),
-        ("java/lang/AssertionError", "(D)V") => Some(native_assertion_error_init_double),
-        // The three index families each build a DIFFERENT fixed message prefix.
-        ("java/lang/IndexOutOfBoundsException", "(I)V") => Some(native_index_oobe_init_int),
-        ("java/lang/IndexOutOfBoundsException", "(J)V") => Some(native_index_oobe_init_long),
-        ("java/lang/ArrayIndexOutOfBoundsException", "(I)V") => {
-            Some(native_array_index_oobe_init_int)
-        }
-        ("java/lang/StringIndexOutOfBoundsException", "(I)V") => {
-            Some(native_string_index_oobe_init_int)
-        }
-        // UncheckedIOException wraps a non-null IOException; `new
-        // UncheckedIOException(null)` throws NullPointerException on JDK 25.
-        ("java/io/UncheckedIOException", "(Ljava/io/IOException;)V") => {
-            Some(native_unchecked_io_exception_init_cause)
-        }
-        ("java/io/UncheckedIOException", "(Ljava/lang/String;Ljava/io/IOException;)V") => {
-            Some(native_unchecked_io_exception_init_message_cause)
-        }
-        // Two classes carry state beyond message/cause.
-        ("java/text/ParseException", "(Ljava/lang/String;I)V") => {
-            Some(native_parse_exception_init_message_offset)
-        }
-        (
-            "java/util/MissingResourceException",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-        ) => Some(native_missing_resource_exception_init),
-        // The generic Throwable shapes.
-        _ => match descriptor {
-            "()V" => Some(native_exc_init_noargs),
-            "(Ljava/lang/String;)V" => Some(native_exc_init_message),
-            "(Ljava/lang/String;Ljava/lang/Throwable;)V" => Some(native_exc_init_message_cause),
-            "(Ljava/lang/Throwable;)V" => Some(native_exc_init_cause),
-            _ => None,
-        },
-    }
-}
-
-/// Shared tail of every `AssertionError(<primitive-or-Object>)` overload:
-/// `this(String.valueOf(x))`, i.e. exactly `Throwable(String)`.
-fn assertion_error_init_with_message(ctx: &mut dyn NativeContext, this: ObjectRef, message: Value) {
-    write_throwable_detail_message(ctx, this, message);
-    // `Throwable.cause` is the `cause = this` sentinel until initCause() runs.
-    write_throwable_cause(ctx, this, Value::Object(Some(this)));
-    capture_throwable_trace(ctx, this);
-}
-
-/// `AssertionError.<init>(Ljava/lang/Object;)V` — **the descriptor `javac`
-/// emits for BOTH `throw new AssertionError(msg)` and `assert cond : msg`**,
-/// because `AssertionError(String)` is private in the JDK.
-///
-/// JDK 25 body:
-/// ```text
-///     this(String.valueOf(detailMessage));
-///     if (detailMessage instanceof Throwable)
-///         initCause((Throwable) detailMessage);
-/// ```
-/// MEASURED consequences, all reproduced here:
-///   * `new AssertionError((Object) null)` has `getMessage()` == the four-char
-///     String "null", NOT a null message — `String.valueOf(Object)` is what
-///     runs, and its null arm returns the text.
-///   * `new AssertionError((Object) aThrowable)` has `getMessage()` ==
-///     `aThrowable.toString()` AND `getCause() == aThrowable`, so a later
-///     `initCause(...)` throws IllegalStateException. With a non-Throwable
-///     argument `initCause` still succeeds, which is why the sentinel is
-///     written first and only then overwritten.
-pub(crate) fn native_assertion_error_init_object(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return Ok(None);
-    };
-    let detail = args.get(1).copied().unwrap_or(Value::Object(None));
-    // GC-safety: `String.valueOf(Object)` runs the argument's real `toString()`
-    // bytecode, which allocates and can relocate BOTH `this` and `detail`. Pin
-    // them across the call and re-read the forwarded references — this is the
-    // `assert` failure path, so it runs at arbitrary allocation pressure.
-    let this_pin = ctx.pin_native_root(this);
-    let detail_ref = match detail {
-        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
-        _ => None,
-    };
-    // Reuse String.valueOf(Object) rather than re-deriving it: it already
-    // carries the "toString() may legitimately return a real null" contract,
-    // and re-implementing it here would be another copy of that rule.
-    let valued = crate::lang_string::native_string_value_of_object(ctx, &[detail]);
-    let this = ctx.read_native_pin(this_pin, this);
-    let detail = match detail_ref {
-        Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
-        None => detail,
-    };
-    ctx.unpin_native_roots(this_pin);
-    let message = match valued? {
-        Some(v) => v,
-        None => Value::Object(None),
-    };
-    assertion_error_init_with_message(ctx, this, message);
-    if let Value::Object(Some(obj)) = detail {
-        if value_is_throwable(ctx, obj) {
-            // initCause((Throwable) detailMessage)
-            write_throwable_cause(ctx, this, detail);
-        }
-    }
-    Ok(None)
-}
-
-/// Is `obj` a `java.lang.Throwable`? Used only by
-/// `native_assertion_error_init_object` to decide whether the JDK's
-/// `instanceof Throwable` arm fires.
-fn value_is_throwable(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
-    let Some(throwable_cid) = ctx.class_id_by_name("java/lang/Throwable") else {
-        // No Throwable class yet (bootstrap-era): fail CLOSED — not adopting a
-        // cause leaves `initCause` usable, which is the recoverable direction.
-        return false;
-    };
-    let obj_cid = ctx.class_id_of_object(obj);
-    obj_cid == throwable_cid || ctx.is_subclass(obj_cid, throwable_cid)
-}
-
-/// `AssertionError.<init>(Z)V` — `this(String.valueOf(detailMessage))`.
-pub(crate) fn native_assertion_error_init_boolean(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    assertion_error_init_prim(
-        ctx,
-        args,
-        crate::lang_string::native_string_value_of_boolean,
-    )
-}
-
-/// `AssertionError.<init>(C)V` — `this(String.valueOf(detailMessage))`.
-pub(crate) fn native_assertion_error_init_char(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    assertion_error_init_prim(ctx, args, crate::lang_string::native_string_value_of_char)
-}
-
-/// `AssertionError.<init>(I)V` — `this(String.valueOf(detailMessage))`.
-pub(crate) fn native_assertion_error_init_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    assertion_error_init_prim(ctx, args, crate::lang_string::native_string_value_of_int)
-}
-
-/// `AssertionError.<init>(J)V` — `this(String.valueOf(detailMessage))`.
-pub(crate) fn native_assertion_error_init_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    assertion_error_init_prim(ctx, args, crate::lang_string::native_string_value_of_long)
-}
-
-/// `AssertionError.<init>(F)V` — `this(String.valueOf(detailMessage))`.
-pub(crate) fn native_assertion_error_init_float(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    assertion_error_init_prim(ctx, args, crate::lang_string::native_string_value_of_float)
-}
-
-/// `AssertionError.<init>(D)V` — `this(String.valueOf(detailMessage))`.
-pub(crate) fn native_assertion_error_init_double(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    assertion_error_init_prim(ctx, args, crate::lang_string::native_string_value_of_double)
-}
-
-/// The six primitive `AssertionError` overloads differ only in WHICH
-/// `String.valueOf` runs, so they share this body and delegate the formatting
-/// to `lang_string`'s existing natives. That matters for `(F)` and `(D)`:
-/// Java's float/double-to-text rules are not Rust's `to_string`, and
-/// `format_float`/`format_double` are the in-tree implementations of the Java
-/// ones. Re-deriving them here would be another drifting copy.
-fn assertion_error_init_prim(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    value_of: cratonvm_native_api::NativeCallback,
-) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return Ok(None);
-    };
-    let raw = args.get(1).copied().unwrap_or(Value::Int(0));
-    // GC-safety: `String.valueOf` allocates the result String, which can
-    // relocate `this`. Pin it and re-read the forwarded reference.
-    let this_pin = ctx.pin_native_root(this);
-    let valued = value_of(ctx, &[raw]);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    let message = match valued? {
-        Some(v) => v,
-        None => Value::Object(None),
-    };
-    assertion_error_init_with_message(ctx, this, message);
-    Ok(None)
-}
-
-/// Shared body for the three index-out-of-bounds constructors, which differ
-/// only in the message prefix. JDK 25 form: `super(<prefix> + index)`.
-fn index_oobe_init_with_prefix(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    prefix: &str,
-    index: i64,
-) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return Ok(None);
-    };
-    let text = format!("{prefix}{index}");
-    // GC-safety: allocating the message String can relocate `this`.
-    let this_pin = ctx.pin_native_root(this);
-    let message = ctx.create_string_uninterned(&text);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
-    write_throwable_cause(ctx, this, Value::Object(Some(this)));
-    capture_throwable_trace(ctx, this);
-    Ok(None)
-}
-
-/// `IndexOutOfBoundsException.<init>(I)V` — MEASURED message
-/// `"Index out of range: 7"` for index 7.
-pub(crate) fn native_index_oobe_init_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let index = match args.get(1) {
-        Some(Value::Int(v)) => i64::from(*v),
-        _ => 0,
-    };
-    index_oobe_init_with_prefix(ctx, args, "Index out of range: ", index)
-}
-
-/// `IndexOutOfBoundsException.<init>(J)V` — same MEASURED prefix as the `(I)`
-/// overload; JDK 25 does not distinguish them in the text.
-pub(crate) fn native_index_oobe_init_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let index = match args.get(1) {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
-    index_oobe_init_with_prefix(ctx, args, "Index out of range: ", index)
-}
-
-/// `ArrayIndexOutOfBoundsException.<init>(I)V` — MEASURED message
-/// `"Array index out of range: 7"`.
-pub(crate) fn native_array_index_oobe_init_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let index = match args.get(1) {
-        Some(Value::Int(v)) => i64::from(*v),
-        _ => 0,
-    };
-    index_oobe_init_with_prefix(ctx, args, "Array index out of range: ", index)
-}
-
-/// `StringIndexOutOfBoundsException.<init>(I)V` — MEASURED message
-/// `"String index out of range: 7"`.
-pub(crate) fn native_string_index_oobe_init_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let index = match args.get(1) {
-        Some(Value::Int(v)) => i64::from(*v),
-        _ => 0,
-    };
-    index_oobe_init_with_prefix(ctx, args, "String index out of range: ", index)
-}
-
-/// `UncheckedIOException.<init>(Ljava/io/IOException;)V`.
-///
-/// JDK 25: `super(Objects.requireNonNull(cause))`. So it is `Throwable(Throwable)`
-/// — detailMessage becomes `cause.toString()` — with a null check in front.
-/// MEASURED: `new UncheckedIOException(null)` throws NullPointerException, and
-/// `new UncheckedIOException(new FileNotFoundException("f.txt"))` reports
-/// `getMessage() == "java.io.FileNotFoundException: f.txt"`.
-///
-/// Before this row existed, ALL FOUR blanket descriptors were dead on this
-/// class and neither real constructor was registered: the class advertised
-/// four constructors and had none.
-pub(crate) fn native_unchecked_io_exception_init_cause(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
-        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("UncheckedIOException cause must not be null".to_string()),
-        }
-        .into());
-    }
-    native_exc_init_cause(ctx, args)
-}
-
-/// `UncheckedIOException.<init>(Ljava/lang/String;Ljava/io/IOException;)V`.
-///
-/// JDK 25: `super(message, Objects.requireNonNull(cause))`. The message is kept
-/// as given — MEASURED `getMessage() == "wrapped"` — so this is
-/// `Throwable(String,Throwable)` behind the same null check.
-pub(crate) fn native_unchecked_io_exception_init_message_cause(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    if !matches!(args.get(2), Some(Value::Object(Some(_)))) {
-        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("UncheckedIOException cause must not be null".to_string()),
-        }
-        .into());
-    }
-    native_exc_init_message_cause(ctx, args)
-}
-
-/// `ParseException.<init>(Ljava/lang/String;I)V` — this class's ONLY
-/// constructor. JDK 25: `super(s); this.errorOffset = errorOffset;`.
-///
-/// KNOWN PARTIAL, stated rather than hidden: `errorOffset` is written by name,
-/// so in real-JDK mode the real field is set and the real `getErrorOffset()`
-/// bytecode reads it back. In synthetic-JDK mode the stub has no such field and
-/// no `getErrorOffset` native, so the offset is not readable — but the object
-/// is constructible, which it previously was not by any descriptor at all.
-pub(crate) fn native_parse_exception_init_message_offset(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return Ok(None);
-    };
-    let _ = native_exc_init_message(ctx, args)?;
-    let offset = match args.get(2) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    ctx.set_field_by_name(this, "errorOffset", Value::Int(offset));
-    Ok(None)
-}
-
-/// `MissingResourceException.<init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V`
-/// — this class's ONLY constructor. JDK 25:
-/// `super(s); this.className = className; this.key = key;`.
-///
-/// Same KNOWN PARTIAL as `ParseException`: the two extra fields are written by
-/// name, which real-JDK mode reads back through `getClassName()`/`getKey()` and
-/// synthetic-JDK mode cannot yet.
-pub(crate) fn native_missing_resource_exception_init(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return Ok(None);
-    };
-    let _ = native_exc_init_message(ctx, args)?;
-    let class_name = args.get(2).copied().unwrap_or(Value::Object(None));
-    let key = args.get(3).copied().unwrap_or(Value::Object(None));
-    ctx.set_field_by_name(this, "className", class_name);
-    ctx.set_field_by_name(this, "key", key);
-    Ok(None)
-}
-
-pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // Subset that surfaces in jboss-modules / WildFly catch-blocks (per
-    // bench/wildfly-boot/diagnostic.md §WP8.10.7) plus the broader
-    // Error/Exception families that any defensive catch will see.
-    // THE `<init>` DESCRIPTOR TABLE — DERIVED FROM THE JDK, NOT TRANSCRIBED.
-    //
-    // Until 2026-08-13 this was a bare list of class names and the loop below
-    // registered the SAME four descriptors — `()V`, `(String)V`,
-    // `(String,Throwable)V`, `(Throwable)V` — on every one of them. Diffed
-    // against JDK 25.0.3+9-LTS's real constructor tables (E34-1 §2, executed
-    // evidence, `scratchpad/e34/Diff34.java`), that blanket was wrong in both
-    // directions over these 62 classes:
-    //
-    //   * 103 registered descriptors are NOT a public constructor on the real
-    //     class — 97 of them the class does not declare AT ALL;
-    //   *  15 public constructors that `javac` really emits were missing.
-    //
-    // The worst row is `AssertionError`: `AssertionError(String)` is PRIVATE in
-    // the JDK, so `javac` compiles BOTH `throw new AssertionError(msg)` AND
-    // `assert cond : msg` to `<init>(Ljava/lang/Object;)V` — which was not
-    // registered. 88 of the 277 regression-suite classes name that triple, at
-    // 157 call sites (E23-1 §4.2). `java/io/UncheckedIOException` is worse in
-    // kind: all four blanket descriptors are dead on it and neither of its two
-    // real constructors was here, so it was a class carrying four natives that
-    // claim it can be constructed when nothing could construct it.
-    //
-    // THE RULE, so a JDK bump shows up as a DIFF and not as drift: a descriptor
-    // belongs here iff the real class DECLARES it and either it is public
-    // (`javac` can emit a call) or it was already registered before this table
-    // existed (six such, all trivial `super(...)` delegations reachable from the
-    // class's own or a subclass's bytecode — notably `AssertionError(String)`,
-    // which `AssertionError(Object)`'s own bytecode calls via `this(...)`; see
-    // `javap -c java.lang.AssertionError`). Nothing the real class does not
-    // declare is here, so no call site any `javac` could compile lost an answer.
-    //
-    // REGENERATE with `scratchpad/e34/Gen34.java` (JDK 25 reflection over the
-    // class names in column 0; ~2 s, no cargo build and no VM run) and paste its
-    // `rust_table.rs.txt`. `throwable_ctor_table_matches_the_stub_declarations`
-    // in `classloading/src/class_manager.rs` is a source witness that fails if
-    // this table and `synthetic_stub_ctor_methods`' mirror of it ever disagree.
-    //
-    // `#[rustfmt::skip]`: ONE ROW PER CLASS IS THE INTERFACE, not a style
-    // preference. It is the shape `Gen34.java` emits, the shape the source
-    // witness parses, and the shape that makes a JDK bump a one-line-per-class
-    // diff. rustfmt would explode each row over six lines and destroy all three.
-    #[rustfmt::skip]
-    // THROWABLE-CTOR-TABLE BEGIN
-    let throwable_ctors: &[(&str, &[&str])] = &[
-        ("java/lang/Throwable", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/Exception", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/RuntimeException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/Error", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/LinkageError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/NoClassDefFoundError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/SecurityException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/ReflectiveOperationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/ClassNotFoundException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/NoSuchMethodError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NoSuchFieldError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NoSuchMethodException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NoSuchFieldException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/CloneNotSupportedException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/InstantiationException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IllegalAccessException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/reflect/InaccessibleObjectException", &["()V", "(Ljava/lang/String;)V"]),
-        // `()V` is PROTECTED here (retained, see the rule above); `(String)V`
-        // and `(String,Throwable)V` are NOT declared by this class at all and
-        // are gone. `(Throwable,String)V` was already registered by the
-        // special-case arm below — E23-1 §5.1 counted it as one of "16 missing"
-        // because it read only the blanket loop, so the real miss count is 15.
-        ("java/lang/reflect/InvocationTargetException", &["()V", "(Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;Ljava/lang/String;)V"]),
-        ("java/lang/InterruptedException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NullPointerException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ArithmeticException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ArrayIndexOutOfBoundsException", &["()V", "(I)V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IndexOutOfBoundsException", &["()V", "(I)V", "(J)V", "(Ljava/lang/String;)V"]),
-        ("java/lang/StringIndexOutOfBoundsException", &["()V", "(I)V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ClassCastException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IllegalArgumentException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/IllegalStateException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/UnsupportedOperationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        // Three of the four blanket descriptors did not exist on this class.
-        ("java/lang/TypeNotPresentException", &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/StackOverflowError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/OutOfMemoryError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/NoSuchElementException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/InputMismatchException", &["()V", "(Ljava/lang/String;)V"]),
-        // The only constructor this class has. All four blanket descriptors
-        // were dead on it.
-        ("java/util/MissingResourceException", &["(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"]),
-        ("java/util/FormatterClosedException", &["()V"]),
-        ("java/io/IOException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/io/FileNotFoundException", &["()V", "(Ljava/lang/String;)V"]),
-        // The sharpest row after `AssertionError`: ALL FOUR blanket descriptors
-        // were dead here and neither real constructor was registered, so this
-        // class could not be constructed by any means while advertising that it
-        // could. Both real ctors are `IOException`-typed.
-        ("java/io/UncheckedIOException", &["(Ljava/io/IOException;)V", "(Ljava/lang/String;Ljava/io/IOException;)V"]),
-        ("java/io/NotSerializableException", &["()V", "(Ljava/lang/String;)V"]),
+/// Module-level so the gate at the bottom of this file can walk it: every
+/// constructor descriptor `cratonvm_classloading::throwable_ctor_descriptors`
+/// declares for one of these must have a native here, or the synthetic stub
+/// declares a method that resolves to nothing.
+pub(crate) const THROWABLE_FAMILY_CLASSES: &[&str] = &[
+        "java/lang/Throwable",
+        "java/lang/Exception",
+        "java/lang/RuntimeException",
+        "java/lang/Error",
+        "java/lang/LinkageError",
+        "java/lang/NoClassDefFoundError",
+        "java/lang/SecurityException",
+        "java/lang/ReflectiveOperationException",
+        "java/lang/ClassNotFoundException",
+        "java/lang/NoSuchMethodError",
+        "java/lang/NoSuchFieldError",
+        "java/lang/NoSuchMethodException",
+        "java/lang/NoSuchFieldException",
+        "java/lang/CloneNotSupportedException",
+        "java/lang/InstantiationException",
+        "java/lang/IllegalAccessException",
+        "java/lang/reflect/InaccessibleObjectException",
+        "java/lang/reflect/InvocationTargetException",
+        "java/lang/InterruptedException",
+        "java/lang/NullPointerException",
+        "java/lang/ArithmeticException",
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "java/lang/IndexOutOfBoundsException",
+        "java/lang/StringIndexOutOfBoundsException",
+        "java/lang/ClassCastException",
+        "java/lang/IllegalArgumentException",
+        "java/lang/IllegalStateException",
+        "java/lang/UnsupportedOperationException",
+        "java/lang/TypeNotPresentException",
+        "java/lang/StackOverflowError",
+        "java/lang/OutOfMemoryError",
+        "java/util/NoSuchElementException",
+        "java/util/InputMismatchException",
+        "java/util/MissingResourceException",
+        "java/util/FormatterClosedException",
+        "java/io/IOException",
+        "java/io/FileNotFoundException",
+        "java/io/UncheckedIOException",
+        "java/io/NotSerializableException",
         // `java/io/InvalidClassException` is deliberately NOT in this list, for
         // the same reason `java/util/regex/PatternSyntaxException` is not: it
         // OVERRIDES `getMessage()`, prepending the offending class name to the
@@ -2966,22 +2870,19 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         // two lists; it and `NullPointerException` were the only two left after
         // PatternSyntaxException. See
         // `a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
-        ("java/io/EOFException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/io/UnsupportedEncodingException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/net/MalformedURLException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/net/UnknownHostException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NumberFormatException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/ConcurrentModificationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/TimeoutException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/concurrent/RejectedExecutionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/CancellationException", &["()V", "(Ljava/lang/String;)V"]),
-        // `()V` and `(String)V` are PROTECTED on both of these (retained).
-        ("java/util/concurrent/CompletionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/ExecutionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/BrokenBarrierException", &["()V", "(Ljava/lang/String;)V"]),
-        // `(String,int)` is this class's ONLY constructor; all four blanket
-        // descriptors were dead on it.
-        ("java/text/ParseException", &["(Ljava/lang/String;I)V"]),
+        "java/io/EOFException",
+        "java/io/UnsupportedEncodingException",
+        "java/net/MalformedURLException",
+        "java/net/UnknownHostException",
+        "java/lang/NumberFormatException",
+        "java/util/ConcurrentModificationException",
+        "java/util/concurrent/TimeoutException",
+        "java/util/concurrent/RejectedExecutionException",
+        "java/util/concurrent/CancellationException",
+        "java/util/concurrent/CompletionException",
+        "java/util/concurrent/ExecutionException",
+        "java/util/concurrent/BrokenBarrierException",
+        "java/text/ParseException",
         // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
         // list. It is the one exception here that OVERRIDES `getMessage()`:
         // the JDK builds a three-line report ("Unclosed character class near
@@ -2993,40 +2894,126 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         // `(String,String,int)V`, which is not among the `<init>` shapes
         // registered here either, so every bridge this loop would add is
         // either dead or actively wrong. Removed 2026-08-05.
-        ("java/lang/NegativeArraySizeException", &["()V", "(Ljava/lang/String;)V"]),
-        // THE 88-FIXTURE ROW. `(Ljava/lang/Object;)V` is what `javac` emits for
-        // BOTH `throw new AssertionError(msg)` and `assert cond : msg`, because
-        // `AssertionError(String)` is private. `(String)V` stays because the
-        // class's OWN bytecode calls it (`this(String.valueOf(...))`);
-        // `(Throwable)V` is not declared here at all and is gone.
-        ("java/lang/AssertionError", &["()V", "(C)V", "(D)V", "(F)V", "(I)V", "(J)V", "(Ljava/lang/Object;)V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Z)V"]),
-        ("java/lang/MatchException", &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/IncompatibleClassChangeError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IllegalAccessError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ExceptionInInitializerError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/VerifyError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/AbstractMethodError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/InternalError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/UnsatisfiedLinkError", &["()V", "(Ljava/lang/String;)V"]),
-    ];
-    // THROWABLE-CTOR-TABLE END
+        "java/lang/NegativeArraySizeException",
+        "java/lang/AssertionError",
+        "java/lang/MatchException",
+        "java/lang/IncompatibleClassChangeError",
+        "java/lang/IllegalAccessError",
+        "java/lang/ExceptionInInitializerError",
+        "java/lang/VerifyError",
+        "java/lang/AbstractMethodError",
+        "java/lang/InternalError",
+        "java/lang/UnsatisfiedLinkError",
+];
 
-    for (cls, ctors) in throwable_ctors.iter() {
-        // Constructors: exactly the descriptors the real JDK 25 class declares.
-        // `throwable_ctor_native` chooses the body per (class, descriptor); a
-        // descriptor with no body is a table/dispatcher desync, which the
-        // assertion names instead of silently registering nothing — the
-        // failure mode this whole change exists to remove is a `<init>` that
-        // looks registered and is not.
-        for desc in ctors.iter() {
-            match throwable_ctor_native(cls, desc) {
-                Some(cb) => r.register(cls, "<init>", desc, cb),
-                None => debug_assert!(
+/// The native body for one `(class, constructor descriptor)` pair from
+/// [`cratonvm_classloading::throwable_ctor_descriptors`].
+///
+/// `None` means the table names a descriptor this file cannot implement, which
+/// is a bug in one of the two — the caller `debug_assert!`s on it rather than
+/// registering a declaration with no body.
+///
+/// Most rows are class-independent: the four `Throwable` shapes mean the same
+/// thing everywhere. The exceptions are the point of the table — the SAME
+/// descriptor means different things on different classes. `(I)V` is
+/// `String.valueOf(int)` on `AssertionError` and "Array index out of range: N"
+/// on `ArrayIndexOutOfBoundsException`, so the body is chosen by class here
+/// rather than sniffed from the receiver at call time.
+fn throwable_ctor_native(cls: &str, descriptor: &str) -> Option<NativeCallback> {
+    // Class-specific rows first: a later generic arm must not shadow them.
+    match (cls, descriptor) {
+        ("java/lang/AssertionError", "(Ljava/lang/Object;)V") => {
+            return Some(native_assertion_error_init_object)
+        }
+        ("java/lang/AssertionError", "(Z)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Boolean))
+        }
+        ("java/lang/AssertionError", "(C)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Char))
+        }
+        ("java/lang/AssertionError", "(I)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Int))
+        }
+        ("java/lang/AssertionError", "(J)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Long))
+        }
+        ("java/lang/AssertionError", "(F)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Float))
+        }
+        ("java/lang/AssertionError", "(D)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Double))
+        }
+        ("java/lang/ArrayIndexOutOfBoundsException", "(I)V") => {
+            return Some(|ctx, args| {
+                index_exception_init_index(ctx, args, "Array index out of range: ")
+            })
+        }
+        ("java/lang/StringIndexOutOfBoundsException", "(I)V") => {
+            return Some(|ctx, args| {
+                index_exception_init_index(ctx, args, "String index out of range: ")
+            })
+        }
+        ("java/lang/IndexOutOfBoundsException", "(I)V" | "(J)V") => {
+            return Some(|ctx, args| index_exception_init_index(ctx, args, "Index out of range: "))
+        }
+        ("java/io/UncheckedIOException", "(Ljava/io/IOException;)V") => {
+            return Some(native_unchecked_io_init_cause)
+        }
+        ("java/io/UncheckedIOException", "(Ljava/lang/String;Ljava/io/IOException;)V") => {
+            return Some(native_unchecked_io_init_message_cause)
+        }
+        ("java/text/ParseException", "(Ljava/lang/String;I)V") => {
+            return Some(native_parse_exception_init)
+        }
+        (
+            "java/util/MissingResourceException",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        ) => return Some(native_missing_resource_init),
+        // `InvocationTargetException` keeps the wrapped throwable in its own
+        // `target` field, not in `Throwable.cause` — see those bodies.
+        ("java/lang/reflect/InvocationTargetException", "(Ljava/lang/Throwable;)V") => {
+            return Some(native_invocation_target_exception_init_target)
+        }
+        (
+            "java/lang/reflect/InvocationTargetException",
+            "(Ljava/lang/Throwable;Ljava/lang/String;)V",
+        ) => return Some(native_invocation_target_exception_init_target_message),
+        _ => {}
+    }
+
+    match descriptor {
+        "()V" => Some(native_exc_init_noargs),
+        "(Ljava/lang/String;)V" => Some(native_exc_init_message),
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V" => Some(native_exc_init_message_cause),
+        "(Ljava/lang/Throwable;)V" => Some(native_exc_init_cause),
+        _ => None,
+    }
+}
+
+pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Subset that surfaces in jboss-modules / WildFly catch-blocks (per
+    // bench/wildfly-boot/diagnostic.md §WP8.10.7) plus the broader
+    // Error/Exception families that any defensive catch will see.
+    let throwable_classes = THROWABLE_FAMILY_CLASSES;
+
+    for cls in throwable_classes.iter() {
+        // The CONSTRUCTORS come from the measured per-class table, shared with
+        // the synthetic stub's method table so the two cannot disagree about
+        // which ones exist. See
+        // `cratonvm_classloading::throwable_ctor_descriptors`.
+        for descriptor in cratonvm_classloading::throwable_ctor_descriptors(cls) {
+            if let Some(body) = throwable_ctor_native(cls, descriptor) {
+                r.register(cls, "<init>", descriptor, body);
+            } else {
+                debug_assert!(
                     false,
-                    "throwable_ctors lists {cls}.<init>{desc}, but throwable_ctor_native has no body for it"
-                ),
+                    "{cls} declares <init>{descriptor} with no native to back it"
+                );
             }
         }
+
         if *cls == "java/lang/reflect/InvocationTargetException" {
             r.register(
                 cls,
@@ -3084,13 +3071,17 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
             );
             continue;
         }
-        // (Constructors were registered from `throwable_ctors` at the top of
-        // this loop body. They used to be four fixed descriptors written out
-        // here; see the table's header for what that cost. The historical note
-        // is worth keeping: audit-2026-05-16 replaced a generic
-        // `native_noop_with_this` that left `cause` un-initialised — the
-        // (String) ctor uses the JDK sentinel `cause = this`, so a later
-        // `initCause()` succeeded for (String) ctors but failed for noargs.)
+        // The constructors were registered from the per-class table at the top
+        // of this loop. They used to be four hard-coded `r.register` calls
+        // here — `()V`, `(String)V`, `(String,Throwable)V`, `(Throwable)V` —
+        // for EVERY class in the list, which is 103 descriptors the real JDK
+        // class does not declare and 16 it does that nobody registered.
+        //
+        // Older still, and worth keeping: audit-2026-05-16 replaced a generic
+        // `native_noop_with_this` behind those four descriptors that left
+        // `cause` un-initialised. The (String) ctor writes the JDK sentinel
+        // `cause = this`, so a later `initCause()` succeeded after a (String)
+        // ctor and failed after the no-arg one.
 
         // getMessage()Ljava/lang/String; — read slot 0 (detailMessage).
         r.register(
@@ -3318,6 +3309,75 @@ mod tests {
         assert_eq!(
             native_enum_name(&mut ctx, &[Value::Object(Some(obj))]).unwrap(),
             Some(Value::Object(None)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod throwable_ctor_table_tests {
+    use super::{throwable_ctor_native, THROWABLE_FAMILY_CLASSES};
+    use cratonvm_classloading::{throwable_ctor_descriptors, THROWABLE_DEFAULT_CTORS};
+
+    /// The stub's method table and the native registry are built from ONE list,
+    /// but they are in different crates and only this gate says so out loud: a
+    /// descriptor the stub declares with no native here is a method that
+    /// resolves and then has no body, which is worse than the
+    /// `NoSuchMethodError` it replaces because it fails later and less clearly.
+    #[test]
+    fn every_declared_throwable_ctor_has_a_native() {
+        for class in THROWABLE_FAMILY_CLASSES {
+            for descriptor in throwable_ctor_descriptors(class) {
+                assert!(
+                    throwable_ctor_native(class, descriptor).is_some(),
+                    "{class} declares <init>{descriptor} but no native backs it",
+                );
+            }
+        }
+    }
+
+    /// The measured facts this change is built on, kept where a reader can see
+    /// them fail. Re-derive with `probes/ThrowableCtorCensusProbe.java` after a
+    /// JDK bump — these are JDK 25 numbers, not invariants.
+    #[test]
+    fn the_measured_census_still_describes_the_table() {
+        // `AssertionError(String)` is PRIVATE in the JDK, so registering it
+        // fabricates a constructor javac will never emit — and `(Object)V`,
+        // which javac emits for BOTH `new AssertionError(msg)` and
+        // `assert cond : msg`, is the one that must be there.
+        let assertion_error = throwable_ctor_descriptors("java/lang/AssertionError");
+        assert!(assertion_error.contains(&"(Ljava/lang/Object;)V"));
+        assert!(!assertion_error.contains(&"(Ljava/lang/String;)V"));
+        assert!(!assertion_error.contains(&"(Ljava/lang/Throwable;)V"));
+
+        // `UncheckedIOException` is the worst in kind: all four blanket
+        // descriptors are dead on it, and neither of its two real constructors
+        // was registered.
+        let unchecked_io = throwable_ctor_descriptors("java/io/UncheckedIOException");
+        assert_eq!(
+            unchecked_io,
+            [
+                "(Ljava/io/IOException;)V",
+                "(Ljava/lang/String;Ljava/io/IOException;)V"
+            ]
+        );
+        for dead in THROWABLE_DEFAULT_CTORS {
+            assert!(!unchecked_io.contains(dead), "{dead} is dead on UncheckedIOException");
+        }
+
+        // `NoClassDefFoundError` has no cause-taking constructor at all — the
+        // one in-tree caller that used `(String,Throwable)V` on it was fixed to
+        // message-plus-`initCause`, which is what the JDK's own ClassLoader does.
+        assert_eq!(
+            throwable_ctor_descriptors("java/lang/NoClassDefFoundError"),
+            ["()V", "(Ljava/lang/String;)V"]
+        );
+
+        // A class this table has never measured still gets the common four:
+        // the caller's `is_throwable_like` test is a NAME heuristic and fires
+        // for application classes.
+        assert_eq!(
+            throwable_ctor_descriptors("com/example/TotallyUnknownException"),
+            THROWABLE_DEFAULT_CTORS
         );
     }
 }

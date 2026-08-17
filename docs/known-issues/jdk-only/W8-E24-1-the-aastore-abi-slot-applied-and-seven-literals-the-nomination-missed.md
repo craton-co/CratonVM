@@ -1,5 +1,17 @@
 # W8-E24-1 — the `aastore_check` ABI slot APPLIED (5 of 5), and SEVEN count literals `W8-E19-1` §3(b) did not carry
 
+> **RECONCILED 2026-08-16 (merge of `dev`).** Every `aastore_check`,
+> `jit_aastore_check` and `HelperFnAastoreCheck` below names the spelling that
+> was current when this record was written. The merge of `dev` into
+> `claude/jdk-only-mode-completion-1351c0` settled on **`aastore_type_check`**
+> (ABI field), **`jit_aastore_type_check`** (helper) and
+> **`aastore_store_is_refused`** (the predicate the helper and the x64 inline
+> lowering now share), and the slot is `required: true` -- the old
+> `aastore_check == 0` fallback that routed the whole opcode to
+> `helpers.aastore` no longer exists. `grep -rn 'aastore_check' --include=*.rs`
+> returns nothing in the tree. The names here are kept as written; read them as
+> history, not as a pointer to live code.
+
 > **STATUS: the atomic set is now 5 of 5 applied and the tree should compile.**
 > This lane applied `W8-E19-1` §3 halves (a), (b) and (c) — `jit-api/src/lib.rs`,
 > `jit-api/src/helpers_abi.rs`, `jit/src/x64/tests.rs` — on top of the two the

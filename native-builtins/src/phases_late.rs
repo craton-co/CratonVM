@@ -1155,26 +1155,71 @@ fn native_quarkus_logging_handle_failed_start(
         let empty_map_cur = read_pinned_object_value(ctx, empty_map_pin, empty_map);
         let empty_list_cur = read_pinned_object_value(ctx, empty_list_pin, empty_list);
         let supplier_rv_cur = ctx.read_native_pin(supplier_rv_pin, supplier_rv);
-        ctx.invoke_virtual(
-            recorder_cur,
-            "initializeLogging",
-            "(Lio/quarkus/runtime/logging/DiscoveredLogComponents;Ljava/util/Map;ZLio/quarkus/runtime/RuntimeValue;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/LaunchMode;Z)Lio/quarkus/runtime/shutdown/ShutdownListener;",
-            &[
-                Value::Object(Some(components_cur)),
-                empty_map_cur,
-                Value::Int(0),
-                Value::Object(None),
-                empty_list_cur,
-                empty_list_cur,
-                empty_list_cur,
-                empty_list_cur,
-                empty_list_cur,
-                empty_list_cur,
-                Value::Object(Some(supplier_rv_cur)),
-                Value::Object(Some(launch_mode)),
-                Value::Int(0),
-            ],
-        )?;
+        // The descriptor is READ OFF THE CLASS, never written down here.
+        //
+        // It used to be a literal with six `Ljava/util/List;` parameters,
+        // matching the Quarkus revision this native was written against. The
+        // recorder has since grown a seventh list (the per-named-handler
+        // formatter map), so on a newer Quarkus every call through here raised
+        // `NoSuchMethodError: LoggingSetupRecorder.initializeLogging(...)` —
+        // caught and reported as nothing worse than a logging-setup failure,
+        // which is exactly why it survived: the literal named a method that no
+        // longer existed and only the arity said so.
+        //
+        // `initializeLogging` is the recorder's only overload (its sibling is
+        // `initializeLoggingForImageBuild`, no-arg), so selecting by name and
+        // return type is unambiguous, and filling the argument vector from the
+        // parsed parameter list reproduces the bytecode `handleFailedStart`
+        // itself runs on either shape: empty list for every `List`, empty map
+        // for the `Map`, false for both booleans, a null `RuntimeValue` for the
+        // handler slot and the supplied one for the last.
+        let recorder_class_id = match ctx.ensure_class_initialized(
+            "io/quarkus/runtime/logging/LoggingSetupRecorder",
+        ) {
+            Ok(cid) => cid,
+            Err(_) => return Ok(None),
+        };
+        let Some(descriptor) = ctx
+            .declared_methods(recorder_class_id)
+            .into_iter()
+            .find(|m| {
+                m.name == "initializeLogging"
+                    && m.descriptor
+                        .ends_with(")Lio/quarkus/runtime/shutdown/ShutdownListener;")
+            })
+            .map(|m| m.descriptor)
+        else {
+            return Ok(None);
+        };
+        let Some((params, _ret)) = crate::lang_invoke::split_descriptor_params(&descriptor) else {
+            return Ok(None);
+        };
+        let last_runtime_value = params
+            .iter()
+            .rposition(|p| p == "Lio/quarkus/runtime/RuntimeValue;");
+        let mut call_args = Vec::with_capacity(params.len());
+        for (i, param) in params.iter().enumerate() {
+            call_args.push(match param.as_str() {
+                "Lio/quarkus/runtime/logging/DiscoveredLogComponents;" => {
+                    Value::Object(Some(components_cur))
+                }
+                "Ljava/util/Map;" => empty_map_cur,
+                "Ljava/util/List;" => empty_list_cur,
+                "Lio/quarkus/runtime/LaunchMode;" => Value::Object(Some(launch_mode)),
+                "Z" => Value::Int(0),
+                "Lio/quarkus/runtime/RuntimeValue;" if Some(i) == last_runtime_value => {
+                    Value::Object(Some(supplier_rv_cur))
+                }
+                // Every other reference parameter — including the handler
+                // `RuntimeValue` the real bytecode passes `aconst_null` for.
+                _ if param.starts_with('L') || param.starts_with('[') => Value::Object(None),
+                // A primitive this native does not know how to fill means the
+                // signature moved somewhere this mirror no longer models.
+                // Refusing beats guessing a value into a logging bootstrap.
+                _ => return Ok(None),
+            });
+        }
+        ctx.invoke_virtual(recorder_cur, "initializeLogging", &descriptor, &call_args)?;
 
         Ok(None)
     })();

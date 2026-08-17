@@ -1761,29 +1761,30 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // aastore — store reference into a reference array, via the
-                // `jit_aastore` helper (vm/src/jit/helpers.rs).
+                // aastore — store a reference into a reference array.
                 //
-                // ## Why this is a helper call and not the inline store
+                // Lowered INLINE (null check, bounds check, covariance check,
+                // SATB pre-write barrier, store, card mark). The single
+                // call-out is `jit_aastore_type_check` (vm/src/jit/helpers.rs),
+                // because answering the JVMS §6.5 covariance question needs the
+                // class manager. The complete-opcode helper `jit_aastore` is
+                // NOT reached from here.
                 //
-                // It used to be inline. R20 / HIGH-5 (docs/PRESENTATION.md)
-                // replaced the `jit_aastore` call with an inline
-                // `MOV QWORD [array + index*8 + HEADER_SIZE], val` plus a
-                // barrier-only helper call, and justified dropping the helper
-                // with this comment:
+                // ## Why the covariance check is emitted at all
                 //
-                //     "the current `jit_aastore` helper does NOT enforce the
-                //      ASE check (the interpreter does it via
-                //      `set_array_element`). This inline path matches the
-                //      helper's behavior exactly — no regression."
-                //
-                // That premise was TRUE when it was written and was FALSIFIED
-                // later, silently, when the JVMS §aastore covariance check
-                // landed inside `jit_aastore` — because a premise stated in a
-                // comment is not a compile-time link. From that moment the
-                // compiled tier performed every reference array store
-                // unconditionally while the interpreter refused the illegal
-                // ones, and nothing failed to build.
+                // This note used to read "the current `jit_aastore` helper does
+                // NOT enforce the ASE check (the interpreter does it via
+                // `set_array_element`). This inline path matches the helper's
+                // behavior exactly — no regression." That premise was TRUE when
+                // R20 / HIGH-5 (docs/PRESENTATION.md) replaced the helper call
+                // with the inline store, and was FALSIFIED later — silently —
+                // when the JVMS §aastore covariance check landed inside
+                // `jit_aastore`, because this path had already stopped calling
+                // that helper and a premise stated in a comment is not a
+                // compile-time link. From that moment the compiled tier
+                // performed every reference array store unconditionally while
+                // the interpreter refused the illegal ones, and nothing failed
+                // to build.
                 //
                 // The consequence is not a wrong answer, it is heap type
                 // confusion: `Object[] a = new String[1]; a[0] = anInteger;`
@@ -1792,28 +1793,19 @@ impl Compiler {
                 // `Integer` with no cast to catch it. Under a precise GC that
                 // is a memory-safety-relevant corruption, not an etiquette
                 // problem — and it is TIER-DEPENDENT: correct for the first
-                // ~500 executions and wrong once the method tiers up. See
-                // docs/known-issues/jdk-only/W7-38-jit-aastore-store-check.md.
+                // ~500 executions and wrong once the method tiers up.
+                // `RExceptions` read `cold=[java.lang.Integer] hot=[no-throw]`
+                // at i≈500, i.e. the tier-parity assertion caught it the moment
+                // the method tiered up. See
+                // docs/known-issues/jdk-only/W7-38-jit-aastore-never-called-its-own-check.md.
                 //
-                // ## Why the whole opcode routes to the helper
-                //
-                // `jit_aastore` is not an ASE-check helper, it is the complete
-                // opcode: null check (pending-NPE, `ASTORE_OBJECT` action),
-                // bounds check (pending-AIOOBE with index+length), the JVMS
-                // covariance check routed through `throw_runtime_error` so the
-                // message carries HotSpot's EXTERNAL class name, the SATB
-                // pre-write barrier, the store, and the card mark. Calling it
-                // restores all six in their correct order with no new helper
-                // and no ABI change — `helpers.aastore` has been populated all
-                // along (the slot was simply never emitted against).
-                //
-                // The cheaper shape — keep the inline lowering and call a
-                // *check-only* helper before the store — is `helpers
-                // .aastore_check` (`jit_aastore_check`, W8-E19-1). It exists
-                // now, so this arm has two lowerings and picks by whether the
-                // slot is wired. `0` means a hand-built test table: route the
-                // WHOLE opcode to `helpers.aastore`, never the bare inline
-                // store, which is the defect above.
+                // The claim that an inline ASE check "needs type-narrowing
+                // infrastructure" is also not so: type narrowing is what would
+                // let a check be ELIDED, not what makes one correct. And the
+                // rule now lives in exactly ONE body — `aastore_store_is_refused`
+                // in vm/src/jit/helpers.rs, shared by `jit_aastore_type_check`
+                // and `jit_aastore` — so the inline lowering and the full helper
+                // can never again enforce different rules.
                 //
                 // ## Ordering — JVMS §6.5 is NPE → AIOOBE → ASE
                 //
@@ -1822,12 +1814,12 @@ impl Compiler {
                 // `RArrayStoreTiers` s15 caught in the interpreter fast path:
                 // ASE reported for a past-the-end index.
                 //
-                // `flush_scratch_registers` first, on BOTH arms: it rewrites
-                // every register-resident (`Scratch`/`Xmm`) stack slot to a
-                // frame slot, so every `load_slot_to_reg` below reads from
-                // memory and cannot clobber another's source register
-                // regardless of ABI (`ARG_REGS` is RCX/RDX/R8/R9 on Windows,
-                // RDI/RSI/RDX/RCX on SysV).
+                // `flush_scratch_registers` first: it rewrites every
+                // register-resident (`Scratch`/`Xmm`) stack slot to a frame
+                // slot, so every `load_slot_to_reg` below reads from memory and
+                // cannot clobber another's source register regardless of ABI
+                // (`ARG_REGS` is RCX/RDX/R8/R9 on Windows, RDI/RSI/RDX/RCX on
+                // SysV).
                 //
                 // A helper call clobbers the caller-saved registers, so
                 // `array_slot` / `index_slot` / `val_slot` are RE-LOADED after
@@ -1835,103 +1827,113 @@ impl Compiler {
                 // loads above either call is silently wrong.
                 //
                 // 0x53 is a one-byte opcode, so
-                // `emit_post_invoke_exception_check` keeps THIS pc as the
-                // throw pc, which is what the handler `[start_pc, end_pc)`
-                // range test needs (see the note at that function).
+                // `emit_post_invoke_exception_check` keeps THIS pc as the throw
+                // pc, which is what the handler `[start_pc, end_pc)` range test
+                // needs (see the note at that function).
                 //
-                // ## What the guard actually guards, per arm
+                // ## Why this arm must force the dispatch-aware entry
                 //
-                // `jit_aastore` returns `()`, so after it RAX is UNDEFINED and
-                // `emit_post_invoke_exception_check(b'V')` is comparing
-                // garbage: on that arm the exception is delivered by the
-                // interpreter's post-JIT-return drain
-                // (`take_all_jit_signals`), not by this guard. Kept anyway —
-                // it is free on the not-taken path and a spurious hit only
-                // routes to the same drain — but do NOT read it as the
-                // mechanism. `jit_aastore_check` returns a real `i64::MIN`
-                // sentinel, so on the inline arm the guard means what it says.
-                //
-                // ## Why the inline arm also closes a `has_dispatch` hole
-                //
-                // `jit_aastore_check` builds its `ArrayStoreException` through
-                // `jit_thread_mut()`, which only the dispatch-aware entry sets
-                // (`vm/src/runtime/interpreter/jit_bridge.rs`, the
-                // `!compiled.has_dispatch` arm skips `set_jit_thread`). The
-                // helper-only arm above emits NO bounds-check stub and NO
-                // null-check stub, so a method whose only listed content is an
-                // `aastore` computes `has_dispatch == false` in
-                // `x64/driver.rs` — and then the check fails open (its
-                // documented last resort) and the illegal store proceeds. The
-                // inline arm below emits both stubs, which is exactly what
-                // that computation reads, so it forces the dispatch entry as a
-                // structural consequence rather than by a flag someone has to
-                // remember. See the record for the narrow shapes that reach
-                // it.
+                // `jit_aastore_type_check` builds its `ArrayStoreException`
+                // through `jit_thread_mut()`, which only the dispatch-aware
+                // entry sets (`vm/src/runtime/interpreter/jit_bridge.rs` — the
+                // `!compiled.has_dispatch` arm skips `set_jit_thread`). Without
+                // it the check fails open (its documented last resort) and the
+                // illegal store proceeds. `emitted_aastore_throw` below is what
+                // forces that entry; `x64/driver.rs` reads it alongside
+                // `emitted_checkcast_throw`, for the same reason.
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
                     let index_slot = self.pop_stack();
                     let array_slot = self.pop_stack();
-                    if self.helpers.aastore_check == 0 {
-                        // jit_aastore(vm_ptr, array_ptr, index, val) — the
-                        // complete opcode.
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.load_slot_to_reg(ARG_REGS[1], array_slot);
-                        self.load_slot_to_reg(ARG_REGS[2], index_slot);
-                        self.load_slot_to_reg(ARG_REGS[3], val_slot);
-                        self.emit_call_absolute(self.helpers.aastore);
-                        self.emit_post_invoke_exception_check(b'V');
+                    self.load_slot_to_reg(RAX, array_slot);
+                    self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
+                    // Records a null-check stub.
+                    self.emit_null_check_array_store_at(code, pc);
+                    // AIOOBE. Records a bounds-check stub.
+                    self.emit_bounds_check(pc);
+                    // JVMS §aastore covariance check, BEFORE anything mutates:
+                    // on a refusal no element may be written and no barrier may
+                    // run. `jit_aastore_type_check` answers 0 (legal) or the
+                    // i64::MIN sentinel, having stashed the
+                    // ArrayStoreException; `emit_post_invoke_exception_check`
+                    // routes the sentinel through the same drain
+                    // `jit_checkcast`'s ClassCastException uses.
+                    //
+                    // A null value is legal for every reference array, so it
+                    // branches over the call entirely — `arr[i] = null` keeps
+                    // costing a test and a not-taken jump. Everything else pays
+                    // one call, which is the price of the JVMS rule; the arm
+                    // already makes one (SATB) to two (card mark) helper calls.
+                    self.load_slot_to_reg(RDX, val_slot);
+                    self.buf.emit(&[0x48, 0x85, 0xD2]); // TEST RDX, RDX
+                    self.buf.emit(&[0x0F, 0x84]); // JZ rel32 -> past the call
+                    let ase_skip_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    // Args: (vm_ptr, array_ptr, value_ptr).
+                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                    self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                    self.load_slot_to_reg(ARG_REGS[2], val_slot);
+                    // The refusal path allocates (it builds the throwable), so
+                    // spill and publish an oop map exactly as `checkcast` does.
+                    self.emit_pre_safepoint_spill();
+                    self.emit_call_absolute(self.helpers.aastore_type_check);
+                    self.emit_oop_map_for_safepoint();
+                    // `b'V'` is the OPCODE's return descriptor, which is what
+                    // this parameter documents; it selects the plain
+                    // `CMP RAX, i64::MIN; JE bail`, correct because the helper
+                    // returns only `0` or the sentinel — RAX here is a defined
+                    // value, not the undefined RAX a `-> ()` helper leaves.
+                    self.emit_post_invoke_exception_check(b'V');
+                    self.emitted_aastore_throw = true;
+                    {
+                        let here = self.buf.pos() as i32;
+                        let rel = here - (ase_skip_patch as i32 + 4);
+                        self.buf.try_patch_i32(ase_skip_patch, rel).ok();
+                    }
+                    // The call clobbers the scratch registers; re-establish
+                    // RAX=array / RCX=index for the SATB load below.
+                    self.load_slot_to_reg(RAX, array_slot);
+                    self.load_slot_to_reg(RCX, index_slot);
+                    // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
+                    // Inline-load the OLD reference at the slot and pipe it
+                    // through `jit_satb_pre_write_barrier(vm_ptr, old_ref)`
+                    // BEFORE the inline store overwrites it. The helper
+                    // short-circuits via a single Acquire load when no
+                    // concurrent mark cycle is in flight (`SatbQueue::
+                    // is_active() == false`), so the steady-state cost is
+                    // just an inline load + a not-taken-branch call. Without
+                    // this, a still-live reference overwritten by JIT code
+                    // during concurrent marking would be silently dropped by
+                    // the marker → use-after-free on the next mixed
+                    // evacuation (audit: history/round7-gc.md §1).
+                    //
+                    // Save RAX (array) / RCX (index) into argument registers
+                    // first since `emit_ref_aload_regs` clobbers RAX with
+                    // the loaded value.
+                    self.emit_ref_aload_regs(); // RAX = OLD ref value
+                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                    self.emit_mov_reg_reg(ARG_REGS[1], RAX);
+                    self.emit_call_absolute(self.helpers.satb_pre_write_barrier);
+                    // Reload array / index / new value (helper call may have
+                    // clobbered scratch registers including RAX, RCX, RDX).
+                    self.load_slot_to_reg(RAX, array_slot);
+                    self.load_slot_to_reg(RCX, index_slot);
+                    self.load_slot_to_reg(RDX, val_slot);
+                    // Inline store: MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
+                    self.emit_ref_astore_regs();
+                    // Post-store publication. Generational GC exposes a stable
+                    // atomic card map, so RAX=array/RDX=value can mark it
+                    // inline without a helper transition. G1/ZGC retain their
+                    // collector-specific helper.
+                    if self.inline_card_mark_available() {
+                        self.emit_inline_card_mark_regs(RAX, RDX);
                     } else {
-                        self.load_slot_to_reg(RAX, array_slot);
-                        self.load_slot_to_reg(RCX, index_slot);
-                        // 1. NPE on a null array (JVMS §aastore). Records a
-                        //    null-check stub.
-                        self.emit_null_check_array_store_at(code, pc);
-                        // 2. AIOOBE. Records a bounds-check stub.
-                        self.emit_bounds_check(pc);
-                        // 3. ASE — jit_aastore_check(vm_ptr, array_ptr, val)
-                        //    -> i64::MIN (refused, exception published) | 0.
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], array_slot);
                         self.load_slot_to_reg(ARG_REGS[2], val_slot);
-                        self.emit_call_absolute(self.helpers.aastore_check);
-                        // `b'V'` is the OPCODE's return descriptor, which is
-                        // what this parameter documents; it selects the plain
-                        // `CMP RAX, i64::MIN; JE bail`, correct because the
-                        // helper returns only `0` or the sentinel. Unlike the
-                        // arm above, RAX here is a defined value.
-                        self.emit_post_invoke_exception_check(b'V');
-                        // 4. SATB pre-write barrier on the OLD element, before
-                        //    it is overwritten. Round-7 CRIT (history/
-                        //    round7-gc.md §1): a still-live reference dropped
-                        //    by JIT code during concurrent marking is a
-                        //    use-after-free on the next mixed evacuation. The
-                        //    helper short-circuits on one Acquire load when no
-                        //    mark cycle is in flight.
-                        self.load_slot_to_reg(RAX, array_slot);
-                        self.load_slot_to_reg(RCX, index_slot);
-                        self.emit_ref_aload_regs(); // RAX = OLD ref value
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_reg_reg(ARG_REGS[1], RAX);
-                        self.emit_call_absolute(self.helpers.satb_pre_write_barrier);
-                        // 5. The store itself:
-                        //    MOV [RAX + RCX*8 + HEADER_SIZE], RDX.
-                        self.load_slot_to_reg(RAX, array_slot);
-                        self.load_slot_to_reg(RCX, index_slot);
-                        self.load_slot_to_reg(RDX, val_slot);
-                        self.emit_ref_astore_regs();
-                        // 6. Post-store publication. Generational GC exposes a
-                        //    stable atomic card map, so RAX=array / RDX=value
-                        //    can mark it inline; G1/ZGC keep their
-                        //    collector-specific helper.
-                        if self.inline_card_mark_available() {
-                            self.emit_inline_card_mark_regs(RAX, RDX);
-                        } else {
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.load_slot_to_reg(ARG_REGS[1], array_slot);
-                            self.load_slot_to_reg(ARG_REGS[2], val_slot);
-                            self.emit_call_absolute(self.helpers.write_barrier);
-                        }
+                        self.emit_call_absolute(self.helpers.write_barrier);
                     }
                     pc += 1;
                 }
@@ -7422,6 +7424,141 @@ impl Compiler {
                         #[allow(unused_mut)]
                         let mut intrinsic_handled = false;
 
+                        // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+                        // `AtomicInteger` RMW family, emitted as ONE
+                        // `LOCK XADD [value], ECX`.
+                        //
+                        // `XADD` atomically adds the source register to the
+                        // destination and leaves the PRE-add value in the
+                        // source, which is exactly `getAndAdd` semantics; the
+                        // `*AndGet` forms add the delta back afterwards. That
+                        // replaces a full native dispatch (~250 ns/op measured)
+                        // with a single locked instruction.
+                        //
+                        // Soundness rests on three things:
+                        //   * the registered native keeps its state in the SAME
+                        //     memory (`get_field_volatile(this, 0)` /
+                        //     `compare_and_swap_field(this, 0, ..)`), so an
+                        //     interpreted caller and a compiled caller still
+                        //     agree on one location;
+                        //   * the receiver class-id guard below — AtomicInteger
+                        //     is not final, so a subclass override must NOT take
+                        //     this path;
+                        //   * the per-object COMPACT/LEGACY branch, the same one
+                        //     `emit_load_string_i32_field` uses, because a class
+                        //     with a registered `CompactLayout` may still have
+                        //     legacy-laid-out instances.
+                        // Every uncertain case (null receiver, class mismatch)
+                        // goes to the shared uncommon-trap stub and re-runs in
+                        // the interpreter, which reproduces the NPE exactly.
+                        if !intrinsic_handled {
+                            // (delta_imm, return_post_add, delta_is_arg)
+                            let plan: Option<(i32, bool, bool)> = if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndIncrement.as_entry()
+                            {
+                                Some((1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndDecrement.as_entry()
+                            {
+                                Some((-1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntIncrementAndGet.as_entry()
+                            {
+                                Some((1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntDecrementAndGet.as_entry()
+                            {
+                                Some((-1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndAdd.as_entry()
+                            {
+                                Some((0, false, true))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntAddAndGet.as_entry()
+                            {
+                                Some((0, true, true))
+                            } else {
+                                None
+                            };
+                            if let Some((delta_imm, return_post_add, delta_is_arg)) = plan {
+                                // Recomputed from the same two inputs the
+                                // matcher used; `None` here cannot happen for a
+                                // registered site, and bailing keeps the plain
+                                // direct-call path rather than emitting a CALL
+                                // to an intrinsic sentinel.
+                                if let Some(layout) =
+                                    crate::AtomicIntFieldLayout::new(0, guard_class_id)
+                                {
+                                    self.flush_scratch_registers();
+                                    if crate::deopt_real_enabled() {
+                                        self.snapshot_pre_intrinsic_call(
+                                            pc,
+                                            crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                        );
+                                    }
+                                    let mut bail: Vec<usize> = Vec::new();
+                                    // Operands: delta (if any) is shallower,
+                                    // the receiver is deepest.
+                                    let delta_slot =
+                                        if delta_is_arg { Some(self.pop_stack()) } else { None };
+                                    let recv_slot = self.pop_stack();
+
+                                    // RAX = receiver; null → deopt.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    self.emit_test_r64_r64(RAX);
+                                    bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                    // Exact receiver class guard:
+                                    // CMP DWORD [RAX + 0], guard_class_id ; JNE
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&guard_class_id.to_le_bytes());
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                    // EDX = delta (kept for the *AndGet fixup,
+                                    // since XADD overwrites its source with the
+                                    // pre-add value).
+                                    match delta_slot {
+                                        Some(slot) => self.load_slot_to_reg(RDX, slot),
+                                        None => {
+                                            self.buf.emit(&[0xBA]); // MOV EDX, imm32
+                                            self.buf.emit(&delta_imm.to_le_bytes());
+                                        }
+                                    }
+                                    self.buf.emit(&[0x89, 0xD1]); // MOV ECX, EDX
+
+                                    // Per-object layout branch.
+                                    self.emit_test_mem8_imm8(
+                                        RAX,
+                                        cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                        cratonvm_types::GC_FLAG_COMPACT,
+                                    );
+                                    let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                                                                  // LOCK XADD [RAX + compact], ECX
+                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                    self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    let done = self.emit_jmp_rel32_patch();
+                                    self.patch_rel32_to_here(legacy);
+                                    // LOCK XADD [RAX + legacy], ECX
+                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                    self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    self.patch_rel32_to_here(done);
+
+                                    // ECX now holds the PRE-add value.
+                                    if return_post_add {
+                                        self.buf.emit(&[0x01, 0xD1]); // ADD ECX, EDX
+                                    }
+                                    self.buf.emit(&[0x48, 0x63, 0xC1]); // MOVSXD RAX, ECX
+                                    self.push_from_rax();
+
+                                    for p in bail {
+                                        self.deopt_stubs.push((p, pc, 6));
+                                    }
+                                    intrinsic_handled = true;
+                                }
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
                         // java.lang.String access intrinsics (Phase 3a):
                         // length()I, isEmpty()Z, charAt(I)C, hashCode()I.
@@ -10090,7 +10227,7 @@ impl Compiler {
                                 "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
                             );
                         }
-                        self.buf.mark_overflowed();
+                        self.buf.mark_codegen_unencodable("unresumable-indy-trap");
                     }
 
                     let patch = self.emit_jmp_rel32_patch();

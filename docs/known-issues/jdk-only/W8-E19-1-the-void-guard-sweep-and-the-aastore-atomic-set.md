@@ -1,5 +1,17 @@
 # W8-E19-1 — the undefined-RAX guard sweep, the `aastore` ATOMIC SET (2 of 5 applied), and a second not-single-site opcode
 
+> **RECONCILED 2026-08-16 (merge of `dev`).** Every `aastore_check`,
+> `jit_aastore_check` and `HelperFnAastoreCheck` below names the spelling that
+> was current when this record was written. The merge of `dev` into
+> `claude/jdk-only-mode-completion-1351c0` settled on **`aastore_type_check`**
+> (ABI field), **`jit_aastore_type_check`** (helper) and
+> **`aastore_store_is_refused`** (the predicate the helper and the x64 inline
+> lowering now share), and the slot is `required: true` -- the old
+> `aastore_check == 0` fallback that routed the whole opcode to
+> `helpers.aastore` no longer exists. `grep -rn 'aastore_check' --include=*.rs`
+> returns nothing in the tree. The names here are kept as written; read them as
+> history, not as a pointer to live code.
+
 > **STATUS: two of FIVE files applied; THE TREE DOES NOT BUILD UNTIL §3's
 > NOMINATION LANDS IN THE SAME COMMIT.** This lane owns
 > `jit/src/x64/bytecode_walk.rs` and `vm/src/jit/helpers.rs` and has written

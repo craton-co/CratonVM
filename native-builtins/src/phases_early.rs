@@ -7701,7 +7701,7 @@ pub(crate) fn register_exchanger_natives(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let unit_ordinal = match args.get(3) {
-                Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                Some(Value::Object(Some(u))) => crate::time_unit_ordinal(ctx, *u),
                 _ => 2,
             };
             let timeout_ms = crate::convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -15836,12 +15836,20 @@ fn pbkdf2_derive<D: sha2::Digest + Clone>(
 
 /// Map a `PBKDF2WithHmac*` algorithm name to a PRF code (the SHA bit length).
 pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
-    match alg {
-        "PBKDF2WithHmacSHA1" => Some(1),
-        "PBKDF2WithHmacSHA224" => Some(224),
-        "PBKDF2WithHmacSHA256" => Some(256),
-        "PBKDF2WithHmacSHA384" => Some(384),
-        "PBKDF2WithHmacSHA512" => Some(512),
+    // JCA algorithm names are CASE-INSENSITIVE (`Provider`'s own service
+    // lookup upper-cases both sides), and the spelling differs per provider:
+    // SunJCE registers `PBKDF2WithHmacSHA256`, BouncyCastle registers
+    // `PBKDF2WITHHMACSHA256`, and BouncyCastle's own callers ask for
+    // `PBKDF2withHMACSHA256`. Matching the SunJCE spelling exactly meant every
+    // BouncyCastle spelling threw `SecurityException: … SecretKeyFactory not
+    // available` (measured 2026-08-13 — three of the seven spellings a caller
+    // can legitimately use were rejected).
+    match alg.to_ascii_uppercase().as_str() {
+        "PBKDF2WITHHMACSHA1" => Some(1),
+        "PBKDF2WITHHMACSHA224" => Some(224),
+        "PBKDF2WITHHMACSHA256" => Some(256),
+        "PBKDF2WITHHMACSHA384" => Some(384),
+        "PBKDF2WITHHMACSHA512" => Some(512),
         _ => None,
     }
 }
@@ -16078,6 +16086,56 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
+    let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    // `Alg.Alias.SecretKeyFactory.<oid>` spellings first — PKCS#5/PKCS#12 code
+    // names its KDFs by OID as a matter of course.
+    let alg = crate::jca::provider_chain::canonical_if_unrecognised(
+        requested_provider.as_deref(),
+        "SecretKeyFactory",
+        &alg,
+        &|n| {
+            pbkdf2_prf_code(n).is_some()
+                || is_known_pbe_keyfactory_alg(n)
+                || (pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(n))
+        },
+    )
+    .unwrap_or(alg);
+    // A caller that NAMED a third-party provider gets THAT provider's
+    // `SecretKeyFactorySpi`, wrapped in a REAL `javax.crypto.SecretKeyFactory`
+    // built through the JDK's own `(Spi, Provider, String)` constructor. Every
+    // method on it — including `getKeySpec`/`translateKey`, which this crate
+    // does not intercept at all — is then ordinary JDK bytecode over the
+    // provider's own engine, and the three natives that DO shadow this class
+    // already route a receiver they did not build back to its `spi` field (see
+    // `skf_receiver_is_ours`).
+    //
+    // Deliberately NOT restricted to names this VM cannot serve. Serving
+    // `PBKDF2WithHmacSHA256` from our own derivation while reporting provider
+    // `SunJCE` for a caller who asked BouncyCastle is the exact shape of
+    // `jca-getinstance-ignores-the-requested-provider`, whose measured cost was
+    // a SILENTLY WRONG KEY — the two providers agreed on that one name, and
+    // did not on the next. The anonymous overload keeps this VM's own path.
+    //
+    // The anonymous overload takes this route only where neither family covers
+    // the name — chain order, since every provider ahead of a third-party one
+    // is a JDK provider this crate services natively. `PBKDF-OpenSSL` and
+    // `PBKDF2with8BIT` (bc-java's `openssl` suite) are asked for without a
+    // provider named and exist only on BouncyCastle.
+    let skf_provider = requested_provider.clone().or_else(|| {
+        let ours = pbkdf2_prf_code(&alg).is_some()
+            || is_known_pbe_keyfactory_alg(&alg)
+            || (pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(&alg));
+        (!ours)
+            .then(|| crate::jca::provider_chain::find_service_provider("SecretKeyFactory", &alg))
+            .flatten()
+    });
+    if let Some(provider) = skf_provider.as_deref() {
+        if let Some(obj) =
+            crate::jca::provider_chain::build_real_secret_key_factory(ctx, provider, &alg)?
+        {
+            return Ok(Some(Value::Object(Some(obj))));
+        }
+    }
     match pbkdf2_prf_code(&alg) {
         Some(code) => {
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1)?;
@@ -16105,10 +16163,24 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
             skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
-        None => Err(RuntimeError::SecurityException {
-            message: format!("{alg} SecretKeyFactory not available"),
-        }
-        .into()),
+        // `NoSuchAlgorithmException`, not `SecurityException`, and the
+        // difference is a caller's `catch`. `SecretKeyFactory.getInstance`
+        // DECLARES `NoSuchAlgorithmException`, so the standard
+        //
+        //     catch (NoSuchAlgorithmException | NoSuchProviderException e)
+        //
+        // does not catch an unchecked `java.lang.SecurityException` at all: the
+        // refusal escapes the handler written for exactly this case. Measured
+        // against HotSpot JDK 25 with `probes/JcaGetInstanceProbe.java`, which
+        // prints the exception CLASS per engine — the same shape as the
+        // `IOException`-where-`CertificateException`-belongs batch found in the
+        // trust manager. `throw_jca_exc` builds the real Java exception object,
+        // so what a caller catches is what HotSpot throws.
+        None => Err(throw_jca_exc(
+            ctx,
+            "java/security/NoSuchAlgorithmException",
+            &format!("{alg} SecretKeyFactory not available"),
+        )),
     }
 }
 
@@ -16138,23 +16210,82 @@ pub(crate) fn pbkdf2_get_algorithm(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = pbkdf2_key_for(ctx, this);
-    let algo = skf_algo_table()
-        .lock()
-        .unwrap()
-        .get(&key)
-        .cloned()
-        .unwrap_or_default();
+    let algo = skf_algo_table().lock().unwrap().get(&key).cloned();
+    let Some(algo) = algo else {
+        // Not one of ours — see `skf_receiver_is_ours`. Answer from the real
+        // object's own field rather than from an empty table entry.
+        //
+        // Type-checked, not trusted: `get_field_by_name` can fall back to a
+        // name->slot mapping, and a slot that is not the field we asked for
+        // reads back as some other object entirely. Returning it would put a
+        // `String` where a `Provider` belongs (measured: the sibling
+        // `getProvider` did exactly that, and the caller got
+        // `NoSuchMethodError: java.lang.String.getName()`).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "algorithm") {
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(s))
+                .is_some_and(|n| n == "java/lang/String")
+            {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
+    };
     Ok(Some(Value::Object(Some(ctx.create_string(&algo)))))
 }
 
-/// `SecretKeyFactory.getProvider()` — SunJCE, which is where HotSpot resolves
-/// every `PBKDF2With*` and `PBEWith*` factory.
+/// `SecretKeyFactory.getProvider()` — SunJCE for the factories this VM builds,
+/// which is where HotSpot resolves every `PBKDF2With*` and `PBEWith*` factory;
+/// the real object's own `provider` field for any other receiver.
 pub(crate) fn pbkdf2_get_provider(
     ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Ok(this) = obj_arg(args, 0) {
+        if !skf_receiver_is_ours(ctx, this) {
+            // Type-checked for the reason `pbkdf2_get_algorithm` documents: an
+            // unchecked `get_field_by_name` handed back the `algorithm` String
+            // here and the caller died on `String.getName()`.
+            if let Value::Object(Some(p)) = ctx.get_field_by_name(this, "provider") {
+                let pid = ctx.class_id_by_name("java/security/Provider");
+                let is_provider =
+                    pid.is_some_and(|pid| ctx.is_subclass(ctx.class_id_of_object(p), pid));
+                if is_provider {
+                    return Ok(Some(Value::Object(Some(p))));
+                }
+            }
+        }
+    }
     let p = crate::jca::make_named_provider(ctx, "SunJCE")?;
     Ok(Some(Value::Object(Some(p))))
+}
+
+/// Did **this VM** build this `SecretKeyFactory`?
+///
+/// `getInstance(String[, String])` is a native here, and every factory it
+/// returns is recorded in `skf_algo_table`. `getInstance(String, Provider)` is
+/// NOT registered, so that overload runs the real JDK bytecode and hands back a
+/// genuine `SecretKeyFactory` wrapping the requested provider's own SPI — and
+/// the three natives registered on this class then shadowed the real bytecode
+/// for it too.
+///
+/// The consequence was not a crash but a **silently wrong key**, which is the
+/// worst shape this workspace has a name for. Measured 2026-08-13 against
+/// HotSpot 25 with the same jars: BouncyCastle's `PEMUtilities.getKey` asks for
+/// `SecretKeyFactory.getInstance("PBKDF-OpenSSL", bcProvider)` and derives
+/// `90e508cc4fc9798bdec87516bebe5ecd`; on CratonVM the same call reported
+/// provider `SunJCE`, algorithm `""`, and derived
+/// `bcfb6da32cd0aae96fdc53ed8980f72b` — `generateSecret` had fallen out of its
+/// `unwrap_or(256)` default and run PBKDF2-HMAC-SHA256 under another
+/// algorithm's name. Every netty PKCS#1-encrypted-key test failed downstream of
+/// that (`IOException: Invalid lenByte`, because netty then fell back to
+/// handing raw PKCS#1 bytes to `EncryptedPrivateKeyInfo`).
+///
+/// Table membership is the right test rather than a class-name check: it is
+/// exactly "did our `getInstance` produce this object".
+fn skf_receiver_is_ours(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let key = pbkdf2_key_for(ctx, this);
+    skf_algo_table().lock().unwrap().contains_key(&key)
 }
 
 /// `SecretKeyFactory.generateSecret(PBEKeySpec)` for a PBKDF2 synthetic.
@@ -16166,6 +16297,31 @@ pub(crate) fn pbkdf2_generate_secret(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A factory this VM did not build belongs to the provider that did — run
+    // ITS `engineGenerateSecret` instead of deriving a key of our own choosing
+    // under its algorithm's name. See `skf_receiver_is_ours` for the measured
+    // wrong-key this closes.
+    if !skf_receiver_is_ours(ctx, this) {
+        if let Value::Object(Some(spi)) = ctx.get_field_by_name(this, "spi") {
+            let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+            return ctx.invoke_virtual(
+                spi,
+                "engineGenerateSecret",
+                "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
+                &[spec],
+            );
+        }
+        // No SPI to delegate to (a receiver of a shape we do not recognise).
+        // Refuse rather than derive something: this native has no idea what
+        // algorithm was asked for, and answering anyway is how the defect
+        // above happened.
+        return Err(RuntimeError::SecurityException {
+            message: "SecretKeyFactory.generateSecret: this factory was not created by CratonVM \
+                      and carries no provider SPI to delegate to"
+                .to_string(),
+        }
+        .into());
+    }
     // Same GC-stable, collision-disambiguated key used by `getInstance` so the
     // PRF is looked up deterministically for THIS factory instance.
     let key = pbkdf2_key_for(ctx, this);
@@ -22012,28 +22168,33 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         // duplicates `net_phase_e::inet_addr_host_name_value` because both
         // registrations exist and either may win the last-writer-wins registry
         // slot — they must not disagree.
-        let (host, ip) = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
-            Some((h, i)) => (h, i),
-            None => {
-                let h = match ctx.get_field(this, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                (h, String::new())
-            }
+        let host = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
+            Some((h, _)) => h,
+            None => match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
         };
-        let answer = if host.is_empty() { ip } else { host };
+        // The no-name fallback is `getHostAddress()` — scope suffix included.
+        let answer = if host.is_empty() {
+            crate::net_phase_e::inet_addr_scoped_text(ctx, this, "")
+        } else {
+            host
+        };
         Ok(Some(Value::Object(Some(ctx.create_string(&answer)))))
     });
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Some((_, ip)) = crate::net_phase_e::inet_addr_resolve(ctx, this) {
-            let ip = if ip.is_empty() {
-                "127.0.0.1".to_string()
-            } else {
-                ip
-            };
-            return Ok(Some(Value::Object(Some(ctx.create_string(&ip)))));
+        if crate::net_phase_e::inet_addr_resolve(ctx, this).is_some() {
+            // Shared with the `net_phase_e` registrations so the IPv6 scope
+            // suffix cannot depend on which duplicate won the registry slot.
+            let v = crate::net_phase_e::inet_addr_host_address_value(ctx, this);
+            if let Value::Object(Some(s)) = v {
+                if ctx.read_string(s).is_some_and(|t| !t.is_empty()) {
+                    return Ok(Some(v));
+                }
+            }
+            return Ok(Some(Value::Object(Some(ctx.create_string("127.0.0.1")))));
         }
         let nf = ctx.object_num_fields(this);
         if nf > 1 {
@@ -22049,17 +22210,16 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     // with real DNS resolution; do NOT re-register here as it would shadow them.
     r.register(ia, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Real-JDK `InetAddress.toString()` => `hostName + "/" + ipString`.
-        let (host, ip) = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
-            Some(pair) => pair,
-            None => {
-                let h = match ctx.get_field(this, 0) {
-                    Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                (h, String::new())
-            }
+        // Real-JDK `InetAddress.toString()` => `hostName + "/" + getHostAddress()`,
+        // and the right-hand half carries the IPv6 scope suffix.
+        let host = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
+            Some((h, _)) => h,
+            None => match ctx.get_field(this, 0) {
+                Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
+                _ => String::new(),
+            },
         };
+        let ip = crate::net_phase_e::inet_addr_scoped_text(ctx, this, "");
         let s = ctx.create_string(&format!("{host}/{ip}"));
         Ok(Some(Value::Object(Some(s))))
     });

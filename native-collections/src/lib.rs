@@ -3770,15 +3770,19 @@ const AL_DEFAULT_CAPACITY: usize = 10;
 /// each access rather than caching globally.
 #[inline]
 fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
-    let data = ctx.resolve_field_index("java/util/ArrayList", "elementData");
-    let size = ctx.resolve_field_index("java/util/ArrayList", "size");
-    match (data, size) {
-        (Some(d), Some(s)) => {
-            let n = std::cmp::max(d, s) + 1;
-            (d, s, n)
-        }
-        _ => (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS),
-    }
+    al_slots_resolved(ctx).unwrap_or((AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS))
+}
+
+/// `al_slots`, but reporting whether the layout was actually RESOLVED rather
+/// than defaulted. `al_slots_for`'s memo caches only `Some`: a
+/// `resolve_field_index` that fails today because the class is not loaded yet
+/// can succeed later, and caching the constant fallback would pin the wrong
+/// layout for the rest of the run. Same argument `class_name_rc` makes for not
+/// caching its `None`.
+fn al_slots_resolved(ctx: &dyn NativeContext) -> Option<(usize, usize, usize)> {
+    let data = ctx.resolve_field_index("java/util/ArrayList", "elementData")?;
+    let size = ctx.resolve_field_index("java/util/ArrayList", "size")?;
+    Some((data, size, std::cmp::max(data, size) + 1))
 }
 
 /// Receiver-aware slot resolution for the shared ArrayList-backed list natives.
@@ -3792,34 +3796,207 @@ fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
 /// the element → Xerces external-DTD entity stack empty → "Premature end of
 /// file"). Resolve against the receiver's actual class instead.
 fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usize) {
+    al_slots_and_layout_for(ctx, this).0
+}
+
+/// [`al_slots_for`] with the receiver's [`AlLayout`] verdict, from the same
+/// memo entry. Callers that need both — `al_state` does, on every operation —
+/// must use this rather than asking twice.
+fn al_slots_and_layout_for(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> ((usize, usize, usize), AlLayout) {
     let cid = ctx.class_id_of_object(this);
+    let raw = cid.as_u32();
+    let vm = ctx.vm_identity();
+    let index = facts_slot_index(raw) & (AL_SLOTS_WAYS - 1);
+
+    let hit = AL_SLOTS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0 != Some(vm) {
+            *cache = (Some(vm), [None; AL_SLOTS_WAYS]);
+        }
+        match cache.1[index] {
+            Some((cached_id, slots)) if cached_id == raw => Some(slots),
+            _ => None,
+        }
+    });
+    if let Some(slots) = hit {
+        return slots;
+    }
+
+    // Cold. The borrow above is released first: the resolution below re-enters
+    // the VM, which must never find this `RefCell` already borrowed.
+    let resolved = al_slots_for_uncached(ctx, cid);
+    if let Some(slots) = resolved {
+        AL_SLOTS.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.0 == Some(vm) {
+                cache.1[index] = Some((raw, slots));
+            }
+        });
+        return slots;
+    }
+    (
+        (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS),
+        AlLayout::Lenient,
+    )
+}
+
+/// Ways in the direct-mapped receiver-class -> list-slot-layout cache.
+///
+/// `al_slots_for` sits on EVERY `native_al_*` operation and re-derived a
+/// constant each time: a string-keyed `class_id_by_name`, an `is_subclass`
+/// walk, and two string-keyed `resolve_field_index` calls, all behind the
+/// class-manager lock. `native_al_size` reaches it twice per call. Measured
+/// before this memo, on an idle box: `ArrayList.size()` 1014 ns/op against
+/// 28 ns/op for the identical method body written in plain Java on the same VM;
+/// netty's `AhoCorasicSearchProcessorFactory.buildTrie` — 6.05 M ArrayList
+/// native calls — took 217 s where HotSpot takes 0.214 s.
+///
+/// Sound for the same reason as `RECEIVER_FACTS` and `RECEIVER_NAMES`: a
+/// `ClassId` is never reissued, and a class's field layout is immutable after
+/// linking.
+const AL_SLOTS_WAYS: usize = 64;
+
+thread_local! {
+    /// `(vm_identity, [(ClassId, ((data, size, n), layout)); WAYS])`.
+    static AL_SLOTS: std::cell::RefCell<(
+        Option<usize>,
+        [Option<(u32, ((usize, usize, usize), AlLayout))>; AL_SLOTS_WAYS],
+    )> = const { std::cell::RefCell::new((None, [None; AL_SLOTS_WAYS])) };
+}
+
+/// What the receiver's CLASS says about its list layout — the class-only half
+/// of [`al_is_list_layout`], resolved once per `ClassId` and cached beside the
+/// slot layout in [`AL_SLOTS`].
+///
+/// PERF (2026-08-13, the `arraylist-native-overhead` residual). The predicate
+/// this replaces ran `class_id_by_name("java/util/ArrayList")` followed by
+/// `is_subclass` on EVERY `al_state`, and a second such pair for
+/// `java/util/Vector` whenever the first said no — each of them a
+/// `class_manager` read lock plus a name-hash lookup over a 19-byte string.
+/// `native_al_size` reached `al_state` twice, so one `ArrayList.size()` paid
+/// two of them. A flat `perf record -F 499` of a `size()`-only loop put
+/// `class_id_by_name` + `find_unique_class_by_name` + `classify_exact_name` at
+/// **15.9% of the whole run** — the largest family in that profile, ahead of
+/// every dispatch symbol.
+///
+/// Sound for the same reason as [`AL_SLOTS`] itself and `RECEIVER_FACTS`: a
+/// `ClassId` is never reissued and a class's ancestry is immutable after
+/// linking. Like `AL_SLOTS` it is only ever FILLED with a resolved verdict —
+/// while `java/util/ArrayList` is not loaded the old predicate answered its
+/// lenient `true` for every receiver, and freezing that into the memo would
+/// keep answering it after ArrayList arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlLayout {
+    /// `java/util/ArrayList` or a subclass — the ordinary case.
+    ArrayList,
+    /// `java/util/Vector` or a subclass (`java/util/Stack`), which carries its
+    /// own `elementData`/`elementCount` slots.
+    Vector,
+    /// Exactly `java/lang/Object`. CratonVM's own class-id-0 placeholders land
+    /// here; a zero-field bare `Object` is not a list. See
+    /// [`is_bare_java_lang_object`], whose test this reproduces.
+    BareObject,
+    /// Nameless or unnamed class — the lenient arm the original carried so
+    /// bare synthetic allocations keep working.
+    Lenient,
+    /// A known, named, non-list class (`String`, `LinkedList`, a JDK bean).
+    /// Reading ArrayList's slots out of one of these is the wild-read the
+    /// guard exists to prevent — see [`al_state`].
+    Foreign,
+}
+
+impl AlLayout {
+    /// `true` when the receiver's class alone rules out every wrapper/view
+    /// route a `native_al_*` entry point checks before doing its own work.
+    ///
+    /// `ksv_route` asks whether the receiver is a
+    /// `ConcurrentHashMap$KeySetView`; `unmod_receiver_backing` whether it is
+    /// one of the `cratonvm/internal/Unmodifiable*` views. Neither can be an
+    /// `ArrayList`, a `Vector` or a map-view carrier — they are named classes
+    /// with their own layouts, so they classify as [`AlLayout::Foreign`]. Every
+    /// `native_al_*` entry point ran both anyway, on every ordinary list, at a
+    /// combined 3.5% of a flat `ArrayList.size()` profile (`ksv_route` 1.3%,
+    /// `unmod_receiver_backing` 1.0%, and the `class_name_rc` it drives 1.3%).
+    /// This answers both from the memo the operation is about to consult for
+    /// its slot layout anyway.
+    #[inline]
+    fn rules_out_wrapper_routes(self) -> bool {
+        matches!(self, AlLayout::ArrayList | AlLayout::Vector)
+    }
+
+    /// The verdict [`al_is_list_layout`] returns for an object of this class.
+    /// `n_fields` is the receiver's own field count, which every caller has
+    /// already read for the slot bounds check.
+    #[inline]
+    fn accepts(self, n_fields: usize) -> bool {
+        match self {
+            AlLayout::ArrayList | AlLayout::Vector | AlLayout::Lenient => true,
+            // `!is_bare_java_lang_object`: exact `java/lang/Object` with zero
+            // fields is rejected; one that carries fields is a CratonVM
+            // placeholder list and stays accepted.
+            AlLayout::BareObject => n_fields != 0,
+            AlLayout::Foreign => false,
+        }
+    }
+}
+
+/// The uncached body of [`al_slots_for`]. `None` when the layout could not be
+/// resolved, so the caller can apply the constant fallback WITHOUT caching it.
+fn al_slots_for_uncached(
+    ctx: &dyn NativeContext,
+    cid: ClassId,
+) -> Option<((usize, usize, usize), AlLayout)> {
     if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
         if cid == vec_id || ctx.is_subclass(cid, vec_id) {
             if let (Some(d), Some(s)) = (
                 ctx.resolve_field_index("java/util/Vector", "elementData"),
                 ctx.resolve_field_index("java/util/Vector", "elementCount"),
             ) {
-                return (d, s, std::cmp::max(d, s) + 1);
+                return Some(((d, s, std::cmp::max(d, s) + 1), AlLayout::Vector));
             }
+            // A Vector receiver whose own layout is unresolvable must NOT fall
+            // through to ArrayList's `size` slot — that is the DF08 mixup this
+            // function exists to prevent. Report unresolved instead.
+            return None;
         }
     }
-    al_slots(ctx)
+    let slots = al_slots_resolved(ctx)?;
+    // Refuse to CACHE a verdict until `java/util/ArrayList` itself resolves:
+    // the arm below this one is the old predicate's lenient "ArrayList not
+    // loaded (synthetic-jdk) — preserve old behavior" answer, and it stops
+    // being true the moment ArrayList loads. The uncached fallback in
+    // `al_slots_for` reproduces it meanwhile.
+    let al_id = ctx.class_id_by_name("java/util/ArrayList")?;
+    let layout = if cid == al_id || ctx.is_subclass(cid, al_id) {
+        AlLayout::ArrayList
+    } else {
+        // Not an ArrayList: reject only when the class is known and named.
+        match ctx.class_name_arc_of_id(cid).as_deref() {
+            None => AlLayout::Lenient,
+            Some("") => AlLayout::Lenient,
+            Some("java/lang/Object") => AlLayout::BareObject,
+            // A map view carries its state in ArrayList's own resolved slots
+            // under its own class — see `MAP_VIEW_CARRIERS`. Without this arm
+            // the guard below rejects it as a named non-list and every view
+            // reads back EMPTY.
+            Some(n) if is_map_view_carrier(n) => AlLayout::ArrayList,
+            Some(_) => AlLayout::Foreign,
+        }
+    };
+    Some((slots, layout))
 }
 
 /// `true` iff `obj` has a list layout the `native_al_*` natives can read at the
 /// receiver-aware slots — ArrayList (or subclass) **or** Vector (or subclass,
-/// e.g. Stack). See [`al_is_arraylist_layout`] for the foreign-receiver rationale.
+/// e.g. Stack). See [`AlLayout`] for the foreign-receiver rationale and for why
+/// the answer is memoized per `ClassId` rather than re-derived per call.
 fn al_is_list_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    if al_is_arraylist_layout(ctx, obj) {
-        return true;
-    }
-    let cid = ctx.class_id_of_object(obj);
-    if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
-        if cid == vec_id || ctx.is_subclass(cid, vec_id) {
-            return true;
-        }
-    }
-    false
+    al_slots_and_layout_for(ctx, obj)
+        .1
+        .accepts(ctx.object_num_fields(obj))
 }
 
 /// Allocate an ArrayList instance, sized to fit whichever field layout the
@@ -3857,22 +4034,15 @@ fn is_bare_java_lang_object(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// CratonVM's internal placeholder lists allocate against
 /// `java/util/ArrayList` (so they resolve by name and qualify), but bare
 /// class-id-0 allocations must keep working as before.
+///
+/// The classification itself now lives in [`AlLayout`], memoized per
+/// `ClassId`; this is the exact-ArrayList question on top of it, which is not
+/// the same as [`al_is_list_layout`] (that one also admits `Vector`).
 fn al_is_arraylist_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    let cid = ctx.class_id_of_object(obj);
-    match ctx.class_id_by_name("java/util/ArrayList") {
-        Some(al_id) => {
-            if cid == al_id || ctx.is_subclass(cid, al_id) {
-                return true;
-            }
-            // Not an ArrayList: reject only when the class is known and named.
-            match ctx.class_name_of_id(cid) {
-                None => true, // synthetic / unknown — lenient
-                Some(n) if n.is_empty() => true,
-                Some(n) if n == "java/lang/Object" => !is_bare_java_lang_object(ctx, obj),
-                Some(_) => false,
-            }
-        }
-        None => true, // ArrayList not loaded (synthetic-jdk) — preserve old behavior
+    match al_slots_and_layout_for(ctx, obj).1 {
+        AlLayout::ArrayList | AlLayout::Lenient => true,
+        AlLayout::BareObject => !is_bare_java_lang_object(ctx, obj),
+        AlLayout::Vector | AlLayout::Foreign => false,
     }
 }
 
@@ -3891,7 +4061,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // throw, so callers reaching `al_state` are read-only. Mirrors the same
     // unwrap that `map_state` already performs for unmodifiable maps.
     let this = unwrap_unmod(ctx, this);
-    let (data_slot, size_slot, _) = al_slots_for(ctx, this);
+    let ((data_slot, size_slot, _), layout) = al_slots_and_layout_for(ctx, this);
     // Receiver-layout guard. `al_state` is reached through `Collection`-
     // and `List`-interface natives (`size`, `forEach`, `stream`, …) whose
     // bytecode dispatcher can target *any* object — including non-list
@@ -3920,7 +4090,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // ArrayList slots when the receiver actually has ArrayList layout; otherwise
     // return the empty sentinel so the caller falls back to the receiver's own
     // `iterator()` (equals) / virtual dispatch.
-    if !al_is_list_layout(ctx, this) {
+    if !layout.accepts(n_fields) {
         return (None, 0);
     }
     let data = match ctx.get_field(this, data_slot) {
@@ -4369,6 +4539,72 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
     // Fix (item 6): the backed-view class returned by `subList`.
     register_al_sublist_natives(r);
+    // The classes a map's `values()`/`entrySet()` view is minted under.
+    register_map_view_carrier_natives(r);
+}
+
+/// The `Collection` surface of a map view, registered on each of the
+/// [`MAP_VIEW_CARRIERS`].
+///
+/// A view is ArrayList-LAYOUT under its own class, so it needs the same
+/// `native_al_*` bodies the ArrayList registration installs. Interface-level
+/// registrations (`java/util/Collection`, `java/util/AbstractCollection`) catch
+/// some of these already, but only for methods the carrier's own JDK class does
+/// not declare — and `HashMap$Values` declares `size`, `iterator`, `clear`,
+/// `forEach` and `spliterator` itself, `TreeMap$Values` adds `contains` and
+/// `remove`, and `ConcurrentHashMap$ValuesView` declares nearly the whole
+/// surface. Registering here is what keeps the receiver-has-own-bytecode rule
+/// from running JDK bodies that would read `this$0` (null on these carriers) —
+/// paired with the entries in `force_native_over_real_jdk_bytecode`.
+///
+/// Deliberately NOT registered: `equals` and `hashCode`. The JDK's views
+/// inherit `AbstractCollection`'s, i.e. `Object` identity, and installing the
+/// LIST-contract `native_al_equals`/`native_al_hash_code` here would reinstate
+/// exactly the `values().equals(anArrayList) == true` divergence that giving
+/// these views their own class removes. `get`/`indexOf`/`lastIndexOf`/`set`/
+/// `add(int, …)` are omitted for the same reason: a `Collection` has no
+/// positional access, and answering one would make the view act like the `List`
+/// it is no longer classed as.
+fn register_map_view_carrier_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in MAP_VIEW_CARRIERS {
+        let c = *c;
+        r.register(c, "size", "()I", native_al_size);
+        r.register(c, "isEmpty", "()Z", native_al_is_empty);
+        r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
+        r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
+        r.register(c, "toArray", "()[Ljava/lang/Object;", native_al_to_array);
+        r.register(
+            c,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            native_al_to_array_typed,
+        );
+        r.register(
+            c,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            native_collection_to_array_generator,
+        );
+        r.register(c, "toString", "()Ljava/lang/String;", native_al_to_string);
+        r.register(c, "remove", "(Ljava/lang/Object;)Z", native_al_remove_obj);
+        r.register(c, "clear", "()V", native_al_clear);
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_al_for_each,
+        );
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
+        r.register(
+            c,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            native_al_remove_if,
+        );
+    }
+    r.set_category(__prev_cat);
 }
 
 pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4621,7 +4857,21 @@ fn unmod_list_oob_error(
 }
 
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
+    // The receiver's CLASS answers this outright for every ordinary list, from
+    // a memo the operation is about to consult anyway — see
+    // `AlLayout::rules_out_wrapper_routes`. Without it this function ran a
+    // `class_id_of_object`, a `class_name_rc` and a `starts_with` on every
+    // `size()`/`get()`/`isEmpty()` of every `ArrayList` in the process, for an
+    // answer the class had already settled: 1.0% of a flat `ArrayList.size()`
+    // profile here plus the 1.3% `class_name_rc` it drives.
+    if al_slots_and_layout_for(&*ctx, this).1.rules_out_wrapper_routes() {
+        return None;
+    }
+    // `class_name_rc` is the memoized reader; `class_name_of_id` takes the
+    // class-manager read lock and allocates a fresh `String` on EVERY call.
+    // This runs on the hot path of every `native_al_*` entry point.
+    let cid = ctx.class_id_of_object(this);
+    let name = class_name_rc(&*ctx, cid)?;
     if !name.starts_with("cratonvm/internal/Unmodifiable") {
         return None;
     }
@@ -4639,8 +4889,8 @@ fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Optio
 /// reporting **0**. The sizes are constants of the wrapper type, so answer them
 /// directly and keep the delegation as the path for everything else.
 fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
-    match name.as_str() {
+    let name = class_name_rc(ctx, ctx.class_id_of_object(this))?;
+    match &*name {
         "java/util/Collections$SingletonList"
         | "java/util/Collections$SingletonSet"
         | "java/util/Collections$SingletonMap" => Some(1),
@@ -4649,6 +4899,63 @@ fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i3
         | "java/util/Collections$EmptyMap" => Some(0),
         _ => None,
     }
+}
+
+/// Outcome of [`al_state_for_read`].
+enum AlRead {
+    /// The receiver is a live map view and the caller wanted only its element
+    /// count, which the source answered without a rebuild.
+    ViewSize(i32),
+    /// Ordinary state: the (possibly relocated) receiver, its backing array
+    /// and its size.
+    State(ObjectRef, Option<ObjectRef>, i32),
+}
+
+/// `al_state` for a receiver that may be a live map view, computing the ONE
+/// `al_state` that both the marker test and the answer need.
+///
+/// `resync_values_view` opens with `values_view_source`, which is itself an
+/// `al_state`; every native that called it and then `al_state` therefore read
+/// the receiver's two fields twice and classified its layout twice. On the
+/// non-view path — every ordinary `ArrayList`, which is the bulk of the traffic
+/// — the second read is pure duplication: `values_view_source` allocates
+/// nothing and runs no Java, so nothing between the two can have moved the
+/// object. On the view path the rebuild DOES move things, so the re-read stays.
+///
+/// `size_only` additionally skips the rebuild altogether. A view's logical size
+/// is by construction its source's size — `resync_values_view` refills it from
+/// `collect_entries_any(source)` and stores exactly that many elements — so
+/// `size()` and `isEmpty()` never need the elements at all, and rebuilding for
+/// them was O(n) with an allocation PER CALL: measured at **15.9 us** for
+/// `values().size()` over a 64-entry `HashMap`, against 610 ns for
+/// `ArrayList.size()` on the same binary and 3 ns on HotSpot. One virtual
+/// `size()` on the source replaces it. A source that cannot answer falls back
+/// to the rebuild rather than inventing a number.
+fn al_state_for_read(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    size_only: bool,
+) -> Result<AlRead, MethodCallFailed> {
+    let (data, size) = al_state(ctx, this);
+    let Some(d) = data else {
+        return Ok(AlRead::State(this, None, size));
+    };
+    let Some(source) = view_source_in(ctx, d, size) else {
+        return Ok(AlRead::State(this, data, size));
+    };
+    // A view naming ITSELF as its source would recurse forever. The marker is
+    // never written that way, but these natives are reachable from application
+    // bytecode that can hand over any object.
+    if size_only && source != this {
+        if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(source, "size", "()I", &[]) {
+            if n >= 0 {
+                return Ok(AlRead::ViewSize(n));
+            }
+        }
+    }
+    let this = resync_values_view(ctx, this)?;
+    let (data, size) = al_state(ctx, this);
+    Ok(AlRead::State(this, data, size))
 }
 
 pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4662,13 +4969,23 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(b) = unmod_receiver_backing(ctx, this) {
         return native_al_size(ctx, &[Value::Object(Some(b))]);
     }
-    // A real `Map.values()` view class counts through its source map, not
-    // through an ArrayList backing it does not have. See `vc_route_source_size`.
+    // Two DIFFERENT view shapes reach here, and each needs its own test.
+    //
+    // First: a real `Map.values()` view-class receiver (`java.util.HashMap$Values`
+    // and family, `CF_VALUES_VIEW`). It is not ArrayList-shaped at ALL — it has
+    // no `elementData` — so `al_state` cannot decode it and the class test has
+    // to run first. It counts through its source map. See `vc_route_source_size`.
     if let Some(r) = vc_route_source_size(ctx, this) {
         return r;
     }
-    let this = resync_values_view(ctx, this)?;
-    let (data, size) = al_state(ctx, this);
+    // Second: an ArrayList-SHAPED carrier that names a source map in the spare
+    // trailing slot of its backing array. `al_state_for_read` reads the one
+    // `al_state` both the marker test and the answer need, and `size_only`
+    // answers from the source instead of rebuilding the carrier to count it.
+    let (this, data, size) = match al_state_for_read(ctx, this, true)? {
+        AlRead::ViewSize(n) => return Ok(Some(Value::Int(n))),
+        AlRead::State(t, d, s) => (t, d, s),
+    };
     if data.is_none() {
         if let Some(r) =
             try_delegate_real_collection(ctx, this, "java/util/Collection", "size", "()I")
@@ -4690,17 +5007,20 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    // Same source-map count as `native_al_size`, reduced to the boolean. Going
-    // through the count rather than through `vc_route` keeps `isEmpty()` free
-    // of the carrier allocation.
+    // Both view shapes again, in the same order as `native_al_size`, each
+    // reduced to the boolean. Going through the COUNT rather than through
+    // `vc_route` keeps `isEmpty()` free of the carrier allocation on either
+    // path.
     if let Some(r) = vc_route_source_size(ctx, this) {
         return Ok(Some(Value::Int(match r? {
             Some(Value::Int(n)) => i32::from(n == 0),
             _ => 1,
         })));
     }
-    let this = resync_values_view(ctx, this)?;
-    let (data, size) = al_state(ctx, this);
+    let (this, data, size) = match al_state_for_read(ctx, this, true)? {
+        AlRead::ViewSize(n) => return Ok(Some(Value::Int(i32::from(n == 0)))),
+        AlRead::State(t, d, s) => (t, d, s),
+    };
     if data.is_none() {
         if let Some(r) =
             try_delegate_real_collection(ctx, this, "java/util/Collection", "isEmpty", "()Z")
@@ -5032,8 +5352,10 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         }
         _ => {}
     }
-    let this = resync_values_view(ctx, this)?;
-    let (data, size) = al_state(ctx, this);
+    let (this, data, size) = match al_state_for_read(ctx, this, false)? {
+        AlRead::ViewSize(n) => return Ok(Some(Value::Int(n))),
+        AlRead::State(t, d, s) => (t, d, s),
+    };
     if index < 0 || index >= size {
         // HotSpot: IndexOutOfBoundsException, "Index N out of bounds for
         // length M". NOT the ArrayIndexOutOfBoundsException subclass -- that is
@@ -6200,16 +6522,31 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `ArrayList.subList` returns a `java.util.ArrayList$SubList` running real
     // bytecode, so handing back this stand-in under `--jdk-only` is exactly the
     // substitution §5 forbids. Refuse there instead, naming the class.
-    let view = try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS)?;
-    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(this)));
-    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(from as i32));
-    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(sub_size as i32));
-    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(parent_size));
+    // GC-SAFETY: `alloc_asl_view` allocates (and may run a `<clinit>`), and
+    // `this` is stored into the new view immediately afterwards — a from-space
+    // `this` here is the root list every later read of the view indexes into.
+    let this_pin = ctx.pin_native_root(this);
+    let view = match alloc_asl_view(ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let view_pin = ctx.pin_native_root(view);
+    let this = ctx.read_native_pin(this_pin, this);
+    let view = ctx.read_native_pin(view_pin, view);
+    let base = asl_base(ctx, view);
+    ctx.set_field(view, base + ASL_FIELD_PARENT, Value::Object(Some(this)));
+    ctx.set_field(view, base + ASL_FIELD_OFFSET, Value::Int(from as i32));
+    ctx.set_field(view, base + ASL_FIELD_SIZE, Value::Int(sub_size as i32));
+    ctx.set_field(view, base + ASL_FIELD_EXPECTED, Value::Int(parent_size));
     // Explicit, not left to whatever `alloc_object` zero-initialises a slot of
     // an undeclared shape to: W7-1's `lastRet` was exactly this hazard, an
     // int-zero read as a meaningful value. `this` is a real `ArrayList` here,
     // so there is no enclosing view to propagate to.
-    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(None));
+    ctx.set_field(view, base + ASL_FIELD_VIEW_PARENT, Value::Object(None));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(view))))
 }
 
@@ -6219,10 +6556,11 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// view" (it degrades to the pre-existing behaviour) rather than reading past
 /// the object.
 fn asl_view_parent(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    if ctx.object_num_fields(this) <= ASL_FIELD_VIEW_PARENT {
+    let base = asl_base(ctx, this);
+    if ctx.object_num_fields(this) <= base + ASL_FIELD_VIEW_PARENT {
         return None;
     }
-    match ctx.get_field(this, ASL_FIELD_VIEW_PARENT) {
+    match ctx.get_field(this, base + ASL_FIELD_VIEW_PARENT) {
         Value::Object(Some(p)) => Some(p),
         _ => None,
     }
@@ -6250,6 +6588,10 @@ fn asl_view_parent(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef
 /// `native_al_sub_list`, and note the `fromIndex > toIndex` case is an
 /// `IllegalArgumentException` rather than a bounds exception at all.
 fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "subList", "(II)Ljava/util/List;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6297,7 +6639,7 @@ fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // copies — a from-space `parent` recorded here would be what every later
     // read of the nested view indexes into.
     let this_pin = ctx.pin_native_root(this);
-    let view = match try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS) {
+    let view = match alloc_asl_view(ctx) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -6314,11 +6656,12 @@ fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let view = ctx.read_native_pin(view_pin, view);
-    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(parent)));
-    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(offset + from_i32));
-    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(to_i32 - from_i32));
-    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(expected));
-    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(Some(this)));
+    let base = asl_base(ctx, view);
+    ctx.set_field(view, base + ASL_FIELD_PARENT, Value::Object(Some(parent)));
+    ctx.set_field(view, base + ASL_FIELD_OFFSET, Value::Int(offset + from_i32));
+    ctx.set_field(view, base + ASL_FIELD_SIZE, Value::Int(to_i32 - from_i32));
+    ctx.set_field(view, base + ASL_FIELD_EXPECTED, Value::Int(expected));
+    ctx.set_field(view, base + ASL_FIELD_VIEW_PARENT, Value::Object(Some(this)));
     let view = ctx.read_native_pin(view_pin, view);
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(view))))
@@ -6366,21 +6709,158 @@ const ASL_FIELD_EXPECTED: usize = 3;
 const ASL_FIELD_VIEW_PARENT: usize = 4;
 const ASL_NUM_FIELDS: usize = 5;
 
+/// The class HotSpot's `arrayList.subList(0, 2).getClass()` answers, and the
+/// one row of `probes/ViewClassProbe` this VM still does not match.
+///
+/// **Not used as a carrier, and the reason is measured** — see
+/// `fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`,
+/// "the one row that stayed open". The undeclared-slot rule does apply here:
+/// the JDK class declares `root`/`parent`/`offset`/`size` on top of
+/// `AbstractList.modCount`, this VM's five fields go PAST them ([`asl_base`]),
+/// and `--real-jdk` measures byte-clean that way. What is NOT solved is
+/// receiver OWNERSHIP. Registering the `native_asl_*` family on the real class
+/// means it also fires for a `SubList` that **java.base's own bytecode** built —
+/// which is precisely what `--jdk-only` produces, because there
+/// `ArrayList.subList` runs its own body. Such an object has the class's
+/// declared width and none of this VM's fields, so `asl_state` reads `modCount`
+/// as `parent` and answers "empty": `sublist.size` 0, `sublist.of-sublist`
+/// null, `Pattern.split` -> `null|null|null` — seven lines of
+/// `probes/JdkOnlyCollectionViewProbe`, on an arm where the `--real-jdk` arm of
+/// the same run was clean.
+///
+/// A retry needs a receiver test, not another carrier: `asl_base` must answer
+/// `None` when `object_num_fields < class_num_total_fields + ASL_NUM_FIELDS`,
+/// and every `native_asl_*` must then delegate through
+/// `invoke_virtual_bytecode_only` instead of answering zero. Mirroring this
+/// VM's state into the JDK's five fields was tried first and is not sufficient
+/// alone: it makes the JDK's bodies correct on OUR objects and does nothing
+/// about ours running on THEIRS.
+const ASL_REAL_CLASS: &str = "java/util/ArrayList$SubList";
+
+/// Where a sublist view's five native fields start: past the carrier's own
+/// declared fields (5 on the real JDK class, 0 on [`ASL_CLASS`]).
+///
+/// Derived from the object's width for the same reason [`key_itr_base`] is —
+/// both mint sites allocate exactly `declared + ASL_NUM_FIELDS`, and a view
+/// built by some other path with the older FOUR-field shape stays at 0, which
+/// is what keeps `asl_view_parent`'s width guard meaning what it meant.
+#[inline]
+fn asl_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this).saturating_sub(ASL_NUM_FIELDS)
+}
+
+/// [`asl_base`], answering `None` for a receiver this VM did not mint.
+///
+/// This is the receiver-ownership test the carrier needed. Wearing
+/// [`ASL_REAL_CLASS`] means the `native_asl_*` family is also handed every
+/// `SubList` **java.base's own bytecode** built — `ArrayList.subList` runs its
+/// own body under `--jdk-only`, and can under `--real-jdk` too. Such an object
+/// is exactly `class_num_total_fields` wide and carries none of this VM's five
+/// fields, so [`asl_base`] would land inside the JDK's own
+/// `root`/`parent`/`offset`/`size`, read `modCount` as `parent`, and every
+/// native would answer empty. That is a SILENT wrong answer on the most
+/// universally reached list path in the VM, which is why the previous attempt
+/// at this carrier was withdrawn rather than shipped
+/// (`fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`,
+/// "the one row that stayed open").
+///
+/// Every mint site allocates `class_num_total_fields + ASL_NUM_FIELDS` — on
+/// BOTH carriers, which is what makes one comparison serve both and needs no
+/// assumption about how wide `class_manager` fabricates [`ASL_CLASS`]. A
+/// receiver narrower than that is not ours; [`asl_delegate_foreign`] then runs
+/// the receiver's own bytecode.
+#[inline]
+fn asl_base_checked(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let width = ctx.object_num_fields(this);
+    let declared = ctx.class_num_total_fields(ctx.class_id_of_object(this));
+    if width < declared + ASL_NUM_FIELDS {
+        return None;
+    }
+    Some(width - ASL_NUM_FIELDS)
+}
+
+/// Run the receiver's OWN bytecode when it is a `SubList` this VM did not mint.
+///
+/// Returns `None` for a receiver that is ours, so the caller proceeds with the
+/// native body. `invoke_virtual_bytecode_only` is what keeps this from
+/// recursing straight back into the same registration.
+fn asl_delegate_foreign(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if asl_base_checked(&*ctx, this).is_some() {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
+}
+
+/// Allocate a sublist view under [`ASL_REAL_CLASS`], wide enough for its own
+/// declared fields plus this VM's five, falling back to [`ASL_CLASS`].
+///
+/// **The §5 gate runs FIRST, and it is asked about the INTERNAL name.** That is
+/// not bookkeeping. A sublist view is a compatibility stand-in whatever class it
+/// wears — its state is at [`asl_base`], not in `root`/`parent`/`offset`/`size`
+/// — so `--jdk-only` must go on refusing it, and refusing is what makes strict
+/// mode fall back to `java.base`'s own `ArrayList.subList`, which builds a REAL
+/// SubList that works. Skipping the gate because the object now has a real class
+/// name was measured, on `probes/JdkOnlyCollectionViewProbe`:
+///
+/// ```text
+/// sublist.mid    HotSpot [b|c]/2   --jdk-only []/0
+/// Pattern.split  HotSpot 1|2|3     --jdk-only null|null|null
+/// ```
+///
+/// — the JDK's own `SubList` bytecode reading fields this VM never fills. Seven
+/// probe lines, from one skipped refusal.
+///
+/// `try_ensure_synthetic_class` rather than a throwaway `try_alloc_synthetic`:
+/// same policy question, same answer, no object allocated to ask it.
+fn alloc_asl_view(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    // Policy FIRST, and asked about the INTERNAL name — see this function's
+    // doc comment. Wearing a real class must not smuggle a compatibility
+    // stand-in past a mode that refuses them.
+    let fallback = match ctx.try_ensure_synthetic_class(ASL_CLASS, ASL_NUM_FIELDS) {
+        Ok(id) => id,
+        Err(err) => return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+    };
+    // `ensure_class_initialized` can report success having FABRICATED a
+    // stand-in, so check the resolved name rather than trusting `Ok` — the same
+    // check `alloc_key_set_view_object` makes for the same reason.
+    if let Ok(cid) = ctx.ensure_class_initialized(ASL_REAL_CLASS) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(ASL_REAL_CLASS) {
+            let n = ctx.class_num_total_fields(cid) + ASL_NUM_FIELDS;
+            return Ok(ctx.alloc_object(cid, n));
+        }
+    }
+    // Same width rule on the fallback carrier, so `asl_base_checked` has one
+    // comparison to make and not two.
+    let n = ctx.class_num_total_fields(fallback) + ASL_NUM_FIELDS;
+    Ok(ctx.alloc_object(fallback, n))
+}
+
+
 /// Read `(parent, offset, size, expected_parent_size)` from a sublist view.
 fn asl_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32, i32)> {
-    let parent = match ctx.get_field(this, ASL_FIELD_PARENT) {
+    let base = asl_base(ctx, this);
+    let parent = match ctx.get_field(this, base + ASL_FIELD_PARENT) {
         Value::Object(Some(p)) => p,
         _ => return None,
     };
-    let offset = match ctx.get_field(this, ASL_FIELD_OFFSET) {
+    let offset = match ctx.get_field(this, base + ASL_FIELD_OFFSET) {
         Value::Int(o) => o,
         _ => 0,
     };
-    let size = match ctx.get_field(this, ASL_FIELD_SIZE) {
+    let size = match ctx.get_field(this, base + ASL_FIELD_SIZE) {
         Value::Int(s) => s,
         _ => 0,
     };
-    let expected = match ctx.get_field(this, ASL_FIELD_EXPECTED) {
+    let expected = match ctx.get_field(this, base + ASL_FIELD_EXPECTED) {
         Value::Int(e) => e,
         _ => 0,
     };
@@ -6403,9 +6883,27 @@ fn asl_check_comod(
 }
 
 fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
+    // Both carriers. `ASL_REAL_CLASS` is safe to register now that
+    // `asl_base_checked` can tell a view this VM minted from one java.base's
+    // own bytecode built; without that test this registration is a silent
+    // empty list on every foreign `SubList`, which is why it was withdrawn
+    // once already.
+    register_al_sublist_natives_on(r, ASL_CLASS);
+    register_al_sublist_natives_on(r, ASL_REAL_CLASS);
+    register_al_sublist_iterator_natives(r);
+}
+
+/// The whole `subList` surface, on one carrier class.
+///
+/// Split out from `register_al_sublist_natives` for a second carrier that was
+/// then withdrawn: registering this family on the real
+/// `java/util/ArrayList$SubList` also hands it every `SubList` java.base's own
+/// bytecode builds, which have none of this VM's fields. [`ASL_REAL_CLASS`]
+/// carries the measurement. The shape is left as a function because the retry
+/// described there needs exactly it, plus a receiver test.
+fn register_al_sublist_natives_on(r: &mut NativeMethodRegistry, c: &str) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let c = ASL_CLASS;
     r.register(c, "size", "()I", native_asl_size);
     r.register(c, "isEmpty", "()Z", native_asl_is_empty);
     r.register(c, "get", "(I)Ljava/lang/Object;", native_asl_get);
@@ -6502,17 +7000,21 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;)Z",
         |ctx, args| asl_delegate_snapshot(ctx, args, "containsAll", "(Ljava/util/Collection;)Z"),
     );
+    // NOT `asl_delegate_snapshot`: it returned a real `ArrayList$ListItr` over
+    // a snapshot `ArrayList`, whose `set`/`remove`/`add` mutated the COPY and
+    // reported success — three silently-wrong rows of
+    // `probes/SubListBehaviourProbe`. See the `SLI_CLASS` block.
     r.register(
         c,
         "listIterator",
         "()Ljava/util/ListIterator;",
-        |ctx, args| asl_delegate_snapshot(ctx, args, "listIterator", "()Ljava/util/ListIterator;"),
+        native_asl_list_iterator,
     );
     r.register(
         c,
         "listIterator",
         "(I)Ljava/util/ListIterator;",
-        |ctx, args| asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;"),
+        native_asl_list_iterator_idx,
     );
     // NOT `asl_delegate_snapshot`: a view of a snapshot reads correctly and
     // writes nowhere. See `native_asl_sub_list`.
@@ -6565,10 +7067,708 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "sort", "(Ljava/util/Comparator;)V", |ctx, args| {
         asl_delegate_mutating(ctx, args, "sort", "(Ljava/util/Comparator;)V")
     });
+    // The rest of the `List` surface, on the REAL carrier only.
+    //
+    // WHY IT IS NEEDED. On the INTERNAL carrier an unregistered method fell to
+    // an interface-level native and raised `AbstractMethodError:
+    // java/util/List.removeAll has no Code attribute` — already a defect, and
+    // `probes/SubListBehaviourProbe` is what found it. On [`ASL_REAL_CLASS`]
+    // the same gap is worse: the receiver now HAS its own bytecode, so
+    // `removeAll`/`retainAll`/`replaceAll` reach the JDK's real `SubList`
+    // bodies and NPE on the null `root` this VM never fills. A carrier is only
+    // as complete as the surface registered on it — the same lesson
+    // `register_set_view_carrier_natives` records for the Set views.
+    //
+    // WHY ONLY THERE. The ambient `Bridge` set above is re-tagged
+    // `SyntheticStub` for a `cratonvm/internal/*` receiver, so registering
+    // these on both carriers adds twelve synthetic stubs and trips
+    // `stub_ratchet` — for rows nothing can reach. [`alloc_asl_view`] mints
+    // under [`ASL_REAL_CLASS`] whenever a class of that name resolves, and
+    // `class_manager` carries `java/util/ArrayList$SubList` in its preload list
+    // with a declared width, so synthetic-JDK mode resolves it too. The
+    // internal carrier is a fallback for "no class of that name anywhere" and
+    // keeps the surface it has always had.
+    if c == ASL_REAL_CLASS {
+        r.register(c, "removeAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "removeAll", "(Ljava/util/Collection;)Z")
+        });
+        r.register(c, "retainAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "retainAll", "(Ljava/util/Collection;)Z")
+        });
+        r.register(
+            c,
+            "replaceAll",
+            "(Ljava/util/function/UnaryOperator;)V",
+            |ctx, args| {
+                asl_delegate_mutating(
+                    ctx,
+                    args,
+                    "replaceAll",
+                    "(Ljava/util/function/UnaryOperator;)V",
+                )
+            },
+        );
+        r.register(c, "addAll", "(ILjava/util/Collection;)Z", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "addAll", "(ILjava/util/Collection;)Z")
+        });
+        r.register(
+            c,
+            "parallelStream",
+            "()Ljava/util/stream/Stream;",
+            |ctx, args| {
+                asl_delegate_snapshot(ctx, args, "parallelStream", "()Ljava/util/stream/Stream;")
+            },
+        );
+        // `SequencedCollection` (JDK 21). `List` declares all seven, so a receiver
+        // with real bytecode answers them from `root` — null here.
+        r.register(c, "getFirst", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_snapshot(ctx, args, "getFirst", "()Ljava/lang/Object;")
+        });
+        r.register(c, "getLast", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_snapshot(ctx, args, "getLast", "()Ljava/lang/Object;")
+        });
+        r.register(c, "addFirst", "(Ljava/lang/Object;)V", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "addFirst", "(Ljava/lang/Object;)V")
+        });
+        r.register(c, "addLast", "(Ljava/lang/Object;)V", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "addLast", "(Ljava/lang/Object;)V")
+        });
+        r.register(c, "removeFirst", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "removeFirst", "()Ljava/lang/Object;")
+        });
+        r.register(c, "removeLast", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "removeLast", "()Ljava/lang/Object;")
+        });
+        // `reversed()` is a live VIEW in the JDK, and a view of a snapshot writes
+        // nowhere — the same reason `subList` is NOT snapshot-delegated (see
+        // `native_asl_sub_list`). Registered anyway because the alternative is the
+        // JDK body on a null `root`: reads are correct, writes through the reversed
+        // view are lost, and that is strictly better than an NPE. Covered by
+        // `probes/SubListBehaviourProbe`'s `read.reversed` row.
+        r.register(c, "reversed", "()Ljava/util/List;", |ctx, args| {
+            asl_delegate_snapshot(ctx, args, "reversed", "()Ljava/util/List;")
+        });
+    }
     r.set_category(__prev_cat);
 }
 
+
+// ---------------------------------------------------------------------------
+// The sublist view's LIVE ListIterator
+// ---------------------------------------------------------------------------
+//
+// WHAT WAS WRONG. `iterator()` snapshotted the slice into an `Object[]` and
+// handed back a real `java.util.Arrays$ArrayItr` over it; `listIterator()` went
+// through `asl_delegate_snapshot`, so it returned a real
+// `java.util.ArrayList$ListItr` over a snapshot `ArrayList`. Both were
+// iterators over a COPY, and `List.subList` is specified as a LIVE VIEW, so
+// seven rows of `probes/SubListBehaviourProbe` were wrong at once:
+//
+//   iter.remove / removeSecond / removeAllViaIterator
+//       `Arrays$ArrayItr` declares no `remove()` at all, so the call reached
+//       `Iterator.remove()`'s throwing default: UnsupportedOperationException
+//       where HotSpot mutates.
+//   iter.removeBeforeNext
+//       the same UOE where HotSpot raises IllegalStateException.
+//   iter.listIterator.set / .remove / .add
+//       `ArrayList$ListItr` HAS working mutators — and they mutated the copy.
+//       Those three reported SUCCESS and changed nothing, which is the
+//       dangerous half: a silent wrong answer on a live-view contract, where
+//       the `Iterator.remove` rows at least threw.
+//
+// WHY A CARRIER AND NOT A ROUTE. A write-through `remove()` can be bolted onto
+// the snapshot iterator — `snapshot_itr_backing_table` already does exactly
+// that for `HashSet`/`TreeSet`/`LinkedList`/`ArrayDeque` — but `set` and `add`
+// cannot: both need the POSITION the iterator is at, in the VIEW's
+// coordinates, and a snapshot iterator's cursor drifts from the view's indices
+// the moment anything is removed. So this is a real iterator over
+// `(view, cursor, lastRet)`, which is what the JDK's own
+// `ArrayList$SubList$1` is, and every method below is that class's body
+// rewritten against this VM's view state.
+//
+// WHY THE JDK'S OWN CLASS IS THE CARRIER. `SubList.iterator()` on HotSpot IS
+// `listIterator()`, so one live iterator serves both entry points and
+// `subList(1,4).iterator().getClass()` stops answering
+// `java.util.Arrays$ArrayItr`. The cost is the receiver-ownership trap the
+// `ASL_REAL_CLASS` carrier hit one level up: wearing a real class means these
+// natives are also handed every `ArrayList$SubList$1` **java.base's own
+// bytecode** built, which is what `--jdk-only` produces (there
+// `ArrayList.subList` is refused, java.base runs its own body, and its
+// iterator is a real one with real state). `sli_base_checked` is the same
+// width test `asl_base_checked` is, for the same reason, and
+// `sli_delegate_foreign` runs the receiver's own bytecode when the answer is
+// "not ours". `probes/SubListBehaviourProbe` on BOTH arms is what proves it.
+//
+// A build with no `java.util.ArrayList$SubList$1` to resolve keeps the
+// snapshot iterators it has always had — `alloc_sli_view` answers `None` and
+// both entry points fall back. That is deliberate and not a second carrier:
+// registering this surface on a `cratonvm/internal/*` name would add ten
+// synthetic stubs and trip `stub_ratchet`, for rows only a synthetic-JDK build
+// could reach, which is the same trade `register_al_sublist_natives` records
+// for the twelve `List` methods it puts on the real carrier only.
+
+/// The JDK's own anonymous `ListIterator` inside `ArrayList$SubList`, and the
+/// class `subList(a, b).iterator().getClass()` answers on HotSpot.
+const SLI_CLASS: &str = "java/util/ArrayList$SubList$1";
+
+/// The sublist view this iterator walks.
+const SLI_FIELD_VIEW: usize = 0;
+/// `nextIndex()`, in the VIEW's coordinates.
+const SLI_FIELD_CURSOR: usize = 1;
+/// The index `next()`/`previous()` last returned, or `-1` — the JDK's `lastRet`,
+/// and the flag `remove()`/`set()` raise `IllegalStateException` on.
+const SLI_FIELD_LASTRET: usize = 2;
+const SLI_NUM_FIELDS: usize = 3;
+
+/// Where this iterator's three native fields start: past the carrier's own
+/// declared fields. Exactly [`asl_base`]'s rule, one level down.
+#[inline]
+fn sli_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this).saturating_sub(SLI_NUM_FIELDS)
+}
+
+/// [`sli_base`], answering `None` for an iterator this VM did not mint.
+///
+/// The receiver-ownership test. A real `ArrayList$SubList$1` that java.base
+/// built is exactly `class_num_total_fields` wide (`cursor`, `lastRet`,
+/// `expectedModCount`, `val$index`, `this$0`) and carries none of this VM's
+/// three; without this, every native below would read `expectedModCount` as
+/// the view and answer for an object it knows nothing about — the silent
+/// wrong answer that withdrew the first attempt at the `ArrayList$SubList`
+/// carrier.
+#[inline]
+fn sli_base_checked(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let width = ctx.object_num_fields(this);
+    let declared = ctx.class_num_total_fields(ctx.class_id_of_object(this));
+    if width < declared + SLI_NUM_FIELDS {
+        return None;
+    }
+    Some(width - SLI_NUM_FIELDS)
+}
+
+/// Run the receiver's OWN bytecode when it is a `SubList` iterator this VM did
+/// not mint. `None` means the receiver is ours and the caller proceeds.
+fn sli_delegate_foreign(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if sli_base_checked(&*ctx, this).is_some() {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
+}
+
+/// Whether `this` is a live sublist iterator this VM minted.
+///
+/// Used by the interface-level `hasNext`/`next` natives to route deliberately
+/// rather than by accident: their generic fallback would reach these bodies
+/// anyway, through a by-name re-dispatch guarded against shadow recursion, and
+/// an explicit arm is cheaper to read and impossible to lose to a change in
+/// that fallback. Costs nothing on the fast path — it is only consulted after
+/// the "slot 0 holds an `Object[]`" probe has already missed.
+fn is_live_sublist_itr(ctx: &dyn NativeContext, this: ObjectRef, class_name: &str) -> bool {
+    class_name == SLI_CLASS && sli_base_checked(ctx, this).is_some()
+}
+
+/// Allocate a live sublist iterator over `view`, positioned at `index`.
+///
+/// `None` when this image has no real `java.util.ArrayList$SubList$1` — the
+/// caller then keeps the snapshot iterator it has always returned. The resolved
+/// NAME is checked, not just `Ok`, for the same reason `alloc_asl_view` checks
+/// it: `ensure_class_initialized` can report success having fabricated a
+/// stand-in, and a fabricated carrier is exactly what must not be minted here.
+fn alloc_sli_view(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    index: i32,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(SLI_CLASS).ok()?;
+    if ctx.class_name_arc_of_id(cid).as_deref() != Some(SLI_CLASS) {
+        return None;
+    }
+    let n = ctx.class_num_total_fields(cid) + SLI_NUM_FIELDS;
+    // GC-SAFETY: `alloc_object` collects, and `view` is a bare Rust local the
+    // collector cannot see. Root it across the allocation and read both halves
+    // back through their pins before the stores — the contract
+    // `alloc_real_snapshot_iterator_of` documents, and what `gc_native_pins`
+    // covers.
+    let view_pin = ctx.pin_native_root(view);
+    let itr = ctx.alloc_object(cid, n);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let view = ctx.read_native_pin(view_pin, view);
+    let base = n - SLI_NUM_FIELDS;
+    ctx.set_field(itr, base + SLI_FIELD_VIEW, Value::Object(Some(view)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr, base + SLI_FIELD_CURSOR, Value::Int(index));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    // Explicit, not left to whatever `alloc_object` zero-initialises an
+    // undeclared slot to: `lastRet` MUST start at -1, and W7-1's `lastRet` was
+    // exactly this hazard — an int-zero read as a meaningful value, which here
+    // would make `remove()` before any `next()` delete element 0 instead of
+    // raising `IllegalStateException`.
+    ctx.set_field(itr, base + SLI_FIELD_LASTRET, Value::Int(-1));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(view_pin);
+    Some(itr)
+}
+
+/// Read `(view, cursor, lastRet)`.
+fn sli_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32)> {
+    let base = sli_base_checked(ctx, this)?;
+    let view = match ctx.get_field(this, base + SLI_FIELD_VIEW) {
+        Value::Object(Some(v)) => v,
+        _ => return None,
+    };
+    let cursor = match ctx.get_field(this, base + SLI_FIELD_CURSOR) {
+        Value::Int(c) => c,
+        _ => 0,
+    };
+    let last_ret = match ctx.get_field(this, base + SLI_FIELD_LASTRET) {
+        Value::Int(l) => l,
+        _ => -1,
+    };
+    Some((view, cursor, last_ret))
+}
+
+fn sli_set_cursor(ctx: &mut dyn NativeContext, this: ObjectRef, cursor: i32, last_ret: i32) {
+    let base = sli_base(ctx, this);
+    ctx.set_field(this, base + SLI_FIELD_CURSOR, Value::Int(cursor));
+    ctx.set_field(this, base + SLI_FIELD_LASTRET, Value::Int(last_ret));
+}
+
+/// The view's current `size()`, which also runs the comodification check —
+/// so a parent mutated behind the view's back fails here exactly as it does
+/// through any other accessor.
+fn sli_view_size(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    match native_asl_size(ctx, &[Value::Object(Some(view))])? {
+        Some(Value::Int(n)) => Ok(n),
+        _ => Ok(0),
+    }
+}
+
+/// `new IllegalStateException()` — with NO message, which is what
+/// `ArrayList$SubList$1.remove()`/`set()` throw.
+///
+/// The message is load-bearing here in the negative: `RuntimeError::IllegalStateException`
+/// always carries one (`Some(message.as_str())`), so routing through it prints
+/// `java.lang.IllegalStateException: remove` where HotSpot prints
+/// `java.lang.IllegalStateException` — `Throwable.toString()` omits the suffix
+/// only for a NULL message, and `iter.removeBeforeNext` measures exactly that
+/// line. `Iterator.remove()`'s throwing DEFAULT does carry `"remove"`, which is
+/// why the snapshot iterator's version keeps it; this is the other exception,
+/// from the other class, and it is bare.
+/// `new NoSuchElementException()` — with NO message, which is what
+/// `LinkedList$ListItr.next()`/`previous()` throw.
+///
+/// `RuntimeError::NoSuchElementException` always supplies a message and
+/// `Throwable.toString()` prints the suffix whenever there is one, so a
+/// "helpful" `"LinkedList$ListItr.next"` is a visible difference from HotSpot
+/// rather than a bonus. Exactly the trap [`sli_illegal_state`] exists for, on
+/// the other exception — this is the third time it has been paid in this file,
+/// which is why it is now a named helper instead of an inline literal.
+///
+/// NOT for the interface-level snapshot iterators: `ArrayList$Itr.next()`'s
+/// JDK body also throws bare, but several natives here deliberately carry a
+/// message that a caller matches on. Change those only with a probe row.
+fn bare_no_such_element(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized("java/util/NoSuchElementException", "()V", &[])
+    {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::NoSuchElementException {
+        message: String::new(),
+    }
+    .into()
+}
+
+fn sli_illegal_state(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized("java/lang/IllegalStateException", "()V", &[])
+    {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    // An image with no `java.lang.IllegalStateException` to build cannot
+    // happen, but a wrong message beats no exception.
+    cratonvm_types::error::RuntimeError::IllegalStateException {
+        message: "remove".to_string(),
+    }
+    .into()
+}
+
+fn native_sli_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "hasNext", "()Z") {
+        return r;
+    }
+    let Some((view, cursor, _)) = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+    else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let size = sli_view_size(ctx, view)?;
+    Ok(Some(Value::Int(i32::from(cursor != size))))
+}
+
+fn native_sli_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "next", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let size = sli_view_size(ctx, view)?;
+    if cursor >= size {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
+    }
+    let v = native_asl_get(ctx, &[Value::Object(Some(view)), Value::Int(cursor)])?
+        .unwrap_or(Value::Object(None));
+    sli_set_cursor(ctx, this, cursor + 1, cursor);
+    Ok(Some(v))
+}
+
+fn native_sli_has_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "hasPrevious", "()Z") {
+        return r;
+    }
+    let Some((_, cursor, _)) = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+    else {
+        return Ok(Some(Value::Int(0)));
+    };
+    Ok(Some(Value::Int(i32::from(cursor != 0))))
+}
+
+fn native_sli_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "previous", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    if cursor <= 0 {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
+    }
+    let i = cursor - 1;
+    let v = native_asl_get(ctx, &[Value::Object(Some(view)), Value::Int(i)])?
+        .unwrap_or(Value::Object(None));
+    sli_set_cursor(ctx, this, i, i);
+    Ok(Some(v))
+}
+
+fn native_sli_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "nextIndex", "()I") {
+        return r;
+    }
+    let cursor = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+        .map(|(_, c, _)| c)
+        .unwrap_or(0);
+    Ok(Some(Value::Int(cursor)))
+}
+
+fn native_sli_previous_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "previousIndex", "()I") {
+        return r;
+    }
+    let cursor = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+        .map(|(_, c, _)| c)
+        .unwrap_or(0);
+    Ok(Some(Value::Int(cursor - 1)))
+}
+
+/// `remove()` — delete the element `next()`/`previous()` last returned, THROUGH
+/// the view, so the parent list sees it.
+///
+/// Removal is BY INDEX, not by element: a list is positional and may hold
+/// duplicates, and `lastRet` already says which slot. `asl_delegate_mutating`
+/// is the view's own `remove(int)`, so the parent's backing array is rebuilt
+/// and every enclosing view's `size`/`expected` is resynced — which is what
+/// keeps the very next read of the view from raising
+/// `ConcurrentModificationException`.
+fn native_sli_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "remove", "()V") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((view, _cursor, last_ret)) = sli_state(&*ctx, this) else {
+        return Ok(None);
+    };
+    if last_ret < 0 {
+        return Err(sli_illegal_state(ctx));
+    }
+    // GC-SAFETY: the delegate allocates (a snapshot list, a replacement backing
+    // array) and can dispatch Java, so the iterator can move under us. Root it
+    // and read it back before the bookkeeping write.
+    let this_pin = ctx.pin_native_root(this);
+    let r = asl_delegate_mutating(
+        ctx,
+        &[Value::Object(Some(view)), Value::Int(last_ret)],
+        "remove",
+        "(I)Ljava/lang/Object;",
+    );
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    r?;
+    // The JDK's `cursor = lastRet; lastRet = -1`: the elements after the hole
+    // shift down by one, so the next `next()` must re-read the slot just
+    // vacated. `iter.removeAllViaIterator` is the row that catches getting
+    // this wrong — it removes index 0 three times in a row.
+    sli_set_cursor(ctx, this, last_ret, -1);
+    Ok(None)
+}
+
+/// `set(E)` — overwrite the element last returned, through the view.
+fn native_sli_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "set", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((view, _cursor, last_ret)) = sli_state(&*ctx, this) else {
+        return Ok(None);
+    };
+    if last_ret < 0 {
+        return Err(sli_illegal_state(ctx));
+    }
+    let value = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_asl_set(
+        ctx,
+        &[Value::Object(Some(view)), Value::Int(last_ret), value],
+    )?;
+    // `set` does not disturb the cursor and does not clear `lastRet` — the JDK
+    // allows `set` twice in a row, and only `remove`/`add` reset it.
+    Ok(None)
+}
+
+/// `add(E)` — insert at the cursor, through the view.
+fn native_sli_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "add", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+        return Ok(None);
+    };
+    let value = args.get(1).copied().unwrap_or(Value::Object(None));
+    let this_pin = ctx.pin_native_root(this);
+    let r = asl_delegate_mutating(
+        ctx,
+        &[Value::Object(Some(view)), Value::Int(cursor), value],
+        "add",
+        "(ILjava/lang/Object;)V",
+    );
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    r?;
+    // The JDK's `cursor++; lastRet = -1`: the new element goes BEFORE the one
+    // `next()` would return, so the cursor moves past it, and `add` invalidates
+    // `remove`/`set` exactly as it does on `ArrayList$ListItr`.
+    sli_set_cursor(ctx, this, cursor + 1, -1);
+    Ok(None)
+}
+
+/// `forEachRemaining(Consumer)`.
+///
+/// Registered because the carrier DECLARES it: leaving it to the real body
+/// would run JDK bytecode over `this$0`/`expectedModCount` this VM never fills
+/// — an NPE on a receiver every other method serves correctly, which is the
+/// "a carrier is only as complete as the surface registered on it" rule
+/// `register_al_sublist_natives` records.
+fn native_sli_for_each_remaining(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(
+        ctx,
+        args,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+    ) {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(None),
+    };
+    // Bounded by the size read at entry, re-read each round: the consumer can
+    // legally mutate nothing here, but a shrinking view must end the loop
+    // rather than index past it.
+    loop {
+        let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+            return Ok(None);
+        };
+        let size = sli_view_size(ctx, view)?;
+        if cursor >= size {
+            return Ok(None);
+        }
+        let v = native_asl_get(ctx, &[Value::Object(Some(view)), Value::Int(cursor)])?
+            .unwrap_or(Value::Object(None));
+        sli_set_cursor(ctx, this, cursor + 1, cursor);
+        let this_pin = ctx.pin_native_root(this);
+        let r = ctx.invoke_virtual(
+            consumer,
+            "accept",
+            "(Ljava/lang/Object;)V",
+            &[v],
+        );
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        r?;
+        let _ = this;
+    }
+}
+
+/// The ten `ListIterator` methods `ArrayList$SubList$1` declares.
+///
+/// On the REAL carrier only, and gated by `sli_delegate_foreign` on every one:
+/// the class also names every iterator java.base's own `SubList` bytecode
+/// builds, and those must keep running their own bodies.
+fn register_al_sublist_iterator_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let c = SLI_CLASS;
+    r.register(c, "hasNext", "()Z", native_sli_has_next);
+    r.register(c, "next", "()Ljava/lang/Object;", native_sli_next);
+    r.register(c, "hasPrevious", "()Z", native_sli_has_previous);
+    r.register(c, "previous", "()Ljava/lang/Object;", native_sli_previous);
+    r.register(c, "nextIndex", "()I", native_sli_next_index);
+    r.register(c, "previousIndex", "()I", native_sli_previous_index);
+    r.register(c, "remove", "()V", native_sli_remove);
+    r.register(c, "set", "(Ljava/lang/Object;)V", native_sli_set);
+    r.register(c, "add", "(Ljava/lang/Object;)V", native_sli_add);
+    r.register(
+        c,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+        native_sli_for_each_remaining,
+    );
+    r.set_category(__prev_cat);
+}
+
+/// `listIterator()` / `listIterator(int)` / `iterator()` for a sublist view.
+///
+/// One body for all three, because on HotSpot they ARE one body:
+/// `ArrayList$SubList.iterator()` is `listIterator()`.
+fn asl_live_list_iterator(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    index: i32,
+) -> Option<MethodCallResult> {
+    // Fail the same way every other view accessor does if the parent moved
+    // under us, BEFORE minting an iterator over a stale slice.
+    let size = match asl_state(&*ctx, view) {
+        Some((parent, _, size, expected)) => match asl_check_comod(&*ctx, parent, expected) {
+            Ok(()) => size,
+            Err(e) => return Some(Err(e)),
+        },
+        None => return None,
+    };
+    if index < 0 || index > size {
+        return Some(Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index: {index}"
+        ))
+        .into()));
+    }
+    alloc_sli_view(ctx, view, index).map(|itr| Ok(Some(Value::Object(Some(itr)))))
+}
+
+fn native_asl_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "listIterator", "()Ljava/util/ListIterator;") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if let Some(r) = asl_live_list_iterator(ctx, this, 0) {
+        return r;
+    }
+    // No real `ArrayList$SubList$1` in this image — keep the snapshot
+    // ListIterator this method has always returned.
+    asl_delegate_snapshot(ctx, args, "listIterator", "()Ljava/util/ListIterator;")
+}
+
+fn native_asl_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;")
+    {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    if let Some(r) = asl_live_list_iterator(ctx, this, index) {
+        return r;
+    }
+    asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;")
+}
+
 fn native_asl_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "size", "()I") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -6583,6 +7783,10 @@ fn native_asl_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_asl_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "isEmpty", "()Z") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(1))),
@@ -6597,6 +7801,10 @@ fn native_asl_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_asl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "get", "(I)Ljava/lang/Object;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6628,6 +7836,12 @@ fn native_asl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_asl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) =
+        asl_delegate_foreign(ctx, args, "set", "(ILjava/lang/Object;)Ljava/lang/Object;")
+    {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6686,6 +7900,10 @@ fn asl_snapshot(
 }
 
 fn native_asl_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "toArray", "()[Ljava/lang/Object;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6695,6 +7913,10 @@ fn native_asl_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "toString", "()Ljava/lang/String;") {
+        return r;
+    }
+
     use std::fmt::Write as _;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -6720,10 +7942,23 @@ fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_asl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "iterator", "()Ljava/util/Iterator;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `SubList.iterator()` IS `listIterator()` on HotSpot, and it has to be
+    // here too: a snapshot iterator cannot write through, which is what made
+    // `iter.remove` answer `UnsupportedOperationException` where HotSpot
+    // mutates the parent. See the `SLI_CLASS` block above.
+    if let Some(r) = asl_live_list_iterator(ctx, this, 0) {
+        return r;
+    }
+    // No real `ArrayList$SubList$1` in this image — keep the snapshot iterator
+    // this method has always returned.
     let buf = asl_snapshot(ctx, this)?;
     let len = ctx.array_length(buf);
     // `make_iterator_from_array` already returns a `MethodCallResult`
@@ -6741,6 +7976,9 @@ fn asl_delegate_snapshot(
     method: &str,
     descriptor: &str,
 ) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, method, descriptor) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6770,6 +8008,9 @@ fn asl_delegate_mutating(
     method: &str,
     descriptor: &str,
 ) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, method, descriptor) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6833,8 +8074,9 @@ fn asl_delegate_mutating(
     }
     al_set_data(ctx, parent, new_buf);
     al_set_size(ctx, parent, w as i32);
-    ctx.set_field(this, ASL_FIELD_SIZE, Value::Int(new_size));
-    ctx.set_field(this, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+    let this_base = asl_base(ctx, this);
+    ctx.set_field(this, this_base + ASL_FIELD_SIZE, Value::Int(new_size));
+    ctx.set_field(this, this_base + ASL_FIELD_EXPECTED, Value::Int(w as i32));
     // Ripple the element-count change up the enclosing views, the way the JDK's
     // `SubList.updateSizeAndModCount` walks its own `parent` chain. Without
     // this, `sub.subList(1,3).clear()` leaves `sub` holding the pre-mutation
@@ -6852,12 +8094,13 @@ fn asl_delegate_mutating(
     let mut cursor = asl_view_parent(ctx, this);
     for _ in 0..64 {
         let Some(v) = cursor else { break };
-        let vs = match ctx.get_field(v, ASL_FIELD_SIZE) {
+        let vb = asl_base(ctx, v);
+        let vs = match ctx.get_field(v, vb + ASL_FIELD_SIZE) {
             Value::Int(s) => s,
             _ => break,
         };
-        ctx.set_field(v, ASL_FIELD_SIZE, Value::Int((vs + delta).max(0)));
-        ctx.set_field(v, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+        ctx.set_field(v, vb + ASL_FIELD_SIZE, Value::Int((vs + delta).max(0)));
+        ctx.set_field(v, vb + ASL_FIELD_EXPECTED, Value::Int(w as i32));
         cursor = asl_view_parent(ctx, v);
     }
     ctx.unpin_native_roots(pin);
@@ -11116,8 +12359,18 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     // Build the live view through the shared helper so every key, including a
     // legal HashMap null key, is inserted through native_map_put.
+    //
+    // The wrapper verdict is taken BEFORE the build: `make_view_set_of`
+    // allocates, so `this` afterwards may be a pre-move address and asking it
+    // for its class then would be reading a corpse.
+    let sync = wants_synchronized_views(&*ctx, this);
     let keys = map_collect_keys(ctx, this);
     let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
+    let set = if sync {
+        wrap_synchronized_view(ctx, set, true)?
+    } else {
+        set
+    };
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -11138,10 +12391,13 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // list/buffer allocations move `this` and every snapshotted value before
     // the stores below (mirrors native_map_keys_as_array).
+    let carrier = values_carrier_for(&*ctx, this);
+    // Taken before anything allocates — see `native_map_key_set`.
+    let sync = wants_synchronized_views(&*ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let (_, val_handles) = pin_value_slice(ctx, &values);
     let __al_n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -11155,6 +12411,11 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(this_pin);
+    let list = if sync {
+        wrap_synchronized_view(ctx, list, false)?
+    } else {
+        list
+    };
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -11175,10 +12436,12 @@ pub fn make_live_values_list(
     source: ObjectRef,
     values: &[Value],
 ) -> Result<ObjectRef, MethodCallFailed> {
+    let carrier = values_carrier_for(&*ctx, source);
+    let sync = wants_synchronized_views(&*ctx, source);
     let source_pin = ctx.pin_native_root(source);
     let (_, val_handles) = pin_value_slice(ctx, values);
     let __al_n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -11192,6 +12455,9 @@ pub fn make_live_values_list(
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(source_pin);
+    if sync {
+        return wrap_synchronized_view(ctx, list, false);
+    }
     Ok(list)
 }
 
@@ -11203,16 +12469,19 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if is_tree_map_receiver(ctx, this) {
         return native_tm_entry_set(ctx, args);
     }
+    // Taken before anything allocates — see `native_map_key_set`.
+    let sync = wants_synchronized_views(&*ctx, this);
     // Both allocations below may run a moving young collection. Keep the
     // source and newly created view rooted, then collect entries only after
     // the view is fully wired; otherwise `set_field(set, ...)` can target the
     // pre-move Set and leave entrySet().iterator() observing a null backing.
     let this_pin = ctx.pin_native_root(this);
     let entry_count = map_collect_entries(ctx, this).len();
-    // Build a HashSet of Map.Entry objects, backed by a view backing that
-    // remembers the source map so removing an entry through the set (or its
-    // iterator) deletes the corresponding key from the source map.
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    // Build an entrySet carrier holding Map.Entry objects, backed by a view
+    // backing that remembers the source map so removing an entry through the
+    // set (or its iterator) deletes the corresponding key from the source map.
+    let carrier = set_view_carrier_for(&*ctx, this, VIEW_KIND_ENTRYSET);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entry_count.next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let this = ctx.read_native_pin(this_pin, this);
@@ -11220,7 +12489,7 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let backing_pin = ctx.pin_native_root(backing_map);
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_pin, backing_map);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
     let this = ctx.read_native_pin(this_pin, this);
     let entries = map_collect_entries(ctx, this);
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
@@ -11276,6 +12545,11 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.unpin_native_roots(backing_pin);
     ctx.unpin_native_roots(set_pin);
     ctx.unpin_native_roots(this_pin);
+    let set = if sync {
+        wrap_synchronized_view(ctx, set, true)?
+    } else {
+        set
+    };
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -11283,13 +12557,16 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// `(key, value)` pairs backed by `source`. Mirrors [`native_map_entry_set`]
 /// (3-field live `Map$Entry` elements, a view backing that remembers `source`
 /// so `remove`/`iterator().remove()` and `Entry.setValue` write through to
-/// `source` via its virtual `remove`/`put`), but tagged `VIEW_KIND_ENTRYSET_STATIC`
-/// so the view is materialised **once** and never resynced from `source`.
+/// `source` via its virtual `remove`/`put`), but tagged
+/// `VIEW_KIND_ENTRYSET_STATIC`, which decides HOW the view refreshes rather
+/// than whether it does.
 ///
-/// This is for sources whose entries cannot be read back without re-entering
-/// `entrySet()` — `java/util/Properties`, whose data lives in a Rust side-table.
-/// A standard (resyncing) entrySet view would walk `Properties.entrySet()` on
-/// every `iterator()` and recurse. Because the write-through is keyed on this
+/// This is for sources whose entries cannot be read back by walking their
+/// fields — `java/util/Properties`, whose data lives in a Rust side-table. A
+/// standard (field-walking) entrySet view would walk `Properties.entrySet()` on
+/// every `iterator()` and recurse, so a read of this kind instead calls the
+/// source's own `entrySet()` once and adopts the fresh view's backing
+/// ([`adopt_fresh_view_backing`]). Because the write-through is keyed on this
 /// specific view backing (not on the entries' source field), a later
 /// `new HashSet<>(props.entrySet())` copy is a plain set and its `remove` is
 /// correctly detached from the source.
@@ -11306,6 +12583,7 @@ pub fn make_static_entry_set(
     // entries; `(String) entry.getKey()` then observed a zeroed/reused block
     // identifying as bare `java.lang.Object`. Pin + re-read everything,
     // mirroring `resync_view_set`'s entry loop.
+    let sync = wants_synchronized_views(&*ctx, source);
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (elem_base, flat_pins) = pin_value_slice(ctx, &flat);
     let source_pin = ctx.pin_native_root(source);
@@ -11314,14 +12592,15 @@ pub fn make_static_entry_set(
     } else {
         elem_base
     };
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let carrier = set_view_carrier_for(&*ctx, source, VIEW_KIND_ENTRYSET_STATIC);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let source_now = ctx.read_native_pin(source_pin, source);
     let backing_map = alloc_view_backing(ctx, source_now, VIEW_KIND_ENTRYSET_STATIC, cap)?;
     let backing_pin = ctx.pin_native_root(backing_map);
     let set_now = ctx.read_native_pin(set_pin, set);
-    ctx.set_field(set_now, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set_now, backing_map);
     let sentinel = Value::Int(1);
     for i in 0..entries.len() {
         // 3-field Map$Entry: key@0, value@1, sourceMap@2 — so `Entry.setValue`
@@ -11364,7 +12643,35 @@ pub fn make_static_entry_set(
     }
     let set_now = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(first_pin);
+    if sync {
+        return wrap_synchronized_view(ctx, set_now, true);
+    }
     Ok(set_now)
+}
+
+/// The keySet twin of [`make_static_entry_set`]: a live `keySet()` view over
+/// `keys`, backed by `source`, tagged [`VIEW_KIND_KEYSET_STATIC`] so a read
+/// refreshes it through the source's own `keySet()` rather than by walking the
+/// source's fields.
+///
+/// `java/util/Properties` is the caller. Its keys are half in a Rust side-table
+/// and half in a `ConcurrentHashMap` field, so `map_collect_keys` — which every
+/// other keySet view resyncs through — sees only the second half. Handing back
+/// a plain snapshot instead was the older answer, and it cost both liveness on
+/// read and write-through: `remove`/`retainAll` had to be re-implemented as an
+/// override on the snapshot's class. A view carrier gets both from the shared
+/// machinery (`native_hs_remove` consults the view backing).
+pub fn make_static_key_set(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    keys: &[Value],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let sync = wants_synchronized_views(&*ctx, source);
+    let set = make_view_set_of(ctx, source, VIEW_KIND_KEYSET_STATIC, keys)?;
+    if sync {
+        return wrap_synchronized_view(ctx, set, true);
+    }
+    Ok(set)
 }
 
 fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11765,11 +13072,33 @@ const VIEW_KIND_ENTRYSET: i32 = 1;
 /// the backing directly; only structural `remove` (and `Entry.setValue`)
 /// propagate to the live source.
 const VIEW_KIND_ENTRYSET_STATIC: i32 = 2;
+/// `VIEW_KIND_KEYSET_STATIC`: the keySet twin of [`VIEW_KIND_ENTRYSET_STATIC`]
+/// — elements are bare keys and a `remove` writes through, but the source's
+/// keys cannot be collected by walking its fields, so a resync cannot go
+/// through `collect_keys_any`. Used for `java/util/Properties`, whose keys are
+/// half in a Rust side-table and half in a `ConcurrentHashMap` field and are
+/// only assembled correctly by `Properties.keySet()` itself.
+///
+/// Both STATIC kinds resync by [`adopt_fresh_view_backing`]: ask the source for
+/// a NEW view and take its backing. That costs one extra view construction per
+/// read and, unlike a field walk, cannot get the contents wrong.
+const VIEW_KIND_KEYSET_STATIC: i32 = 3;
 
 /// True for either entrySet view kind (elements are `Map.Entry` objects), as
 /// opposed to a keySet view (elements are bare keys).
 fn is_entryset_kind(kind: i32) -> bool {
     kind == VIEW_KIND_ENTRYSET || kind == VIEW_KIND_ENTRYSET_STATIC
+}
+
+/// The accessor a view of `kind` is rebuilt through — see
+/// [`adopt_fresh_view_backing`]. `None` for the resyncing kinds, which rebuild
+/// their contents from the source's fields instead.
+fn static_view_accessor(kind: i32) -> Option<(&'static str, &'static str)> {
+    match kind {
+        VIEW_KIND_ENTRYSET_STATIC => Some(("entrySet", "()Ljava/util/Set;")),
+        VIEW_KIND_KEYSET_STATIC => Some(("keySet", "()Ljava/util/Set;")),
+        _ => None,
+    }
 }
 
 /// Allocate the backing HashMap for a keySet/entrySet view: a synthetic
@@ -12193,14 +13522,15 @@ fn make_view_set_of(
     } else {
         elem_base
     };
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let carrier = set_view_carrier_for(&*ctx, source, kind);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let source = ctx.read_native_pin(source_pin, source);
     let backing = alloc_view_backing(ctx, source, kind, cap)?;
     let backing_pin = ctx.pin_native_root(backing);
     let set = ctx.read_native_pin(set_pin, set);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, set, backing);
     let sentinel = Value::Int(1);
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
@@ -12218,9 +13548,279 @@ fn make_view_set_of(
     Ok(set)
 }
 
-/// Build a `values()` view: an `ArrayList` snapshot whose element array stashes
-/// the source map in its last capacity slot so removals write through.
-fn make_view_list_of(ctx: &mut dyn NativeContext, source: ObjectRef, vals: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+/// The carrier classes a map view is minted under.
+///
+/// Every one of these was `java/util/ArrayList` until 2026-08-13, and that had
+/// two costs. The visible one: `hashMap.values().getClass()` answered
+/// `java.util.ArrayList`, `values() instanceof List` was `true` where HotSpot
+/// says `false`, and `values().equals(anArrayList)` was `true` where HotSpot's
+/// `AbstractCollection` gives identity equality. The expensive one: because a
+/// receiver whose class is exactly `java/util/ArrayList` MIGHT have been a
+/// view, no `native_al_*` operation could take an exact-class fast path — every
+/// `size()` on every ordinary list ran the whole view-discrimination chain
+/// first.
+///
+/// These are the REAL JDK class names, not `cratonvm/internal/*` ones, which is
+/// affordable here in a way it was not for `cratonvm/internal/ArrayListSubList`
+/// (see the "ArrayList subList backed view" section): a view carries its state
+/// in ArrayList's own resolved `elementData`/`size` slots, which sit at
+/// absolute indices 1 and 2 in the real-JDK layout, past the single `this$0`
+/// these classes declare. Writing there is the same undeclared-slot pattern
+/// `alloc_key_set_view_object` already uses on the real
+/// `ConcurrentHashMap$KeySetView`: an undeclared slot resolves to no field
+/// descriptor and is left untyped rather than mistyped. The JDK's own bodies
+/// for these classes must not run over that layout, which is why every name
+/// here also appears in `force_native_over_real_jdk_bytecode` and in
+/// `vm_exec`'s companion arm, exactly as `java/util/ArrayList` did.
+const MAP_VIEW_CARRIERS: &[&str] = &[
+    "java/util/HashMap$Values",
+    "java/util/LinkedHashMap$LinkedValues",
+    "java/util/TreeMap$Values",
+    "java/util/TreeMap$EntrySet",
+    "java/util/Hashtable$ValueCollection",
+    "java/util/concurrent/ConcurrentHashMap$ValuesView",
+];
+
+/// `true` iff `name` is one of the [`MAP_VIEW_CARRIERS`]. Cold path only: the
+/// per-call answer comes from the `AlLayout` memo, which consults this once per
+/// `ClassId`.
+#[inline]
+fn is_map_view_carrier(name: &str) -> bool {
+    MAP_VIEW_CARRIERS.contains(&name)
+}
+
+/// The carrier classes a map's SET-shaped view (`keySet()`, `entrySet()`) is
+/// minted under — the [`MAP_VIEW_CARRIERS`] argument, one family over.
+///
+/// Every one of these was `java/util/HashSet` until 2026-08-13, so
+/// `hashMap.keySet().getClass()` answered `java.util.HashSet` where HotSpot
+/// says `java.util.HashMap$KeySet` (`probes/ViewClassProbe`, six rows).
+///
+/// Same undeclared-slot argument as the values carriers, one slot lower: a view
+/// set keeps its state in HashSet's own `map` slot, which is absolute index 0
+/// because nothing in `HashSet`'s superclass chain declares a field — and these
+/// carriers declare exactly one field there themselves, the compiler-generated
+/// `this$0`, a REFERENCE of the enclosing map's type. Storing the view backing
+/// (a real `java/util/HashMap`, or `cratonvm/util/MapViewBacking` before
+/// `java/util/HashMap` resolves) in it is a reference into a reference slot, so
+/// no collector and no GC guard sees anything unusual; it is only the *declared
+/// type* that can be a supertype mismatch, and that would matter solely to JDK
+/// bytecode — which is exactly what the two force-native gates keep off these
+/// classes. `Hashtable$KeySet`/`$EntrySet` are the inner views the JDK wraps in
+/// a `Collections$Synchronized*`; see [`wrap_synchronized_view`].
+const SET_VIEW_CARRIERS: &[&str] = &[
+    "java/util/HashMap$KeySet",
+    "java/util/HashMap$EntrySet",
+    "java/util/LinkedHashMap$LinkedKeySet",
+    "java/util/LinkedHashMap$LinkedEntrySet",
+    "java/util/Hashtable$KeySet",
+    "java/util/Hashtable$EntrySet",
+    "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+];
+
+/// `true` iff `name` is one of the [`SET_VIEW_CARRIERS`]. Cold path only —
+/// `is_hashset_native_backed` reaches it just for a receiver that is not a
+/// `HashSet` subclass, which every ordinary set is.
+#[inline]
+fn is_set_view_carrier(name: &str) -> bool {
+    SET_VIEW_CARRIERS.contains(&name)
+}
+
+/// The class a `keySet()`/`entrySet()` view over `source` should be minted
+/// under, matching what the JDK's own accessor returns for that map family.
+///
+/// `Hashtable`/`Properties` name the INNER view here; the JDK's outer answer is
+/// a `Collections$Synchronized{Set,Collection}` around it, applied separately by
+/// [`wrap_synchronized_view`] so the wrapper's own bytecode does the delegating.
+/// `TreeMap` is absent because its keySet is a `TreeSet`-shaped view with its
+/// own carrier (`native_tm_key_set`) and its entrySet an ArrayList-shaped one
+/// (`MAP_VIEW_CARRIERS`); `ConcurrentHashMap`'s keySet is
+/// `alloc_key_set_view_object`'s real `KeySetView`.
+fn set_view_carrier_for(ctx: &dyn NativeContext, source: ObjectRef, kind: i32) -> &'static str {
+    let entryset = is_entryset_kind(kind);
+    // Order mirrors `collect_entries_any`: LinkedHashMap is a HashMap subclass,
+    // so it has to be asked first.
+    if is_lhm_receiver(ctx, source) {
+        if entryset {
+            "java/util/LinkedHashMap$LinkedEntrySet"
+        } else {
+            "java/util/LinkedHashMap$LinkedKeySet"
+        }
+    } else if is_chm_receiver(ctx, source) {
+        if entryset {
+            "java/util/concurrent/ConcurrentHashMap$EntrySetView"
+        } else {
+            // Reached only if a CHM keySet ever arrives here; its own accessor
+            // returns the real `KeySetView` via `alloc_key_set_view_object`.
+            "java/util/HashMap$KeySet"
+        }
+    } else if receiver_facts(ctx, source).has(CF_HASHTABLE_ANCESTRY) {
+        if entryset {
+            "java/util/Hashtable$EntrySet"
+        } else {
+            "java/util/Hashtable$KeySet"
+        }
+    } else if entryset {
+        "java/util/HashMap$EntrySet"
+    } else {
+        "java/util/HashMap$KeySet"
+    }
+}
+
+/// Allocate a set-view carrier wide enough for both its own declared fields and
+/// [`HS_FIELD_MAP`], falling back to `java/util/HashSet` if the carrier class
+/// cannot be had.
+///
+/// The fallback is the same not-decoration argument [`alloc_view_carrier`]
+/// makes: these are package-private JDK classes, and a stripped image or a
+/// synthetic-JDK build that has not bootstrapped them must not turn
+/// `map.keySet()` — which cannot fail — into a `NoClassDefFoundError`.
+fn alloc_set_view_carrier(
+    ctx: &mut dyn NativeContext,
+    carrier: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
+            // Declared fields, then one undeclared slot for the backing map —
+            // the slot `hs_map_slot` reads. See its doc for why not slot 0.
+            let n = ctx.class_num_total_fields(cid) + HS_NUM_FIELDS;
+            return Ok(ctx.alloc_object(cid, n));
+        }
+    }
+    try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)
+}
+
+/// Wrap a `Hashtable`-family view in the `Collections$Synchronized*` the JDK's
+/// own `Hashtable.keySet()`/`entrySet()`/`values()` return, so `getClass()`
+/// answers what HotSpot answers.
+///
+/// The wrapper is a REAL `Collections$SynchronizedCollection`/`$SynchronizedSet`
+/// running real JDK bytecode — `Collections.synchronizedSet` already builds one
+/// (`native_collections_synchronized_set`) — so every method is
+/// `synchronized (mutex) { c.method(); }` onto the inner view, which is the
+/// carrier this crate's natives are registered on. Nothing about the view's
+/// liveness or write-through changes; one delegation hop is added.
+///
+/// Returns `view` unchanged if the wrapper class cannot be built, which costs
+/// the `getClass()` fidelity for that run and nothing else.
+fn wrap_synchronized_view(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    as_set: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let (cls, desc) = if as_set {
+        (
+            "java/util/Collections$SynchronizedSet",
+            "(Ljava/util/Set;)V",
+        )
+    } else {
+        (
+            "java/util/Collections$SynchronizedCollection",
+            "(Ljava/util/Collection;)V",
+        )
+    };
+    // GC-SAFETY: `new_object_initialized` allocates and runs a constructor;
+    // `view` is a bare Rust local passed INTO it and used again on the failure
+    // path, so it is pinned and re-read.
+    let view_pin = ctx.pin_native_root(view);
+    let built = ctx.new_object_initialized(cls, desc, &[Value::Object(Some(view))]);
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(view_pin);
+    match built {
+        Ok(Some(Value::Object(Some(w)))) => Ok(w),
+        _ => Ok(view),
+    }
+}
+
+/// `true` iff `source`'s views are the JDK's `synchronized` wrappers — i.e. it
+/// is a `Hashtable` or a subclass such as `Properties`.
+fn wants_synchronized_views(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
+    receiver_facts(ctx, source).has(CF_HASHTABLE_ANCESTRY)
+}
+
+/// The collection inside a `Collections$Synchronized{Collection,Set,List,…}`,
+/// or `obj` itself when it is not one.
+///
+/// The inverse of [`wrap_synchronized_view`], for the native paths that need
+/// the CratonVM-backed view rather than the JDK object in front of it.
+fn unwrap_synchronized(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
+    let is_sync = match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+    {
+        Some(n) => n.starts_with("java/util/Collections$Synchronized"),
+        None => false,
+    };
+    if !is_sync {
+        return obj;
+    }
+    // `c` is the field every `SynchronizedCollection` subclass inherits; by
+    // name, not by index, because the synthetic-JDK stub and the real class
+    // need not agree on the slot.
+    match ctx.get_field_by_name(obj, "c") {
+        Value::Object(Some(inner)) => inner,
+        _ => obj,
+    }
+}
+
+/// The class a `values()` view over `source` should be minted under, chosen to
+/// match what the JDK's own `values()` returns for that map family.
+///
+/// `Hashtable`/`Properties` are the one deliberate approximation: the JDK wraps
+/// `Hashtable$ValueCollection` in a `Collections$SynchronizedCollection`, and
+/// only the inner class is modelled here. That is a strictly smaller divergence
+/// than `java.util.ArrayList` and does not affect the exact-class fast path,
+/// which only needs the answer to be "not `java/util/ArrayList`".
+fn values_carrier_for(ctx: &dyn NativeContext, source: ObjectRef) -> &'static str {
+    // Order matters and mirrors `collect_entries_any`: LinkedHashMap is a
+    // HashMap subclass, so it has to be asked first.
+    if is_lhm_receiver(ctx, source) {
+        "java/util/LinkedHashMap$LinkedValues"
+    } else if is_tree_map_receiver(ctx, source) {
+        "java/util/TreeMap$Values"
+    } else if is_chm_receiver(ctx, source) {
+        "java/util/concurrent/ConcurrentHashMap$ValuesView"
+    } else if receiver_facts(ctx, source).has(CF_HASHTABLE_ANCESTRY) {
+        "java/util/Hashtable$ValueCollection"
+    } else {
+        "java/util/HashMap$Values"
+    }
+}
+
+/// Allocate a view carrier, falling back to `java/util/ArrayList` if the
+/// carrier class cannot be had.
+///
+/// The fallback is not decoration. These are package-private JDK classes; a
+/// stripped image, a `--jdk-only` policy refusal, or a synthetic-JDK build that
+/// has not bootstrapped them would otherwise turn `map.values()` — which cannot
+/// fail — into a `NoClassDefFoundError`. Degrading to the old carrier costs the
+/// `getClass()` fidelity for that run and nothing else, because every
+/// `native_al_*` path still accepts an ArrayList-classed view.
+fn alloc_view_carrier(
+    ctx: &mut dyn NativeContext,
+    carrier: &str,
+    n_fields: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
+            return Ok(ctx.alloc_object(cid, n_fields));
+        }
+    }
+    if let Some(cid) = ctx.class_id_by_name(carrier) {
+        return Ok(ctx.alloc_object(cid, n_fields));
+    }
+    try_alloc_synthetic(ctx, "java/util/ArrayList", n_fields)
+}
+
+/// Build a `values()` view: an ArrayList-LAYOUT snapshot, under its own carrier
+/// class, whose element array stashes the source map in its last capacity slot
+/// so removals write through.
+fn make_view_list_of(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    vals: &[Value],
+    carrier: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     // cceres5 (metrics-registry Properties CCE family): the list/buffer
     // allocations below can move `source` and every snapshotted value held
     // only in this Rust slice; storing the raw refs would bake pre-move
@@ -12233,7 +13833,7 @@ fn make_view_list_of(ctx: &mut dyn NativeContext, source: ObjectRef, vals: &[Val
         elem_base
     };
     let __al_n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -12248,6 +13848,102 @@ fn make_view_list_of(ctx: &mut dyn NativeContext, source: ObjectRef, vals: &[Val
     al_set_size(ctx, list, vals.len() as i32);
     ctx.unpin_native_roots(first_pin);
     Ok(list)
+}
+
+thread_local! {
+    /// Sources currently being re-read by [`adopt_fresh_view_backing`], keyed
+    /// on the source's own pointer.
+    ///
+    /// The accessors this calls (`Properties.keySet()` / `.entrySet()`)
+    /// materialise a view directly from their storage and do not resync
+    /// anything, so today the re-entrant case cannot arise. It is guarded
+    /// anyway, for the reason `ITER_COLLECT_GUARD` was added: a source whose
+    /// accessor DOES read one of its own views turns "refresh on read" into
+    /// unbounded recursion, and that shape was found live once already
+    /// (the JSSE-connector stack overflow during TLS init).
+    static ADOPT_VIEW_GUARD: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// RAII removal from [`ADOPT_VIEW_GUARD`], including on unwind — see
+/// [`IterCollectGuard`], which this mirrors.
+struct AdoptViewGuard {
+    key: u64,
+    inserted: bool,
+}
+impl Drop for AdoptViewGuard {
+    fn drop(&mut self) {
+        if self.inserted {
+            ADOPT_VIEW_GUARD.with(|g| {
+                g.borrow_mut().remove(&self.key);
+            });
+        }
+    }
+}
+
+/// Refresh a STATIC view (see [`VIEW_KIND_KEYSET_STATIC`]) by asking `source`
+/// for a fresh view of the same kind and pointing `set` at the fresh view's
+/// backing.
+///
+/// The fresh view is built by the source's own accessor native, which is the
+/// only code that knows how to assemble that source's contents; adopting its
+/// backing wholesale means this function never has to know. The fresh backing
+/// carries the same `(source, kind)` markers — `alloc_view_backing` wrote them
+/// — so `set` stays a live view with write-through afterwards.
+///
+/// Refusals from the accessor are propagated. A non-view answer (no backing to
+/// adopt) leaves `set` exactly as it was: a stale view is a worse answer than a
+/// fresh one, but an emptied view is worse than both.
+fn adopt_fresh_view_backing(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+    source: ObjectRef,
+    method: &str,
+    descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    let guard_key = source.as_ptr() as u64;
+    let inserted = ADOPT_VIEW_GUARD.with(|g| g.borrow_mut().insert(guard_key));
+    let _guard = AdoptViewGuard {
+        key: guard_key,
+        inserted,
+    };
+    if !inserted {
+        return Ok(());
+    }
+    // GC-SAFETY: the accessor is a full native dispatch that allocates a view,
+    // its backing and its bucket array — `set` is a bare Rust local used for
+    // the store afterwards, so it is pinned and re-read (the same shape
+    // `native_hs_iterator` uses around its own `resync_view_set` call).
+    let set_pin = ctx.pin_native_root(set);
+    let fresh = ctx.invoke_virtual(source, method, descriptor, &[]);
+    let fresh = match fresh {
+        Ok(Some(Value::Object(Some(f)))) => f,
+        Err(e) => {
+            ctx.unpin_native_roots(set_pin);
+            return Err(e);
+        }
+        _ => {
+            ctx.unpin_native_roots(set_pin);
+            return Ok(());
+        }
+    };
+    // `Hashtable`/`Properties` accessors hand back the JDK's
+    // `Collections$Synchronized*` wrapper (see `wrap_synchronized_view`), so the
+    // fresh view is one level in. Without this the backing lookup answers `None`
+    // and the resync becomes a silent no-op — which is the very bug this
+    // function exists to close.
+    let fresh = unwrap_synchronized(ctx, fresh);
+    let backing = match hs_backing_map(ctx, fresh) {
+        Some(b) => b,
+        None => {
+            ctx.unpin_native_roots(set_pin);
+            return Ok(());
+        }
+    };
+    let set = ctx.read_native_pin(set_pin, set);
+    hs_set_backing_map(ctx, set, backing);
+    ctx.unpin_native_roots(set_pin);
+    Ok(())
 }
 
 /// Refresh a keySet/entrySet view's backing HashSet from its live source map,
@@ -12266,11 +13962,19 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> Result<(), Me
         None => return Ok(()),
     };
     let kind = view_backing_kind(ctx, backing);
-    // A STATIC entrySet view (Properties) is materialised once and never
-    // resynced — its source cannot be read back without recursing through
-    // `Properties.entrySet()`. Leave the backing's contents untouched.
-    if kind == VIEW_KIND_ENTRYSET_STATIC {
-        return Ok(());
+    // A STATIC view's source cannot be read back by walking its fields, so it
+    // is refreshed by asking the source for a fresh view and adopting that
+    // view's backing. Until 2026-08-13 this arm returned without doing
+    // anything, which is what `probes/MapViewBehaviourProbe` measured as
+    //
+    // ```text
+    // props.keys.afterPut.size      HotSpot 3   CratonVM 2
+    // props.entries.afterPut.size   HotSpot 3   CratonVM 2
+    // ```
+    //
+    // — a `Properties` view was live in the WRITE direction only.
+    if let Some((method, desc)) = static_view_accessor(kind) {
+        return adopt_fresh_view_backing(ctx, set, source, method, desc);
     }
     // Rebuild the backing map's contents from the live source. Derive the
     // capacity from the current bucket-array length via `map_state` (NOT a raw
@@ -12417,11 +14121,14 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
 /// layout `native_lhm_entry_set` and `native_hs_remove`'s key-extraction use).
 fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
     if let Some(source) = view_backing_source(ctx, backing) {
-        // STATIC entrySet (Properties): never resynced from the source, so read
-        // the entries straight from the backing — the same path a plain set
-        // takes — rather than walking the source (which would recurse into
-        // `Properties.entrySet()`).
-        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET_STATIC {
+        // A STATIC view (Properties): its contents were put in the backing by
+        // the source's own accessor — either at construction or by the
+        // `adopt_fresh_view_backing` this read's `resync_view_set` just ran —
+        // so read them straight from the backing, the same path a plain set
+        // takes. Walking the source instead would recurse into
+        // `Properties.entrySet()`. Both kinds' elements are already the right
+        // objects (entries for one, keys for the other).
+        if static_view_accessor(view_backing_kind(ctx, backing)).is_some() {
             return Ok(map_collect_keys(ctx, backing));
         }
         if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
@@ -12580,7 +14287,19 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<Ob
 /// capacity slots of a normal list are always null).
 fn values_view_source(ctx: &dyn NativeContext, list: ObjectRef) -> Option<ObjectRef> {
     let (data, size) = al_state(ctx, list);
-    let data = data?;
+    view_source_in(ctx, data?, size)
+}
+
+/// The marker test of [`values_view_source`], for a caller that already holds
+/// the receiver's `(elementData, size)` pair.
+///
+/// Split out so the hot natives can answer "is this a view?" from the
+/// `al_state` they had to run anyway. Reading it through `values_view_source`
+/// instead cost a second full `al_state` — two more `get_field`s and a second
+/// layout classification — on every `size()`/`isEmpty()`/`get()` of every
+/// ordinary list, which is the overwhelming majority of the calls.
+#[inline]
+fn view_source_in(ctx: &dyn NativeContext, data: ObjectRef, size: i32) -> Option<ObjectRef> {
     let dlen = ctx.array_length(data) as i32;
     if dlen > size {
         if let Value::Object(Some(src)) = ctx.get_array_element(data, (dlen - 1) as usize) {
@@ -12906,6 +14625,74 @@ fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
     None
 }
 
+/// Refresh a `TreeMap.keySet()` view from its live source map, so a read sees
+/// keys put into the map AFTER the view was taken. JDK keySet views are live;
+/// this is the `TreeSet`-carried family's counterpart to [`resync_view_set`]
+/// (HashSet-carried keySet/entrySet) and [`resync_values_view`]
+/// (ArrayList-carried values/TreeMap-entrySet).
+///
+/// Measured before this existed, `probes/MapViewBehaviourProbe`:
+///
+/// ```text
+/// tm.keys.afterPut.size   HotSpot 3   CratonVM 2
+/// ```
+///
+/// — the view had write-through (`remove`/`clear`/`pollFirst` all consult the
+/// marker) but no read-through, so it was a snapshot in the read direction
+/// only. `values()` and `entrySet()` of the same TreeMap already resynced,
+/// which is why exactly this one row diverged.
+///
+/// Only a **map** source is rebuilt. `TreeSet.descendingSet()` puts another
+/// `TreeSet` behind the same marker and its elements are the source's in
+/// REVERSE; rebuilding it in sorted order here would silently un-reverse the
+/// view. Its liveness is a separate, unmeasured row — see
+/// [`ts_source_remove`], which makes the same map-vs-set distinction.
+fn resync_ts_view(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let source = match ts_view_source(ctx, this) {
+        Some(s) => s,
+        None => return Ok(this),
+    };
+    if !is_tree_map_receiver(ctx, source) {
+        return Ok(this);
+    }
+    // GC-SAFETY: `tm_collect_pairs` boxes fast-mode keys (allocating), and
+    // `alloc_ref_array` below collects too. `this`, `source` and every
+    // collected key are bare Rust locals used after those calls, so all three
+    // are pinned and re-read — the same shape `resync_values_view` uses.
+    let this_pin = ctx.pin_native_root(this);
+    let source_pin = ctx.pin_native_root(source);
+    let source = ctx.read_native_pin(source_pin, source);
+    let keys: Vec<Value> = tm_collect_pairs(ctx, source)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let (_, key_handles) = pin_value_slice(ctx, &keys);
+    let cap = std::cmp::max(keys.len(), TS_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
+    for (i, k) in keys.iter().enumerate() {
+        let k = read_pinned_elem(ctx, key_handles[i], *k);
+        let buf = ctx.read_native_pin(buf_pin, buf);
+        ctx.set_array_element(buf, i, k);
+    }
+    // Re-install the trailing source marker: the array is longer than the
+    // logical size and its last slot is non-null, which is exactly what
+    // `ts_view_source` tests for. Without it the rebuilt view stops writing
+    // through.
+    let source = ctx.read_native_pin(source_pin, source);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
+    let this = ctx.read_native_pin(this_pin, this);
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(keys.len() as i32));
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    Ok(this)
+}
+
 /// Write a removal back to whatever a [`ts_view_source`] marker names.
 ///
 /// Two kinds of source reach that marker now. A `TreeMap` keySet view names a
@@ -12929,6 +14716,36 @@ fn ts_source_remove(
 
 /// Get the backing HashMap from a HashSet.
 fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    hs_map_slot(ctx, this).is_some()
+}
+
+/// The slot a HashSet-shaped receiver keeps its backing map in, or `None` when
+/// the receiver is not HashSet-shaped at all.
+///
+/// For a real `HashSet` (or `CopyOnWriteArraySet`, or a subclass) it is
+/// [`HS_FIELD_MAP`] — absolute 0, because nothing in that chain declares a
+/// field before `HashSet.map`.
+///
+/// For one of the [`SET_VIEW_CARRIERS`] it is **past** the class's own declared
+/// fields, and that is not decoration:
+///
+/// ```text
+/// java.util.HashMap$KeySet             final java.util.HashMap this$0;
+/// java.util.LinkedHashMap$LinkedKeySet final boolean reversed;
+///                                      final java.util.LinkedHashMap this$0;
+/// ```
+///
+/// The `Linked*` views declare `reversed` FIRST, so slot 0 there is a BOOLEAN.
+/// Storing the backing map at slot 0 (which is what the first cut of this
+/// change did) wrote a reference into an int-declared slot, and every
+/// `linkedHashMap.keySet()` read back empty —
+/// `probes/MapViewBehaviourProbe`'s `lhm.keys.size` 0 against HotSpot's 2, and
+/// `AbstractMap.toString` recursing until the stack ran out. Anchoring on
+/// `class_num_total_fields` puts it in an UNDECLARED slot, which resolves to no
+/// field descriptor and is left untyped — the same rule the values carriers
+/// follow, and the reason those were already safe (they write ArrayList's
+/// absolute slots 1 and 2, past both declared fields).
+fn hs_map_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let cid = ctx.class_id_of_object(this);
     for class_name in [
         "java/util/HashSet",
@@ -12936,18 +14753,30 @@ fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     ] {
         if let Some(base) = ctx.class_id_by_name(class_name) {
             if cid == base || ctx.is_subclass(cid, base) {
-                return true;
+                return Some(HS_FIELD_MAP);
             }
         }
     }
-    false
+    // Reached only after both subclass checks miss, so no ordinary set pays for
+    // the name lookup.
+    match ctx.class_name_arc_of_id(cid).as_deref() {
+        Some(n) if is_set_view_carrier(n) => Some(ctx.class_num_total_fields(cid)),
+        _ => None,
+    }
+}
+
+/// Point a HashSet-shaped receiver at its backing map, at whatever slot
+/// [`hs_map_slot`] says. Every view mint site goes through this rather than
+/// writing [`HS_FIELD_MAP`] directly, so the reader and the writer cannot
+/// disagree about where the backing lives.
+fn hs_set_backing_map(ctx: &mut dyn NativeContext, set: ObjectRef, backing: ObjectRef) {
+    let slot = hs_map_slot(&*ctx, set).unwrap_or(HS_FIELD_MAP);
+    ctx.set_field(set, slot, Value::Object(Some(backing)));
 }
 
 fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    if !is_hashset_native_backed(ctx, this) {
-        return None;
-    }
-    match ctx.get_field(this, HS_FIELD_MAP) {
+    let slot = hs_map_slot(ctx, this)?;
+    match ctx.get_field(this, slot) {
         Value::Object(Some(m)) => Some(m),
         _ => None,
     }
@@ -13170,7 +14999,7 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
     set_map_size(ctx, backing_map, 0);
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
 
     let (_, elem_pins) = pin_value_slice(ctx, elems);
     let sentinel = Value::Int(1);
@@ -13286,6 +15115,92 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
         "()I",
         native_hs_hash_code,
     );
+    r.set_category(__prev_cat);
+    // The classes a map's `keySet()`/`entrySet()` view is minted under.
+    register_set_view_carrier_natives(r);
+}
+
+/// The `Set` surface of a keySet/entrySet view, registered on each of the
+/// [`SET_VIEW_CARRIERS`] — the set-shaped twin of
+/// [`register_map_view_carrier_natives`].
+///
+/// A view is HashSet-LAYOUT under its own class, so it needs the same
+/// `native_hs_*` bodies the `HashSet` registration installs. It is not optional:
+/// `HashMap$KeySet` declares `size`, `contains`, `remove`, `iterator`, `clear`,
+/// `forEach` and `spliterator` itself, and the receiver-has-own-bytecode rule
+/// would run those JDK bodies over `this$0` — null on a CratonVM view, whose
+/// state is the backing map in that same slot. Paired with the entries in
+/// `force_native_over_real_jdk_bytecode` and its `vm_exec` twin.
+///
+/// `equals`/`hashCode` ARE registered here, unlike on the values carriers: the
+/// JDK's set views extend `AbstractSet`, whose `equals`/`hashCode` are the SET
+/// contract, which is exactly what `native_hs_equals`/`native_hs_hash_code`
+/// implement. (On a `Collection` view they would have installed LIST semantics,
+/// which is why that family omits them.)
+///
+/// `<init>` is deliberately absent: nothing constructs these, and a constructor
+/// native would fire for a JDK-built view too.
+fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in SET_VIEW_CARRIERS {
+        let c = *c;
+        r.register(c, "size", "()I", native_hs_size);
+        r.register(c, "isEmpty", "()Z", native_hs_is_empty);
+        r.register(c, "add", "(Ljava/lang/Object;)Z", native_hs_add);
+        r.register(c, "remove", "(Ljava/lang/Object;)Z", native_hs_remove);
+        r.register(c, "contains", "(Ljava/lang/Object;)Z", native_hs_contains);
+        r.register(c, "clear", "()V", native_hs_clear);
+        r.register(c, "iterator", "()Ljava/util/Iterator;", native_hs_iterator);
+        r.register(c, "toArray", "()[Ljava/lang/Object;", native_hs_to_array);
+        r.register(
+            c,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            native_hs_to_array_typed,
+        );
+        r.register(
+            c,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            native_collection_to_array_generator,
+        );
+        r.register(c, "toString", "()Ljava/lang/String;", native_hs_to_string);
+        r.register(c, "hashCode", "()I", native_hs_hash_code);
+        r.register(c, "equals", "(Ljava/lang/Object;)Z", native_hs_equals);
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_hs_for_each,
+        );
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
+        r.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_hs_spliterator,
+        );
+        r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_hs_add_all);
+        r.register(
+            c,
+            "removeAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_remove_all,
+        );
+        r.register(
+            c,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_retain_all,
+        );
+        r.register(
+            c,
+            "containsAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_contains_all,
+        );
+    }
     r.set_category(__prev_cat);
 }
 
@@ -13607,7 +15522,7 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, this, backing);
     ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
@@ -13625,7 +15540,7 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, cap);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, this, backing);
     ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
@@ -14022,7 +15937,7 @@ fn native_hs_contains_pinned(
         // native lookup bypassed that override so `keySet().contains("KEY")`
         // returned false (LinkedCaseInsensitiveMapTests putAndGet /
         // putWithOverlappingKeys).
-        if view_backing_kind(ctx, backing) == VIEW_KIND_KEYSET {
+        if !is_entryset_kind(view_backing_kind(ctx, backing)) {
             let elem = read_pinned_elem(ctx, elem_pin, elem);
             let has =
                 ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[elem])?;
@@ -14163,7 +16078,11 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // A refusal is not the end of the road: `real_snapshot_iterator` hands back
     // the same elements through a real `Arrays$ArrayItr`, carrying the same
     // backing set so `it.remove()` still writes through (see that function).
-    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
+    let this_now = ctx.read_native_pin(this_pin, this);
+    let backing_now = ctx.read_native_pin(backing_pin, backing);
+    let entryset = is_entryset_kind(view_backing_kind(ctx, backing_now));
+    let carrier = key_itr_carrier_for(&*ctx, this_now, entryset);
+    let itr = match alloc_key_itr(ctx, carrier) {
         Ok(itr) => itr,
         Err(_refused) => {
             let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
@@ -14178,17 +16097,18 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return real;
         }
     };
+    let base = key_itr_base(ctx, itr);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
     // Wire backing HashSet for Iterator.remove() — without this, JDK code
     // like MXBeanSupport.findMXBeanInterface (which iterates a HashSet and
     // calls it.remove() inside the loop) throws UnsupportedOperationException
     // because dispatch falls through to the default Iterator.remove().
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
@@ -14416,6 +16336,98 @@ const MAP_KEY_ITR_FIELD_BACKING: usize = 3;
 const MAP_KEY_ITR_FIELD_LAST_RET: usize = 4;
 const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 
+/// The classes a snapshot key/entry iterator over a HashSet-shaped receiver is
+/// minted under, alongside the historical fabricated `java/util/HashMap$KeyItr`.
+///
+/// `HashMap$KeyItr` is a name no JDK declares — the real one is
+/// `HashMap$KeyIterator` — which is both a `getClass()` divergence
+/// (`probes/ViewClassProbe`'s `lhs.iterator` row: HotSpot
+/// `java.util.LinkedHashMap$LinkedKeyIterator`, CratonVM
+/// `java.util.HashMap$KeyItr`) and the reason six `--jdk-only` strict-mode rows
+/// used to die with `NoClassDefFoundError` (see `real_snapshot_iterator`).
+///
+/// Unlike the collection carriers, these DO collide: `HashMap$HashIterator`
+/// declares `next`/`current` (references) and `expectedModCount`/`index`
+/// (ints), and this VM's five fields would land an `Int` cursor in a reference
+/// slot. So the native state goes PAST the declared fields —
+/// [`key_itr_base`] — and the object is allocated `declared + 5` wide.
+const MAP_KEY_ITR_CARRIERS: &[&str] = &[
+    "java/util/HashMap$KeyIterator",
+    "java/util/HashMap$EntryIterator",
+    "java/util/LinkedHashMap$LinkedKeyIterator",
+    "java/util/LinkedHashMap$LinkedEntryIterator",
+];
+
+/// `true` for the fabricated `HashMap$KeyItr` shape and for every
+/// [`MAP_KEY_ITR_CARRIERS`] name — i.e. every receiver whose five native
+/// iterator fields live at [`key_itr_base`].
+fn is_map_key_itr_class(name: &str) -> bool {
+    name == "java/util/HashMap$KeyItr" || MAP_KEY_ITR_CARRIERS.contains(&name)
+}
+
+/// Where this iterator's five native fields start.
+///
+/// Derived from the object's own width rather than from its class, which makes
+/// it one header read on a path (`hasNext`/`next`) that runs once per element:
+/// every mint site allocates exactly `declared + MAP_KEY_ITR_NUM_FIELDS` slots,
+/// so the base is whatever is left over. The fabricated `HashMap$KeyItr`
+/// declares nothing and lands on 0, and the legacy three-field snapshot shape
+/// (`make_fabricated_iterator_from_array`) is narrower than five and also lands
+/// on 0 — which is what keeps `n_fields > base + LAST_RET` telling the two
+/// apart, exactly as it did when the base was always zero.
+#[inline]
+fn key_itr_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this)
+        .saturating_sub(MAP_KEY_ITR_NUM_FIELDS)
+}
+
+/// The iterator class a `HashSet`-shaped receiver's `iterator()` should mint,
+/// matching what HotSpot answers for that receiver.
+///
+/// `LinkedHashSet.iterator()` is `LinkedHashMap$LinkedKeyIterator` in the JDK
+/// because a `LinkedHashSet` is backed by a `LinkedHashMap`; a keySet/entrySet
+/// view follows its SOURCE map the same way. Anything else — a plain
+/// `HashSet`, a `CopyOnWriteArraySet`, a view of a map family with no iterator
+/// carrier of its own — takes the `HashMap` pair, which is what an unqualified
+/// `HashSet.iterator()` answers.
+fn key_itr_carrier_for(ctx: &dyn NativeContext, receiver: ObjectRef, entryset: bool) -> &'static str {
+    let linked = match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(receiver))
+        .as_deref()
+    {
+        Some("java/util/LinkedHashSet") => true,
+        Some(
+            "java/util/LinkedHashMap$LinkedKeySet" | "java/util/LinkedHashMap$LinkedEntrySet",
+        ) => true,
+        _ => false,
+    };
+    match (linked, entryset) {
+        (true, false) => "java/util/LinkedHashMap$LinkedKeyIterator",
+        (true, true) => "java/util/LinkedHashMap$LinkedEntryIterator",
+        (false, false) => "java/util/HashMap$KeyIterator",
+        (false, true) => "java/util/HashMap$EntryIterator",
+    }
+}
+
+/// Allocate a snapshot key/entry iterator under `carrier`, wide enough for the
+/// class's own declared fields plus this VM's five.
+///
+/// Falls back to the fabricated `java/util/HashMap$KeyItr` shape when the real
+/// class cannot be had, which is the pre-2026-08-13 behaviour and keeps a
+/// stripped image iterating rather than failing.
+fn alloc_key_itr(
+    ctx: &mut dyn NativeContext,
+    carrier: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
+            let n = ctx.class_num_total_fields(cid) + MAP_KEY_ITR_NUM_FIELDS;
+            return Ok(ctx.alloc_object(cid, n));
+        }
+    }
+    try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)
+}
+
 fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -14439,25 +16451,18 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
         native_al_itr_remove,
     );
 
-    // HashMap$KeyItr
-    r.register(
-        "java/util/HashMap$KeyItr",
-        "hasNext",
-        "()Z",
-        native_map_key_itr_has_next,
-    );
-    r.register(
-        "java/util/HashMap$KeyItr",
-        "next",
-        "()Ljava/lang/Object;",
-        native_map_key_itr_next,
-    );
-    r.register(
-        "java/util/HashMap$KeyItr",
-        "remove",
-        "()V",
-        native_map_key_itr_remove,
-    );
+    // The fabricated `HashMap$KeyItr` shape and the real classes that replaced
+    // it as the default carrier (`MAP_KEY_ITR_CARRIERS`). The real ones need
+    // these registrations for the same reason the collection carriers do: their
+    // own JDK bodies walk `next`/`current`/`index`, which this VM's snapshot
+    // iterator never populates. Paired with the entries in
+    // `force_native_over_real_jdk_bytecode`.
+    for c in std::iter::once(&"java/util/HashMap$KeyItr").chain(MAP_KEY_ITR_CARRIERS.iter()) {
+        let c = *c;
+        r.register(c, "hasNext", "()Z", native_map_key_itr_has_next);
+        r.register(c, "next", "()Ljava/lang/Object;", native_map_key_itr_next);
+        r.register(c, "remove", "()V", native_map_key_itr_remove);
+    }
     r.set_category(__prev_cat);
 }
 
@@ -14610,11 +16615,12 @@ fn native_map_key_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let cursor = match ctx.get_field(this, MAP_KEY_ITR_FIELD_CURSOR) {
+    let base = key_itr_base(ctx, this);
+    let cursor = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_CURSOR) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let total = match ctx.get_field(this, MAP_KEY_ITR_FIELD_TOTAL) {
+    let total = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_TOTAL) {
         Value::Int(t) => t,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -14626,11 +16632,12 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cursor = match ctx.get_field(this, MAP_KEY_ITR_FIELD_CURSOR) {
+    let base = key_itr_base(ctx, this);
+    let cursor = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_CURSOR) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let total = match ctx.get_field(this, MAP_KEY_ITR_FIELD_TOTAL) {
+    let total = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_TOTAL) {
         Value::Int(t) => t,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -14651,18 +16658,18 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             .into(),
         );
     }
-    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
+    let keys = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_KEYS) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = ctx.get_array_element(keys, cursor as usize);
-    ctx.set_field(this, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    ctx.set_field(this, base + MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
     // Record index just returned for a subsequent Iterator.remove().
     // Iterator allocated with <5 fields (older snapshot iterators) silently
     // ignores the write because alloc_object pre-sized the field block.
     let n_fields = ctx.object_num_fields(this);
-    if n_fields > MAP_KEY_ITR_FIELD_LAST_RET {
-        ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
+    if n_fields > base + MAP_KEY_ITR_FIELD_LAST_RET {
+        ctx.set_field(this, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
     }
     Ok(Some(val))
 }
@@ -14686,11 +16693,12 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // Iterators allocated via the legacy 3-field snapshot path
     // (`make_iterator_from_array`) have no backing reference — surface
     // UnsupportedOperationException so callers see the JDK-spec behaviour.
+    let base = key_itr_base(ctx, this);
     let n_fields = ctx.object_num_fields(this);
-    if n_fields <= MAP_KEY_ITR_FIELD_LAST_RET {
+    if n_fields <= base + MAP_KEY_ITR_FIELD_LAST_RET {
         return Err(unsupported_op());
     }
-    let last_ret = match ctx.get_field(this, MAP_KEY_ITR_FIELD_LAST_RET) {
+    let last_ret = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_LAST_RET) {
         Value::Int(v) => v,
         _ => -1,
     };
@@ -14700,11 +16708,11 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         .into());
     }
-    let backing = match ctx.get_field(this, MAP_KEY_ITR_FIELD_BACKING) {
+    let backing = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_BACKING) {
         Value::Object(Some(b)) => b,
         _ => return Err(unsupported_op()),
     };
-    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
+    let keys = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_KEYS) {
         Value::Object(Some(a)) => a,
         _ => return Ok(None),
     };
@@ -14731,7 +16739,7 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let _ = removed?;
-    ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    ctx.set_field(this, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(None)
 }
 
@@ -16156,7 +18164,7 @@ fn ensure_collections_empty_singletons(
                     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
                     let inner_map = alloc_backing_map(ctx);
                     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
-                    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+                    hs_set_backing_map(ctx, set, inner_map);
                     set
                 }
             };
@@ -17825,17 +19833,190 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
 
 /// Generic `List.of` for fixed-arity overloads: every positional arg is an
 /// element. Produces a frozen (unmodifiable) list.
+// ---------------------------------------------------------------------------
+// `List.of` / `Set.of` / `Map.of` argument validation
+// ---------------------------------------------------------------------------
+//
+// These factories are not "an ArrayList with a frozen wrapper". Their contract
+// is `java.util.ImmutableCollections`', which REJECTS a null element with a
+// `NullPointerException` and a repeated `Set` element / `Map` key with an
+// `IllegalArgumentException`. Ours accepted both: `Set.of("a","a")` silently
+// deduplicated to `["a"]` and `Map.of(null,"1")` produced `{null=1}`. Validating
+// is the reason an application writes `Set.of(...)` instead of
+// `new HashSet<>(Arrays.asList(...))`, so answering with a collection where the
+// JDK throws converts a caught, located bug into a wrong value carried onward.
+//
+// The checks live at the `of` ENTRY POINTS and NOT inside `make_set_of` /
+// `make_map_of`, because those two also build `Collectors.toSet()`, `Set.copyOf`
+// and every other synthetic set/map in this crate — and `copyOf` DEDUPLICATES
+// by contract (`Set.copyOf(List.of("a","a")).size() == 1`, a row
+// `ImmutableCollectionsDifferentialProbe` asserts). One helper serving both
+// callers would have to pick, and either pick is wrong for the other.
+
+/// `Objects.requireNonNull` over a factory's arguments.
+///
+/// The NPE carries **no message**: the JDK's comes from a bare
+/// `Objects.requireNonNull(e)`, and `Throwable.toString()` omits the `": …"`
+/// suffix only for a null message — so a "helpful" message here is a visible
+/// difference from HotSpot rather than a bonus. Same trap as the bare
+/// `IllegalStateException` in `ArrayList$SubList$1.remove`.
+fn of_reject_null_elements(elems: &[Value]) -> Result<(), MethodCallFailed> {
+    if elems.iter().any(|e| matches!(e, Value::Object(None))) {
+        return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+            message: None,
+        }));
+    }
+    Ok(())
+}
+
+/// Render one element for a `duplicate element: …` / `duplicate key: …`
+/// message through the receiver's own `toString()` — the text HotSpot prints,
+/// and the text the probe diffs.
+fn of_element_text(ctx: &mut dyn NativeContext, v: Value) -> String {
+    match v {
+        Value::Object(Some(o)) => ctx
+            .invoke_virtual(o, "toString", "()Ljava/lang/String;", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| match r {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| "?".to_string()),
+        Value::Int(i) => i.to_string(),
+        Value::Long(l) => l.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `IllegalArgumentException: duplicate <noun>: <e>` for the first repeat.
+///
+/// Equality is `values_equal_deep`, which ends in the RECEIVER's `equals` — the
+/// same predicate `make_set_of`'s `native_map_put` uses, so the check and the
+/// build can never disagree about what counts as a duplicate. Quadratic, and
+/// deliberately so: every `of` overload the JDK declares takes at most ten
+/// arguments, and the array form is the only unbounded one.
+fn of_reject_duplicates(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+    noun: &str,
+) -> Result<(), MethodCallFailed> {
+    if elems.len() < 2 {
+        return Ok(());
+    }
+    // `values_equal_deep` ends in the receiver's `equals`, which allocates and
+    // can therefore MOVE every element in this slice. The `Value`s here are
+    // bare copies of the caller's argument registers; re-reading them through
+    // pins is the same discipline `make_set_of` and `make_map_of` already keep
+    // for exactly this reason, and skipping it is how a comparison ends up
+    // asking an unrelated `java.lang.Object` whether it equals itself.
+    let (base, handles) = pin_value_slice(ctx, elems);
+    let mut verdict: Result<(), MethodCallFailed> = Ok(());
+    'outer: for i in 1..elems.len() {
+        for j in 0..i {
+            let a = read_pinned_elem(ctx, handles[i], elems[i]);
+            let b = read_pinned_elem(ctx, handles[j], elems[j]);
+            match values_equal_deep(ctx, &a, &b) {
+                Ok(false) => {}
+                Ok(true) => {
+                    let dup = read_pinned_elem(ctx, handles[i], elems[i]);
+                    let text = of_element_text(ctx, dup);
+                    verdict = Err(MethodCallFailed::from(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!("duplicate {noun}: {text}"),
+                        },
+                    ));
+                    break 'outer;
+                }
+                Err(e) => {
+                    verdict = Err(e);
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    verdict
+}
+
+/// The one `List.of` body. Every arity registration reaches it.
+fn of_list(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    of_reject_null_elements(elems)?;
+    let r = make_list_of(ctx, elems);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+}
+
+/// The one `Set.of` body — nulls first, then duplicates, in the JDK's order:
+/// `Set.of("a", null)` is an NPE, not an IAE.
+fn of_set(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    of_reject_null_elements(elems)?;
+    of_reject_duplicates(ctx, elems, "element")?;
+    let r = make_set_of(ctx, elems);
+    freeze_result(ctx, UNMOD_SET_CLASS, r)
+}
+
+/// The one `Map.of` / `Map.ofEntries` body. Keys AND values must be non-null;
+/// only keys are checked for duplicates.
+fn of_map(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> MethodCallResult {
+    let flat: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    of_reject_null_elements(&flat)?;
+    let keys: Vec<Value> = pairs.iter().map(|(k, _)| *k).collect();
+    of_reject_duplicates(ctx, &keys, "key")?;
+    let r = make_map_of(ctx, pairs);
+    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+}
+
+/// Does `src` (any `Collection`) hold a null element? Asked through `toArray()`
+/// so it also answers for a collection this crate does not own.
+fn source_collection_has_null(ctx: &mut dyn NativeContext, src: ObjectRef) -> bool {
+    let arr = match ctx.invoke_virtual(src, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return false,
+    };
+    let len = ctx.array_length(arr);
+    (0..len).any(|i| matches!(ctx.get_array_element(arr, i), Value::Object(None)))
+}
+
+/// Is `v` already an immutable `*.of` / `copyOf` product of `class_name`?
+///
+/// `UNMOD_FIELD_IMMUTABLE` is the discriminator the wrapper already carried:
+/// `alloc_immutable_wrapper` sets it and `alloc_unmod_wrapper` — which is what
+/// `Collections.unmodifiableList` uses — does not. That is exactly the JDK's
+/// `coll instanceof ImmutableCollections.AbstractImmutableList` test, and it is
+/// why `copyOf` may return its argument unchanged here while still snapshotting
+/// a `Collections.unmodifiableList` VIEW of a mutable list: the view's contents
+/// can still change underneath it, which is the aliasing the Kafka
+/// `AdminApiDriver` fix above was about.
+fn already_immutable_of(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+    class_name: &str,
+) -> Option<ObjectRef> {
+    let obj = match v {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let cid = ctx.class_id_of_object(obj);
+    if ctx.class_name_of_id(cid).as_deref() != Some(class_name) {
+        return None;
+    }
+    match ctx.get_field(obj, UNMOD_FIELD_IMMUTABLE) {
+        Value::Int(1) => Some(obj),
+        _ => None,
+    }
+}
+
 fn native_list_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elems: Vec<Value> = args.to_vec();
-    let r = make_list_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &elems)
 }
 
 /// Generic `Set.of` for fixed-arity overloads. Produces a frozen set.
 fn native_set_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elems: Vec<Value> = args.to_vec();
-    let r = make_set_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &elems)
 }
 
 /// Generic `Map.of` for fixed-arity overloads: args are k0,v0,k1,v1,...
@@ -17846,8 +20027,7 @@ fn native_map_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         pairs.push((args[i], args[i + 1]));
         i += 2;
     }
-    let r = make_map_of(ctx, &pairs);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &pairs)
 }
 
 /// `Map.ofEntries(Map$Entry...)`.
@@ -17863,8 +20043,7 @@ fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => {
-            let r = make_map_of(ctx, &[]);
-            return freeze_result(ctx, UNMOD_MAP_CLASS, r);
+            return of_map(ctx, &[]);
         }
     };
     let len = ctx.array_length(arr);
@@ -17884,8 +20063,7 @@ fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             pairs.push((k, v));
         }
     }
-    let r = make_map_of(ctx, &pairs);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &pairs)
 }
 
 /// Helper: create an ArrayList from a slice of values.
@@ -17962,7 +20140,7 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     set_map_size(ctx, backing_map, 0);
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
 
     let sentinel = Value::Int(1);
     for (index, elem) in elems.iter().enumerate() {
@@ -18051,37 +20229,32 @@ fn freeze_result(
 }
 
 fn native_list_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let r = make_list_of(ctx, &[]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[])
 }
 
 fn native_list_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
-    let r = make_list_of(ctx, &[e1]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[e1])
 }
 
 fn native_list_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
-    let r = make_list_of(ctx, &[e1, e2]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[e1, e2])
 }
 
 fn native_list_of_3(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
     let e3 = args.get(2).copied().unwrap_or(Value::Object(None));
-    let r = make_list_of(ctx, &[e1, e2, e3]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[e1, e2, e3])
 }
 
 fn native_list_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let r = make_list_of(ctx, &[]);
-            return freeze_result(ctx, UNMOD_LIST_CLASS, r);
+            return of_list(ctx, &[]);
         }
     };
     let len = ctx.array_length(arr);
@@ -18089,34 +20262,29 @@ fn native_list_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     for i in 0..len {
         elems.push(ctx.get_array_element(arr, i));
     }
-    let r = make_list_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &elems)
 }
 
 fn native_set_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let r = make_set_of(ctx, &[]);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &[])
 }
 
 fn native_set_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
-    let r = make_set_of(ctx, &[e1]);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &[e1])
 }
 
 fn native_set_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
-    let r = make_set_of(ctx, &[e1, e2]);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &[e1, e2])
 }
 
 fn native_set_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let r = make_set_of(ctx, &[]);
-            return freeze_result(ctx, UNMOD_SET_CLASS, r);
+            return of_set(ctx, &[]);
         }
     };
     let len = ctx.array_length(arr);
@@ -18124,20 +20292,17 @@ fn native_set_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for i in 0..len {
         elems.push(ctx.get_array_element(arr, i));
     }
-    let r = make_set_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &elems)
 }
 
 fn native_map_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let r = make_map_of(ctx, &[]);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &[])
 }
 
 fn native_map_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let k = args.first().copied().unwrap_or(Value::Object(None));
     let v = args.get(1).copied().unwrap_or(Value::Object(None));
-    let r = make_map_of(ctx, &[(k, v)]);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &[(k, v)])
 }
 
 fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -18145,8 +20310,7 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let v1 = args.get(1).copied().unwrap_or(Value::Object(None));
     let k2 = args.get(2).copied().unwrap_or(Value::Object(None));
     let v2 = args.get(3).copied().unwrap_or(Value::Object(None));
-    let r = make_map_of(ctx, &[(k1, v1), (k2, v2)]);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &[(k1, v1), (k2, v2)])
 }
 
 // ===========================================================================
@@ -21199,6 +23363,7 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
+    let this = resync_ts_view(ctx, this)?;
     let this_pin = ctx.pin_native_root(this);
     let (_, size, _) = ts_state(ctx, this);
     let stream = try_alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS)?;
@@ -29622,7 +31787,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
             let this_pin = ctx.pin_native_root(this);
             let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
             let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+            hs_set_backing_map(ctx, this, backing);
             ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
@@ -29651,7 +31816,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     let backing_pin = ctx.pin_native_root(backing);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, this, backing);
 
     // Round 49 fix: route through `collect_collection_elements` so we
     // honour every wrapper layout (ArrayList, Arrays$ArrayList,
@@ -32493,6 +34658,10 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // testGroupInference assertEquals(ArrayList, LinkedList)). The interface
     // natives registered on `java/util/ListIterator` share the same
     // array@0/cursor@1 layout, so dispatch through either route agrees.
+    // The REAL carrier, preferred by both entry points above. Registered
+    // before the fallback so a reader meets them in dispatch order.
+    register_ll_list_itr_natives(registry);
+
     let lit = "cratonvm/internal/LinkedListSnapshotListItr";
     // `register_with_kind`, NOT the ambient `register`, and the difference is
     // the census column `kind_stated` rather than the kind itself — the kind is
@@ -32570,17 +34739,517 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
         lit,
         "remove",
         "()V",
-        native_ll_listitr_remove_noop,
+        native_ll_listitr_remove,
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.register_with_kind(
         lit,
         "add",
         "(Ljava/lang/Object;)V",
-        native_ll_listitr_remove_noop,
+        native_ll_listitr_add,
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// The LinkedList snapshot ListIterator's slots
+// ---------------------------------------------------------------------------
+//
+// 0/1/2 are load-bearing NAMES, not just a layout: the interface-level
+// `java/util/ListIterator` natives dispatch on "slot 0 holds an `Object[]`,
+// slot 1 an `Int` cursor", so those two indices are shared with every other
+// snapshot iterator in this file and must not move.
+//
+// Slot 3 (`lastRet`) was added 2026-08-15 with `add`/`remove`. Before it, `set`
+// wrote at `cursor - 1` — correct after `next()`, WRONG after `previous()`
+// (the JDK's `set` targets the element the last `next`/`previous` returned,
+// which after `previous()` is at `cursor`), and there was no way at all to
+// answer `IllegalStateException` for a `set`/`remove` with no preceding call.
+// It is written EXPLICITLY to -1 at construction rather than left to whatever
+// `alloc_object` zeroes an undeclared slot to: an int-zero read as a
+// meaningful `lastRet` makes `remove()` before any `next()` delete element 0
+// instead of raising. Same hazard as `ArrayList$SubList$1`'s `lastRet`, which
+// is where this rule comes from.
+const LLI_FIELD_ARR: usize = 0;
+const LLI_FIELD_CURSOR: usize = 1;
+const LLI_FIELD_LIST: usize = 2;
+const LLI_FIELD_LASTRET: usize = 3;
+const LLI_NUM_FIELDS: usize = 4;
+
+/// `lastRet`, or `None` for a 3-slot iterator minted before that slot existed.
+/// The `None` arm keeps the old `cursor - 1` reading rather than inventing a
+/// value — a defensive read, since both mint sites now allocate four.
+fn lli_last_ret(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    if ctx.object_num_fields(this) <= LLI_FIELD_LASTRET {
+        return None;
+    }
+    match ctx.get_field(this, LLI_FIELD_LASTRET) {
+        Value::Int(v) => Some(v),
+        _ => Some(-1),
+    }
+}
+
+fn lli_set_last_ret(ctx: &mut dyn NativeContext, this: ObjectRef, v: i32) {
+    if ctx.object_num_fields(this) > LLI_FIELD_LASTRET {
+        ctx.set_field(this, LLI_FIELD_LASTRET, Value::Int(v));
+    }
+}
+
+/// The index `set`/`remove` act on: the real `lastRet` when the carrier has
+/// one, else the pre-2026-08-15 `cursor - 1`.
+fn lli_target_index(ctx: &dyn NativeContext, this: ObjectRef, cursor: i32) -> i32 {
+    lli_last_ret(ctx, this).unwrap_or(cursor - 1)
+}
+
+/// Re-take the snapshot after a structural change and re-publish it.
+///
+/// `add`/`remove` mutate the backing `LinkedList`, so the array slot 0 holds is
+/// stale the instant they return; every later `next()` would walk the old
+/// elements. Re-snapshotting is O(n) per mutation and is what keeps this
+/// iterator's reads agreeing with the list it just edited.
+fn lli_resnapshot(ctx: &mut dyn NativeContext, this: ObjectRef, list: ObjectRef) {
+    let mut this = this;
+    let list_at_call = list;
+    let arr = rooted_across(ctx, &mut [&mut this], |ctx| {
+        ll_snapshot_array(ctx, list_at_call)
+    });
+    ctx.set_field(this, LLI_FIELD_ARR, Value::Object(Some(arr)));
+}
+
+// ===========================================================================
+// `java.util.LinkedList$ListItr` — the real carrier, live over the node chain
+// ===========================================================================
+//
+// WHY THE JDK'S OWN CLASS. `LinkedList.iterator()` is
+// `AbstractSequentialList.iterator()`, which IS `listIterator()`, so HotSpot
+// answers `java.util.LinkedList$ListItr` for both. This VM answered
+// `cratonvm.internal.LinkedListSnapshotListItr` for one and
+// `java.util.LinkedList$Itr` for the other — and `LinkedList$Itr` is a class
+// the real JDK **does not declare at all** (`javap -p java.util.LinkedList$Itr`
+// → class not found). Two carriers, one of them fabricated, for a method the
+// JDK implements once.
+//
+// WHY LIVE AND NOT A SNAPSHOT. The snapshot carrier could not raise
+// `ConcurrentModificationException` (it has nothing to compare), and its
+// `remove()` had to re-take the whole snapshot to stay consistent — O(n) per
+// removal, so a `removeIf`/`Iterator.remove` drain over a `LinkedList` was
+// quadratic on the one collection whose entire selling point is O(1) removal.
+// A node cursor is the JDK's own `ListItr` state and makes every mutator O(1).
+//
+// WHY THIS IS SAFE NOW AND WAS NOT BEFORE. The comment this replaces recorded a
+// real failure: binding a 3-slot overlay to the name `java/util/LinkedList$ListItr`
+// put our `Int` cursor into the real `next:Node` slot, `next()` never advanced,
+// and `AbstractList.equals` compared element 0 forever — kafka `ConfigDef`
+// `testGroupInference`'s `assertEquals(ArrayList, LinkedList)` answered false
+// for ANY LinkedList. The fix is not to avoid the name, it is to stop
+// overlapping the declared fields: allocate `class_num_total_fields + N` slots
+// and put this VM's state ENTIRELY PAST them, which is what
+// `ArrayList$SubList$1` already does one collection over. `lli_base_checked` is
+// the matching receiver-ownership test, for the same reason `sli_base_checked`
+// is: these natives are also handed every `LinkedList$ListItr` **java.base's
+// own bytecode** built, and answering for one of those is the silent wrong
+// answer that withdrew the first attempt at this carrier.
+//
+// An image with no real `java.util.LinkedList$ListItr` to resolve keeps the
+// snapshot iterator it has always had — `alloc_lli_view` answers `None` and
+// both entry points fall back. Same trade as the sublist carrier.
+
+/// The JDK's own `ListIterator` inside `LinkedList`, and the class
+/// `linkedList.iterator().getClass()` answers on HotSpot.
+const LLI_CLASS: &str = "java/util/LinkedList$ListItr";
+
+/// The `LinkedList` being walked.
+const LLI_SLOT_LIST: usize = 0;
+/// The node `next()` will return, or null at the end. The JDK's `next`.
+const LLI_SLOT_NEXT: usize = 1;
+/// The node the last `next()`/`previous()` returned, or null. The JDK's
+/// `lastReturned`, and the flag `set`/`remove` raise `IllegalStateException` on.
+const LLI_SLOT_LAST: usize = 2;
+/// `nextIndex()`.
+const LLI_SLOT_INDEX: usize = 3;
+/// The list size this iterator was created against — the poor relation of the
+/// JDK's `expectedModCount`. See `lli_check_comodification`.
+const LLI_SLOT_EXPECTED_SIZE: usize = 4;
+const LLI_SLOTS: usize = 5;
+
+/// The fewest fields a REAL `java.util.LinkedList$ListItr` declares —
+/// `lastReturned`, `next`, `nextIndex`, `expectedModCount`. (The real class also
+/// carries `this$0`; four is the conservative floor, since the point is only to
+/// separate a real class from a fabricated one, which declares zero.)
+const LLI_REAL_MIN_FIELDS: usize = 4;
+
+/// Where this iterator's state starts: past the carrier's own declared fields.
+#[inline]
+fn lli_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this).saturating_sub(LLI_SLOTS)
+}
+
+/// [`lli_base`], answering `None` for an iterator this VM did not mint.
+///
+/// A real `LinkedList$ListItr` that java.base built is exactly
+/// `class_num_total_fields` wide (`lastReturned`, `next`, `nextIndex`,
+/// `expectedModCount`, `this$0`) and carries none of this VM's five. Without
+/// this test every native below would read `expectedModCount` as the list.
+#[inline]
+fn lli_base_checked(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let width = ctx.object_num_fields(this);
+    let declared = ctx.class_num_total_fields(ctx.class_id_of_object(this));
+    // `declared` is also floored: on an image where the carrier is a fabricated
+    // 0-field stand-in, `declared + LLI_SLOTS` equals the width of anything this
+    // VM minted AND of anything else five slots wide, so the test would stop
+    // discriminating. `alloc_lli_view` refuses to mint on such an image, and
+    // this is the matching refusal on the read side.
+    if declared < LLI_REAL_MIN_FIELDS || width < declared + LLI_SLOTS {
+        return None;
+    }
+    Some(width - LLI_SLOTS)
+}
+
+/// Whether `this` is a live LinkedList list-iterator this VM minted.
+fn is_live_ll_list_itr(ctx: &dyn NativeContext, this: ObjectRef, class_name: &str) -> bool {
+    class_name == LLI_CLASS && lli_base_checked(ctx, this).is_some()
+}
+
+/// Run the receiver's OWN bytecode when it is a `LinkedList$ListItr` this VM
+/// did not mint. `None` means the receiver is ours and the caller proceeds.
+fn lli_delegate_foreign(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if lli_base_checked(&*ctx, this).is_some() {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
+}
+
+fn lli_obj(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Option<ObjectRef> {
+    let base = lli_base_checked(ctx, this)?;
+    match ctx.get_field(this, base + slot) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn lli_int(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> i32 {
+    match lli_base_checked(ctx, this) {
+        Some(base) => match ctx.get_field(this, base + slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
+        None => 0,
+    }
+}
+
+fn lli_put(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+    if let Some(base) = lli_base_checked(&*ctx, this) {
+        ctx.set_field(this, base + slot, v);
+    }
+}
+
+/// The JDK's `checkForComodification`, over SIZE rather than a modCount.
+///
+/// `LinkedList`'s overlay has no `modCount` and adding one means bumping it in
+/// every mutator in this file — a much wider change than this carrier, and one
+/// that fails open (a missed bump is a missed exception). Size is the
+/// conservative half of the same test: it catches every structural change that
+/// alters the length, which is `add`, `remove`, `clear` and `addAll`, and
+/// misses only a balanced add+remove between two calls. It can never fire
+/// SPURIOUSLY, which is the direction that matters — a false
+/// `ConcurrentModificationException` on a correct program is far worse than a
+/// missed one on an incorrect program.
+fn lli_check_comodification(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    list: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if ll_size(ctx, list) != lli_int(ctx, this, LLI_SLOT_EXPECTED_SIZE) {
+        return Err(RuntimeError::ConcurrentModificationException.into());
+    }
+    Ok(())
+}
+
+/// Allocate a live `LinkedList$ListItr` over `list`, positioned at `index`.
+///
+/// `None` when this image has no real `java.util.LinkedList$ListItr` — the
+/// caller then keeps the iterator it has always returned.
+///
+/// TWO tests, and the second one is the load-bearing half.
+/// `ensure_class_initialized` can report `Ok` having FABRICATED a stand-in, and
+/// a fabricated stand-in carries exactly the name that was asked for — so the
+/// name check alone admits it. The real `java.util.LinkedList$ListItr` declares
+/// `lastReturned`, `next`, `nextIndex`, `expectedModCount` and `this$0`; a
+/// fabricated one declares nothing. Anchoring on `class_num_total_fields` is
+/// what tells them apart, and getting it wrong is not a cosmetic mistake:
+/// minting a fabricated `java/util/*` carrier is what §5 of the native contract
+/// forbids, and it made `vm::tests::linked_list_iterator` fail on the
+/// synthetic-JDK build — that test asks `LinkedList.iterator()` for an iterator
+/// and then calls `java/util/LinkedList$Itr.hasNext` on it BY NAME, which is
+/// the correct expectation for an image that has no real carrier to wear.
+fn alloc_lli_view(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(LLI_CLASS).ok()?;
+    if ctx.class_name_arc_of_id(cid).as_deref() != Some(LLI_CLASS) {
+        return None;
+    }
+    let declared = ctx.class_num_total_fields(cid);
+    if declared < LLI_REAL_MIN_FIELDS {
+        return None;
+    }
+    let n = declared + LLI_SLOTS;
+    let size = ll_size(&*ctx, list);
+    // GC-SAFETY: `alloc_object` collects and `list` is a bare Rust local the
+    // collector cannot see. Root it across the allocation and read both halves
+    // back through their pins before the stores.
+    let list_pin = ctx.pin_native_root(list);
+    let itr = ctx.alloc_object(cid, n);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let list = ctx.read_native_pin(list_pin, list);
+    let base = n - LLI_SLOTS;
+    ctx.set_field(itr, base + LLI_SLOT_LIST, Value::Object(Some(list)));
+    // The node walk is a plain pointer chase over already-live objects, but it
+    // is done AFTER the allocation and through the pinned list.
+    let start = if index <= 0 {
+        match ll_get(&*ctx, list, "head") {
+            Value::Object(Some(n)) => Some(n),
+            _ => None,
+        }
+    } else if index >= size {
+        None
+    } else {
+        ll_node_at(&*ctx, list, index)
+    };
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr, base + LLI_SLOT_NEXT, Value::Object(start));
+    // Written EXPLICITLY, never left to whatever `alloc_object` zero-initialises
+    // an undeclared slot to: a non-null `lastReturned` read out of an unwritten
+    // slot makes `remove()` before any `next()` unlink a real node instead of
+    // raising, and an int-zero `nextIndex` on a `listIterator(k)` silently
+    // reports the wrong position. `ArrayList$SubList$1`'s `lastRet` is the same
+    // hazard, one collection over.
+    ctx.set_field(itr, base + LLI_SLOT_LAST, Value::Object(None));
+    ctx.set_field(itr, base + LLI_SLOT_INDEX, Value::Int(index.clamp(0, size)));
+    ctx.set_field(itr, base + LLI_SLOT_EXPECTED_SIZE, Value::Int(size));
+    ctx.unpin_native_roots(list_pin);
+    Some(itr)
+}
+
+/// `(list, next, lastReturned, nextIndex)` for a receiver this VM minted.
+fn lli_state(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Option<(
+    ObjectRef,
+    ObjectRef,
+    Option<ObjectRef>,
+    Option<ObjectRef>,
+    i32,
+)> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let list = lli_obj(ctx, this, LLI_SLOT_LIST)?;
+    Some((
+        this,
+        list,
+        lli_obj(ctx, this, LLI_SLOT_NEXT),
+        lli_obj(ctx, this, LLI_SLOT_LAST),
+        lli_int(ctx, this, LLI_SLOT_INDEX),
+    ))
+}
+
+fn native_lli_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "hasNext", "()Z") {
+        return r;
+    }
+    let (this, list, _next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let _ = this;
+    Ok(Some(Value::Int((index < ll_size(&*ctx, list)) as i32)))
+}
+
+fn native_lli_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "next", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let (this, list, next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Err(bare_no_such_element(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    let node = match next {
+        Some(n) if index < ll_size(&*ctx, list) => n,
+        _ => return Err(bare_no_such_element(ctx)),
+    };
+    let elem = ctx.get_field(node, LL_NODE_ELEM);
+    let following = match ctx.get_field(node, LL_NODE_NEXT) {
+        Value::Object(Some(n)) => Some(n),
+        _ => None,
+    };
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(Some(node)));
+    lli_put(ctx, this, LLI_SLOT_NEXT, Value::Object(following));
+    lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index + 1));
+    Ok(Some(elem))
+}
+
+fn native_lli_has_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "hasPrevious", "()Z") {
+        return r;
+    }
+    let (_this, _list, _next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int((index > 0) as i32)))
+}
+
+fn native_lli_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "previous", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let (this, list, next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Err(bare_no_such_element(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    if index <= 0 {
+        return Err(bare_no_such_element(ctx));
+    }
+    // The JDK's `next = (next == null) ? last : next.prev` — a cursor parked
+    // past the end steps back onto the tail.
+    let node = match next {
+        Some(n) => match ctx.get_field(n, LL_NODE_PREV) {
+            Value::Object(Some(p)) => p,
+            _ => return Err(bare_no_such_element(ctx)),
+        },
+        None => match ll_get(&*ctx, list, "tail") {
+            Value::Object(Some(t)) => t,
+            _ => return Err(bare_no_such_element(ctx)),
+        },
+    };
+    let elem = ctx.get_field(node, LL_NODE_ELEM);
+    lli_put(ctx, this, LLI_SLOT_NEXT, Value::Object(Some(node)));
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(Some(node)));
+    lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index - 1));
+    Ok(Some(elem))
+}
+
+fn native_lli_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "nextIndex", "()I") {
+        return r;
+    }
+    Ok(Some(Value::Int(
+        lli_state(&*ctx, args).map(|s| s.4).unwrap_or(0),
+    )))
+}
+
+fn native_lli_previous_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "previousIndex", "()I") {
+        return r;
+    }
+    Ok(Some(Value::Int(
+        lli_state(&*ctx, args).map(|s| s.4).unwrap_or(0) - 1,
+    )))
+}
+
+fn native_lli_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "set", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let (this, list, _next, last, _index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let node = match last {
+        Some(n) => n,
+        None => return Err(sli_illegal_state(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(node, LL_NODE_ELEM, elem);
+    Ok(None)
+}
+
+fn native_lli_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "remove", "()V") {
+        return r;
+    }
+    let (this, list, next, last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let node = match last {
+        Some(n) => n,
+        None => return Err(sli_illegal_state(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    // The JDK's bookkeeping, verbatim: if the cursor was sitting ON the node
+    // being removed (a `previous()` then `remove()`), it steps forward onto its
+    // successor and the index does NOT move; otherwise the cursor is past it
+    // and the index drops by one.
+    let following = match ctx.get_field(node, LL_NODE_NEXT) {
+        Value::Object(Some(n)) => Some(n),
+        _ => None,
+    };
+    ll_unlink_node(ctx, list, node);
+    if next == Some(node) {
+        lli_put(ctx, this, LLI_SLOT_NEXT, Value::Object(following));
+    } else {
+        lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index - 1));
+    }
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(None));
+    let expected = lli_int(&*ctx, this, LLI_SLOT_EXPECTED_SIZE);
+    lli_put(ctx, this, LLI_SLOT_EXPECTED_SIZE, Value::Int(expected - 1));
+    Ok(None)
+}
+
+fn native_lli_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "add", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let (this, list, next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    match next {
+        Some(succ) => ll_link_before(ctx, list, elem, succ)?,
+        None => ll_link_last(ctx, list, elem)?,
+    }
+    // `add` clears `lastReturned`, so an immediately following `set`/`remove`
+    // raises — the JDK's rule, and the reason `listIterator.add then set` is a
+    // probe row.
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(None));
+    lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index + 1));
+    let expected = lli_int(&*ctx, this, LLI_SLOT_EXPECTED_SIZE);
+    lli_put(ctx, this, LLI_SLOT_EXPECTED_SIZE, Value::Int(expected + 1));
+    Ok(None)
+}
+
+fn register_ll_list_itr_natives(registry: &mut NativeMethodRegistry) {
+    let prev = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let c = LLI_CLASS;
+    registry.register(c, "hasNext", "()Z", native_lli_has_next);
+    registry.register(c, "next", "()Ljava/lang/Object;", native_lli_next);
+    registry.register(c, "hasPrevious", "()Z", native_lli_has_previous);
+    registry.register(c, "previous", "()Ljava/lang/Object;", native_lli_previous);
+    registry.register(c, "nextIndex", "()I", native_lli_next_index);
+    registry.register(c, "previousIndex", "()I", native_lli_previous_index);
+    registry.register(c, "set", "(Ljava/lang/Object;)V", native_lli_set);
+    registry.register(c, "remove", "()V", native_lli_remove);
+    registry.register(c, "add", "(Ljava/lang/Object;)V", native_lli_add);
+    registry.set_category(prev);
 }
 
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
@@ -32613,6 +35282,12 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // The real carrier when this image has one; the snapshot below when it does
+    // not (a synthetic-JDK build, where no `java.util.LinkedList$ListItr` exists
+    // to wear).
+    if let Some(live) = alloc_lli_view(ctx, this, 0) {
+        return Ok(Some(Value::Object(Some(live))));
+    }
     // GC-safety: the snapshot and the iterator shell each allocate; `this`
     // and the snapshot are both stored afterwards. See `rooted_across`.
     let mut this = this;
@@ -32641,12 +35316,16 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // collect, and `arr` and `this` are stored into the result immediately
     // after, so hoisting it out would leave both unrooted across a moving GC.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
-        ctx.alloc_object(cid, 3)
+        let cid = ctx.ensure_vm_internal_class(
+            "cratonvm/internal/LinkedListSnapshotListItr",
+            LLI_NUM_FIELDS,
+        );
+        ctx.alloc_object(cid, LLI_NUM_FIELDS)
     });
-    ctx.set_field(it, 0, Value::Object(Some(arr)));
-    ctx.set_field(it, 1, Value::Int(0));
-    ctx.set_field(it, 2, Value::Object(Some(this)));
+    ctx.set_field(it, LLI_FIELD_ARR, Value::Object(Some(arr)));
+    ctx.set_field(it, LLI_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(it, LLI_FIELD_LIST, Value::Object(Some(this)));
+    lli_set_last_ret(ctx, it, -1);
     Ok(Some(Value::Object(Some(it))))
 }
 
@@ -32659,6 +35338,15 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    // `listIterator(index)` bounds-checks BEFORE constructing, and the JDK's
+    // message is the one `ll_out_of_bounds` builds.
+    let size = ll_size(&*ctx, this);
+    if idx < 0 || idx > size {
+        return Err(ll_out_of_bounds(idx, size));
+    }
+    if let Some(live) = alloc_lli_view(ctx, this, idx) {
+        return Ok(Some(Value::Object(Some(live))));
+    }
     // GC-safety: the snapshot and the iterator shell each allocate; `this`
     // and the snapshot are both stored afterwards. See `rooted_across`.
     let mut this = this;
@@ -32668,12 +35356,16 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     });
     // Same mint, same pairing, as `native_ll_list_iterator` above.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
-        ctx.alloc_object(cid, 3)
+        let cid = ctx.ensure_vm_internal_class(
+            "cratonvm/internal/LinkedListSnapshotListItr",
+            LLI_NUM_FIELDS,
+        );
+        ctx.alloc_object(cid, LLI_NUM_FIELDS)
     });
-    ctx.set_field(it, 0, Value::Object(Some(arr)));
-    ctx.set_field(it, 1, Value::Int(idx.max(0)));
-    ctx.set_field(it, 2, Value::Object(Some(this)));
+    ctx.set_field(it, LLI_FIELD_ARR, Value::Object(Some(arr)));
+    ctx.set_field(it, LLI_FIELD_CURSOR, Value::Int(idx.max(0)));
+    ctx.set_field(it, LLI_FIELD_LIST, Value::Object(Some(this)));
+    lli_set_last_ret(ctx, it, -1);
     Ok(Some(Value::Object(Some(it))))
 }
 
@@ -32732,6 +35424,7 @@ fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let elem = ctx.get_array_element(arr, cursor as usize);
     ctx.set_field(this, 1, Value::Int(cursor + 1));
+    lli_set_last_ret(ctx, this, cursor);
     Ok(Some(elem))
 }
 
@@ -32784,6 +35477,10 @@ fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     let elem = ctx.get_array_element(arr, (cursor - 1) as usize);
     ctx.set_field(this, 1, Value::Int(cursor - 1));
+    // The JDK's `previous()` leaves `lastReturned` on the element it returned,
+    // which is now AT the cursor — not behind it. `set` after `previous` is the
+    // row that tells the two apart.
+    lli_set_last_ret(ctx, this, cursor - 1);
     Ok(Some(elem))
 }
 
@@ -32815,25 +35512,30 @@ fn native_ll_listitr_previous_index(
 }
 
 fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Set the element at (cursor - 1) in both the snapshot array AND the
-    // backing LinkedList node, so `List.sort` actually sorts.
+    // Set the element the last `next()`/`previous()` returned, in both the
+    // snapshot array AND the backing LinkedList node, so `List.sort` actually
+    // sorts.
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    let cursor = match ctx.get_field(this, 1) {
+    let cursor = match ctx.get_field(this, LLI_FIELD_CURSOR) {
         Value::Int(v) => v,
         _ => 0,
     };
-    let idx = cursor - 1;
+    let idx = lli_target_index(&*ctx, this, cursor);
     if idx < 0 {
-        return Ok(None);
+        // Was `Ok(None)` — a silent no-op where HotSpot raises. A `set()` with
+        // no preceding `next()` is a caller bug, and swallowing it is the
+        // "reported success and changed nothing" shape the sublist iterators
+        // were fixed out of.
+        return Err(sli_illegal_state(ctx));
     }
-    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+    if let Value::Object(Some(arr)) = ctx.get_field(this, LLI_FIELD_ARR) {
         ctx.set_array_element(arr, idx as usize, elem);
     }
-    if let Value::Object(Some(list)) = ctx.get_field(this, 2) {
+    if let Value::Object(Some(list)) = ctx.get_field(this, LLI_FIELD_LIST) {
         if let Some(node) = ll_node_at(ctx, list, idx) {
             ctx.set_field(node, LL_NODE_ELEM, elem);
         }
@@ -32847,11 +35549,72 @@ fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// mutation must throw `UnsupportedOperationException` rather than silently
 /// no-op'ing (which would mask caller bugs and diverge from real JDK
 /// behaviour). Used for both `remove()` and `add(Object)`.
-fn native_ll_listitr_remove_noop(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Err(unsupported_op())
+/// `ListItr.remove()` — the JDK's body against this VM's snapshot state.
+///
+/// Was a shared `Err(unsupported_op())` stub with `add`. `LinkedList` is a
+/// `List`, `listIterator()` is specified to return a mutating iterator, and
+/// `AbstractList`'s own `removeAll`/`retainAll`/`Collection.removeIf` defaults
+/// all reach it — so the stub did not merely lose a feature, it made every
+/// default method that drains a `LinkedList` through its list-iterator throw.
+fn native_ll_listitr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Err(sli_illegal_state(ctx)),
+    };
+    let cursor = match ctx.get_field(this, LLI_FIELD_CURSOR) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let idx = lli_target_index(&*ctx, this, cursor);
+    if idx < 0 {
+        return Err(sli_illegal_state(ctx));
+    }
+    let list = match ctx.get_field(this, LLI_FIELD_LIST) {
+        Value::Object(Some(l)) => l,
+        _ => return Err(sli_illegal_state(ctx)),
+    };
+    if let Some(node) = ll_node_at(&*ctx, list, idx) {
+        ll_unlink_node(ctx, list, node);
+    }
+    lli_resnapshot(ctx, this, list);
+    // The JDK's `cursor` bookkeeping: removing an element the iterator has
+    // already passed shifts everything after it down by one.
+    if idx < cursor {
+        ctx.set_field(this, LLI_FIELD_CURSOR, Value::Int(cursor - 1));
+    }
+    lli_set_last_ret(ctx, this, -1);
+    Ok(None)
+}
+
+/// `ListItr.add(e)` — insert before the implicit cursor, per the JDK: the new
+/// element goes where `next()` would have read, `nextIndex()` advances past it,
+/// and `lastRet` is cleared so an immediately following `set`/`remove` raises.
+fn native_ll_listitr_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let cursor = match ctx.get_field(this, LLI_FIELD_CURSOR) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let list = match ctx.get_field(this, LLI_FIELD_LIST) {
+        Value::Object(Some(l)) => l,
+        _ => return Ok(None),
+    };
+    native_ll_add_at(
+        ctx,
+        &[
+            Value::Object(Some(list)),
+            Value::Int(cursor.max(0)),
+            elem,
+        ],
+    )?;
+    lli_resnapshot(ctx, this, list);
+    ctx.set_field(this, LLI_FIELD_CURSOR, Value::Int(cursor.max(0) + 1));
+    lli_set_last_ret(ctx, this, -1);
+    Ok(None)
 }
 
 fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33902,7 +36665,24 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 // LinkedList$Itr = 2-field synthetic (field 0 = current node, field 1 = list ref for size tracking)
+/// `LinkedList.iterator()`.
+///
+/// On HotSpot this method does not exist: `LinkedList` inherits
+/// `AbstractSequentialList.iterator()`, which is `return listIterator();`. So
+/// `iterator()` and `listIterator()` return the SAME class, and
+/// `linkedList.iterator() instanceof ListIterator` is true. This VM returned a
+/// separate `java/util/LinkedList$Itr` — a name the real JDK does not declare —
+/// so both of those were wrong. Route to the same carrier and the divergence
+/// closes at the source rather than at nine more registrations.
+///
+/// The `LinkedList$Itr` body below is retained, unchanged, for the image that
+/// has no real `LinkedList$ListItr` to wear.
 fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(live) = alloc_lli_view(ctx, this, 0) {
+            return Ok(Some(Value::Object(Some(live))));
+        }
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
@@ -34022,10 +36802,16 @@ fn native_ll_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(n)) => n,
         _ => {
             // `remove()` before `next()`, or twice in a row.
-            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-                message: "remove".to_string(),
-            }
-            .into());
+            //
+            // Through `sli_illegal_state`, which builds the exception with NO
+            // message. `RuntimeError::IllegalStateException` always supplies
+            // one, so this printed `java.lang.IllegalStateException: remove`
+            // where HotSpot prints `java.lang.IllegalStateException` —
+            // `Throwable.toString()` omits the suffix only for a null message.
+            // The `"remove"` text belongs to `Iterator.remove()`'s throwing
+            // DEFAULT, which is a different exception from a different class;
+            // copying it here made the two indistinguishable in a log.
+            return Err(sli_illegal_state(ctx));
         }
     };
     let list = match ctx.get_field(this, 1) {
@@ -35421,7 +38207,8 @@ fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let vals = lhm_collect_values(ctx, this);
-    let list = make_view_list_of(ctx, this, &vals)?;
+    let carrier = values_carrier_for(&*ctx, this);
+    let list = make_view_list_of(ctx, this, &vals, carrier)?;
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -35458,15 +38245,16 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let mut this = this;
     let flat: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (flat_base, flat_pins) = pin_value_slice(ctx, &flat);
+    let carrier = set_view_carrier_for(&*ctx, this, VIEW_KIND_ENTRYSET);
     let mut set = rooted_across(ctx, &mut [&mut this], |ctx| {
-        try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)
+        alloc_set_view_carrier(ctx, carrier)
     })?;
     let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let this_at_call = this;
     let mut backing_map = rooted_across(ctx, &mut [&mut this, &mut set], |ctx| {
         alloc_view_backing(ctx, this_at_call, VIEW_KIND_ENTRYSET, cap)
     })?;
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
     for i in 0..pairs.len() {
         let mut entry_obj =
             rooted_across(ctx, &mut [&mut this, &mut set, &mut backing_map], |ctx| {
@@ -37652,7 +40440,15 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         // LDAPDn.getParentDn → LdapName.getPrefix/toString SIGSEGV; also a wild
         // call through StringBuilder.append(Object) → EXCEPTION_ACCESS_VIOLATION).
         // Read the real slice straight out of the parent's backing array instead.
-        if cls_name == ASL_CLASS {
+        // Both carriers, and only for a view this VM minted: a `SubList`
+        // java.base's own bytecode built carries none of these fields, and
+        // falling THROUGH is right for it — the ArrayList-shape heuristic
+        // below does not match its `(modCount:int, root:ref, ...)` layout, so
+        // it reaches the `toArray()` fallback, which runs the receiver's own
+        // correct bytecode.
+        if (cls_name == ASL_CLASS || cls_name == ASL_REAL_CLASS)
+            && asl_base_checked(ctx, coll).is_some()
+        {
             if let Some((parent, offset, size, _expected)) = asl_state(ctx, coll) {
                 if size > 0 {
                     if let (Some(data), _) = al_state(ctx, parent) {
@@ -38124,8 +40920,21 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         .class_id_by_name("java/util/HashSet")
         .map(|hs| cid == hs || ctx.is_subclass(cid, hs))
         .unwrap_or(false);
-    if is_hashset_like && HS_FIELD_MAP < n_fields {
-        if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
+    // A keySet/entrySet view is HashSet-shaped but is NOT a `HashSet` subclass
+    // since it got its own carrier class (`SET_VIEW_CARRIERS`), and it keeps
+    // its backing past its declared fields rather than at slot 0. The gate
+    // above is about not mistaking an arbitrary `Set` with a `HashMap` in slot
+    // 0 for a HashSet; a carrier is not arbitrary, so it is admitted by name.
+    let backing_slot = if is_hashset_like {
+        Some(HS_FIELD_MAP)
+    } else {
+        match ctx.class_name_arc_of_id(cid).as_deref() {
+            Some(n) if is_set_view_carrier(n) => Some(ctx.class_num_total_fields(cid)),
+            _ => None,
+        }
+    };
+    if backing_slot.is_some_and(|s| s < n_fields) {
+        if let Value::Object(Some(backing)) = ctx.get_field(coll, backing_slot.unwrap()) {
             // An insertion-ordered set (LinkedHashSet / CopyOnWriteArraySet) is
             // backed by a LinkedHashMap, which keeps its entries in the
             // insertion-order overlay rather than the bucket array — so the
@@ -38709,6 +41518,25 @@ fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // A key/entry-iterator carrier keeps its snapshot at `key_itr_base`, not at
+    // slot 0 — slot 0 there is the JDK class's own `next` field. Route it to the
+    // dedicated native; without this the array probe below misses and the
+    // iterator falls through to the real-bytecode arm, which walks a `next`
+    // chain nothing populated and reports every collection exhausted.
+    //
+    // Gated on the object's WIDTH, not its class name: this native is the
+    // per-element `hasNext` of every snapshot iterator in the VM, and a name
+    // lookup here would be paid by all of them. Only a carrier is wider than
+    // the five native fields (see `key_itr_base`), so a base of 0 — the
+    // fabricated `HashMap$KeyItr` and the legacy three-field shape — keeps
+    // reading slot 0 exactly as before.
+    if key_itr_base(ctx, this) > 0 {
+        let cid = ctx.class_id_of_object(this);
+        let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+        if is_map_key_itr_class(&cn) {
+            return native_map_key_itr_has_next(ctx, args);
+        }
+    }
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
         _ => {
@@ -38725,6 +41553,13 @@ fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // `cursor` int), so service them from the backing collection.
             if let Some((_queue, size, cursor)) = real_inner_itr_state(ctx, this, &cn) {
                 return Ok(Some(Value::Int(if cursor < size { 1 } else { 0 })));
+            }
+            // The live sublist iterator, routed DELIBERATELY: the by-name
+            // re-dispatch below would reach the same body, but only by
+            // accident, and only while that fallback keeps working. See
+            // `is_live_sublist_itr`.
+            if is_live_sublist_itr(&*ctx, this, &cn) {
+                return native_sli_has_next(ctx, args);
             }
             // Any other real iterator: try its concrete `hasNext` bytecode by
             // name, but guard against the shadow-recursion — if dispatch
@@ -38817,7 +41652,7 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // otherwise it.remove() throws spurious IllegalStateException.
     let cid = ctx.class_id_of_object(this);
     let cn = ctx.class_name_of_id(cid).unwrap_or_default();
-    if cn == "java/util/HashMap$KeyItr" {
+    if is_map_key_itr_class(&cn) {
         return native_map_key_itr_next(ctx, args);
     }
     // Real-JDK fallback: see `native_snapshot_itr_has_next` doc comment.
@@ -38839,6 +41674,9 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                     }
                     .into(),
                 );
+            }
+            if is_live_sublist_itr(&*ctx, this, &cn) {
+                return native_sli_next(ctx, args);
             }
             if !cn.is_empty() && cn != "java/util/Iterator" && cn != "java/util/ListIterator" {
                 // Guard the shadow-recursion (same as hasNext).
@@ -42888,7 +45726,18 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // collect, moving both `this` and every key still held only in `pairs`.
     let this_pin = ctx.pin_native_root(this);
     let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let ts = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    // The carrier is `java/util/TreeMap$KeySet` — what HotSpot's
+    // `treeMap.keySet().getClass()` answers — falling back to `java/util/TreeSet`
+    // when that class cannot be had. Nothing about the view's STATE depends on
+    // the choice: a native TreeSet keeps `(data, size, comparator)` in the
+    // `ts_array_table` side-table keyed on the object, never in its fields, so
+    // the carrier's own declared `m` slot is neither read nor written. What the
+    // choice does need is the `native_ts_*` family registered on the carrier
+    // (`register_tree_set_natives`) and the name in both force-native gates.
+    let ts = match try_alloc_declared_width(ctx, "java/util/TreeMap$KeySet", TS_NUM_FIELDS) {
+        Ok(o) => o,
+        Err(_) => try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?,
+    };
     // Reserve one extra trailing slot and stash the source TreeMap there so the
     // keySet view writes through (`keySet().remove` / `iterator().remove`).
     // The slot lives beyond the logical size, so sorted iteration / binary
@@ -43044,7 +45893,8 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
     let vals: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
-    let list = make_view_list_of(ctx, this, &vals)?;
+    let carrier = values_carrier_for(&*ctx, this);
+    let list = make_view_list_of(ctx, this, &vals, carrier)?;
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -43086,7 +45936,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .map(|i| read_pinned_elem(ctx, entry_pins[i], entries[i]))
         .collect();
     let this = ctx.read_native_pin(this_pin, this);
-    let list = make_view_list_of(ctx, this, &entries)?;
+    let list = make_view_list_of(ctx, this, &entries, "java/util/TreeMap$EntrySet")?;
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
@@ -43936,6 +46786,7 @@ fn native_ts_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, comparator) = ts_state(ctx, this);
     // W7-36 residual: `TreeSet.contains` is `m.containsKey(o)`, i.e. the same
     // `getEntry` null-check + `Comparable` checkcast `native_ts_add` already
@@ -43958,6 +46809,7 @@ fn native_ts_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let size = match ts_get_slot(ctx, this, TS_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -44101,6 +46953,7 @@ fn native_ts_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let size = match ts_get_slot(ctx, this, TS_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -44142,6 +46995,7 @@ fn native_ts_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             )
         }
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // Treat a None backing array as empty rather than panicking on `unwrap`.
     let data = match data_opt {
@@ -44170,6 +47024,7 @@ fn native_ts_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             )
         }
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // Treat a None backing array as empty rather than panicking on `unwrap`.
     let data = match data_opt {
@@ -44312,6 +47167,7 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // GC-safety: both allocations below collect; `this`, the backing data array
     // and the snapshot are bare Rust locals used afterwards. See `rooted_across`.
@@ -44470,6 +47326,7 @@ fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -44503,6 +47360,7 @@ fn native_ts_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // cceres3: `data` spans the result-array allocation — pin + re-read.
     let data_pin = data_opt.map(|d| ctx.pin_native_root(d));
@@ -44523,6 +47381,7 @@ fn native_ts_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     let mut buf = String::from("[");
     if let Some(data) = data_opt {
@@ -44987,6 +47846,7 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     let n = size as usize;
     // GC-safety: see `native_ts_iterator`.
@@ -45559,140 +48419,149 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
 fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let c = "java/util/TreeSet";
-    registry.register(c, "<init>", "()V", native_ts_init);
-    registry.register(
-        c,
-        "<init>",
-        "(Ljava/util/Comparator;)V",
-        native_ts_init_comparator,
-    );
-    registry.register(
-        c,
-        "<init>",
-        "(Ljava/util/Collection;)V",
-        native_ts_init_collection,
-    );
-    registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
-    registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
-    // Serialization: drive the stream from `ts_state` so a native TreeSet
-    // round-trips byte-correct (the inherited real methods go through the
-    // never-populated backing `m` TreeMap → an empty set).
-    registry.register(
-        c,
-        "writeObject",
-        "(Ljava/io/ObjectOutputStream;)V",
-        native_ts_write_object,
-    );
-    registry.register(
-        c,
-        "readObject",
-        "(Ljava/io/ObjectInputStream;)V",
-        native_ts_read_object,
-    );
-    registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ts_contains);
-    registry.register(c, "size", "()I", native_ts_size);
-    registry.register(c, "isEmpty", "()Z", native_ts_is_empty);
-    registry.register(c, "clear", "()V", native_ts_clear);
-    registry.register(c, "first", "()Ljava/lang/Object;", native_ts_first);
-    registry.register(c, "last", "()Ljava/lang/Object;", native_ts_last);
-    registry.register(
-        c,
-        "ceiling",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_ceiling,
-    );
-    registry.register(
-        c,
-        "floor",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_floor,
-    );
-    registry.register(
-        c,
-        "higher",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_higher,
-    );
-    registry.register(
-        c,
-        "lower",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_lower,
-    );
-    registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ts_iterator);
-    registry.register(
-        c,
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-        native_ts_for_each,
-    );
-    registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ts_to_array);
-    registry.register(c, "toString", "()Ljava/lang/String;", native_ts_to_string);
-    registry.register(
-        c,
-        "comparator",
-        "()Ljava/util/Comparator;",
-        native_ts_comparator,
-    );
-    registry.register(
-        c,
-        "headSet",
-        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-        native_ts_head_set,
-    );
-    registry.register(
-        c,
-        "tailSet",
-        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-        native_ts_tail_set,
-    );
-    registry.register(
-        c,
-        "subSet",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
-        native_ts_sub_set,
-    );
-    // NavigableSet range views (inclusive flags). The inherited bytecode reads
-    // the never-populated backing `m` TreeMap and NPEs; drive them from the
-    // side-table. (PMRPR's jar-entry scan calls `tailSet(entry, false)`.)
-    registry.register(
-        c,
-        "tailSet",
-        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
-        native_ts_tail_set_inclusive,
-    );
-    registry.register(
-        c,
-        "headSet",
-        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
-        native_ts_head_set_inclusive,
-    );
-    registry.register(
-        c,
-        "subSet",
-        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
-        native_ts_sub_set_inclusive,
-    );
-    registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
-    registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
-    // Descending/poll views — read the backing `m` TreeMap in real JDK, which
-    // CratonVM's native TreeSet never populates (state lives in the side-table),
-    // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
-    registry.register(
-        c,
-        "descendingIterator",
-        "()Ljava/util/Iterator;",
-        native_ts_descending_iterator,
-    );
-    registry.register(
-        c,
-        "descendingSet",
-        "()Ljava/util/NavigableSet;",
-        native_ts_descending_set,
-    );
-    registry.register(c, "pollFirst", "()Ljava/lang/Object;", native_ts_poll_first);
-    registry.register(c, "pollLast", "()Ljava/lang/Object;", native_ts_poll_last);
+    // Every registration below is mirrored onto `java/util/TreeMap$KeySet`, the
+    // class `native_tm_key_set` mints a TreeMap keySet view under since
+    // 2026-08-13 (HotSpot: `treeMap.keySet().getClass()` is
+    // `java.util.TreeMap$KeySet`, not `java.util.TreeSet`). The view is a
+    // TreeSet-SHAPED object under its own class — its state is in the
+    // `ts_array_table` side-table, not in fields — so it needs the identical
+    // native surface, and `force_native_over_real_jdk_bytecode` carries the name
+    // so the JDK's own `KeySet` bodies (which read `m`, null here) never run.
+    for c in ["java/util/TreeSet", "java/util/TreeMap$KeySet"] {
+        registry.register(c, "<init>", "()V", native_ts_init);
+        registry.register(
+            c,
+            "<init>",
+            "(Ljava/util/Comparator;)V",
+            native_ts_init_comparator,
+        );
+        registry.register(
+            c,
+            "<init>",
+            "(Ljava/util/Collection;)V",
+            native_ts_init_collection,
+        );
+        registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
+        registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
+        // Serialization: drive the stream from `ts_state` so a native TreeSet
+        // round-trips byte-correct (the inherited real methods go through the
+        // never-populated backing `m` TreeMap → an empty set).
+        registry.register(
+            c,
+            "writeObject",
+            "(Ljava/io/ObjectOutputStream;)V",
+            native_ts_write_object,
+        );
+        registry.register(
+            c,
+            "readObject",
+            "(Ljava/io/ObjectInputStream;)V",
+            native_ts_read_object,
+        );
+        registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ts_contains);
+        registry.register(c, "size", "()I", native_ts_size);
+        registry.register(c, "isEmpty", "()Z", native_ts_is_empty);
+        registry.register(c, "clear", "()V", native_ts_clear);
+        registry.register(c, "first", "()Ljava/lang/Object;", native_ts_first);
+        registry.register(c, "last", "()Ljava/lang/Object;", native_ts_last);
+        registry.register(
+            c,
+            "ceiling",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_ceiling,
+        );
+        registry.register(
+            c,
+            "floor",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_floor,
+        );
+        registry.register(
+            c,
+            "higher",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_higher,
+        );
+        registry.register(
+            c,
+            "lower",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_lower,
+        );
+        registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ts_iterator);
+        registry.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_ts_for_each,
+        );
+        registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ts_to_array);
+        registry.register(c, "toString", "()Ljava/lang/String;", native_ts_to_string);
+        registry.register(
+            c,
+            "comparator",
+            "()Ljava/util/Comparator;",
+            native_ts_comparator,
+        );
+        registry.register(
+            c,
+            "headSet",
+            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+            native_ts_head_set,
+        );
+        registry.register(
+            c,
+            "tailSet",
+            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+            native_ts_tail_set,
+        );
+        registry.register(
+            c,
+            "subSet",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+            native_ts_sub_set,
+        );
+        // NavigableSet range views (inclusive flags). The inherited bytecode reads
+        // the never-populated backing `m` TreeMap and NPEs; drive them from the
+        // side-table. (PMRPR's jar-entry scan calls `tailSet(entry, false)`.)
+        registry.register(
+            c,
+            "tailSet",
+            "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+            native_ts_tail_set_inclusive,
+        );
+        registry.register(
+            c,
+            "headSet",
+            "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+            native_ts_head_set_inclusive,
+        );
+        registry.register(
+            c,
+            "subSet",
+            "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
+            native_ts_sub_set_inclusive,
+        );
+        registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+        registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
+        // Descending/poll views — read the backing `m` TreeMap in real JDK, which
+        // CratonVM's native TreeSet never populates (state lives in the side-table),
+        // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
+        registry.register(
+            c,
+            "descendingIterator",
+            "()Ljava/util/Iterator;",
+            native_ts_descending_iterator,
+        );
+        registry.register(
+            c,
+            "descendingSet",
+            "()Ljava/util/NavigableSet;",
+            native_ts_descending_set,
+        );
+        registry.register(c, "pollFirst", "()Ljava/lang/Object;", native_ts_poll_first);
+        registry.register(c, "pollLast", "()Ljava/lang/Object;", native_ts_poll_last);
+    }
 
     // TreeSet iterator
     let ti = "java/util/TreeSet$Itr";
@@ -47966,7 +50835,11 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         elem_base
     };
     let n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", n_fields)?;
+    let list = alloc_view_carrier(
+        ctx,
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        n_fields,
+    )?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let arr = alloc_ref_array(ctx, cap);
@@ -47998,12 +50871,13 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     } else {
         elem_base
     };
-    // Build a HashSet of Map.Entry objects. Each entry must be a real
-    // `java/util/Map$Entry` (not raw Object cid=0) so user-bytecode
+    // Build an entrySet carrier holding Map.Entry objects. Each entry must be a
+    // real `java/util/Map$Entry` (not raw Object cid=0) so user-bytecode
     // `checkcast Map$Entry` succeeds after iterating entrySet() — see
     // Spring DefaultSingletonBeanRegistry.destroyBean iterating the
     // dependentBeanMap (a ConcurrentHashMap) entrySet.
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let carrier = set_view_carrier_for(&*ctx, this, VIEW_KIND_ENTRYSET);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     // Live entrySet view: back the HashSet with a view-backing that remembers the
@@ -48025,7 +50899,7 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let backing = alloc_view_backing(ctx, this_now, VIEW_KIND_ENTRYSET, cap)?;
     let backing_pin = ctx.pin_native_root(backing);
     let set_now = ctx.read_native_pin(set_pin, set);
-    ctx.set_field(set_now, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, set_now, backing);
     // cceres5: `alloc_live_entry`/`map_alloc_node` below can move the raw
     // snapshot refs still pending in `entries` (and `set`/`backing`/`this`
     // themselves); pin + re-read everything (see make_static_entry_set).
@@ -53032,6 +55906,21 @@ fn native_collections_synchronized_collection(
 // mutators throw.
 fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = args.first().copied().unwrap_or(Value::Object(None));
+    // `List.copyOf(x) == x` when `x` is ALREADY immutable — not an optimisation
+    // the JDK left implicit: `ImmutableCollections.listCopy` returns its
+    // argument, and application code compares the two with `==`. The
+    // independent-snapshot rule above still holds for everything else, which is
+    // what `already_immutable_of` is careful about.
+    if let Some(same) = already_immutable_of(ctx, src, UNMOD_LIST_CLASS) {
+        return Ok(Some(Value::Object(Some(same))));
+    }
+    if let Value::Object(Some(s)) = src {
+        if source_collection_has_null(ctx, s) {
+            return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+                message: None,
+            }));
+        }
+    }
     let backing = try_alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS)?;
     native_al_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
@@ -53043,6 +55932,20 @@ fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = args.first().copied().unwrap_or(Value::Object(None));
+    // Identity for an already-immutable source, as `List.copyOf`. NOTE the
+    // asymmetry with `Set.of`: `copyOf` DEDUPLICATES and must not throw on a
+    // repeat (`Set.copyOf(List.of("a","a")).size() == 1`); only nulls are
+    // rejected.
+    if let Some(same) = already_immutable_of(ctx, src, UNMOD_SET_CLASS) {
+        return Ok(Some(Value::Object(Some(same))));
+    }
+    if let Value::Object(Some(s)) = src {
+        if source_collection_has_null(ctx, s) {
+            return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+                message: None,
+            }));
+        }
+    }
     let backing = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     native_hs_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
@@ -53054,6 +55957,9 @@ fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = args.first().copied().unwrap_or(Value::Object(None));
+    if let Some(same) = already_immutable_of(ctx, src, UNMOD_MAP_CLASS) {
+        return Ok(Some(Value::Object(Some(same))));
+    }
     // GC-safety: the allocation and the copy-in below both collect; `src` and
     // `backing` are bare locals used after each. See `rooted_across`.
     let src_pin = pin_value(ctx, src);
@@ -53067,6 +55973,17 @@ fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         ctx.unpin_native_roots(src_pin);
     }
     copied?;
+    // `Map.copyOf` rejects a null key or value, like the `of` factories. Read
+    // off the BUILT backing (ours, so the walk is a field read) rather than
+    // re-entering the source's `entrySet`.
+    if map_collect_entries(ctx, backing)
+        .iter()
+        .any(|(k, v)| matches!(k, Value::Object(None)) || matches!(v, Value::Object(None)))
+    {
+        return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+            message: None,
+        }));
+    }
     let wrapper = alloc_immutable_wrapper(ctx, UNMOD_MAP_CLASS, backing)?;
     Ok(Some(Value::Object(Some(wrapper))))
 }
@@ -53166,7 +56083,7 @@ fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+    hs_set_backing_map(ctx, set, inner_map);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -53190,7 +56107,7 @@ fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+    hs_set_backing_map(ctx, set, inner_map);
     // Add elem
     native_map_put(
         ctx,
@@ -53419,7 +56336,57 @@ fn native_collections_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         let b = ctx.get_array_element(d, j);
         ctx.set_array_element(d, i, b);
         ctx.set_array_element(d, j, a);
+        return Ok(None);
     }
+    // Not an ArrayList-layout receiver. `al_state` answers `(None, 0)` for a
+    // sublist view, a `LinkedList`, or any application `List`, and the loop
+    // above then swapped nothing and reported success — a SILENT no-op, which
+    // is what `probes/SubListBehaviourProbe`'s `write.swap` row measures. It
+    // failed on both collectors AND under `--jdk-only`, because this native is
+    // reached whatever runs `Collections.swap`. Go through the receiver's own
+    // `get`/`set`, which is what the JDK's own body does.
+    list_swap_via_accessors(ctx, list, i as i32, j as i32)
+}
+
+/// `Collections.swap` for a receiver whose backing array this file cannot
+/// read: two `get`s and two `set`s through the list's own methods.
+///
+/// Each invoke can allocate and therefore move the other element, so both are
+/// pinned across the pair.
+fn list_swap_via_accessors(
+    ctx: &mut dyn NativeContext,
+    list: ObjectRef,
+    i: i32,
+    j: i32,
+) -> MethodCallResult {
+    let list_pin = ctx.pin_native_root(list);
+    let a = ctx
+        .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)])?
+        .unwrap_or(Value::Object(None));
+    let a_pin = pin_value(ctx, a);
+    let list = ctx.read_native_pin(list_pin, list);
+    let b = ctx
+        .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(j)])?
+        .unwrap_or(Value::Object(None));
+    let b_pin = pin_value(ctx, b);
+    let list = ctx.read_native_pin(list_pin, list);
+    let a = read_pinned_elem(ctx, a_pin, a);
+    let b = read_pinned_elem(ctx, b_pin, b);
+    ctx.invoke_virtual(
+        list,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Int(i), b],
+    )?;
+    let list = ctx.read_native_pin(list_pin, list);
+    let a = read_pinned_elem(ctx, a_pin, a);
+    ctx.invoke_virtual(
+        list,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Int(j), a],
+    )?;
+    ctx.unpin_native_roots(list_pin);
     Ok(None)
 }
 
@@ -53434,7 +56401,27 @@ fn native_collections_fill(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         for i in 0..size as usize {
             ctx.set_array_element(d, i, val);
         }
+        return Ok(None);
     }
+    // Same silent no-op as `native_collections_swap`, same fix: a receiver
+    // whose backing array this file cannot read gets its own `size`/`set`.
+    let list_pin = ctx.pin_native_root(list);
+    let val_pin = pin_value(ctx, val);
+    let n = match ctx.invoke_virtual(list, "size", "()I", &[])? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    for i in 0..n {
+        let list_cur = ctx.read_native_pin(list_pin, list);
+        let val_cur = read_pinned_elem(ctx, val_pin, val);
+        ctx.invoke_virtual(
+            list_cur,
+            "set",
+            "(ILjava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Int(i), val_cur],
+        )?;
+    }
+    ctx.unpin_native_roots(list_pin);
     Ok(None)
 }
 
@@ -54686,8 +57673,13 @@ fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if let Some(Value::Object(Some(this))) = args.first().copied() {
         let cid = ctx.class_id_of_object(this);
         let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+        // The fabricated `HashMap$KeyItr` and the real classes that replaced it
+        // (`MAP_KEY_ITR_CARRIERS`) share one body — asked by name, not by a
+        // literal, so a new carrier cannot be added without this route seeing it.
+        if is_map_key_itr_class(&cn) {
+            return native_map_key_itr_remove(ctx, args);
+        }
         match cn.as_str() {
-            "java/util/HashMap$KeyItr" => return native_map_key_itr_remove(ctx, args),
             "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => {
                 return native_al_itr_remove(ctx, args);
             }
@@ -54710,6 +57702,11 @@ fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             // Answers UOE itself when no backing was recorded, so a genuine
             // snapshot (`Arrays.asList(a).iterator()`) is unaffected.
             "java/util/Arrays$ArrayItr" => return native_snapshot_itr_remove(ctx, args),
+            // The live sublist iterator. `native_sli_remove` screens the
+            // receiver itself (`sli_delegate_foreign`), so an iterator
+            // java.base built keeps running its own `remove()` — which is the
+            // whole reason this arm can name a REAL JDK class at all.
+            SLI_CLASS => return native_sli_remove(ctx, args),
             _ => {}
         }
     }
@@ -59273,6 +62270,7 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
     ts_set_slot(ctx, this, slot, v);
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59311,6 +62309,128 @@ mod tests {
 
     // Unit tests for helper functions only.
     // Integration tests are in vm.rs since they need the full VM.
+
+    // --- al_slots_for memo -------------------------------------------------
+    //
+    // `al_slots_for` is on the path of EVERY `native_al_*` operation and used
+    // to re-derive a constant each call (a string-keyed `class_id_by_name`, an
+    // `is_subclass` walk, two string-keyed `resolve_field_index` lookups, all
+    // behind the class-manager lock). It is now memoized per receiver ClassId.
+    // A stale or cross-wired entry reads the WRONG field slots on every
+    // collection operation in the VM, so the memo is covered directly.
+
+    fn memo_ctx() -> (lbq_blocking_tests::MockCtx, ClassId, ClassId) {
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        let al = ClassId::new(4001);
+        let vec = ClassId::new(4002);
+        ctx.define_class(al, "java/util/ArrayList");
+        ctx.define_class(vec, "java/util/Vector");
+        ctx.define_field(al, "elementData", 4);
+        ctx.define_field(al, "size", 6);
+        ctx.define_field(vec, "elementData", 2);
+        ctx.define_field(vec, "elementCount", 3);
+        (ctx, al, vec)
+    }
+
+    #[test]
+    fn al_slots_memo_matches_the_uncached_path_and_is_stable() {
+        let (ctx, al, _vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+
+        let uncached = super::al_slots_for_uncached(&ctx, al);
+        let first = super::al_slots_and_layout_for(&ctx, list);
+        assert_eq!(
+            first,
+            super::al_slots_and_layout_for(&ctx, list),
+            "memo must be stable"
+        );
+        assert_eq!(first, super::al_slots_and_layout_for(&ctx, list));
+        if let Some(u) = uncached {
+            assert_eq!(first, u, "memo must match the uncached resolution");
+        }
+    }
+
+    /// The memo carries the layout VERDICT beside the slots now, so a stale or
+    /// cross-wired entry can answer "not a list" for a real list — which
+    /// `al_state` turns into a silently EMPTY collection rather than an error.
+    /// Pin the verdict per receiver class explicitly.
+    #[test]
+    fn al_layout_verdict_is_per_receiver_class() {
+        let (ctx, al, vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+        let vector = ctx.alloc_object_of(vec, 8);
+
+        assert_eq!(super::al_slots_and_layout_for(&ctx, list).1, super::AlLayout::ArrayList);
+        assert_eq!(super::al_slots_and_layout_for(&ctx, vector).1, super::AlLayout::Vector);
+        // Both must survive the other being asked for, in both orders.
+        assert_eq!(super::al_slots_and_layout_for(&ctx, vector).1, super::AlLayout::Vector);
+        assert_eq!(super::al_slots_and_layout_for(&ctx, list).1, super::AlLayout::ArrayList);
+        assert!(super::al_is_list_layout(&ctx, list));
+        assert!(super::al_is_list_layout(&ctx, vector));
+        assert!(super::al_is_arraylist_layout(&ctx, list));
+        assert!(
+            !super::al_is_arraylist_layout(&ctx, vector),
+            "a Vector is list-layout but NOT ArrayList-layout"
+        );
+    }
+
+    /// A named class that is neither ArrayList nor Vector must be refused, or
+    /// `al_state` reads its slots as `elementData`/`size` — the wild read the
+    /// guard exists for.
+    #[test]
+    fn al_layout_verdict_refuses_a_foreign_named_class() {
+        let (ctx, _al, _vec) = memo_ctx();
+        let foreign = ClassId::new(4003);
+        ctx.define_class(foreign, "java/lang/String");
+        let s = ctx.alloc_object_of(foreign, 8);
+        assert_eq!(super::al_slots_and_layout_for(&ctx, s).1, super::AlLayout::Foreign);
+        assert!(!super::al_is_list_layout(&ctx, s));
+        assert!(!super::al_is_arraylist_layout(&ctx, s));
+    }
+
+    #[test]
+    fn al_slots_memo_does_not_cross_wire_two_receiver_classes() {
+        let (ctx, al, vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+        let vector = ctx.alloc_object_of(vec, 8);
+
+        let l1 = super::al_slots_for(&ctx, list);
+        let v1 = super::al_slots_for(&ctx, vector);
+        // Re-ask in the opposite order: a cache without a tag comparison would
+        // hand the second class the first one's layout here.
+        assert_eq!(super::al_slots_for(&ctx, vector), v1, "Vector layout moved");
+        assert_eq!(super::al_slots_for(&ctx, list), l1, "ArrayList layout moved");
+        assert_ne!(
+            l1, v1,
+            "ArrayList and Vector declare different slots; the memo must keep them apart"
+        );
+    }
+
+    /// An UNRESOLVABLE layout must not be cached: `resolve_field_index` can
+    /// fail before the class is loaded and succeed afterwards, so pinning the
+    /// constant fallback would freeze the wrong slots for the rest of the run.
+    #[test]
+    fn al_slots_memo_does_not_cache_the_fallback() {
+        let ctx = lbq_blocking_tests::MockCtx::new(2);
+        let foreign = ClassId::new(4003);
+        ctx.define_class(foreign, "java/nio/charset/Charset");
+        let obj = ctx.alloc_object_of(foreign, 3);
+
+        assert!(super::al_slots_for_uncached(&ctx, foreign).is_none());
+        let fallback = (super::AL_FIELD_DATA, super::AL_FIELD_SIZE, super::AL_NUM_FIELDS);
+        assert_eq!(super::al_slots_for(&ctx, obj), fallback);
+
+        // Now the layout becomes resolvable, exactly as a late class load would
+        // make it. A cached fallback would keep answering the old slots.
+        ctx.define_class(foreign, "java/util/ArrayList");
+        ctx.define_field(foreign, "elementData", 4);
+        ctx.define_field(foreign, "size", 6);
+        assert_eq!(
+            super::al_slots_for(&ctx, obj),
+            (4, 6, 7),
+            "the fallback was cached, so a later resolution could not win"
+        );
+    }
 
     /// `java.util.Random.nextGaussian()` must reproduce the JDK's documented
     /// sequence for a given seed. The expected bit patterns are the first six
@@ -61649,8 +64769,16 @@ mod tests {
                 Value::Object(None)
             }
             fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
-            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-                None
+            /// Resolve by NAME through the same modelled layout
+            /// `resolve_field_index_by_class_id` uses. This was a `None` stub
+            /// while the by-id form was fully modelled, so a class the test had
+            /// just described with `define_class` + `define_field` still
+            /// answered "no such field" here — which forces
+            /// `al_slots`/`al_slots_for` onto their constant-fallback path and
+            /// makes a layout test unable to exercise the resolved branch.
+            fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
+                let class_id = self.class_id_by_name(class_name)?;
+                self.resolve_field_index_by_class_id(class_id, field_name)
             }
             fn create_string(&mut self, _t: &str) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();

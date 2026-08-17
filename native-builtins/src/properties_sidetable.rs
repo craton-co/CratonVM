@@ -2471,195 +2471,52 @@ fn build_string_collection(
     Ok(coll)
 }
 
-/// Build a real `HashSet<String>` populated with the side-table keys for the
-/// given Properties object.  Returns an empty HashSet if the object isn't
-/// tracked.
-fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
-    let keys: Vec<String> = ordered_snapshot_kv(ctx, this)
-        .into_iter()
-        .map(|(k, _v)| k)
-        .collect();
-    // `java/util/LinkedHashSet`, not the far more common `java/util/HashSet`:
-    // this snapshot needs `retainAll`/`remove` to propagate back to the
-    // source `Properties` (see `tag_properties_keyset_source` below, for the
-    // common `props.keySet().retainAll(baseline)` test-cleanup idiom), which
-    // requires a native override on the snapshot's exact class. Scoping that
-    // override to `LinkedHashSet` instead of `HashSet` keeps the blast radius
-    // to "objects this function creates" — every other `new HashSet<>()` in
-    // the entire process (a MUCH more common class) is completely
-    // unaffected. `LinkedHashSet extends HashSet`, so `instanceof HashSet`
-    // and the `Set` contract are unchanged for callers.
-    Ok(build_string_collection(ctx, "java/util/LinkedHashSet", keys)?)
-}
-
-/// Side table linking a `Properties.keySet()` snapshot `Set` (by identity
-/// hash) back to the source `Properties` object it was built from. Read by
-/// the `LinkedHashSet.retainAll`/`remove` overrides below so mutating the
-/// snapshot also mutates the real, side-table-backed source — otherwise
-/// `properties.keySet().retainAll(...)`/`.remove(...)` silently no-ops on
-/// the disconnected snapshot alone (`build_key_set` above is a snapshot,
-/// not a live view).
-fn properties_keyset_source_table() -> &'static Mutex<FxHashMap<i32, usize>> {
-    static T: OnceLock<Mutex<FxHashMap<i32, usize>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(FxHashMap::default()))
-}
-
-fn tag_properties_keyset_source(ctx: &mut dyn NativeContext, set: ObjectRef, source: ObjectRef) {
-    let set_pin = ctx.pin_native_root(set);
-    let handle = ctx.add_global_root(source);
-    let set = ctx.read_native_pin(set_pin, set);
-    let key = ctx.identity_hash_code(set);
-    let mut table = properties_keyset_source_table().lock();
-    // Retention cap: each entry roots one snapshot `Set` (and the source
-    // `Properties`, usually already permanently alive) forever. Bound the
-    // leak rather than grow unboundedly — mirrors the sibling cap in
-    // `logmanager.rs`'s `log_record_messages`.
-    if table.len() > 4096 {
-        if let Some(&oldest) = table.keys().next() {
-            if let Some(h) = table.remove(&oldest) {
-                ctx.remove_global_root(h);
-            }
-        }
-    }
-    table.insert(key, handle);
-    ctx.unpin_native_roots(set_pin);
-}
-
-fn properties_keyset_source(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<ObjectRef> {
-    let key = ctx.identity_hash_code(set);
-    let handle = *properties_keyset_source_table().lock().get(&key)?;
-    ctx.resolve_global_root(handle)
-}
-
-/// Native `LinkedHashSet.retainAll(Collection)Z`, gated on
-/// `properties_keyset_source`. For an ordinary `LinkedHashSet` (anything
-/// not built by `build_key_set`) this is a plain pass-through to real
-/// bytecode (`invoke_virtual_bytecode_only`, which skips re-entering this
-/// same native — its `args` contract is PARAMS ONLY, receiver excluded,
-/// hence `&args[1..]` below). For a `Properties.keySet()` snapshot, first
-/// remove every currently side-table-tracked key NOT present in the
-/// retain collection from the SOURCE `Properties` (whose own `remove` is a
-/// real, working mutation), then let real bytecode finish the snapshot's
-/// own (already-correct) in-memory `retainAll`.
+/// Native `LinkedHashSet.retainAll(Collection)Z`.
+///
+/// **This no longer has a `Properties` arm.** It used to: `Properties.keySet()`
+/// handed back a disconnected `LinkedHashSet` snapshot, so `retainAll` on it had
+/// to look the source `Properties` up in a side table (keyed by the snapshot's
+/// identity hash) and delete the dropped keys from it by hand. Since 2026-08-13
+/// `native_properties_key_set` returns a real view — `make_static_key_set`, a
+/// keySet carrier whose backing names the source — and the shared
+/// `native_hs_retain_all`/`native_hs_remove` write through for every view,
+/// `Properties`' included. The bespoke arm, the side table it read and the
+/// global root it held per snapshot are all gone.
+///
+/// What is left is the registration itself, which is load-bearing for ORDINARY
+/// `LinkedHashSet`s and must stay: it routes them to
+/// `try_native_hashset_remove`/real bytecode rather than to the plain
+/// `native_hs_*` body. See `native_linkedhashset_remove` for the `PRESENT`
+/// sentinel mismatch that makes the difference, and the record at
+/// `fixed-suite-bugs/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
 fn native_linkedhashset_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let Some(Value::Object(Some(retain_coll))) = args.get(1).copied() else {
-        return ctx.invoke_virtual_bytecode_only(
-            this,
-            "retainAll",
-            "(Ljava/util/Collection;)Z",
-            &args[1..],
-        );
-    };
-    let Some(source) = properties_keyset_source(ctx, this) else {
-        return ctx.invoke_virtual_bytecode_only(
-            this,
-            "retainAll",
-            "(Ljava/util/Collection;)Z",
-            &args[1..],
-        );
-    };
-    let keys = side_key_set(ctx, source);
-    let this_pin = ctx.pin_native_root(this);
-    let source_pin = ctx.pin_native_root(source);
-    let retain_pin = ctx.pin_native_root(retain_coll);
-    for key in keys {
-        let key_obj = ctx.create_string(&key);
-        let retain_coll = ctx.read_native_pin(retain_pin, retain_coll);
-        let contained = matches!(
-            ctx.invoke_virtual(
-                retain_coll,
-                "contains",
-                "(Ljava/lang/Object;)Z",
-                &[Value::Object(Some(key_obj))]
-            ),
-            Ok(Some(Value::Int(1)))
-        );
-        if !contained {
-            let source = ctx.read_native_pin(source_pin, source);
-            let key_obj = ctx.create_string(&key);
-            let _ = ctx.invoke_virtual(
-                source,
-                "remove",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[Value::Object(Some(key_obj))],
-            );
-        }
-    }
-    let this = ctx.read_native_pin(this_pin, this);
-    let retain_coll = ctx.read_native_pin(retain_pin, retain_coll);
-    ctx.unpin_native_roots(this_pin);
-    ctx.unpin_native_roots(source_pin);
-    ctx.unpin_native_roots(retain_pin);
-    ctx.invoke_virtual_bytecode_only(
-        this,
-        "retainAll",
-        "(Ljava/util/Collection;)Z",
-        &[Value::Object(Some(retain_coll))],
-    )
+    ctx.invoke_virtual_bytecode_only(this, "retainAll", "(Ljava/util/Collection;)Z", &args[1..])
 }
 
-/// Native `LinkedHashSet.remove(Object)Z` — same
-/// disconnected-snapshot-vs-source-`Properties` gate as
-/// `native_linkedhashset_retain_all`, for the single-key removal case
-/// (`properties.keySet().remove(key)`).
+/// Native `LinkedHashSet.remove(Object)Z`.
+///
+/// Like `native_linkedhashset_retain_all`, the `Properties.keySet()` arm is
+/// gone; what remains is the ordinary-`LinkedHashSet` path, unchanged.
+///
+/// It must NOT go straight to real bytecode: `HashSet.remove` is
+/// `return map.remove(o) == PRESENT;` and this VM's synthetic backing map stores
+/// an `Int(1)` sentinel, never JDK `HashSet.PRESENT`, so that identity
+/// comparison is always false — the element was removed but `remove()` answered
+/// `false`. (`LinkedHashSet` inherits `remove`, so this override is the only
+/// registration that sees such a call.)
+///
+/// javac was the loudest victim: `Annotate.attributeAnnotation` puts an
+/// annotation type's elements in a `LinkedHashSet` and reports "duplicate
+/// element 'value' in annotation @X" when `members.remove` returns false —
+/// making EVERY annotation with a `value` element uncompilable by the in-process
+/// compiler that Spring's AOT `TestCompiler` uses.
 fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let Some(source) = properties_keyset_source(ctx, this) else {
-        // An ordinary LinkedHashSet, not a `Properties.keySet()` snapshot.
-        // It still must NOT go to real bytecode: `HashSet.remove` is
-        // `return map.remove(o) == PRESENT;` and this VM's synthetic backing
-        // map stores an `Int(1)` sentinel, never JDK `HashSet.PRESENT`, so the
-        // identity comparison is always false — the element was removed but
-        // `remove()` answered `false`. (`LinkedHashSet` inherits `remove`, so
-        // this override is the only registration that sees such a call.)
-        //
-        // javac was the loudest victim: `Annotate.attributeAnnotation` puts an
-        // annotation type's elements in a `LinkedHashSet` and reports
-        // "duplicate element 'value' in annotation @X" when `members.remove`
-        // returns false — making EVERY annotation with a `value` element
-        // uncompilable by the in-process compiler that Spring's AOT
-        // `TestCompiler` uses.
-        if let Some(result) = cratonvm_native_collections::try_native_hashset_remove(ctx, args) {
-            return result;
-        }
-        return ctx.invoke_virtual_bytecode_only(this, "remove", "(Ljava/lang/Object;)Z", &args[1..]);
-    };
-    if let Some(Value::Object(Some(elem))) = args.get(1).copied() {
-        let this_pin = ctx.pin_native_root(this);
-        let source_pin = ctx.pin_native_root(source);
-        let elem_pin = ctx.pin_native_root(elem);
-        let elem = ctx.read_native_pin(elem_pin, elem);
-        let source = ctx.read_native_pin(source_pin, source);
-        let _ = ctx.invoke_virtual(
-            source,
-            "remove",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Object(Some(elem))],
-        );
-        let this = ctx.read_native_pin(this_pin, this);
-        let elem = ctx.read_native_pin(elem_pin, elem);
-        ctx.unpin_native_roots(this_pin);
-        ctx.unpin_native_roots(source_pin);
-        ctx.unpin_native_roots(elem_pin);
-        // Same reason as the non-snapshot branch above: real `HashSet.remove`
-        // bytecode compares the backing map's value against JDK `PRESENT`,
-        // which this VM's synthetic map never stores.
-        let fwd = [Value::Object(Some(this)), Value::Object(Some(elem))];
-        if let Some(result) = cratonvm_native_collections::try_native_hashset_remove(ctx, &fwd) {
-            return result;
-        }
-        return ctx.invoke_virtual_bytecode_only(
-            this,
-            "remove",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(elem))],
-        );
-    }
     if let Some(result) = cratonvm_native_collections::try_native_hashset_remove(ctx, args) {
         return result;
     }
@@ -2786,10 +2643,25 @@ fn native_properties_string_property_names(
     Ok(Some(Value::Object(Some(set?))))
 }
 
-/// Native `Properties.keySet()Ljava/util/Set;` — returns a synthetic
-/// HashSet populated from the side-table.  Spring's
+/// Native `Properties.keySet()Ljava/util/Set;` — returns a **live** keySet view
+/// backed by this `Properties`.  Spring's
 /// `SpringIterableConfigurationPropertySource` walks this once it
 /// recognises the source as enumerable.
+///
+/// Until 2026-08-13 this built a disconnected `LinkedHashSet` snapshot and
+/// bought write-through separately, with a native override on `LinkedHashSet`
+/// gated on a side table keyed by the snapshot's identity hash. Reads were
+/// never live at all — `probes/MapViewBehaviourProbe` measured
+/// `props.keys.afterPut.size` as 2 where HotSpot says 3, because a `keySet()`
+/// taken before a `put` never saw it.
+///
+/// `make_static_key_set` is the standard keySet-view carrier, tagged
+/// `VIEW_KIND_KEYSET_STATIC` because `Properties`' keys live half in the Rust
+/// side-table and half in the CHM field, so a resync cannot collect them by
+/// walking the receiver's fields the way every other map's keySet view does —
+/// it re-enters this native instead and adopts the fresh view's backing.
+/// Write-through (`remove`/`retainAll`/`iterator().remove()`/`clear`) now comes
+/// from the shared `native_hs_*` view machinery.
 fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2799,48 +2671,45 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
     let mut this = this;
-    let mut set = build_key_set(ctx, &mut this)?;
-    let set_pin = ctx.pin_native_root(set);
+    let snapshot = ordered_snapshot_kv(ctx, &mut this);
+    // cceres5-style GC safety (mirrors `native_properties_values`): every
+    // `create_string` below, and `chm_extra_entries`' re-entry into Java, can
+    // move `this` and every key already accumulated in `keys`. Pin each as it
+    // is produced and refresh the whole vector before handing it over.
+    let this_pin = ctx.pin_native_root(this);
+    let mut keys: Vec<Value> = Vec::with_capacity(snapshot.len());
+    let mut key_pins: Vec<usize> = Vec::with_capacity(snapshot.len());
+    for (k, _v) in &snapshot {
+        let ks = ctx.create_string(k);
+        key_pins.push(ctx.pin_native_root(ks));
+        keys.push(Value::Object(Some(ks)));
+    }
     // Add keys for CHM-exclusive (non-String-valued) entries so the key view
     // matches the real map; `stringPropertyNames()` deliberately does NOT do
     // this (it is specified to return only String-keyed/String-valued names).
-    let side = side_key_set(ctx, this);
-    let extra = chm_extra_entries(ctx, this, &side);
-    let extra_key_pins: Vec<(usize, ObjectRef)> = extra
-        .iter()
-        .map(|(key_obj, _value, _kstr)| (ctx.pin_native_root(*key_obj), *key_obj))
-        .collect();
-    for ((key_obj, _value, kstr), (key_pin, key_fallback)) in
-        extra.iter().zip(extra_key_pins.iter())
-    {
-        let key_value = if let Some(s) = kstr {
-            // String keys are common for Properties; rebuild a fresh Java
-            // String after the CHM walk so the key cannot be a stale raw ref
-            // from a previous iterator call.
-            let fresh = ctx.create_string(s);
-            let fresh_pin = ctx.pin_native_root(fresh);
-            let fresh = ctx.read_native_pin(fresh_pin, fresh);
-            let value = Value::Object(Some(fresh));
-            set = ctx.read_native_pin(set_pin, set);
-            let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[value]);
-            ctx.unpin_native_roots(fresh_pin);
-            continue;
-        } else {
-            let _ = key_obj;
-            Value::Object(Some(ctx.read_native_pin(*key_pin, *key_fallback)))
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let side = side_key_set(ctx, this_cur);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    for (key_obj, _value, kstr) in chm_extra_entries(ctx, this_cur, &side) {
+        // String keys are common for Properties; rebuild a fresh Java String
+        // after the CHM walk so the key cannot be a stale raw ref from a
+        // previous iterator call.
+        let k = match kstr {
+            Some(s) => ctx.create_string(&s),
+            None => key_obj,
         };
-        set = ctx.read_native_pin(set_pin, set);
-        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[key_value]);
+        key_pins.push(ctx.pin_native_root(k));
+        keys.push(Value::Object(Some(k)));
     }
-    for (pin, _fallback) in extra_key_pins {
-        ctx.unpin_native_roots(pin);
+    for (i, pin) in key_pins.iter().enumerate() {
+        keys[i] = match keys[i] {
+            Value::Object(Some(o)) => Value::Object(Some(ctx.read_native_pin(*pin, o))),
+            other => other,
+        };
     }
-    set = ctx.read_native_pin(set_pin, set);
-    // Tag the snapshot so `LinkedHashSet.retainAll`/`remove` can propagate
-    // mutations back to `this` (the source `Properties`) — see
-    // `tag_properties_keyset_source`'s doc comment.
-    tag_properties_keyset_source(ctx, set, this);
-    ctx.unpin_native_roots(set_pin);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let set = cratonvm_native_collections::make_static_key_set(ctx, this_cur, &keys)?;
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -4085,12 +3954,33 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     //    sentinel for non-String values would shadow the CHM in
     //    native_properties_get, causing a String→XProperty CCE downstream.
     let mut str_collected: Vec<(String, String)> = Vec::new();
-    let entries_obj = match ctx.invoke(
-        "java/util/Map",
-        "entrySet",
-        "()Ljava/util/Set;",
-        &[Value::Object(Some(other))],
-    ) {
+    // Use `invoke_virtual` (dispatch on the receiver's actual runtime class),
+    // NOT `invoke` (which resolves against the literal interface/class name
+    // passed in). `invoke`'s C25 interface retarget correctly redirects e.g.
+    // `java/util/Iterator` onto the receiver's concrete class (verified via
+    // `is_subclass_of`), but the dispatch that follows only prefers a
+    // registered native over inherited bytecode for synthetic-stub/interface
+    // classes (`prefer_exact_class_native`). Since 2026-08-13, `HashMap$
+    // EntryIterator`/`KeyIterator` are minted as the REAL declared JDK class
+    // (see `alloc_key_itr`), which has real bytecode and so no longer counts
+    // as a stub — `invoke`'s dispatch then finds that real `HashIterator`
+    // bytecode instead of `native_map_key_itr_has_next`/`_next`, and that
+    // bytecode reads `next`/`current`/`index` fields this VM's snapshot
+    // iterator never populates, so `hasNext()` silently reports `false` on
+    // a non-empty iterator. This was invisible for a `Properties`-shaped
+    // source (which never reaches this generic-Map fallback at all) and for
+    // ordinary bytecode `invokeinterface` (whose interpreter loop checks the
+    // native registry before falling back to inherited bytecode, unlike this
+    // native-initiated entry point) — only a native calling through `invoke`
+    // with an interface-typed class name hit it. Concretely: `Properties.
+    // putAll(new HashMap<>(Map.of("k", "v")))` silently dropped every entry,
+    // which is what broke Hibernate's `foreign` id-generator `@Parameter`
+    // reading (`GeneratorParameters.collectParameters`'s `params.putAll
+    // (configuration)`, `configuration` being a plain `HashMap` built from
+    // the `@Parameter` array) — `ForeignGenerator.configure()` then saw no
+    // "property" entry and threw `MappingException: param named "property"
+    // is required for foreign id generation strategy`.
+    let entries_obj = match ctx.invoke_virtual(other, "entrySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -4098,12 +3988,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
     this = ctx.read_native_pin(this_pin, this);
-    let it = match ctx.invoke(
-        "java/util/Set",
-        "iterator",
-        "()Ljava/util/Iterator;",
-        &[Value::Object(Some(entries_obj))],
-    ) {
+    let it = match ctx.invoke_virtual(entries_obj, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -4117,12 +4002,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let it_pin = ctx.pin_native_root(it);
     let mut it = it;
     loop {
-        let has_next = match ctx.invoke(
-            "java/util/Iterator",
-            "hasNext",
-            "()Z",
-            &[Value::Object(Some(it))],
-        ) {
+        let has_next = match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) => n != 0,
             _ => false,
         };
@@ -4131,23 +4011,13 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         if !has_next {
             break;
         }
-        let entry = match ctx.invoke(
-            "java/util/Iterator",
-            "next",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(it))],
-        ) {
+        let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => break,
         };
         it = ctx.read_native_pin(it_pin, it);
         let entry_pin = ctx.pin_native_root(entry);
-        let key_obj = match ctx.invoke(
-            "java/util/Map$Entry",
-            "getKey",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(entry))],
-        ) {
+        let key_obj = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => {
                 ctx.unpin_native_roots(entry_pin);
@@ -4156,12 +4026,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         };
         let entry = ctx.read_native_pin(entry_pin, entry);
         let key_pin = ctx.pin_native_root(key_obj);
-        let val_v = match ctx.invoke(
-            "java/util/Map$Entry",
-            "getValue",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(entry))],
-        ) {
+        let val_v = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(v)) => v,
             _ => {
                 ctx.unpin_native_roots(entry_pin);

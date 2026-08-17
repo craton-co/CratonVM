@@ -155,6 +155,36 @@ fn set_app_loader(vm: usize, value: Option<ObjectRef>) {
     with_loader_singletons(|table| table.entry(vm).or_default().app = value);
 }
 
+/// Which built-in loader `this` is, as the `ClassLoaderId` wire ordinal
+/// (`NATIVE_EXTENSION` for platform, `NATIVE_APPLICATION` for app), or `None`
+/// when `this` is neither singleton (in practice: a user-defined loader, or
+/// bootstrap — which has no `ClassLoader` object to be `this` in the first
+/// place). Used by `find_loaded_class_for_loader_inner` to bound a built-in
+/// loader's `findLoadedClass` visibility to itself and its own ancestors
+/// (Bootstrap -> Extension -> Application is a strict chain, not a mutually
+/// visible group). Mirrors `parent_is_platform`'s identity check: the
+/// singleton reference is the fast path, the class name is the real-JDK
+/// fallback (the JDK can manufacture another loader object of the same kind
+/// before our singleton is observed).
+fn builtin_loader_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<u32> {
+    let vm = ctx.vm_identity();
+    if platform_loader_of(vm).is_some_and(|p| p.as_ptr() == this.as_ptr())
+        || ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+    {
+        return Some(cratonvm_types::ClassLoaderId::NATIVE_EXTENSION);
+    }
+    if app_loader_of(vm).is_some_and(|p| p.as_ptr() == this.as_ptr())
+        || ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$AppClassLoader")
+    {
+        return Some(cratonvm_types::ClassLoaderId::NATIVE_APPLICATION);
+    }
+    None
+}
+
 /// Temporary debug-only accessor (CRATONVM_DBG_OBSREG investigation).
 pub(crate) fn platform_loader_dbg(vm: usize) -> Option<ObjectRef> {
     platform_loader_of(vm)
@@ -2399,6 +2429,33 @@ pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u3
 /// are 2-3 deep.
 fn loader_namespace_id_at(ctx: &mut dyn NativeContext, loader: ObjectRef, depth: usize) -> u32 {
     if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
+        // Which built-in loader `loader` actually is matters to a caller
+        // reached through `parent_namespace_id`: a blanket `0` here does not
+        // just mean "no id", it means "this loader's PARENT delegates to the
+        // WHOLE built-in chain (Bootstrap, Extension, Application)" — see
+        // `loaded_class_for_requesting_loader`'s built-in-chain fallback.
+        // Collapsing the platform loader into that generic `0` let a
+        // `ModifiedClassPathClassLoader` (parent = platform, specifically to
+        // EXCLUDE Application from delegation) fall back to probing
+        // Application anyway, silently resolving a same-named class through
+        // the wrong loader — observed as the `PropertySource`/
+        // `EnumerablePropertySource` cross-loader `ClassCastException`
+        // family under `@ClassPathExclusions`. Identity check mirrors
+        // `parent_is_platform` above: the singleton reference is the fast
+        // path, the class name is the real-JDK fallback (the JDK can
+        // manufacture another `PlatformClassLoader` object before our
+        // singleton is observed).
+        let vm = ctx.vm_identity();
+        let is_platform = platform_loader_of(vm).is_some_and(|p| p.as_ptr() == loader.as_ptr())
+            || ctx
+                .class_name_of_id(ctx.class_id_of_object(loader))
+                .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader");
+        if is_platform {
+            return cratonvm_types::ClassLoaderId::NATIVE_EXTENSION;
+        }
+        if app_loader_of(vm).is_some_and(|p| p.as_ptr() == loader.as_ptr()) {
+            return cratonvm_types::ClassLoaderId::NATIVE_APPLICATION;
+        }
         return 0;
     }
     if let Some(v) = loader_id_of(ctx, loader) {
@@ -2744,8 +2801,33 @@ fn find_loaded_class_for_loader_inner(
             // loaders. Application-namespace classes that merely record a
             // user-defined defining loader still keep their app-loader
             // visibility below.
-            if ctx.loader_id_of_class(cid) > 2 {
+            //
+            // The three built-in loaders are NOT mutually visible either: they
+            // form a strict ancestor chain (Bootstrap -> Extension/Platform ->
+            // Application), and `findLoadedClass` must only report a class
+            // defined by `this` or one of `this`'s OWN ancestors — never a
+            // descendant's. A blanket `> 2` here treated Bootstrap, Extension,
+            // and Application as one undifferentiated group: asking the
+            // PLATFORM loader whether it has an application class "loaded"
+            // (as happens on every `super.loadClass` delegation from a loader
+            // parented to platform — e.g. a `ModifiedClassPathClassLoader`,
+            // Spring's `@ClassPathExclusions` isolation) found the app
+            // loader's pre-existing copy and returned it, so the isolated
+            // loader's `loadClass` never reached its own `findClass` to define
+            // a fresh one — a same-named class split across two loaders,
+            // observed as the `PropertySource`/`EnumerablePropertySource`
+            // family's `ClassCastException` under `@ClassPathExclusions`.
+            // `builtin_loader_ordinal(this) == None` (bootstrap has no `this`
+            // object in practice, or the singleton could not be identified)
+            // keeps the old permissive bound as a safe fallback.
+            let candidate_ordinal = ctx.loader_id_of_class(cid);
+            if candidate_ordinal > 2 {
                 return None;
+            }
+            if let Some(this_ordinal) = builtin_loader_ordinal(ctx, this) {
+                if candidate_ordinal > this_ordinal as i32 {
+                    return None;
+                }
             }
             if let Some(def) = defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
                 if !loader_can_see_defining(ctx, this, def) {
@@ -5278,6 +5360,87 @@ fn deduplicate_rooted_urls(ctx: &mut dyn NativeContext, urls: &mut Vec<RootedUrl
     *urls = unique;
 }
 
+/// A `getResources` enumeration that builds each `java.net.URL` only when the
+/// caller asks for it.
+///
+/// The array holds the spec strings the classpath walk produced; slot 2 of the
+/// enumeration marks them as such, so `nextElement` runs
+/// `build_synthetic_url` per element handed out rather than per element found.
+/// See [`ENUM_ELEMENTS_URL_SPECS`] for the measurement that motivated it.
+///
+/// Falls back to the eager form when the fabricated `Enumeration$Impl` is
+/// refused (`--jdk-only`), since the real `java.util.Enumeration` that lands
+/// there has no slot to carry the marker and no native to act on it.
+/// A `getResources` enumeration that does not scan the classpath until the
+/// caller asks for an element, and then only far enough to find it.
+///
+/// Returns `None` when this call cannot use the form — the name can match more
+/// than once inside a single entry (a glob), the VM has no incremental scan
+/// (a mock `NativeContext`), or the fabricated `Enumeration$Impl` is refused
+/// (`--jdk-only`) — and the caller falls back to scanning eagerly.
+///
+/// The empty case is left to the caller too. `cl_get_resources_impl` has a
+/// documented fallback for "no entry served this name" (the `classpath:<name>`
+/// pseudo-URL) and a cap for `META-INF/MANIFEST.MF`, both of which need the
+/// whole result to decide; probing for the FIRST element here is what tells
+/// the caller whether either can apply.
+fn lazy_scan_enumeration(
+    ctx: &mut dyn NativeContext,
+    resource_name: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if !ctx.resource_name_supports_incremental_scan(resource_name) {
+        return Ok(None);
+    }
+    // If the scan yields nothing at all, the caller's empty-result fallback
+    // owns the answer — hand it back rather than returning an empty lazy
+    // enumeration that would skip it.
+    if ctx.next_resource_url(resource_name, 0, 0).is_none() {
+        return Ok(None);
+    }
+    let name_obj = ctx.create_string(resource_name);
+    let name_pin = ctx.pin_native_root(name_obj);
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 5) {
+        Ok(enm) => {
+            let name_obj = ctx.read_native_pin(name_pin, name_obj);
+            ctx.set_field(enm, 0, Value::Object(Some(name_obj)));
+            ctx.set_field(enm, 1, Value::Int(0));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_LAZY_SCAN));
+            ctx.set_field(enm, 4, Value::Int(0));
+            Some(enm)
+        }
+        Err(_) => None,
+    };
+    ctx.unpin_native_roots(name_pin);
+    Ok(out)
+}
+
+fn lazy_enumeration_from_url_strings(
+    ctx: &mut dyn NativeContext,
+    urls: &[String],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+    // GC-safety: `create_string` allocates, and `arr` is written across every
+    // iteration, so it has to be read back through the pin each time.
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, u) in urls.iter().enumerate() {
+        let spec = ctx.create_string(u);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(Some(spec)));
+    }
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 5) {
+        Ok(enm) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(enm, 0, Value::Object(Some(arr)));
+            ctx.set_field(enm, 1, Value::Int(0));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_URL_SPECS));
+            Ok(enm)
+        }
+        Err(_) => enumeration_from_url_strings(ctx, urls),
+    };
+    ctx.unpin_native_roots(arr_pin);
+    out
+}
+
 fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     // GC-safety: `build_synthetic_url` per iteration allocates (transitively
@@ -5600,6 +5763,15 @@ fn cl_get_resources_impl(
         }
     }
 
+    // The lazy form first: it is the same enumeration, in the same order, but
+    // it stops scanning where the caller stops reading. It declines the cases
+    // the two fallbacks below need a whole result for.
+    if resource_name != "META-INF/MANIFEST.MF" {
+        if let Some(enm) = lazy_scan_enumeration(ctx, resource_name)? {
+            return Ok(Some(Value::Object(Some(enm))));
+        }
+    }
+
     let mut urls = ctx.find_all_resource_urls(resource_name);
 
     // WF32-fix: bound the per-jar `META-INF/MANIFEST.MF` enumeration.
@@ -5683,7 +5855,7 @@ fn cl_get_resources_impl(
     // are registered unconditionally by `register_enumeration_impl_natives`
     // so this works in both synthetic-JDK and real-JDK modes without
     // relying on java.util.Vector's internal layout.
-    let enm = enumeration_from_url_strings(ctx, &urls)?;
+    let enm = lazy_enumeration_from_url_strings(ctx, &urls)?;
     Ok(Some(Value::Object(Some(enm))))
 }
 
@@ -6014,6 +6186,59 @@ pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
 /// §1.1 violation the policy refuses, which is why it needs the landing below.
 pub(crate) const ENUMERATION_IMPL_CLASS: &str = "java/util/Enumeration$Impl";
 
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds the values the
+/// enumeration yields, verbatim. Every producer except `getResources` uses
+/// this, and it is what a zero-initialized instance already means, so an
+/// `Enumeration$Impl` built by `new_object` (which writes no slots) behaves
+/// exactly as it did before slot 3 existed.
+///
+/// Slot 3, not slot 2: `Hashtable.keys()`/`elements()` already stamp a
+/// keys-vs-values discriminator into slot 2, and 1 is its `keys` value — so a
+/// marker there turned every `Hashtable` key into a `java.net.URL`
+/// (`ClassCastException: java.net.URL cannot be cast to java.lang.String`,
+/// xerces reading SAX features, PomProfileReposEffectivePomTest).
+pub(crate) const ENUM_ELEMENTS_AS_IS: i32 = 0;
+
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds URL *spec
+/// strings*, and each is turned into a `java.net.URL` by `nextElement`/`next`
+/// at the moment it is handed out.
+///
+/// `ClassLoader.getResources` is the one producer whose consumers routinely
+/// stop early. The JDK's own enumeration is lazy per element, so
+/// `classLoader.resources(name).anyMatch(..)` — SmallRye Config's
+/// `isInClassloader`, and the shape behind every `findFirst`/`anyMatch` over
+/// `resources()` — materializes only as far as the first match. CratonVM's
+/// native answered eagerly, building a `java.net.URL` (a 13-slot synthetic
+/// plus three `String`s) for EVERY match before the caller looked at one.
+///
+/// On the Quarkus full-reactor harness that meant 1843 URLs built 1388 times
+/// — 2.5M URL objects, ~12M allocations — where HotSpot built about eight per
+/// call. Deferring construction to `nextElement` restores the short-circuit
+/// without changing what the enumeration yields: the strings were already
+/// computed by the classpath walk, and `build_synthetic_url` is the same
+/// function the eager path called.
+pub(crate) const ENUM_ELEMENTS_URL_SPECS: i32 = 1;
+
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: there is no element array at all.
+/// Slot 0 holds the RESOURCE NAME, and each element is found by resuming the
+/// classpath scan from the cursor in slots 1 (entry index) and 4 (class-path
+/// segment).
+///
+/// [`ENUM_ELEMENTS_URL_SPECS`] stopped `getResources` building 1843
+/// `java.net.URL`s for a caller that wanted one, but it still SCANNED all 4230
+/// classpath entries to collect the spec strings first. Measured on the Quarkus
+/// full-reactor classpath, `resources("").anyMatch(..)` matching on element 1
+/// cost 1.20 ms against HotSpot's 0.03 ms — 40x, all of it work the caller
+/// never asked for. The JDK's enumeration touches one entry; this makes ours
+/// do the same.
+///
+/// There is deliberately no "peeked element" slot: `hasMoreElements` re-runs
+/// the same query `nextElement` does rather than caching. The query is a pure
+/// function of (name, cursor) that stops at the first hit, so re-running it
+/// costs only the entries between here and the next match — and a peek slot
+/// would be one more piece of state to keep consistent with the cursor.
+pub(crate) const ENUM_ELEMENTS_LAZY_SCAN: i32 = 2;
+
 /// A real `java.util.Enumeration` over `array`, or `None` when this image
 /// cannot build one.
 ///
@@ -6071,11 +6296,12 @@ pub(crate) fn make_snapshot_enumeration(
     // both and read it back through the pin, the same contract
     // `make_iterator_from_array` documents.
     let pin = ctx.pin_native_root(array);
-    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 2) {
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 5) {
         Ok(enm) => {
             let array = ctx.read_native_pin(pin, array);
             ctx.set_field(enm, 0, Value::Object(Some(array)));
             ctx.set_field(enm, 1, Value::Int(0));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_AS_IS));
             Ok(enm)
         }
         Err(refusal) => {
@@ -6094,6 +6320,70 @@ pub(crate) fn make_snapshot_enumeration(
     out
 }
 
+/// `Enumeration$Impl.nextElement()` / `.next()` — one body, because the two
+/// have always been the same code and only one of them may now materialize.
+///
+/// Slot 3 says how to read slot 0's element: verbatim
+/// ([`ENUM_ELEMENTS_AS_IS`], what every producer but `getResources` stores and
+/// what a zero-initialized instance already means) or as a URL spec string to
+/// be turned into a `java.net.URL` right here ([`ENUM_ELEMENTS_URL_SPECS`]).
+/// The next `(spec, segment, index)` a lazy-scan enumeration would yield, or
+/// `None` when the classpath is exhausted. Pure in the receiver: it reads the
+/// cursor but never advances it, so `hasMoreElements` and `nextElement` both
+/// call it and agree.
+fn enum_impl_peek_lazy(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(String, u32, u32)> {
+    let name = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s)?,
+        _ => return None,
+    };
+    let index = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as u32;
+    let segment = ctx.get_field(this, 4).as_int().unwrap_or(0).max(0) as u32;
+    ctx.next_resource_url(&name, segment, index)
+}
+
+fn enum_impl_is_lazy(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.get_field(this, 3).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) == ENUM_ELEMENTS_LAZY_SCAN
+}
+
+fn enum_impl_next_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if enum_impl_is_lazy(ctx, this) {
+        let Some((spec, segment, index)) = enum_impl_peek_lazy(ctx, this) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        ctx.set_field(this, 4, Value::Int(segment as i32));
+        ctx.set_field(this, 1, Value::Int(index as i32));
+        let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec)?;
+        return Ok(Some(Value::Object(Some(url))));
+    }
+    let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let len = ctx.array_length(arr);
+    if idx >= len {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = ctx.get_array_element(arr, idx);
+    ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
+    if ctx.get_field(this, 3).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) != ENUM_ELEMENTS_URL_SPECS {
+        return Ok(Some(elem));
+    }
+    let Value::Object(Some(spec_obj)) = elem else {
+        return Ok(Some(elem));
+    };
+    let Some(spec) = ctx.read_string(spec_obj) else {
+        return Ok(Some(elem));
+    };
+    // GC-safety: `build_synthetic_url` allocates (a 13-slot URL plus three
+    // `String`s), so nothing raw may be held across it. `this` is not read
+    // again after this point and the cursor was already advanced, so there is
+    // nothing left to re-read through a pin.
+    let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec)?;
+    Ok(Some(Value::Object(Some(url))))
+}
+
 pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
     // Install the URLClassPath safe stubs alongside the enumeration helpers
     // so both real-JDK (`register_essential_natives`) and synthetic-JDK
@@ -6103,6 +6393,10 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
     let enm = "java/util/Enumeration$Impl";
     r.register(enm, "hasMoreElements", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if enum_impl_is_lazy(ctx, this) {
+            let more = enum_impl_peek_lazy(ctx, this).is_some();
+            return Ok(Some(Value::Int(i32::from(more))));
+        }
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
@@ -6111,23 +6405,13 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
     });
-    r.register(enm, "nextElement", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let len = ctx.array_length(arr);
-        if idx >= len {
-            return Ok(Some(Value::Object(None)));
-        }
-        let elem = ctx.get_array_element(arr, idx);
-        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-        Ok(Some(elem))
-    });
+    r.register(enm, "nextElement", "()Ljava/lang/Object;", enum_impl_next_element);
     r.register(enm, "hasNext", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if enum_impl_is_lazy(ctx, this) {
+            let more = enum_impl_peek_lazy(ctx, this).is_some();
+            return Ok(Some(Value::Int(i32::from(more))));
+        }
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
@@ -6136,21 +6420,7 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
     });
-    r.register(enm, "next", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let len = ctx.array_length(arr);
-        if idx >= len {
-            return Ok(Some(Value::Object(None)));
-        }
-        let elem = ctx.get_array_element(arr, idx);
-        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-        Ok(Some(elem))
-    });
+    r.register(enm, "next", "()Ljava/lang/Object;", enum_impl_next_element);
     let anon_enm = "cratonvm/synthetic/AnonymousObject$2";
     // `SyntheticStub`, stated for this block. The receiver is the VM's
     // anonymous-object fallback class — minted here, on no image — so §1.5's

@@ -947,6 +947,183 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         pe_segment_as_slice,
     );
 
+    // asSlice(long offset) → the rest of the segment.
+    //
+    // `MemorySegment` declares BOTH arities and both are `public abstract`, so
+    // the one nobody registered was not a slow path — it was
+    // `AbstractMethodError: … has no Code attribute` at the interface method.
+    // It shares the two-argument body rather than restating the bounds check,
+    // which is the asymmetry that produced the gap in the first place.
+    r.register(
+        ms,
+        "asSlice",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = pe_long_arg(args, 1);
+            let size = crate::panama_libffi::segment_byte_size(ctx, this);
+            pe_segment_slice(ctx, this, offset, (size - offset).max(0), None)
+        },
+    );
+
+    // asReadOnly() → the same memory, refused for writes.
+    //
+    // A full-size slice with the read-only flag FORCED on rather than
+    // inherited. Without it `asReadOnly()` was `AbstractMethodError`, so
+    // nothing could obtain a read-only view at all — and
+    // `AbstractMemorySegmentImpl.asByteBuffer()` reaches for exactly this to
+    // decide whether to hand back a read-only buffer.
+    //
+    // The other direction is the F21 rule, and it is `pe_segment_slice`'s:
+    // read-only is CONTAGIOUS, so every `asSlice` above inherits the parent's
+    // flag and there is no route back to writable.
+    r.register(
+        ms,
+        "asReadOnly",
+        "()Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let size = crate::panama_libffi::segment_byte_size(ctx, this);
+            pe_segment_slice(ctx, this, 0, size, Some(true))
+        },
+    );
+
+    // asByteBuffer() → a direct ByteBuffer over the segment's own memory.
+    r.register(
+        ms,
+        "asByteBuffer",
+        "()Ljava/nio/ByteBuffer;",
+        pe_segment_as_byte_buffer,
+    );
+
+    // asSlice(long offset, long size, long byteAlignment) — the alignment-
+    // checked form. A third arity, therefore a third AbstractMethodError; it
+    // shares the bounds-checked body above and adds the check the argument is
+    // FOR, rather than accepting and ignoring it.
+    r.register(
+        ms,
+        "asSlice",
+        "(JJJ)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = pe_long_arg(args, 1);
+            let new_size = pe_long_arg(args, 2);
+            let align = pe_long_arg(args, 3);
+            if align <= 0 || (align & (align - 1)) != 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("Invalid alignment constraint: {align}"),
+                }
+                .into());
+            }
+            let addr = pe_segment_base_address(ctx, this).saturating_add(offset);
+            if addr % align != 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("Target offset {offset} incompatible with alignment {align}"),
+                }
+                .into());
+            }
+            pe_segment_slice(ctx, this, offset, new_size, None)
+        },
+    );
+
+    // asSlice(long offset, MemoryLayout layout) — size taken from the layout.
+    r.register(
+        ms,
+        "asSlice",
+        "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = pe_long_arg(args, 1);
+            let layout = obj_arg(args, 2)?;
+            let width = pe_memory_layout_width(ctx, layout);
+            pe_segment_slice(ctx, this, offset, width, None)
+        },
+    );
+
+    // maxByteAlignment() — the JDK's rule is the largest power of two that
+    // divides the segment's base address, and the address-layout alignment for
+    // a base of 0.
+    //
+    // The base address is read through [`pe_segment_base_address`], not
+    // `segment_address`, so it is the SAME number `address()` answers: on a
+    // heap carrier `segment_address` is deliberately 0 (F27 — a length is not
+    // an address), and reading it here would have claimed 8-byte alignment for
+    // every heap slice regardless of where in the array it starts.
+    r.register(ms, "maxByteAlignment", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = pe_segment_base_address(ctx, this);
+        Ok(Some(Value::Long(if addr == 0 {
+            8
+        } else {
+            addr & addr.wrapping_neg()
+        })))
+    });
+
+    // heapBase() — present only for a heap segment, whose Java array this
+    // answers; a native segment has no heap base.
+    //
+    // Asked through `heap_segment_view`, which is the same reader `isNative()`
+    // and `address()` above use, so the three cannot disagree. The plain
+    // `SEG_BACKING_ARRAY_FIELD` read this used to do knew only ONE of the three
+    // heap carriers — the `ofArray` off-heap mirror — and answered empty for a
+    // real `HeapMemorySegmentImpl$Of*` and for this file's own alias carrier
+    // (`[6]=array, [7]=start`), the two that `isNative()` already reports as
+    // non-native. The mirror is kept as the fallback because its array lives in
+    // slot 2 and `heap_segment_view` does not claim it.
+    r.register(ms, "heapBase", "()Ljava/util/Optional;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let base = match heap_segment_view(ctx, this) {
+            Some(view) => Value::Object(Some(view.base)),
+            None => match ctx.get_field(this, SEG_BACKING_ARRAY_FIELD) {
+                Value::Object(Some(array)) if ctx.object_is_array(array) => {
+                    Value::Object(Some(array))
+                }
+                _ => Value::Object(None),
+            },
+        };
+        ctx.invoke(
+            "java/util/Optional",
+            "ofNullable",
+            "(Ljava/lang/Object;)Ljava/util/Optional;",
+            &[base],
+        )
+    });
+
+    // isAccessibleBy(Thread) — delegate to the SESSION rather than re-deriving
+    // confinement here. The owner slot belongs to `foreign_ffm`'s session model,
+    // and a second copy of that index is exactly the drift this file's
+    // scope-resolution comment warns about.
+    r.register(ms, "isAccessibleBy", "(Ljava/lang/Thread;)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let thread = args.get(1).copied().unwrap_or(Value::Object(None));
+        match pe_segment_session(ctx, this) {
+            Some(session) => {
+                ctx.invoke_virtual(session, "isAccessibleBy", "(Ljava/lang/Thread;)Z", &[thread])
+            }
+            // No modelled session means unconfined, which every thread may reach.
+            None => Ok(Some(Value::Int(1))),
+        }
+    });
+
+    // isLoaded / load / unload / force — specified to throw for a segment that
+    // did not come from `FileChannel.map`, which is every segment this VM mints.
+    // Registered rather than left absent so the caller sees the JDK's own
+    // exception (message included, measured) instead of an AbstractMethodError
+    // that names dispatch.
+    r.register(ms, "isLoaded", "()Z", |_ctx, _args| {
+        Err(RuntimeError::UnsupportedOperationException {
+            message: "Not a mapped segment".to_string(),
+        }
+        .into())
+    });
+    for method in ["load", "unload", "force"] {
+        r.register(ms, method, "()V", |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "Not a mapped segment".to_string(),
+            }
+            .into())
+        });
+    }
 
     // ofAddress(long address) → MemorySegment (wraps a raw address, zero-length)
     r.register(
@@ -1429,6 +1606,386 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         },
     );
 
+
+    // ---- the rest of the surface `java.lang.foreign` declares -------------
+    //
+    // Every method below is `public abstract` on the `MemorySegment`
+    // interface, so one that nobody registers is not a slow path — it is
+    // `AbstractMethodError: … has no Code attribute` at the call site, an
+    // error that names dispatch rather than the missing feature. They were
+    // found by running the whole public surface one call at a time against
+    // both VMs (`FfmAudit`), which is the only way to find this shape: each
+    // one otherwise surfaces a single application at a time.
+
+    // copyFrom(src) — bulk copy, sizes must match exactly.
+    r.register(
+        ms,
+        "copyFrom",
+        "(Ljava/lang/foreign/MemorySegment;)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let src = obj_arg(args, 1)?;
+            pe_segment_check_scope(ctx, this)?;
+            pe_segment_check_scope(ctx, src)?;
+            let dst_size = crate::panama_libffi::segment_byte_size(ctx, this);
+            let src_size = crate::panama_libffi::segment_byte_size(ctx, src);
+            if src_size != dst_size {
+                return Err(RuntimeError::IndexOutOfBoundsException {
+                    message: Some(format!(
+                        "Cannot copy {} bytes into a {}-byte segment",
+                        src_size, dst_size
+                    )),
+                }
+                .into());
+            }
+            let n = usize::try_from(dst_size).unwrap_or(0);
+            if n > MAX_COPY_SIZE {
+                return Err(RuntimeError::IllegalStateException {
+                    message: format!("copy size {} exceeds maximum of {} bytes", n, MAX_COPY_SIZE),
+                }
+                .into());
+            }
+            let dst_addr = crate::panama_libffi::segment_address(ctx, this) as *mut u8;
+            let src_addr = crate::panama_libffi::segment_address(ctx, src) as *const u8;
+            if n > 0 && !dst_addr.is_null() && !src_addr.is_null() {
+                // SAFETY: both addresses come from JVM-managed segments whose
+                // sizes were just checked equal to `n`, and the two blocks may
+                // overlap (`copyFrom` does not forbid it), hence `copy` and not
+                // `copy_nonoverlapping`.
+                unsafe { std::ptr::copy(src_addr, dst_addr, n) };
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+
+    // mismatch(other) — index of the first differing byte, or -1.
+    r.register(
+        ms,
+        "mismatch",
+        "(Ljava/lang/foreign/MemorySegment;)J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = obj_arg(args, 1)?;
+            pe_segment_check_scope(ctx, this)?;
+            pe_segment_check_scope(ctx, other)?;
+            let a_len = crate::panama_libffi::segment_byte_size(ctx, this).max(0);
+            let b_len = crate::panama_libffi::segment_byte_size(ctx, other).max(0);
+            let common = a_len.min(b_len);
+            let a = crate::panama_libffi::segment_address(ctx, this) as *const u8;
+            let b = crate::panama_libffi::segment_address(ctx, other) as *const u8;
+            if a.is_null() || b.is_null() {
+                // Nothing to compare through; fall back to the length rule.
+                return Ok(Some(Value::Long(if a_len == b_len { -1 } else { common })));
+            }
+            let n = usize::try_from(common).unwrap_or(0).min(MAX_COPY_SIZE);
+            // SAFETY: both pointers are segment bases and `n` is bounded by the
+            // shorter of the two segment sizes.
+            let (a_bytes, b_bytes) =
+                unsafe { (std::slice::from_raw_parts(a, n), std::slice::from_raw_parts(b, n)) };
+            let index = a_bytes
+                .iter()
+                .zip(b_bytes.iter())
+                .position(|(x, y)| x != y)
+                .map(|i| i as i64);
+            // The JDK's contract: the first differing byte; else the common
+            // length when one segment is a prefix of the other; else -1.
+            Ok(Some(Value::Long(match index {
+                Some(i) => i,
+                None if a_len == b_len => -1,
+                None => common,
+            })))
+        },
+    );
+
+    // getString(offset[, charset]) — a NUL-terminated string, read in place.
+    for desc in [
+        "(J)Ljava/lang/String;",
+        "(JLjava/nio/charset/Charset;)Ljava/lang/String;",
+    ] {
+        r.register(ms, "getString", desc, |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            pe_segment_check_scope(ctx, this)?;
+            let offset = match args.get(1) {
+                Some(Value::Long(n)) => *n,
+                _ => 0,
+            };
+            let size = crate::panama_libffi::segment_byte_size(ctx, this).max(0);
+            if offset < 0 || offset > size {
+                return Err(RuntimeError::IndexOutOfBoundsException {
+                    message: Some(format!("offset {} out of bounds for size {}", offset, size)),
+                }
+                .into());
+            }
+            let base = crate::panama_libffi::segment_address(ctx, this) as *const u8;
+            if base.is_null() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let avail = usize::try_from(size - offset).unwrap_or(0).min(MAX_COPY_SIZE);
+            // SAFETY: `offset` is within the segment and `avail` is the
+            // remaining length from there.
+            let bytes = unsafe { std::slice::from_raw_parts(base.add(offset as usize), avail) };
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(avail);
+            // The charset overload is accepted and read as UTF-8: that is the
+            // only decoder available here, and it is the default the no-charset
+            // form uses. Non-UTF-8 bytes are replaced rather than refused,
+            // matching `String::from_utf8_lossy` — recorded rather than silent.
+            let text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+            let s = ctx.create_string(&text);
+            Ok(Some(Value::Object(Some(s))))
+        });
+    }
+
+    // setString(offset, value[, charset]) — write the bytes plus a NUL.
+    for desc in [
+        "(JLjava/lang/String;)V",
+        "(JLjava/lang/String;Ljava/nio/charset/Charset;)V",
+    ] {
+        r.register(ms, "setString", desc, |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            pe_segment_check_scope(ctx, this)?;
+            let offset = match args.get(1) {
+                Some(Value::Long(n)) => *n,
+                _ => 0,
+            };
+            let text = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let size = crate::panama_libffi::segment_byte_size(ctx, this).max(0);
+            let needed = text.len() as i64 + 1;
+            if offset < 0 || offset.saturating_add(needed) > size {
+                return Err(RuntimeError::IndexOutOfBoundsException {
+                    message: Some(format!(
+                        "writing {} bytes at offset {} exceeds segment size {}",
+                        needed, offset, size
+                    )),
+                }
+                .into());
+            }
+            let base = crate::panama_libffi::segment_address(ctx, this) as *mut u8;
+            if base.is_null() {
+                return Ok(None);
+            }
+            // SAFETY: the bounds check above guarantees `offset + text.len() + 1`
+            // bytes are inside the segment.
+            unsafe {
+                let dst = base.add(offset as usize);
+                std::ptr::copy_nonoverlapping(text.as_ptr(), dst, text.len());
+                dst.add(text.len()).write(0);
+            }
+            Ok(None)
+        });
+    }
+
+    // asOverlappingSlice(other) — the shared region, as an Optional.
+    r.register(
+        ms,
+        "asOverlappingSlice",
+        "(Ljava/lang/foreign/MemorySegment;)Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let that = obj_arg(args, 1)?;
+            let a_start = crate::panama_libffi::segment_address(ctx, this);
+            let a_end = a_start.saturating_add(crate::panama_libffi::segment_byte_size(ctx, this));
+            let b_start = crate::panama_libffi::segment_address(ctx, that);
+            let b_end = b_start.saturating_add(crate::panama_libffi::segment_byte_size(ctx, that));
+            let lo = a_start.max(b_start);
+            let hi = a_end.min(b_end);
+            let empty = lo >= hi;
+            let value = if empty {
+                Value::Object(None)
+            } else {
+                pe_segment_slice(ctx, this, lo - a_start, hi - lo, None)?
+                    .unwrap_or(Value::Object(None))
+            };
+            let opt = crate::phases_late::foreign_ffm::p67_optional(ctx, value)?;
+            Ok(Some(Value::Object(Some(opt))))
+        },
+    );
+
+
+    // toArray(elementLayout) — copy the whole segment out into a Java array.
+    //
+    // Eight overloads, one per primitive layout, each with its own array return
+    // type. They share one body because `register` takes a plain fn pointer —
+    // a per-descriptor closure could not capture its element width — so the
+    // width and the array kind come from the layout argument, exactly as
+    // `get`/`set` take theirs.
+    for desc in [
+        "(Ljava/lang/foreign/ValueLayout$OfBoolean;)[Z",
+        "(Ljava/lang/foreign/ValueLayout$OfByte;)[B",
+        "(Ljava/lang/foreign/ValueLayout$OfChar;)[C",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;)[S",
+        "(Ljava/lang/foreign/ValueLayout$OfInt;)[I",
+        "(Ljava/lang/foreign/ValueLayout$OfFloat;)[F",
+        "(Ljava/lang/foreign/ValueLayout$OfLong;)[J",
+        "(Ljava/lang/foreign/ValueLayout$OfDouble;)[D",
+    ] {
+        r.register(ms, "toArray", desc, pe_segment_to_array);
+    }
+
+
+
+    // allocateFrom(elementLayout, values...) — the seven array overloads.
+    //
+    // These are `default` methods on `SegmentAllocator`, so real JDK bytecode
+    // runs for them, and it ends in
+    // `((AbstractMemorySegmentImpl) segment).copyFrom(...)` — a cast that can
+    // never succeed while CratonVM fabricates segments as instances of the
+    // `MemorySegment` INTERFACE. The failure was therefore not "no Code
+    // attribute" like its neighbours but a `ClassCastException` from inside the
+    // JDK, which is why it survived the interface audit that found the rest.
+    // A native for each descriptor keeps that bytecode from running at all.
+    for allocator in [
+        "java/lang/foreign/Arena",
+        "java/lang/foreign/SegmentAllocator",
+    ] {
+        // Seven, not eight: `SegmentAllocator` declares no `boolean...`
+        // overload. Registering a descriptor the JDK does not declare would be
+        // dead weight that reads like coverage.
+        for desc in [
+            "(Ljava/lang/foreign/ValueLayout$OfByte;[B)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfChar;[C)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfShort;[S)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfInt;[I)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfFloat;[F)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfLong;[J)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfDouble;[D)Ljava/lang/foreign/MemorySegment;",
+        ] {
+            r.register(allocator, "allocateFrom", desc, pe_allocate_from_array);
+        }
+    }
+
+    // spliterator(elementLayout) / elements(elementLayout).
+    //
+    // The last two `MemorySegment` methods that answered
+    // `AbstractMethodError`. They are implemented LAZILY — see
+    // `pe_segment_spliterator` for why a materialised list of slices would be
+    // wrong for exactly the case these methods exist for.
+    r.register(
+        ms,
+        "spliterator",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/util/Spliterator;",
+        pe_segment_spliterator,
+    );
+    r.register(
+        ms,
+        "elements",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/util/stream/Stream;",
+        pe_segment_elements,
+    );
+
+    // The splitter's own surface. Registered on ITS class, not on
+    // `java/util/Spliterator`: that interface already carries the
+    // array-backed collections implementation (field 0 = `Object[]`, 1 =
+    // cursor, 2 = fence), registered later than this file runs, and a second
+    // registration of the same triple would silently take those calls over.
+    // A distinct receiver class keeps the two implementations apart with no
+    // ordering dependency and no shape-sniffing.
+    let splitter = PE_SEGMENT_SPLITTER;
+    r.register(
+        splitter,
+        "tryAdvance",
+        "(Ljava/util/function/Consumer;)Z",
+        pe_splitter_try_advance,
+    );
+    r.register(
+        splitter,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+        |ctx, args| {
+            // `Spliterator.forEachRemaining` has a default body, but it is not
+            // reachable here: the receiver's class is a fabricated stub with no
+            // declared interfaces, so nothing routes the call to
+            // `java.util.Spliterator`. Every method the contract exposes is
+            // therefore registered explicitly rather than inherited.
+            while matches!(pe_splitter_try_advance(ctx, args)?, Some(Value::Int(1))) {}
+            Ok(None)
+        },
+    );
+    r.register(
+        splitter,
+        "trySplit",
+        "()Ljava/util/Spliterator;",
+        |ctx, args| {
+            // The JDK's `SegmentSplitter.trySplit`: split only before the first
+            // element is consumed, hand the LOW half to the new splitter and keep
+            // the high half (plus the odd element) here.
+            let this = obj_arg(args, 0)?;
+            let (elem_count, elem_size, index) = pe_splitter_state(ctx, this);
+            if index != 0 || elem_count <= 1 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let (split, lobound, hibound) = pe_split_bounds(elem_count, elem_size);
+            // What THIS splitter keeps: everything the low half did not take,
+            // i.e. the JDK's `split + rem` with `rem = elemCount % 2`.
+            let high_count = elem_count - split;
+            let segment = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let low = match pe_segment_slice(ctx, segment, 0, lobound, None)? {
+                Some(Value::Object(Some(s))) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let low_pin = ctx.pin_native_root(low);
+            let prefix = pe_new_splitter(ctx, low, split, elem_size)?;
+            ctx.unpin_native_roots(low_pin);
+            // Only now narrow this splitter to its own (high) half.
+            let this = obj_arg(args, 0)?;
+            let segment = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Some(Value::Object(Some(high))) =
+                pe_segment_slice(ctx, segment, lobound, hibound, None)?
+            {
+                ctx.set_field(this, 0, Value::Object(Some(high)));
+            }
+            ctx.set_field(this, 1, Value::Long(high_count));
+            Ok(Some(Value::Object(Some(prefix))))
+        },
+    );
+    // `elemCount`, NOT `elemCount - currentIndex`. The JDK returns the former
+    // verbatim, so a half-drained splitter still reports its ORIGINAL size —
+    // measured, `tryAdvance` x3 over 8 elements still answers 8 on HotSpot.
+    // Subtracting would be the more sensible number and the wrong one.
+    r.register(splitter, "estimateSize", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (elem_count, _, _) = pe_splitter_state(ctx, this);
+        Ok(Some(Value::Long(elem_count.max(0))))
+    });
+    r.register(splitter, "getExactSizeIfKnown", "()J", |ctx, args| {
+        // SIZED, so the exact size IS known — and it is `estimateSize()`,
+        // which is what the interface default returns.
+        let this = obj_arg(args, 0)?;
+        let (elem_count, _, _) = pe_splitter_state(ctx, this);
+        Ok(Some(Value::Long(elem_count.max(0))))
+    });
+    r.register(splitter, "characteristics", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(PE_SPLITTER_CHARACTERISTICS)))
+    });
+    r.register(splitter, "hasCharacteristics", "(I)Z", |_ctx, args| {
+        let wanted = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let has = (PE_SPLITTER_CHARACTERISTICS & wanted) == wanted;
+        Ok(Some(Value::Int(i32::from(has))))
+    });
+    r.register(
+        splitter,
+        "getComparator",
+        "()Ljava/util/Comparator;",
+        |_ctx, _args| {
+            // Not SORTED — the spec'd answer is to throw, not to return null
+            // (null means "sorted in natural order"). `Spliterator`'s default
+            // throws `new IllegalStateException()`, so `getMessage()` is empty;
+            // measured on HotSpot as `IllegalStateException: null`.
+            Err(RuntimeError::IllegalStateException {
+                message: String::new(),
+            }
+            .into())
+        },
+    );
+
     // fill(byte value) — memset
     r.register(
         ms,
@@ -1462,6 +2019,585 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+}
+
+/// `MemorySegment.toArray(ValueLayout$OfX)` — the segment copied out into a
+/// fresh Java array of the matching primitive type.
+///
+/// The element kind is taken from the layout argument's class name, which is
+/// how the eight overloads share one body. `checkArraySize` in the JDK refuses
+/// a segment whose size is not a whole number of elements; that is the
+/// `size % width` arm here.
+fn pe_segment_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType as AET;
+    let this = obj_arg(args, 0)?;
+    pe_segment_check_scope(ctx, this)?;
+    let layout = obj_arg(args, 1)?;
+    let layout_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(layout))
+        .unwrap_or_default();
+    let (width, kind) = if layout_class.contains("OfBoolean") {
+        (1_i64, AET::Boolean)
+    } else if layout_class.contains("OfByte") {
+        (1, AET::Byte)
+    } else if layout_class.contains("OfChar") {
+        (2, AET::Char)
+    } else if layout_class.contains("OfShort") {
+        (2, AET::Short)
+    } else if layout_class.contains("OfInt") {
+        (4, AET::Int)
+    } else if layout_class.contains("OfFloat") {
+        (4, AET::Float)
+    } else if layout_class.contains("OfLong") {
+        (8, AET::Long)
+    } else if layout_class.contains("OfDouble") {
+        (8, AET::Double)
+    } else {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("toArray: unsupported element layout {}", layout_class),
+        }
+        .into());
+    };
+
+    let size = crate::panama_libffi::segment_byte_size(ctx, this).max(0);
+    if size % width != 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!("Segment size is not a multiple of {}. Size: {}", width, size),
+        }
+        .into());
+    }
+    let count = size / width;
+    // `ArraysSupport.SOFT_MAX_ARRAY_LENGTH`, the JDK's own bound.
+    if count > i64::from(i32::MAX) - 8 {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!("Segment is too large to wrap as an array. Size: {}", size),
+        }
+        .into());
+    }
+    let base = crate::panama_libffi::segment_address(ctx, this) as *const u8;
+    let arr = ctx.new_array(kind, count as usize);
+    if base.is_null() {
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+    for i in 0..count as usize {
+        // SAFETY: `i * width` is inside the segment by the size check above,
+        // and each read is exactly `width` bytes wide.
+        let value = unsafe {
+            let p = base.add(i * width as usize);
+            match kind {
+                AET::Boolean => Value::Int(i32::from(p.read() != 0)),
+                AET::Byte => Value::Int(i32::from(p.read() as i8)),
+                AET::Char => Value::Int(i32::from(u16::from_ne_bytes(p.cast::<[u8; 2]>().read()))),
+                AET::Short => Value::Int(i32::from(i16::from_ne_bytes(p.cast::<[u8; 2]>().read()))),
+                AET::Int => Value::Int(i32::from_ne_bytes(p.cast::<[u8; 4]>().read())),
+                AET::Float => Value::Float(f32::from_ne_bytes(p.cast::<[u8; 4]>().read())),
+                AET::Long => Value::Long(i64::from_ne_bytes(p.cast::<[u8; 8]>().read())),
+                _ => Value::Double(f64::from_ne_bytes(p.cast::<[u8; 8]>().read())),
+            }
+        };
+        ctx.set_array_element(arr, i, value);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// A `long` argument, tolerant of the `Int` an interpreter frame may carry.
+fn pe_long_arg(args: &[Value], index: usize) -> i64 {
+    match args.get(index) {
+        Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => *n as i64,
+        _ => 0,
+    }
+}
+
+/// `SegmentAllocator.allocateFrom(ValueLayout$OfX, X... elements)`.
+///
+/// One body for all eight overloads: the element width comes from the layout
+/// argument and the values from the Java array, the same way `toArray` reads
+/// its kind from the layout rather than the descriptor.
+fn pe_allocate_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arena = obj_arg(args, 0)?;
+    let layout = obj_arg(args, 1)?;
+    let Some(Value::Object(Some(array))) = args.get(2).copied() else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("allocateFrom: elements array is null".to_string()),
+        }
+        .into());
+    };
+    let (width, align) = crate::phases_late::foreign_ffm::p67_layout_size_align(ctx, layout);
+    if width <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Invalid byte size: {}", width),
+        }
+        .into());
+    }
+    let count = ctx.array_length(array) as i64;
+    let size = count.saturating_mul(width);
+    // Zero elements still allocates: the JDK hands back an empty segment rather
+    // than null, and `Arena.allocate(0)` is legal.
+    let Some(Value::Object(Some(segment))) =
+        pe_arena_allocate_impl(ctx, arena, size.max(1), align)?
+    else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // The allocator over-allocates one byte for an empty array (`size.max(1)`)
+    // so the pointer is real; report the size the caller asked for.
+    ctx.set_field(segment, 1, Value::Long(size));
+    let base = crate::panama_libffi::segment_address(ctx, segment) as *mut u8;
+    if base.is_null() || count == 0 {
+        return Ok(Some(Value::Object(Some(segment))));
+    }
+    for i in 0..count as usize {
+        let value = ctx.get_array_element(array, i);
+        // SAFETY: `i * width` is inside the block just allocated for
+        // `count * width` bytes, and each write is exactly `width` wide.
+        unsafe {
+            let p = base.add(i * width as usize);
+            match width {
+                1 => p.write(match value {
+                    Value::Int(v) => v as u8,
+                    _ => 0,
+                }),
+                2 => {
+                    let v = match value {
+                        Value::Int(v) => v as u16,
+                        _ => 0,
+                    };
+                    p.cast::<[u8; 2]>().write(v.to_ne_bytes());
+                }
+                4 => {
+                    let bits = match value {
+                        Value::Float(f) => f.to_bits(),
+                        Value::Int(v) => v as u32,
+                        _ => 0,
+                    };
+                    p.cast::<[u8; 4]>().write(bits.to_ne_bytes());
+                }
+                _ => {
+                    let bits = match value {
+                        Value::Double(d) => d.to_bits(),
+                        Value::Long(v) => v as u64,
+                        Value::Int(v) => i64::from(v) as u64,
+                        _ => 0,
+                    };
+                    p.cast::<[u8; 8]>().write(bits.to_ne_bytes());
+                }
+            }
+        }
+    }
+    Ok(Some(Value::Object(Some(segment))))
+}
+
+/// The receiver class of `MemorySegment.spliterator(...)`.
+///
+/// Deliberately NOT `java/util/Spliterator`. That name is already the runtime
+/// class of the array-backed collections spliterators, whose natives are
+/// registered by `native-collections` *after* this file's registrar runs — so
+/// re-registering `tryAdvance` there would take over every `ArrayList`
+/// spliterator in the VM. A distinct class also makes
+/// `StreamSupport.stream(spliterator, false)` treat this as a real
+/// `Spliterator` implementation and drain it lazily through `tryAdvance`,
+/// which is exactly the behaviour wanted here.
+const PE_SEGMENT_SPLITTER: &str = "java/lang/foreign/MemorySegment$SegmentSplitter";
+
+/// `NONNULL | SUBSIZED | SIZED | IMMUTABLE | ORDERED`, the value the JDK's
+/// `AbstractMemorySegmentImpl.SegmentSplitter.characteristics()` returns.
+const PE_SPLITTER_CHARACTERISTICS: i32 = 0x100 | 0x4000 | 0x40 | 0x400 | 0x10;
+
+/// `(low half element count, low half byte size, high half byte size)`.
+///
+/// The JDK's `SegmentSplitter.trySplit` arithmetic, lifted out so it can be
+/// checked without a heap: the LOW half gets `elemCount / 2` elements and the
+/// odd one stays with the high half, so an odd count splits 2/3, not 3/2. An
+/// off-by-one here silently drops or duplicates an element in every parallel
+/// stream over a segment, which is exactly the bug a differential probe over
+/// an even count cannot see.
+fn pe_split_bounds(elem_count: i64, elem_size: i64) -> (i64, i64, i64) {
+    let rem = elem_count % 2;
+    let split = elem_count / 2;
+    let lobound = split * elem_size;
+    let hibound = lobound + (rem * elem_size);
+    (split, lobound, hibound)
+}
+
+/// `(elemCount, elementSize, currentIndex)` off a splitter carrier.
+///
+/// Slots: `[0]=segment, [1]=elemCount, [2]=elementSize, [3]=currentIndex`.
+fn pe_splitter_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> (i64, i64, i64) {
+    let long_at = |ctx: &mut dyn NativeContext, i: usize| match ctx.get_field(this, i) {
+        Value::Long(v) => v,
+        Value::Int(v) => i64::from(v),
+        _ => 0,
+    };
+    (long_at(ctx, 1), long_at(ctx, 2), long_at(ctx, 3))
+}
+
+/// Allocate a splitter over `segment`.
+fn pe_new_splitter(
+    ctx: &mut dyn NativeContext,
+    segment: ObjectRef,
+    elem_count: i64,
+    elem_size: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let segment_pin = ctx.pin_native_root(segment);
+    let splitter = try_alloc_concurrent_synthetic(ctx, PE_SEGMENT_SPLITTER, 4)?;
+    let segment = ctx.read_native_pin(segment_pin, segment);
+    ctx.unpin_native_roots(segment_pin);
+    ctx.set_field(splitter, 0, Value::Object(Some(segment)));
+    ctx.set_field(splitter, 1, Value::Long(elem_count));
+    ctx.set_field(splitter, 2, Value::Long(elem_size));
+    ctx.set_field(splitter, 3, Value::Long(0));
+    Ok(splitter)
+}
+
+/// `Spliterator.tryAdvance` — hand the consumer the next slice, one at a time.
+///
+/// This is where the laziness lives: the slice for element `i` is minted when
+/// `i` is reached, so a segment with more elements than fit in memory as
+/// separate `MemorySegment` objects still streams. A materialised list of
+/// slices would answer the same two calls and be wrong for exactly the case
+/// these methods exist for.
+fn pe_splitter_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (elem_count, elem_size, index) = pe_splitter_state(ctx, this);
+    if index >= elem_count {
+        return Ok(Some(Value::Int(0)));
+    }
+    let segment = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let slice = pe_segment_slice(ctx, segment, index * elem_size, elem_size, None)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    // Advance BEFORE the callback: the JDK increments in a `finally`, so a
+    // consumer that throws still leaves the splitter past this element.
+    ctx.set_field(this, 3, Value::Long(index + 1));
+    if let Some(Value::Object(Some(consumer))) = args.get(1) {
+        let slice = slice.unwrap_or(Value::Object(None));
+        ctx.invoke_virtual(*consumer, "accept", "(Ljava/lang/Object;)V", &[slice])?;
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+/// `MemorySegment.spliterator(MemoryLayout)`.
+///
+/// The four `IllegalArgumentException`s are the JDK's, in its order — see
+/// `AbstractMemorySegmentImpl.spliterator`.
+fn pe_segment_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let layout = obj_arg(args, 1)?;
+    pe_segment_check_scope(ctx, this)?;
+    let (elem_size, elem_align) =
+        crate::phases_late::foreign_ffm::p67_layout_size_align(ctx, layout);
+    if elem_size == 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Element layout size cannot be zero".into(),
+        }
+        .into());
+    }
+    if elem_size % elem_align != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Element layout size is not multiple of alignment".into(),
+        }
+        .into());
+    }
+    if crate::panama_libffi::segment_address(ctx, this) % elem_align != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Incompatible alignment constraints".into(),
+        }
+        .into());
+    }
+    let size = crate::panama_libffi::segment_byte_size(ctx, this).max(0);
+    if size % elem_size != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Segment size is not a multiple of layout size".into(),
+        }
+        .into());
+    }
+    let splitter = pe_new_splitter(ctx, this, size / elem_size, elem_size)?;
+    Ok(Some(Value::Object(Some(splitter))))
+}
+
+/// `MemorySegment.elements(MemoryLayout)` — `StreamSupport.stream(spliterator, false)`.
+///
+/// Built here rather than by calling that method, because `NativeContext` has
+/// no `invoke_static`. The shape is not invented: it is byte for byte what
+/// `service_loader::native_stream_support_stream_from_spliterator` builds for a
+/// non-synthetic spliterator — a `java/util/stream/Stream` carrier with a null
+/// element array in slot 0 and the spliterator parked in the lazy slot 2, which
+/// `native-collections`' `materialize_lazy_stream` / `stream_lazy_spliterator`
+/// drain on demand. Going through that path is what keeps `elements()` lazy:
+/// `forEach` interleaves `tryAdvance` and `accept` instead of buffering.
+fn pe_segment_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(splitter))) = pe_segment_spliterator(ctx, args)? else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let splitter_pin = ctx.pin_native_root(splitter);
+    let cid = ctx
+        .ensure_class_initialized("java/util/stream/Stream")
+        .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
+    // Force >= 3 fields so the lazy slot exists alongside elements (0) and
+    // close-handlers (1).
+    let nfields = ctx.class_num_total_fields(cid).max(3);
+    let stream = ctx.alloc_object(cid, nfields);
+    let stream_pin = ctx.pin_native_root(stream);
+    let mut stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.set_field(stream, 0, Value::Object(None));
+    stream = ctx.read_native_pin(stream_pin, stream);
+    let splitter = ctx.read_native_pin(splitter_pin, splitter);
+    ctx.set_field(stream, 2, Value::Object(Some(splitter)));
+    stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(splitter_pin);
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+/// The base address a segment reports through `address()`.
+///
+/// NOT `panama_libffi::segment_address`: on a heap carrier that is deliberately
+/// 0 (F27 — slot 0 stays 0 so no raw-pointer consumer is ever handed a small
+/// integer to dereference), while `address()` answers the offset of the
+/// segment's first byte within its backing array. Anything that reasons about
+/// WHERE a segment starts — the alignment arms of `asSlice`/`maxByteAlignment`
+/// — must use this one, or it reasons about a native address on a segment that
+/// has none.
+fn pe_segment_base_address(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
+    match heap_segment_view(ctx, seg) {
+        Some(view) => view.start,
+        None => crate::panama_libffi::segment_address(ctx, seg),
+    }
+}
+
+/// The body behind `asSlice(long,long)`, `asSlice(long)`, `asSlice(long,long,
+/// long)`, `asSlice(long,MemoryLayout)` and `asReadOnly()`.
+///
+/// `read_only_override` is `None` to inherit the parent's flag (what a slice
+/// does) and `Some(true)` to force it on (what `asReadOnly` does). Inheriting
+/// is the F21 rule and not a convenience: read-only is CONTAGIOUS, there is no
+/// route back to writable, and a derived view that quietly cleared the flag
+/// would be the wrong CAPABILITY one call after the fix.
+fn pe_segment_slice(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    offset: i64,
+    new_size: i64,
+    read_only_override: Option<bool>,
+) -> MethodCallResult {
+    let size = crate::panama_libffi::segment_byte_size(ctx, this);
+    let end = offset.checked_add(new_size);
+    if offset < 0 || new_size < 0 || end.map_or(true, |n| n > size) {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!(
+                "slice offset {} + size {} exceeds segment size {}",
+                offset, new_size, size
+            ),
+        }
+        .into());
+    }
+    // A SLICE OF A HEAP SEGMENT IS A HEAP SEGMENT.
+    //
+    // The address arithmetic below is only meaningful for a carrier
+    // that HAS an address. For a heap one `segment_address` answers 0
+    // (F27), so `slice_ptr` came out as the slice's OFFSET and was
+    // stamped into slot 0 of a synthetic segment — reconstructing, one
+    // level up, exactly the defect F27 closed: a small integer that is
+    // not an address, sitting where every consumer reads an address.
+    // `ofArray(new byte[16]).asSlice(3, 4).get(JAVA_BYTE, 0)` then
+    // dereferenced the literal address 3. (At offset 0 it stayed 0 and
+    // refused, which is why the un-sliced repro looked fixed.)
+    //
+    // Measured on the oracle: `ofArray(new byte[16]).asSlice(3, 4)` has
+    // `byteSize=4`, `address()=3`, `isNative()=false`, and a write
+    // through it lands at `src[3..7]`.
+    if let Some(view) = heap_segment_view(ctx, this) {
+        let read_only = i32::from(read_only_override.unwrap_or(view.read_only));
+        let start = view.start.saturating_add(offset);
+        // The allocation below can MOVE the backing array (the native
+        // stale-local family), so pin it and re-read it through the
+        // pin — the same discipline the session handling below uses.
+        let base_pin = ctx.pin_native_root(view.base);
+        let slice = try_alloc_concurrent_synthetic(
+            ctx,
+            "java/lang/foreign/MemorySegment",
+            SEG_HEAP_FIELDS,
+        )?;
+        let base = ctx.read_native_pin(base_pin, view.base);
+        ctx.unpin_native_roots(base_pin);
+        // Slot 0 stays 0: a heap slice has no machine address either,
+        // and `segment_address` must keep answering the value every
+        // raw-pointer consumer already refuses on.
+        ctx.set_field(slice, 0, Value::Long(0));
+        ctx.set_field(slice, 1, Value::Long(new_size));
+        ctx.set_field(slice, 2, Value::Object(None));
+        ctx.set_field(slice, 3, Value::Int(read_only));
+        ctx.set_field(slice, 4, Value::Int(1));
+        ctx.set_field(slice, 5, Value::Long(0));
+        ctx.set_field(slice, SEG_HEAP_BASE_FIELD, Value::Object(Some(base)));
+        ctx.set_field(slice, SEG_HEAP_START_FIELD, Value::Long(start));
+        return Ok(Some(Value::Object(Some(slice))));
+    }
+    let base_ptr = crate::panama_libffi::segment_address(ctx, this);
+    let slice_ptr = base_ptr.checked_add(offset).ok_or_else(|| {
+        MethodCallFailed::from(RuntimeError::IllegalStateException {
+            message: "address arithmetic overflow in MemorySegment.asSlice".into(),
+        })
+    })?;
+
+    // A synthetic slice cannot retain the real implementation's
+    // private scope object.  It stores an already-adjusted absolute
+    // address instead, which is valid for both real and synthetic
+    // source segments and avoids treating real field 0/5 as ptr/off.
+    let read_only = match read_only_override {
+        Some(forced) => Value::Int(i32::from(forced)),
+        None => match ctx.get_field_by_name(this, "readOnly") {
+            Value::Int(n) => Value::Int(n),
+            _ => ctx.get_field(this, 3),
+        },
+    };
+
+    // W7-89: a slice stays inside its parent's scope. Slot 2 used to be
+    // written as the "no arena" marker unconditionally, so
+    // `pe_segment_session` answered `None` for every slice and
+    // `pe_segment_check_scope` let it through — HotSpot raises
+    // `IllegalStateException: Already closed` for a slice of a closed
+    // arena exactly as it does for the parent (measured,
+    // `MemorySessionValidStateProbe` row `C.closed.slice.get`).
+    //
+    // Only a session we MODELLED is propagated, which is all
+    // `pe_segment_session` can return. That is what keeps the slot's
+    // OTHER tenant safe: on an `ofArray` segment slot 2 holds the Java
+    // backing array (`SEG_BACKING_ARRAY_FIELD`), an array resolves to no
+    // session, and such a slice keeps the historical `Object(None)` — so
+    // `isNative()` and `sync_heap_backed_segment` see exactly what they
+    // saw before.
+    let parent_session = pe_segment_session(ctx, this);
+    let session_pin = parent_session.map(|session| ctx.pin_native_root(session));
+    let slice = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+    // The allocation above can move the session (native stale-local
+    // family), so re-read it through the pin before storing it.
+    let scope_value = match (parent_session, session_pin) {
+        (Some(session), Some(pin)) => {
+            let session = ctx.read_native_pin(pin, session);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(session))
+        }
+        _ => Value::Object(None),
+    };
+    ctx.set_field(slice, 0, Value::Long(slice_ptr));
+    ctx.set_field(slice, 1, Value::Long(new_size));
+    ctx.set_field(slice, 2, scope_value);
+    ctx.set_field(slice, 3, read_only);
+    ctx.set_field(slice, 4, Value::Int(1));
+    ctx.set_field(slice, 5, Value::Long(0));
+    Ok(Some(Value::Object(Some(slice))))
+}
+
+/// `MemorySegment.asByteBuffer()` — a direct `ByteBuffer` over the segment.
+///
+/// This is the JDK 25 bridge between `java.lang.foreign` and every existing
+/// NIO API, and the reason netty's non-`sun.misc.Unsafe` allocator could not
+/// allocate at all on CratonVM: `CleanerJava25` is FFM-`Arena`-backed, and
+/// every one of its allocations ended in
+/// `AbstractMethodError: MemorySegment.asByteBuffer() has no Code attribute`.
+///
+/// Mirrors `AbstractMemorySegmentImpl.asByteBuffer()`:
+///
+/// * `checkArraySize("ByteBuffer", 1)` first — a segment larger than a byte
+///   array can hold is an `IllegalStateException`, not a truncated buffer;
+/// * `NativeMemorySegmentImpl.makeByteBuffer()` is
+///   `NIO_ACCESS.newDirectByteBuffer(min, (int) length, null, this)`, so in
+///   real-JDK mode run that very constructor and inherit every `Buffer`
+///   invariant instead of restating them. Passing the segment as the
+///   constructor's `MemorySegment` argument is also what keeps the arena
+///   reachable for the buffer's lifetime — the buffer holds the segment, the
+///   segment holds its scope;
+/// * a read-only segment yields a read-only buffer (`_bb.asReadOnlyBuffer()`).
+///
+/// Deliberately NOT gated on `require_native_access`, unlike `get`/`set`/`fill`
+/// in this file: `asByteBuffer` is not `@Restricted` in the JDK, an
+/// `Arena`-derived segment is a safe (bounds- and lifetime-checked) one, and
+/// gating it would deny the exact call netty makes on a VM where HotSpot allows
+/// it — trading a real divergence for no security the `Arena.allocate` call
+/// that produced the segment already gave away.
+fn pe_segment_as_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    pe_segment_check_scope(ctx, this)?;
+    let size = crate::panama_libffi::segment_byte_size(ctx, this);
+    // `ArraysSupport.SOFT_MAX_ARRAY_LENGTH`, the bound `checkArraySize` uses.
+    const SOFT_MAX_ARRAY_LENGTH: i64 = i32::MAX as i64 - 8;
+    if size < 0 || size > SOFT_MAX_ARRAY_LENGTH {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!("Segment is too large to wrap as ByteBuffer. Size: {}", size),
+        }
+        .into());
+    }
+    let addr = crate::panama_libffi::segment_address(ctx, this);
+    let read_only = matches!(
+        match ctx.get_field_by_name(this, "readOnly") {
+            v @ Value::Int(_) => v,
+            _ => ctx.get_field(this, 3),
+        },
+        Value::Int(n) if n != 0
+    );
+
+    // Real-JDK mode: `java.nio.DirectByteBuffer(long addr, int cap, Object ob,
+    // MemorySegment segment)` is the package-private constructor
+    // `JavaNioAccess.newDirectByteBuffer` calls. Both probes are needed for the
+    // same reason `ByteBuffer.allocateDirect` needs both — see that registrar.
+    let real_direct_byte_buffer = !ctx.would_fabricate_synthetic_stub("java/nio/DirectByteBuffer")
+        && !ctx.is_class_synthetic_stub("java/nio/DirectByteBuffer");
+    let buffer = if real_direct_byte_buffer {
+        ctx.new_object_initialized(
+            "java/nio/DirectByteBuffer",
+            "(JILjava/lang/Object;Ljava/lang/foreign/MemorySegment;)V",
+            &[
+                Value::Long(addr),
+                Value::Int(size as i32),
+                Value::Object(None),
+                Value::Object(Some(this)),
+            ],
+        )?
+    } else {
+        // Synthetic-JDK mode: no `DirectByteBuffer` bytecode to run. Seed the
+        // same field set `direct_buffer::dbb_allocate_direct0` does, minus the
+        // cleaner — this buffer does not own the memory, the arena does, and
+        // registering a cleaner here would free the segment out from under it.
+        let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/DirectByteBuffer", 8)?;
+        ctx.set_field_by_name(buf, "address", Value::Long(addr));
+        ctx.set_field_by_name(buf, "capacity", Value::Int(size as i32));
+        ctx.set_field_by_name(buf, "limit", Value::Int(size as i32));
+        ctx.set_field_by_name(buf, "position", Value::Int(0));
+        ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+        ctx.set_field_by_name(buf, "bigEndian", Value::Int(1));
+        ctx.set_field_by_name(
+            buf,
+            "nativeByteOrder",
+            Value::Int(i32::from(cfg!(target_endian = "big"))),
+        );
+        let named_ok = matches!(
+            ctx.get_field_by_name(buf, "capacity"),
+            Value::Int(c) if c == size as i32
+        );
+        if !named_ok {
+            ctx.set_field(buf, 0, Value::Int(0)); // position
+            ctx.set_field(buf, 1, Value::Int(size as i32)); // limit
+            ctx.set_field(buf, 2, Value::Int(size as i32)); // capacity
+            ctx.set_field(buf, 3, Value::Int(-1)); // mark
+            ctx.set_field(buf, 4, Value::Long(addr)); // address
+            ctx.set_field(buf, 5, Value::Long(size)); // native size
+            ctx.set_field(buf, 6, Value::Int(0)); // no cleaner: the arena owns it
+            ctx.set_field(buf, 7, Value::Int(0));
+        }
+        Some(Value::Object(Some(buf)))
+    };
+
+    if !read_only {
+        return Ok(buffer);
+    }
+    let Some(Value::Object(Some(buf))) = buffer else {
+        return Ok(buffer);
+    };
+    ctx.invoke_virtual(buf, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;", &[])
 }
 
 // --- Scope validity: refuse access through a closed Arena ---
@@ -2033,120 +3169,17 @@ fn unreadable_heap_segment(ctx: &dyn NativeContext, seg: ObjectRef, op: &str) ->
 
 /// `MemorySegment.asSlice(long offset, long size)`.
 ///
-/// Extracted from an inline closure by F35 so its heap arm can be tested.
+/// Extracted from an inline closure by F35 so its heap arm can be tested. The
+/// body itself is [`pe_segment_slice`] — the same one `asSlice(long)`,
+/// `asSlice(long,long,long)`, `asSlice(long,MemoryLayout)` and `asReadOnly()`
+/// call, so the heap arm and the read-only contagion cannot be present on one
+/// arity and absent on the next. Two bodies for one rule is what this file's
+/// `getAtIndex` banner is about; there is now one.
 fn pe_segment_as_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let offset = match args.get(1) {
-        Some(Value::Long(n)) => *n,
-        _ => 0,
-    };
-    let new_size = match args.get(2) {
-        Some(Value::Long(n)) => *n,
-        _ => 0,
-    };
-    let size = crate::panama_libffi::segment_byte_size(ctx, this);
-    let end = offset.checked_add(new_size);
-    if offset < 0 || new_size < 0 || end.map_or(true, |n| n > size) {
-        return Err(RuntimeError::IllegalStateException {
-            message: format!(
-                "slice offset {} + size {} exceeds segment size {}",
-                offset, new_size, size
-            ),
-        }
-        .into());
-    }
-    // A SLICE OF A HEAP SEGMENT IS A HEAP SEGMENT.
-    //
-    // The address arithmetic below is only meaningful for a carrier
-    // that HAS an address. For a heap one `segment_address` answers 0
-    // (F27), so `slice_ptr` came out as the slice's OFFSET and was
-    // stamped into slot 0 of a synthetic segment — reconstructing, one
-    // level up, exactly the defect F27 closed: a small integer that is
-    // not an address, sitting where every consumer reads an address.
-    // `ofArray(new byte[16]).asSlice(3, 4).get(JAVA_BYTE, 0)` then
-    // dereferenced the literal address 3. (At offset 0 it stayed 0 and
-    // refused, which is why the un-sliced repro looked fixed.)
-    //
-    // Measured on the oracle: `ofArray(new byte[16]).asSlice(3, 4)` has
-    // `byteSize=4`, `address()=3`, `isNative()=false`, and a write
-    // through it lands at `src[3..7]`.
-    if let Some(view) = heap_segment_view(ctx, this) {
-        let read_only = i32::from(view.read_only);
-        let start = view.start.saturating_add(offset);
-        // The allocation below can MOVE the backing array (the native
-        // stale-local family), so pin it and re-read it through the
-        // pin — the same discipline the session handling below uses.
-        let base_pin = ctx.pin_native_root(view.base);
-        let slice = try_alloc_concurrent_synthetic(
-            ctx,
-            "java/lang/foreign/MemorySegment",
-            SEG_HEAP_FIELDS,
-        )?;
-        let base = ctx.read_native_pin(base_pin, view.base);
-        ctx.unpin_native_roots(base_pin);
-        // Slot 0 stays 0: a heap slice has no machine address either,
-        // and `segment_address` must keep answering the value every
-        // raw-pointer consumer already refuses on.
-        ctx.set_field(slice, 0, Value::Long(0));
-        ctx.set_field(slice, 1, Value::Long(new_size));
-        ctx.set_field(slice, 2, Value::Object(None));
-        ctx.set_field(slice, 3, Value::Int(read_only));
-        ctx.set_field(slice, 4, Value::Int(1));
-        ctx.set_field(slice, 5, Value::Long(0));
-        ctx.set_field(slice, SEG_HEAP_BASE_FIELD, Value::Object(Some(base)));
-        ctx.set_field(slice, SEG_HEAP_START_FIELD, Value::Long(start));
-        return Ok(Some(Value::Object(Some(slice))));
-    }
-    let base_ptr = crate::panama_libffi::segment_address(ctx, this);
-    let slice_ptr = base_ptr.checked_add(offset).ok_or_else(|| {
-        MethodCallFailed::from(RuntimeError::IllegalStateException {
-            message: "address arithmetic overflow in MemorySegment.asSlice".into(),
-        })
-    })?;
-    // A synthetic slice cannot retain the real implementation's
-    // private scope object.  It stores an already-adjusted absolute
-    // address instead, which is valid for both real and synthetic
-    // source segments and avoids treating real field 0/5 as ptr/off.
-    let read_only = match ctx.get_field_by_name(this, "readOnly") {
-        Value::Int(n) => Value::Int(n),
-        _ => ctx.get_field(this, 3),
-    };
-
-    // W7-89: a slice stays inside its parent's scope. Slot 2 used to be
-    // written as the "no arena" marker unconditionally, so
-    // `pe_segment_session` answered `None` for every slice and
-    // `pe_segment_check_scope` let it through — HotSpot raises
-    // `IllegalStateException: Already closed` for a slice of a closed
-    // arena exactly as it does for the parent (measured,
-    // `MemorySessionValidStateProbe` row `C.closed.slice.get`).
-    //
-    // Only a session we MODELLED is propagated, which is all
-    // `pe_segment_session` can return. That is what keeps the slot's
-    // OTHER tenant safe: on an `ofArray` segment slot 2 holds the Java
-    // backing array (`SEG_BACKING_ARRAY_FIELD`), an array resolves to no
-    // session, and such a slice keeps the historical `Object(None)` — so
-    // `isNative()` and `sync_heap_backed_segment` see exactly what they
-    // saw before.
-    let parent_session = pe_segment_session(ctx, this);
-    let session_pin = parent_session.map(|session| ctx.pin_native_root(session));
-    let slice = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
-    // The allocation above can move the session (native stale-local
-    // family), so re-read it through the pin before storing it.
-    let scope_value = match (parent_session, session_pin) {
-        (Some(session), Some(pin)) => {
-            let session = ctx.read_native_pin(pin, session);
-            ctx.unpin_native_roots(pin);
-            Value::Object(Some(session))
-        }
-        _ => Value::Object(None),
-    };
-    ctx.set_field(slice, 0, Value::Long(slice_ptr));
-    ctx.set_field(slice, 1, Value::Long(new_size));
-    ctx.set_field(slice, 2, scope_value);
-    ctx.set_field(slice, 3, read_only);
-    ctx.set_field(slice, 4, Value::Int(1));
-    ctx.set_field(slice, 5, Value::Long(0));
-    Ok(Some(Value::Object(Some(slice))))
+    let offset = pe_long_arg(args, 1);
+    let new_size = pe_long_arg(args, 2);
+    pe_segment_slice(ctx, this, offset, new_size, None)
 }
 
 /// `MemorySegment.ofArray(byte[] | short[] | char[])` — an ALIAS carrier.
@@ -4560,6 +5593,46 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
     );
 }
 
+/// A layout's byte size, across BOTH layout shapes this tree mints.
+///
+/// This file's own (test-only, since F16) shape is `[0]=kind(Int),
+/// [1]=byteSize`; `phases_late::foreign_ffm`'s — the ONE shape a shipping
+/// binary sees, where `ValueLayout.JAVA_INT` comes from `p67_layout_object` —
+/// is `[0]=byteSize(Long), [1]=byteAlignment(Long)`.
+///
+/// The `_ => -1` this replaces treated the second shape as an unknown KIND, and
+/// `-1` is `< 10`, so `ffi::layout_byte_size(-1)` answered **1 byte for every
+/// layout in real-JDK mode**. Measured with `FfmInterfaceAuditProbe`:
+/// `segment.asSlice(8, JAVA_INT).byteSize()` answered 1 where HotSpot says 4.
+/// Silently wrong, in every caller of this helper — which is why it surfaced
+/// only once `asSlice(J,MemoryLayout)` above gave it a caller that reports.
+///
+/// This is the ONLY survivor of the layout block that used to sit here.
+/// `pe_memory_layout_path_target`, `pe_memory_layout_var_handle`,
+/// `pe_struct_layout`, `pe_union_layout`, `pe_sequence_layout` and
+/// `pe_layout_name_value` were deleted with the registrations that reached
+/// them (F16, 2026-08-13) — see the banner above `register_pe2_struct_layouts`
+/// for why, and `foreign_ffm.rs`'s "THE ONE LAYOUT CARRIER ENCODING" banner for
+/// what replaced them. Keeping them would also not compile: the four compound
+/// `LAYOUT_*` tags they read are test-only imports in this file now.
+fn pe_memory_layout_width(ctx: &mut dyn NativeContext, layout: ObjectRef) -> i64 {
+    match ctx.get_field(layout, 0) {
+        Value::Int(kind) => {
+            if kind < 10 {
+                ffi::layout_byte_size(kind) as i64
+            } else {
+                match ctx.get_field(layout, 1) {
+                    Value::Long(v) => v,
+                    _ => 1,
+                }
+            }
+        }
+        // `foreign_ffm`'s shape: slot 0 IS the byte size.
+        Value::Long(size) if size > 0 => size,
+        _ => 1,
+    }
+}
+
 // --- String marshaling helpers ---
 
 fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
@@ -4751,38 +5824,16 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Arena.allocateUtf8String(String) → MemorySegment
+    // Arena.allocateUtf8String(String) → MemorySegment. JDK 22 renamed this to
+    // `allocateFrom`, which shares the body — see the registration in
+    // `phases_late::foreign_ffm`, where the `allocateFrom` spelling was still
+    // handing back a stand-in segment with address 0 and byteSize 0.
     let arena = "java/lang/foreign/Arena";
     r.register(
         arena,
         "allocateUtf8String",
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let str_obj = obj_arg(args, 1)?;
-            let s = ctx.read_string(str_obj).unwrap_or_default();
-            let bytes = s.as_bytes();
-            let size = (bytes.len() + 1) as i64; // +1 for null terminator
-
-            // Allocate via arena
-            let seg_val = pe_arena_allocate_impl(ctx, this, size, 1)?;
-            if let Some(Value::Object(Some(seg))) = seg_val {
-                // Write the string bytes + null terminator
-                let ptr = match ctx.get_field(seg, 0) {
-                    Value::Long(n) => n,
-                    _ => 0,
-                };
-                if ptr != 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-                        *(ptr as *mut u8).add(bytes.len()) = 0;
-                    }
-                }
-                Ok(Some(Value::Object(Some(seg))))
-            } else {
-                Ok(Some(Value::Object(None)))
-            }
-        },
+        pe_arena_allocate_from_string,
     );
 }
 
@@ -4815,9 +5866,138 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
     }
 }
 
+/// `Arena.allocateFrom(String)` / `Arena.allocateUtf8String(String)`: a segment
+/// holding the string's UTF-8 bytes plus a NUL terminator.
+///
+/// Named rather than inline so `foreign_ffm`'s `allocateFrom` registration can
+/// share it — the two spellings used to be two bodies, and only one of them was
+/// repaired. That spelling used to answer a `p67_arena_segment` stand-in: it
+/// allocated NO memory (`set_field(segment, 1, Long(0)) // address`) and wrote
+/// the SIZE into slot 0 — the inverse of the convention
+/// `panama_libffi::segment_address` and `pe_arena_allocate_impl` use. So
+/// `segment_address` fell through to `get_field(seg, 0)`, read `Long(5)` — the
+/// byte length of `"abcd\0"` — and libffi passed 5 as the `char *`. `strlen`
+/// then dereferenced address 0x5.
+///
+/// Measured 2026-08-12: the same object reported `byteSize() == 0` and
+/// `address() == 5`, inverted on both. The downcall carrier, `invoke` dispatch,
+/// CIF build and return unmarshal were all correct — a positive control
+/// building the argument with `allocate(5)` plus explicit stores returns
+/// `strlen(abcd) == 4`, matching HotSpot. It is the second half of residual 3
+/// in `ffm-elements-spliterator-and-allocatefrom-gaps-20260813`.
+///
+/// A failed allocation RAISES rather than answering a null segment. The whole
+/// defect above was a segment that looked allocated and was not; handing back
+/// `null` here would put the same silence one call further out, where the
+/// caller dereferences it in a downcall.
+pub(crate) fn pe_arena_allocate_from_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let str_obj = obj_arg(args, 1)?;
+    let s = ctx.read_string(str_obj).unwrap_or_default();
+    let bytes = s.as_bytes();
+    let size = (bytes.len() + 1) as i64; // +1 for null terminator
+
+    // Allocate through the SAME path as `Arena.allocate(long, long)`, so the
+    // segment carries a real off-heap base in the `[0]=ptr, [1]=size` layout
+    // every reader expects.
+    let seg = match pe_arena_allocate_impl(ctx, this, size, 1)? {
+        Some(Value::Object(Some(seg))) => seg,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Arena.allocateFrom could not allocate a segment".into(),
+            }
+            .into())
+        }
+    };
+    // Write the string bytes + null terminator.
+    let ptr = match ctx.get_field(seg, 0) {
+        Value::Long(n) => n,
+        _ => 0,
+    };
+    if ptr == 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Arena.allocateFrom segment is not writable".into(),
+        }
+        .into());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        *(ptr as *mut u8).add(bytes.len()) = 0;
+    }
+    Ok(Some(Value::Object(Some(seg))))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// `MemorySegment.spliterator` split arithmetic and characteristics.
+#[cfg(test)]
+mod segment_splitter_tests {
+    use super::{pe_split_bounds, PE_SPLITTER_CHARACTERISTICS};
+
+    #[test]
+    fn an_even_count_splits_down_the_middle() {
+        // 8 ints: low half 4 elements / 16 bytes, high half 16 bytes.
+        assert_eq!(pe_split_bounds(8, 4), (4, 16, 16));
+    }
+
+    #[test]
+    fn an_odd_element_stays_with_the_high_half() {
+        // 5 ints: low half 2 elements / 8 bytes, high half 12 bytes (3 elements).
+        // The JDK keeps the remainder on the side that is NOT handed out, so
+        // `lo + hi` must still be the whole segment.
+        let (split, lobound, hibound) = pe_split_bounds(5, 4);
+        assert_eq!((split, lobound, hibound), (2, 8, 12));
+        assert_eq!(
+            lobound + hibound,
+            5 * 4,
+            "the two halves must tile the segment"
+        );
+    }
+
+    #[test]
+    fn the_halves_always_tile_the_segment() {
+        for count in 1..64_i64 {
+            for size in [1_i64, 2, 4, 8] {
+                let (split, lobound, hibound) = pe_split_bounds(count, size);
+                assert_eq!(
+                    lobound + hibound,
+                    count * size,
+                    "count {count} size {size} leaves a gap or an overlap"
+                );
+                assert_eq!(split * size, lobound, "count {count} size {size}");
+                assert!(split <= count - split, "the low half must never be the larger one");
+                // The element counts must tile too, and each half's count must
+                // match its byte span. Checking only the BYTE bounds is what let
+                // a bad high-half count through: the splitter kept claiming the
+                // whole original count over the half-sized segment it had left,
+                // and ran off the end on the first element past the middle.
+                assert_eq!(
+                    split + (count - split),
+                    count,
+                    "count {count} size {size}: element counts must tile"
+                );
+                assert_eq!(
+                    (count - split) * size,
+                    hibound,
+                    "count {count} size {size}: the high half's count must match its bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn characteristics_match_the_jdk() {
+        // Measured on HotSpot JDK 25: `seg.spliterator(JAVA_INT)
+        // .characteristics()` is 17744 =
+        // NONNULL|SUBSIZED|SIZED|IMMUTABLE|ORDERED.
+        assert_eq!(PE_SPLITTER_CHARACTERISTICS, 17744);
+    }
+}
 
 #[cfg(test)]
 mod tests {

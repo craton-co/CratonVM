@@ -746,7 +746,7 @@ its "moving-young explicitly ruled out" argument) no longer holds as stated:
   now being requested and attempted (always falling back to the non-moving
   sweep), where before it was not requested at all. This is most likely
   explained by the 2026-08-03 moving-young coverage fixes
-  (`../../default-moving-young-enabled-20260730.md`) making the collector
+  (`../default-moving-young-enabled-20260730.md`) making the collector
   attempt cycles under JIT frames more often across the board, not by
   anything specific to this class's workload changing. **The overall
   "moving-young mechanism ruled out" verdict is not retested here** — the

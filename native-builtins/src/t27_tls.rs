@@ -354,6 +354,196 @@ fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<u64, Metho
     Ok(crate::gc_stable_lock_key(ctx, obj)? as u64)
 }
 
+/// The TLS session stores belonging to an `SSLContext`, keyed the same way as
+/// its TrustManagers.
+///
+/// **This is what makes resumption possible at all.** A rustls `ClientConfig`
+/// owns the client-side session store and a `ServerConfig` owns the
+/// server-side one, and `engine_begin` builds a FRESH config for every engine
+/// (it has to — ciphers, protocols, ALPN and client-auth mode are per-engine
+/// settings). Every ticket was therefore thrown away with the engine that
+/// received it, and two engines of one `SSLContext` could never resume.
+/// `HUC_DEFAULT_CLIENT_CONFIG` caches a whole config for the same reason on
+/// the `HttpsURLConnection` path, where there are no per-engine settings to
+/// lose.
+///
+/// Only the STORES are shared, never the configs: a shared config would make
+/// one engine's `setEnabledCipherSuites` silently govern the next engine's
+/// handshake.
+///
+/// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
+#[allow(clippy::type_complexity)]
+fn ctx_client_session_store_table(
+) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>>> =
+        OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Built `ClientConfig`s, keyed by `(SSLContext key, engine shape)`.
+///
+/// **Why the whole config and not just the session store.** rustls refuses to
+/// resume a TLS 1.3 session unless the `ServerCertVerifier` AND the
+/// `ResolvesClientCert` are the *same `Arc`* as when the session was stored
+/// (`persist::Tls13ClientSessionValue::compatible_config`, pointer identity —
+/// a deliberate rule: resuming across a different verifier would silently
+/// inherit a trust decision the new verifier never made). `engine_begin`
+/// builds a fresh config, and therefore a fresh verifier, per engine, so the
+/// ticket was always discarded and every handshake was `Full` — the client
+/// took the ticket out of the store and then never offered it.
+///
+/// The key is the whole engine shape because those settings genuinely change
+/// the config: sharing across different cipher/protocol restrictions would let
+/// one engine's `setEnabledCipherSuites` govern the next engine's handshake.
+///
+/// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
+#[allow(clippy::type_complexity)]
+fn ctx_client_config_table() -> &'static Mutex<HashMap<(u64, String), Arc<ClientConfig>>> {
+    static T: OnceLock<Mutex<HashMap<(u64, String), Arc<ClientConfig>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ctx_client_session_store(key: u64) -> Arc<dyn rustls::client::ClientSessionStore> {
+    ctx_client_session_store_table()
+        .lock()
+        .entry(key)
+        .or_insert_with(|| {
+            let inner: Arc<dyn rustls::client::ClientSessionStore> =
+                Arc::new(rustls::client::ClientSessionMemoryCache::new(256));
+            if crate::nbflags().dbg_tls_auth_ok {
+                Arc::new(TracingClientSessionStore { inner })
+            } else {
+                inner
+            }
+        })
+        .clone()
+}
+
+/// `CRATONVM_DBG_TLS_AUTH=1` only: says whether a ticket was stored and
+/// whether the next connection took one, which is the difference between "the
+/// server never issued one" and "the client never offered it".
+#[derive(Debug)]
+struct TracingClientSessionStore {
+    inner: Arc<dyn rustls::client::ClientSessionStore>,
+}
+
+impl rustls::client::ClientSessionStore for TracingClientSessionStore {
+    fn set_kx_hint(&self, server_name: rustls::pki_types::ServerName<'static>, group: rustls::NamedGroup) {
+        self.inner.set_kx_hint(server_name, group)
+    }
+    fn kx_hint(&self, server_name: &rustls::pki_types::ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.inner.kx_hint(server_name)
+    }
+    fn set_tls12_session(
+        &self,
+        server_name: rustls::pki_types::ServerName<'static>,
+        value: rustls::client::Tls12ClientSessionValue,
+    ) {
+        eprintln!("[dbg-tls-auth] client store: set_tls12_session {server_name:?}");
+        self.inner.set_tls12_session(server_name, value)
+    }
+    fn tls12_session(
+        &self,
+        server_name: &rustls::pki_types::ServerName<'_>,
+    ) -> Option<rustls::client::Tls12ClientSessionValue> {
+        let v = self.inner.tls12_session(server_name);
+        eprintln!(
+            "[dbg-tls-auth] client store: tls12_session {server_name:?} -> {}",
+            v.is_some()
+        );
+        v
+    }
+    fn remove_tls12_session(&self, server_name: &rustls::pki_types::ServerName<'static>) {
+        self.inner.remove_tls12_session(server_name)
+    }
+    fn insert_tls13_ticket(
+        &self,
+        server_name: rustls::pki_types::ServerName<'static>,
+        value: rustls::client::Tls13ClientSessionValue,
+    ) {
+        eprintln!("[dbg-tls-auth] client store: insert_tls13_ticket {server_name:?}");
+        self.inner.insert_tls13_ticket(server_name, value)
+    }
+    fn take_tls13_ticket(
+        &self,
+        server_name: &rustls::pki_types::ServerName<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        let v = self.inner.take_tls13_ticket(server_name);
+        eprintln!(
+            "[dbg-tls-auth] client store: take_tls13_ticket {server_name:?} -> {}",
+            v.is_some()
+        );
+        v
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn ctx_server_session_store_table(
+) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+    static T: OnceLock<
+        Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+    > = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ctx_server_session_store(
+    key: u64,
+) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
+    ctx_server_session_store_table()
+        .lock()
+        .entry(key)
+        .or_insert_with(|| {
+            let inner: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
+                rustls::server::ServerSessionMemoryCache::new(256);
+            if crate::nbflags().dbg_tls_auth_ok {
+                Arc::new(TracingServerSessionStore { inner })
+            } else {
+                inner
+            }
+        })
+        .clone()
+}
+
+/// `CRATONVM_DBG_TLS_AUTH=1` only — the server half of
+/// [`TracingClientSessionStore`].
+#[derive(Debug)]
+struct TracingServerSessionStore {
+    inner: Arc<dyn rustls::server::StoresServerSessions + Send + Sync>,
+}
+
+impl rustls::server::StoresServerSessions for TracingServerSessionStore {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let ok = self.inner.put(key.clone(), value);
+        eprintln!(
+            "[dbg-tls-auth] server store: put len={} -> {}",
+            key.len(),
+            ok
+        );
+        ok
+    }
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let v = self.inner.get(key);
+        eprintln!(
+            "[dbg-tls-auth] server store: get len={} -> {}",
+            key.len(),
+            v.is_some()
+        );
+        v
+    }
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let v = self.inner.take(key);
+        eprintln!(
+            "[dbg-tls-auth] server store: take len={} -> {}",
+            key.len(),
+            v.is_some()
+        );
+        v
+    }
+    fn can_cache(&self) -> bool {
+        self.inner.can_cache()
+    }
+}
+
 /// `SSLContext.init(km, tms, random)` calls this with the raw `tms` array
 /// argument (may be `None`/empty) to stash the actual `TrustManager` Java
 /// objects against this context, keyed the same way as the KMF identity /
@@ -427,15 +617,45 @@ pub(crate) fn attach_trust_managers_to_ctx(
     if let Some(&base) = pins.first() {
         ctx.unpin_native_roots(base);
     }
+    // Whether endpoint identification is THIS VM's job for engines of this
+    // context, decided here for the same reason the issuer hints are:
+    // `engine_begin` — which builds the `ClientConfig` that carries the
+    // in-handshake check — runs with no native context, and this question
+    // needs one (it walks the manager's class hierarchy).
+    let identifies = jsse_owns_endpoint_identification(ctx, &list);
     let mut table = ctx_trust_managers_table().lock();
     if list.is_empty() {
         table.remove(&key);
         ctx_accepted_issuers_table().lock().remove(&key);
+        ctx_jsse_identifies_table().lock().remove(&key);
     } else {
         table.insert(key, list);
         ctx_accepted_issuers_table().lock().insert(key, issuers);
+        ctx_jsse_identifies_table().lock().insert(key, identifies);
     }
     Ok(())
+}
+
+/// Does endpoint identification fall to THIS VM for engines created by this
+/// `SSLContext`? See [`jsse_owns_endpoint_identification`] for the rule and
+/// `attach_trust_managers_to_ctx` for why it is answered at attach time.
+///
+/// Absent = `true`: no application manager is installed, so JSSE's own default
+/// (which this VM stands in for) is the one that identifies.
+fn ctx_jsse_identifies_table() -> &'static Mutex<HashMap<u64, bool>> {
+    static T: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ctx_jsse_identifies(ctx_key: Option<u64>) -> bool {
+    let Some(key) = ctx_key else {
+        return true;
+    };
+    ctx_jsse_identifies_table()
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(true)
 }
 
 /// DER-encoded subject DNs of every `TrustManager`'s accepted issuers, keyed
@@ -863,6 +1083,7 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
                 use_java_trust_manager,
                 provider,
                 &versions,
+                None,
             );
         }
     }
@@ -874,6 +1095,7 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
         use_java_trust_manager,
         provider,
         &versions,
+        None,
     )
 }
 
@@ -1088,6 +1310,295 @@ pub(crate) fn parse_cert_chain_pem(pem: &str) -> Result<Vec<CertificateDer<'stat
         return Err("no CERTIFICATE blocks found in PEM".to_string());
     }
     Ok(certs)
+}
+
+// -----------------------------------------------------------------------------
+// EC PKCS#8 v1 repair: recover the missing public key from the leaf certificate
+// -----------------------------------------------------------------------------
+//
+// `ring` (and therefore rustls's ring backend, including the vendored
+// `rustls-cbc`) can only build an `EcdsaKeyPair` from a PKCS#8 document whose
+// inner SEC1 `ECPrivateKey` carries the optional `publicKey [1]` BIT STRING.
+// The SEC1 branch is no escape hatch: `EcdsaSigningKey::convert_sec1_to_pkcs8`
+// re-wraps and calls the same `from_pkcs8`.
+//
+// `java.security.KeyPairGenerator("EC")` emits the OTHER shape — inner SEC1 of
+// just `version` + `privateKey`, no `parameters [0]`, no `publicKey [1]`. That
+// is not a CratonVM quirk: HotSpot's SunEC produces a byte-identical 67-byte
+// P-256 encoding (verified against JDK 25). rustls reports the refusal as the
+// generic "failed to parse private key as RSA, ECDSA, or EdDSA", which reads
+// like a corrupt key and is not — see
+// `docs/known-issues/netty/ec-pkcs8-v1-server-identity-rejected-20260812.md`.
+//
+// Rather than derive the public point (the in-tree `crypto_impl` EC core is
+// P-256 only, so that would fix one curve), take it from the leaf
+// certificate's `SubjectPublicKeyInfo`, which by definition holds the public
+// key for this identity. That is curve-agnostic and needs no EC arithmetic.
+// It is also self-checking: `ring`'s `from_pkcs8` recomputes the public key
+// from the private scalar and rejects the document if the two disagree, so a
+// cert/key mismatch fails closed exactly as before rather than producing an
+// identity that signs with the wrong key.
+
+/// Byte-length of the DER TLV header at `at` (identifier octet + length
+/// octets), or `None` if the header is truncated or uses an unsupported
+/// long form.
+fn der_header_len(buf: &[u8], at: usize) -> Option<usize> {
+    let len_byte = *buf.get(at + 1)?;
+    if len_byte & 0x80 == 0 {
+        return Some(2);
+    }
+    let n = (len_byte & 0x7f) as usize;
+    // Indefinite length (n == 0) is not valid DER; > 4 length octets is far
+    // beyond anything in a key or certificate.
+    if n == 0 || n > 4 {
+        return None;
+    }
+    Some(2 + n)
+}
+
+/// Value length of the TLV at `at`.
+fn der_value_len(buf: &[u8], at: usize) -> Option<usize> {
+    let len_byte = *buf.get(at + 1)?;
+    if len_byte & 0x80 == 0 {
+        return Some(len_byte as usize);
+    }
+    let n = (len_byte & 0x7f) as usize;
+    if n == 0 || n > 4 {
+        return None;
+    }
+    let mut len = 0usize;
+    for i in 0..n {
+        len = len
+            .checked_mul(256)?
+            .checked_add(*buf.get(at + 2 + i)? as usize)?;
+    }
+    Some(len)
+}
+
+/// `(value_start, value_end)` of the TLV at `at`, bounds-checked against `buf`.
+fn der_tlv(buf: &[u8], at: usize) -> Option<(usize, usize)> {
+    let hdr = der_header_len(buf, at)?;
+    let len = der_value_len(buf, at)?;
+    let start = at.checked_add(hdr)?;
+    let end = start.checked_add(len)?;
+    (end <= buf.len()).then_some((start, end))
+}
+
+/// End offset (exclusive) of the whole TLV at `at`.
+fn der_tlv_end(buf: &[u8], at: usize) -> Option<usize> {
+    Some(der_tlv(buf, at)?.1)
+}
+
+/// `1.2.840.10045.2.1` (id-ecPublicKey), as it appears inside an
+/// `AlgorithmIdentifier` — tag, length and contents.
+const OID_ID_EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+/// Encode one DER TLV.
+fn der_tlv_encode(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 4);
+    out.push(tag);
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else if n <= 0xff {
+        out.extend_from_slice(&[0x81, n as u8]);
+    } else {
+        out.extend_from_slice(&[0x82, (n >> 8) as u8, (n & 0xff) as u8]);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Pull the `subjectPublicKey` BIT STRING contents (the uncompressed EC point,
+/// `0x04 || X || Y`) out of a DER certificate's `SubjectPublicKeyInfo`, if the
+/// certificate carries an EC public key.
+///
+/// Walks `Certificate -> tbsCertificate -> *` looking for the child SEQUENCE
+/// shaped `{ AlgorithmIdentifier{ id-ecPublicKey, .. }, BIT STRING }`. Matching
+/// on shape rather than counting fields keeps this correct across the optional
+/// `[0] version` and the optional trailing extension fields.
+fn cert_ec_public_key_bits(cert_der: &[u8]) -> Option<Vec<u8>> {
+    if *cert_der.first()? != 0x30 {
+        return None;
+    }
+    let (cert_body, cert_end) = der_tlv(cert_der, 0)?;
+    // tbsCertificate is the first child.
+    if *cert_der.get(cert_body)? != 0x30 {
+        return None;
+    }
+    let (tbs_body, tbs_end) = der_tlv(cert_der, cert_body)?;
+    if tbs_end > cert_end {
+        return None;
+    }
+    let mut p = tbs_body;
+    while p < tbs_end {
+        let end = der_tlv_end(cert_der, p)?;
+        if cert_der[p] == 0x30 {
+            if let Some(bits) = spki_ec_bits(cert_der, p) {
+                return Some(bits);
+            }
+        }
+        p = end;
+    }
+    None
+}
+
+/// If the SEQUENCE at `at` is an EC `SubjectPublicKeyInfo`, return its
+/// `subjectPublicKey` bits with the BIT STRING's leading unused-bits octet
+/// removed.
+fn spki_ec_bits(buf: &[u8], at: usize) -> Option<Vec<u8>> {
+    let (body, end) = der_tlv(buf, at)?;
+    // child 1: AlgorithmIdentifier SEQUENCE starting with id-ecPublicKey
+    if *buf.get(body)? != 0x30 {
+        return None;
+    }
+    let (alg_body, alg_end) = der_tlv(buf, body)?;
+    if buf.get(alg_body..alg_body.checked_add(OID_ID_EC_PUBLIC_KEY.len())?)? != OID_ID_EC_PUBLIC_KEY
+    {
+        return None;
+    }
+    // child 2: subjectPublicKey BIT STRING
+    if alg_end >= end || *buf.get(alg_end)? != 0x03 {
+        return None;
+    }
+    let (bits_body, bits_end) = der_tlv(buf, alg_end)?;
+    // First content octet of a BIT STRING is the unused-bit count; an EC point
+    // is whole octets, so it must be zero.
+    if *buf.get(bits_body)? != 0 || bits_end <= bits_body + 1 {
+        return None;
+    }
+    Some(buf[bits_body + 1..bits_end].to_vec())
+}
+
+/// Given a PKCS#8 EC private key whose inner SEC1 omits `publicKey [1]`, return
+/// an equivalent PKCS#8 with the public key from `leaf_cert_der` spliced in.
+///
+/// Returns `None` — meaning "use the key unchanged" — when the key is not an EC
+/// PKCS#8, when it already carries a public key, or when the certificate has no
+/// EC public key to lend. Every failure path is a no-op, so this can only make
+/// more identities usable, never fewer.
+pub(crate) fn ec_pkcs8_splice_public_key(key_der: &[u8], leaf_cert_der: &[u8]) -> Option<Vec<u8>> {
+    if *key_der.first()? != 0x30 {
+        return None;
+    }
+    let (outer_body, outer_end) = der_tlv(key_der, 0)?;
+    // version INTEGER (PKCS#8 v1 == 0)
+    if *key_der.get(outer_body)? != 0x02 {
+        return None;
+    }
+    let version_end = der_tlv_end(key_der, outer_body)?;
+    // privateKeyAlgorithm AlgorithmIdentifier — must be id-ecPublicKey.
+    if *key_der.get(version_end)? != 0x30 {
+        return None;
+    }
+    let (alg_body, alg_end) = der_tlv(key_der, version_end)?;
+    if key_der.get(alg_body..alg_body.checked_add(OID_ID_EC_PUBLIC_KEY.len())?)?
+        != OID_ID_EC_PUBLIC_KEY
+    {
+        return None;
+    }
+    // privateKey OCTET STRING wrapping the SEC1 ECPrivateKey.
+    if *key_der.get(alg_end)? != 0x04 {
+        return None;
+    }
+    let (oct_body, oct_end) = der_tlv(key_der, alg_end)?;
+    if oct_end > outer_end || *key_der.get(oct_body)? != 0x30 {
+        return None;
+    }
+    let (sec1_body, sec1_end) = der_tlv(key_der, oct_body)?;
+    // inner: version INTEGER, privateKey OCTET STRING, then optionals.
+    if *key_der.get(sec1_body)? != 0x02 {
+        return None;
+    }
+    let sec1_version_end = der_tlv_end(key_der, sec1_body)?;
+    if *key_der.get(sec1_version_end)? != 0x04 {
+        return None;
+    }
+    let sec1_priv_end = der_tlv_end(key_der, sec1_version_end)?;
+    // Already has `publicKey [1]`? Then ring is happy and there is nothing to do.
+    let mut p = sec1_priv_end;
+    while p < sec1_end {
+        if key_der[p] == 0xa1 {
+            return None;
+        }
+        p = der_tlv_end(key_der, p)?;
+    }
+
+    let public_bits = cert_ec_public_key_bits(leaf_cert_der)?;
+
+    // Rebuild the inner SEC1 as version + privateKey + [1] publicKey, keeping
+    // any `parameters [0]` that was present. `parameters` stays optional: the
+    // openssl-produced PKCS#8 that ring accepts omits it too (the curve is
+    // already named by the outer AlgorithmIdentifier).
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&key_der[sec1_body..sec1_priv_end]);
+    let mut q = sec1_priv_end;
+    while q < sec1_end {
+        let end = der_tlv_end(key_der, q)?;
+        if key_der[q] == 0xa0 {
+            inner.extend_from_slice(&key_der[q..end]);
+        }
+        q = end;
+    }
+    let mut bit_string = Vec::with_capacity(public_bits.len() + 1);
+    bit_string.push(0); // unused bits
+    bit_string.extend_from_slice(&public_bits);
+    inner.extend_from_slice(&der_tlv_encode(0xa1, &der_tlv_encode(0x03, &bit_string)));
+
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&key_der[outer_body..version_end]); // version
+    outer.extend_from_slice(&key_der[version_end..alg_end]); // privateKeyAlgorithm
+    outer.extend_from_slice(&der_tlv_encode(0x04, &der_tlv_encode(0x30, &inner)));
+    Some(der_tlv_encode(0x30, &outer))
+}
+
+/// Apply [`ec_pkcs8_splice_public_key`] to a parsed key when the chain's leaf
+/// can supply the missing public key. A no-op for every other key shape.
+pub(crate) fn repair_ec_key_for_ring<'a>(
+    key: PrivateKeyDer<'a>,
+    chain: &[CertificateDer<'_>],
+) -> PrivateKeyDer<'a> {
+    let PrivateKeyDer::Pkcs8(ref pkcs8) = key else {
+        return key;
+    };
+    let Some(leaf) = chain.first() else {
+        return key;
+    };
+    match ec_pkcs8_splice_public_key(pkcs8.secret_pkcs8_der(), leaf.as_ref()) {
+        Some(repaired) => {
+            if crate::nbflags().dbg_tls_hs {
+                eprintln!(
+                    "[dbg-tls-hs] repair_ec_key_for_ring: spliced cert public key into EC PKCS#8 \
+                     ({} -> {} bytes)",
+                    pkcs8.secret_pkcs8_der().len(),
+                    repaired.len()
+                );
+            }
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(repaired))
+        }
+        None => key,
+    }
+}
+
+/// Build a `CertifiedKey` from raw DER, repairing a JDK-shaped EC key first.
+///
+/// The mTLS `KeyManager` resolver is the one identity path that never sees PEM:
+/// its material arrives as DER from `km_alias_material`. That is why it was the
+/// call site the EC repair originally missed — it does not share a line with the
+/// six `parse_private_key_pem` builders. It exists as a named function, rather
+/// than three lines inlined into `resolve_via_java`, so a test can exercise the
+/// path the resolver actually takes: delete the repair here and
+/// `a_key_manager_supplied_jdk_ec_identity_is_repaired_too` goes red.
+pub(crate) fn certified_key_from_der_repairing_ec(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key_der: Vec<u8>,
+    provider: &rustls::crypto::CryptoProvider,
+) -> Result<CertifiedKey, rustls::Error> {
+    let key = repair_ec_key_for_ring(
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+        &cert_chain,
+    );
+    CertifiedKey::from_der(cert_chain, key, provider)
 }
 
 /// Parse a PEM-encoded PKCS#8 private key. Returns an error if no key block
@@ -1410,15 +1921,62 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
+
+/// Build **this side's own** TLS identity from a certificate chain and its
+/// private key.
+///
+/// Deliberately `CertifiedKey::new` and not `CertifiedKey::from_der`. The
+/// difference is one call — `from_der` additionally runs `keys_match()`, which
+/// parses the end-entity certificate through webpki purely to compare its
+/// `SubjectPublicKeyInfo` against the private key's:
+///
+/// ```text
+/// pub fn keys_match(&self) -> Result<(), Error> {
+///     let Some(key_spki) = self.key.public_key() else {
+///         return Err(InconsistentKeys::Unknown.into());   // <- already tolerated
+///     };
+///     let cert = ParsedCertificate::try_from(self.end_entity_cert()?)?;
+///     match key_spki == cert.subject_public_key_info() { … }
+/// }
+/// ```
+///
+/// webpki's parser accepts only v3 certificates (`cert.rs`'s `version3`), so a
+/// **v1** identity fails that parse, and the failure escapes as
+/// `InvalidCertificate(Other(UnsupportedCertVersion))` instead of landing in
+/// the `InconsistentKeys::Unknown` arm the surrounding code already treats as
+/// "cannot tell, carry on". The result was that this VM would not *present* a
+/// v1 certificate at all — an error raised while building a config, before any
+/// peer or trust decision exists. JSSE has no such restriction, and netty's
+/// mutual-auth fixtures are all v1 end-entity certificates, so 72 of
+/// `JdkSslEngineTest`'s failures were this one check.
+///
+/// What is given up is the early "your certificate and private key do not
+/// match" diagnosis; a genuine mismatch now fails at handshake time instead of
+/// config time. That check is best-effort in rustls itself — a key provider
+/// that cannot expose a public key already skips it — and this module's own
+/// `SniCertResolver` has always built its identity this way, so the five
+/// single-certificate paths were the odd ones out rather than the safe ones.
+///
+/// This does NOT touch peer verification: a peer's chain still goes through
+/// webpki path building, v3 rule included.
+fn identity_certified_key(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<CertifiedKey, String> {
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| format!("unsupported private key: {}", e))?;
+    Ok(CertifiedKey::new(chain, signing_key))
+}
+
 impl SniCertResolver {
     /// Build a `CertifiedKey` from PEM blobs. Uses rustls's ring-backed
     /// signer, which covers RSA 2048/3072/4096 and ECDSA P-256/P-384.
     fn certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>, String> {
         let chain = parse_cert_chain_pem(cert_pem)?;
-        let key = parse_private_key_pem(key_pem)?;
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .map_err(|e| format!("unsupported private key: {}", e))?;
-        Ok(Arc::new(CertifiedKey::new(chain, signing_key)))
+        // Same repair as the non-SNI server builder: a JDK EC key arrives
+        // without the `publicKey [1]` ring needs, and the cert carries it.
+        let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
+        Ok(Arc::new(identity_certified_key(chain, key)?))
     }
 }
 
@@ -1466,37 +2024,6 @@ pub(crate) struct ServerRegistry {
     pub(crate) server_streams: HashMap<i32, TlsServerStreamEntry>,
 }
 
-/// The negotiated suite's name in JSSE's spelling, which is what
-/// `SSLSession.getCipherSuite()` is contracted to return.
-///
-/// `format!("{:?}", cs.suite())` prints rustls's `CipherSuite` VARIANT name.
-/// rustls spells its five TLS 1.3 suites `TLS13_AES_256_GCM_SHA384`
-/// (`rustls-0.23.38/src/enums.rs:113`-`145`, the `enum_builder!` variants);
-/// the IANA registry — and therefore JSSE — spells the same suite
-/// `TLS_AES_256_GCM_SHA384`. Measured against HotSpot 25.0.3+9-LTS on this
-/// host rather than recalled: of 31 supported suites, the number whose name
-/// begins `TLS13_` is **zero**, and a live TLS 1.3 handshake's
-/// `getSession().getCipherSuite()` answers `TLS_AES_256_GCM_SHA384`. TLS 1.3
-/// is this VM's default, so the raw `{:?}` name was a name no JSSE program has
-/// ever seen, on essentially every connection. `java_cipher_name_to_suite` in
-/// this file — the VM's own reverse mapping — has never accepted it either, so
-/// the round trip did not close.
-///
-/// The pass-through half is measured too, not assumed: all 23 `CipherSuite`
-/// variants were checked against JSSE's supported list, and every one of the 14
-/// negotiable TLS 1.2 suites is byte-identical under both spellings, with zero
-/// non-`TLS13_` names altered by the rewrite. See
-/// `docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md`.
-///
-/// ONE function, so this file has ONE place that knows the translation and the
-/// number of sites that can drift is 2 (one per file) rather than 8. The prefix
-/// rewrite itself lives in `http_url_connection` and is unit-tested there in
-/// both directions; `the_only_rustls_suite_spelling_left_is_the_adapters_own`
-/// below pins the family so a ninth producer cannot be added silently.
-fn negotiated_suite_name(cs: rustls::SupportedCipherSuite) -> String {
-    crate::http_url_connection::jsse_cipher_suite_name(&format!("{:?}", cs.suite()))
-}
-
 pub(crate) struct TlsClientStreamEntry {
     /// Per-stream mutex, NOT guarded by `sreg()`. Blocking socket I/O on one
     /// TLS connection must never hold the process-wide registry lock — see
@@ -1533,18 +2060,38 @@ pub(crate) enum TlsServerStream {
     Native(native_tls::TlsStream<TcpStream>),
     #[cfg(unix)]
     LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+    /// The TCP connection was accepted; its TLS handshake was NOT completed.
+    ///
+    /// JSSE does not run the handshake inside `SSLServerSocket.accept()` at
+    /// all — `accept()` returns as soon as the TCP connection is up, and the
+    /// handshake runs on the returned socket's first read or write. A peer
+    /// that connects and disconnects without a ClientHello therefore costs
+    /// HotSpot one accepted socket whose first read throws
+    /// `SSLHandshakeException`; the listener is untouched. This variant is how
+    /// [`rustls_server_accept`] reaches the same end state while still running
+    /// the handshake eagerly: the failure is carried ON the accepted stream
+    /// and raised at the first I/O, instead of being thrown out of `accept()`
+    /// where it kills the caller's accept loop. See
+    /// `rustls_server_handshake_failure`.
+    HandshakeFailed {
+        /// A duplicate handle taken BEFORE the handshake consumed the stream:
+        /// the failing backends do not all hand the socket back.
+        tcp: Option<TcpStream>,
+        reason: String,
+    },
 }
 
 impl TlsServerStream {
     /// The underlying TCP socket, borrowed. Used only to `try_clone` a
     /// registry-held duplicate at registration time — see
     /// `TlsClientStreamEntry::raw`.
-    fn tcp(&self) -> &TcpStream {
+    fn tcp(&self) -> Option<&TcpStream> {
         match self {
-            TlsServerStream::Rustls(s) => &s.sock,
-            TlsServerStream::Native(s) => s.get_ref(),
+            TlsServerStream::Rustls(s) => Some(&s.sock),
+            TlsServerStream::Native(s) => Some(s.get_ref()),
             #[cfg(unix)]
-            TlsServerStream::LegacyDsa(s) => s.get_ref(),
+            TlsServerStream::LegacyDsa(s) => Some(s.get_ref()),
+            TlsServerStream::HandshakeFailed { tcp, .. } => tcp.as_ref(),
         }
     }
 }
@@ -1675,7 +2222,9 @@ pub(crate) fn build_server_config_single_cert_ex_ciphers(
     enabled_protocols: &[String],
 ) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
-    let key = parse_private_key_pem(key_pem)?;
+    // JDK-generated EC keys omit the `publicKey [1]` that ring demands; the
+    // leaf certificate carries it. No-op for every other key shape.
+    let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
 
     let builder = server_builder_with_versions(enabled_ciphers, enabled_protocols)?;
     let builder = if require_client_cert || optional_client_cert {
@@ -1699,9 +2248,12 @@ pub(crate) fn build_server_config_single_cert_ex_ciphers(
         builder.with_no_client_auth()
     };
 
-    let mut config = builder
-        .with_single_cert(chain, key)
-        .map_err(|e| format!("ServerConfig with_single_cert failed: {}", e))?;
+    // `with_single_cert` is exactly `CertifiedKey::from_der` + this resolver;
+    // the only difference is the `keys_match` parse. See
+    // `identity_certified_key`.
+    let mut config = builder.with_cert_resolver(Arc::new(
+        rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+    ));
 
     // T2.7.11 — server ALPN advertisement.
     config.alpn_protocols = alpn_protocols
@@ -1763,10 +2315,14 @@ pub(crate) fn build_client_config(
     let mut config = match client_auth {
         Some((cert_pem, key_pem)) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
-            let key = parse_private_key_pem(key_pem)?;
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+            // A JDK-generated EC client identity needs the same repair as the
+            // server one — ring rejects it otherwise.
+            let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
+            // See `identity_certified_key` for why this is not
+            // `with_client_auth_cert`.
+            builder.with_client_cert_resolver(Arc::new(
+                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+            ))
         }
         None => builder.with_no_client_auth(),
     };
@@ -1808,17 +2364,65 @@ struct OcspAwareServerCertVerifier {
 #[derive(Debug)]
 struct PassthroughServerCertVerifier {
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+    /// `(algorithm, host)` when this client engine must perform RFC 2818 /
+    /// RFC 6125 endpoint identification, i.e. the application called
+    /// `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS"|"LDAPS")`.
+    ///
+    /// **Why it is HERE and not only in the post-handshake gate.** The
+    /// TrustManager consultation is post-handshake TODAY, but not because it
+    /// has to be: `JavaKeyManagerResolver::resolve` already runs a Java upcall
+    /// from inside `process_new_packets`, reborrowing the caller's context
+    /// through `with_active_native_context`. What actually keeps the
+    /// TrustManager out of here is that `do_unwrap` holds
+    /// `engine_registry()`'s (non-reentrant) write lock across the record
+    /// loop, and an `X509ExtendedTrustManager` handed the `SSLEngine` may call
+    /// straight back into an engine native. Deferring it costs the property
+    /// below in the other direction — see
+    /// `testHandshakeFailureOnlyFireExceptionOnce` in
+    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`,
+    /// where the client sends its `Finished` for a chain its own TrustManager
+    /// rejected. The
+    /// identity check is not: it is a pure comparison of the presented chain
+    /// against the host this side dialled, so it belongs at the point JSSE
+    /// makes it, which is *before the client sends its Finished*.
+    ///
+    /// The difference is visible to the SERVER. netty's
+    /// `testClientHostnameValidationFail` asserts BOTH sides fail: with the
+    /// check deferred, the client's `Finished` had already gone out, the
+    /// server had completed its handshake and netty fired
+    /// `SslHandshakeCompletionEvent.SUCCESS` on it — so the test's server
+    /// handler recorded `IllegalStateException("handshake complete. expected
+    /// failure")` even though the client did reject the certificate.
+    endpoint_identity: Option<(String, String)>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some((alg, host)) = self.endpoint_identity.as_ref() {
+            let mut chain: Vec<Vec<u8>> = Vec::with_capacity(1 + intermediates.len());
+            chain.push(end_entity.as_ref().to_vec());
+            chain.extend(intermediates.iter().map(|c| c.as_ref().to_vec()));
+            if let Err(e) = crate::x509_manager::check_endpoint_identity(&chain, host) {
+                let detail = format!("endpoint identification ({alg}) failed for host {host:?}: {e}");
+                if crate::nbflags().dbg_tls_auth_ok {
+                    eprintln!("[dbg-tls-auth] (in-handshake) {detail}");
+                }
+                set_last_trust_rejection_detail(&detail);
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForNameContext {
+                        expected: _server_name.to_owned(),
+                        presented: Vec::new(),
+                    },
+                ));
+            }
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -1828,7 +2432,7 @@ impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifie
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+        rustls::crypto::verify_tls12_signature_lenient(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
@@ -1837,7 +2441,7 @@ impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifie
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+        rustls::crypto::verify_tls13_signature_lenient(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -2027,6 +2631,7 @@ fn build_client_config_ex(
         use_java_trust_manager,
         Arc::new(cbc_augmented_default_provider()),
         &[],
+        None,
     )
 }
 
@@ -2047,6 +2652,7 @@ fn build_client_config_ex_with_provider(
     use_java_trust_manager: bool,
     provider: Arc<rustls::crypto::CryptoProvider>,
     versions: &[&'static rustls::SupportedProtocolVersion],
+    endpoint_identity: Option<(String, String)>,
 ) -> Result<Arc<ClientConfig>, String> {
     // `with_protocol_versions(&[])` is an error in rustls, and so is a list
     // whose versions the provider cannot serve — fall back to the safe
@@ -2071,6 +2677,7 @@ fn build_client_config_ex_with_provider(
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(PassthroughServerCertVerifier {
                 algorithms: provider.signature_verification_algorithms.clone(),
+                endpoint_identity,
             });
         with_versions!(ClientConfig::builder_with_provider(provider.clone()))
             .dangerous()
@@ -2096,10 +2703,14 @@ fn build_client_config_ex_with_provider(
         ClientAuthMode::Resolver(resolver) => builder.with_client_cert_resolver(resolver),
         ClientAuthMode::Fixed(Some((cert_pem, key_pem))) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
-            let key = parse_private_key_pem(key_pem)?;
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+            // A JDK-generated EC client identity needs the same repair as the
+            // server one — ring rejects it otherwise.
+            let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
+            // See `identity_certified_key` for why this is not
+            // `with_client_auth_cert`.
+            builder.with_client_cert_resolver(Arc::new(
+                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+            ))
         }
         ClientAuthMode::Fixed(None) => builder.with_no_client_auth(),
     };
@@ -2598,8 +3209,12 @@ impl JavaKeyManagerResolver {
                 if cert_chain.is_empty() {
                     continue;
                 }
-                let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
-                match CertifiedKey::from_der(cert_chain, key, &self.provider) {
+                // Repairs the JDK-shaped EC key on the way — without it a
+                // JDK-generated EC *client* identity resolves to `Err` here,
+                // the client sends an empty Certificate, and the far end
+                // answers `CertificateRequired`, a failure that names neither
+                // the key nor this decision.
+                match certified_key_from_der_repairing_ec(cert_chain, key_der, &self.provider) {
                     Ok(ck) => return Some(Arc::new(ck)),
                     Err(e) => {
                         if dbg {
@@ -2687,6 +3302,89 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
             );
         }
         out
+    }
+}
+
+/// A `ResolvesClientCert` that records whether the client actually PRESENTED a
+/// certificate, and otherwise delegates.
+///
+/// rustls exposes no "did I send a client certificate" signal on
+/// `ClientConnection`, and the difference is observable through JSSE:
+/// `SSLSession.getLocalCertificates()` must answer null on a client that had a
+/// `KeyManager` configured but was never asked for a certificate (a server
+/// running `ClientAuth.NONE` sends no `CertificateRequest`, so the resolver is
+/// never consulted). `SSLEngineTest.testSessionLocalWhenNonMutual` sets up
+/// exactly that and asserts null; reporting the identity the engine merely HAD
+/// available answered `expected: <null> but was: <[[…]]>`.
+///
+/// `resolve` is the right place because rustls calls it if and only if the
+/// server asked, and a `Some` answer is exactly the certificate that then goes
+/// on the wire.
+#[derive(Debug)]
+struct RecordingClientCertResolver {
+    inner: Arc<dyn ResolvesClientCert>,
+    presented: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ResolvesClientCert for RecordingClientCertResolver {
+    fn resolve(
+        &self,
+        root_hint_subjects: &[&[u8]],
+        sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let out = self.inner.resolve(root_hint_subjects, sigschemes);
+        if out.is_some() {
+            self.presented
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        out
+    }
+
+    fn has_certs(&self) -> bool {
+        self.inner.has_certs()
+    }
+}
+
+/// The JSSE name for a negotiated rustls `CipherSuite`.
+///
+/// The inverse of [`java_cipher_name_to_suite`], and it has to exist: rustls's
+/// `Debug` spelling of a TLS 1.3 suite carries a `13` infix
+/// (`TLS13_AES_128_GCM_SHA256`) that JSSE's name does not
+/// (`TLS_AES_128_GCM_SHA256`), and eight call sites were reporting the `Debug`
+/// string verbatim as `SSLSession.getCipherSuite()`. netty's
+/// `SSLEngineTest.testGetCiphersuite` compares it against the name it asked for
+/// and got `expected: <TLS_AES_128_GCM_SHA256> but was:
+/// <TLS13_AES_128_GCM_SHA256>`; `assertArrayContains` failed the same way.
+///
+/// Only the TLS 1.3 triple differs — every TLS 1.2 suite rustls names is
+/// already spelled the JSSE way — so this is an explicit list rather than a
+/// blind `replace("TLS13_", "TLS_")`, which would also rewrite a future suite
+/// whose real name happens to contain that text.
+///
+/// `_pub` wrapper for `http_url_connection`, whose https branch reported the
+/// `Debug` spelling for the same reason the eight sites this function was
+/// written for did.
+pub(crate) fn suite_to_java_cipher_name_pub(suite: rustls::CipherSuite) -> String {
+    suite_to_java_cipher_name(suite)
+}
+
+fn suite_to_java_cipher_name(suite: rustls::CipherSuite) -> String {
+    use rustls::CipherSuite::*;
+    match suite {
+        TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256".to_string(),
+        TLS13_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384".to_string(),
+        TLS13_CHACHA20_POLY1305_SHA256 => "TLS_CHACHA20_POLY1305_SHA256".to_string(),
+        // The three arms above are the suites this VM's crypto provider will
+        // actually negotiate; the `TLS13_` infix, though, is a property of
+        // rustls's ENUM SPELLING and not of those three names — the CCM pair
+        // carries it too. Falling through to the prefix rewrite (measured on
+        // HotSpot 25.0.3+9-LTS and unit-tested in both directions in
+        // `http_url_connection`; see
+        // `docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md`)
+        // keeps ONE translation in the tree rather than two that agree today.
+        // It is prefix-only, so a name that is already the registry's is
+        // returned untouched.
+        other => crate::http_url_connection::jsse_cipher_suite_name(&format!("{other:?}")),
     }
 }
 
@@ -2827,13 +3525,53 @@ fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider
         return Arc::new(base);
     }
     let mut restricted = base;
-    restricted
-        .cipher_suites
-        .retain(|cs| wanted.contains(&cs.suite()));
+    // Keep the CALLER'S order, not the provider's. rustls honours the client's
+    // preference order when selecting (`ServerConfig::ignore_client_order` is
+    // false by default), so the order this list ends up in IS the order the
+    // ClientHello offers — and therefore decides which suite gets negotiated
+    // when both ends support several.
+    //
+    // `retain` preserved the provider's own order instead, which puts
+    // AES-256 ahead of AES-128. netty's `SSLEngineTest.verifySSLSessionForMutualAuth`
+    // asserts `session.getCipherSuite()` equals the suite its parameterisation
+    // asked for and saw `TLS_AES_256_GCM_SHA384` where it configured
+    // `TLS_AES_128_GCM_SHA256` — a restriction that was applied as a SET while
+    // the caller meant it as a LIST.
+    let mut ordered: Vec<rustls::SupportedCipherSuite> = Vec::new();
+    for want in &wanted {
+        if let Some(cs) = restricted
+            .cipher_suites
+            .iter()
+            .find(|cs| cs.suite() == *want)
+        {
+            if !ordered.iter().any(|k| k.suite() == cs.suite()) {
+                ordered.push(*cs);
+            }
+        }
+    }
+    restricted.cipher_suites = ordered;
     if restricted.cipher_suites.is_empty() {
         return Arc::new(cbc_augmented_default_provider());
     }
     Arc::new(restricted)
+}
+
+/// Is `name` a JSSE cipher-suite NAME (as opposed to arbitrary text)?
+///
+/// This is the predicate behind `SSLEngine.setEnabledCipherSuites`' contract of
+/// throwing `IllegalArgumentException` for a name that is not a cipher suite.
+/// It is deliberately WIDER than "a suite this engine can negotiate": JSSE
+/// accepts every name in its registry, including suites that are
+/// supported-but-disabled, so narrowing it to `SUPPORTED_CIPHER_SUITE_NAMES`
+/// would reject configurations real JSSE accepts. The `TLS_`/`SSL_` prefix is
+/// what every standard JSSE suite name carries (see the Standard Algorithm
+/// Names spec), which is enough to separate a real name from `InvalidCipher` /
+/// `SOME_INVALID_CIPHER` — the shapes the netty suite actually asserts on.
+pub(crate) fn is_cipher_suite_name(name: &str) -> bool {
+    java_cipher_name_to_suite(name).is_some()
+        || SUPPORTED_CIPHER_SUITE_NAMES.contains(&name)
+        || name.starts_with("TLS_")
+        || name.starts_with("SSL_")
 }
 
 /// True if at least one of `ciphers` maps to a real rustls `CipherSuite` (see
@@ -3117,7 +3855,7 @@ impl rustls::server::danger::ClientCertVerifier for PassthroughClientCertVerifie
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+        rustls::crypto::verify_tls12_signature_lenient(message, cert, dss, &self.algorithms)
     }
     fn verify_tls13_signature(
         &self,
@@ -3125,7 +3863,7 @@ impl rustls::server::danger::ClientCertVerifier for PassthroughClientCertVerifie
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+        rustls::crypto::verify_tls13_signature_lenient(message, cert, dss, &self.algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.algorithms.supported_schemes()
@@ -3148,7 +3886,8 @@ fn build_server_config_single_cert_passthrough_client_auth(
     root_hints: Vec<rustls::DistinguishedName>,
 ) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
-    let key = parse_private_key_pem(key_pem)?;
+    // See the sibling builder: JDK EC keys need the cert's public key spliced in.
+    let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
     let builder = server_builder_with_versions(enabled_ciphers, enabled_protocols)?;
     let algorithms = provider_and_versions(enabled_ciphers, enabled_protocols)
         .0
@@ -3159,10 +3898,12 @@ fn build_server_config_single_cert_passthrough_client_auth(
             algorithms,
             root_hints,
         });
+    // See `identity_certified_key` for why this is not `with_single_cert`.
     let mut config = builder
         .with_client_cert_verifier(verifier)
-        .with_single_cert(chain, key)
-        .map_err(|e| format!("ServerConfig with_single_cert failed: {}", e))?;
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+            identity_certified_key(chain, key)?,
+        )));
     config.alpn_protocols = alpn_protocols
         .iter()
         .map(|s| s.as_bytes().to_vec())
@@ -3189,10 +3930,14 @@ pub(crate) fn build_client_config_ciphers(
     let mut config = match client_auth {
         Some((cert_pem, key_pem)) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
-            let key = parse_private_key_pem(key_pem)?;
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+            // A JDK-generated EC client identity needs the same repair as the
+            // server one — ring rejects it otherwise.
+            let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
+            // See `identity_certified_key` for why this is not
+            // `with_client_auth_cert`.
+            builder.with_client_cert_resolver(Arc::new(
+                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+            ))
         }
         None => builder.with_no_client_auth(),
     };
@@ -3292,7 +4037,7 @@ pub(crate) fn rustls_client_connect(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(negotiated_suite_name)
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| {
             crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
         });
@@ -3446,8 +4191,23 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let (stream, sni_hostname, negotiated_protocol, negotiated_cipher, negotiated_alpn) =
-        match config {
+    // A duplicate handle for the failure path below: `native_tls`'s
+    // `HandshakeError::Failure` does not hand the stream back, so the only
+    // reliable moment to take one is before the handshake starts.
+    let tcp_dup = tcp.try_clone().ok();
+
+    #[allow(clippy::type_complexity)]
+    let handshake: Result<
+        (
+            TlsServerStream,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+        String,
+    > = (|| {
+        Ok(match config {
             TlsServerConfig::Rustls(config) => {
                 let conn = ServerConnection::new(config)
                     .map_err(|e| format!("ServerConnection::new failed: {e}"))?;
@@ -3508,7 +4268,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 let cipher = stream
                     .conn
                     .negotiated_cipher_suite()
-                    .map(negotiated_suite_name)
+                    .map(|cs| suite_to_java_cipher_name(cs.suite()))
                     .unwrap_or_else(|| {
                         crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
                     });
@@ -3609,10 +4369,54 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                     None,
                 )
             }
+        })
+    })();
+
+    // FIX (h2-testtools-ssl-accept-loop-dies): a handshake failure is NOT an
+    // `accept()` failure. It used to be raised straight out of this function,
+    // which `SSLServerSocket.accept()` turns into an `IOException` — and an
+    // H2 `TcpServer.listen()` loop (like any JSSE accept loop, which has no
+    // reason to expect a handshake error there) exits on it, taking the whole
+    // server down. `TcpServer.isRunning()` opens a loopback socket and closes
+    // it again WITHOUT any I/O, so H2 kills its own SSL server on the first
+    // liveness probe: the real JDBC client that follows then finds a listening
+    // socket nobody is accepting from, waits out the 30 s read timeout, and
+    // reports `the handshake process was interrupted` — the symptom this
+    // cluster's TLS residual was filed for, and the reason it read as a
+    // client-side message-mapping problem.
+    //
+    // What HotSpot does with the same three probes, MEASURED (`TlsProbe2`):
+    // `SERVER accepted` four times, three worker threads dying on
+    // `SSLHandshakeException: Remote host terminated the handshake`, and the
+    // fourth connection completing its handshake and rejecting the
+    // certificate in 149 ms. The listener never notices.
+    let (stream, sni_hostname, negotiated_protocol, negotiated_cipher, negotiated_alpn) =
+        match handshake {
+            Ok(parts) => parts,
+            Err(reason) => {
+                if debug_hs {
+                    eprintln!(
+                        "[dbg-tls-hs] server_accept listener_id={} handshake FAILED, \
+                         deferring to first I/O: {reason}",
+                        listener_id
+                    );
+                }
+                (
+                    TlsServerStream::HandshakeFailed {
+                        tcp: tcp_dup,
+                        reason,
+                    },
+                    None,
+                    // What JSSE reports for a session that never negotiated.
+                    "NONE".to_string(),
+                    "SSL_NULL_WITH_NULL_NULL".to_string(),
+                    None,
+                )
+            }
         };
 
     // W7-61: see `TlsClientStreamEntry::raw`.
-    let raw = stream.tcp().try_clone().ok();
+    let raw = stream.tcp().and_then(|t| t.try_clone().ok());
     let entry = TlsServerStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
         raw,
@@ -3769,7 +4573,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(negotiated_suite_name)
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| {
             crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
         });
@@ -3856,7 +4660,7 @@ pub(crate) fn rustls_client_handshake_over_stream(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(negotiated_suite_name)
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| {
             crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
         });
@@ -4123,6 +4927,7 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
             pending.use_java_trust_manager,
             provider,
             &versions,
+            None,
         )
         .map_err(|e| format!("layered client config: {e}"))?;
         match pending.stream {
@@ -4251,6 +5056,13 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
             TlsServerStream::Native(s) => EintrIo::new(s).read(buf),
             #[cfg(unix)]
             TlsServerStream::LegacyDsa(s) => EintrIo::new(s).read(buf),
+            // Where JSSE surfaces a rejected handshake — see the variant's
+            // doc comment. The caller turns this into `SSLHandshakeException`
+            // via `s2_tls_handshake_failure`.
+            TlsServerStream::HandshakeFailed { reason, .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                reason.clone(),
+            )),
         };
         if debug_srv {
             eprintln!(
@@ -4299,6 +5111,11 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
             TlsServerStream::Native(s) => EintrIo::new(s).write(data),
             #[cfg(unix)]
             TlsServerStream::LegacyDsa(s) => EintrIo::new(s).write(data),
+            // See the read arm.
+            TlsServerStream::HandshakeFailed { reason, .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                reason.clone(),
+            )),
         };
         if debug_srv {
             eprintln!(
@@ -4386,8 +5203,32 @@ pub(crate) fn rustls_stream_close(id: i32) {
                 TlsServerStream::LegacyDsa(s) => {
                     let _ = s.shutdown();
                 }
+                // No session to close down gracefully; the `raw` shutdown
+                // above has already ended the TCP connection.
+                TlsServerStream::HandshakeFailed { .. } => {}
             }
         }
+    }
+}
+
+/// Why this accepted server-side stream's TLS handshake failed, or `None` if
+/// it did not — see [`TlsServerStream::HandshakeFailed`]. Lets the Java-facing
+/// read/write natives raise `SSLHandshakeException` (what JSSE raises at the
+/// first I/O on such a socket) rather than a bare `IOException`.
+pub(crate) fn rustls_server_handshake_failure(id: i32) -> Option<String> {
+    let stream = {
+        let reg = sreg().lock();
+        reg.server_streams.get(&id).map(|e| e.stream.clone())
+    }?;
+    // `try_lock`: this is only ever called to CLASSIFY an error the caller
+    // already has, so it must never park behind another thread's blocking
+    // read. A failed stream's own read/write arm returns without waiting, so
+    // losing the race here needs a second thread on the same socket, and
+    // costs only the exception type.
+    let guard = stream.try_lock()?;
+    match &*guard {
+        TlsServerStream::HandshakeFailed { reason, .. } => Some(reason.clone()),
+        _ => None,
     }
 }
 
@@ -4657,24 +5498,41 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
         "()[Ljava/security/cert/X509Certificate;",
         |ctx, _args| {
             let ders = accepted_issuer_ders();
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
-            for (i, der) in ders.iter().enumerate() {
-                let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
-                // Best-effort CN extraction via the existing DER parser.
-                let (subject, issuer) = crate::phases_late::basic_der_extract_names(der)
-                    .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
-                let sub = ctx.create_string(&subject);
-                let iss = ctx.create_string(&issuer);
-                ctx.set_field(cert, 0, Value::Object(Some(sub)));
-                ctx.set_field(cert, 1, Value::Object(Some(iss)));
-                ctx.set_field(cert, 2, Value::Long(0));
-                let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
-                for (j, &b) in der.iter().enumerate() {
-                    ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
+            let arr0 = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
+            // GC: everything in this loop allocates — the mirror, two strings,
+            // the DER byte[] — so `arr` and `cert` must be pinned and re-read,
+            // not held raw. See `x509_manager::get_accepted_issuers`, which
+            // had the identical defect and the netty failure that found it.
+            let pin = ctx.pin_native_root(arr0);
+            let mut arr = arr0;
+            let result = (|| -> Result<(), cratonvm_types::error::MethodCallFailed> {
+                for (i, der) in ders.iter().enumerate() {
+                    let cert0 =
+                        try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
+                    let cert_pin = ctx.pin_native_root(cert0);
+                    // Best-effort CN extraction via the existing DER parser.
+                    let (subject, issuer) = crate::phases_late::basic_der_extract_names(der)
+                        .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
+                    let sub = ctx.create_string(&subject);
+                    let iss = ctx.create_string(&issuer);
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 0, Value::Object(Some(sub)));
+                    ctx.set_field(cert, 1, Value::Object(Some(iss)));
+                    ctx.set_field(cert, 2, Value::Long(0));
+                    let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
+                    for (j, &b) in der.iter().enumerate() {
+                        ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
+                    }
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
+                    ctx.unpin_native_roots(cert_pin);
+                    arr = ctx.read_native_pin(pin, arr0);
+                    ctx.set_array_element(arr, i, Value::Object(Some(cert)));
                 }
-                ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
-                ctx.set_array_element(arr, i, Value::Object(Some(cert)));
-            }
+                Ok(())
+            })();
+            ctx.unpin_native_roots(pin);
+            result?;
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -5263,9 +6121,10 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mut list: Vec<String> = Vec::new();
+            let mut given = 0usize;
             if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
+                given = ctx.array_length(*arr);
+                for i in 0..given {
                     if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
                         if let Some(t) = ctx.read_string(s) {
                             list.push(t);
@@ -5273,7 +6132,8 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            if list.is_empty() {
+            // Same rule as the `SSLEngineImpl` setter — see its comment.
+            if list.is_empty() && given > 0 {
                 list = vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()];
             }
             stash_sss_enabled_protocols(ctx, this, list);
@@ -6218,7 +7078,7 @@ pub(crate) fn run_loopback_self_test(
     let cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(negotiated_suite_name)
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into());
     let alpn = stream
         .conn
@@ -6266,6 +7126,259 @@ fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, RuntimeError> {
 // -----------------------------------------------------------------------------
 // Unit tests — loopback, SNI, mTLS, ALPN
 // -----------------------------------------------------------------------------
+
+/// An EC server identity generated by `java.security.KeyPairGenerator("EC")`
+/// must build a rustls signing key.
+///
+/// The JDK emits PKCS#8 whose inner SEC1 `ECPrivateKey` carries neither
+/// `parameters [0]` nor `publicKey [1]` — 67 bytes for P-256, byte-identical on
+/// HotSpot and CratonVM (verified against JDK 25). `ring` can only build an
+/// `EcdsaKeyPair` from a PKCS#8 that HAS the public key, and reports the refusal
+/// as the generic "failed to parse private key as RSA, ECDSA, or EdDSA" — so
+/// every JDK-generated EC server identity was unusable, and netty's
+/// `Http2MultiplexTransportTest.testFireChannelReadAfterHandshakeSuccess_JDK`
+/// hung forever waiting on a handshake that could never complete.
+///
+/// Both halves are pinned: that the stripped shape is genuinely rejected
+/// WITHOUT the repair (so removing the splice fails this module, rather than
+/// leaving a test that cannot fail), and that it is accepted with it.
+#[cfg(test)]
+mod ec_pkcs8_v1_identity_tests {
+    use super::*;
+
+    /// P-256 identity, generated once with openssl and frozen here so these
+    /// tests need no crypto dependency and run on every platform. The key is
+    /// PKCS#8 WITH `publicKey [1]`; `strip_to_jdk_shape` reduces it to what the
+    /// JDK emits.
+    const P256_KEY: &str = "\
+        308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420\
+        52938df7e0c9a16537f034339c7c7359eced61a35d1b4c87760275ff735ee055a1440342\
+        00040e06bf5c39a8aa566ca83cb86b72d7e38686fee8ce84850064372f42433a7ad3cd49\
+        da99d89ec101763121462a25f8e6c18c90fb7eb089fcfe0e73aa0d743c42";
+    const P256_CRT: &str = "\
+        3082017c30820123a00302010202141f64638ec784227782eb3d08509bde7d8e9fc10c30\
+        0a06082a8648ce3d04030230143112301006035504030c096c6f63616c686f7374301e17\
+        0d3236303831323138303333365a170d3336303830393138303333365a30143112301006\
+        035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d03\
+        0107034200040e06bf5c39a8aa566ca83cb86b72d7e38686fee8ce84850064372f42433a\
+        7ad3cd49da99d89ec101763121462a25f8e6c18c90fb7eb089fcfe0e73aa0d743c42a353\
+        3051301d0603551d0e0416041468f6f21e5636c47e25780b9b832afe4de707a302301f06\
+        03551d2304183016801468f6f21e5636c47e25780b9b832afe4de707a302300f0603551d\
+        130101ff040530030101ff300a06082a8648ce3d0403020347003044022001ce1e112093\
+        114d88086e2105680bb39606ba9c5f67332da35764aafc8d977402204d049c6b89003aa0\
+        5b34697a1a6380393dba365220e82d3f25a6b368d1807289";
+
+    /// P-384 identity — the splice must be curve-agnostic, since it copies the
+    /// point out of the certificate rather than computing it.
+    const P384_KEY: &str = "\
+        3081b6020100301006072a8648ce3d020106052b8104002204819e30819b020101043004\
+        0e7e93856a01d61ca3d12ac7adafd39eccdb844fbeeda287df27b950794f39f4d8277cea\
+        3f4beb35df0ce4e5dec82aa16403620004e185c328a18debe1215987b59333173d761ddc\
+        fc5d5a6172461f40cb8b5e0c2d350792d8008d0b653c81f93c44f8ff8d1b28751f84772b\
+        90662213b6bf2d90fb31f60027c18a38d23d7cc2bd80644a628de877b04077416b879732\
+        ead4163238";
+    const P384_CRT: &str = "\
+        308201ba30820140a00302010202145594e93072003edfb390fffc595b84db6628df7c30\
+        0a06082a8648ce3d04030230143112301006035504030c096c6f63616c686f7374301e17\
+        0d3236303831323138303333365a170d3336303830393138303333365a30143112301006\
+        035504030c096c6f63616c686f73743076301006072a8648ce3d020106052b8104002203\
+        620004e185c328a18debe1215987b59333173d761ddcfc5d5a6172461f40cb8b5e0c2d35\
+        0792d8008d0b653c81f93c44f8ff8d1b28751f84772b90662213b6bf2d90fb31f60027c1\
+        8a38d23d7cc2bd80644a628de877b04077416b879732ead4163238a3533051301d060355\
+        1d0e0416041402e7bb3ae8de78e5dae7449f71da2296fd395874301f0603551d23041830\
+        16801402e7bb3ae8de78e5dae7449f71da2296fd395874300f0603551d130101ff040530\
+        030101ff300a06082a8648ce3d040302036800306502301806748b77941e85ada3cbe438\
+        5e6a5878ffd9b3a1950ffc0265ff13ef21958816d6811b8bffcd3c35f4d0b63f185b1c02\
+        3100afa5d9b1a03c4df25a3807ff3a4408ba7efa1ffd9d6e68aa13429ee73d39b23f3d61\
+        1e36f3ed53be1379ed00737f5d44";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..clean.len() / 2)
+            .map(|i| u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Reduce a PKCS#8 EC key's inner SEC1 to `version` + `privateKey` —
+    /// exactly what a stock JDK's `getEncoded()` produces.
+    fn strip_to_jdk_shape(der: &[u8]) -> Vec<u8> {
+        let (outer, _) = der_tlv(der, 0).unwrap();
+        let ver_end = der_tlv_end(der, outer).unwrap();
+        let alg_end = der_tlv_end(der, ver_end).unwrap();
+        let (oct_body, _) = der_tlv(der, alg_end).unwrap();
+        let (sec1_body, _) = der_tlv(der, oct_body).unwrap();
+        let iv_end = der_tlv_end(der, sec1_body).unwrap();
+        let ipk_end = der_tlv_end(der, iv_end).unwrap();
+
+        let inner = der[sec1_body..ipk_end].to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(&der[outer..alg_end]);
+        body.extend_from_slice(&der_tlv_encode(0x04, &der_tlv_encode(0x30, &inner)));
+        der_tlv_encode(0x30, &body)
+    }
+
+    /// `(parameters[0] present, publicKey[1] present)` for a PKCS#8 EC key.
+    fn inner_optionals(der: &[u8]) -> (bool, bool) {
+        let (outer, _) = der_tlv(der, 0).unwrap();
+        let ver_end = der_tlv_end(der, outer).unwrap();
+        let alg_end = der_tlv_end(der, ver_end).unwrap();
+        let (oct_body, _) = der_tlv(der, alg_end).unwrap();
+        let (sec1_body, sec1_end) = der_tlv(der, oct_body).unwrap();
+        let mut p = der_tlv_end(der, der_tlv_end(der, sec1_body).unwrap()).unwrap();
+        let (mut a, mut b) = (false, false);
+        while p < sec1_end {
+            match der[p] {
+                0xa0 => a = true,
+                0xa1 => b = true,
+                _ => {}
+            }
+            p = der_tlv_end(der, p).unwrap();
+        }
+        (a, b)
+    }
+
+    fn accepted_by_ring(pkcs8: &[u8]) -> bool {
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
+        rustls::crypto::ring::sign::any_supported_type(&key).is_ok()
+    }
+
+    fn round_trip(key_hex: &str, crt_hex: &str, label: &str) {
+        let full = unhex(key_hex);
+        let cert = unhex(crt_hex);
+        assert!(
+            inner_optionals(&full).1,
+            "{label}: fixture must carry publicKey[1] to be a valid control"
+        );
+        assert!(
+            accepted_by_ring(&full),
+            "{label}: control — ring must accept the unmodified fixture"
+        );
+
+        let jdk = strip_to_jdk_shape(&full);
+        assert_eq!(
+            inner_optionals(&jdk),
+            (false, false),
+            "{label}: stripped key must carry no optional fields"
+        );
+        // The bug, pinned. If this ever starts passing, ring learned to derive
+        // the public key and the splice below can be deleted.
+        assert!(
+            !accepted_by_ring(&jdk),
+            "{label}: ring accepted a PKCS#8 EC key with no publicKey"
+        );
+
+        let repaired = ec_pkcs8_splice_public_key(&jdk, &cert)
+            .unwrap_or_else(|| panic!("{label}: splice declined a stripped EC key"));
+        assert!(
+            inner_optionals(&repaired).1,
+            "{label}: repaired key must carry publicKey[1]"
+        );
+        assert!(
+            accepted_by_ring(&repaired),
+            "{label}: ring must accept the repaired key"
+        );
+    }
+
+    #[test]
+    fn jdk_shaped_p256_identity_is_repaired_from_its_certificate() {
+        round_trip(P256_KEY, P256_CRT, "P-256");
+    }
+
+    #[test]
+    fn jdk_shaped_p384_identity_is_repaired_from_its_certificate() {
+        round_trip(P384_KEY, P384_CRT, "P-384");
+    }
+
+    /// The mTLS `KeyManager` resolver is the one identity path that never
+    /// parses PEM: `JavaKeyManagerResolver::resolve_via_java` takes DER
+    /// straight from `km_alias_material` and hands it to
+    /// `CertifiedKey::from_der`. It was missed when the repair first landed, so
+    /// a JDK-generated EC *client* certificate delivered through a Java
+    /// `KeyManager` still resolved to nothing.
+    ///
+    /// Pinned through `CertifiedKey::from_der` rather than
+    /// `any_supported_type`, because that is the call the resolver makes — a
+    /// test against the lower-level entry point would not have caught the
+    /// missing call site either.
+    #[test]
+    fn a_key_manager_supplied_jdk_ec_identity_is_repaired_too() {
+        let cert = CertificateDer::from(unhex(P256_CRT));
+        let jdk = strip_to_jdk_shape(&unhex(P256_KEY));
+        let provider = rustls::crypto::ring::default_provider();
+
+        // Control: the shape `resolve_via_java` used to build is genuinely
+        // rejected, so the positive half below cannot pass vacuously.
+        assert!(
+            CertifiedKey::from_der(
+                vec![cert.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(jdk.clone())),
+                &provider,
+            )
+            .is_err(),
+            "control — CertifiedKey::from_der must reject the stripped JDK shape"
+        );
+
+        // The function `resolve_via_java` calls, not a re-creation of it.
+        assert!(
+            certified_key_from_der_repairing_ec(vec![cert], jdk, &provider).is_ok(),
+            "the KeyManager identity path must repair the JDK EC key it is handed"
+        );
+    }
+
+    #[test]
+    fn splice_declines_a_key_that_already_has_a_public_key() {
+        assert!(
+            ec_pkcs8_splice_public_key(&unhex(P256_KEY), &unhex(P256_CRT)).is_none(),
+            "a key ring already accepts must be left byte-identical"
+        );
+    }
+
+    #[test]
+    fn splice_declines_when_the_certificate_cannot_lend_a_matching_point() {
+        // A P-384 certificate must not have its point spliced into a P-256 key:
+        // the splice keys off the cert, so a mismatched pair must be refused by
+        // ring rather than silently producing an identity that signs wrong.
+        let jdk_p256 = strip_to_jdk_shape(&unhex(P256_KEY));
+        let spliced = ec_pkcs8_splice_public_key(&jdk_p256, &unhex(P384_CRT))
+            .expect("the P-384 cert does carry an EC point");
+        assert!(
+            !accepted_by_ring(&spliced),
+            "ring must reject a public key that does not match the private scalar"
+        );
+    }
+
+    #[test]
+    fn splice_declines_non_ec_keys() {
+        // An RSA PKCS#8 (any bytes with the RSA algorithm OID) must be left
+        // alone — those parse fine and rewriting them could only break them.
+        let rsa_alg_pkcs8 = unhex("30820102020100300d06092a864886f70d0101010500048200ec3082");
+        assert!(ec_pkcs8_splice_public_key(&rsa_alg_pkcs8, &unhex(P256_CRT)).is_none());
+    }
+
+    #[test]
+    fn splice_declines_garbage_without_panicking() {
+        let cert = unhex(P256_CRT);
+        for bad in [
+            &b""[..],
+            &b"\x30"[..],
+            &b"\x30\x82"[..],
+            &b"\x30\x03\x02\x01\x00"[..],
+            &b"\x02\x01\x00"[..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff][..],
+            &[0x30, 0x80, 0x02, 0x01, 0x00][..],
+        ] {
+            assert!(ec_pkcs8_splice_public_key(bad, &cert).is_none());
+        }
+        let jdk = strip_to_jdk_shape(&unhex(P256_KEY));
+        for bad_cert in [
+            &b""[..],
+            &b"\x30\x03\x02\x01\x00"[..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff][..],
+        ] {
+            assert!(ec_pkcs8_splice_public_key(&jdk, bad_cert).is_none());
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -6653,7 +7766,7 @@ mod tests {
         assert!(msg.contains("alpn=h2"));
         // The cipher substring was never asserted here, which is why the
         // rustls spelling survived in this string. It is now the ONLY
-        // behavioural exercise of `negotiated_suite_name` that needs no
+        // behavioural exercise of `suite_to_java_cipher_name` that needs no
         // network: a real in-process TLS 1.3 handshake, whose name must be
         // the one HotSpot reports. Measured on this host, HotSpot 25.0.3+9-LTS
         // answers `TLS_AES_256_GCM_SHA384` for a live TLS 1.3 session and lists
@@ -6666,7 +7779,7 @@ mod tests {
         assert!(
             !msg.contains("cipher=TLS13_"),
             "cipher is still in rustls's TLS 1.3 spelling, which JSSE never \
-             produces -- `negotiated_suite_name` was bypassed: {}",
+             produces -- `suite_to_java_cipher_name` was bypassed: {}",
             msg
         );
     }
@@ -6680,12 +7793,13 @@ mod tests {
     /// what let that happen: nothing asserted that anyone CALLS it. This
     /// asserts the call, by shape, over the working tree.
     ///
-    /// Exactly two occurrences of the raw `{:?}`-on-a-suite idiom may exist in
-    /// this file: inside `negotiated_suite_name`, which is the translation, and
-    /// inside `engine_take_pending_trust_check`, whose value never reaches Java
-    /// (its sole reader is a `contains("ECDSA")` guess, invariant under the
-    /// rewrite — see the comment at that site). A ninth producer, or a rewrite
-    /// of one of the six adapted call sites back to the raw idiom, fails here.
+    /// ZERO occurrences of the raw `{:?}`-on-a-suite idiom may exist in this
+    /// file. The translation is `suite_to_java_cipher_name`, which takes a
+    /// `rustls::CipherSuite` rather than a `Debug` string, so every producer —
+    /// including `engine_take_pending_trust_check`, whose value never reaches
+    /// Java — goes through it and the old two-exception carve-out is gone. A
+    /// new producer, or a rewrite of an adapted call site back to the raw
+    /// idiom, fails here.
     ///
     /// Reads the working tree rather than `include_str!` — this repository is
     /// edited from both Windows and Linux, so `\r` is normalised.
@@ -6734,19 +7848,20 @@ mod tests {
         found.sort();
         found.dedup();
 
-        let expected = vec![
-            "engine_take_pending_trust_check".to_string(),
-            "negotiated_suite_name".to_string(),
-        ];
+        // Was two (`negotiated_suite_name`, the adapter, and
+        // `engine_take_pending_trust_check`, whose value never reaches Java).
+        // Both are now on the typed `suite_to_java_cipher_name`, which takes a
+        // `rustls::CipherSuite` and cannot be handed a `Debug` string at all —
+        // so the raw idiom must appear NOWHERE in this file. A producer that
+        // re-introduces it fails here, exactly as before, on a stricter rule.
+        let expected: Vec<String> = Vec::new();
         assert_eq!(
             found, expected,
-            "the raw rustls suite spelling must appear ONLY in \
-             `negotiated_suite_name` (the translation) and \
-             `engine_take_pending_trust_check` (never reaches Java). Found it \
-             in: {found:?}. Every other producer feeds \
+            "the raw rustls suite spelling must appear NOWHERE in this file. \
+             Found it in: {found:?}. Every producer feeds \
              `SSLSession.getCipherSuite()`, which is contracted to return the \
              IANA/JSSE name -- HotSpot 25 lists ZERO suites spelled `TLS13_`. \
-             Use `negotiated_suite_name`."
+             Use `suite_to_java_cipher_name`, which takes the suite itself."
         );
     }
 
@@ -7181,6 +8296,13 @@ mod tests {
         assert!(r.find(cls, "setNeedClientAuth", "(Z)V").is_some());
         assert!(r.find(cls, "setWantClientAuth", "(Z)V").is_some());
         assert!(r.find(cls, "beginHandshake", "()V").is_some());
+        // JSSE's delegated-task contract. `getDelegatedTask` was unregistered
+        // until 2026-08-16, so a caller that followed the NEED_TASK this
+        // engine can report had no way to satisfy it. See `DelegatedTask`.
+        assert!(r
+            .find(cls, "getDelegatedTask", "()Ljava/lang/Runnable;")
+            .is_some());
+        assert!(r.find("java/lang/Runnable", "run", "()V").is_some());
         assert!(r
             .find(
                 cls,
@@ -7289,6 +8411,70 @@ mod tests {
         assert!(r
             .find(cls, "getApplicationProtocols", "()[Ljava/lang/String;")
             .is_some());
+    }
+
+    #[test]
+    fn a_delegated_task_is_owed_once_and_handed_over_once() {
+        // The state machine behind JSSE's NEED_TASK contract. See
+        // `DelegatedTask` for what each transition is load-bearing for.
+        let id = super::engine_alloc_id();
+        super::engine_registry()
+            .write()
+            .insert(id, super::EngineState::default());
+
+        // First need: deferred, and a Runnable is now owed.
+        assert_eq!(super::engine_begin_or_defer(id), Ok(true));
+        super::with_engine(id, |s| {
+            assert_eq!(s.delegated_task, super::DelegatedTask::Owed);
+            assert!(s.task_unclaimed);
+        });
+
+        // Collected exactly once — netty's in-line `runDelegatedTasks` loop
+        // terminates on the second, null answer and would otherwise spin.
+        assert!(super::claim_delegated_task(id));
+        assert!(!super::claim_delegated_task(id));
+        super::with_engine(id, |s| {
+            assert_eq!(s.delegated_task, super::DelegatedTask::HandedOut)
+        });
+
+        // Handed out and not yet run: the engine makes no progress, however
+        // many times it is asked. This refusal is the whole feature — it is
+        // what `test{Client,Server}HandshakeTimeoutBecauseExecutorNotExecute`
+        // measure, and it has to survive a retry loop.
+        assert_eq!(super::engine_begin_or_defer(id), Ok(true));
+        assert_eq!(super::engine_begin_or_defer(id), Ok(true));
+
+        super::engine_registry().write().remove(&id);
+    }
+
+    #[test]
+    fn a_task_done_inline_is_still_handed_over_when_the_caller_asks() {
+        // Rule 2 on `DelegatedTask`: netty's `SslTasksRunner.run()` returns
+        // WITHOUT calling `runComplete()` when `getDelegatedTask()` answers
+        // null, so `SslHandler` stays in STATE_PROCESS_TASK — where `decode()`
+        // and `flush()` are both no-ops — and the connection is wedged for
+        // good. Measured: `getDelegatedTask id=3 hand_out=false` on the
+        // executor thread, immediately after the event-loop thread had done
+        // the work inline, was `testHandshakeWithExecutorJDK`'s failure.
+        //
+        // A promise made must therefore be answered even when the work was
+        // meanwhile done by somebody else.
+        let id = super::engine_alloc_id();
+        let mut st = super::EngineState::default();
+        // Exactly what the `Owed` arm of `engine_begin_or_defer` leaves
+        // behind when it self-heals: the work is done, the promise is not.
+        st.delegated_task = super::DelegatedTask::None;
+        st.delegated_task_armed = true;
+        st.task_unclaimed = true;
+        super::engine_registry().write().insert(id, st);
+
+        assert!(
+            super::claim_delegated_task(id),
+            "a caller told NEED_TASK must never be answered with null"
+        );
+        assert!(!super::claim_delegated_task(id));
+
+        super::engine_registry().write().remove(&id);
     }
 
     #[test]
@@ -7553,6 +8739,14 @@ mod tests {
         assert!(!super::endpoint_alg_verifies_identity("NONE"));
     }
 
+    /// The engine id these trust-check tests pass through.
+    ///
+    /// `handshaked_pair()` builds `EngineState`s directly instead of
+    /// registering engines, so there is no registry id to quote — and
+    /// `engine_take_pending_trust_check` only copies the value into
+    /// `PendingTrustCheck::engine_id`, so any stable value serves.
+    const TEST_ENGINE_ID: i32 = 0;
+
     /// REGRESSION (`TestSecurity2018.testCVE_2018_8034`): a client engine
     /// configured with `setEndpointIdentificationAlgorithm("HTTPS")` must
     /// refuse a certificate that does not name the host it dialled — even
@@ -7570,7 +8764,7 @@ mod tests {
         //    exactly as cheap as before this fix.
         client.trust_check_done = false;
         client.endpoint_id_alg = None;
-        assert!(super::engine_take_pending_trust_check(&mut client).is_none());
+        assert!(super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client).is_none());
 
         // 2. HTTPS configured: a pending check appears even with no
         //    TrustManager attached, because JSSE's own default manager is what
@@ -7578,9 +8772,14 @@ mod tests {
         client.trust_check_done = false;
         client.endpoint_id_alg = Some("HTTPS".to_string());
         client.peer_host = Some("localhost".to_string());
-        let pending =
-            super::engine_take_pending_trust_check(&mut client).expect("identity check pending");
+        let pending = super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client)
+            .expect("identity check pending");
         assert!(pending.trust_ctx_key.is_none());
+        // The engine id is carried through so the deferred half
+        // (`engine_run_trust_check`, which runs after the registry lock is
+        // dropped) can find its engine again. Nothing asserted it, which is
+        // why adding the parameter broke three call sites and no test.
+        assert_eq!(pending.engine_id, TEST_ENGINE_ID);
         assert_eq!(
             pending.endpoint_identity,
             Some(("HTTPS".to_string(), "localhost".to_string()))
@@ -7605,7 +8804,7 @@ mod tests {
         //    is configured on it.
         client.trust_check_done = false;
         client.is_client = false;
-        let pending = super::engine_take_pending_trust_check(&mut client);
+        let pending = super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client);
         assert!(pending.is_none(), "server engines do not identify endpoints");
     }
 
@@ -7671,6 +8870,21 @@ mod tests {
         assert!(
             super::jsse_owns_endpoint_identification(&mut ctx, &[plain2, netty]),
             "the FIRST manager decides, matching SSLContextImpl.chooseTrustManager"
+        );
+
+        // 5. JSSE's OWN X509TrustManagerImpl is an X509ExtendedTrustManager
+        //    too, but its `checkServerTrusted` is served natively here and
+        //    performs no identification — so this VM must, or nobody does
+        //    (`testClientHostnameValidationFail`). This is the case
+        //    `SslContextBuilder.trustManager(File)` produces.
+        let jsse_cls = ctx
+            .ensure_class_initialized("sun/security/ssl/X509TrustManagerImpl")
+            .expect("mock class");
+        ctx.set_superclass(jsse_cls, extended);
+        let jsse = ctx.alloc_object(jsse_cls, 1);
+        assert!(
+            super::jsse_owns_endpoint_identification(&mut ctx, &[jsse]),
+            "JSSE's own trust manager does not identify on this VM, so this VM must"
         );
     }
 
@@ -8764,6 +9978,15 @@ impl EngineConn {
             EngineConn::Server(s) => s.is_handshaking(),
         }
     }
+    /// Full, hello-retry or RESUMED — see `client_session_cache`, the only
+    /// consumer, which must not hand back a previous session object for a
+    /// handshake that was not actually a continuation of it.
+    fn handshake_kind(&self) -> Option<rustls::HandshakeKind> {
+        match self {
+            EngineConn::Client(c) => c.handshake_kind(),
+            EngineConn::Server(s) => s.handshake_kind(),
+        }
+    }
     fn wants_read(&self) -> bool {
         match self {
             EngineConn::Client(c) => c.wants_read(),
@@ -8830,6 +10053,23 @@ impl EngineConn {
             EngineConn::Server(s) => s.send_close_notify(),
         }
     }
+    /// Queue a fatal alert for the peer — see
+    /// `rustls::CommonState::queue_fatal_alert` (a CratonVM addition to the
+    /// vendored fork) for why this exists and why it is idempotent.
+    fn queue_fatal_alert(&mut self, desc: rustls::AlertDescription) {
+        match self {
+            EngineConn::Client(c) => c.queue_fatal_alert(desc),
+            EngineConn::Server(s) => s.queue_fatal_alert(desc),
+        }
+    }
+    /// Has the peer sent us a `close_notify`? The inbound half of the
+    /// connection is then closed for good — see `do_unwrap`'s CLOSED report.
+    fn peer_has_closed(&self) -> bool {
+        match self {
+            EngineConn::Client(c) => c.has_received_close_notify(),
+            EngineConn::Server(s) => s.has_received_close_notify(),
+        }
+    }
     fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
         match self {
             EngineConn::Client(c) => c.peer_certificates(),
@@ -8871,6 +10111,34 @@ pub(crate) struct EngineState {
     /// exists so `SSLEngine.getPeerPort()` can answer what the application asked
     /// for instead of the uninitialised `-1` of a bare synthetic allocation.
     peer_port: i32,
+    /// JSSE's delegated-task state for this engine. See [`DelegatedTask`].
+    delegated_task: DelegatedTask,
+    /// This engine has already used its one deferral. Without it a caller that
+    /// keeps handing the engine back its own NEED_TASK would re-arm forever.
+    delegated_task_armed: bool,
+    /// We told a caller NEED_TASK and have not yet handed it a `Runnable`.
+    /// Deliberately NOT cleared when the work is done inline — see the `Owed`
+    /// arm of [`engine_begin_or_defer`] for what returning `null` to a caller
+    /// that was promised a task costs.
+    task_unclaimed: bool,
+    /// Complete TLS records taken out of the caller's buffer while the
+    /// connection did not exist yet, waiting for the delegated task to realize
+    /// it. See the NEED_TASK arm of `do_unwrap`.
+    deferred_inbound: Vec<u8>,
+    /// A handshake failure this SERVER engine has detected but not yet
+    /// reported, because the fatal alert rustls queued for it still has to be
+    /// flushed first.
+    ///
+    /// `do_unwrap` used to DISCARD a server-side handshake error for exactly
+    /// that reason ("let the handshake driver observe NEED_WRAP and flush it
+    /// before the channel closes"), which delivered the alert to the peer and
+    /// left this side with no failure at all: netty's
+    /// `SslHandlerTest.testHandshakeFailureCipherMissmatch*` asserts BOTH
+    /// sides see an `SSLException`, and the server saw
+    /// `StacklessClosedChannelException` — the promise failed by the peer
+    /// hanging up, not by the mismatch this engine detected. Deferred to the
+    /// wrap that drains the alert instead of dropped.
+    deferred_handshake_error: Option<(&'static str, String)>,
     /// The `SSLParameters.getEndpointIdentificationAlgorithm()` value the
     /// application configured on this engine ("HTTPS" / "LDAPS"), if any.
     ///
@@ -8935,6 +10203,31 @@ pub(crate) struct EngineState {
     /// to tell Tomcat's "renegotiate to collect the client certificate"
     /// second `beginHandshake()` apart from an ordinary redundant one.
     client_auth_requested: bool,
+    /// Set once this server engine's `SNIMatcher`s have been consulted for the
+    /// ClientHello's `server_name`, so the callback into Java happens once per
+    /// connection — same one-shot discipline as `trust_check_done`.
+    sni_match_done: bool,
+    /// `beginHandshake()` was called on a SERVER engine whose rustls connection
+    /// is deliberately NOT realized yet, because a handshake ALPN selector has
+    /// to see the ClientHello first (see `engine_apply_alpn_selector`). Makes
+    /// `handshake_status_of` answer NEED_UNWRAP rather than NOT_HANDSHAKING for
+    /// that window, so a caller that polls the status still feeds us the hello.
+    alpn_selection_deferred: bool,
+    /// The `legacy_session_id` seen in the ServerHello — written by the server
+    /// engine as it produces that record and read by the client engine as it
+    /// consumes it, so both ends of one connection hold the same bytes. See
+    /// [`peek_server_hello_session_id`]; consumed by
+    /// `build_synthetic_ssl_session` for TLS 1.2 sessions only.
+    negotiated_session_id: Vec<u8>,
+    /// For a CLIENT engine: did this side actually PRESENT a certificate?
+    ///
+    /// Written by [`RecordingClientCertResolver`] from inside rustls's
+    /// handshake, which is the only moment the answer exists. `None` until
+    /// `engine_begin` builds the client config; `Some(false)` means the
+    /// resolver was installed and never returned a certificate. Read by
+    /// `build_synthetic_ssl_session` to decide whether
+    /// `SSLSession.getLocalCertificates()` has anything to report.
+    client_cert_presented: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for EngineState {
@@ -8957,6 +10250,11 @@ impl Default for EngineState {
             server_config: None,
             peer_host: None,
             peer_port: -1,
+            delegated_task: DelegatedTask::None,
+            delegated_task_armed: false,
+            task_unclaimed: false,
+            deferred_inbound: Vec::new(),
+            deferred_handshake_error: None,
             endpoint_id_alg: None,
             identity_override: None,
             trust_roots_override: None,
@@ -8965,6 +10263,10 @@ impl Default for EngineState {
             trust_managers_ctx_key: None,
             trust_check_done: false,
             client_auth_requested: false,
+            sni_match_done: false,
+            alpn_selection_deferred: false,
+            negotiated_session_id: Vec::new(),
+            client_cert_presented: None,
         }
     }
 }
@@ -9213,7 +10515,37 @@ fn alloc_engine_result(
 /// Compute the next handshake status from an EngineState.
 fn handshake_status_of(s: &EngineState) -> i32 {
     if s.closed_inbound && s.closed_outbound {
+        // …but a fully-closed engine can still OWE the peer a record. The
+        // automatic TLS 1.2 `close_notify` response (see `do_unwrap`) closes
+        // both halves and queues the reply in one step, and rustls holds that
+        // reply until a `write_tls` — which only happens if the caller is told
+        // to `wrap` again. Answering NOT_HANDSHAKING here made netty stop
+        // wrapping and the reply was never emitted: `CloseNotifyTest`'s TLS 1.2
+        // parameterisation read `null` where the client's own close_notify
+        // belonged.
+        //
+        // `wants_write()` as well as `outbound`, because the queue that matters
+        // here is rustls's — `outbound` only holds what a previous `wrap`
+        // already drained out of it.
+        if !s.outbound.is_empty() || s.conn.as_ref().is_some_and(|c| c.wants_write()) {
+            return HS_NEED_WRAP_R;
+        }
         return HS_NOT_HANDSHAKING_R;
+    }
+    // A handshake failure waiting to be raised is owed to the caller on a
+    // WRAP, so keep asking for one. Without this the engine answered
+    // NEED_UNWRAP as soon as the alert had drained, the caller stopped
+    // wrapping, and the failure sat on the engine until the peer hung up —
+    // which is the `StacklessClosedChannelException` the deferral exists to
+    // prevent. See `EngineState::deferred_handshake_error` and the
+    // `drained.is_empty()` note in `do_wrap`.
+    if s.deferred_handshake_error.is_some() {
+        return HS_NEED_WRAP_R;
+    }
+    // A delegated task the caller owes us outranks everything else: JSSE
+    // reports NEED_TASK until the task has actually run. See `DelegatedTask`.
+    if s.delegated_task != DelegatedTask::None {
+        return HS_NEED_TASK_R;
     }
     // `write_tls()` may have produced more than one complete TLS record. A
     // previous wrap can legitimately emit only the first record when the
@@ -9224,6 +10556,10 @@ fn handshake_status_of(s: &EngineState) -> i32 {
     }
     let conn = match s.conn.as_ref() {
         Some(c) => c,
+        // A server engine whose connection is held back until the ClientHello
+        // arrives (ALPN selector) is still HANDSHAKING as far as the caller is
+        // concerned, and what it needs next is the hello.
+        None if s.alpn_selection_deferred => return HS_NEED_UNWRAP_R,
         None => return HS_NOT_HANDSHAKING_R,
     };
     if !conn.is_handshaking() {
@@ -9770,6 +11106,197 @@ fn wants_deferred_client_auth(ctx_key: Option<u64>) -> bool {
         .unwrap_or(false)
 }
 
+/// Marker prefix on an `engine_begin` error string meaning "this is a
+/// NEGOTIATION failure, not a configuration/IO one".
+///
+/// The distinction is visible to applications: JSSE reports "there is nothing
+/// this engine and its peer could agree on" as `SSLHandshakeException`, and
+/// callers assert on that type — `SSLEngineTest.testProtocolNoMatch` does
+/// `assertThrows(SSLHandshakeException.class, () -> handshake(...))`. A bare
+/// `IOException` is not an `SSLException` at all, so such a caller sees the
+/// wrong type even when the handshake correctly refuses to happen.
+pub(crate) const HANDSHAKE_ERR_PREFIX: &str = "handshake_failure: ";
+
+/// JSSE's delegated-task contract, which this engine implements.
+///
+/// `SSLEngine.wrap`/`unwrap` may answer `NEED_TASK`, meaning "I have work I
+/// want done off this thread". The caller must then collect the `Runnable`
+/// from `getDelegatedTask()` and run it before the engine will make progress.
+///
+/// It is not decoration. netty's
+/// `SslHandlerTest.test{Client,Server}HandshakeTimeoutBecauseExecutorNotExecute`
+/// installs an `Executor` that deliberately never runs what it is given and
+/// asserts the handshake then TIMES OUT. With no task ever emitted there was
+/// nothing to withhold: the handshake completed and the assertion saw `null`
+/// where an `SslHandshakeTimeoutException` belonged. `getDelegatedTask()` was
+/// not registered at all, so a caller that reached it got nothing back.
+///
+/// **The work is real.** What gets deferred is `engine_begin` — building the
+/// rustls configuration, which parses PEM chains, loads private keys and can
+/// call back into Java `KeyManager` code. That is the class of work JSSE
+/// defers, and until the task runs the connection genuinely does not exist, so
+/// an executor that drops the task really does stall the handshake.
+///
+/// **Two rules the callers impose, both learned the expensive way:**
+///
+/// 1. *Consume first, then defer.* netty's `SslHandler.decodeJdkCompatible`
+///    hands `unwrap` exactly one TLS record and treats
+///    `bytesConsumed != packetLength` as "not an SSL/TLS record" — it throws
+///    `NotSslRecordException` and fails the handshake. An `unwrap` that
+///    answers NEED_TASK having consumed nothing is not deferring the
+///    handshake, it is killing it. Real JSSE ingests the record and defers the
+///    processing; `do_unwrap` stages the records into `deferred_inbound` and
+///    reports them consumed.
+/// 2. *Never answer `null` to a caller that was promised a task.* netty's
+///    `SslTasksRunner.run()` returns immediately when `getDelegatedTask()` is
+///    `null`, WITHOUT calling `runComplete()` — so `SslHandler` stays in
+///    `STATE_PROCESS_TASK`, where `decode()` and `flush()` are both no-ops,
+///    and the connection is wedged for good. `task_unclaimed` is what
+///    guarantees one non-null answer per promise even if the work was
+///    meanwhile done inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegatedTask {
+    /// Nothing outstanding — either never needed, or already run.
+    None,
+    /// A caller was told NEED_TASK; `getDelegatedTask()` owes it a `Runnable`.
+    Owed,
+    /// Collected. The caller owns the work now, and the engine stays
+    /// `NEED_TASK` until it is run — however long that takes, or forever,
+    /// which is exactly what the two timeout tests measure.
+    HandedOut,
+}
+
+/// Which `SSLException` subclass JSSE raises for a handshake-phase failure.
+///
+/// `SSLProtocolException` means "the peer broke the protocol" — a message of
+/// the wrong type or at the wrong time, a payload that will not decode, an
+/// implementation that did something RFC-illegal. `SSLHandshakeException`
+/// means "we could not agree", which is everything else here: a rejected
+/// certificate, no cipher suites in common, no ALPN protocol.
+///
+/// The distinction is asserted, not cosmetic: netty's
+/// `SslHandlerTest.testTruncatedPacket` pushes a ServerHello INTO a server
+/// engine and requires `SSLProtocolException` specifically, and JSSE's
+/// `SSLEngineInputRecord` raises exactly that for an unexpected handshake
+/// message.
+fn jsse_handshake_exception_class(e: &rustls::Error) -> &'static str {
+    match e {
+        rustls::Error::InappropriateMessage { .. }
+        | rustls::Error::InappropriateHandshakeMessage { .. }
+        | rustls::Error::InvalidMessage(_)
+        | rustls::Error::PeerMisbehaved(_)
+        | rustls::Error::PeerSentOversizedRecord
+        | rustls::Error::BadMaxFragmentSize => "javax/net/ssl/SSLProtocolException",
+        _ => "javax/net/ssl/SSLHandshakeException",
+    }
+}
+
+/// Turn an `engine_begin` error string into the Java exception JSSE raises for
+/// it — see [`HANDSHAKE_ERR_PREFIX`].
+///
+/// MUST be called with the `engine_registry()` lock DROPPED: it allocates.
+fn engine_begin_failure(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    e: String,
+) -> MethodCallFailed {
+    match e.strip_prefix(HANDSHAKE_ERR_PREFIX) {
+        Some(rest) => crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            rest,
+        ),
+        None => RuntimeError::IOException { message: e }.into(),
+    }
+}
+
+/// Take the `Runnable` this engine owes its caller, if it still owes one.
+///
+/// Answers `true` at most once per promise: netty's in-line
+/// `runDelegatedTasks` loop drains `getDelegatedTask()` until it answers null,
+/// so a second `true` would spin it. It reads `task_unclaimed` rather than
+/// `delegated_task` on purpose — see rule 2 on [`DelegatedTask`].
+fn claim_delegated_task(id: i32) -> bool {
+    with_engine(id, |s| {
+        if s.task_unclaimed {
+            s.task_unclaimed = false;
+            if s.delegated_task == DelegatedTask::Owed {
+                s.delegated_task = DelegatedTask::HandedOut;
+            }
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Realize the rustls connection, or hand the caller a delegated task to do
+/// it — JSSE's `NEED_TASK` contract. See [`DelegatedTask`].
+///
+/// Returns `Ok(true)` when the work was DEFERRED (the caller must now be told
+/// `NEED_TASK` and given no bytes), `Ok(false)` when it was done or was not
+/// needed.
+fn engine_begin_or_defer(id: i32) -> Result<bool, String> {
+    let mut g = engine_registry().write();
+    let Some(s) = g.get_mut(&id) else {
+        return Ok(false);
+    };
+    if crate::nbflags().dbg_tls_hs_ok {
+        eprintln!(
+            "[dbg-tls-task] thread={:?} begin_or_defer id={} state={:?} armed={} unclaimed={}",
+            std::thread::current().id(),
+            id,
+            s.delegated_task,
+            s.delegated_task_armed,
+            s.task_unclaimed
+        );
+    }
+    match s.delegated_task {
+        // Collected and not yet run: the caller owns the work. Refuse to make
+        // progress. This refusal IS the feature.
+        DelegatedTask::HandedOut => Ok(true),
+        // Owed, but the caller came back for more instead of collecting it.
+        // A caller that ignores NEED_TASK entirely would otherwise spin
+        // forever, so do the work inline and let it through.
+        //
+        // `task_unclaimed` is deliberately NOT cleared here. A caller can also
+        // reach this arm by being merely SLOW — its executor collects the task
+        // on another thread a moment later — and handing that caller a `null`
+        // is what wedges netty (rule 2 on [`DelegatedTask`]). One promise, one
+        // non-null answer, whoever did the work.
+        DelegatedTask::Owed => {
+            s.delegated_task = DelegatedTask::None;
+            engine_begin_if_needed(s).map(|()| false)
+        }
+        DelegatedTask::None => {
+            if s.delegated_task_armed {
+                return engine_begin_if_needed(s).map(|()| false);
+            }
+            // The roots are staged in a thread-local by whichever thread built
+            // the `SSLContext`; a delegated task runs on another thread by
+            // definition, so snapshot them onto the engine while we are still
+            // on the thread that can see them.
+            if s.trust_roots_override.is_none() {
+                s.trust_roots_override = take_selected_context_trust_roots();
+            }
+            s.delegated_task_armed = true;
+            s.task_unclaimed = true;
+            s.delegated_task = DelegatedTask::Owed;
+            Ok(true)
+        }
+    }
+}
+
+/// `engine_begin`, but only when the connection is not there yet. A CLIENT
+/// engine reaches the delegated-task paths with its connection already built —
+/// it defers the PROCESSING of the server's first flight, not the config.
+fn engine_begin_if_needed(state: &mut EngineState) -> Result<(), String> {
+    if state.conn.is_some() {
+        return Ok(());
+    }
+    engine_begin(state)
+}
+
 /// Begin the handshake — construct the rustls connection from the cached
 /// configs (or defaults) and stash it on the engine.
 fn engine_begin(state: &mut EngineState) -> Result<(), String> {
@@ -9798,13 +11325,63 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         }
         return Ok(());
     }
+    // An EXPLICIT protocol restriction that names only versions this stack
+    // cannot negotiate is a handshake failure, not an invitation to widen.
+    //
+    // `provider_and_versions` (via `protocol_versions_for`) answers "no
+    // restriction" for both "the caller asked for nothing" and "the caller
+    // asked only for TLSv1/TLSv1.1", and the two are not the same thing: the
+    // second is a peer this engine has nothing in common with, and silently
+    // offering TLS 1.2+1.3 anyway makes a deliberately-incompatible pair
+    // handshake successfully. netty's `SSLEngineTest.testProtocolNoMatch`
+    // configures a `TLSv1.2`-only client against a `TLSv1`/`TLSv1.1`-only
+    // server and asserts `SSLHandshakeException`; it got a completed
+    // handshake. (`testProtocolMatch`, whose server list also contains
+    // `TLSv1.2`, is unaffected — the intersection is non-empty there.)
+    //
+    // Deliberately scoped to a NON-EMPTY list: an explicitly emptied one
+    // (`setEnabledProtocols(new String[0])`, which
+    // `testEnablingAnAlreadyDisabledSslProtocol` round-trips before restoring a
+    // real list) keeps its existing "unrestricted" treatment rather than
+    // gaining a new failure mode this page never measured.
+    if !state.enabled_protocols.is_empty()
+        && protocol_versions_for(&state.enabled_protocols).is_empty()
+    {
+        return Err(format!(
+            "{HANDSHAKE_ERR_PREFIX}No appropriate protocol (protocol is disabled or \
+             cipher suites are inappropriate): enabled protocols {:?} name no TLS \
+             version this engine can negotiate",
+            state.enabled_protocols
+        ));
+    }
     let alpn_strs: Vec<&str> = state
         .alpn_protocols
         .iter()
         .filter_map(|p| std::str::from_utf8(p).ok())
         .collect();
     if state.is_client {
-        let config = match state.client_config.clone() {
+        // The shape that has to match for two engines to share one config —
+        // see `ctx_client_config_table`. A client WITH an identity is excluded
+        // below (it needs a per-engine `RecordingClientCertResolver`), so the
+        // identity is not part of the key.
+        let shape = format!(
+            "{:?}|{:?}|{:?}|{:?}|{}|{}",
+            state.enabled_ciphers,
+            state.enabled_protocols,
+            state.alpn_protocols,
+            (&state.endpoint_id_alg, &state.peer_host),
+            state.need_client_auth,
+            state.want_client_auth,
+        );
+        let shareable = state.identity_override.is_none() && state.client_config.is_none();
+        let cached = if shareable {
+            state
+                .trust_managers_ctx_key
+                .and_then(|k| ctx_client_config_table().lock().get(&(k, shape.clone())).cloned())
+        } else {
+            None
+        };
+        let config = match state.client_config.clone().or(cached) {
             Some(c) => c,
             // A real Java TrustManager is the authority for this context.
             // Rustls must only perform cryptographic handshake verification in
@@ -9860,6 +11437,29 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                 // TLS 1.3 it cannot actually negotiate.
                 let (provider, versions) =
                     provider_and_versions(&state.enabled_ciphers, &state.enabled_protocols);
+                // Endpoint identification runs INSIDE the handshake (see
+                // `PassthroughServerCertVerifier::endpoint_identity`), because
+                // the SERVER can tell the difference: a client that rejects
+                // the certificate after its own `Finished` has already let the
+                // server complete. The post-handshake gate keeps its copy of
+                // the check for the paths that never build a config here.
+                //
+                // Gated on the SAME predicate as the post-handshake gate: an
+                // application `X509ExtendedTrustManager` OWNS identification
+                // and JSSE adds none, which is what netty's wrapper around
+                // `InsecureTrustManagerFactory` relies on — `testSessionCache`
+                // dials `a.netty.io` against a `localhost` certificate and
+                // expects it to connect.
+                let endpoint_identity = match (&state.endpoint_id_alg, &state.peer_host) {
+                    (Some(alg), Some(host))
+                        if endpoint_alg_verifies_identity(alg)
+                            && !host.is_empty()
+                            && ctx_jsse_identifies(state.trust_managers_ctx_key) =>
+                    {
+                        Some((alg.clone(), host.clone()))
+                    }
+                    _ => None,
+                };
                 build_client_config_ex_with_provider(
                     roots,
                     &alpn_strs,
@@ -9868,8 +11468,57 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     use_java_trust_manager,
                     provider,
                     &versions,
+                    endpoint_identity,
                 )?
             }
+        };
+        // Interpose the "was a client certificate actually sent?" recorder on
+        // whichever resolver the config ended up with — the fixed-identity one,
+        // the `JavaKeyManagerResolver`, or a caller-supplied one on a pre-built
+        // config. Doing it here rather than inside each builder keeps the one
+        // signal in one place; see `RecordingClientCertResolver` for why the
+        // signal is needed at all. The clone is per engine, and the parts that
+        // matter for sharing (the resumption/session store) are `Arc`s that
+        // clone by reference.
+        // Interpose the recorder ONLY on a client that has an identity to
+        // present. Without one there is nothing to record — the existing
+        // `None` case already means "nothing sent" — and the wrapper's fresh
+        // `Arc` per engine is precisely what makes resumption impossible, so
+        // installing it unconditionally cost every identity-less client its
+        // session cache.
+        let needs_recorder = state.identity_override.is_some() || !shareable;
+        let session_store = state.trust_managers_ctx_key.map(ctx_client_session_store);
+        let config = if needs_recorder {
+            let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut cloned = (*config).clone();
+            cloned.client_auth_cert_resolver = Arc::new(RecordingClientCertResolver {
+                inner: cloned.client_auth_cert_resolver.clone(),
+                presented: presented.clone(),
+            });
+            if let Some(store) = session_store {
+                cloned.resumption = rustls::client::Resumption::store(store);
+            }
+            state.client_cert_presented = Some(presented);
+            Arc::new(cloned)
+        } else if let Some(k) = state.trust_managers_ctx_key {
+            // Share this SSLContext's session store across its engines, then
+            // remember the finished config so the NEXT engine of the same
+            // shape is byte-for-byte the same object — see
+            // `ctx_client_config_table`.
+            let config = {
+                let mut cloned = (*config).clone();
+                if let Some(store) = session_store {
+                    cloned.resumption = rustls::client::Resumption::store(store);
+                }
+                Arc::new(cloned)
+            };
+            ctx_client_config_table()
+                .lock()
+                .entry((k, shape))
+                .or_insert(config)
+                .clone()
+        } else {
+            config
         };
         let host = state
             .peer_host
@@ -10087,8 +11736,39 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // custom-trust-manager case. NEED (mandatory) mode is
                     // untouched: `optional_client_cert` is false whenever
                     // `state.need_client_auth` is true.
-                    let use_passthrough_verifier =
-                        has_custom_trust_managers || (client_ca.is_none() && optional_client_cert);
+                    // FIX (jdksslenginetest-engine-level-gaps, cause B2): a
+                    // registered Java `TrustManager[]` is the AUTHORITY for the
+                    // client chain, exactly as it already is for the server
+                    // chain on the client side (`use_java_trust_manager` in the
+                    // client branch above), and for the same reason: webpki and
+                    // the JDK do not agree on what a valid chain is, and the
+                    // oracle is the JDK.
+                    //
+                    // The asymmetry this replaces was measurable. netty's test
+                    // certificates are self-signed with `basicConstraints
+                    // CA:true` — `SelfSignedCertificate`, and `CertificateBuilder
+                    // .setIsCertificateAuthority(true)` — so when such a
+                    // certificate is presented as a CLIENT identity webpki
+                    // refuses it with `CaUsedAsEndEntity` and the server sends a
+                    // `certificate_unknown` alert. JSSE has no such rule; it
+                    // completes the handshake, and `testSessionAfterHandshake0`
+                    // then reads `serverSession.getPeerCertificates()`. On this
+                    // VM that threw `SSLPeerUnverifiedException` for 48 of this
+                    // class's failures — not because the chain was never
+                    // captured, but because the handshake it belonged to had
+                    // already been aborted.
+                    //
+                    // Trust is NOT weakened: `engine_run_trust_check` runs
+                    // `checkClientTrusted` on the captured chain the moment the
+                    // crypto handshake finishes and aborts with a fatal alert on
+                    // rejection, so a client the truststore does not trust is
+                    // still refused — by the JDK validator instead of webpki.
+                    // `testMutualAuthClientCertFail` and
+                    // `testMutualAuthDiffCertsServerFailure` (both of which
+                    // assert a REJECTION) are the check on that.
+                    let use_passthrough_verifier = has_custom_trust_managers
+                        || (client_ca.is_none() && optional_client_cert)
+                        || (request && has_trust_source);
                     if crate::nbflags().dbg_tls_auth_ok {
                         eprintln!(
                             "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={} use_passthrough_verifier={}",
@@ -10137,6 +11817,17 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         // branches, so `engine_begin`'s rehandshake detector never mistakes
         // "already asked" for "asking for the first time".
         state.client_auth_requested |= state.need_client_auth || state.want_client_auth;
+        // Share this SSLContext's server-side session store across its engines,
+        // for the same reason as the client's — a server that forgets every
+        // session cannot honour a resumption attempt.
+        let config = match state.trust_managers_ctx_key {
+            Some(k) => {
+                let mut cloned = (*config).clone();
+                cloned.session_storage = ctx_server_session_store(k);
+                Arc::new(cloned)
+            }
+            None => config,
+        };
         let sc =
             ServerConnection::new(config).map_err(|e| format!("ServerConnection::new: {}", e))?;
         state.conn = Some(EngineConn::Server(sc));
@@ -10207,6 +11898,20 @@ fn engine_wrap_pump(
 /// Push inbound TLS bytes into rustls, process packets, then drain plaintext
 /// into the dsts (returned as `Vec<u8>`). Returns (consumed_from_src, plaintext_out).
 fn engine_unwrap_pump(state: &mut EngineState, inbound: &[u8]) -> Result<(usize, Vec<u8>), String> {
+    engine_unwrap_pump_raw(state, inbound).map_err(|e| format!("rustls process_new_packets: {}", e))
+}
+
+/// As [`engine_unwrap_pump`], but surfacing the rustls error itself.
+///
+/// The KIND of the error decides which `SSLException` subclass JSSE raises
+/// (`jsse_handshake_exception_class`), and a stringified error cannot be
+/// classified: `testTruncatedPacket` wants `SSLProtocolException` for a
+/// ServerHello pushed into a server engine and sees `SSLHandshakeException`
+/// if the class is picked before the kind is known.
+fn engine_unwrap_pump_raw(
+    state: &mut EngineState,
+    inbound: &[u8],
+) -> Result<(usize, Vec<u8>), rustls::Error> {
     let conn = match state.conn.as_mut() {
         Some(c) => c,
         None => return Ok((0, Vec::new())),
@@ -10225,9 +11930,7 @@ fn engine_unwrap_pump(state: &mut EngineState, inbound: &[u8]) -> Result<(usize,
             match conn.read_tls(&mut cursor) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if let Err(e) = conn.process_new_packets() {
-                        return Err(format!("rustls process_new_packets: {}", e));
-                    }
+                    conn.process_new_packets()?;
                     if !conn.wants_read() && cursor.position() == pos_before {
                         break;
                     }
@@ -10293,6 +11996,9 @@ fn engine_capture_negotiation(state: &mut EngineState) {
 /// (`trust_ctx_key`), so this can safely cross the lock-drop boundary before
 /// `engine_run_trust_check` (which calls into Java) runs.
 struct PendingTrustCheck {
+    /// The engine this check belongs to, so a rejection can queue the fatal
+    /// alert JSSE sends the peer — see `reject_peer_with_fatal_alert`.
+    engine_id: i32,
     is_client: bool,
     peer_chain_der: Vec<Vec<u8>>,
     /// `None` when the owning `SSLContext` has no `TrustManager[]` attached —
@@ -10324,7 +12030,40 @@ fn endpoint_alg_verifies_identity(alg: &str) -> bool {
 /// deferred to `engine_run_trust_check` specifically so no allocating/GC-
 /// triggering call ever happens while this lock is held (see
 /// `EngineState::trust_managers_ctx_key`'s doc for why that matters).
-fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTrustCheck> {
+/// The ClientHello `server_name` about to be handed to rustls, exactly once
+/// per engine. `None` — meaning "no gate to apply" — for a client engine, for
+/// an engine with no matchers configured, for every call after the first, and
+/// for any source buffer that does not begin with a parseable ClientHello
+/// carrying a `server_name`.
+///
+/// Marks the engine checked as soon as it looks at a handshake record, so a
+/// hello that carries no SNI is not re-examined on every later `unwrap`.
+fn engine_pending_sni_host(
+    ctx: &mut dyn NativeContext,
+    id: i32,
+    view: &BbView,
+    from: usize,
+    to: usize,
+) -> Option<String> {
+    let interesting = with_engine(id, |s| !s.is_client && !s.sni_match_done).unwrap_or(false);
+    if !interesting {
+        return None;
+    }
+    // No cheap matcher pre-check here: the table is keyed by the ENGINE
+    // object, which this helper does not hold, and
+    // `engine_run_sni_match_check` returns immediately when the engine has
+    // none. This runs at most once per engine either way.
+    let bytes = bb_bytes_range(ctx, view, from, to.min(from + 4096));
+    let host = peek_client_hello_sni(&bytes);
+    if !bytes.is_empty() && bytes[0] == 22 {
+        with_engine(id, |s| {
+            s.sni_match_done = true;
+        });
+    }
+    host
+}
+
+fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<PendingTrustCheck> {
     if state.trust_check_done {
         return None;
     }
@@ -10361,28 +12100,514 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
     if trust_ctx_key.is_none() && endpoint_identity.is_none() {
         return None;
     }
-    // DELIBERATELY the raw rustls spelling, and the ONLY place in this file
-    // that is. This string never reaches Java: its sole reader is the
+    // This string never reaches Java: its sole reader is the
     // `contains("ECDSA")` auth-type guess below, which feeds `checkServerTrusted`
-    // an `"ECDSA"`/`"RSA"` literal. `jsse_cipher_suite_name` rewrites only the
-    // `TLS13_` prefix, so it can only alter a TLS 1.3 name, and no TLS 1.3 suite
-    // contains `ECDSA` under either spelling (measured: all five variants, both
-    // spellings) — the guess is invariant under the rewrite. Applying the helper
-    // here would be a no-op that additionally claims "this is a JSSE cipher
-    // name", which it is not. Named here so the next reader need not re-derive
-    // it, and so the witness test's one exception is legible at the site.
+    // an `"ECDSA"`/`"RSA"` literal. The translation is applied anyway, and it is
+    // a no-op for this reader: the rewrite touches only the `TLS13_` prefix, so
+    // it can only alter a TLS 1.3 name, and no TLS 1.3 suite contains `ECDSA`
+    // under either spelling (measured: all five variants, both spellings) — the
+    // guess is invariant under it. Going through the one helper rather than the
+    // raw `Debug` string is what lets the witness test below carry NO
+    // exceptions.
     let cipher_name = state
         .conn
         .as_ref()
         .and_then(|c| c.negotiated_cipher_suite())
-        .map(|cs| format!("{:?}", cs.suite()));
+        .map(|cs| suite_to_java_cipher_name(cs.suite()));
     Some(PendingTrustCheck {
+        engine_id: id,
         is_client: state.is_client,
         peer_chain_der: state.peer_cert_chain_der.clone(),
         trust_ctx_key,
         negotiated_cipher_suite_name: cipher_name,
         endpoint_identity,
     })
+}
+
+/// Extract the `server_name` (SNI host) from a buffer that starts at a TLS
+/// record boundary and is expected to hold a ClientHello.
+///
+/// Why parse it here instead of asking rustls: rustls only reports
+/// `server_name()` AFTER it has processed the ClientHello, and processing it
+/// also produces the whole server flight. JSSE's SNI gate runs at ClientHello
+/// time — `ServerHandshakeContext` refuses before a ServerHello exists, so the
+/// client sees an `unrecognized_name` alert and nothing else. Checking after
+/// the fact left the client's handshake already complete: netty's
+/// `SniClientTest.testSniSNIMatcherDoesNotMatchClient` then saw the server
+/// report a failure and the client report success, and its
+/// `assertThrows(SSLException.class, …)` failed with "nothing was thrown".
+///
+/// Deliberately total and bounds-checked: every length is validated against
+/// the remaining slice, and anything unexpected answers `None` (meaning "no
+/// gate to apply"), never a panic. `None` is also the answer for a hello with
+/// no `server_name` extension, which is exactly JSSE's behaviour — with no
+/// name received there is nothing for a matcher to match.
+fn peek_client_hello_sni(buf: &[u8]) -> Option<String> {
+    fn u16at(b: &[u8], i: usize) -> Option<usize> {
+        Some(((*b.get(i)? as usize) << 8) | *b.get(i + 1)? as usize)
+    }
+    // TLS record: type(1) version(2) length(2). Handshake is 22.
+    if *buf.first()? != 22 {
+        return None;
+    }
+    let rec_len = u16at(buf, 3)?;
+    let body = buf.get(5..5 + rec_len)?;
+    // Handshake: msg_type(1)=client_hello, length(3).
+    if *body.first()? != 1 {
+        return None;
+    }
+    let hs_len = ((*body.get(1)? as usize) << 16)
+        | ((*body.get(2)? as usize) << 8)
+        | (*body.get(3)? as usize);
+    let hello = body.get(4..4 + hs_len)?;
+    // legacy_version(2) random(32)
+    let mut p = 34usize;
+    // legacy_session_id
+    p += 1 + *hello.get(p)? as usize;
+    // cipher_suites
+    p += 2 + u16at(hello, p)?;
+    // legacy_compression_methods
+    p += 1 + *hello.get(p)? as usize;
+    // extensions
+    let ext_total = u16at(hello, p)?;
+    p += 2;
+    let ext_end = p.checked_add(ext_total)?;
+    if ext_end > hello.len() {
+        return None;
+    }
+    while p + 4 <= ext_end {
+        let ext_type = u16at(hello, p)?;
+        let ext_len = u16at(hello, p + 2)?;
+        let data = hello.get(p + 4..p + 4 + ext_len)?;
+        if ext_type == 0x0000 {
+            // ServerNameList: list_length(2), then entries of
+            // name_type(1) + length(2) + host.
+            let list_len = u16at(data, 0)?;
+            let list = data.get(2..2 + list_len)?;
+            let mut q = 0usize;
+            while q + 3 <= list.len() {
+                let name_type = *list.get(q)?;
+                let name_len = u16at(list, q + 1)?;
+                let name = list.get(q + 3..q + 3 + name_len)?;
+                if name_type == 0 {
+                    return String::from_utf8(name.to_vec()).ok();
+                }
+                q += 3 + name_len;
+            }
+            return None;
+        }
+        p += 4 + ext_len;
+    }
+    None
+}
+
+/// Extract the ALPN protocol list a ClientHello offered, from a buffer that
+/// starts at a TLS record boundary.
+///
+/// Same shape, bounds discipline and totality as [`peek_client_hello_sni`] —
+/// see that function for why the ClientHello is parsed here rather than asked
+/// of rustls. `None` means "no ALPN extension" (or "not a parseable
+/// ClientHello"), which is distinct from `Some(vec![])`: a client that sent no
+/// ALPN extension must not have a server selector applied to it at all.
+fn peek_client_hello_alpn(buf: &[u8]) -> Option<Vec<String>> {
+    fn u16at(b: &[u8], i: usize) -> Option<usize> {
+        Some(((*b.get(i)? as usize) << 8) | *b.get(i + 1)? as usize)
+    }
+    if *buf.first()? != 22 {
+        return None;
+    }
+    let rec_len = u16at(buf, 3)?;
+    let body = buf.get(5..5 + rec_len)?;
+    if *body.first()? != 1 {
+        return None;
+    }
+    let hs_len = ((*body.get(1)? as usize) << 16)
+        | ((*body.get(2)? as usize) << 8)
+        | (*body.get(3)? as usize);
+    let hello = body.get(4..4 + hs_len)?;
+    let mut p = 34usize; // legacy_version(2) + random(32)
+    p += 1 + *hello.get(p)? as usize; // legacy_session_id
+    p += 2 + u16at(hello, p)?; // cipher_suites
+    p += 1 + *hello.get(p)? as usize; // legacy_compression_methods
+    let ext_total = u16at(hello, p)?;
+    p += 2;
+    let ext_end = p.checked_add(ext_total)?;
+    if ext_end > hello.len() {
+        return None;
+    }
+    while p + 4 <= ext_end {
+        let ext_type = u16at(hello, p)?;
+        let ext_len = u16at(hello, p + 2)?;
+        let data = hello.get(p + 4..p + 4 + ext_len)?;
+        // application_layer_protocol_negotiation (RFC 7301) is extension 16.
+        if ext_type == 0x0010 {
+            let list_len = u16at(data, 0)?;
+            let list = data.get(2..2 + list_len)?;
+            let mut out = Vec::new();
+            let mut q = 0usize;
+            while q < list.len() {
+                let n = *list.get(q)? as usize;
+                let name = list.get(q + 1..q + 1 + n)?;
+                if let Ok(s) = std::str::from_utf8(name) {
+                    out.push(s.to_string());
+                }
+                q += 1 + n;
+            }
+            return Some(out);
+        }
+        p += 4 + ext_len;
+    }
+    None
+}
+
+/// Extract the `legacy_session_id` a ServerHello carries, from a buffer that
+/// starts at a TLS record boundary.
+///
+/// This is the ONE piece of session identity that is on the wire and that both
+/// engines can therefore agree on. rustls exposes no session id of its own, so
+/// `SSLSession.getId()` had to derive a pseudo-id from the session object's
+/// identity — which is stable per engine and necessarily DIFFERENT on the two
+/// ends of one connection. netty's `SSLEngineTest.testSSLSessionId` asserts
+/// that a TLS 1.2 client and server report byte-identical ids.
+///
+/// TLS 1.2 only, by design: under TLS 1.3 the field is a meaningless echo of
+/// whatever the client put in its own `legacy_session_id`, both sides would
+/// trivially agree, and the same test asserts they must NOT
+/// (`assertFalse(Arrays.equals(...))` for the TLSV13 combo). The version check
+/// lives at the call site, which knows the negotiated version; this function
+/// only parses.
+///
+/// Same bounds discipline as [`peek_client_hello_sni`]: every length is checked
+/// and anything unexpected answers `None`.
+fn peek_server_hello_session_id(buf: &[u8]) -> Option<Vec<u8>> {
+    // TLS record: type(1)=22 handshake, version(2), length(2).
+    if *buf.first()? != 22 {
+        return None;
+    }
+    let rec_len = ((*buf.get(3)? as usize) << 8) | *buf.get(4)? as usize;
+    let body = buf.get(5..5 + rec_len)?;
+    // Handshake: msg_type(1)=2 server_hello, length(3).
+    if *body.first()? != 2 {
+        return None;
+    }
+    let hs_len = ((*body.get(1)? as usize) << 16)
+        | ((*body.get(2)? as usize) << 8)
+        | (*body.get(3)? as usize);
+    let hello = body.get(4..4 + hs_len)?;
+    // legacy_version(2) + random(32), then legacy_session_id_echo.
+    let id_len = *hello.get(34)? as usize;
+    if id_len == 0 {
+        return None;
+    }
+    Some(hello.get(35..35 + id_len)?.to_vec())
+}
+
+/// The `BiFunction<SSLEngine, List<String>, String>` a caller installed with
+/// `SSLEngine.setHandshakeApplicationProtocolSelector`, keyed by
+/// `engine_objref_key`.
+///
+/// This used to be an inert registration whose own comment called itself a
+/// KNOWN DIVERGENCE: the selector was accepted and never invoked, and the
+/// getter answered null so nothing could tell. It is a real hook now, and it
+/// is the ONLY way a server engine learns which protocols to advertise —
+/// netty's `JdkAlpnSslEngine` calls `setApplicationProtocols` for a CLIENT
+/// engine but `setHandshakeApplicationProtocolSelector` for a SERVER one, so
+/// with the setter inert a server advertised nothing at all and ALPN
+/// negotiated to null on BOTH sides (`SSLEngineTest.verifyApplicationLevelProtocol`,
+/// `expected: <my-protocol-http2> but was: <null>`).
+///
+/// Holds a live `ObjectRef`, so it is scanned and remapped by
+/// `gc_scan_tls_ctx_trust_manager_roots` / `gc_update_tls_ctx_trust_manager_refs`
+/// alongside this module's other object-holding tables.
+fn engine_alpn_selector_table() -> &'static Mutex<HashMap<u64, ObjectRef>> {
+    static T: OnceLock<Mutex<HashMap<u64, ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run the installed server-side ALPN selector against the ClientHello sitting
+/// in `src`, and record its answer as this engine's advertised protocol list.
+///
+/// MUST run BEFORE `engine_begin`: rustls fixes `ServerConfig::alpn_protocols`
+/// at construction and selects from it with its own "first of mine the client
+/// also offers" rule, so the only place a Java policy can be honoured is by
+/// deciding that list first. Setting it to exactly the one protocol the
+/// selector chose makes rustls's rule agree with the selector's by
+/// construction — including `testAlpnCompatibleProtocolsDifferentClientOrder`,
+/// where server preference must beat client order.
+///
+/// Three answers, matching `SSLEngine`'s documented contract for the selector:
+///   * a non-empty string → advertise exactly that protocol;
+///   * the empty string → the selector declined; advertise nothing, which is a
+///     successful handshake with no ALPN (netty's `NO_ADVERTISE` behaviour);
+///   * `null` → "fail the handshake", which JSSE reports as a
+///     `no_application_protocol` fatal alert. netty's `FATAL_ALERT` selector
+///     behaviour produces exactly this, and
+///     `testTlsExtensionNoCompatibleProtocolsServerHandshakeFailure` asserts the
+///     server sees an `SSLHandshakeException`.
+///
+/// A hello with no ALPN extension does not consult the selector at all (JSSE
+/// does not either — netty's `AlpnSelector.checkUnsupported` is the handler for
+/// that case), and neither does a buffer that is not yet a parseable
+/// ClientHello: the caller re-enters with more bytes.
+fn engine_apply_alpn_selector(
+    ctx: &mut dyn NativeContext,
+    id: i32,
+    engine: ObjectRef,
+    src: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let interesting = with_engine(id, |s| !s.is_client && s.conn.is_none()).unwrap_or(false);
+    if !interesting {
+        return Ok(());
+    }
+    let key = engine_objref_key(ctx, engine);
+    let selector = match engine_alpn_selector_table().lock().get(&key).copied() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    let view = bb_view(ctx, src);
+    let bytes = bb_bytes_range(ctx, &view, view.pos, view.lim.min(view.pos + 4096));
+    let offered = match peek_client_hello_alpn(&bytes) {
+        Some(list) if !list.is_empty() => list,
+        _ => return Ok(()),
+    };
+    // Build the `List<String>` argument. Everything that can move across an
+    // allocation is pinned and re-read, the same discipline
+    // `engine_run_sni_match_check` uses.
+    let sel_pin = ctx.pin_native_root(selector);
+    let eng_pin = ctx.pin_native_root(engine);
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(sel_pin);
+            return Ok(());
+        }
+    };
+    let list_pin = ctx.pin_native_root(list);
+    for p in &offered {
+        let s = ctx.create_string(p);
+        let list_now = ctx.read_native_pin(list_pin, list);
+        let _ = ctx.invoke_virtual(
+            list_now,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(s))],
+        );
+    }
+    let sel_now = ctx.read_native_pin(sel_pin, selector);
+    let eng_now = ctx.read_native_pin(eng_pin, engine);
+    let list_now = ctx.read_native_pin(list_pin, list);
+    let picked = ctx.invoke_virtual(
+        sel_now,
+        "apply",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(eng_now)), Value::Object(Some(list_now))],
+    );
+    let chosen: Option<String> = match picked {
+        Ok(Some(Value::Object(Some(s)))) => Some(ctx.read_string(s).unwrap_or_default()),
+        // A selector that throws is JSSE's "fail the handshake" too — it must
+        // never be read as "no preference".
+        _ => None,
+    };
+    ctx.unpin_native_roots(sel_pin);
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] engine_apply_alpn_selector id={} offered={:?} -> {:?}",
+            id, offered, chosen
+        );
+    }
+    match chosen {
+        Some(p) if !p.is_empty() => {
+            with_engine(id, |s| {
+                s.alpn_protocols = vec![p.clone().into_bytes()];
+            });
+            Ok(())
+        }
+        Some(_) => {
+            with_engine(id, |s| {
+                s.alpn_protocols.clear();
+            });
+            Ok(())
+        }
+        None => Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            "no_application_protocol: the configured ApplicationProtocolSelector \
+             rejected every protocol the client offered",
+        )),
+    }
+}
+
+/// Read `SSLParameters.getSNIMatchers()` into raw `ObjectRef`s and file them
+/// under this engine. A null/empty collection CLEARS any previous set, so a
+/// caller that reads the parameters, edits something else and writes them back
+/// does not accidentally keep matchers it removed.
+fn capture_sni_matchers(ctx: &mut dyn NativeContext, engine: ObjectRef, params: ObjectRef) {
+    let key = engine_objref_key(ctx, engine);
+    let coll = match ctx.invoke_virtual(params, "getSNIMatchers", "()Ljava/util/Collection;", &[]) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => {
+            engine_sni_matchers_table().lock().remove(&key);
+            return;
+        }
+    };
+    let mut list = Vec::new();
+    // Walk the Collection through its Iterator rather than assuming an
+    // ArrayList: `SSLParameters.getSNIMatchers` answers an unmodifiable
+    // wrapper, and JSSE itself builds it from whatever the caller passed.
+    if let Ok(Some(Value::Object(Some(it)))) =
+        ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])
+    {
+        let it_pin = ctx.pin_native_root(it);
+        // Bounded: a matcher set is a handful of entries, and an iterator that
+        // never reports exhaustion must not wedge the handshake.
+        for _ in 0..64 {
+            let it_now = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it_now, "hasNext", "()Z", &[]) {
+                Ok(Some(Value::Int(1))) => {}
+                _ => break,
+            }
+            let it_now = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it_now, "next", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(m)))) => list.push(m),
+                _ => break,
+            }
+        }
+        ctx.unpin_native_roots(it_pin);
+    }
+    let mut table = engine_sni_matchers_table().lock();
+    if list.is_empty() {
+        table.remove(&key);
+    } else {
+        table.insert(key, list);
+    }
+}
+
+/// JSSE's server-side SNI gate: for the `server_name` the peer sent, consult
+/// every configured `SNIMatcher` of the matching type and abort the handshake
+/// with `unrecognized_name` if one refuses.
+///
+/// `SNIHostName`'s type is `StandardConstants.SNI_HOST_NAME` (0), the only type
+/// rustls surfaces, so a matcher declaring any other type is not consulted —
+/// matching `ServerHandshakeContext`, which pairs each received name with the
+/// matcher registered for that name's type and ignores the rest.
+///
+/// Runs with the engine registry lock NOT held: it calls into Java.
+fn engine_run_sni_match_check(
+    ctx: &mut dyn NativeContext,
+    engine_id: i32,
+    engine: ObjectRef,
+    host: String,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let key = engine_objref_key(ctx, engine);
+    let matchers = match engine_sni_matchers_table().lock().get(&key).cloned() {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(()),
+    };
+    let name_str = ctx.create_string(&host);
+    let base = ctx.pin_native_root(name_str);
+    let name_str = ctx.read_native_pin(base, name_str);
+    let sni_name = ctx.new_object_initialized(
+        "javax/net/ssl/SNIHostName",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(name_str))],
+    );
+    let sni_name = match sni_name {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(base);
+            return Ok(());
+        }
+    };
+    let name_pin = ctx.pin_native_root(sni_name);
+    let m_pins: Vec<usize> = matchers.iter().map(|m| ctx.pin_native_root(*m)).collect();
+    let mut refused = false;
+    for (i, _) in matchers.iter().enumerate() {
+        let m_now = ctx.read_native_pin(m_pins[i], matchers[i]);
+        // Only a SNI_HOST_NAME matcher applies to the name rustls gave us.
+        match ctx.invoke_virtual(m_now, "getType", "()I", &[]) {
+            Ok(Some(Value::Int(0))) => {}
+            _ => continue,
+        }
+        let m_now = ctx.read_native_pin(m_pins[i], matchers[i]);
+        let name_now = ctx.read_native_pin(name_pin, sni_name);
+        match ctx.invoke_virtual(
+            m_now,
+            "matches",
+            "(Ljavax/net/ssl/SNIServerName;)Z",
+            &[Value::Object(Some(name_now))],
+        ) {
+            Ok(Some(Value::Int(0))) => {
+                refused = true;
+                break;
+            }
+            // A matcher that throws is JSSE's "no match" too — it never lets an
+            // application exception decide the handshake succeeded.
+            Err(_) => {
+                refused = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    ctx.unpin_native_roots(base);
+    if !refused {
+        return Ok(());
+    }
+    with_engine(engine_id, |s| {
+        if let Some(c) = s.conn.as_mut() {
+            c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName);
+        }
+    });
+    Err(crate::phases_early::throw_jca_exc(
+        ctx,
+        "javax/net/ssl/SSLHandshakeException",
+        &format!("Unrecognized server name indication: {host}"),
+    ))
+}
+
+thread_local! {
+    /// Set for the duration of an application `TrustManager` callback.
+    ///
+    /// This VM defers the consultation until AFTER `process_new_packets`
+    /// (deliberately — calling into the JVM while the engine registry lock is
+    /// held is what `engine_take_pending_trust_check`'s doc forbids), so by the
+    /// time the manager runs, rustls reports the handshake finished. Real JSSE
+    /// calls it DURING the handshake, and an `X509ExtendedTrustManager` may
+    /// legitimately read `sslEngine.getHandshakeSession()` — netty's
+    /// `SniClientJava8TestUtil` manager asserts it is non-null. Without this
+    /// flag the "handshake is over, answer null" rule (correct for every other
+    /// caller) made that assertion fail from inside the callback.
+    static IN_TRUST_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// As [`IN_TRUST_CHECK`], but true only for the CLIENT-side callback
+    /// (`checkServerTrusted`). See [`in_client_trust_check`].
+    static IN_CLIENT_TRUST_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is this thread inside an application `TrustManager` callback? See
+/// [`IN_TRUST_CHECK`].
+fn in_trust_check() -> bool {
+    IN_TRUST_CHECK.with(|c| c.get())
+}
+
+/// Is this thread inside a CLIENT-side `checkServerTrusted` callback?
+///
+/// The distinction is observable through `SSLSession.getLocalCertificates()`.
+/// JSSE calls `checkServerTrusted` while the client is processing the SERVER's
+/// Certificate message — BEFORE the client has sent its own — so the handshake
+/// session reports no local certificate there, and netty's
+/// `SSLEngineTest$TestTrustManagerFactory.checkServerTrusted` asserts exactly
+/// that (`assertNull(session.getLocalCertificates())`) even in a mutual-auth
+/// handshake where the same session answers a chain once the handshake is over.
+/// Its `checkClientTrusted` sibling asserts the opposite for the SERVER, whose
+/// certificate HAS been sent by the time it runs.
+///
+/// CratonVM cannot move the callback: rustls owns the handshake and this VM's
+/// consultation happens the moment it completes. Reporting the client's local
+/// chain as absent for the duration of the callback restores the ORDER the
+/// contract is really about.
+pub(crate) fn in_client_trust_check() -> bool {
+    IN_CLIENT_TRUST_CHECK.with(|c| c.get())
 }
 
 /// Run the post-handshake `TrustManager` consultation captured by
@@ -10403,6 +12628,7 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
 fn engine_run_trust_check(
     ctx: &mut dyn NativeContext,
     pending: PendingTrustCheck,
+    engine_obj: Option<ObjectRef>,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let trust_managers = match pending.trust_ctx_key {
         Some(key) => ctx_trust_managers_table()
@@ -10471,6 +12697,10 @@ fn engine_run_trust_check(
     // pin pattern in `net_phase_e.rs`'s group-collector native. `base + 1` is
     // the authType pin because these two pins are taken back to back.
     let _ = ctx.pin_native_root(auth_type_str);
+    // The `SSLEngine` goes into the same pin scope: the three-argument
+    // `checkServerTrusted` overload passes it to Java, and every
+    // `invoke_virtual` in the loop below can move it.
+    let engine_pin = engine_obj.map(|e| (ctx.pin_native_root(e), e));
     let tm_pins: Vec<usize> = trust_managers
         .iter()
         .map(|tm| ctx.pin_native_root(*tm))
@@ -10493,16 +12723,39 @@ fn engine_run_trust_check(
     }
     let mut rejected = false;
     let mut rejection: Option<String> = None;
+    // See `IN_TRUST_CHECK`. Cleared on every exit path below — the early
+    // `return Err(e)` for a propagating `Error` clears it too.
+    IN_TRUST_CHECK.with(|c| c.set(true));
+    IN_CLIENT_TRUST_CHECK.with(|c| c.set(pending.is_client));
     for (i, _tm) in trust_managers.iter().enumerate() {
         let arr_now = ctx.read_native_pin(base, arr);
         let auth_now = ctx.read_native_pin(base + 1, auth_type_str);
         let tm_now = ctx.read_native_pin(tm_pins[i], trust_managers[i]);
-        let result = ctx.invoke_virtual(
-            tm_now,
-            method,
-            "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
-            &[Value::Object(Some(arr_now)), Value::Object(Some(auth_now))],
-        );
+        // Which overload JSSE would use — see `tm_is_extended`. The engine is
+        // absent on the native client-socket path
+        // (`run_client_trust_check_for_chain`), where JSSE's `Socket`-flavoured
+        // overload would apply and we have no `Socket` mirror either; the
+        // two-argument form stays the answer there, exactly as before.
+        let engine_now = engine_pin.map(|(pin, e)| ctx.read_native_pin(pin, e));
+        let result = match engine_now {
+            Some(engine) if tm_is_extended(ctx, tm_now) => ctx.invoke_virtual(
+                tm_now,
+                method,
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;\
+                  Ljavax/net/ssl/SSLEngine;)V",
+                &[
+                    Value::Object(Some(arr_now)),
+                    Value::Object(Some(auth_now)),
+                    Value::Object(Some(engine)),
+                ],
+            ),
+            _ => ctx.invoke_virtual(
+                tm_now,
+                method,
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+                &[Value::Object(Some(arr_now)), Value::Object(Some(auth_now))],
+            ),
+        };
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] engine_run_trust_check: invoke_virtual[{}] -> {}",
@@ -10518,6 +12771,18 @@ fn engine_run_trust_check(
             );
         }
         if let Err(e) = result {
+            // An `Error` is NOT a rejection. JSSE catches `Exception` around an
+            // application TrustManager and lets `Error` through untouched; see
+            // `throwable_is_error`. Unpin first — this is an early return out
+            // of the pinned region.
+            if let cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) = &e {
+                if throwable_is_error(ctx, *exc) {
+                    IN_TRUST_CHECK.with(|c| c.set(false));
+                    IN_CLIENT_TRUST_CHECK.with(|c| c.set(false));
+                    ctx.unpin_native_roots(base);
+                    return Err(e);
+                }
+            }
             // Name WHY, unconditionally — not only under `CRATONVM_DBG=tls-auth`.
             // "TrustManager rejected the peer certificate chain" on its own is
             // indistinguishable between the three things that reach it: the
@@ -10546,11 +12811,14 @@ fn engine_run_trust_check(
             break;
         }
     }
+    IN_TRUST_CHECK.with(|c| c.set(false));
+    IN_CLIENT_TRUST_CHECK.with(|c| c.set(false));
     ctx.unpin_native_roots(base);
 
     if rejected {
         let detail = rejection.unwrap_or_else(|| "no exception detail available".to_string());
         set_last_trust_rejection_detail(&detail);
+        reject_peer_with_fatal_alert(pending.engine_id);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
@@ -10558,6 +12826,35 @@ fn engine_run_trust_check(
         ));
     }
     engine_check_endpoint_identity(ctx, &pending, jsse_identifies)
+}
+
+/// Tell the peer that its certificate was refused, the way JSSE does: queue a
+/// fatal `certificate_unknown` alert on the engine's rustls connection.
+///
+/// This is the missing half of a `TrustManager` rejection. rustls has already
+/// ACCEPTED the chain by the time the Java manager is consulted (the
+/// consultation is deliberately deferred until after `process_new_packets`, so
+/// that calling into the JVM never happens while the engine registry lock is
+/// held), so rustls itself generates no alert. Throwing
+/// `SSLHandshakeException` locally and sending nothing left the peer with an
+/// unexplained TCP close: netty's
+/// `ParameterizedSslHandlerTest.testAlertProducedAndSend` waits for an
+/// `SSLException` derived from that alert and blocked forever without it
+/// (~170x HotSpot's 6 s, still running after 17 minutes).
+///
+/// `certificate_unknown` is the description JSSE maps a `CertificateException`
+/// from a `TrustManager` to. The record itself is emitted by the next `wrap`,
+/// which netty performs because `setHandshakeFailure` -> `ctx.close()` ->
+/// `closeOutboundAndChannel` flushes an empty buffer through the engine.
+///
+/// Takes no `NativeContext` and calls no Java: it must be safe to run on the
+/// rejection path, which is already unwinding.
+fn reject_peer_with_fatal_alert(engine_id: i32) {
+    with_engine(engine_id, |s| {
+        if let Some(c) = s.conn.as_mut() {
+            c.queue_fatal_alert(rustls::AlertDescription::CertificateUnknown);
+        }
+    });
 }
 
 /// Would real JSSE perform endpoint identification itself for this
@@ -10605,6 +12902,58 @@ fn engine_run_trust_check(
 /// behaviour. `CRATONVM_DBG=tls-auth` names the chain that was walked, because
 /// "returned true" and "never found the class" are the two answers that must
 /// not be confused when this is next investigated.
+/// Is `tm` an `X509ExtendedTrustManager`?
+///
+/// JSSE picks the overload by this: `SSLContextImpl.chooseTrustManager` uses an
+/// `X509ExtendedTrustManager` AS-IS and `X509TrustManagerImpl` then calls the
+/// **three**-argument `checkServerTrusted(chain, authType, SSLEngine)`; only a
+/// plain `X509TrustManager` gets the two-argument form (through
+/// `AbstractTrustManagerWrapper`). A manager that implements both — every
+/// `X509ExtendedTrustManager` does, the two-arg methods being inherited
+/// abstract — can tell the difference, and the ones in test suites do
+/// deliberately: netty's `SniClientJava8TestUtil` `fail()`s the two-arg form
+/// and asserts on `sslEngine.getHandshakeSession()` in the three-arg one, so
+/// calling the wrong overload turned a passing test into
+/// `SSLHandshakeException: TrustManager rejected the peer certificate chain:
+/// org/opentest4j/AssertionFailedError`.
+fn tm_is_extended(ctx: &mut dyn NativeContext, tm: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(tm));
+    // Bounded for the same reason `jsse_owns_endpoint_identification` bounds
+    // its walk: a corrupted `superclass_of` must not hang the handshake.
+    for _ in 0..32 {
+        let Some(c) = cid else { break };
+        if ctx.class_name_of_id(c).as_deref() == Some("javax/net/ssl/X509ExtendedTrustManager") {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
+/// Is `exc` a `java.lang.Error`?
+///
+/// JSSE catches `Exception` around an application `TrustManager` call, never
+/// `Error`. A JUnit assertion failure inside a `TrustManager`
+/// (`org.opentest4j.AssertionFailedError`) is an `Error`, and it is meant to
+/// reach the test runner intact rather than be re-reported as
+/// `SSLHandshakeException` — which is what this VM did, hiding both the
+/// assertion's message and its stack.
+fn throwable_is_error(ctx: &mut dyn NativeContext, exc: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(exc));
+    for _ in 0..64 {
+        let Some(c) = cid else { break };
+        match ctx.class_name_of_id(c).as_deref() {
+            Some("java/lang/Error") => return true,
+            // `Throwable` is above both `Error` and `Exception`; reaching it
+            // without having seen `Error` means this is an `Exception`.
+            Some("java/lang/Throwable") | Some("java/lang/Object") => return false,
+            _ => {}
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
 fn jsse_owns_endpoint_identification(
     ctx: &mut dyn NativeContext,
     trust_managers: &[ObjectRef],
@@ -10625,10 +12974,34 @@ fn jsse_owns_endpoint_identification(
         if dbg {
             chain.push(name.clone().unwrap_or_else(|| format!("<id {}>", c.as_u32())));
         }
+        // JSSE's OWN default trust manager is an `X509ExtendedTrustManager`,
+        // and on HotSpot it is the thing that identifies the endpoint. On
+        // THIS VM its `checkServerTrusted` is served by a native shim
+        // (`x509_manager::do_check_trusted`) which validates the chain and
+        // nothing else — it never sees the `SSLEngine`, so it cannot read
+        // `SSLParameters.getEndpointIdentificationAlgorithm()`.
+        //
+        // A predicate must mirror the dispatch it guards. Answering "the
+        // application owns identification" for a class whose identification
+        // code this VM does not run means NOBODY runs it:
+        // `testClientHostnameValidationFail` handshakes a client that dialled
+        // `localhost` against `notlocalhost_server.pem` and asserts the
+        // handshake FAILS; it completed.
+        if name.as_deref() == Some("sun/security/ssl/X509TrustManagerImpl") {
+            if dbg {
+                eprintln!(
+                    "[dbg-tls-auth] trust manager is JSSE's own X509TrustManagerImpl ({}) — \
+                     its checkServerTrusted is native here and does NOT identify, \
+                     so this VM must",
+                    chain.join(" -> ")
+                );
+            }
+            return true;
+        }
         if name.as_deref() == Some("javax/net/ssl/X509ExtendedTrustManager") {
             if dbg {
                 eprintln!(
-                    "[dbg-tls-auth] trust manager is an X509ExtendedTrustManager ({}) — \
+                    "[dbg-tls-auth] trust manager is an application X509ExtendedTrustManager ({}) — \
                      it owns endpoint identification, JSSE adds none",
                     chain.join(" -> ")
                 );
@@ -10702,6 +13075,9 @@ fn engine_check_endpoint_identity(
                 eprintln!("[dbg-tls-auth] {detail}");
             }
             set_last_trust_rejection_detail(&detail);
+            // Same reasoning as the TrustManager rejection above: the peer has
+            // to be told, or it sees an unexplained close.
+            reject_peer_with_fatal_alert(pending.engine_id);
             Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "javax/net/ssl/SSLHandshakeException",
@@ -10744,6 +13120,12 @@ pub(crate) fn run_client_trust_check_for_chain(
     engine_run_trust_check(
         ctx,
         PendingTrustCheck {
+            // No SSLEngine here: this is the native client-socket path, whose
+            // rustls connection is owned by `servlet::s2_tls_connect` and is
+            // not in `engine_registry`. `reject_peer_with_fatal_alert` is a
+            // no-op for an id that names no engine, which is the right answer
+            // — that path tears the socket down itself.
+            engine_id: -1,
             is_client: true,
             peer_chain_der,
             trust_ctx_key: Some(trust_ctx_key),
@@ -10753,6 +13135,7 @@ pub(crate) fn run_client_trust_check_for_chain(
             // does not route endpoint identification through here.
             endpoint_identity: None,
         },
+        None,
     )
 }
 
@@ -10766,6 +13149,181 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 // -----------------------------------------------------------------------------
 // Native registrations (WP5.1 + WP5.4)
 // -----------------------------------------------------------------------------
+
+/// Build a synthetic `SSLSession` reflecting `id`'s negotiated (or, before/
+/// outside a handshake, best-effort default) cipher/protocol/ALPN state.
+/// The `SSLSession` object this engine is currently presenting, keyed by
+/// `engine_objref_key` and by handshake epoch (`false` = the pre-handshake
+/// session, `true` = the negotiated one).
+///
+/// `getSession()` used to build a FRESH synthetic session on every call, which
+/// breaks the identity every stateful part of the API depends on:
+/// `putValue`/`getValue` landed on different objects, so an attribute never
+/// read back; `invalidate()` marked an object the next `isValid()` never saw;
+/// and `getCreationTime()` moved every time it was asked. netty's
+/// `SSLEngineTest.testSessionAfterHandshake0` is the direct witness — 48 of
+/// this class's failures, `expected: <true> but was: <null>` from
+/// `assertEquals(Boolean.TRUE, engine.getSession().getValue(key))`.
+///
+/// Two epochs rather than one, because JSSE genuinely replaces the session at
+/// handshake completion and the same test asserts it: values put on the
+/// pre-handshake session must NOT be visible afterwards.
+///
+/// Holds live `ObjectRef`s, so it is scanned and remapped by
+/// `gc_scan_tls_ctx_trust_manager_roots` /
+/// `gc_update_tls_ctx_trust_manager_refs` alongside this module's other
+/// object-holding tables.
+fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
+    static T: OnceLock<Mutex<HashMap<(u64, bool), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The client-side session cache: `(SSLContext key, host, port)` → the
+/// negotiated `SSLSession` object that connection produced.
+///
+/// This is JSSE's `SSLSessionContextImpl` for a client, which is keyed on
+/// host+port for exactly one reason — so that a LATER engine from the same
+/// `SSLContext`, dialling the same peer and RESUMING the session, hands the
+/// application back the *same* `SSLSession` object, with the same
+/// `putValue`/`getValue` bindings on it.
+///
+/// netty's `SSLEngineTest.doHandshakeVerifyReusedAndClose` is written around
+/// that: it puts `key=TRUE` on the first connection's session, reconnects to
+/// the same `a.netty.io:9999`, and asserts the value is readable off the new
+/// engine's session. A fresh object per engine answers `null`.
+///
+/// Entries are only ever CONSULTED for a handshake rustls reports as
+/// `HandshakeKind::Resumed`, so this cannot manufacture continuity that the
+/// TLS layer did not actually provide.
+///
+/// Holds live `ObjectRef`s → scanned and remapped alongside
+/// `engine_session_table` (see `gc_scan_tls_ctx_trust_manager_roots`).
+#[allow(clippy::type_complexity)]
+fn client_session_cache() -> &'static Mutex<HashMap<(u64, String, i32), ObjectRef>> {
+    static T: OnceLock<Mutex<HashMap<(u64, String, i32), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache key for a client engine, or `None` when this engine has no
+/// SSLContext identity or no peer to key on (a server engine, or a client
+/// created without a host).
+fn client_session_cache_key(id: i32) -> Option<(u64, String, i32)> {
+    with_engine(id, |s| {
+        if !s.is_client {
+            return None;
+        }
+        let ctx_key = s.trust_managers_ctx_key?;
+        let host = s.peer_host.clone().filter(|h| !h.is_empty())?;
+        Some((ctx_key, host, s.peer_port))
+    })
+    .flatten()
+}
+
+/// `SSLSession.getLastAccessedTime()` for the sessions that have been accessed
+/// again — i.e. reused by a later handshake. Keyed by `gc_stable_objref_key`,
+/// like `session_wire_id_table` beside it; absent means "never reused", and
+/// `getLastAccessedTime` then answers the creation time, which is what JSSE
+/// reports for a session used exactly once.
+fn session_last_accessed_table() -> &'static Mutex<HashMap<u64, i64>> {
+    static T: OnceLock<Mutex<HashMap<u64, i64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn touch_session_access_time(ctx: &mut dyn NativeContext, ses: ObjectRef) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let k = gc_stable_objref_key(ctx, ses);
+    session_last_accessed_table().lock().insert(k, now);
+}
+
+/// Did rustls RESUME this connection's session (TLS 1.2 session id or ticket,
+/// TLS 1.3 PSK)? `false` for a full handshake and for a connection that has
+/// not got far enough to say.
+fn engine_handshake_was_resumed(id: i32) -> bool {
+    with_engine(id, |s| {
+        matches!(
+            s.conn.as_ref().and_then(|c| c.handshake_kind()),
+            Some(rustls::HandshakeKind::Resumed)
+        )
+    })
+    .unwrap_or(false)
+}
+
+/// Identity keys of the session objects built in the NEGOTIATED epoch.
+///
+/// Only `engine_session_for` knows which epoch a session belongs to, and the
+/// object itself has no spare slot to record it in (all eight are in use, and
+/// `javax/net/ssl/SSLSession` is a real interface with no fields of its own to
+/// widen into). Keyed by `gc_stable_objref_key` — the same GC-stable identity
+/// `getId` already derives its bytes from.
+fn negotiated_session_keys() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Has this session object been through a completed handshake? See
+/// [`negotiated_session_keys`].
+fn session_is_negotiated(ctx: &mut dyn NativeContext, ses: ObjectRef) -> bool {
+    let key = gc_stable_objref_key(ctx, ses);
+    negotiated_session_keys().lock().contains(&key)
+}
+
+/// `getSession()`'s stable answer: the cached session for this engine's current
+/// handshake epoch, built on first use. See [`engine_session_table`].
+fn engine_session_for(
+    ctx: &mut dyn NativeContext,
+    engine: ObjectRef,
+    id: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let handshaked = with_engine(id, |s| {
+        s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+    })
+    .unwrap_or(false);
+    let key = (engine_objref_key(ctx, engine), handshaked);
+    if let Some(existing) = engine_session_table().lock().get(&key).copied() {
+        return Ok(existing);
+    }
+    // A RESUMED connection continues the previous session, so it must answer
+    // with the previous session OBJECT — its `putValue` bindings and its
+    // creation time are what "resumed" means to an application. See
+    // `client_session_cache`.
+    let cache_key = if handshaked {
+        client_session_cache_key(id)
+    } else {
+        None
+    };
+    if let Some(ck) = cache_key.as_ref() {
+        if crate::nbflags().dbg_tls_auth_ok {
+            eprintln!(
+                "[dbg-tls-auth] engine_session_for id={} key={:?} resumed={} kind={:?} cached={}",
+                id,
+                ck,
+                engine_handshake_was_resumed(id),
+                with_engine(id, |s| s.conn.as_ref().and_then(|c| c.handshake_kind())).flatten(),
+                client_session_cache().lock().contains_key(ck)
+            );
+        }
+        if engine_handshake_was_resumed(id) {
+            if let Some(prev) = client_session_cache().lock().get(ck).copied() {
+                engine_session_table().lock().insert(key, prev);
+                touch_session_access_time(ctx, prev);
+                return Ok(prev);
+            }
+        }
+    }
+    let ses = build_synthetic_ssl_session(ctx, id)?;
+    if handshaked {
+        let k = gc_stable_objref_key(ctx, ses);
+        negotiated_session_keys().lock().insert(k);
+    }
+    engine_session_table().lock().insert(key, ses);
+    if let Some(ck) = cache_key {
+        client_session_cache().lock().insert(ck, ses);
+    }
+    Ok(ses)
+}
 
 /// Build a synthetic `SSLSession` reflecting `id`'s negotiated cipher/protocol/
 /// ALPN state, or — before/outside a handshake — JSSE's own "nothing was
@@ -10796,7 +13354,7 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
             .conn
             .as_ref()
             .and_then(|c| c.negotiated_cipher_suite())
-            .map(negotiated_suite_name)
+            .map(|cs| suite_to_java_cipher_name(cs.suite()))
             .unwrap_or_else(|| {
                 crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into()
             });
@@ -10859,6 +13417,22 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     ctx.set_field(ses, 4, Value::Int(-1));
     ctx.set_field(ses, 5, Value::Long(crate::epoch_millis_now()));
     ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
+    // The real, on-the-wire session id, for the one case where it exists and
+    // both ends must agree: a completed TLS 1.2 handshake. Under TLS 1.3 the
+    // field is a meaningless echo and `getId()`'s per-object pseudo-id is the
+    // right answer (see `peek_server_hello_session_id`).
+    if proto == "TLSv1.2" {
+        let sid = with_engine(id, |s| s.negotiated_session_id.clone()).unwrap_or_default();
+        if !sid.is_empty() {
+            session_wire_id_table()
+                .lock()
+                .insert(gc_stable_objref_key(ctx, ses), sid);
+        }
+    }
+    // GC: the pin taken around the `create_string`/`set_field` pairs above is
+    // released HERE rather than immediately after them. Nothing between the two
+    // points allocates, and holding it across the wire-id insert keeps `ses`
+    // stable for that block's `gc_stable_objref_key`.
     ctx.unpin_native_roots(pin);
     // Associate the peer (client) cert chain with this session object so
     // SSLSession.getPeerCertificates() can return it for mTLS auth.
@@ -10876,7 +13450,24 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     // unconditionally — a server ALWAYS presents a certificate, so an empty
     // chain here failed every HTTPS request through a `SecureRequestCustomizer`
     // (JettyServletWebServerFactoryTests/JettyReactiveWebServerFactoryTests).
+    //
+    // A CLIENT, though, reports what it SENT, not what it had available: JSSE
+    // answers null on a client whose `KeyManager` was configured but never
+    // consulted, because the server ran `ClientAuth.NONE` and asked for
+    // nothing. `RecordingClientCertResolver` is the signal (rustls exposes
+    // none of its own); `None` — no resolver installed, i.e. no client identity
+    // at all — is also "nothing sent". A SERVER always presents its
+    // certificate, so its branch is unconditional.
     let local_chain_pem = with_engine(id, |s| {
+        if s.is_client
+            && !s
+                .client_cert_presented
+                .as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false)
+        {
+            return None;
+        }
         s.identity_override
             .as_ref()
             .map(|(cert, _)| cert.clone())
@@ -10931,54 +13522,52 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if mode { 1 } else { 0 })))
     });
 
-    // KNOWN DIVERGENCE, not a KEEP (wave 4 re-derivation). The wave-2/3 note
-    // called this pair "intentionally inert AND intentionally consistent" and
-    // stopped there. State it plainly instead: **a caller that installs a
-    // handshake ALPN selector here will never have it invoked.**
+    // WAS A KNOWN DIVERGENCE (waves 2-4): this pair was inert — the selector
+    // was accepted, never invoked, and the getter answered null so nothing
+    // could observe the loss. The escalation the old note described (let the
+    // ClientHello's offered list reach a Java `BiFunction` before rustls picks)
+    // is what `engine_apply_alpn_selector` now does, by parsing the hello in
+    // `do_unwrap` ahead of `engine_begin` — no cross-module hook needed, and
+    // no `Acceptor`.
     //
-    // What is and is not lost:
-    //   * ALPN itself works. rustls negotiates from the protocol list on
-    //     `SSLParameters`, and `getApplicationProtocol()` returns the real
-    //     negotiated value (see `register_alpn_accessor`).
-    //   * What is lost is CUSTOM server-side selection — a `BiFunction` that
-    //     inspects the client's offered list and picks. rustls applies its own
-    //     "first of my configured list that the client offers" rule instead.
-    //     A selector that would have made the same choice is indistinguishable;
-    //     one encoding a different policy is silently overruled.
-    //
-    // Why not THROW `UnsupportedOperationException`: real
-    // `SSLEngineImpl.setHandshakeApplicationProtocolSelector` never throws, and
-    // Netty's `JdkAlpnApplicationProtocolNegotiator` calls it unconditionally
-    // while building an HTTP/2 engine — throwing would take out ALPN entirely
-    // rather than degrade one policy hook. Strictly worse.
-    //
-    // Why the getter must stay null while the setter is inert: the two are read
-    // as a pair (Netty probes the getter to decide whether JDK-style ALPN
-    // callbacks are live). Storing the selector so the getter could echo it
-    // back would advertise a callback that still never runs — a worse lie than
-    // the truthful "none installed" we report now.
-    //
-    // ESCALATION (this is the fix, and it is not local to this file): rustls
-    // CAN delegate the choice — `ServerConfig`'s cert resolver / `Acceptor`
-    // sees the `ClientHello` with its `alpn_protocols` before the server
-    // selects. Making the selector real needs (a) the handshake driver in
-    // `crate::servlet::s2_tls_*` to expose a pre-selection hook carrying the
-    // offered list, and (b) a `NativeContext` re-entry from inside that hook so
-    // the Java `BiFunction` can be applied. Both are cross-module; the engine
-    // side-table here is the natural place to park the selector once they exist.
+    // Why it matters more than "custom selection policy": netty's
+    // `JdkAlpnSslEngine` configures a CLIENT engine through
+    // `SSLParameters.setApplicationProtocols` but a SERVER engine ONLY through
+    // this setter. With the setter inert a server advertised no protocols at
+    // all, so ALPN negotiated to null on both sides of every JDK-provider
+    // connection.
     r.register(
         cls_impl,
         "setHandshakeApplicationProtocolSelector",
         "(Ljava/util/function/BiFunction;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = engine_objref_key(ctx, this);
+            match args.get(1) {
+                Some(Value::Object(Some(f))) => {
+                    engine_alpn_selector_table().lock().insert(key, *f);
+                }
+                // An explicit null CLEARS the selector, per `SSLEngine`'s
+                // contract ("null to remove").
+                _ => {
+                    engine_alpn_selector_table().lock().remove(&key);
+                }
+            }
+            Ok(None)
+        },
     );
-    // Paired with the setter above — see its comment for why this deliberately
-    // reports "no selector installed" rather than echoing one back.
+    // Now a truthful echo of what the setter stored: netty reads this pair to
+    // decide whether JDK-style ALPN callbacks are live, and they are.
     r.register(
         cls_impl,
         "getHandshakeApplicationProtocolSelector",
         "()Ljava/util/function/BiFunction;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = engine_objref_key(ctx, this);
+            let f = engine_alpn_selector_table().lock().get(&key).copied();
+            Ok(Some(Value::Object(f)))
+        },
     );
 
     r.register(cls_impl, "setNeedClientAuth", "(Z)V", |ctx, args| {
@@ -11037,9 +13626,10 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
             let mut list: Vec<String> = Vec::new();
+            let mut given = 0usize;
             if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
+                given = ctx.array_length(*arr);
+                for i in 0..given {
                     if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
                         if let Some(t) = ctx.read_string(s) {
                             list.push(t);
@@ -11047,8 +13637,22 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            // Spec: must contain at least one of TLSv1.3 / TLSv1.2.
-            if list.is_empty() {
+            // An EXPLICITLY empty array means "nothing enabled", and JSSE keeps
+            // it: `SSLEngineImpl.setEnabledProtocols` stores
+            // `ProtocolVersion.namesOf(protocols)` verbatim and only rejects
+            // null, so the next `getEnabledProtocols()` answers an empty array
+            // and a handshake attempt fails with "no appropriate protocol".
+            // Substituting the defaults told the caller its disable had been
+            // ignored — netty's
+            // `SSLEngineTest.testEnablingAnAlreadyDisabledSslProtocol` asserts
+            // exactly that round trip (`array lengths differ, expected: <0> but
+            // was: <2>`).
+            //
+            // The defaulting stays for the OTHER way `list` can end up empty —
+            // a non-empty array whose entries this native could not read back —
+            // where falling back to a negotiable pair is a safety net rather
+            // than a contradiction of the caller.
+            if list.is_empty() && given > 0 {
                 list = vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()];
             }
             with_engine(id, |s| {
@@ -11139,6 +13743,34 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
+            // JSSE VALIDATES the names: `CipherSuite.validValuesOf` throws
+            // `IllegalArgumentException("Unsupported CipherSuite: <name>")` for
+            // anything that is not a cipher-suite name, and callers rely on
+            // that both to fail loudly and as a probe — netty's
+            // `JdkSslContext.supportedCiphers` catches the IAE to decide
+            // whether an `SSL_`-prefixed alias exists, and
+            // `SslContextBuilderTest.testInvalidCipherJdk` /
+            // `SSLEngineTest.testInvalidCipher` assert it for a made-up name.
+            // Storing whatever arrived meant a typo'd or bogus cipher list was
+            // accepted here and then quietly widened by `cipher_provider_for`
+            // (which falls back to the full provider when nothing maps), so
+            // the application ran unrestricted believing it had restricted.
+            //
+            // The accepted set is deliberately broader than what this engine
+            // can NEGOTIATE: JSSE accepts every name in its cipher-suite
+            // registry, including suites that are supported-but-disabled, and
+            // rejecting those here would break a caller that legitimately
+            // names one. A name is taken as a cipher-suite name when it maps to
+            // a rustls suite, is one we advertise, or carries the `TLS_`/`SSL_`
+            // prefix every JSSE suite name has.
+            if let Some(bad) = list.iter().find(|n| !is_cipher_suite_name(n.as_str())) {
+                let msg = format!("Unsupported CipherSuite: {bad}");
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/IllegalArgumentException",
+                    &msg,
+                ));
+            }
             with_engine(id, |s| {
                 s.enabled_ciphers = list;
             });
@@ -11176,11 +13808,220 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     r.register(cls_impl, "beginHandshake", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = engine_id_or_alloc(ctx, this);
-        let mut g = engine_registry().write();
-        if let Some(s) = g.get_mut(&id) {
-            engine_begin(s).map_err(|e| RuntimeError::IOException { message: e })?;
+        // Real `SSLEngineImpl.beginHandshake()` refuses on a closed engine:
+        // `TransportContext.kickstart` throws `SSLException("Engine is
+        // closing/closed")` once either direction has been shut down.
+        // `SSLEngineTest.testBeginHandshakeAfterEngineClosed` asserts exactly
+        // that (closeInbound + closeOutbound, then `beginHandshake()` must
+        // throw); returning normally left the test at a bare `fail()`.
+        let closed = with_engine(id, |s| s.closed_inbound || s.closed_outbound).unwrap_or(false);
+        if closed {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLException",
+                "Engine is closing/closed",
+            ));
+        }
+        // A SERVER engine with a handshake ALPN selector installed must NOT
+        // realize its rustls connection here: the connection's advertised ALPN
+        // list is fixed at construction, and the selector's answer is not known
+        // until the ClientHello arrives. `do_unwrap` realizes it (after running
+        // `engine_apply_alpn_selector`), which is also when a server engine has
+        // anything to do — JSSE's server-side `beginHandshake()` cannot produce
+        // a byte before it has seen the hello either.
+        let defer_for_alpn = with_engine(id, |s| !s.is_client && s.conn.is_none()).unwrap_or(false)
+            && engine_alpn_selector_table()
+                .lock()
+                .contains_key(&engine_objref_key(ctx, this));
+        if defer_for_alpn {
+            with_engine(id, |s| {
+                s.alpn_selection_deferred = true;
+            });
+            return Ok(None);
+        }
+        // Drop the registry lock BEFORE reporting a failure: `engine_begin_failure`
+        // allocates a Java exception, and allocating while holding this lock is the
+        // GC self-deadlock `EngineState::trust_managers_ctx_key`'s doc describes.
+        let res = {
+            let mut g = engine_registry().write();
+            match g.get_mut(&id) {
+                Some(s) => engine_begin(s),
+                None => Ok(()),
+            }
+        };
+        if let Err(e) = res {
+            return Err(engine_begin_failure(ctx, e));
         }
         Ok(None)
+    });
+
+    // getDelegatedTask() — hand over the work this engine deferred, once.
+    //
+    // Was not registered at all before, so a caller that followed the
+    // NEED_TASK this engine can already report (the fallthrough at the end of
+    // `handshake_status_of`) had no way to satisfy it.
+    r.register(
+        cls_impl,
+        "getDelegatedTask",
+        "()Ljava/lang/Runnable;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = engine_id_or_alloc(ctx, this);
+            let hand_out = claim_delegated_task(id);
+            if crate::nbflags().dbg_tls_hs_ok {
+                eprintln!(
+                    "[dbg-tls-task] thread={:?} getDelegatedTask id={} hand_out={}",
+                    std::thread::current().id(),
+                    id,
+                    hand_out
+                );
+            }
+            if !hand_out {
+                // JSSE answers null once the queue is drained, and netty's
+                // in-line `runDelegatedTasks` loop terminates on exactly that.
+                return Ok(Some(Value::Object(None)));
+            }
+            let task = try_alloc_concurrent_synthetic(ctx, "java/lang/Runnable", 1)?;
+            ctx.set_field(task, 0, Value::Int(id));
+            Ok(Some(Value::Object(Some(task))))
+        },
+    );
+
+    // The task itself. Registered on `java.lang.Runnable` because that is the
+    // class the object above wears — nothing else in this VM allocates a bare
+    // `Runnable`, so the interception cannot capture an application's own.
+    //
+    // **It never throws.** The task runs on somebody else's thread — that is
+    // its whole point — and callers do not treat it as a call site that can
+    // fail. Throwing left `delegate=true` blind to failures `delegate=false`
+    // saw: `SSLEngineTest.testClientHostnameValidationFail` failed on exactly
+    // its three `delegate=true` parameterisations, and `testIncompatibleCiphers`
+    // spun forever because neither engine ever learned the handshake was over.
+    // Failures go onto `EngineState::deferred_handshake_error`, which exists
+    // for this shape and which `do_wrap` raises once rustls's fatal alert has
+    // gone out — so the peer learns why before this side does.
+    r.register("java/lang/Runnable", "run", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let id = match ctx.get_field(this, 0) {
+            Value::Int(v) => v,
+            _ => return Ok(None),
+        };
+        // Both failure shapes are carried OUT from under the registry lock
+        // before they are raised: building a Java exception allocates, and
+        // allocating under this lock is the GC self-deadlock
+        // `EngineState::trust_managers_ctx_key` documents.
+        let outcome = {
+            let mut g = engine_registry().write();
+            match g.get_mut(&id) {
+                None => Ok(None),
+                Some(s) => {
+                    s.delegated_task = DelegatedTask::None;
+                    // On a SERVER engine this builds the rustls config; on a
+                    // CLIENT the connection already exists and this is a no-op.
+                    match engine_begin_if_needed(s) {
+                        Err(e) => Err(e),
+                        Ok(()) => {
+                            // The work proper: feed rustls the handshake flight
+                            // the deferring `unwrap` took out of the caller's
+                            // buffer, and process it. This is the expensive
+                            // half of a handshake — certificate verification,
+                            // key agreement, signing — and it is what JSSE
+                            // defers. Doing it HERE rather than leaving it for
+                            // a later `unwrap` matters: a caller that feeds the
+                            // engine only when it has bytes has none left to
+                            // feed, and both peers stall waiting for each
+                            // other. See `DelegatedTask`.
+                            let staged = std::mem::take(&mut s.deferred_inbound);
+                            if staged.is_empty() {
+                                Ok(None)
+                            } else {
+                                // The CLIENT half of the shared TLS 1.2 session
+                                // id is peeked out of the ServerHello RECORD,
+                                // before rustls consumes it — `do_unwrap`'s
+                                // record loop does exactly this, and deferring
+                                // routes the record past that loop.
+                                // `SSLEngineTest.testSSLSessionId` compares the
+                                // two engines' ids byte for byte and read
+                                // "array contents differ at index [0]" on all
+                                // six of its running parameterisations.
+                                if s.negotiated_session_id.is_empty() {
+                                    let mut off = 0usize;
+                                    while off + 5 <= staged.len() {
+                                        let len = ((staged[off + 3] as usize) << 8)
+                                            | staged[off + 4] as usize;
+                                        let end = off + 5 + len;
+                                        if end > staged.len() {
+                                            break;
+                                        }
+                                        if let Some(sid) =
+                                            peek_server_hello_session_id(&staged[off..end])
+                                        {
+                                            s.negotiated_session_id = sid;
+                                            break;
+                                        }
+                                        off = end;
+                                    }
+                                }
+                                match engine_unwrap_pump_raw(s, &staged) {
+                                    Ok((_, pt)) => {
+                                        // Any plaintext belongs to the caller's
+                                        // next unwrap; `do_unwrap`'s Step 0
+                                        // serves this buffer before it touches
+                                        // the network again.
+                                        s.plaintext_pending.extend_from_slice(&pt);
+                                        // NOT `engine_capture_negotiation` —
+                                        // the task runs mid-handshake, and
+                                        // capturing there latched a session id
+                                        // that was not the negotiated one:
+                                        // `SSLEngineTest.testSSLSessionId`
+                                        // read "array contents differ at index
+                                        // [0]" on all six of its running
+                                        // parameterisations. `do_wrap` and
+                                        // `do_unwrap` both capture at the
+                                        // right moment already.
+                                        Ok(None)
+                                    }
+                                    Err(e) => {
+                                        // Handed to the engine, not thrown.
+                                        // See the note above `r.register(
+                                        // "java/lang/Runnable", ...)`.
+                                        s.deferred_handshake_error = Some((
+                                            jsse_handshake_exception_class(&e),
+                                            format!("rustls: {}", e),
+                                        ));
+                                        Ok(Some(format!("rustls: {}", e)))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if crate::nbflags().dbg_tls_hs_ok {
+            eprintln!(
+                "[dbg-tls-task] thread={:?} task.run id={} outcome={}",
+                std::thread::current().id(),
+                id,
+                match &outcome {
+                    Ok(None) => "ok".to_string(),
+                    Ok(Some(msg)) => format!("deferred: {msg}"),
+                    Err(e) => format!("begin-failed: {e}"),
+                }
+            );
+        }
+        match outcome {
+            // Both arms return normally: whatever went wrong is on the engine
+            // now, and the caller's next `wrap` raises it.
+            Ok(_) => Ok(None),
+            Err(e) => {
+                with_engine(id, |s| {
+                    s.deferred_handshake_error =
+                        Some(("javax/net/ssl/SSLHandshakeException", e.clone()));
+                });
+                Ok(None)
+            }
+        }
     });
 
     // wrap(ByteBuffer src, ByteBuffer dst)
@@ -11264,26 +14105,82 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // JSSE's `closeInbound()` is not a plain setter: `TransportContext
+    // .initiateInboundClose` throws `SSLException("closing inbound before
+    // receiving peer's close_notify")` when a handshake is IN PROGRESS
+    // (`handshakeContext != null`) and no `close_notify` has arrived — a
+    // truncation attack is indistinguishable from a peer that simply stopped
+    // talking, so the contract is to complain rather than to accept a
+    // half-open connection silently.
+    //
+    // The gate is "a handshake has begun and has not finished", which is what
+    // makes the two netty tests that straddle it agree:
+    // `testCloseInboundAfterBeginHandshake` calls `beginHandshake()` first and
+    // asserts a throw, while `testBeginHandshakeAfterEngineClosed` calls
+    // `closeInbound()` on a never-handshaked engine and asserts it returns
+    // normally. The inbound flag is set either way — the exception reports what
+    // happened, it does not veto the close.
     r.register(cls_impl, "closeInbound", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = engine_id_or_alloc(ctx, this);
+        let complain = with_engine(id, |s| {
+            !s.closed_inbound
+                && match s.conn.as_ref() {
+                    Some(c) => c.is_handshaking() && !c.peer_has_closed(),
+                    None => false,
+                }
+        })
+        .unwrap_or(false);
         with_engine(id, |s| {
             s.closed_inbound = true;
         });
+        if complain {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLException",
+                "closing inbound before receiving peer's close_notify",
+            ));
+        }
         Ok(None)
     });
 
+    // JSSE's `isInboundDone()` is "no more inbound data will be accepted",
+    // which is true both when the application called `closeInbound()` AND when
+    // the PEER's `close_notify` has been received — `SSLEngineTest
+    // .testCloseNotifySequence` asserts exactly the second case
+    // (`assertTrue(server.isInboundDone())` after the server unwrapped the
+    // client's close_notify, with no `closeInbound()` call anywhere).
     r.register(cls_impl, "isInboundDone", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = engine_id_or_alloc(ctx, this);
-        let v = with_engine(id, |s| s.closed_inbound).unwrap_or(false);
+        let v = with_engine(id, |s| {
+            s.closed_inbound
+                || s.conn
+                    .as_ref()
+                    .map(|c| c.peer_has_closed())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
 
+    // ...and `isOutboundDone()` is "the close_notify has been SENT", not
+    // "closeOutbound() was called". `closeOutbound()` only QUEUES the alert;
+    // until a `wrap()` drains it the engine still has outbound work to do and
+    // JSSE answers false. `testCloseNotifySequence` asserts both halves in a
+    // row — `assertFalse(client.isOutboundDone())` immediately after
+    // `closeOutbound()`, then `assertTrue(...)` after the wrap that drains it —
+    // and the flag-only answer failed the first of them
+    // (`expected: <false> but was: <true>`).
     r.register(cls_impl, "isOutboundDone", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = engine_id_or_alloc(ctx, this);
-        let v = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
+        let v = with_engine(id, |s| {
+            s.closed_outbound
+                && s.outbound.is_empty()
+                && !s.conn.as_ref().map(|c| c.wants_write()).unwrap_or(false)
+        })
+        .unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
 
@@ -11295,9 +14192,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
-            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
-                ctx, id,
-            )?))))
+            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id)?))))
         },
     );
 
@@ -11355,16 +14250,28 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             // connection, and `is_handshaking()` flips false once the
             // handshake completes — so this is non-null over exactly the
             // window HotSpot measures above, and null on both sides of it.
+            //
+            // `in_trust_check()` is the one state rustls does not call
+            // "handshaking" while JSSE still counts it as inside the window,
+            // and the socket-door oracle measures it directly (E31-1 §1,
+            // `docs/known-issues/jdk-only/`): `getHandshakeSession()` answers a
+            // POPULATED session inside `checkServerTrusted(chain, auth,
+            // Socket)` and `null` again inside `HandshakeCompletedListener`.
+            // dev's version of this handler reached for the same flag, from the
+            // other side of the predicate.
             let mid_handshake = with_engine(id, |s| {
                 s.conn.as_ref().map(|c| c.is_handshaking()).unwrap_or(false)
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+                || in_trust_check();
             if !mid_handshake {
                 return Ok(Some(Value::Object(None)));
             }
-            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
-                ctx, id,
-            )?))))
+            // `engine_session_for`, not a fresh `build_synthetic_ssl_session` on
+            // every call: the session OBJECT's identity is what
+            // `putValue`/`getValue`, `invalidate()` and `getCreationTime()` are
+            // answered from — see `engine_session_table`.
+            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id)?))))
         },
     );
 
@@ -11540,35 +14447,76 @@ fn do_wrap(
         );
     }
 
-    // Closed-outbound short-circuit.
+    // Closed outbound — but NOT a short circuit.
+    //
+    // `closeOutbound()` queues a `close_notify` on the rustls connection, and
+    // a fatal alert may be queued there too (a `TrustManager` rejection — see
+    // `engine_run_trust_check`). The wrap that FOLLOWS the close is the call
+    // JSSE specifies as the one that emits that record: `wrap` returns
+    // `Status.CLOSED` with `bytesProduced` equal to the alert's length, and
+    // only once the queue is empty does it produce nothing.
+    //
+    // This used to return `CLOSED, produced=0` immediately, so the alert was
+    // generated, encrypted, and then left in rustls's write queue forever.
+    // Measured consequences, all one defect:
+    //   * netty's `CloseNotifyTest` / `ApplicationProtocolNegotiationHandlerTest`
+    //     see an EMPTY outbound buffer where a close_notify record belongs
+    //     (`assertCloseNotify`: "0 to be greater than or equal to 7");
+    //   * `ParameterizedSslHandlerTest.testAlertProducedAndSend` blocks
+    //     forever in `awaitUninterruptibly()` — the peer is waiting for an
+    //     alert that is sitting in this queue.
+    //
+    // The drain below is the ordinary path; `closed` only suppresses reading
+    // application data from `srcs` (JSSE consumes nothing after close) and
+    // forces the reported status to CLOSED.
     let closed = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
     if closed {
+        let no_conn = with_engine(id, |s| s.conn.is_none()).unwrap_or(true);
+        let nothing_queued = with_engine(id, |s| s.outbound.is_empty()).unwrap_or(true);
+        if no_conn && nothing_queued {
+            // Closed before anything was ever negotiated: there is no record
+            // layer to encode an alert with, so CLOSED with nothing produced
+            // is the whole truth. Realizing a connection here would start a
+            // handshake for a closed engine.
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_NO_CONNECTION",
+                    std::thread::current().id(),
+                    id
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
+            return Ok(Some(Value::Object(Some(result?))));
+        }
         if __dbg_hs {
             eprintln!(
-                "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_OUTBOUND_SHORT_CIRCUIT",
+                "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_OUTBOUND_DRAIN",
                 std::thread::current().id(),
                 id
             );
         }
-        let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
-        return Ok(Some(Value::Object(Some(result?))));
     }
 
-    // Lazily realize rustls connection.
     {
-        let mut g = engine_registry().write();
-        if let Some(s) = g.get_mut(&id) {
-            if s.conn.is_none() {
-                if let Err(e) = engine_begin(s) {
-                    if crate::nbflags().dbg_tls_hs_ok {
-                        eprintln!(
-                            "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
-                            std::thread::current().id(), id, e
-                        );
-                    }
-                    return Err(RuntimeError::IOException { message: e }.into());
-                }
+        // The lock is dropped before the failure is reported: `engine_begin_failure`
+        // allocates the Java exception, and allocating under `engine_registry()`'s
+        // write lock is the GC self-deadlock `EngineState::trust_managers_ctx_key`
+        // documents.
+        let res = {
+            let mut g = engine_registry().write();
+            match g.get_mut(&id) {
+                Some(s) if s.conn.is_none() => engine_begin(s),
+                _ => Ok(()),
             }
+        };
+        if let Err(e) = res {
+            if crate::nbflags().dbg_tls_hs_ok {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
+                    std::thread::current().id(), id, e
+                );
+            }
+            return Err(engine_begin_failure(ctx, e));
         }
     }
 
@@ -11597,14 +14545,17 @@ fn do_wrap(
     // wraps, which is why nothing but the WebSocket client ever noticed.
     let mut app_bytes = Vec::new();
     let mut consumed_app = 0usize;
-    let needs_app_data = with_engine(id, |s| {
-        s.handshake_finished_reported
-            && s.conn
-                .as_ref()
-                .map(|c| !c.is_handshaking())
-                .unwrap_or(false)
-    })
-    .unwrap_or(false);
+    // `!closed`: JSSE consumes nothing from `srcs` once `closeOutbound()` has
+    // been called — the only thing left to produce is the queued alert.
+    let needs_app_data = !closed
+        && with_engine(id, |s| {
+            s.handshake_finished_reported
+                && s.conn
+                    .as_ref()
+                    .map(|c| !c.is_handshaking())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
     if needs_app_data {
         for bb in &srcs {
             let n = bb_read_into(ctx, *bb, &mut app_bytes, 16384);
@@ -11627,7 +14578,7 @@ fn do_wrap(
     }
     let dst_remaining = dst_view.lim.saturating_sub(dst_view.pos);
 
-    let (consumed_inner, status, hs, drained, pending_trust_check) = {
+    let (consumed_inner, status, hs, drained, pending_trust_check, deferred_failure) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
             Some(s) => s,
@@ -11639,6 +14590,15 @@ fn do_wrap(
             }
         };
         let (cons, _produced) = engine_wrap_pump(s, &app_bytes, dst_remaining);
+        // The SERVER side of the shared TLS 1.2 session id: the ServerHello is
+        // the first record this engine ever writes, and it is still in
+        // `outbound` here — the drain below removes it. See
+        // `peek_server_hello_session_id`.
+        if !s.is_client && s.negotiated_session_id.is_empty() {
+            if let Some(sid) = peek_server_hello_session_id(&s.outbound) {
+                s.negotiated_session_id = sid;
+            }
+        }
         // Drain only complete TLS records. A partial record written to the
         // channel cannot be recovered by a later wrap call.
         let take = complete_tls_record_prefix(&s.outbound, dst_remaining);
@@ -11649,21 +14609,68 @@ fn do_wrap(
         // lets Tomcat flush it and call wrap again for the remaining record.
         let status = if drained.is_empty() && !s.outbound.is_empty() {
             SR_BUFFER_OVERFLOW
+        } else if closed {
+            // JSSE: every wrap after `closeOutbound()` reports CLOSED,
+            // including the one that carries the close_notify / alert record.
+            // netty writes `out` BEFORE it looks at the status, so reporting
+            // CLOSED alongside a non-zero `bytesProduced` is exactly what gets
+            // the record onto the wire and then stops the wrap loop.
+            SR_CLOSED
         } else {
             SR_OK
         };
         engine_capture_negotiation(s);
-        let hs = handshake_status_of(s);
+        // A closed engine is not handshaking; it either still owes the peer
+        // the rest of its alert (NEED_WRAP, so a caller that loops keeps
+        // pulling) or it owes nothing.
+        let hs = if closed {
+            // `wants_write()` too: rustls may still be holding the alert that
+            // no `wrap` has drained into `outbound` yet.
+            if s.outbound.is_empty() && !s.conn.as_ref().is_some_and(|c| c.wants_write()) {
+                HS_NOT_HANDSHAKING_R
+            } else {
+                HS_NEED_WRAP_R
+            }
+        } else {
+            handshake_status_of(s)
+        };
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
+        // The handshake failure this engine detected on a previous `unwrap`,
+        // once the fatal alert it queued has actually gone out. Taking it only
+        // when nothing is left to write is what keeps the peer's copy of the
+        // alert intact — see `EngineState::deferred_handshake_error`.
+        //
+        // `drained.is_empty()` as well, and that is the load-bearing half: a
+        // wrap that raises cannot also deliver. netty advances its out-buffer's
+        // writerIndex from `result.bytesProduced()`, and a throwing `wrap` has
+        // no result to read it from — the buffer reads back empty, is released,
+        // and the alert this very call had just drained into it dies there. The
+        // peer then learns only that the channel closed, which is exactly what
+        // `testHandshakeFailureCipherMissmatch{TLSv12,TLSv13}Jdk` measured on
+        // the CLIENT side (SslHandlerTest:1670,
+        // `StacklessClosedChannelException` where an `SSLException` belongs).
+        //
+        // `handshake_status_of` keeps answering NEED_WRAP while the failure is
+        // pending, so the caller comes back for the wrap that produces nothing
+        // — and that one raises.
+        let deferred_failure = if s.deferred_handshake_error.is_some()
+            && drained.is_empty()
+            && s.outbound.is_empty()
+            && !s.conn.as_ref().is_some_and(|c| c.wants_write())
+        {
+            s.deferred_handshake_error.take()
+        } else {
+            None
+        };
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
-        let pending_trust_check = engine_take_pending_trust_check(s);
-        (cons, status, hs, drained, pending_trust_check)
+        let pending_trust_check = engine_take_pending_trust_check(id, s);
+        (cons, status, hs, drained, pending_trust_check, deferred_failure)
     };
     if let Some(pending) = pending_trust_check {
-        engine_run_trust_check(ctx, pending)?;
+        engine_run_trust_check(ctx, pending, Some(this))?;
     }
 
     // Step 3: write the drained bytes into dst.
@@ -11672,6 +14679,11 @@ fn do_wrap(
     } else {
         0
     };
+    if let Some((cls, msg)) = deferred_failure {
+        // The alert is in `dst` (or already went out on an earlier wrap), so
+        // the peer learns why; this side now learns it too.
+        return Err(crate::phases_early::throw_jca_exc(ctx, cls, &msg));
+    }
 
     let total_consumed = consumed_app.max(consumed_inner) as i32;
     if __dbg_hs {
@@ -11803,22 +14815,12 @@ fn do_unwrap(
         return Ok(Some(Value::Object(Some(result?))));
     }
 
-    {
-        let mut g = engine_registry().write();
-        if let Some(s) = g.get_mut(&id) {
-            if s.conn.is_none() {
-                if let Err(e) = engine_begin(s) {
-                    if crate::nbflags().dbg_tls_hs_ok {
-                        eprintln!(
-                            "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
-                            std::thread::current().id(), id, e
-                        );
-                    }
-                    return Err(RuntimeError::IOException { message: e }.into());
-                }
-            }
-        }
-    }
+    // Server-side ALPN selection has to happen BEFORE the rustls connection
+    // exists — its advertised protocol list is fixed at construction — and the
+    // choice needs the ClientHello, so it runs here, ahead of `engine_begin`.
+    // A no-op for client engines, for an already-realized connection, and for
+    // an engine with no selector installed.
+    engine_apply_alpn_selector(ctx, id, this, src)?;
 
     // Step 1+2: record-oriented unwrap. Feed rustls only COMPLETE TLS records
     // from `src` whose decrypted plaintext fits the caller's dst buffers, and
@@ -11915,6 +14917,113 @@ fn do_unwrap(
     let (src_pos, src_lim) = (src_view.pos, src_view.lim);
     let mut offset = src_pos;
 
+    // JSSE's server-side SNI gate, run at ClientHello time — see
+    // `peek_client_hello_sni` for why it cannot wait until rustls has parsed
+    // the record. Nothing is consumed here; on refusal the bytes are never fed
+    // to rustls at all, so no ServerHello is ever produced.
+    if let Some(host) = engine_pending_sni_host(ctx, id, &src_view, src_pos, src_lim) {
+        engine_run_sni_match_check(ctx, id, this, host)?;
+    }
+
+    // Realize the rustls connection — and, on the first inbound handshake
+    // flight, hand the caller a delegated task instead of processing it. This
+    // is the ONLY place that defers; see `DelegatedTask`.
+    //
+    // Gated on a complete, plausible TLS record sitting at the head of `src`,
+    // for two independent reasons:
+    //
+    //   * Deferring here CONSUMES the caller's records first, into
+    //     `deferred_inbound`. netty's `SslHandler.decodeJdkCompatible` hands
+    //     `unwrap` exactly one TLS record and treats
+    //     `bytesConsumed != packetLength` as "not an SSL/TLS record": it
+    //     throws `NotSslRecordException` and fails the handshake. With no
+    //     record to consume there is nothing to report, so deferring would
+    //     kill the handshake rather than delay it.
+    //   * `src` may not hold a TLS record at all.
+    //     `SSLEngineTest.testSSLEngineUnwrapNoSslRecord` feeds a zeroed
+    //     application buffer and requires an `SSLException`; staging it as
+    //     3277 five-byte "records" would answer NEED_TASK instead. Anything
+    //     that does not look like a record falls through to rustls, which is
+    //     what raises the error.
+    //
+    // The lock is dropped before any failure is reported — see the identical
+    // note in `do_wrap`.
+    let head_is_tls_record = {
+        let mut ok = false;
+        if !matches!(src_view.backing, BbBacking::Unresolved) && src_pos + 5 <= src_lim {
+            let ct = bb_get_byte(ctx, &src_view, src_pos).unwrap_or(0);
+            let vmaj = bb_get_byte(ctx, &src_view, src_pos + 1).unwrap_or(0);
+            let b3 = bb_get_byte(ctx, &src_view, src_pos + 3).unwrap_or(0) as usize;
+            let b4 = bb_get_byte(ctx, &src_view, src_pos + 4).unwrap_or(0) as usize;
+            // ChangeCipherSpec / Alert / Handshake / ApplicationData, TLS
+            // version major 3, and the whole record present.
+            ok = (20..=23).contains(&ct) && vmaj == 3 && src_pos + 5 + ((b3 << 8) | b4) <= src_lim;
+        }
+        ok
+    };
+    let defer_decision = if head_is_tls_record {
+        engine_begin_or_defer(id)
+    } else {
+        // Nothing stageable: realize the connection the way `do_wrap` does and
+        // let the record loop (or rustls's error) speak.
+        let mut g = engine_registry().write();
+        match g.get_mut(&id) {
+            Some(s) => engine_begin_if_needed(s).map(|()| false),
+            None => Ok(false),
+        }
+    };
+    match defer_decision {
+        Err(e) => {
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(engine_begin ERROR) err={}",
+                    std::thread::current().id(),
+                    id,
+                    e
+                );
+            }
+            return Err(engine_begin_failure(ctx, e));
+        }
+        Ok(true) => {
+            let mut staged: Vec<u8> = Vec::new();
+            if !matches!(src_view.backing, BbBacking::Unresolved) {
+                // Whole records only, exactly as the main loop below decides
+                // it: an incomplete record stays in the caller's buffer for
+                // its next unwrap.
+                while offset + 5 <= src_lim {
+                    let b3 = bb_get_byte(ctx, &src_view, offset + 3).unwrap_or(0) as usize;
+                    let b4 = bb_get_byte(ctx, &src_view, offset + 4).unwrap_or(0) as usize;
+                    let rec_end = offset + 5 + ((b3 << 8) | b4);
+                    if rec_end > src_lim {
+                        break;
+                    }
+                    let rec = bb_bytes_range(ctx, &src_view, offset, rec_end);
+                    if rec.len() != rec_end - offset {
+                        // Backing could not produce the whole record (clamped
+                        // direct access) — leave it where it is.
+                        break;
+                    }
+                    staged.extend_from_slice(&rec);
+                    offset = rec_end;
+                }
+            }
+            let consumed = offset - src_pos;
+            if consumed > 0 {
+                bb_set_pos(ctx, src, src_view.layout, offset);
+                with_engine(id, |s| s.deferred_inbound.extend_from_slice(&staged));
+            }
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(delegated-task) status=OK hs=NEED_TASK consumed={} produced=0",
+                    std::thread::current().id(), id, consumed
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_OK, HS_NEED_TASK_R, consumed as i32, 0)?;
+            return Ok(Some(Value::Object(Some(result))));
+        }
+        Ok(false) => {}
+    }
+
     let (status, hs, plaintext, pending_trust_check) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
@@ -11935,6 +15044,70 @@ fn do_unwrap(
         };
         let mut plaintext: Vec<u8> = Vec::new();
         let mut underflow = false;
+        // Collected inside the loop (which holds `s.conn` mutably) and written
+        // back to the engine once that borrow ends.
+        let mut captured_session_id: Option<Vec<u8>> = None;
+        // The loop stopped because the caller's destination could not hold the
+        // next record's plaintext — BUFFER_OVERFLOW, not BUFFER_UNDERFLOW. The
+        // two are opposite instructions ("give me a bigger buffer" vs "read more
+        // network data"), and answering UNDERFLOW when nothing more is coming is
+        // how a caller spins.
+        let mut dst_too_small = false;
+        let mut deferred_error: Option<(&'static str, String)> = None;
+        // Replay whatever a delegated task deferred. These records were taken
+        // out of the caller's buffer before the connection existed (see the
+        // NEED_TASK arm above), so the caller will never present them again —
+        // this is the only place left that can feed them to rustls.
+        //
+        // A failure here is classified exactly as the record loop below
+        // classifies its own, because it IS the same failure, merely one call
+        // later: the error KIND picks the `SSLException` subclass, and a
+        // server defers it so rustls's fatal alert reaches the peer first.
+        let staged = std::mem::take(&mut s.deferred_inbound);
+        if !staged.is_empty() {
+            match engine_unwrap_pump_raw(s, &staged) {
+                Ok((_, pt)) => plaintext.extend_from_slice(&pt),
+                Err(e) => {
+                    let handshaking_now = s.conn.as_ref().is_some_and(|c| c.is_handshaking());
+                    if handshaking_now {
+                        // Raised here, NOT deferred the way the record loop
+                        // below defers a server's handshake error.
+                        //
+                        // That deferral works only because the loop consumed a
+                        // record: the call reports progress, the caller comes
+                        // back, and the `wrap` that drains rustls's fatal
+                        // alert raises the error on its way out. This replay
+                        // consumed nothing from `src` — its records were taken
+                        // a call earlier, by the NEED_TASK arm — so the call
+                        // reports BUFFER_UNDERFLOW, the caller waits for
+                        // network data that is never coming, and the deferred
+                        // error is never drained. Measured with the deferral:
+                        // `testHandshakeFailureCipherMissmatch{TLSv12,TLSv13}Jdk`
+                        // fail with `StacklessClosedChannelException`, which is
+                        // the exact symptom that deferral was introduced to
+                        // cure. Both pass when it is raised here.
+                        let cls = jsse_handshake_exception_class(&e);
+                        return Err(crate::phases_early::throw_jca_exc(
+                            ctx,
+                            cls,
+                            &format!("rustls: {}", e),
+                        ));
+                    } else {
+                        let msg = match e {
+                            rustls::Error::AlertReceived(desc) => {
+                                format!("Received fatal alert: {desc:?}")
+                            }
+                            other => format!("rustls process_new_packets: {other}"),
+                        };
+                        return Err(crate::phases_early::throw_jca_exc(
+                            ctx,
+                            "javax/net/ssl/SSLException",
+                            &msg,
+                        ));
+                    }
+                }
+            }
+        }
         let src_resolved = !matches!(src_view.backing, BbBacking::Unresolved);
         if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) {
             loop {
@@ -11953,14 +15126,62 @@ fn do_unwrap(
                     underflow = true; // incomplete record body
                     break;
                 }
-                // Don't start a record whose plaintext would overflow the dst
-                // (once we already have some to deliver). `rec_len >= plaintext`
-                // is a safe upper bound (TLS overhead only shrinks it).
-                if !plaintext.is_empty() && plaintext.len() + rec_len > dst_cap {
+                // Don't START a record whose plaintext could overflow the dst.
+                //
+                // The `!plaintext.is_empty()` guard used to make this apply only
+                // from the SECOND record on, so the FIRST record of a call was
+                // always decrypted no matter how small the caller's buffer was:
+                // the excess went to `plaintext_pending` and the call reported
+                // BUFFER_OVERFLOW having already consumed the record. JSSE
+                // consumes NOTHING in that case, and
+                // `SSLEngineTest.testUnwrapBehavior` asserts exactly that
+                // (`assertEquals(remaining, encryptedClientToServer.remaining())`
+                // after an unwrap into a 3-byte buffer).
+                //
+                // `rec_len - 17` is a safe upper bound on a record's plaintext
+                // for every suite this engine negotiates: TLS 1.3 spends at
+                // least 1 byte of content type plus a 16-byte AEAD tag, TLS 1.2
+                // AEAD spends 8 + 16, and CBC spends more still. Using the
+                // bound rather than the exact length keeps the decision on the
+                // "do not feed rustls" side of the record, which is the only
+                // side from which nothing has been consumed yet.
+                //
+                // The gate applies only once the handshake is over: handshake
+                // records carry no application plaintext, and refusing to feed
+                // one for want of application-buffer space would wedge the
+                // handshake itself.
+                //
+                // The bound is ALSO capped at `getApplicationBufferSize()`
+                // (16384, the RFC 8446 §5.1 TLSPlaintext limit this engine
+                // reports): a caller that sized its buffer the documented way
+                // must never be told a record does not fit. Without the cap a
+                // full-size TLS 1.2 AEAD record (8-byte explicit nonce + 16-byte
+                // tag) bounds to 16391 against a 16384-byte buffer and every
+                // retry answers BUFFER_OVERFLOW again — a livelock, not a
+                // stricter contract.
+                let max_plaintext = rec_len.saturating_sub(17).min(16384);
+                if !handshaking && plaintext.len() + max_plaintext > dst_cap {
+                    dst_too_small = true;
+                    break;
+                }
+                // One application record per `unwrap`, as JSSE does. Decrypting
+                // every record that fits made a single call answer with two
+                // records' plaintext at once, so a caller that checks
+                // `bytesProduced()` per record saw the sum
+                // (`testUnwrapBehavior` expects 5 then 6, and got 11 then 0).
+                // Handshake records produce no plaintext and still batch, so
+                // the handshake driver's iteration count is unchanged.
+                if !plaintext.is_empty() {
                     break;
                 }
                 let rec_total = 5 + rec_len;
                 let rec = bb_bytes_range(ctx, &src_view, offset, rec_end);
+                // The CLIENT side of the shared TLS 1.2 session id — the mirror
+                // of the server's capture in `do_wrap`. Reads the record before
+                // rustls consumes it; see `peek_server_hello_session_id`.
+                if captured_session_id.is_none() {
+                    captured_session_id = peek_server_hello_session_id(&rec);
+                }
                 if rec.len() != rec_total {
                     // Backing couldn't produce the full record (clamped
                     // direct access) — treat like an incomplete record.
@@ -12031,19 +15252,46 @@ fn do_unwrap(
                         // and flush it before the channel closes; otherwise Netty
                         // reports only ClosedChannelException to the client.
                         if matches!(&*conn, EngineConn::Server(_)) {
+                            // Deferred, not discarded: the next `wrap` drains
+                            // the alert and then raises this.
+                            deferred_error =
+                                Some((jsse_handshake_exception_class(&e), format!("rustls: {}", e)));
                             offset = rec_end;
                             break;
                         }
+                        let cls = jsse_handshake_exception_class(&e);
                         return Err(crate::phases_early::throw_jca_exc(
                             ctx,
-                            "javax/net/ssl/SSLHandshakeException",
+                            cls,
                             &format!("rustls: {}", e),
                         ));
                     }
-                    return Err(RuntimeError::IOException {
-                        message: format!("rustls process_new_packets: {}", e),
-                    }
-                    .into());
+                    // POST-handshake record-layer failure. `SSLException`, not
+                    // a bare `IOException`, for the same reason the handshake
+                    // branch above gives — and here it is load-bearing rather
+                    // than merely tidy: a **fatal alert from the peer** lands
+                    // on this line, and it is the only signal that says "the
+                    // other side rejected us" as opposed to "the socket
+                    // dropped". netty's
+                    // `ParameterizedSslHandlerTest.testAlertProducedAndSend`
+                    // waits for exactly `cause.getCause() instanceof
+                    // SSLException` and hung forever (~170x HotSpot's 6 s) on
+                    // the `IOException` this used to throw. `SSLException`
+                    // extends `IOException`, so every existing
+                    // `catch (IOException)` is unaffected.
+                    let msg = match e {
+                        rustls::Error::AlertReceived(desc) => {
+                            // JSSE's wording, so a caller matching on the
+                            // message sees what it sees on HotSpot.
+                            format!("Received fatal alert: {desc:?}")
+                        }
+                        other => format!("rustls process_new_packets: {other}"),
+                    };
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/net/ssl/SSLException",
+                        &msg,
+                    ));
                 }
                 let mut tmp = [0u8; 16384];
                 loop {
@@ -12075,14 +15323,77 @@ fn do_unwrap(
                 }
             }
         }
+        if let Some(sid) = captured_session_id {
+            if s.negotiated_session_id.is_empty() {
+                s.negotiated_session_id = sid;
+            }
+        }
+        if deferred_error.is_some() {
+            s.deferred_handshake_error = deferred_error;
+        }
         engine_capture_negotiation(s);
         let _ = underflow;
         let mut status = SR_OK;
         if plaintext.is_empty() && offset == src_pos {
-            // No progress: src was empty or held only an incomplete record. Tell
-            // the caller to read more network data (matches SSLEngine semantics;
-            // returning OK here makes Tomcat's handshake loop spin forever).
-            status = SR_BUFFER_UNDERFLOW;
+            // No progress. Which of the two "try again" answers depends on WHY:
+            // a destination too small for the next record's plaintext is
+            // BUFFER_OVERFLOW (`SSLEngineTest.testUnwrapBehavior` unwraps into a
+            // 3-byte buffer and asserts exactly that, with `src` untouched);
+            // anything else is src being empty or holding a partial record, i.e.
+            // BUFFER_UNDERFLOW (returning OK there makes Tomcat's handshake loop
+            // spin forever).
+            status = if dst_too_small {
+                SR_BUFFER_OVERFLOW
+            } else {
+                SR_BUFFER_UNDERFLOW
+            };
+        }
+        // The peer's `close_notify` has arrived: JSSE reports CLOSED from this
+        // unwrap and every one after it, and that report is the ONLY way a
+        // caller learns the connection was closed cleanly rather than dropped.
+        //
+        // netty's `SslHandler.unwrap` switches on exactly this
+        // (`case CLOSED: notifyClosure = true`) to fire
+        // `SslCloseCompletionEvent`; without it `CloseNotifyTest` sees the
+        // decrypted response arrive and then no close event at all. Marking
+        // `closed_inbound` here is the same fact seen through
+        // `isInboundDone()`, which is how a caller that polls rather than
+        // switches finds out.
+        //
+        // CLOSED overrides BUFFER_UNDERFLOW deliberately: once the peer has
+        // closed there is no more network data to ask for, and telling the
+        // caller to read more is how a close turns into a spin.
+        if s.conn.as_ref().is_some_and(|c| c.peer_has_closed()) {
+            s.closed_inbound = true;
+            status = SR_CLOSED;
+            // TLS 1.2 and below: answer the peer's `close_notify` with our
+            // own, automatically, the way JSSE does.
+            //
+            // RFC 5246 §7.2.1 makes the response required; RFC 8446 §6.1 makes
+            // it optional, and JSSE's TLS 1.3 engine does NOT send one — an
+            // asymmetry netty encodes directly (`CloseNotifyTest.jdkTls13`
+            // takes a different branch for exactly this, and asserts the
+            // automatic response on every other parameterisation). rustls
+            // queues nothing on its own in either case, so under TLS 1.2 the
+            // peer waited for a record that was never coming:
+            // `ParameterizedSslHandlerTest.testCloseNotify`'s client promise
+            // never completed.
+            //
+            // Marking the engine outbound-closed as well is what JSSE does
+            // here too — an automatic close is a full close, and the next
+            // `wrap` is the one that emits the record (see `do_wrap`'s
+            // closed-outbound drain).
+            let responds = s
+                .conn
+                .as_ref()
+                .and_then(|c| c.protocol_version())
+                .is_some_and(|v| v != rustls::ProtocolVersion::TLSv1_3);
+            if responds && !s.closed_outbound {
+                s.closed_outbound = true;
+                if let Some(c) = s.conn.as_mut() {
+                    c.send_close_notify();
+                }
+            }
         }
         let hs = handshake_status_of(s);
         if hs == HS_FINISHED_R {
@@ -12090,11 +15401,11 @@ fn do_unwrap(
         }
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
-        let pending_trust_check = engine_take_pending_trust_check(s);
+        let pending_trust_check = engine_take_pending_trust_check(id, s);
         (status, hs, plaintext, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
-        engine_run_trust_check(ctx, pending)?;
+        engine_run_trust_check(ctx, pending, Some(this))?;
     }
     let consumed = offset - src_pos;
     bb_set_pos(ctx, src, src_view.layout, offset);
@@ -12337,6 +15648,62 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                 with_engine(id, |s| {
                     s.endpoint_id_alg = alg.clone();
                 });
+                // `setServerNames` — the CLIENT-side counterpart of the matcher
+                // gate: the name this connection is for, overriding the host it
+                // was dialled on.
+                //
+                // JSSE uses it for BOTH the `server_name` extension AND the
+                // endpoint-identity check (`X509TrustManagerImpl.checkIdentity`
+                // prefers the requested SNI host name over the socket's peer
+                // host). Dropping it meant a client that dialled an IP and
+                // declared an SNI name verified the certificate against the IP:
+                // netty's `testUsingX509TrustManagerVerifiesSNIHostname`
+                // connects to `127.0.0.1` with `serverName(new SNIHostName(
+                // "something.netty.io"))` against a certificate for that name
+                // and expects success; it got `endpoint identification (HTTPS)
+                // failed for host "127.0.0.1"`.
+                if let Ok(Some(Value::Object(Some(list)))) =
+                    ctx.invoke_virtual(*p, "getServerNames", "()Ljava/util/List;", &[])
+                {
+                    let n = ctx
+                        .invoke_virtual(list, "size", "()I", &[])
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(0);
+                    for i in 0..n.min(16) {
+                        let Ok(Some(Value::Object(Some(sn)))) = ctx.invoke_virtual(
+                            list,
+                            "get",
+                            "(I)Ljava/lang/Object;",
+                            &[Value::Int(i)],
+                        ) else {
+                            break;
+                        };
+                        // Only `SNI_HOST_NAME` (type 0) names a host.
+                        if !matches!(
+                            ctx.invoke_virtual(sn, "getType", "()I", &[]),
+                            Ok(Some(Value::Int(0)))
+                        ) {
+                            continue;
+                        }
+                        if let Ok(Some(Value::Object(Some(s)))) =
+                            ctx.invoke_virtual(sn, "getAsciiName", "()Ljava/lang/String;", &[])
+                        {
+                            if let Some(host) = ctx.read_string(s) {
+                                if !host.is_empty() {
+                                    with_engine(id, |st| {
+                                        st.peer_host = Some(host.clone());
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                // SNI matchers — the server-side gate. See
+                // `engine_run_sni_match_check`.
+                capture_sni_matchers(ctx, this, *p);
             }
             Ok(None)
         },
@@ -12535,6 +15902,29 @@ pub(crate) fn set_engine_trust_ctx_key(
     Ok(())
 }
 
+/// The `SNIMatcher`s a caller installed on a server engine via
+/// `SSLParameters.setSNIMatchers` + `SSLEngine.setSSLParameters`, keyed by
+/// `engine_objref_key`.
+///
+/// A matcher is arbitrary application code — `SNIMatcher.matches(SNIServerName)`
+/// is abstract and netty's own tests subclass it inline — so the decision
+/// cannot be precomputed in Rust from the `SSLParameters`; the objects have to
+/// survive until the ClientHello arrives. That makes this the third
+/// `ObjectRef`-holding table in this module, and it is scanned and remapped by
+/// `gc_scan_tls_ctx_trust_manager_roots` / `gc_update_tls_ctx_trust_manager_refs`
+/// below alongside the other two.
+///
+/// Before this existed, `setSSLParameters` read the ALPN list, the cipher
+/// suites, the client-auth booleans and the endpoint-identification algorithm
+/// off the `SSLParameters` and silently dropped everything else. A server
+/// configured with a matcher that refuses every name still completed the
+/// handshake — netty's `SniClientTest.testSniSNIMatcherDoesNotMatchClient`
+/// asserts an `SSLException` and got `AssertionError: expected SSLException`.
+fn engine_sni_matchers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
 /// this exists (the only ObjectRef-holding side-table in this module that
 /// isn't purely derived PEM/DER bytes).
@@ -12548,6 +15938,39 @@ pub fn gc_scan_tls_ctx_trust_manager_roots(roots: &mut Vec<ObjectRef>) {
         }
     }
     drop(table);
+    let matchers = engine_sni_matchers_table().lock();
+    for list in matchers.values() {
+        for m in list {
+            if !m.as_ptr().is_null() {
+                roots.push(*m);
+            }
+        }
+    }
+    drop(matchers);
+    let selectors = engine_alpn_selector_table().lock();
+    for f in selectors.values() {
+        if !f.as_ptr().is_null() {
+            roots.push(*f);
+        }
+    }
+    drop(selectors);
+    let sessions = engine_session_table().lock();
+    for ses in sessions.values() {
+        if !ses.as_ptr().is_null() {
+            roots.push(*ses);
+        }
+    }
+    drop(sessions);
+    // The client session cache outlives the engine that created each entry —
+    // that is its whole point — so it is an independent root, not something
+    // `engine_session_table` keeps alive for it.
+    let cached = client_session_cache().lock();
+    for ses in cached.values() {
+        if !ses.as_ptr().is_null() {
+            roots.push(*ses);
+        }
+    }
+    drop(cached);
     if let Some(f) = *huc_default_factory_slot().lock() {
         if !f.as_ptr().is_null() {
             roots.push(f);
@@ -12602,6 +16025,48 @@ pub fn gc_update_tls_ctx_trust_manager_refs(map: &cratonvm_types::PointerMap) {
         }
     }
     drop(table);
+    let mut matchers = engine_sni_matchers_table().lock();
+    for list in matchers.values_mut() {
+        for m in list.iter_mut() {
+            let old = m.as_ptr() as usize;
+            if let Some(&new) = map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: as above.
+                *m = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
+    drop(matchers);
+    let mut selectors = engine_alpn_selector_table().lock();
+    for f in selectors.values_mut() {
+        let old = f.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: as above.
+            *f = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    }
+    drop(selectors);
+    let mut sessions = engine_session_table().lock();
+    for ses in sessions.values_mut() {
+        let old = ses.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: as above.
+            *ses = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    }
+    drop(sessions);
+    let mut cached = client_session_cache().lock();
+    for ses in cached.values_mut() {
+        let old = ses.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: as above.
+            *ses = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    }
+    drop(cached);
     // Same treatment for the installed default `SSLSocketFactory` — see
     // `huc_default_factory_slot`.
     let mut slot = huc_default_factory_slot().lock();
@@ -12801,6 +16266,14 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
 /// HTTPS server never serves (~18 TLS/HTTP2-TLS/WebSocket-SSL test classes).
 /// Side-table associating an `SSLSession` object with its peer (client)
 /// certificate chain (DER, leaf first), populated by the engine's getSession().
+/// The real TLS session id (ServerHello `legacy_session_id`) for a session
+/// object, keyed by `gc_stable_objref_key` like the other session side-tables.
+/// Populated for TLS 1.2 sessions only — see [`peek_server_hello_session_id`].
+fn session_wire_id_table() -> &'static Mutex<HashMap<u64, Vec<u8>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
     static T: OnceLock<Mutex<HashMap<u64, Vec<Vec<u8>>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
@@ -13267,6 +16740,60 @@ fn sslsess_attrs_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize>
     }
 }
 
+/// Fire `SSLSessionBindingListener.valueBound`/`valueUnbound` for a value that
+/// implements the interface, the way `SSLSessionImpl.putValue`/`removeValue`
+/// do.
+///
+/// JSSE's contract is explicit: "if the object implements
+/// SSLSessionBindingListener, the valueBound method is called". netty's
+/// `SSLEngineTest.assertSSLSessionBindingEventValue` is a listener that
+/// records the event it was handed and asserts on `event.getName()`; with no
+/// callback the recorded event stayed null and the test died on
+/// `NullPointerException: Cannot invoke
+/// "javax.net.ssl.SSLSessionBindingEvent.getName()" because "event" is null`.
+///
+/// A value that is not a listener, or an event that cannot be constructed, is
+/// silently skipped — the attribute store is the primary effect and must not
+/// fail because of a callback.
+fn fire_session_binding(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+    name: Value,
+    value: Value,
+    bound: bool,
+) {
+    let Value::Object(Some(v)) = value else {
+        return;
+    };
+    let Some(iface) = ctx.class_id_by_name("javax/net/ssl/SSLSessionBindingListener") else {
+        return;
+    };
+    if !ctx.is_subclass(ctx.class_id_of_object(v), iface) {
+        return;
+    }
+    let ses_pin = ctx.pin_native_root(session);
+    let v_pin = ctx.pin_native_root(v);
+    let ses_now = ctx.read_native_pin(ses_pin, session);
+    let event = ctx.new_object_initialized(
+        "javax/net/ssl/SSLSessionBindingEvent",
+        "(Ljavax/net/ssl/SSLSession;Ljava/lang/String;)V",
+        &[Value::Object(Some(ses_now)), name],
+    );
+    if let Ok(Some(Value::Object(Some(ev)))) = event {
+        let ev_pin = ctx.pin_native_root(ev);
+        let v_now = ctx.read_native_pin(v_pin, v);
+        let ev_now = ctx.read_native_pin(ev_pin, ev);
+        let method = if bound { "valueBound" } else { "valueUnbound" };
+        let _ = ctx.invoke_virtual(
+            v_now,
+            method,
+            "(Ljavax/net/ssl/SSLSessionBindingEvent;)V",
+            &[Value::Object(Some(ev_now))],
+        );
+    }
+    ctx.unpin_native_roots(ses_pin);
+}
+
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
 
@@ -13373,9 +16900,50 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // a trackable one. Measured HotSpot 25.0.3+9-LTS, E12-1 §1/§4.
     r.register(cls, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if !session_has_negotiated(ctx, this) {
-            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-            return Ok(Some(Value::Object(Some(empty))));
+        // Two gates, one question, because the two families of session shape
+        // record "was anything negotiated" in different places.
+        //
+        // `session_has_negotiated` is the width-aware predicate every other
+        // door in this file uses (E12/E42): on the 4-field socket shapes it
+        // reads the stream id in slot 2, and a session that negotiated nothing
+        // carries `-1`.
+        //
+        // The 7/8-field engine shape needs the second gate as well. Its slot 2
+        // is the `isValid` flag written at mint time, while WHICH HANDSHAKE
+        // EPOCH a cached session object belongs to is known only to
+        // `engine_session_for` — see `negotiated_session_keys`. netty's
+        // `SSLEngineTest.testSSLSessionId` asserts
+        // `assertEquals(0, engine.getSession().getId().length)` on a
+        // freshly-created engine and got 32.
+        //
+        // Both predicates are hoisted into `let`s rather than chained inline:
+        // `session_has_negotiated` takes `&dyn` and `session_is_negotiated`
+        // `&mut dyn`, and this file already records (see `getPeerHost`) how
+        // easily a reborrow in a compound scrutinee collides with the `&mut`
+        // beside it.
+        let negotiated = session_has_negotiated(ctx, this);
+        let engine_shape = ctx.object_num_fields(this) >= 7;
+        if !negotiated || (engine_shape && !session_is_negotiated(ctx, this)) {
+            return Ok(Some(Value::Object(Some(
+                ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
+            ))));
+        }
+        // The REAL id, when there is one: a TLS 1.2 handshake puts a session id
+        // on the wire and both engines saw it, so both answer the same bytes.
+        // `SSLEngineTest.testSSLSessionId` asserts exactly that equality — a
+        // per-object pseudo-id can never satisfy it. (Under TLS 1.3 nothing is
+        // recorded here and the pseudo-id below stands, which is what the same
+        // test's `assertFalse(Arrays.equals(...))` branch wants.)
+        let wire_id = session_wire_id_table()
+            .lock()
+            .get(&gc_stable_objref_key(ctx, this))
+            .cloned();
+        if let Some(id) = wire_id {
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, id.len());
+            for (i, b) in id.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+            }
+            return Ok(Some(Value::Object(Some(arr))));
         }
         let seed = gc_stable_objref_key(ctx, this);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
@@ -13670,6 +17238,12 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "getLastAccessedTime", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // A session reused by a later handshake was last accessed then, not
+        // when it was created (`session_last_accessed_table`).
+        let k = gc_stable_objref_key(ctx, this);
+        if let Some(t) = session_last_accessed_table().lock().get(&k).copied() {
+            return Ok(Some(Value::Long(t)));
+        }
         if ctx.object_num_fields(this) > 5 {
             Ok(Some(ctx.get_field(this, 5)))
         } else {
@@ -13762,12 +17336,17 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 None => return Ok(None),
             };
             let map = sslsess_attrs_map(ctx, this, slot)?;
-            ctx.invoke(
+            let old = ctx.invoke(
                 "java/util/HashMap",
                 "put",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[Value::Object(Some(map)), name, value],
             )?;
+            // JSSE unbinds the value being replaced before binding the new one.
+            if let Some(old @ Value::Object(Some(_))) = old {
+                fire_session_binding(ctx, this, name, old, false);
+            }
+            fire_session_binding(ctx, this, name, value, true);
             Ok(None)
         },
     );
@@ -13790,12 +17369,15 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Value::Object(Some(m)) => m,
             _ => return Ok(None),
         };
-        ctx.invoke(
+        let old = ctx.invoke(
             "java/util/HashMap",
             "remove",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(map)), name],
         )?;
+        if let Some(old @ Value::Object(Some(_))) = old {
+            fire_session_binding(ctx, this, name, old, false);
+        }
         Ok(None)
     });
     r.register(cls, "getValueNames", "()[Ljava/lang/String;", |ctx, args| {

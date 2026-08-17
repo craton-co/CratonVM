@@ -232,7 +232,7 @@ Two further reasons this residual was never evidence:
 
 * `ZonedDateTimeTest` is **bimodal** with no VM change at all — roughly 300 s
   or past 900 s, documented in
-  `docs/internal/jit-ir-relocation-map-contract.md` with the eight-run table
+  `../fixed-suite-bugs/jit-ir-relocation-map-contract.md` with the eight-run table
   that shows it. A single sample per lane cannot support any attribution, and
   that is exactly what the claim rested on.
 * The host it would have to be re-measured on carries 30–140 load average from
@@ -513,7 +513,7 @@ gives up compaction.
 that was not actually being made: the moving young generation was
 default-*requested* but could never *engage* under JIT, so a process paid the
 optimizing tier for compaction it never received. Three defects caused that
-(see `docs/internal/default-moving-young-enabled-20260730.md`) and all are fixed —
+(see `../fixed-suite-bugs/default-moving-young-enabled-20260730.md`) and all are fixed —
 `BinTreesClassic 18` at `-Xmx512m` now runs 25 real Cheney young cycles with
 zero coverage fallbacks. The cost recorded here is now buying something, so the
 comparison a reader should make is three-way, not two-way:
@@ -681,7 +681,7 @@ moving-young:
    one, silently. Fixed 2026-07-31; the constraint now lives where the
    layout-naive displacement is emitted.
 
-Both are documented in `docs/internal/jit-ir-relocation-map-contract.md`, along
+Both are documented in `../fixed-suite-bugs/jit-ir-relocation-map-contract.md`, along
 with the per-stage refusal reporting that makes this checkable instead of
 inferable. The practical consequence for THIS document: its verification table
 shows unit-test counts, which the scoping genuinely fixed, but nothing in it

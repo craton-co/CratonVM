@@ -1356,7 +1356,8 @@ impl Compiler {
                          reason={reason} site_pc={site_pc}"
                     );
                 }
-                self.buf.mark_overflowed();
+                self.buf
+                    .mark_codegen_unencodable("deopt-stub-without-saved-regs");
                 return;
             }
             if let Some(box_ptr) = frame_box_ptr {

@@ -399,12 +399,11 @@ fn test_helpers() -> JitRuntimeHelpers {
         // Unwired (0) — these tests build no class-`ldc` site, and 0 makes
         // the backend refuse one rather than emit a null CALL.
         ldc_class_cp: 0,
-        // Unwired (0) on purpose: it routes the `0x53` arm to `aastore` (the
-        // complete opcode), which is the lowering every existing `aastore`
-        // codegen test in this file was written against. Wiring the panicking
-        // sentinel here would switch them all to the inline-store-plus-check
-        // arm and emit a CALL to a stub that panics.
-        aastore_check: 0,
+        // Wired to the panicking sentinel: the `0x53` arm is unconditionally
+        // inline and always emits a CALL to this slot, and the slot is
+        // `required` in `jit-api`, so 0 would fail `validate()` rather than
+        // select a different lowering.
+        aastore_type_check: sentinel,
     }
 }
 
@@ -567,6 +566,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         Vec::new(),
         method_key,
         Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
     )?;
     compiled
         .oop_maps
@@ -4615,6 +4615,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             vec![(2usize, 0u32, true)],
             "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
             Vec::new(),
+            None, // elidable_init_pcs: no constant pool, so nothing is proven empty
         )
         .expect("reference putfield must compile")
     };

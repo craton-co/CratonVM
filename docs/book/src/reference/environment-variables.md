@@ -103,7 +103,7 @@ a synthetic-vs-real difference.
 | Variable / token | Description |
 |------------------|-------------|
 | `-lazy-streams` / `eager-streams` | Opt out of the lazy/short-circuiting `java.util.stream` pipeline (lazy is the default and matches HotSpot). |
-| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements (the `-ea` analog). A scalar. |
+| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements. A scalar. An unscoped `-ea` on the command line sets it; `-da` clears it, inherited value and all. |
 
 ## Security & sandboxing — `CRATONVM_SECURITY` and `CRATONVM_IO`
 

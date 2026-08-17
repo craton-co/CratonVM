@@ -168,6 +168,194 @@ fn registry() -> &'static Mutex<ConnRegistry> {
     R.get_or_init(|| Mutex::new(ConnRegistry::new()))
 }
 
+/// What the TLS handshake of an `https` exchange learned about the peer, kept
+/// for the `HttpsURLConnection` accessors that report it.
+struct HttpsPeerInfo {
+    /// Peer certificate chain, DER, leaf first — exactly what rustls handed
+    /// back, so `getServerCertificates()` reports the real chain.
+    chain_der: Vec<Vec<u8>>,
+    /// JSSE spelling (see `t27_tls`'s `suite_to_java_cipher_name`), not
+    /// rustls's `Debug` spelling.
+    cipher: String,
+}
+
+/// Peer info per connection object, keyed by identity hash.
+///
+/// Keyed by object identity rather than a `HUC_*` slot for the reason the
+/// `RealReq` table above documents: a real-JDK
+/// `sun.net.www.protocol.https.HttpsURLConnectionImpl` carries the JDK's own
+/// instance layout, and writing a synthetic slot into it corrupts a real field.
+fn https_peer_info() -> &'static Mutex<HashMap<u64, HttpsPeerInfo>> {
+    static R: OnceLock<Mutex<HashMap<u64, HttpsPeerInfo>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_https_peer_info(
+    ctx: &dyn NativeContext,
+    connection: Option<ObjectRef>,
+    chain_der: &[Vec<u8>],
+    cipher: &str,
+) {
+    let Some(conn) = connection else { return };
+    if chain_der.is_empty() {
+        return;
+    }
+    https_peer_info().lock().unwrap().insert(
+        ctx.identity_hash_code(conn) as u32 as u64,
+        HttpsPeerInfo {
+            chain_der: chain_der.to_vec(),
+            cipher: cipher.to_string(),
+        },
+    );
+}
+
+/// Make sure the exchange that produces the handshake info has actually run.
+///
+/// `HttpsURLConnection.getServerCertificates()` and friends are defined to
+/// report the session of a connected connection, and the JDK's
+/// `HttpsURLConnectionImpl` connects on demand. CratonVM's `huc_connect` is a
+/// deliberate NO-OP for a real-JDK carrier — HotSpot's `connect()` opens the
+/// socket but sends nothing, so the request is deferred to
+/// `getResponseCode`/`getInputStream` — which means an app that does
+/// `connect(); getServerCertificates();` (netty's `OcspClientTest` does exactly
+/// that) had no handshake behind it at all. Drive the same lazy exchange the
+/// response getters drive, then read what it recorded.
+///
+/// Errors are swallowed: the accessor's own contract is
+/// `SSLPeerUnverifiedException`, and the caller below raises that when the
+/// table is still empty. A connect failure surfaces properly on the next
+/// `getResponseCode`/`getInputStream`.
+fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    if https_peer_info()
+        .lock()
+        .unwrap()
+        .contains_key(&(ctx.identity_hash_code(this) as u32 as u64))
+    {
+        return;
+    }
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("https://") {
+            let _ = huc_real_perform(ctx, this, &url_str);
+        }
+        return;
+    }
+    let _ = ensure_connected(ctx, this);
+}
+
+/// The peer chain recorded for `this`, or an `SSLPeerUnverifiedException` when
+/// there is none — the JSSE contract `HttpsURLConnection.getServerCertificates`
+/// documents, and the one callers actually catch.
+fn https_peer_chain_or_throw(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
+    https_ensure_exchanged(ctx, this);
+    let key = ctx.identity_hash_code(this) as u32 as u64;
+    match https_peer_info().lock().unwrap().get(&key) {
+        Some(info) if !info.chain_der.is_empty() => Ok(info.chain_der.clone()),
+        _ => Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLPeerUnverifiedException",
+            "peer not authenticated",
+        )),
+    }
+}
+
+/// The `javax.net.ssl.HttpsURLConnection` accessors that report the handshake.
+///
+/// These are ABSTRACT on `javax.net.ssl.HttpsURLConnection` — in the real JDK
+/// they are implemented by `HttpsURLConnectionImpl`, which forwards to a
+/// `DelegateHttpsURLConnection` holding the live `SSLSession`. CratonVM's
+/// carrier performs the exchange itself (see `perform`) and has no such
+/// delegate, so without these registrations a call landed on the abstract
+/// declaration and threw
+/// `AbstractMethodError: javax/net/ssl/HttpsURLConnection.getServerCertificates()
+/// has no Code attribute` — an abstract declaration reached because no
+/// override exists, not a bad dispatch, and the failure behind
+/// `OcspClientTest`'s `[1] https://apple.com` case in the retired
+/// `ssl-cert-validation-residuals` write-up.
+///
+/// Registered for the whole family, not just the one method the OCSP test
+/// needed: an app that reads the chain almost always reads the cipher suite
+/// beside it, and leaving the siblings abstract just moves the same
+/// `AbstractMethodError` one line down.
+fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
+    r.register(
+        cls,
+        "getServerCertificates",
+        "()[Ljava/security/cert/Certificate;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let chain = https_peer_chain_or_throw(ctx, this)?;
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
+            for (i, der) in chain.iter().enumerate() {
+                let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der)?;
+                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    // No client certificate is ever sent by `perform` (it builds its rustls
+    // client config without one), so this is `null` — the JDK's own answer for
+    // a connection that did not authenticate itself, not a stand-in.
+    r.register(
+        cls,
+        "getLocalCertificates",
+        "()[Ljava/security/cert/Certificate;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        https_ensure_exchanged(ctx, this);
+        let key = ctx.identity_hash_code(this) as u32 as u64;
+        let cipher = https_peer_info()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|i| i.cipher.clone());
+        match cipher {
+            Some(c) if !c.is_empty() => Ok(Some(Value::Object(Some(ctx.create_string(&c))))),
+            _ => Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLPeerUnverifiedException",
+                "peer not authenticated",
+            )),
+        }
+    });
+    r.register(
+        cls,
+        "getPeerPrincipal",
+        "()Ljava/security/Principal;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let chain = https_peer_chain_or_throw(ctx, this)?;
+            // JSSE's own fallback: the peer principal is the leaf certificate's
+            // subject when the session carries no separate principal.
+            let leaf = crate::keystore::make_x509_mirror(ctx, "peer", &chain[0])?;
+            let pin = ctx.pin_native_root(leaf);
+            let leaf = ctx.read_native_pin(pin, leaf);
+            let principal = ctx.invoke_virtual(
+                leaf,
+                "getSubjectX500Principal",
+                "()Ljavax/security/auth/x500/X500Principal;",
+                &[],
+            );
+            ctx.unpin_native_roots(pin);
+            match principal {
+                Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+                Err(e) => Err(e),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
+    r.register(
+        cls,
+        "getLocalPrincipal",
+        "()Ljava/security/Principal;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Real-JDK HttpURLConnection support
 // ---------------------------------------------------------------------------
@@ -2051,8 +2239,11 @@ fn huc_builtin_endpoint_identification(host: &str, chain: &[Vec<u8>]) -> Result<
 /// Prefix-only, deliberately: it is exactly the five `TLS13_*` variants, and a
 /// name that does not carry the prefix is already the registry's.
 ///
-/// `pub(crate)` because `t27_tls.rs` has the other seven producers of a rustls
-/// suite name and reaches this through its own `negotiated_suite_name` adapter
+/// `pub(crate)` because `t27_tls.rs` has the other producers of a rustls suite
+/// name and reaches this rewrite through `suite_to_java_cipher_name`'s
+/// fall-through arm — that typed helper is the one entry point both files call,
+/// and `suite_to_java_cipher_name_pub` is how THIS file calls it (see the https
+/// branch below)
 /// — see `docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md`.
 pub(crate) fn jsse_cipher_suite_name(rustls_name: &str) -> String {
     match rustls_name.strip_prefix("TLS13_") {
@@ -2738,8 +2929,13 @@ fn perform(
                 let cipher = stream
                     .conn
                     .negotiated_cipher_suite()
-                    .map(|cs| jsse_cipher_suite_name(&format!("{:?}", cs.suite())))
+                    .map(|cs| crate::t27_tls::suite_to_java_cipher_name_pub(cs.suite()))
                     .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".to_string());
+                // Record BEFORE the hostname check: the accessors below report
+                // what the handshake produced, and a peer that fails endpoint
+                // identification still produced a chain the caller may want to
+                // inspect from the exception path.
+                record_https_peer_info(ctx, connection, &peer_chain_der, &cipher);
                 huc_verify_hostname(
                     ctx,
                     connection,
@@ -4375,6 +4571,10 @@ pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
     // Some apps use the abstract base class directly via reflection.
     register_one(r, "java/net/HttpURLConnection");
     register_one(r, "javax/net/ssl/HttpsURLConnection");
+    // The TLS-specific accessors, on the https classes only — `java.net`'s
+    // plain `HttpURLConnection` does not declare them.
+    register_https_session_accessors(r, "sun/net/www/protocol/https/HttpsURLConnectionImpl");
+    register_https_session_accessors(r, "javax/net/ssl/HttpsURLConnection");
     r.set_category(__prev_cat);
 }
 

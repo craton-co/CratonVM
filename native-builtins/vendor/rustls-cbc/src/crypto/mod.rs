@@ -11,8 +11,8 @@ use crate::msgs::ffdhe_groups::FfdheGroup;
 use crate::sign::SigningKey;
 use crate::sync::Arc;
 pub use crate::webpki::{
-    WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
-    verify_tls13_signature_with_raw_key,
+    WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls12_signature_lenient,
+    verify_tls13_signature, verify_tls13_signature_lenient, verify_tls13_signature_with_raw_key,
 };
 #[cfg(doc)]
 use crate::{

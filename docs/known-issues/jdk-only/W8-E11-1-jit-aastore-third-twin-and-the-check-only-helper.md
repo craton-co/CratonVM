@@ -1,5 +1,17 @@
 # W8-E11-1 — the third `aastore` twin, and the check-only helper that lets the inline store come back (APPLIED + NOMINATION SET)
 
+> **RECONCILED 2026-08-16 (merge of `dev`).** Every `aastore_check`,
+> `jit_aastore_check` and `HelperFnAastoreCheck` below names the spelling that
+> was current when this record was written. The merge of `dev` into
+> `claude/jdk-only-mode-completion-1351c0` settled on **`aastore_type_check`**
+> (ABI field), **`jit_aastore_type_check`** (helper) and
+> **`aastore_store_is_refused`** (the predicate the helper and the x64 inline
+> lowering now share), and the slot is `required: true` -- the old
+> `aastore_check == 0` fallback that routed the whole opcode to
+> `helpers.aastore` no longer exists. `grep -rn 'aastore_check' --include=*.rs`
+> returns nothing in the tree. The names here are kept as written; read them as
+> history, not as a pointer to live code.
+
 > **STATUS: applied in the two files this lane owns** — `vm/src/jit/helpers.rs`
 > and `vm/src/runtime/interpreter/lambda.rs`. **Every CratonVM "after" below is
 > PREDICTED**: this lane may not build or run the binary. The HotSpot columns

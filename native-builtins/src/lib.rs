@@ -4747,8 +4747,23 @@ mod context_class_loader_tests {
         assert_eq!(got, Some(Value::Object(None)));
     }
 
+    /// The zero-quiet-period shutdown must NOT be registered against Netty's
+    /// event executor groups.
+    ///
+    /// It was, on the premise that naming `MultiThreadIoEventLoopGroup`
+    /// restricted it to MongoDB Reactive Streams' driver group — but that is
+    /// the ordinary group every Netty 4.2 application constructs, so the
+    /// registration turned every `group.shutdownGracefully()` in the process
+    /// into `shutdownGracefully(0, 0, MILLISECONDS)`. A zero quiet period does
+    /// not drain the event loop, and Netty runs channel deregistration (and
+    /// therefore `handlerRemoved`) as a queued task: `PcapWriteHandler`'s
+    /// capture came out 522 bytes of 732, with every TCP close packet missing.
+    ///
+    /// The Mongo lifecycle still gets its zero quiet period — its `destroy()`
+    /// bridge calls `native_netty_event_executor_group_shutdown_gracefully`
+    /// directly, which is the scoping that actually holds.
     #[test]
-    fn essential_registers_netty_event_executor_shutdown_bridge() {
+    fn essential_does_not_register_a_zero_quiet_period_netty_group_shutdown() {
         let mut registry = NativeMethodRegistry::new();
         register_essential_natives(&mut registry);
         for class_name in [
@@ -4756,14 +4771,25 @@ mod context_class_loader_tests {
             "io/netty/util/concurrent/AbstractEventExecutorGroup",
             "io/netty/channel/MultiThreadIoEventLoopGroup",
         ] {
-            assert!(registry
-                .find(
-                    class_name,
-                    "shutdownGracefully",
-                    "()Lio/netty/util/concurrent/Future;"
-                )
-                .is_some());
+            assert!(
+                registry
+                    .find(
+                        class_name,
+                        "shutdownGracefully",
+                        "()Lio/netty/util/concurrent/Future;"
+                    )
+                    .is_none(),
+                "{class_name}.shutdownGracefully() must keep Netty's own quiet period"
+            );
         }
+        // The Mongo lifecycle bridge that DOES need it is still installed.
+        assert!(registry
+            .find(
+                "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
+                "destroy",
+                "()V"
+            )
+            .is_some());
     }
 
     #[test]
@@ -5914,9 +5940,28 @@ fn cmstateset_same_set(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> b
 }
 
 fn xmlchar_chars_array(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    let class_id = ctx
-        .class_id_by_name(XERCES_XMLCHAR)
-        .or_else(|| ctx.ensure_class_initialized(XERCES_XMLCHAR).ok())?;
+    // LOADED is not enough — the class must be INITIALIZED.
+    //
+    // `XMLChar.<clinit>` assigns `CHARS = new byte[0x10000]` first and spends
+    // the rest of its body filling it. A reader that accepts "the class id
+    // resolves" (which `class_id_by_name` answers for a merely-loaded class)
+    // can therefore read the array reference while another thread is still
+    // filling it, and every character it asks about below the fill point comes
+    // back with a zero mask. `isNameStart('c')` then answers false and xerces
+    // rejects `<component-set>` with "The markup in the document preceding the
+    // root element must be well-formed" at [1,2].
+    //
+    // Ordinary bytecode cannot hit this: the `getstatic XMLChar.CHARS` inside
+    // `XMLEntityScanner.scanQName` carries the initialization barrier. It is
+    // reachable only because CratonVM replaces that scanner with a native, so
+    // the barrier the bytecode would have run is gone unless this asks for it.
+    let class_id = match ctx.class_id_by_name(XERCES_XMLCHAR) {
+        Some(id) => {
+            ctx.ensure_class_initialized_with_class_id(id).ok()?;
+            id
+        }
+        None => ctx.ensure_class_initialized(XERCES_XMLCHAR).ok()?,
+    };
     let field_index = ctx.static_field_index_by_name(class_id, "CHARS")?;
     match ctx.get_static_field(class_id, field_index) {
         Value::Object(Some(chars)) => Some(chars),
@@ -6574,11 +6619,48 @@ fn populate_real_thread_holder(
     let group = match group {
         Value::Object(Some(_)) => group,
         _ => {
-            let cur = ctx.current_thread_object();
-            let g = ctx.get_field_by_name(cur, "holder");
-            match g {
-                Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
-                _ => Value::Object(None),
+            // A thread created with no group of its own takes the installed
+            // SecurityManager's `getThreadGroup()` first, and only then the
+            // creating thread's group. That is the JDK's rule up to 23; JDK 24
+            // dropped it along with the SecurityManager itself (JEP 486).
+            //
+            // CratonVM deliberately did NOT adopt JEP 486 — `System
+            // .setSecurityManager` still installs, because the exec and Panama
+            // gates consult the installed manager for real (see
+            // `security_manager::register_system_security`). Keeping the
+            // manager alive but ignoring the one hook it has over thread
+            // construction left it half-alive: netty's
+            // `DefaultThreadFactoryTest
+            // .testDefaultThreadFactoryInheritsThreadGroupFromSecurityManager`
+            // installs a manager whose `getThreadGroup()` returns a sticky
+            // group and got the creating thread's group instead.
+            //
+            // This branch cannot introduce a divergence from HotSpot 25: it is
+            // reachable only once a SecurityManager is installed, which on
+            // HotSpot 25 cannot happen at all. The default
+            // `SecurityManager.getThreadGroup()` body is
+            // `Thread.currentThread().getThreadGroup()`, i.e. exactly the
+            // fallback below, so an unremarkable manager changes nothing.
+            let from_manager = match crate::security_manager::get_security_manager(&*ctx) {
+                Some(sm) => {
+                    match ctx.invoke_virtual(sm, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
+                    {
+                        Ok(Some(Value::Object(Some(g)))) => Some(g),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            match from_manager {
+                Some(g) => Value::Object(Some(g)),
+                None => {
+                    let cur = ctx.current_thread_object();
+                    let g = ctx.get_field_by_name(cur, "holder");
+                    match g {
+                        Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
+                        _ => Value::Object(None),
+                    }
+                }
             }
         }
     };
@@ -10936,15 +11018,25 @@ pub fn register_essential_natives_with_shims(
     // Keep CyclicBarrier constructors available this early too; surefire and
     // plugin ecosystems may switch between latch/semaphore/barrier patterns.
     // `SyntheticStub` for the same reason as the latch above.
-    let surefire_cb = "java/util/concurrent/CyclicBarrier";
-    registry.register_with_kind(surefire_cb, "<init>", "(I)V", native_cb_init, cratonvm_native_api::NativeKind::SyntheticStub);
-    registry.register_with_kind(
-        surefire_cb,
-        "<init>",
-        "(ILjava/lang/Runnable;)V",
-        native_cb_init_action,
-        cratonvm_native_api::NativeKind::SyntheticStub,
-    );
+    //
+    // Gated on `synthetic_aqs` for the same reason as Semaphore above, and it
+    // matters MORE here: `native_cb_init` parks its int[3] state holder in the
+    // receiver's slot 0, which on the real JDK layout is the `lock`
+    // ReentrantLock field. Registering only the constructors while `await()`
+    // runs real bytecode would hand that bytecode a barrier whose `lock` is an
+    // int[] — so these two must live or die with the `await` natives in
+    // `util_concurrent_ext::register_concurrent_natives`.
+    if synthetic_aqs {
+        let surefire_cb = "java/util/concurrent/CyclicBarrier";
+        registry.register_with_kind(surefire_cb, "<init>", "(I)V", native_cb_init, cratonvm_native_api::NativeKind::SyntheticStub);
+        registry.register_with_kind(
+            surefire_cb,
+            "<init>",
+            "(ILjava/lang/Runnable;)V",
+            native_cb_init_action,
+            cratonvm_native_api::NativeKind::SyntheticStub,
+        );
+    }
     // If CommandReader.<clinit> still fails, surefire wraps the cause in
     // UnsatisfiedLinkError / ExceptionInInitializerError very early.
     registry.register(
@@ -17072,6 +17164,39 @@ pub fn register_essential_natives_with_shims(
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register_with_kind(mhn, "registerNatives", "()V", native_noop, NativeKind::Bridge);
 
+    // `MethodHandleNatives.<clinit>` ends with `assert(verifyConstants())`, and
+    // `verifyConstants` is the sole caller of `getNamedCon`. With assertions
+    // off that whole path is dead, which is why an unimplemented native here
+    // went unnoticed for as long as `-ea` was being discarded by the launcher.
+    // The moment the flag started reaching the switch, every `-ea` run died
+    // during `java.lang.invoke` boot:
+    //
+    //     UnsatisfiedLinkError: MethodHandleNatives.getNamedCon(I[Ljava/lang/Object;)I
+    //         at MethodHandleNatives.verifyConstants(MethodHandleNatives.java:197)
+    //         at MethodHandleNatives.<clinit>(MethodHandleNatives.java:221)
+    //
+    // The JDK-side protocol (see the loop in `verifyConstants`) is: return the
+    // `which`th constant the VM names and store its name into `name[0]`; a null
+    // `name[0]` means "no such constant" and terminates the scan. The check
+    // exists so HotSpot's internal `MN_*` / `REF_*` table can be diffed against
+    // `MethodHandleNatives.Constants`. CratonVM keeps no counterpart of that
+    // table — `MemberName` flags are computed where they are used, not held in
+    // a VM-side constant list — so there is nothing here to cross-check and the
+    // truthful answer is "I name none": leave `name[0]` untouched and return 0,
+    // and the loop exits on its first iteration with `verifyConstants` true.
+    //
+    // Deliberately NOT fabricating values. Echoing the JDK's own numbers back
+    // would make the assertion certify an agreement that was never checked,
+    // which is worse than declining it. If CratonVM ever grows a real constant
+    // table, exporting it here turns this into a genuine boot-time drift check.
+    registry.register_with_kind(
+        mhn,
+        "getNamedCon",
+        "(I[Ljava/lang/Object;)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+        NativeKind::Bridge,
+    );
+
     // C33: InvokerBytecodeGenerator bypass — register the three entry points
     // that drive JEP 466 code-gen as natives that return a minimal resolved
     // MemberName. Prevents `java.lang.classfile.constantpool.ConstantPoolException:
@@ -17208,7 +17333,7 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            match ctx.get_field_by_name(this, "detailMessage") {
+            match crate::lang_misc::throwable_field_get(ctx, this, "detailMessage") {
                 Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
                 _ => Ok(Some(Value::Object(None))),
             }
@@ -21021,33 +21146,30 @@ pub fn register_essential_natives_with_shims(
         Ok(Some(Value::Int(system_ephemeral_port_range().1)))
     }, NativeKind::Bridge);
 
-    // MongoDB Reactive Streams 5.7 uses Netty 4.2's
-    // MultiThreadIoEventLoopGroup for its driver lifecycle. After a Mongo
-    // client has closed, a monitor callback can keep re-enqueuing work in
-    // CratonVM's event-loop implementation, so Netty's ordinary two-second
-    // quiet period never becomes quiet and Spring's context destroy callback
-    // waits indefinitely. Restrict the bridge to that concrete Netty 4.2
-    // group: it invokes Netty's own three-argument shutdown bytecode with a
-    // zero quiet period. Other EventExecutorGroup implementations retain
-    // their original no-argument bytecode unchanged.
-    registry.register(
-        "io/netty/util/concurrent/EventExecutorGroup",
-        "shutdownGracefully",
-        "()Lio/netty/util/concurrent/Future;",
-        native_netty_event_executor_group_shutdown_gracefully,
-    );
-    registry.register(
-        "io/netty/util/concurrent/AbstractEventExecutorGroup",
-        "shutdownGracefully",
-        "()Lio/netty/util/concurrent/Future;",
-        native_netty_event_executor_group_shutdown_gracefully,
-    );
-    registry.register(
-        "io/netty/channel/MultiThreadIoEventLoopGroup",
-        "shutdownGracefully",
-        "()Lio/netty/util/concurrent/Future;",
-        native_netty_event_executor_group_shutdown_gracefully,
-    );
+    // NOT registered here: `EventExecutorGroup.shutdownGracefully()`.
+    //
+    // The zero-quiet-period shutdown that MongoDB Reactive Streams' lifecycle
+    // needs lives in `native_netty_event_executor_group_shutdown_gracefully`,
+    // and `native_springboot_mongo_reactive_customizer_destroy` — itself a
+    // full native replacement of the one Spring bean method that hung — calls
+    // it DIRECTLY. Registering it against `EventExecutorGroup`,
+    // `AbstractEventExecutorGroup` and `MultiThreadIoEventLoopGroup` as well
+    // was meant to be "restricted to that concrete Netty 4.2 group", but
+    // `MultiThreadIoEventLoopGroup` is the ordinary group every Netty 4.2
+    // application constructs, so the restriction admitted everything: EVERY
+    // `group.shutdownGracefully()` in the process became
+    // `shutdownGracefully(0, 0, MILLISECONDS)`.
+    //
+    // A zero quiet period does not drain. Netty runs a closed channel's
+    // deregistration — and therefore `ChannelHandler.handlerRemoved` — as a
+    // task on the event loop, so with the quiet period gone the loop
+    // terminated with that task still queued. `PcapWriteHandler` writes its
+    // fake TCP FIN/FIN-ACK/ACK sequence from `handlerRemoved`, so the capture
+    // came out byte-exact through the last data packet and then simply
+    // stopped: 522 bytes instead of 732 (docs/known-issues/netty/
+    // pcap-write-handler-three-residuals-20260812.md, residual 2). Anything
+    // that relies on graceful shutdown actually being graceful had the same
+    // hole. Ordinary groups keep their own bytecode, and their own defaults.
     registry.register(
         "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
         "customize",
@@ -32334,57 +32456,157 @@ struct SemState {
 
 // Same descriptor-coercion trap as Semaphore/CountDownLatch above: the real
 // `java.util.concurrent.CyclicBarrier` layout is lock(0,L), trip(1,L),
-// parties(2,I), barrierCommand(3,L), generation(4,L), count(5,I) — so the
-// synthetic Int writes to slots 0/1 were coerced to null and the "broken"
-// write to slot 2 landed in the REAL `parties` int. Keep the three ints in an
-// int[3] holder ([0]=parties, [1]=count, [2]=broken) stored in slot 0 (an
-// `L` slot — an object survives). Raw-Int fallback covers legacy synthetic
-// allocations.
+// parties(2,I), barrierCommand(3,L), generation(4,L), count(5,I) — so a
+// synthetic Int write to slot 0/1 is coerced to null and a "broken" write to
+// slot 2 lands in the REAL `parties` int. All the state therefore lives in a
+// holder object parked in slot 0, which is an `L` slot in the real layout (an
+// object survives there) and an untyped slot in the synthetic stub.
+//
+// HOLDER LAYOUT — receiver slot 0 holds a REFERENCE array of length 2:
+//
+//     [0] = long[4] { parties, count, generation, broken_gen }
+//     [1] = the barrier action `Runnable`, or null
+//
+// The nesting exists so the action can be stored **without** punning a second
+// slot. It used to be a bare `int[3]` and the two-arg constructor threw the
+// `Runnable` away with a "Simplified: ignore the barrier action" comment, so
+// `new CyclicBarrier(2, action)` ran the action zero times where HotSpot runs
+// it once per trip. Parking a reference in another declared-`int` slot to fix
+// that is exactly the shape the GC's W7-84 guard reports and auto-boxes; one
+// reference array holding one primitive array and one `Runnable` is type-clean
+// on both sides and costs one extra indirection per access.
+//
+// `generation`/`broken_gen` are `long` and not `int` so that the
+// "is this generation broken" comparison below can never alias by wraparound.
+// Raw-Int fallback covers legacy synthetic allocations whose slots were
+// written before any native ran.
+
+/// Holder-array indices (NOT receiver object slots).
+const CB_HOLDER_STATE: usize = 0;
+const CB_HOLDER_ACTION: usize = 1;
+const CB_HOLDER_LEN: usize = 2;
+
+/// `long[4]` state indices (NOT receiver object slots).
+const CB_H_PARTIES: usize = 0;
+const CB_H_COUNT: usize = 1;
+/// Trip counter. A waiting party is released iff this has moved past the value
+/// it read on arrival — which is what makes the barrier CYCLIC. The previous
+/// "released iff `count` is back to 0" test was only valid while nobody
+/// re-entered the barrier: a released waiter preempted before it re-read `count`
+/// would find a faster party had already bumped it to 1.., conclude it had NOT
+/// been released, and wait again with its wake-up already spent. That left the
+/// barrier permanently one party short and deadlocked every later trip (100%
+/// reproducible with 4 parties over 20 rounds, JIT on and `--nojit`).
+const CB_H_GENERATION: usize = 2;
+/// The generation that was broken, or [`CB_NO_BREAK`]. Per-generation, not a
+/// flag: `reset()` has to break the generation its parked parties are waiting
+/// in — they must wake with `BrokenBarrierException` — while leaving the FRESH
+/// generation unbroken, so `isBroken()` reads false immediately afterwards.
+const CB_H_BROKEN_GEN: usize = 3;
+const CB_STATE_LEN: usize = 4;
+
+/// `broken_gen` value meaning "no generation has been broken". Generations
+/// start at 0 and only increase, so this can never collide with a real one.
+const CB_NO_BREAK: i64 = -1;
+
+/// Resolve (or lazily install) the receiver's holder array. Returns the
+/// possibly-relocated receiver alongside it — installing the holder allocates.
 fn cb_holder(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, ObjectRef) {
     if let Value::Object(Some(h)) = ctx.get_field(this, CB_FIELD_PARTIES) {
         return (this, h);
     }
     let legacy_parties = match ctx.get_field(this, CB_FIELD_PARTIES) {
-        Value::Int(v) => v,
+        Value::Int(v) => v as i64,
         _ => 0,
     };
     let legacy_count = match ctx.get_field(this, CB_FIELD_COUNT) {
-        Value::Int(v) => v,
+        Value::Int(v) => v as i64,
         _ => 0,
     };
     let legacy_broken = match ctx.get_field(this, CB_FIELD_BROKEN) {
         Value::Int(v) => v,
         _ => 0,
     };
-    // Pin across the allocation (moving-GC receiver-relocation hazard).
-    let this_pin = ctx.pin_native_root(this);
-    let h = ctx.new_array(cratonvm_types::ArrayElementType::Int, 3);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    ctx.set_array_element(h, 0, Value::Int(legacy_parties));
-    ctx.set_array_element(h, 1, Value::Int(legacy_count));
-    ctx.set_array_element(h, 2, Value::Int(legacy_broken));
-    ctx.set_field(this, CB_FIELD_PARTIES, Value::Object(Some(h)));
-    (this, h)
+    // Two allocations, so the receiver AND the first array must be rooted
+    // across the second (moving-GC relocation hazard).
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let state = scope.new_array(cratonvm_types::ArrayElementType::Long, CB_STATE_LEN);
+    let state_h = scope.root(state);
+    let holder = scope.new_array(cratonvm_types::ArrayElementType::Reference, CB_HOLDER_LEN);
+    let state = scope.get(&state_h);
+    let this = scope.get(&this_h);
+    scope.set_array_element(state, CB_H_PARTIES, Value::Long(legacy_parties));
+    scope.set_array_element(state, CB_H_COUNT, Value::Long(legacy_count));
+    scope.set_array_element(state, CB_H_GENERATION, Value::Long(0));
+    scope.set_array_element(
+        state,
+        CB_H_BROKEN_GEN,
+        Value::Long(if legacy_broken != 0 { 0 } else { CB_NO_BREAK }),
+    );
+    scope.set_array_element(holder, CB_HOLDER_STATE, Value::Object(Some(state)));
+    scope.set_array_element(holder, CB_HOLDER_ACTION, Value::Object(None));
+    scope.set_field(this, CB_FIELD_PARTIES, Value::Object(Some(holder)));
+    (this, holder)
 }
 
-fn cb_get(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize) -> i32 {
-    let (_, h) = cb_holder(ctx, this);
-    match ctx.get_array_element(h, idx) {
-        Value::Int(v) => v,
+/// The `long[4]` state array inside a holder.
+fn cb_state(ctx: &dyn NativeContext, holder: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_array_element(holder, CB_HOLDER_STATE) {
+        Value::Object(Some(s)) => Some(s),
+        _ => None,
+    }
+}
+
+fn cb_get(ctx: &dyn NativeContext, state: ObjectRef, idx: usize) -> i64 {
+    match ctx.get_array_element(state, idx) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
         _ => 0,
     }
 }
 
-fn cb_set(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize, v: i32) {
-    let (_, h) = cb_holder(ctx, this);
-    ctx.set_array_element(h, idx, Value::Int(v));
+fn cb_set(ctx: &dyn NativeContext, state: ObjectRef, idx: usize, v: i64) {
+    ctx.set_array_element(state, idx, Value::Long(v));
 }
 
-// Holder indices (NOT object slots).
-const CB_H_PARTIES: usize = 0;
-const CB_H_COUNT: usize = 1;
-const CB_H_BROKEN: usize = 2;
+/// Receiver + holder + state in one step, for every native below.
+fn cb_parts(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, ObjectRef, ObjectRef)> {
+    let (this, holder) = cb_holder(ctx, this);
+    let state = cb_state(ctx, holder)?;
+    Some((this, holder, state))
+}
+
+/// Shared constructor body. `action` is the `Runnable` from the two-arg form.
+fn cb_init_common(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    parties: i32,
+    action: Option<ObjectRef>,
+) -> MethodCallResult {
+    if parties <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "parties must be > 0".to_string(),
+        }
+        .into());
+    }
+    // `cb_holder` allocates, so the action has to be rooted across it too —
+    // it arrives as a raw `ObjectRef` from the caller's operand stack.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let action_h = action.map(|a| scope.root(a));
+    let this = scope.get(&this_h);
+    let Some((_, holder, state)) = cb_parts(&mut *scope, this) else {
+        return Ok(None);
+    };
+    scope.set_array_element(state, CB_H_PARTIES, Value::Long(parties as i64));
+    scope.set_array_element(state, CB_H_COUNT, Value::Long(0)); // number currently waiting
+    scope.set_array_element(state, CB_H_GENERATION, Value::Long(0));
+    scope.set_array_element(state, CB_H_BROKEN_GEN, Value::Long(CB_NO_BREAK));
+    let action_now = action_h.as_ref().map(|h| scope.get(h));
+    scope.set_array_element(holder, CB_HOLDER_ACTION, Value::Object(action_now));
+    Ok(None)
+}
 
 fn native_cb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -32395,24 +32617,58 @@ fn native_cb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if parties <= 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "parties must be > 0".to_string(),
-        }
-        .into());
-    }
-    let (this, h) = cb_holder(ctx, this);
-    let _ = this;
-    ctx.set_array_element(h, CB_H_PARTIES, Value::Int(parties));
-    ctx.set_array_element(h, CB_H_COUNT, Value::Int(0)); // number currently waiting
-    ctx.set_array_element(h, CB_H_BROKEN, Value::Int(0));
-    Ok(None)
+    cb_init_common(ctx, this, parties, None)
 }
 
+/// `CyclicBarrier(int parties, Runnable barrierAction)`.
+///
+/// The action is stored in the holder's reference slot and run by
+/// [`cb_await_inner`] on the last arriving thread. It used to be discarded
+/// outright.
 fn native_cb_init_action(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Simplified: ignore the barrier action Runnable
-    native_cb_init(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let parties = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let action = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    cb_init_common(ctx, this, parties, action)
 }
+
+/// Throw the REAL `java.util.concurrent.BrokenBarrierException` /
+/// `TimeoutException` for a barrier failure, rather than an
+/// `IllegalStateException` whose *message* merely names them.
+///
+/// `CyclicBarrier.await` declares both as checked exceptions and callers
+/// discriminate on the TYPE: `catch (TimeoutException)` to retry vs
+/// `catch (BrokenBarrierException)` to abandon the generation. An
+/// `IllegalStateException` matches neither, so a correct caller propagates a
+/// fatal error where HotSpot would have recovered.
+///
+/// Falls back to the historic `IllegalStateException` when the class cannot be
+/// constructed (synthetic-JDK mode without these classes registered), so no
+/// configuration loses the failure entirely.
+fn cb_throw(ctx: &mut dyn NativeContext, class_name: &str) -> MethodCallFailed {
+    match ctx.new_object_initialized(class_name, "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalStateException {
+            message: format!(
+                "{}: CyclicBarrier await",
+                class_name.rsplit('/').next().unwrap_or(class_name)
+            ),
+        }
+        .into(),
+    }
+}
+
+const CB_BROKEN_BARRIER: &str = "java/util/concurrent/BrokenBarrierException";
+const CB_TIMEOUT: &str = "java/util/concurrent/TimeoutException";
 
 /// Shared barrier-await. `deadline: None` blocks indefinitely (the plain
 /// `await()`, which previously returned WITHOUT waiting for the other
@@ -32424,59 +32680,96 @@ fn cb_await_inner(
 ) -> MethodCallResult {
     // Install the holder up-front so no allocation happens inside the
     // monitor section (re-binds `this` across the possible allocation).
-    let (this, _) = cb_holder(ctx, this);
+    let Some((this, holder, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    // Rebound after the barrier action runs, which can move all three.
+    let (mut this, mut holder, mut state) = (this, holder, state);
 
     ctx.monitor_enter(this);
-    if cb_get(ctx, this, CB_H_BROKEN) != 0 {
+    if cb_get(ctx, state, CB_H_BROKEN_GEN) == cb_get(ctx, state, CB_H_GENERATION) {
         ctx.monitor_exit(this);
-        return Err(RuntimeError::IllegalStateException {
-            message: "BrokenBarrierException".to_string(),
-        }
-        .into());
+        return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
     }
-    let parties = cb_get(ctx, this, CB_H_PARTIES).max(1);
-    let count = cb_get(ctx, this, CB_H_COUNT);
+    let parties = cb_get(ctx, state, CB_H_PARTIES).max(1);
+    let my_gen = cb_get(ctx, state, CB_H_GENERATION);
+    let count = cb_get(ctx, state, CB_H_COUNT);
     let new_count = count + 1;
 
     if new_count >= parties {
-        // All parties arrived: reset count for the next generation and wake
-        // the waiters. Return 0 (the last arrival's index).
-        cb_set(ctx, this, CB_H_COUNT, 0);
+        // Last party in. The barrier action runs HERE — still holding the
+        // monitor, with no party released yet — which is where
+        // `CyclicBarrier.nextGeneration` runs it under its own ReentrantLock.
+        // A caller can therefore rely on the action having completed before
+        // any `await()` returns.
+        let action = match ctx.get_array_element(holder, CB_HOLDER_ACTION) {
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
+        };
+        if let Some(action) = action {
+            let (run_result, this_now, holder_now, state_now) = {
+                let mut scope = NativeHandleScope::new(ctx);
+                let this_h = scope.root(this);
+                let holder_h = scope.root(holder);
+                let state_h = scope.root(state);
+                let action_h = scope.root(action);
+                let receiver = scope.get(&action_h);
+                let r = scope.invoke_virtual(receiver, "run", "()V", &[]);
+                (
+                    r,
+                    scope.get(&this_h),
+                    scope.get(&holder_h),
+                    scope.get(&state_h),
+                )
+            };
+            this = this_now;
+            holder = holder_now;
+            state = state_now;
+            let _ = holder;
+            if let Err(e) = run_result {
+                // HotSpot breaks the barrier and propagates: every other party
+                // must fail rather than silently proceed past an action that
+                // did not complete.
+                cb_set(ctx, state, CB_H_BROKEN_GEN, my_gen);
+                let _ = ctx.monitor_notify_all(this);
+                ctx.monitor_exit(this);
+                return Err(e);
+            }
+        }
+        // Trip: open the next generation and wake everyone parked in this one.
+        cb_set(ctx, state, CB_H_COUNT, 0);
+        cb_set(ctx, state, CB_H_GENERATION, my_gen.wrapping_add(1));
         let notify_result = ctx.monitor_notify_all(this);
         ctx.monitor_exit(this);
         notify_result?;
         return Ok(Some(Value::Int(0)));
     }
 
-    // Not all parties yet — record the arrival and wait for the trip (count
-    // reset to 0) or a timeout/broken barrier.
-    cb_set(ctx, this, CB_H_COUNT, new_count);
+    // Not all parties yet — record the arrival and wait for this generation to
+    // trip, break, or time out.
+    cb_set(ctx, state, CB_H_COUNT, new_count);
+    let arrival_index = (parties - new_count) as i32;
     loop {
-        let current_count = cb_get(ctx, this, CB_H_COUNT);
-        if current_count == 0 || current_count >= parties {
+        if cb_get(ctx, state, CB_H_BROKEN_GEN) == my_gen {
             ctx.monitor_exit(this);
-            return Ok(Some(Value::Int(parties - new_count)));
+            return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
         }
-        if cb_get(ctx, this, CB_H_BROKEN) != 0 {
+        if cb_get(ctx, state, CB_H_GENERATION) != my_gen {
             ctx.monitor_exit(this);
-            return Err(RuntimeError::IllegalStateException {
-                message: "BrokenBarrierException".to_string(),
-            }
-            .into());
+            return Ok(Some(Value::Int(arrival_index)));
         }
         let wait_ms = match deadline {
             Some(dl) => {
                 let remaining = dl.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    // Timeout — break the barrier so other waiters fail too.
-                    cb_set(ctx, this, CB_H_BROKEN, 1);
+                    // Timeout — break THIS generation so the other parties
+                    // waiting in it fail too, and leave it broken until
+                    // `reset()`, which is what `isBroken()` reports.
+                    cb_set(ctx, state, CB_H_BROKEN_GEN, my_gen);
                     let notify_result = ctx.monitor_notify_all(this);
                     ctx.monitor_exit(this);
                     notify_result?;
-                    return Err(RuntimeError::IllegalStateException {
-                        message: "TimeoutException: CyclicBarrier await timed out".to_string(),
-                    }
-                    .into());
+                    return Err(cb_throw(ctx, CB_TIMEOUT));
                 }
                 bounded_monitor_wait_ms(remaining, 10)
             }
@@ -32512,7 +32805,7 @@ fn native_cb_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -32526,8 +32819,10 @@ fn native_cb_get_parties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let parties = cb_get(ctx, this, CB_H_PARTIES);
-    Ok(Some(Value::Int(parties)))
+    let Some((_, _, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    Ok(Some(Value::Int(cb_get(ctx, state, CB_H_PARTIES) as i32)))
 }
 
 fn native_cb_get_number_waiting(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -32535,32 +32830,315 @@ fn native_cb_get_number_waiting(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let count = cb_get(ctx, this, CB_H_COUNT);
-    Ok(Some(Value::Int(count)))
+    let Some((_, _, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    Ok(Some(Value::Int(cb_get(ctx, state, CB_H_COUNT) as i32)))
 }
 
+/// `isBroken()` asks about the CURRENT generation, not about whether the
+/// barrier was ever broken — which is why `reset()` below can leave a broken
+/// generation behind and still report false.
 fn native_cb_is_broken(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let broken = cb_get(ctx, this, CB_H_BROKEN);
-    Ok(Some(Value::Int(broken)))
+    let Some((_, _, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let broken = cb_get(ctx, state, CB_H_BROKEN_GEN) == cb_get(ctx, state, CB_H_GENERATION);
+    Ok(Some(Value::Int(broken as i32)))
 }
 
+/// `reset()` — break the generation the parked parties are waiting in, then
+/// open a fresh, unbroken one.
+///
+/// Both halves matter: parties already at the barrier must wake with
+/// `BrokenBarrierException` (they were promised a trip that will not happen),
+/// while `isBroken()` must read false immediately afterwards. Clearing a single
+/// "broken" flag cannot express that — the waiters have not run yet when
+/// `reset()` returns, so by the time they look, the flag they needed to see is
+/// already gone.
 fn native_cb_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let (this, _) = cb_holder(ctx, this);
+    let Some((this, _, state)) = cb_parts(ctx, this) else {
+        return Ok(None);
+    };
     ctx.monitor_enter(this);
-    cb_set(ctx, this, CB_H_COUNT, 0);
-    cb_set(ctx, this, CB_H_BROKEN, 0);
+    let gen = cb_get(ctx, state, CB_H_GENERATION);
+    cb_set(ctx, state, CB_H_BROKEN_GEN, gen);
+    cb_set(ctx, state, CB_H_COUNT, 0);
+    cb_set(ctx, state, CB_H_GENERATION, gen.wrapping_add(1));
     let notify_result = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
     notify_result?;
     Ok(None)
+}
+
+#[cfg(test)]
+mod cyclic_barrier_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::NativeHeapAccess;
+    use cratonvm_types::ArrayElementType;
+
+    /// Slot the counting hook keeps its tally in, on the action object itself —
+    /// the hook is a plain `fn` and cannot capture a counter.
+    const ACTION_RUN_COUNT_SLOT: usize = 0;
+
+    fn count_run_calls(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "run" && descriptor == "()V" {
+            let prev = match ctx.get_field(receiver, ACTION_RUN_COUNT_SLOT) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            ctx.set_field(receiver, ACTION_RUN_COUNT_SLOT, Value::Int(prev + 1));
+            return Some(Ok(None));
+        }
+        None
+    }
+
+    fn failing_run(
+        _ctx: &mut crate::test_utils::MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "run" && descriptor == "()V" {
+            return Some(Err(RuntimeError::IllegalStateException {
+                message: "barrier action blew up".to_string(),
+            }
+            .into()));
+        }
+        None
+    }
+
+    fn new_barrier_obj(ctx: &mut crate::test_utils::MockNativeContext) -> ObjectRef {
+        match ctx.new_object("java/util/concurrent/CyclicBarrier") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("expected a receiver, got {other:?}"),
+        }
+    }
+
+    fn runs(ctx: &crate::test_utils::MockNativeContext, action: ObjectRef) -> i32 {
+        match ctx.get_field(action, ACTION_RUN_COUNT_SLOT) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    }
+
+    /// The `Runnable` handed to `CyclicBarrier(int, Runnable)` must run once per
+    /// trip, on the last party in.
+    ///
+    /// It used to be discarded by the constructor — `native_cb_init_action` was
+    /// `native_cb_init` with a "Simplified: ignore the barrier action" comment —
+    /// so `barrierActionRuns` was 0 where HotSpot says 1. One party is enough to
+    /// measure it: `await()` with `parties == 1` IS the last arrival.
+    #[test]
+    fn barrier_action_runs_once_per_trip() {
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(count_run_calls);
+
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(1),
+                Value::Object(Some(action)),
+            ],
+        )
+        .unwrap();
+
+        for expected in 1..=3 {
+            let idx = native_cb_await(&mut ctx, &[Value::Object(Some(barrier))])
+                .unwrap()
+                .unwrap();
+            assert_eq!(idx, Value::Int(0), "the last arrival's index is 0");
+            assert_eq!(
+                runs(&ctx, action),
+                expected,
+                "the barrier action must run once per trip"
+            );
+        }
+    }
+
+    /// The ONE-arg constructor has no action, and must not invent one by reading
+    /// whatever the holder's action slot happens to hold.
+    #[test]
+    fn barrier_without_an_action_runs_nothing() {
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(count_run_calls);
+
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(1)]).unwrap();
+        native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+        assert_eq!(runs(&ctx, action), 0);
+    }
+
+    /// The action is stored in a REFERENCE slot of a reference array, not punned
+    /// into a slot the class declares as an `int`.
+    ///
+    /// That is the whole reason the holder gained a level: the receiver's slot 0
+    /// is `lock` in the real layout and an untyped stub slot in the synthetic
+    /// one, and parking a `Runnable` in a second slot would be the shape the
+    /// GC's W7-84 guard reports and auto-boxes.
+    #[test]
+    fn holder_keeps_state_and_action_in_typed_arrays() {
+        let mut ctx = mock_ctx();
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(4),
+                Value::Object(Some(action)),
+            ],
+        )
+        .unwrap();
+
+        let holder = match ctx.get_field(barrier, CB_FIELD_PARTIES) {
+            Value::Object(Some(h)) => h,
+            other => panic!("expected the holder in slot 0, got {other:?}"),
+        };
+        assert_eq!(ctx.heap_element_type_of(holder), ArrayElementType::Reference);
+        assert_eq!(ctx.array_length(holder), CB_HOLDER_LEN);
+        assert_eq!(
+            ctx.get_array_element(holder, CB_HOLDER_ACTION),
+            Value::Object(Some(action))
+        );
+
+        let state = cb_state(&ctx, holder).expect("state array");
+        assert_eq!(ctx.heap_element_type_of(state), ArrayElementType::Long);
+        assert_eq!(ctx.array_length(state), CB_STATE_LEN);
+        assert_eq!(cb_get(&ctx, state, CB_H_PARTIES), 4);
+        assert_eq!(cb_get(&ctx, state, CB_H_BROKEN_GEN), CB_NO_BREAK);
+    }
+
+    /// A trip opens a NEW generation instead of only clearing `count`.
+    ///
+    /// The old release test was "`count` is back to 0", which is only valid
+    /// while nobody re-enters the barrier: a released waiter preempted before it
+    /// re-read `count` would find a faster party had already bumped it, decide
+    /// it had not been released, and park again with its wake-up spent — one
+    /// party short, and every later trip deadlocked. The generation only ever
+    /// moves forward, so a waiter's "did my generation end" test cannot be
+    /// undone by the next round starting.
+    #[test]
+    fn a_trip_advances_the_generation() {
+        let mut ctx = mock_ctx();
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(1)]).unwrap();
+        let holder = match ctx.get_field(barrier, CB_FIELD_PARTIES) {
+            Value::Object(Some(h)) => h,
+            other => panic!("expected the holder, got {other:?}"),
+        };
+        let state = cb_state(&ctx, holder).expect("state array");
+
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 0);
+        native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 1);
+        assert_eq!(cb_get(&ctx, state, CB_H_COUNT), 0);
+        native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 2);
+    }
+
+    /// `reset()` breaks the generation its parked parties are waiting in, and
+    /// still reports `isBroken() == false` — the two are not in conflict, they
+    /// are about different generations.
+    #[test]
+    fn reset_breaks_the_old_generation_and_reports_unbroken() {
+        let mut ctx = mock_ctx();
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(3)]).unwrap();
+        let holder = match ctx.get_field(barrier, CB_FIELD_PARTIES) {
+            Value::Object(Some(h)) => h,
+            other => panic!("expected the holder, got {other:?}"),
+        };
+        let state = cb_state(&ctx, holder).expect("state array");
+        // Two of three parties have arrived and are parked.
+        cb_set(&ctx, state, CB_H_COUNT, 2);
+
+        native_cb_reset(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+
+        assert_eq!(
+            cb_get(&ctx, state, CB_H_BROKEN_GEN),
+            0,
+            "generation 0 — the one the parked parties are in — must be broken"
+        );
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 1);
+        assert_eq!(
+            native_cb_is_broken(&mut ctx, &[Value::Object(Some(barrier))]).unwrap(),
+            Some(Value::Int(0)),
+            "the FRESH generation is not broken"
+        );
+        assert_eq!(
+            native_cb_get_number_waiting(&mut ctx, &[Value::Object(Some(barrier))]).unwrap(),
+            Some(Value::Int(0))
+        );
+    }
+
+    /// An action that throws breaks the barrier and propagates, rather than
+    /// letting the parties past a trip whose action did not complete.
+    #[test]
+    fn a_failing_barrier_action_breaks_the_barrier() {
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(failing_run);
+
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(1),
+                Value::Object(Some(action)),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).is_err(),
+            "the action's failure must reach the caller"
+        );
+        assert_eq!(
+            native_cb_is_broken(&mut ctx, &[Value::Object(Some(barrier))]).unwrap(),
+            Some(Value::Int(1))
+        );
+        // ...and the barrier stays broken for the next party in.
+        assert!(native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).is_err());
+    }
+
+    /// `parties <= 0` is rejected by BOTH constructors.
+    #[test]
+    fn zero_parties_is_rejected_by_both_constructors() {
+        let mut ctx = mock_ctx();
+        let barrier = new_barrier_obj(&mut ctx);
+        assert!(native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(0)]).is_err());
+        assert!(native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(-1),
+                Value::Object(None)
+            ]
+        )
+        .is_err());
+    }
 }
 
 // ===========================================================================
@@ -39476,7 +40054,7 @@ fn native_exception_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
     // Real-JDK layout: detailMessage at slot 1; synthetic stubs put it at 0.
-    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    let by_name = crate::lang_misc::throwable_field_get(ctx, this, "detailMessage");
     if matches!(by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
     }
@@ -39513,7 +40091,7 @@ fn native_exception_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         .class_name_of_id(ctx.class_id_of_object(this))
         .map(|n| n.replace('/', "."))
         .unwrap_or_else(|| "java.lang.Throwable".to_string());
-    let msg = match ctx.get_field_by_name(this, "detailMessage") {
+    let msg = match crate::lang_misc::throwable_field_get(ctx, this, "detailMessage") {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     };
@@ -40757,6 +41335,167 @@ fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodR
             "()[Ljava/lang/Object;",
             native_sync_collection_to_array,
         );
+        // The rest of the `Collection` contract, forwarded verbatim — see
+        // `sync_collection_delegate` for why a wrapper now needs all of it.
+        registry.register(class, "clear", "()V", |ctx, args| {
+            sync_collection_delegate(ctx, args, "clear", "()V", None)
+        });
+        registry.register(class, "toString", "()Ljava/lang/String;", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "toString",
+                "()Ljava/lang/String;",
+                Some(Value::Object(None)),
+            )
+        });
+        registry.register(class, "stream", "()Ljava/util/stream/Stream;", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "stream",
+                "()Ljava/util/stream/Stream;",
+                Some(Value::Object(None)),
+            )
+        });
+        registry.register(
+            class,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "spliterator",
+                    "()Ljava/util/Spliterator;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "forEach",
+                    "(Ljava/util/function/Consumer;)V",
+                    None,
+                )
+            },
+        );
+        registry.register(
+            class,
+            "containsAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "containsAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(class, "addAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "addAll",
+                "(Ljava/util/Collection;)Z",
+                Some(Value::Int(0)),
+            )
+        });
+        registry.register(
+            class,
+            "removeAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "removeAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "retainAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "removeIf",
+                    "(Ljava/util/function/Predicate;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "toArray",
+                    "([Ljava/lang/Object;)[Ljava/lang/Object;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "toArray",
+                    "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        // `equals`/`hashCode` ONLY on the Set wrapper, matching the JDK:
+        // `SynchronizedSet` overrides both to delegate (the Set contract),
+        // `SynchronizedCollection` inherits `Object` identity and must keep it.
+        if class == "java/util/Collections$SynchronizedSet" {
+            registry.register(class, "hashCode", "()I", |ctx, args| {
+                sync_collection_delegate(ctx, args, "hashCode", "()I", Some(Value::Int(0)))
+            });
+            registry.register(class, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "equals",
+                    "(Ljava/lang/Object;)Z",
+                    Some(Value::Int(0)),
+                )
+            });
+        }
     }
     let map = "java/util/Collections$SynchronizedMap";
     registry.register(map, "<init>", "(Ljava/util/Map;)V", native_sync_map_init);

@@ -56,6 +56,54 @@ fn ref_next_slot(ctx: &mut dyn NativeContext, ref_obj: cratonvm_types::ObjectRef
         .unwrap_or(REF_FIELD_NEXT)
 }
 
+/// Run `body` holding the `ReferenceQueue`'s own Java monitor, and hand it the
+/// post-acquire receiver.
+///
+/// **Why this exists (H2 `TestMultiThread`, 2026-08-16).** The real JDK guards
+/// `head`, `queueLength` and `Reference.next` with `ReferenceQueue.lock` — a
+/// `ReentrantLock` taken by `enqueue0`, `poll` and `remove` alike. The natives
+/// below REPLACE that bytecode, and until now supplied no exclusion of their
+/// own: `native_rq_poll` reads `head`, reads `head.next`, then writes both back,
+/// with nothing stopping a second thread from doing the same read in between.
+/// Two threads then pop the SAME reference and both return it, and a third
+/// interleaving loses a whole segment of the list.
+///
+/// Measured on this host, 8 threads × 400 phantom refs through one queue,
+/// against HotSpot's 3200-delivered / 0-duplicate baseline: unguarded CratonVM
+/// delivered 2882 with 152 duplicates; with the same natives serialized, 3186
+/// with 22. H2 sees it as `CloseWatcher.pollUnclosed` returning a watcher it has
+/// already removed from its `refs` set — or, when the crossed links strand a
+/// reclaimed slot, as `ClassCastException: class java.lang.String cannot be cast
+/// to class org.h2.util.CloseWatcher` out of a `ReferenceQueue.poll()`, which is
+/// what `new JdbcConnection(...)` → `closeOld()` raises on a concurrent open.
+///
+/// The QUEUE object's own monitor, deliberately, rather than a new global lock:
+/// it is per-queue (two unrelated queues never contend), it needs no new static
+/// and no new `Mutex`, and no Java code competes for it — JDK 9+ `ReferenceQueue`
+/// synchronizes on a private `ReentrantLock` field, never on `this`. The JDK's
+/// lock therefore nests strictly INSIDE this one on the delegating enqueue path
+/// (`native_ref_enqueue`'s real-layout arm) and never in the other order, so no
+/// cycle is introduced.
+///
+/// Plain `monitor_enter`, not `monitor_enter_gc_safe`: the contended wait on the
+/// ordinary path is not GC-blocked, so `queue` cannot move underneath it — but
+/// the pin is taken anyway and the body is handed the re-read receiver, since
+/// every caller here goes on to touch fields on it.
+fn with_queue_monitor<T>(
+    ctx: &mut dyn NativeContext,
+    queue: ObjectRef,
+    body: impl FnOnce(&mut dyn NativeContext, ObjectRef) -> T,
+) -> T {
+    let pin = ctx.pin_native_root(queue);
+    let entered = ctx.read_native_pin(pin, queue);
+    ctx.monitor_enter(entered);
+    let out = body(&mut *ctx, entered);
+    let entered = ctx.read_native_pin(pin, entered);
+    ctx.monitor_exit(entered);
+    ctx.unpin_native_roots(pin);
+    out
+}
+
 /// Register every `java.lang.ref.*` native. Called from
 /// `register_essential_natives` in `lib.rs`.
 pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
@@ -553,26 +601,36 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             let Value::Object(Some(queue)) = queue else {
                 return Ok(Some(Value::Int(0)));
             };
-            let queue_pin = ctx.pin_native_root(queue);
-            let result = {
+            // Under the queue's monitor like every other list mutation here:
+            // the JDK's `enqueue` takes its own `ReentrantLock`, which excludes
+            // this path against ITSELF but not against `native_rq_poll`, whose
+            // pop of the same `head` is pure native. See [`with_queue_monitor`].
+            let result = with_queue_monitor(ctx, queue, |ctx, queue| {
+                let queue_pin = ctx.pin_native_root(queue);
                 let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field_by_name(this, "referent", Value::Object(None));
                 let queue = ctx.read_native_pin(queue_pin, queue);
-                ctx.invoke_special(
+                let this = ctx.read_native_pin(this_pin, this);
+                let out = ctx.invoke_special(
                     "java/lang/ref/ReferenceQueue",
                     "enqueue",
                     "(Ljava/lang/ref/Reference;)Z",
                     &[Value::Object(Some(queue)), Value::Object(Some(this))],
-                )
-            };
-            ctx.unpin_native_roots(queue_pin);
+                );
+                ctx.unpin_native_roots(queue_pin);
+                out
+            });
             return result;
         }
         let queue = ctx.get_field(this, REF_FIELD_QUEUE);
         match queue {
             Value::Object(Some(q)) => {
-                let queue_pin = ctx.pin_native_root(q);
-                let result = {
+                // Same exclusion as the real-layout arm above and as
+                // `native_rq_poll` — this arm publishes a new `head` and links
+                // the old one through `next`, which is exactly the read-modify-
+                // write a concurrent poll must not interleave with.
+                let result = with_queue_monitor(ctx, q, |ctx, q| {
+                    let queue_pin = ctx.pin_native_root(q);
                     // `ref_next_slot` can resolve/load metadata. Root both
                     // participants and resolve it before loading old_head, so
                     // no unrooted queue-link value crosses that GC-capable call.
@@ -603,9 +661,9 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     // Mark as enqueued — sentinel Int(1) distinguishes from
                     // never having had a queue.
                     ctx.set_field(this, REF_FIELD_QUEUE, Value::Int(1));
+                    ctx.unpin_native_roots(queue_pin);
                     Ok(Some(Value::Int(1)))
-                };
-                ctx.unpin_native_roots(queue_pin);
+                });
                 result
             }
             _ => Ok(Some(Value::Int(0))), // no queue attached
@@ -687,8 +745,12 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // furthermore resolving Reference.next can allocate/load metadata. Root
     // both the queue and the dequeued reference, then reload each before every
     // field access in the linked-list update.
+    //
+    // The whole pop — read head, read head.next, publish next as the new head —
+    // runs under the queue's monitor. See [`with_queue_monitor`]: without it two
+    // concurrent pollers hand the same Reference to both callers.
     let this_pin = ctx.pin_native_root(this);
-    let result = (|| -> MethodCallResult {
+    let result = with_queue_monitor(ctx, this, |ctx, this| -> MethodCallResult {
         let this = ctx.read_native_pin(this_pin, this);
         if ctx.object_num_fields(this) < 2 {
             return Ok(Some(Value::Object(None)));
@@ -773,7 +835,7 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
             _ => Ok(Some(Value::Object(None))),
         }
-    })();
+    });
     ctx.unpin_native_roots(this_pin);
     result
 }

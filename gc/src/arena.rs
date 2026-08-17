@@ -252,6 +252,82 @@ pub struct Arena {
     /// much adjacency a merge could possibly have to collapse. Bumped by every
     /// push (`push_block_routed`), zeroed by the merge.
     free_pushed: usize,
+    /// Downward bump cursor for the HIGH region: allocations enter at
+    /// `capacity` and grow towards [`Self::cursor`]. `capacity` means the
+    /// region has never been used, which is the state every arena but ZGC's
+    /// stays in forever.
+    ///
+    /// # Why an arena needs two ends
+    ///
+    /// On a collector that does not compact, the largest servable request is
+    /// the largest gap between two survivors — so the allocator's own layout
+    /// decisions set the ceiling. Measured on Tomcat's
+    /// `TestNonBlockingAPI` under ZGC (2026-08-13), a 2,101,264-byte `char[]`
+    /// failed with 1.99 GB free because the biggest hole was 524,192 bytes:
+    /// one TLAB chunk. The report that found it named the walls exactly —
+    /// **544 live bytes in four runs (four `AQS$ConditionNode`s and two
+    /// `AQS$ExclusiveNode`s) standing inside 2,621,264 bytes of otherwise
+    /// contiguous arena**. Each parked thread leaves one small, long-lived
+    /// node inside its own 512 KiB private chunk, and one survivor per chunk
+    /// caps every hole in the heap at one chunk, permanently.
+    ///
+    /// Raising the chunk size only moves that ceiling (it was already raised
+    /// once, 64 KiB -> 512 KiB, when a 65,552-byte `DFAState[8192]` hit the
+    /// same wall). Separating the two populations removes it: a request too
+    /// big for any TLAB is served from the opposite end of the arena, where
+    /// the only neighbours it can ever have are other large objects — objects
+    /// that are orders of magnitude rarer, so their holes stay large.
+    ///
+    /// The two ends share the middle: neither has a fixed reservation, and
+    /// whichever population grows faster gets the space. When they meet,
+    /// `cursor == high_cursor` and the partition is fixed and exact for the
+    /// rest of the run, which is what makes the region test on a free block
+    /// (`offset >= high_cursor`) permanently correct.
+    high_cursor: usize,
+    /// Reclaimed regions at or above [`Self::high_cursor`] — the large-object
+    /// end's free list.
+    ///
+    /// A plain `Vec` scanned best-fit, deliberately, where the low end needed
+    /// a size-keyed map and a bitmap: the population here is large objects, of
+    /// which a running VM has thousands at most against the low end's tens of
+    /// millions. The scan is also on the *rarest* allocation path there is —
+    /// an object no TLAB will ever hold. Buying a `BTreeMap` here would be
+    /// paying the maintenance cost of the low end's structures for a list that
+    /// is three orders of magnitude shorter.
+    free_high: Vec<FreeBlock>,
+    /// Exact size of the largest block on [`Self::free_high`], or 0.
+    /// Recomputed by the scans that can lower it; raised by every push.
+    high_max: usize,
+    /// Bytes at the top of the arena the LOW bump will not consume while the
+    /// high end still has a claim on them. 0 disables the reserve, which is
+    /// what every arena but ZGC's uses.
+    ///
+    /// # Why a reserve, when the two ends already share the middle
+    ///
+    /// Sharing sounds fair and is not, because the two populations do not
+    /// compete at comparable rates. Measured on `TestNonBlockingAPI` under ZGC
+    /// (2026-08-13, `-Xmx 2g`) with the split in place but no reserve: the free
+    /// list at the failing allocation held **3,829 spans of ~512 KiB** — that
+    /// is 1.96 GB of a 2.15 GB arena consumed as thread-private TLAB chunks
+    /// alone, one per thread the workload created. The two cursors met while
+    /// the large-object end had claimed almost nothing, so the split existed
+    /// and bought nothing: a 2 MB `char[]` still had nowhere but the walled
+    /// low end to go.
+    ///
+    /// The reserve is what makes the split load-bearing rather than
+    /// theoretical. It is a **preference, not a wall**: the low end may still
+    /// take reserved bytes as its last resort before failing (see
+    /// [`Self::alloc`]), so a workload that allocates no large objects at all
+    /// loses nothing, and one that would otherwise OOM at the low end still
+    /// gets the memory.
+    ///
+    /// It also SHRINKS as it is used — `remaining_high_reserve` subtracts what
+    /// the high end has already bumped — so the reserve is a floor on the
+    /// large-object region's size, not an additional tax on top of it.
+    high_reserve: usize,
+    /// Blocks pushed to [`Self::free_high`] since the last high-end merge.
+    /// Same role as [`Self::free_pushed`] for the low end.
+    high_pushed: usize,
     /// How many pushes [`Arena::alloc`]'s last-resort merge waits for before it
     /// will sort the free list again.
     ///
@@ -356,6 +432,97 @@ fn sort_by_offset(v: &mut Vec<(usize, usize)>) {
     }
 }
 
+
+/// One contiguous stretch of the arena measured against a target request: the
+/// window of free spans — and the live "walls" standing between them — that
+/// would serve `request` at the least cost in bytes that would have to be
+/// moved out of the way.
+///
+/// This is the number that decides what a fragmentation OOM actually needs.
+/// `largest_free_block < request` says the request cannot be served; it does
+/// not say whether the heap is a mosaic of thousands of live objects (nothing
+/// short of relocation helps) or whether a *handful* of small survivors stands
+/// between gigabytes of otherwise contiguous free space (which a targeted fix
+/// can address). Those want opposite work, and the guard could not tell them
+/// apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FragWindow {
+    /// Arena offset the window starts at (the base of its first free span).
+    pub start: usize,
+    /// Arena offset the window ends at, exclusive (the end of its last span).
+    pub end: usize,
+    /// Free bytes inside the window.
+    pub free_bytes: usize,
+    /// Occupied bytes inside the window — what stands between the holes.
+    pub wall_bytes: usize,
+    /// How many separate occupied runs those bytes form.
+    pub walls: usize,
+}
+
+/// What a fragmented free list actually looks like, laid out across the arena.
+///
+/// Produced by [`Arena::frag_profile`] on the allocation-failure path only —
+/// it sorts the whole free list, so it is far too expensive for any path that
+/// is not already about to raise `OutOfMemoryError`.
+#[derive(Debug, Clone, Default)]
+pub struct FragProfile {
+    /// Bump high-water mark at the time of the failure.
+    pub cursor: usize,
+    /// Arena capacity.
+    pub capacity: usize,
+    /// Total free-list bytes (both tiers).
+    pub free_bytes: usize,
+    /// Free-list blocks (both tiers).
+    pub spans: usize,
+    /// Largest single free block.
+    pub largest_span: usize,
+    /// `(2^i, count)` — spans whose size is in `[2^i, 2^(i+1))`. Only
+    /// non-empty buckets are listed.
+    pub span_hist: Vec<(usize, usize)>,
+    /// Occupied runs strictly between two free spans.
+    pub walls: usize,
+    /// Bytes in those runs.
+    pub wall_bytes: usize,
+    /// `(2^i, count)` over wall sizes, non-empty buckets only.
+    pub wall_hist: Vec<(usize, usize)>,
+    /// The cheapest contiguous window that could serve the request, if the
+    /// swept region contains one at all.
+    pub cheapest: Option<FragWindow>,
+}
+
+/// `(2^i, count)` buckets over `sizes`, non-empty buckets only, ascending.
+fn log2_hist(sizes: impl Iterator<Item = usize>) -> Vec<(usize, usize)> {
+    let mut buckets = [0usize; 48];
+    for s in sizes {
+        let b = (usize::BITS - 1 - s.max(1).leading_zeros()) as usize;
+        buckets[b.min(47)] += 1;
+    }
+    buckets
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n != 0)
+        .map(|(b, &n)| (1usize << b, n))
+        .collect()
+}
+
+/// Render a `(2^i, count)` histogram compactly: `4K:12 512K:3892`.
+pub fn format_log2_hist(hist: &[(usize, usize)]) -> String {
+    fn unit(v: usize) -> String {
+        const NAMES: [&str; 5] = ["", "K", "M", "G", "T"];
+        let mut v = v;
+        let mut i = 0;
+        while v >= 1024 && i + 1 < NAMES.len() {
+            v /= 1024;
+            i += 1;
+        }
+        format!("{v}{}", NAMES[i])
+    }
+    hist.iter()
+        .map(|&(lo, n)| format!("{}:{n}", unit(lo)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Arena {
     /// Create a new arena with the given capacity in bytes.
     pub fn new(capacity: usize) -> Self {
@@ -384,6 +551,11 @@ impl Arena {
             anchor_shift: 0,
             free_pushed: 0,
             coalesce_threshold: COALESCE_THRESHOLD_MIN,
+            high_cursor: capacity,
+            free_high: Vec::new(),
+            high_max: 0,
+            high_pushed: 0,
+            high_reserve: 0,
         };
         a.rearm_alloc_anchors();
         a
@@ -510,7 +682,10 @@ impl Arena {
     /// and those want completely different fixes. Reported by the ZGC
     /// allocation-failure guard for exactly that reason.
     pub fn free_span_shape(&self) -> (usize, usize) {
-        (self.free_large_blocks, self.free_large.len())
+        (
+            self.free_large_blocks + self.free_high.len(),
+            self.free_large.len() + usize::from(!self.free_high.is_empty()),
+        )
     }
 
     /// The EXACT largest span, or 0 when the tier is empty.
@@ -809,7 +984,18 @@ impl Arena {
         let aligned = self.cursor.checked_add(align - 1).map(|v| v & !(align - 1));
         let end = aligned.and_then(|a| a.checked_add(alloc_size));
         if let (Some(aligned), Some(end)) = (aligned, end) {
-            if end <= self.data.len() {
+            // `high_cursor`, not `data.len()`: the two ends share one middle,
+            // and bumping past the descending cursor would hand out memory the
+            // large-object end has already allocated. On an arena that never
+            // used the high end and set no reserve this is `data.len()`
+            // verbatim.
+            //
+            // The reserve is subtracted here and NOT on the failure path below,
+            // which is the whole of what "preference, not a wall" means: an
+            // allocation that can be served any other way leaves the
+            // large-object floor alone, and one that cannot takes it rather
+            // than raising `OutOfMemoryError`.
+            if end <= self.high_cursor.saturating_sub(self.remaining_high_reserve()) {
                 // SAFETY: `aligned` is within `[0, self.data.len())` because
                 // `end <= self.data.len()` was just checked.
                 let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
@@ -884,7 +1070,346 @@ impl Arena {
                 return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
             }
         }
+
+        // ABSOLUTELY last, in two steps. First take from the large-object
+        // end's FREE LIST if it has anything: those bytes are already claimed
+        // by the high end, so spending them costs the reserve nothing.
+        if !self.free_high.is_empty() {
+            if let Some(off) = self.high_fit(alloc_size, align) {
+                // SAFETY: inside the consumed block.
+                return Some(unsafe { self.data.as_mut_ptr().add(off) });
+            }
+        }
+
+        // Then, and only then, eat into the UNCLAIMED reserve rather than fail.
+        //
+        // The reserve is a preference, not a wall — a workload that allocates
+        // no large objects must not be made to raise `OutOfMemoryError` over
+        // space nothing was ever going to claim. But it is the last preference
+        // to give up, after the free list, the un-reserved bump tail and the
+        // merge have all said no. Placing it earlier (its first home) made the
+        // reserve worthless: the low end reached it on ordinary TLAB churn and
+        // drained the whole reserve straight through it.
+        if self.high_reserve != 0 {
+            let aligned = self.cursor.checked_add(align - 1).map(|v| v & !(align - 1));
+            let end = aligned.and_then(|a| a.checked_add(alloc_size));
+            if let (Some(aligned), Some(end)) = (aligned, end) {
+                if end <= self.high_cursor {
+                    // SAFETY: `aligned < end <= high_cursor <= data.len()`.
+                    let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
+                    self.cursor = end;
+                    return Some(ptr);
+                }
+            }
+        }
         None
+    }
+
+    /// Is `offset` in the high (large-object) region?
+    ///
+    /// The test is a comparison against [`Self::high_cursor`] and nothing
+    /// else, which is exact for every block that exists: a block is only ever
+    /// published for memory that has been handed out, the high end only ever
+    /// hands out memory at or above its cursor, and that cursor only descends.
+    /// An arena that never called [`Self::alloc_high`] has
+    /// `high_cursor == capacity`, so nothing is ever high — the low end
+    /// behaves byte-for-byte as it did before the region existed.
+    #[inline]
+    fn is_high(&self, offset: usize) -> bool {
+        offset >= self.high_cursor
+    }
+
+    /// **Large-object allocation: bump DOWN from the top of the arena.**
+    ///
+    /// Same contract as [`Self::alloc`] — `size` bytes at `align`, `None` when
+    /// it cannot be served — over the opposite end of the same buffer. See
+    /// [`Self::high_cursor`] for why the two ends exist.
+    ///
+    /// A caller that gets `None` may still fall back to [`Self::alloc`]: the
+    /// two ends share one middle, so "the high end cannot serve this" does not
+    /// mean the low end cannot. ZGC does exactly that, because serving a large
+    /// object out of the small-object end is merely bad for future
+    /// fragmentation, while failing is an `OutOfMemoryError`.
+    pub fn alloc_high(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+        if size & 7 != 0 {
+            warn_unaligned_block("alloc-high-size", self.high_cursor, size);
+        }
+        // Same grid rounding as `alloc`: whole 8-byte units, so split
+        // remainders and both cursors stay on the object grid.
+        let size = size.checked_add(7)? & !7;
+        let alloc_size = size.checked_add(align - 1).map(|v| v & !(align - 1))?;
+
+        if let Some(off) = self.high_fit(alloc_size, align) {
+            // SAFETY: `off + alloc_size` lies within the consumed block, which
+            // came from a region inside the buffer.
+            return Some(unsafe { self.data.as_mut_ptr().add(off) });
+        }
+
+        // Bump path: descend. Align DOWN, because the allocation's base is
+        // what has to be aligned and the cursor is its end.
+        if let Some(base) = self.high_cursor.checked_sub(alloc_size) {
+            let base = base & !(align - 1);
+            if base >= self.cursor {
+                self.high_cursor = base;
+                // SAFETY: `base >= self.cursor` and `base + alloc_size` is at
+                // most the old cursor, hence within the buffer.
+                return Some(unsafe { self.data.as_mut_ptr().add(base) });
+            }
+        }
+
+        // Last resort before failing: merge this end's adjacent holes and look
+        // once more — the mirror of `alloc`'s last-resort merge, reached on the
+        // same terms (both the free list and the bump space have said no).
+        if self.high_pushed != 0 && self.coalesce_high() != 0 {
+            if let Some(off) = self.high_fit(alloc_size, align) {
+                // SAFETY: as above — inside the consumed block.
+                return Some(unsafe { self.data.as_mut_ptr().add(off) });
+            }
+        }
+        None
+    }
+
+    /// Best fit over [`Self::free_high`]: the smallest block that covers the
+    /// request plus its alignment padding. Removes the block, re-publishes the
+    /// head and tail remainders, and returns the allocation offset.
+    ///
+    /// Best fit rather than first fit for the reason the low end's span tier
+    /// gives: first fit over a size-mixed list carves large spans up for
+    /// requests a smaller block would have served, and dust at THIS end is
+    /// exactly the failure the region exists to prevent.
+    fn high_fit(&mut self, alloc_size: usize, align: usize) -> Option<usize> {
+        if self.free_high.is_empty() || alloc_size > self.high_max {
+            return None;
+        }
+        let base = self.data.as_ptr() as usize;
+        // (index, head padding, block size)
+        let mut best: Option<(usize, usize, usize)> = None;
+        for (i, block) in self.free_high.iter().enumerate() {
+            let block_addr = base + block.offset;
+            let padding = ((block_addr + align - 1) & !(align - 1)) - block_addr;
+            let Some(need) = padding.checked_add(alloc_size) else {
+                continue;
+            };
+            if need <= block.size && best.is_none_or(|(_, _, s)| block.size < s) {
+                best = Some((i, padding, block.size));
+            }
+        }
+        let (idx, padding, _) = best?;
+        let block = self.free_high.swap_remove(idx);
+        if block.size >= self.high_max {
+            // The block taken may have been the maximum; re-derive rather than
+            // leave a bound that over-states what is available. This list is
+            // short by construction — see the field doc.
+            self.high_max = self.free_high.iter().map(|b| b.size).max().unwrap_or(0);
+        }
+        self.free_bytes_total -= block.size;
+        let (offset, remainders) = Self::split(block, padding, alloc_size);
+        for r in remainders.into_iter().flatten() {
+            self.push_high(r);
+        }
+        Some(offset)
+    }
+
+    /// Publish a block to the high end's free list.
+    fn push_high(&mut self, block: FreeBlock) {
+        if block.size == 0 {
+            return;
+        }
+        if (block.offset | block.size) & 7 != 0 {
+            warn_unaligned_block("route-high", block.offset, block.size);
+        }
+        self.high_max = self.high_max.max(block.size);
+        self.free_bytes_total += block.size;
+        self.high_pushed += 1;
+        self.free_high.push(block);
+    }
+
+    /// Merge adjacent holes at the high end. Returns blocks removed.
+    ///
+    /// Separate from [`Self::coalesce_free_list`] rather than folded into it,
+    /// so that no merge can ever produce a block straddling
+    /// `cursor == high_cursor` once the two ends meet. Such a block would be
+    /// genuinely contiguous free memory, but it would also be routed by its own
+    /// offset into ONE of the two lists — silently moving the partition, and
+    /// with it the region test every other method here relies on.
+    pub fn coalesce_high(&mut self) -> usize {
+        self.high_pushed = 0;
+        if self.free_high.len() < 2 {
+            return 0;
+        }
+        let before = self.free_high.len();
+        let mut v: Vec<(usize, usize)> = self.free_high.iter().map(|b| (b.offset, b.size)).collect();
+        sort_by_offset(&mut v);
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(before);
+        for (off, sz) in v {
+            if let Some(last) = merged.last_mut() {
+                let last_end = last.0 + last.1;
+                if off <= last_end {
+                    last.1 = last_end.max(off + sz) - last.0;
+                    continue;
+                }
+            }
+            merged.push((off, sz));
+        }
+        if merged.len() == before {
+            return 0;
+        }
+        let removed = before - merged.len();
+        for b in self.free_high.drain(..) {
+            self.free_bytes_total -= b.size;
+        }
+        self.high_max = 0;
+        for (off, sz) in merged {
+            self.push_high(FreeBlock {
+                offset: off,
+                size: sz,
+            });
+        }
+        self.high_pushed = 0;
+        removed
+    }
+
+    /// Un-bump a wholly-free head of the high region: the mirror of
+    /// [`Self::retract_cursor_into_free_tail`].
+    ///
+    /// The low end's version exists because objects die young, so the top of
+    /// its bump region is usually all garbage. The same is true here from the
+    /// other side — a burst of large buffers that all die leaves the LOWEST
+    /// part of the high region (the most recently bumped) free — and without
+    /// this the downward cursor is the one-way ratchet the upward one was
+    /// before it got its retraction: once a process has cumulatively allocated
+    /// its capacity, every later request must fit an existing hole however
+    /// little is live.
+    ///
+    /// Callers must coalesce first, so the lowest block is already maximal.
+    /// Returns the bytes handed back (0 when a live object sits at the bottom
+    /// of the region, the ordinary case).
+    pub fn retract_high_cursor_into_free_head(&mut self) -> usize {
+        let Some((idx, block)) = self
+            .free_high
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| b.offset)
+            .map(|(i, b)| (i, *b))
+        else {
+            return 0;
+        };
+        if block.size == 0 || block.offset != self.high_cursor {
+            return 0;
+        }
+        // Refuse to retract below the reserve, and this is the whole reason the
+        // check exists rather than a tidiness bound.
+        //
+        // Retracting moves bytes out of `free_high` into the SHARED middle,
+        // where the low end can take them — and the low end, on a thread-heavy
+        // workload, is carving 512 KiB TLAB chunks continuously. Measured on
+        // `TestNonBlockingAPI` with this ungated: the large-object region
+        // claimed 92 MB, then every sweep handed its freed head back to the
+        // middle, the low end took it, and the region reached the failing
+        // allocation holding **3,224 free bytes** — drained to its own live
+        // set, one sweep at a time. The low end's own retraction has no such
+        // hazard because there is no third party to lose the bytes to.
+        //
+        // So retraction survives only for what it is actually good for: a
+        // region that over-claimed relative to its floor handing the excess
+        // back.
+        //
+        // Partial, not all-or-nothing: hand back exactly the excess. A merged
+        // free head is frequently larger than the excess, and refusing the
+        // whole thing would mean a region that over-claimed early never gave
+        // any of it back.
+        let region = self.data.len() - self.high_cursor;
+        let give = region
+            .saturating_sub(self.high_reserve)
+            .min(block.size)
+            & !7;
+        if give == 0 {
+            return 0;
+        }
+        // Those bytes are becoming un-bumped space; leaving them listed would
+        // hand them out twice. The part that stays reserved stays listed.
+        self.free_high.swap_remove(idx);
+        self.free_bytes_total -= block.size;
+        self.high_max = self.free_high.iter().map(|b| b.size).max().unwrap_or(0);
+        self.high_cursor += give;
+        if give < block.size {
+            self.push_high(FreeBlock {
+                offset: block.offset + give,
+                size: block.size - give,
+            });
+        }
+        give
+    }
+
+    /// The high region's downward bump cursor. Diagnostics and tests.
+    pub fn high_cursor(&self) -> usize {
+        self.high_cursor
+    }
+
+    /// Set the large-object bump reserve. See [`Self::high_reserve`].
+    ///
+    /// Clamped to a quarter of capacity: past that the reserve stops being a
+    /// floor under one population and becomes a ceiling over the other.
+    pub fn set_high_reserve(&mut self, bytes: usize) {
+        self.high_reserve = bytes.min(self.data.len() / 4);
+    }
+
+    /// How much of [`Self::high_reserve`] the high end has not yet claimed.
+    ///
+    /// Subtracting what it has already bumped is what makes the reserve a
+    /// FLOOR on the region rather than a permanent tax: once the large-object
+    /// end holds `high_reserve` bytes of its own, the reserve is zero and the
+    /// low end may bump right up to it again.
+    #[inline]
+    fn remaining_high_reserve(&self) -> usize {
+        self.high_reserve
+            .saturating_sub(self.data.len() - self.high_cursor)
+    }
+
+    /// Current size of the large-object region (`capacity - high_cursor`).
+    /// Diagnostic/test helper — `capacity` and `high_cursor` say the same
+    /// thing but read as arithmetic at every call site.
+    pub fn high_region_bytes(&self) -> usize {
+        self.data.len() - self.high_cursor
+    }
+
+    /// The exact largest block on the LOW end alone.
+    ///
+    /// [`Self::largest_free_block`] folds in the large-object end, which is the
+    /// right answer for "what could this arena hand out" and the wrong one for
+    /// a caller sizing a small-object allocation: acting on a high-end block's
+    /// size would size a TLAB chunk that the low end then cannot serve.
+    pub fn largest_low_free_block(&self) -> usize {
+        let large = self.large_max();
+        if large > 0 {
+            large
+        } else {
+            self.small_max_floor()
+        }
+    }
+
+    /// Bytes of [`Self::high_reserve`] the large-object end has not claimed
+    /// yet — i.e. how much of the shared middle is spoken for.
+    ///
+    /// Published because a GC trigger sized against the WHOLE arena's un-bumped
+    /// tail cannot see it, and that is the difference between collecting while
+    /// the reserve is intact and collecting after the small-object end has
+    /// bumped straight through it.
+    pub fn unclaimed_high_reserve(&self) -> usize {
+        self.remaining_high_reserve()
+    }
+
+    /// Free-list state of the large-object end: `(blocks, bytes, largest)`.
+    /// Diagnostics only — the allocation-failure report prints it beside the
+    /// low end's, because "the split is in place" and "the split has any space
+    /// in it" are different claims and only the second one predicts an OOM.
+    pub fn high_free_shape(&self) -> (usize, usize, usize) {
+        (
+            self.free_high.len(),
+            self.free_high.iter().map(|b| b.size).sum(),
+            self.high_max,
+        )
     }
 
     /// Merge adjacent (and defensively overlapping) free blocks into maximal
@@ -908,7 +1433,10 @@ impl Arena {
             return 0;
         }
         self.free_pushed = 0;
-        let sorted = self.free_blocks_sorted();
+        // LOW blocks only. The high end merges through `coalesce_high`, and
+        // keeping the two apart is what guarantees no span can straddle the
+        // point where the two cursors meet — see `coalesce_high`.
+        let sorted = self.low_blocks_sorted();
         if sorted.len() < 2 {
             return 0;
         }
@@ -938,7 +1466,7 @@ impl Arena {
             return 0;
         }
         let removed = before - merged.len();
-        self.clear_free_list();
+        self.clear_low_free_list();
         for (off, sz) in merged {
             self.add_free_block(off, sz);
         }
@@ -962,14 +1490,24 @@ impl Arena {
     /// region of the arena.
     pub fn add_free_block(&mut self, offset: usize, size: usize) {
         debug_assert!(
-            offset + size <= self.cursor,
-            "free block must lie within the bump region",
+            offset + size <= self.cursor || self.is_high(offset),
+            "free block must lie within one of the two bump regions",
         );
         if size == 0 {
             return;
         }
         if (offset | size) & 7 != 0 {
             warn_unaligned_block("add_free_block", offset, size);
+        }
+        // Region routing. A reclaimed span goes back to the end it was carved
+        // from, and `max_free_upper` deliberately does NOT see the high end:
+        // that bound exists to let the LOW tiers skip their scans, the high
+        // end has its own exact `high_max`, and folding the two would make a
+        // large free buffer at the top cause pointless small-tier scans on
+        // every small allocation.
+        if self.is_high(offset) {
+            self.push_high(FreeBlock { offset, size });
+            return;
         }
         self.max_free_upper = self.max_free_upper.max(size);
         self.push_block_routed(FreeBlock { offset, size });
@@ -987,6 +1525,9 @@ impl Arena {
         self.free_large.clear();
         self.free_large_blocks = 0;
         self.max_free_upper = 0;
+        self.free_high.clear();
+        self.high_max = 0;
+        self.high_pushed = 0;
         self.free_bytes_total = 0;
         // An empty list holds no adjacency.
         self.free_pushed = 0;
@@ -1036,11 +1577,17 @@ impl Arena {
         let large = self.large_max();
         // Any span is >= LARGE_BLOCK_MIN, which is larger than every block in
         // the small tier by construction — so a non-zero span maximum is the
-        // overall maximum and the small tier need not be consulted.
-        if large > 0 {
-            return large;
-        }
-        self.small_max_floor()
+        // overall maximum of the LOW end and the small tier need not be
+        // consulted. The high end is a separate list and is always folded in:
+        // every caller of this is asking "what is the biggest thing this arena
+        // could hand out", and after the two-ended split that answer is
+        // frequently a large-object hole.
+        let low = if large > 0 {
+            large
+        } else {
+            self.small_max_floor()
+        };
+        low.max(self.high_max)
     }
 
     /// Early-exit probe: is there any single free block of at least `size`
@@ -1061,7 +1608,13 @@ impl Arena {
     /// probe — the highest occupied size class answers directly.
     pub fn has_free_block_at_least(&mut self, size: usize) -> bool {
         if size == 0 {
-            return !self.free_is_empty();
+            return !self.free_is_empty() || !self.free_high.is_empty();
+        }
+        // The high end first: `high_max` is exact, so this is one compare and
+        // it cannot be answered by the low-tier bound below (which deliberately
+        // never sees high blocks — see `add_free_block`).
+        if self.high_max >= size {
+            return true;
         }
         if size > self.max_free_upper {
             return false;
@@ -1106,6 +1659,152 @@ impl Arena {
         }
     }
 
+    /// Lay the free list out across the arena and measure what stands between
+    /// its holes, against one target `request`.
+    ///
+    /// **Failure path only.** This sorts the entire free list (the same
+    /// `free_blocks_sorted` a sweep pays for once a cycle) and then makes a
+    /// few linear passes over it, so it costs what a sweep's merge costs.
+    /// Every caller is one step from raising `OutOfMemoryError`.
+    ///
+    /// The interesting output is [`FragProfile::cheapest`]: the contiguous
+    /// window of arena that would serve `request` while displacing the fewest
+    /// live bytes. `wall_bytes == 0` there would mean the free list was merely
+    /// split and a coalesce would have served the request; a small
+    /// `wall_bytes` over a small `walls` count means a handful of survivors is
+    /// holding the whole window hostage; a `wall_bytes` comparable to
+    /// `request` means the region really is a live/dead mosaic and only
+    /// relocation can serve it. Those three want completely different fixes,
+    /// and `largest_free_block < request` cannot tell them apart.
+    pub fn frag_profile(&self, request: usize) -> FragProfile {
+        let blocks = self.free_blocks_sorted();
+        let mut profile = FragProfile {
+            cursor: self.cursor,
+            capacity: self.data.len(),
+            free_bytes: self.free_bytes_total,
+            spans: blocks.len(),
+            largest_span: self.largest_free_block(),
+            span_hist: log2_hist(blocks.iter().map(|&(_, s)| s)),
+            ..FragProfile::default()
+        };
+        if blocks.is_empty() {
+            return profile;
+        }
+        // `gap[k]` is the occupied run between block `k` and block `k + 1`.
+        // Adjacent spans (a list the coalescer has not merged yet) give a zero
+        // gap, which is deliberately not counted as a wall — it is not
+        // standing in anybody's way.
+        let gaps: Vec<usize> = blocks
+            .windows(2)
+            .map(|w| w[1].0.saturating_sub(w[0].0 + w[0].1))
+            .collect();
+        profile.walls = gaps.iter().filter(|&&g| g != 0).count();
+        profile.wall_bytes = gaps.iter().sum();
+        profile.wall_hist = log2_hist(gaps.iter().copied().filter(|&g| g != 0));
+
+        // Cheapest window. `blocks[i].0 .. blocks[j].0 + blocks[j].1` is one
+        // contiguous stretch of arena; it can hold `request` once it is that
+        // wide, and the price of using it is every occupied byte strictly
+        // inside it. Widening a window can only add wall bytes, so for each
+        // left edge the FIRST `j` that reaches `request` is also the cheapest,
+        // and `j` only ever moves right as `i` does — one pass, not a
+        // quadratic search.
+        //
+        // Both quantities come from prefix sums rather than incremental
+        // add/remove bookkeeping: the wall bytes inside a window are its total
+        // width minus its free bytes, which needs no per-edge fixups to stay
+        // correct.
+        if request != 0 {
+            // `free_prefix[k]` = free bytes in `blocks[..k]`.
+            let mut free_prefix = Vec::with_capacity(blocks.len() + 1);
+            free_prefix.push(0usize);
+            for &(_, s) in &blocks {
+                let last = *free_prefix.last().expect("seeded with 0");
+                free_prefix.push(last + s);
+            }
+            // `wallcount_prefix[k]` = non-zero gaps in `gaps[..k]`.
+            let mut wallcount_prefix = Vec::with_capacity(gaps.len() + 1);
+            wallcount_prefix.push(0usize);
+            for &g in &gaps {
+                let last = *wallcount_prefix.last().expect("seeded with 0");
+                wallcount_prefix.push(last + usize::from(g != 0));
+            }
+            let mut best: Option<FragWindow> = None;
+            let mut j = 0usize;
+            for i in 0..blocks.len() {
+                if j < i {
+                    j = i;
+                }
+                while j < blocks.len()
+                    && (blocks[j].0 + blocks[j].1).saturating_sub(blocks[i].0) < request
+                {
+                    j += 1;
+                }
+                if j >= blocks.len() {
+                    // No window with this left edge is wide enough, and every
+                    // later left edge starts further right, so none is either.
+                    break;
+                }
+                let start = blocks[i].0;
+                let end = blocks[j].0 + blocks[j].1;
+                let free_bytes = free_prefix[j + 1] - free_prefix[i];
+                let cand = FragWindow {
+                    start,
+                    end,
+                    free_bytes,
+                    wall_bytes: (end - start).saturating_sub(free_bytes),
+                    walls: wallcount_prefix[j] - wallcount_prefix[i],
+                };
+                if best.is_none_or(|b| (cand.wall_bytes, cand.walls) < (b.wall_bytes, b.walls)) {
+                    best = Some(cand);
+                }
+            }
+            profile.cheapest = best;
+        }
+        profile
+    }
+
+    /// The LOW end's blocks as `(offset, size)`, sorted by ascending offset.
+    ///
+    /// The low-region twin of [`Self::free_blocks_sorted`]. Used by the two
+    /// operations that rebuild the low list ([`Self::coalesce_free_list`],
+    /// [`Self::retract_cursor_into_free_tail`]) — both of which must not see a
+    /// high block, because both re-publish what they read through
+    /// [`Self::add_free_block`], and a merge that straddled the two ends would
+    /// be re-routed into one of them by its own offset alone.
+    fn low_blocks_sorted(&self) -> Vec<(usize, usize)> {
+        let mut v: Vec<(usize, usize)> = self
+            .free_small
+            .iter()
+            .flatten()
+            .chain(self.free_large.values().flatten())
+            .map(|b| (b.offset, b.size))
+            .collect();
+        sort_by_offset(&mut v);
+        v
+    }
+
+    /// Drop every LOW-end block, leaving the high end untouched. The rebuild
+    /// half of the two low-list operations above.
+    fn clear_low_free_list(&mut self) {
+        let dropped: usize = self
+            .free_small
+            .iter()
+            .flatten()
+            .chain(self.free_large.values().flatten())
+            .map(|b| b.size)
+            .sum();
+        self.free_bytes_total -= dropped;
+        for bucket in self.free_small.iter_mut() {
+            bucket.clear();
+        }
+        self.small_mask = [0u64; SMALL_MASK_WORDS];
+        self.free_large.clear();
+        self.free_large_blocks = 0;
+        self.max_free_upper = 0;
+        self.free_pushed = 0;
+    }
+
     /// Snapshot of the current free list as `(offset, size)` pairs,
     /// sorted by ascending offset. Used by the non-moving sweep's object
     /// walker to skip holes the same way `OldGen::walk_objects` does.
@@ -1115,6 +1814,7 @@ impl Arena {
             .iter()
             .flatten()
             .chain(self.free_large.values().flatten())
+            .chain(self.free_high.iter())
             .map(|b| (b.offset, b.size))
             .collect();
         sort_by_offset(&mut v);
@@ -1151,13 +1851,114 @@ impl Arena {
     /// cursor (or the conservative root scanner is replaced with a precise
     /// stack map). The audit-flagged "perf bug" is a real cost, but the
     /// correctness hazard outweighs it.
+    /// Drop the low bump cursor to `new_cursor` after an external compaction
+    /// has slid every low-end survivor below it. Returns the bytes reclaimed.
+    ///
+    /// # Why this is not `retract_cursor_into_free_tail`
+    ///
+    /// That method is careful and incremental: it hands back only a free span
+    /// that ends exactly AT the cursor, because on a non-moving heap anything
+    /// else may still be live. This one is the compacting twin — the caller
+    /// asserts that everything above `new_cursor` at the low end is now dead,
+    /// which is a claim only a relocator that has just moved the survivors can
+    /// make. It is `pub(crate)` so that claim stays inside this crate.
+    ///
+    /// `touched` is the half-open offset range the slide actually WROTE into --
+    /// its destination window. Free blocks that overlap it are dropped, because
+    /// the slide places survivors without consulting this list and may have put
+    /// one on top of a hole. Everything else below `new_cursor` is kept.
+    ///
+    /// # The list used to be dropped wholesale, and that was the churn OOM
+    ///
+    /// The premise was "after a slide every low hole is inside the reclaimed
+    /// span by construction, so a surviving entry would name bytes that are now
+    /// un-bumped tail and would hand them out twice". True of a slide that
+    /// compacts the whole low region; this one compacts the pages the
+    /// relocation-set selector picked, into `[slide_floor, dest)`, and leaves
+    /// every other byte exactly where it was. A hole outside that window is a
+    /// real free block below the cursor, and dropping it loses the memory
+    /// permanently -- the sweep only ever free-lists objects that DIE, so a
+    /// hole that was already free when the slide ran is never re-discovered.
+    ///
+    /// Measured on `repros/frag-churn` (512 MiB heap, ~2 MiB live): the sweep
+    /// free-listed 400 MB, the slide cleared it, and from then on the bump
+    /// cursor advanced by EXACTLY the bytes allocated -- not one byte came from
+    /// the free list -- until it reached capacity and the VM threw
+    /// `OutOfMemoryError` with 99% of the heap dead. It is also why the arm
+    /// with the JIT ON survives: `relocate_stw` declines to relocate while a
+    /// compiled frame is live, so on that arm `compact_low_to` is barely
+    /// called and the free list is left alone.
+    ///
+    /// The **high end is untouched**. Large objects live above `high_cursor`
+    /// with their own free list, and this compaction does not move them; that
+    /// is a deliberate first cut, not an oversight — see
+    /// `ZgcRealHeap::relocate_stw`.
+    /// Bytes of the low region a compaction may consider -- the bump cursor.
+    ///
+    /// Not [`Self::used`], which folds in the large-object region at the other
+    /// end and would send a compactor walking addresses above `high_cursor`.
+    pub(crate) fn used_low_for_compaction(&self) -> usize {
+        self.cursor
+    }
+
+    pub(crate) fn compact_low_to(
+        &mut self,
+        new_cursor: usize,
+        touched: std::ops::Range<usize>,
+    ) -> usize {
+        assert!(
+            new_cursor <= self.cursor,
+            "compaction must not raise the cursor: {new_cursor} > {}",
+            self.cursor
+        );
+        let reclaimed = self.cursor - new_cursor;
+        // Zero the vacated span. A slid-down survivor leaves its old bytes
+        // behind verbatim, including a valid-looking `ObjectHeader`, and a
+        // conservative scanner that met one would resurrect a corpse.
+        self.data[new_cursor..self.cursor].fill(0);
+        self.cursor = new_cursor;
+        // Keep the holes the slide did not write into. A block is dropped if it
+        // overlaps the destination window (a survivor may be sitting on it) or
+        // reaches above the new cursor (those bytes are un-bumped tail now, and
+        // serving them from both the list and the cursor is the double-hand-out
+        // the wholesale clear was guarding against). A block that straddles the
+        // cursor is truncated rather than dropped.
+        let keep: Vec<(usize, usize)> = self
+            .low_blocks_sorted()
+            .into_iter()
+            .filter_map(|(off, size)| {
+                if off >= new_cursor {
+                    return None;
+                }
+                let size = size.min(new_cursor - off);
+                if size == 0 {
+                    return None;
+                }
+                let overlaps_touched = off < touched.end && touched.start < off + size;
+                (!overlaps_touched).then_some((off, size))
+            })
+            .collect();
+        self.clear_low_free_list();
+        for (off, size) in keep {
+            self.add_free_block(off, size);
+        }
+        // Every recorded low object start just moved.
+        self.clear_alloc_anchors();
+        reclaimed
+    }
+
     pub fn reset(&mut self) {
         // stw-residual-close forensics: record the wipe range before zeroing
         // (site 2 = from-space reset). Gated; no-op unless the env is set.
         crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
         // Zero out used region for safety (prevents stale data reads)
         self.data[..self.cursor].fill(0);
+        // The high region too, or a reset arena hands out bytes that still
+        // hold a previous object's header — the exact hazard `reset`'s own
+        // contract exists to close.
+        self.data[self.high_cursor..].fill(0);
         self.cursor = 0;
+        self.high_cursor = self.data.len();
         self.clear_free_list();
         // Every recorded object start just became zeroed bytes.
         self.clear_alloc_anchors();
@@ -1181,6 +1982,7 @@ impl Arena {
     #[allow(dead_code)]
     pub unsafe fn reset_no_zero(&mut self) {
         self.cursor = 0;
+        self.high_cursor = self.data.len();
         self.clear_free_list();
         self.clear_alloc_anchors();
     }
@@ -1192,9 +1994,14 @@ impl Arena {
         ptr >= base && ptr < end
     }
 
-    /// The number of bytes currently allocated (cursor position).
+    /// The number of bytes currently allocated: both bump regions together.
+    ///
+    /// `capacity - used()` is therefore still exactly the un-bumped middle,
+    /// which is what every consumer of this actually means by "used" (the ZGC
+    /// headroom trigger sizes its margin from it, and the allocation-failure
+    /// guard prints it beside `capacity` to say whether the heap is full).
     pub fn used(&self) -> usize {
-        self.cursor
+        self.cursor + (self.data.len() - self.high_cursor)
     }
 
     /// The total capacity in bytes.
@@ -1230,7 +2037,12 @@ impl Arena {
     /// does not reach the cursor (a live object sits above it), the ordinary
     /// mid-heap case.
     pub fn retract_cursor_into_free_tail(&mut self) -> usize {
-        let blocks = self.free_blocks_sorted();
+        // LOW blocks only. Reading the whole list here would take the highest
+        // block in the ARENA — which, once the large-object end has been used,
+        // is a high-region block that by construction never ends at `cursor`.
+        // The retraction would then silently answer 0 for the rest of the run,
+        // re-arming the one-way-ratchet failure it exists to prevent.
+        let blocks = self.low_blocks_sorted();
         let Some(&(off, size)) = blocks.last() else {
             return 0;
         };
@@ -1239,7 +2051,7 @@ impl Arena {
         }
         // Rebuild the list without the tail block: those bytes are becoming
         // un-bumped space, and leaving them listed would hand them out twice.
-        self.clear_free_list();
+        self.clear_low_free_list();
         for (o, s) in blocks.iter().take(blocks.len() - 1) {
             self.add_free_block(*o, *s);
         }
@@ -1291,6 +2103,15 @@ impl Arena {
         let old_base = self.data.as_ptr();
         let old_capacity = self.data.len();
         self.data.resize(new_capacity, 0);
+        // The high end anchors at capacity, so growing moves it. Safe for the
+        // same reason the assert above allows the grow at all: `cursor == 0`
+        // means the arena is empty, so there is nothing at the old top to
+        // strand. (`assert_eq!(self.cursor, 0)` fires above otherwise.)
+        debug_assert_eq!(
+            self.high_cursor, old_capacity,
+            "an empty arena must have an un-bumped high region",
+        );
+        self.high_cursor = new_capacity;
         // The bucket table is indexed by capacity; `grow` is the only other
         // place `data.len()` moves. `cursor == 0` was just asserted, so there
         // is nothing recorded to preserve.
@@ -1308,7 +2129,7 @@ impl Arena {
     /// fragmented: a single allocation can only use one block, so this is
     /// an upper bound on the largest satisfiable request.
     pub fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.cursor) + self.free_list_bytes()
+        self.high_cursor.saturating_sub(self.cursor) + self.free_list_bytes()
     }
 }
 
@@ -1329,6 +2150,69 @@ impl std::fmt::Debug for Arena {
 mod tests {
     use super::*;
 
+    /// **A compaction may only drop the holes it wrote into.**
+    ///
+    /// `compact_low_to` used to clear the whole low free list, on the premise
+    /// that a slide leaves no hole below the cursor. That holds for a slide
+    /// which compacts the entire low region; ZGC's compacts the pages its
+    /// relocation-set selector picked and leaves the rest untouched, so every
+    /// hole outside the destination window is a real free block — and the
+    /// sweep never re-discovers it, because the sweep only free-lists objects
+    /// that DIE.
+    ///
+    /// The cost was total: on `repros/frag-churn` the sweep free-listed 400 MB,
+    /// the slide cleared it, and from then on the bump cursor advanced by
+    /// exactly the bytes allocated until it hit capacity and the VM threw
+    /// `OutOfMemoryError` with 99% of the heap dead.
+    ///
+    /// Three blocks, one of each kind, so the test cannot pass by halves:
+    /// below the window (must survive), inside it (must go — a survivor may be
+    /// sitting on it), and straddling the new cursor (must be truncated, not
+    /// dropped, or the bytes below the cursor are lost too).
+    #[test]
+    fn compaction_keeps_the_free_holes_it_did_not_write_into() {
+        let mut arena = Arena::new(64 * 1024);
+        // Bump the cursor out so every offset below is inside the live region.
+        let _ = arena.alloc(32 * 1024, 8).expect("fresh arena has room");
+
+        arena.add_free_block(1024, 512); // below the window
+        arena.add_free_block(8192, 512); // inside the window
+        arena.add_free_block(20_480, 4096); // straddles the new cursor
+
+        let before = arena.free_list_bytes();
+        assert_eq!(
+            before,
+            512 + 512 + 4096,
+            "the fixture must set up three blocks"
+        );
+
+        // The slide wrote into [4096, 12288) and left the cursor at 22528.
+        let reclaimed = arena.compact_low_to(22_528, 4096..12_288);
+        assert!(reclaimed > 0, "the cursor must actually retract");
+
+        let kept = arena.free_blocks_sorted();
+        assert!(
+            kept.iter().any(|&(off, sz)| off == 1024 && sz == 512),
+            "a hole below the destination window is untouched memory and must \
+             survive: {kept:?}"
+        );
+        assert!(
+            !kept.iter().any(|&(off, _)| off == 8192),
+            "a hole inside the destination window may have a survivor on it and \
+             must be dropped: {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|&(off, sz)| off == 20_480 && sz == 2048),
+            "a hole straddling the new cursor must be TRUNCATED to the part \
+             below it, not dropped: {kept:?}"
+        );
+        assert_eq!(
+            arena.free_list_bytes(),
+            512 + 2048,
+            "the accounting must match the blocks that survived"
+        );
+    }
+
     /// The `ZipContentTests` shape, in miniature: the cursor is a one-way
     /// ratchet, so a request larger than the biggest hole is unservable even
     /// when most of the heap is free.
@@ -1340,7 +2224,310 @@ mod tests {
     /// are still live, and one that merely coalesced would not move the cursor
     /// at all. The RED it pins is the real one — `alloc` fails before the
     /// retraction and succeeds after, with nothing else changed.
+     /// The defect this whole region exists for, reduced to eleven lines.
+    ///
+    /// One small survivor inside each of four chunk-sized runs caps every hole
+    /// at one chunk, so a request larger than a chunk cannot be served however
+    /// much of the arena is free. This is the `TestNonBlockingAPI` shape
+    /// exactly: four AQS nodes, 544 bytes, holding 2.6 MB hostage.
+    ///
+    /// Built so it cannot pass by accident: the survivors are deliberately
+    /// placed so that no two adjacent free runs can merge into anything as
+    /// large as the request, and the assertion on the LOW end is that the
+    /// request genuinely fails there — if that ever starts succeeding, the
+    /// second half of the test is proving nothing.
     #[test]
+    fn a_survivor_in_every_chunk_caps_the_low_end_but_not_the_high_end() {
+        // One "chunk" of small-object churn plus one large object, repeated —
+        // which is what a running VM does, and the interleaving is the whole
+        // point: it is what puts a survivor between every pair of large-object
+        // holes when the two populations share one bump region.
+        const CHUNK: usize = 4096;
+        const LARGE: usize = 4096;
+        const REQUEST: usize = LARGE * 2;
+        const ROUNDS: usize = 4;
+
+        let mut arena = Arena::new((CHUNK + LARGE) * ROUNDS);
+        let base = arena.base_ptr() as usize;
+        let mut low_churn = Vec::new();
+        let mut large_dead = Vec::new();
+        for _ in 0..ROUNDS {
+            // A survivor that is never freed, then churn, then a large object.
+            let _survivor = arena.alloc(64, 8).unwrap();
+            let churn = arena.alloc(CHUNK - 64, 8).unwrap();
+            let large = arena.alloc_high(LARGE, 8).unwrap();
+            low_churn.push((churn as usize - base, CHUNK - 64));
+            large_dead.push((large as usize - base, LARGE));
+        }
+        assert_eq!(
+            arena.used(),
+            (CHUNK + LARGE) * ROUNDS,
+            "both ends are fully bumped: nothing can come from un-bumped space",
+        );
+        for (off, size) in &low_churn {
+            arena.add_free_block(*off, *size);
+        }
+        arena.coalesce_free_list();
+
+        // The low end is walled: its holes are `CHUNK - 64` apart, so however
+        // many bytes it holds, none of them is a contiguous `REQUEST`. Asserted
+        // while the HIGH free list is still empty, so the low end's
+        // raid-the-other-end last resort cannot answer for it.
+        assert!(
+            arena.alloc(REQUEST, 8).is_none(),
+            "precondition: the low end is walled by one survivor per chunk —              if this succeeds the assertion below proves nothing",
+        );
+
+        // The large-object end never saw a survivor, so its holes merge into
+        // one contiguous run.
+        for (off, size) in &large_dead {
+            arena.add_free_block(*off, *size);
+        }
+        arena.coalesce_high();
+        assert!(
+            arena.alloc_high(REQUEST, 8).is_some(),
+            "the large-object end coalesced into a contiguous run",
+        );
+    }
+
+    /// The two ends must never hand out the same byte, and the shared middle
+    /// is where that would happen.
+    #[test]
+    fn the_two_ends_meet_without_overlapping() {
+        let mut arena = Arena::new(4096);
+        let base = arena.base_ptr() as usize;
+        // Deliberately asymmetric: an allocator that ignored the high end and
+        // simply bumped upwards would put this at 1024, not 3072.
+        let low = arena.alloc(1024, 8).unwrap() as usize - base;
+        let high = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        assert_eq!(low, 0);
+        assert_eq!(high, 3072, "the high end bumps DOWN from capacity");
+        assert_eq!(arena.used(), 2048, "both regions count as used");
+        assert_eq!(arena.remaining(), 2048, "and the middle is what is left");
+        // Close the middle from the low side and check neither can cross.
+        let _fill = arena.alloc(2048, 8).unwrap();
+        assert_eq!(arena.remaining(), 0);
+        assert!(arena.alloc(8, 8).is_none(), "the low end cannot cross over");
+        assert!(
+            arena.alloc_high(8, 8).is_none(),
+            "and neither can the high end",
+        );
+    }
+
+    /// The high end's own one-way-ratchet fix: a wholly-free head goes back to
+    /// the descending cursor. Watched to fail before it passed — with the
+    /// retraction stubbed to 0 the final allocation returns `None`, because
+    /// the two halves are separate free blocks and neither alone is big
+    /// enough.
+    #[test]
+    fn a_wholly_free_high_head_is_handed_back_to_the_descending_cursor() {
+        let mut arena = Arena::new(8192);
+        let base = arena.base_ptr() as usize;
+        // From the top down: [live 1024][dead 1024][dead 1024]
+        let _live = arena.alloc_high(1024, 8).unwrap();
+        let dead_a = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let dead_b = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        assert_eq!(arena.high_cursor(), 8192 - 3072);
+        arena.add_free_block(dead_a, 1024);
+        arena.add_free_block(dead_b, 1024);
+        assert_eq!(
+            arena.coalesce_high(),
+            1,
+            "the two dead spans are adjacent and must merge into one",
+        );
+
+        let handed_back = arena.retract_high_cursor_into_free_head();
+        assert_eq!(handed_back, 2048, "the merged span starts at the cursor");
+        assert_eq!(arena.high_cursor(), 8192 - 1024, "cursor climbed back");
+        assert_eq!(
+            arena.free_list_bytes(),
+            0,
+            "the retracted span must leave the free list, or it is served twice",
+        );
+        assert_eq!(arena.used(), 1024, "only the live object is still charged");
+    }
+
+    /// The other half of that contract: a hole with a live object BELOW it (at
+    /// a lower address, i.e. bumped more recently) must not move the cursor.
+    /// Getting this wrong hands out live bytes.
+    /// The reserve has to survive ordinary low-end churn, or it buys nothing.
+    ///
+    /// This is the shape that made the first version of the reserve useless:
+    /// the low end asks for space it could get from the reserve, gets it, and
+    /// the large-object region is drained before it can claim its floor. The
+    /// low end must be pushed onto its own free list instead, and the reserved
+    /// span must still be there for a large request afterwards.
+    #[test]
+    fn ordinary_low_end_churn_does_not_drain_the_reserve() {
+        let mut arena = Arena::new(16384);
+        arena.set_high_reserve(4096);
+        let base = arena.base_ptr() as usize;
+
+        // Fill the un-reserved low region, then free half of it so the low end
+        // has a free list to fall back on.
+        let mut freed = Vec::new();
+        for i in 0..12 {
+            let p = arena.alloc(1024, 8).unwrap() as usize - base;
+            if i % 2 == 0 {
+                freed.push(p);
+            }
+        }
+        assert_eq!(arena.used(), 12288, "the un-reserved low region is full");
+        for p in &freed {
+            arena.add_free_block(*p, 1024);
+        }
+        // Six 1 KiB holes are now on the low free list. Six more requests must
+        // all come from there and none from the reserve, which is exactly what
+        // ordering the reserve override AFTER the free list buys.
+        for _ in 0..6 {
+            assert!(arena.alloc(1024, 8).is_some(), "served from the free list");
+        }
+        assert_eq!(
+            arena.used(),
+            12288,
+            "no bump happened: every request came out of the free list",
+        );
+        assert!(
+            arena.alloc_high(4096, 8).is_some(),
+            "the reserve survived the churn and the large request fits",
+        );
+    }
+
+    /// ...but the reserve is a preference, not a wall: a low-end request that
+    /// cannot be served any other way takes it rather than failing.
+    #[test]
+    fn the_reserve_yields_rather_than_raising_oom() {
+        let mut arena = Arena::new(16384);
+        arena.set_high_reserve(4096);
+        // Consume everything the low end is allowed to bump.
+        while arena.alloc(1024, 8).is_some() {
+            if arena.used() > 16384 {
+                panic!("bumped past capacity");
+            }
+        }
+        assert_eq!(
+            arena.used(),
+            16384,
+            "the low end took the reserve rather than failing with it free",
+        );
+    }
+
+    /// The drain the gate exists to stop: a freed large object at the bottom of
+    /// the high region must NOT be handed back to the shared middle while the
+    /// region is at or under its floor, because the low end would take it and
+    /// the large-object region would shrink to its own live set one sweep at a
+    /// time (measured: 92 MB claimed, 3,224 bytes left).
+    #[test]
+    fn the_high_retraction_does_not_drain_the_region_below_its_floor() {
+        let mut arena = Arena::new(16384);
+        arena.set_high_reserve(4096);
+        let base = arena.base_ptr() as usize;
+        let dead = arena.alloc_high(2048, 8).unwrap() as usize - base;
+        let cursor_before = arena.high_cursor();
+        arena.add_free_block(dead, 2048);
+        arena.coalesce_high();
+        assert_eq!(
+            arena.retract_high_cursor_into_free_head(),
+            0,
+            "the region holds 2 KiB against a 4 KiB floor — nothing to give back",
+        );
+        assert_eq!(arena.high_cursor(), cursor_before, "cursor must not move");
+        assert_eq!(
+            arena.high_free_shape().1,
+            2048,
+            "and the bytes stay on the HIGH free list, where the low end \
+             cannot reach them",
+        );
+
+        // Over-claim relative to the floor and the EXCESS — only the excess —
+        // is handed back.
+        let over = arena.alloc_high(8192, 8).unwrap() as usize - base;
+        arena.add_free_block(over, 8192);
+        assert_eq!(arena.coalesce_high(), 1, "the two dead spans are adjacent");
+        assert_eq!(
+            arena.retract_high_cursor_into_free_head(),
+            6144,
+            "10 KiB claimed against a 4 KiB floor: 6 KiB goes back, 4 KiB stays",
+        );
+        assert_eq!(
+            arena.high_region_bytes(),
+            4096,
+            "the region settled exactly on its floor",
+        );
+        assert_eq!(
+            arena.high_free_shape().1,
+            4096,
+            "and the retained half is still on the HIGH free list",
+        );
+    }
+
+    #[test]
+    fn a_high_hole_above_a_live_object_does_not_move_the_high_cursor() {
+        let mut arena = Arena::new(8192);
+        let base = arena.base_ptr() as usize;
+        let dead = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let _live_below = arena.alloc_high(512, 8).unwrap();
+        let cursor_before = arena.high_cursor();
+        arena.add_free_block(dead, 1024);
+        assert_eq!(
+            arena.retract_high_cursor_into_free_head(),
+            0,
+            "a hole with a live object below it is not the region's head",
+        );
+        assert_eq!(arena.high_cursor(), cursor_before, "cursor must not move");
+        assert_eq!(arena.free_list_bytes(), 1024, "and the hole stays listed");
+    }
+
+    /// A reclaimed high-end span must come back to the HIGH free list, and a
+    /// low-end one to the low tiers. Routing by offset is the whole basis of
+    /// the region test, so a block landing in the wrong list would let a
+    /// small-object allocation eat the large-object region (and would trip the
+    /// low end's `offset + size <= cursor` invariant).
+    #[test]
+    fn reclaimed_spans_return_to_the_end_they_were_carved_from() {
+        let mut arena = Arena::new(8192);
+        let base = arena.base_ptr() as usize;
+        let low = arena.alloc(1024, 8).unwrap() as usize - base;
+        let high = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        assert_eq!(low, 0, "the low end starts at the bottom");
+        assert_eq!(high, 8192 - 1024, "the high end starts at the top");
+        arena.add_free_block(low, 1024);
+        arena.add_free_block(high, 1024);
+        assert_eq!(arena.free_list_bytes(), 2048);
+
+        // The low tiers must not be able to serve a request out of the high
+        // block: `alloc` never consults `free_high`.
+        let served = arena.alloc(1024, 8).unwrap() as usize - base;
+        assert_eq!(served, low, "the low end reused its own hole");
+        let served_high = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        assert_eq!(served_high, high, "and the high end reused its own");
+        assert_eq!(arena.free_list_bytes(), 0);
+    }
+
+    /// `retract_cursor_into_free_tail` reads the free list to find the block
+    /// that ends at the LOW cursor. Once the high end has been used, the
+    /// highest block in the arena is a high-region block that by construction
+    /// never ends there — so a version that looked at the whole list would
+    /// answer 0 forever and silently re-arm the ratchet it exists to prevent.
+    #[test]
+    fn a_high_region_block_does_not_blind_the_low_retraction() {
+        let mut arena = Arena::new(8192);
+        let base = arena.base_ptr() as usize;
+        let _live_low = arena.alloc(1024, 8).unwrap();
+        let tail = arena.alloc(1024, 8).unwrap() as usize - base;
+        let dead_high = arena.alloc_high(2048, 8).unwrap() as usize - base;
+        arena.add_free_block(dead_high, 2048);
+        arena.add_free_block(tail, 1024);
+
+        assert_eq!(
+            arena.retract_cursor_into_free_tail(),
+            1024,
+            "the low tail must still be found with a high block on the list",
+        );
+        assert_eq!(arena.used(), 1024 + 2048, "low cursor moved, high did not");
+    }
+
+   #[test]
     fn a_wholly_free_tail_is_handed_back_to_the_bump_cursor() {
         let mut arena = Arena::new(4096);
         // Layout: [live 512][dust 256][live 512][free tail 2816]

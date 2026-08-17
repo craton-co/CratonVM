@@ -3623,6 +3623,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // common-case cost of the original helper.
     if heap.try_alloc_young_probe(total_size).is_some() {
         if let Some(obj_ref) = heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            jit_note_external_alloc(total_size);
             return jit_newarray_finish(obj_ref, atype, length);
         }
     }
@@ -3640,6 +3641,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // probe above is unchanged, so a healthy heap never reaches this line and
     // pays nothing.
     if let Some(obj_ref) = heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
+        jit_note_external_alloc(total_size);
         return jit_newarray_finish(obj_ref, atype, length);
     }
     // Slow path: young gen full (or the probe-then-alloc race lost the slot).
@@ -3711,7 +3713,38 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
             }
         }
     };
+    jit_note_external_alloc(total_size);
     jit_newarray_finish(obj_ref, atype, length)
+}
+
+/// Charge `bytes` to the calling thread's allocation counter — the one behind
+/// `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`.
+///
+/// Only for allocations that **bypassed the TLAB**. TLAB-served allocations,
+/// including the ones compiled code performs with its own inline bump, are
+/// already accounted for by [`cratonvm_gc::Tlab::thread_allocated_bytes`],
+/// which reads the live cursor; charging them here as well would double-count.
+///
+/// The JIT keeps its own copies of the interpreter's slow allocation paths
+/// (`jit_newarray`, `jit_new_object`, `jit_anewarray_object`), so the
+/// accounting `alloc_object_shared` / `gc_alloc_array` do has to be repeated
+/// here — otherwise a compiled thread's counter would silently omit every
+/// humongous object it allocated, which is the direction that reads as good
+/// news to a caller asserting "we allocated less than N".
+///
+/// Best-effort: no `JvmThread` (a foreign/unattached caller) means no counter
+/// to charge, and monitoring must never be the thing that fails an allocation.
+///
+/// # Safety
+/// Same contract as [`jit_thread_mut`]: call only from a JIT helper running on
+/// the thread that installed `JIT_THREAD`, with no other `&mut JvmThread` (and
+/// no live `JitThreadGuard`) outstanding. Every call site below sits after the
+/// allocation's own guards have been dropped.
+#[inline]
+unsafe fn jit_note_external_alloc(bytes: usize) {
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        thread.tlab.note_external_allocation(bytes);
+    }
 }
 
 /// W1-vm: surface an allocation failure from `jit_newarray` as a catchable
@@ -3742,22 +3775,26 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
     )
 }
 
-/// G1 last-ditch full mark cycle on allocation failure — see the
-/// interpreter's `g1_force_full_cycle`: young pauses cannot reclaim dead
-/// Old/humongous spans, only a completed mark cycle's cleanup can. Returns
-/// `true` when the cycle was attempted (caller should retry the allocation
+/// Last-ditch reclamation on allocation failure — see the interpreter's
+/// `last_ditch_reclaim`: a completed G1 mark cycle for dead Old/humongous
+/// spans, then a collection with every SoftReference condemned, which
+/// `java.lang.ref` requires before the VM may throw `OutOfMemoryError`.
+/// Returns `true` when it was attempted (caller should retry the allocation
 /// once before surfacing OOM).
+///
+/// The G1 gate this used to open with is gone: it belonged to step 1 alone,
+/// and applying it to the whole function made the soft-reference rule
+/// G1-only — so a ZGC or Generational program OOME'd with a heap of softly
+/// reachable garbage, which is exactly the failure the interpreter-side ladder
+/// was fixed for. `last_ditch_reclaim` re-applies it to the step that owns it.
 #[cold]
 fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
-    if !vm.mem.heap.is_g1() {
-        return false;
-    }
     // SAFETY: called only from the JIT allocation slow-path helpers, on a
     // mutator thread that entered compiled code through the JIT entry
     // trampoline — the same contract as the surrounding `jit_thread_mut`
     // calls in those helpers.
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
-        crate::runtime::interpreter::g1_force_full_cycle(vm, thread);
+        crate::runtime::interpreter::last_ditch_reclaim(vm, thread);
         true
     } else {
         false
@@ -4227,6 +4264,9 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             }
         }
     };
+    // Every arm reaching here allocated outside the TLAB (the TLAB arm above
+    // returns early), so the thread's allocation counter has to be told.
+    jit_note_external_alloc(total_size);
     // Initialize primitive-typed fields to proper JVM default values (zero
     // memory reads as Object(None) which is wrong for int/long/float/double
     // fields) + JLS §12.6 finalizer registration.
@@ -4885,6 +4925,8 @@ pub unsafe extern "C" fn jit_anewarray_object(
             }
         }
     };
+    // Non-TLAB arm (the guarded-refill TLAB arm above returns early).
+    jit_note_external_alloc(total_size);
     arr.as_ptr() as i64
 }
 
@@ -5316,78 +5358,60 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     jit_decode_ref_word(raw, "jit_aaload/element")
 }
 
-/// The JVMS §6.5 *aastore* covariance check, and NOTHING else — no null check,
-/// no bounds check, no barrier, no store.
-///
-/// # Why this exists separately from [`jit_aastore`]
-///
-/// `jit_aastore` is the complete opcode. Routing every reference array store
-/// through it (W7-38, landed) restored correctness at the cost of one helper
-/// call per store — precisely the cost R20's inline lowering had removed. This
-/// helper is the shape W7-38 §6 nominated so the emitter can put the inline
-/// `MOV [array + index*8 + HEADER_SIZE], val` back and call out only for the
-/// part that genuinely needs the VM: the type check.
-///
-/// It is an **extraction, not a copy**. `jit_aastore` below calls it and has no
-/// check of its own. Two independent implementations of one JVMS rule is
-/// exactly how this defect was born — a check in the helper, an inline store in
-/// the emitter, and a comment in each file asserting something about the other
-/// that the build could not verify.
-///
-/// # Contract
-///
-/// Returns `i64::MIN` — the standard deopt / pending-exception sentinel that
-/// `emit_post_invoke_exception_check` tests RAX against — when the store must be
-/// REFUSED and an `ArrayStoreException` has been published on this thread. The
-/// caller must then skip the store, the SATB pre-write barrier and the card
-/// mark. Returns `0` when the store may proceed.
-///
-/// The sentinel is a real, defined return value on purpose: a `-> ()` helper
-/// leaves RAX undefined, so an `emit_post_invoke_exception_check` after it is
-/// testing garbage and the exception surfaces only via the interpreter's
-/// post-JIT-return drain.
-///
-/// Fails **open** in three places, each deliberately: a null `val` (JVMS: always
-/// storable), an implausible `array_ptr` (the caller's null check has already
-/// run; dereferencing a stale word here would SIGSEGV inside Rust, which is
-/// strictly harder to diagnose than the store faulting at its own site), and a
-/// failure to construct the throwable (fall through and perform the store rather
-/// than corrupt VM state — the pre-W7-38 behaviour). `aastore_element_assignable`
-/// itself also fails open on imprecise type info, so no false
-/// `ArrayStoreException` can be produced from here.
-//
-// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm
-// pointer. array_ptr is a plausible heap pointer to a reference array or is
-// screened out below. val is 0 (null) or a raw pointer to a live heap object.
+// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
+// array_ptr must be 0 (null) or a valid heap pointer to a reference array.
+// val is 0 (null) or a raw pointer to a live heap object. Write barrier is issued
+// for non-null stores to maintain generational GC card table invariants.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub unsafe extern "C" fn jit_aastore_check(vm_ptr: i64, array_ptr: i64, val: i64) -> i64 {
-    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
-    // (see conservative_roots::note_jit_boundary). Unconditional and first,
-    // like every sibling helper: the refusal path allocates a throwable, and a
-    // helper that bumps the generation only sometimes is a soundness argument
-    // no one will re-derive correctly later. `jit_aastore` bumps it too, so the
-    // delegated path bumps twice; a redundant bump only forces a re-scan and is
-    // never unsound in the other direction.
-    crate::jit::conservative_roots::note_jit_boundary();
-    // A null element is always storable (JVMS §6.5). Cheapest screen first.
-    if val == 0 {
-        return 0;
-    }
-    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
-        return 0;
-    }
+/// JVMS §aastore covariance: does storing `val` into `array_ptr` have to throw
+/// `ArrayStoreException`?
+///
+/// Returns `true` **and stashes the throwable** when the store is refused;
+/// `false` (allow the store) otherwise. Call only with a non-null `val`: a
+/// null element is always storable.
+///
+/// # One body, two callers, on purpose
+///
+/// [`jit_aastore`] (the full helper) and [`jit_aastore_type_check`] (what the
+/// x64 inline lowering calls) both come here. They used to be one function
+/// with one caller, and then the x64 emitter stopped calling it: R20/HIGH-5
+/// replaced the helper call with an inline store, justified by a comment
+/// saying "the current `jit_aastore` helper does NOT enforce the ASE check …
+/// no regression". That was true when written and was falsified — silently —
+/// when the check landed in the helper, because a premise in a comment is not
+/// a compile-time link. The result was a JIT-compiled `aastore` that performed
+/// the store and raised nothing (`RExceptions`: `cold=[java.lang.Integer]
+/// hot=[no-throw]`).
+///
+/// Keeping the rule in one function is the part that is mechanically
+/// enforceable; the comment above is not.
+///
+/// # Conservative posture
+///
+/// `aastore_element_assignable` fails OPEN on imprecise type information, so
+/// this is additive correctness and never invents an `ArrayStoreException`. If
+/// no JIT thread is available or the funnel cannot build the throwable, this
+/// returns `false` and the store proceeds — the pre-fix behaviour, in the rare
+/// construction-failure case only.
+///
+/// # SAFETY
+///
+/// `vm_ptr` must be a live `SharedVm`; `array_ptr` and `val` must be live heap
+/// pointers (the callers null/plausibility-check both first).
+unsafe fn aastore_store_is_refused(vm_ptr: i64, array_ptr: i64, val: i64) -> bool {
     let vm = &*(vm_ptr as *const SharedVm);
     let array_ref = ObjectRef::from_raw(array_ptr as usize as *mut u8);
     let value_ref = ObjectRef::from_raw(val as usize as *mut u8);
-    if vm.mem.heap.element_type_of(array_ref) != ArrayElementType::Reference
-        || crate::runtime::interpreter::aastore_element_assignable(vm, array_ref, value_ref)
-    {
-        return 0;
+    if vm.mem.heap.element_type_of(array_ref) != ArrayElementType::Reference {
+        return false;
+    }
+    if crate::runtime::interpreter::aastore_element_assignable(vm, array_ref, value_ref) {
+        return false;
     }
     // W8-E11-1: the raw `get_class(class_id_of(value_ref)).name` lookup that
-    // used to stand here was the THIRD twin of a defect that the interpreter's
-    // two `aastore` arms had already had fixed (W8-E6-1). On a reference array
-    // the header class id holds the COMPONENT's class BY DESIGN — stated in
+    // used to stand here was the THIRD twin of a defect the interpreter's two
+    // `aastore` arms had already had fixed (W8-E6-1). On a reference array the
+    // header class id holds the COMPONENT's class BY DESIGN — stated in
     // `typecheck::array_descriptor_of` and again on `cce_display_class_name`,
     // where the same trap once produced `java.lang.String cannot be cast to
     // java.lang.String` and cost a session as a supposed class-identity split.
@@ -5415,8 +5439,13 @@ pub unsafe extern "C" fn jit_aastore_check(vm_ptr: i64, array_ptr: i64, val: i64
     // the `UnmodifiableMap` storage-stamp translation that keeps a VM-internal
     // class out of an app-visible message.
     //
-    // It returns the INTERNAL (slashed) name and that is what we want here:
-    // `throw_runtime_error`'s funnel dots it, and its `rewritable` predicate
+    // It returns the INTERNAL (slashed) name and that is what we want here.
+    // W7-37: raise through `throw_runtime_error`, the single funnel every
+    // VM-minted `RuntimeError` passes through, which is where the message gains
+    // HotSpot's EXTERNAL class name — minting the throwable here printed
+    // `java/lang/Integer` where HotSpot and the interpreter's own `aastore`
+    // print `java.lang.Integer`, and callers regex that message and feed the
+    // capture to `Class.forName`. The funnel's `rewritable` predicate
     // (`contains('/') && no whitespace`) correctly leaves `[I` / `[[I` / `[B`
     // and a default-package name such as `[LPlain;` alone.
     //
@@ -5435,17 +5464,6 @@ pub unsafe extern "C" fn jit_aastore_check(vm_ptr: i64, array_ptr: i64, val: i64
         value_ref,
         &raw_elem_name,
     );
-    // Build a real ArrayStoreException and stash it via the pending-exception
-    // channel; the interpreter's post-JIT-return drain
-    // (`take_jit_pending_exception`) routes it through this method's exception
-    // table.
-    //
-    // Raise it through `throw_runtime_error`, the single funnel every VM-minted
-    // `RuntimeError` passes through, instead of building the throwable here.
-    // The funnel is where an `ArrayStoreException` message is given HotSpot's
-    // EXTERNAL class name; a slashed name in this message is a real defect and
-    // not untidiness, because callers regex it and feed the capture to
-    // `Class.forName`.
     if let Some((thread, _guard)) = jit_thread_mut() {
         use crate::error::MethodCallFailed;
         if let MethodCallFailed::ExceptionThrown(exc) =
@@ -5456,19 +5474,52 @@ pub unsafe extern "C" fn jit_aastore_check(vm_ptr: i64, array_ptr: i64, val: i64
             )
         {
             set_jit_pending_exception(thread, exc);
-            return i64::MIN;
+            return true;
         }
     }
-    // No thread available, or the funnel degraded to an `InternalError`: fall
-    // through and let the store happen rather than corrupting VM state.
-    0
+    false
 }
 
-// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
-// array_ptr must be 0 (null) or a valid heap pointer to a reference array.
-// val is 0 (null) or a raw pointer to a live heap object. Write barrier is issued
-// for non-null stores to maintain generational GC card table invariants.
+/// `aastore` element-type check for the x64 INLINE lowering.
+///
+/// The emitter lowers `aastore` itself — null check, bounds check, SATB
+/// pre-write barrier, `MOV [array + index*8 + HEADER_SIZE], val`, card mark —
+/// and the only part it cannot do inline is this one, because answering it
+/// needs the class manager. So the arm calls this first and lets the store
+/// proceed only on a `0`.
+///
+/// Returns `0` when the store is legal, and the `i64::MIN` deopt sentinel when
+/// it is not, having stashed the `ArrayStoreException`. The codegen routes the
+/// sentinel through `emit_post_invoke_exception_check`, the same drain
+/// `jit_checkcast`'s ClassCastException uses.
+///
+/// A null `val` never reaches here: the emitter branches over the call, so the
+/// overwhelmingly common `arr[i] = null` costs a test-and-jump, not a call.
+///
+/// # SAFETY
+///
+/// Called from JIT-compiled code. `vm_ptr` must be a valid `SharedVm` pointer.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_aastore_type_check(vm_ptr: i64, array_ptr: i64, val: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
+    // Same posture as `jit_checkcast`: a null or implausible (stale/garbage,
+    // unaligned/>47-bit) pointer is not dereferenced. Allow the store rather
+    // than inventing an exception from a value whose type is unknowable.
+    if val == 0
+        || !cratonvm_types::plausible_heap_pointer(val as u64)
+        || !cratonvm_types::plausible_heap_pointer(array_ptr as u64)
+    {
+        return 0;
+    }
+    if aastore_store_is_refused(vm_ptr, array_ptr, val) {
+        i64::MIN
+    } else {
+        0
+    }
+}
+
 pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -5509,25 +5560,29 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     // `RArrayStoreTiers` s15 caught the interpreter fast path reporting ASE for
     // a past-the-end index.
     //
-    // The check itself is `jit_aastore_check`, immediately above, and this is
-    // its only in-tree caller today. It was EXTRACTED rather than copied,
-    // because the throughput follow-up (W7-38 §6, nominated) restores the
-    // emitter's inline store and calls that helper directly — and the way this
-    // whole defect arose was one JVMS rule implemented twice, each copy citing
-    // a property of the other that the build could not check. When the emitter
-    // change lands there must still be exactly ONE ArrayStoreException check
-    // and ONE message builder in this crate.
+    // The rule itself lives in `aastore_store_is_refused`, shared with
+    // `jit_aastore_type_check` — what the x64 inline lowering calls — so the
+    // full helper and the inline path can never again enforce different rules.
+    // It was EXTRACTED rather than copied, because the way this whole defect
+    // arose was one JVMS rule implemented twice, each copy citing a property of
+    // the other that the build could not check. There must stay exactly ONE
+    // ArrayStoreException check and ONE message builder in this crate.
     //
-    // W7-38 (landed): the comment that used to stand here said "on x64 this arm
-    // does not run at all, because nothing calls this function". That was true
-    // when written and is now FALSE — `jit/src/x64/bytecode_walk.rs`'s `0x53`
-    // arm calls `self.helpers.aastore`, so this is a live path in compiled
-    // code. Its twin (the emitter's "the helper does NOT enforce the ASE
-    // check") has been corrected too. If either call is ever removed again,
-    // correct the prose in the same commit: a premise stated in a comment is
-    // not a compile-time link, and this pair of comments spent months
-    // asserting incompatible things about each other.
-    if jit_aastore_check(vm_ptr, array_ptr, val) == i64::MIN {
+    // A comment that used to stand here said "on x64 this arm does not run at
+    // all, because nothing calls this function". That is still true of THIS
+    // function: `jit/src/x64/bytecode_walk.rs`'s `0x53` arm lowers `aastore`
+    // inline and calls `jit_aastore_type_check`, never `self.helpers.aastore`.
+    // What is no longer true is the conclusion once drawn from it — that the
+    // funnel routing below is not what the JIT prints. It is: the emitter's
+    // check and this one are the same body. If that ever stops being so,
+    // correct the prose in the same commit; a premise stated in a comment is
+    // not a compile-time link, and this pair of comments spent months asserting
+    // incompatible things about each other. See
+    // docs/known-issues/jdk-only/W7-37-differential-throwable-and-vm.md
+    // §"Part 4" for the codegen change, and
+    // docs/known-issues/jdk-only/W7-38-jit-aastore-never-called-its-own-check.md for the
+    // defect itself.
+    if val != 0 && aastore_store_is_refused(vm_ptr, array_ptr, val) {
         // Refused; an ArrayStoreException is pending on this thread. No
         // element is written and no barrier runs on the exception path.
         return;
@@ -7335,18 +7390,23 @@ fn jit_typecheck_trace(
         .get_class(obj_class_id)
         .map(|c| c.name.to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
+    let obj_loader = cm
+        .get_class(obj_class_id)
+        .map(|c| format!("{:?}", c.loader_id))
+        .unwrap_or_else(|| "<unknown>".to_string());
     let target_desc = match target {
         Some(t) => format!(
-            "{} (id={})",
+            "{} (id={} loader={:?})",
             cm.get_class(t)
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "<unknown>".to_string()),
-            t.as_u32()
+            t.as_u32(),
+            cm.get_class(t).map(|c| c.loader_id)
         ),
         None => "<none>".to_string(),
     };
     eprintln!(
-        "[DBG_TYPECHECK] {stage}: target_name={class_name} lenient={lenient} recv={obj_name} (id={}) resolved_target={target_desc}",
+        "[DBG_TYPECHECK] {stage}: target_name={class_name} lenient={lenient} recv={obj_name} (id={} loader={obj_loader}) resolved_target={target_desc}",
         obj_class_id.as_u32()
     );
 }
@@ -15319,61 +15379,6 @@ mod tests {
         );
     }
 
-    /// `jit_aastore_check`'s three fail-open screens, pinned.
-    ///
-    /// The check-only helper exists so the emitter can restore the inline
-    /// reference store and call out only for the type check (W7-38 §6). Its
-    /// contract is a *defined* return value — `0` = proceed, `i64::MIN` =
-    /// refused with an `ArrayStoreException` pending — and every screen that
-    /// cannot decide must answer `0`. A screen that answered `i64::MIN` on
-    /// "don't know" would drop a legal store AND fabricate an exception, which
-    /// is worse than the defect the helper exists to prevent.
-    ///
-    /// None of these three cases may dereference `vm_ptr`, which is why they
-    /// can be asserted with a null one.
-    #[test]
-    fn jit_aastore_check_fails_open_and_never_derefs_vm_on_the_screens() {
-        // (a) null element: always storable (JVMS §6.5). Returns before
-        // vm_ptr, array_ptr or val is touched.
-        // SAFETY: val == 0 takes the first early return; no pointer is read.
-        assert_eq!(
-            unsafe { jit_aastore_check(0, 0, 0) },
-            0,
-            "a null element must always be storable"
-        );
-
-        // (b) implausible array pointer (1 is not 8-aligned): the caller's own
-        // null check has already run, so this is a stale/garbage word. Fail
-        // open rather than dereference it inside Rust.
-        // SAFETY: `plausible_heap_pointer(1)` is false, so the helper returns
-        // before constructing the `&SharedVm` from the null vm_ptr.
-        assert_eq!(
-            unsafe { jit_aastore_check(0, 1, 0x1234) },
-            0,
-            "an implausible array pointer must fail open, not raise"
-        );
-
-        // (c) a real reference array on a real heap, with no class graph behind
-        // it. Passing the array as its own element keeps `val` a live heap
-        // pointer without a second allocation. This one asserts the WHOLE
-        // helper runs to a "proceed" answer on a degenerate-but-live input:
-        // `aastore_element_assignable` fails open when it cannot resolve the
-        // component (it degrades to `[Ljava/lang/Object;`, which admits every
-        // reference), and even on the refusing branch there is no JIT thread in
-        // a unit-test thread, so the documented no-thread degradation returns
-        // `0` too. Either way the answer must be "store it" — this helper must
-        // never manufacture an ArrayStoreException out of missing information.
-        let (vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 2);
-        let vm_ptr = &*vm as *const crate::vm::SharedVm as i64;
-        // SAFETY: `vm_ptr` points at the live `SharedVm` owned by `vm` for the
-        // whole call, and `arr_ptr` is a live reference array on its heap.
-        assert_eq!(
-            unsafe { jit_aastore_check(vm_ptr, arr_ptr, arr_ptr) },
-            0,
-            "an unresolvable component type must fail open (never a false ASE)"
-        );
-    }
-
     // ----------------------------------------------------------------------
     // B1 fix (review `vm-runtime.md`): the array load/store helpers used to
     // silently swallow an out-of-bounds index (load returned a fabricated 0 /
@@ -15397,6 +15402,79 @@ mod tests {
         let arr = vm_box.mem.heap.alloc_array(ClassId::new(0), et, len);
         let arr_ptr = arr.as_ptr() as i64;
         (vm_box, arr_ptr)
+    }
+
+    /// The check-only helper allows every store it cannot adjudicate.
+    ///
+    /// `aastore_element_assignable` fails OPEN, and so must everything in
+    /// front of it: the JVMS rule is additive correctness, and a FALSE
+    /// `ArrayStoreException` on a stale or unknowable pointer would be a new
+    /// failure rather than a restored one.
+    #[test]
+    fn jit_aastore_type_check_allows_null_and_implausible_operands() {
+        // SAFETY: every argument below takes a guard arm that returns before
+        // any pointer is dereferenced — that is exactly what is under test.
+        unsafe {
+            assert_eq!(jit_aastore_type_check(0, 0, 0), 0, "null value is legal");
+            assert_eq!(
+                jit_aastore_type_check(0, 0x1000, 0),
+                0,
+                "null value stays legal whatever the array is"
+            );
+            // Unaligned / non-heap pointers: unknowable type, so allow.
+            assert_eq!(
+                jit_aastore_type_check(0, 0x1001, 0x1003),
+                0,
+                "an implausible value pointer must not be dereferenced"
+            );
+            assert_eq!(
+                jit_aastore_type_check(0, 0, 0x1003),
+                0,
+                "an implausible array pointer must not be dereferenced"
+            );
+        }
+
+        // A real reference array on a real heap, with no class graph behind it.
+        // Passing the array as its own element keeps `val` a live heap pointer
+        // without a second allocation. This asserts the WHOLE helper runs to a
+        // "proceed" answer on a degenerate-but-live input:
+        // `aastore_element_assignable` fails open when it cannot resolve the
+        // component (it degrades to `[Ljava/lang/Object;`, which admits every
+        // reference), and even on the refusing branch there is no JIT thread in
+        // a unit-test thread, so the documented no-thread degradation returns
+        // `0` too. Either way the answer must be "store it" — this helper must
+        // never manufacture an ArrayStoreException out of missing information.
+        let (vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 2);
+        let vm_ptr = &*vm as *const crate::vm::SharedVm as i64;
+        // SAFETY: `vm_ptr` points at the live `SharedVm` owned by `vm` for the
+        // whole call, and `arr_ptr` is a live reference array on its heap.
+        assert_eq!(
+            unsafe { jit_aastore_type_check(vm_ptr, arr_ptr, arr_ptr) },
+            0,
+            "an unresolvable component type must fail open (never a false ASE)"
+        );
+    }
+
+    /// The x64 emitter must actually CALL the check.
+    ///
+    /// This is the shape of the original defect, and it is worth a test that
+    /// cannot be satisfied by a comment: `jit_aastore` grew the covariance
+    /// check while the emitter had already stopped calling `jit_aastore` at
+    /// all, so a JIT-compiled `aastore` stored anything into anything. The
+    /// helper slot is declared `required: true` in `jit-api`, which makes a
+    /// null slot a `validate()` failure — this pins the other half, that the
+    /// slot is populated with the real function.
+    #[test]
+    fn aastore_type_check_helper_slot_is_populated() {
+        let helpers = build_helpers();
+        assert_eq!(
+            helpers.aastore_type_check, jit_aastore_type_check as *const () as usize,
+            "the aastore element-type check must be wired to its helper"
+        );
+        assert!(
+            helpers.validate().is_ok(),
+            "the helper table must validate with the appended required slot"
+        );
     }
 
     #[test]
@@ -16192,6 +16270,55 @@ fn thread_stack_bounds() -> Option<(usize, usize)> {
     None
 }
 
+/// How much stack one thread may burn on COMPILED recursion before the guard
+/// converts it into a catchable `StackOverflowError` — the JIT-side analogue of
+/// `-Xss`, and the compiled counterpart of the interpreter's
+/// `JvmConfig::max_stack_depth` frame cap.
+///
+/// Without this bound the two tiers disagree by more than an order of
+/// magnitude on WHEN a program overflows, because they measure different
+/// things: the interpreter counts frames in a heap `Vec` and stops at
+/// `max_stack_depth` (8192 by default), while compiled frames live on the
+/// native stack and were allowed to consume all of it. Measured on this host
+/// with an 8 MiB carrier stack, one trivially recursive method reached:
+///
+/// | tier | depth before StackOverflowError |
+/// |---|---|
+/// | CratonVM interpreter (`--nojit`) | 8 191 |
+/// | CratonVM JIT (before this bound) | 232 417 |
+/// | HotSpot JDK 25 (interpreted → C2) | 11 820 → 23 306 |
+///
+/// A 28x tier-dependent answer is a fidelity bug on its own — the depth at
+/// which a program overflows should not hinge on whether a method happened to
+/// get compiled — and HotSpot's own two numbers differ by only ~2x because
+/// both of ITS tiers are bounded by the same `-Xss`.
+///
+/// It also breaks real tests. `io.netty.util.concurrent.DefaultPromiseTest`
+/// sizes its work from the depth it measures (`stackOverflowDepth << 1`), then
+/// gives that work a fixed 2-second deadline; at 232k the chain was ~465 000
+/// promises where HotSpot builds ~24 000–47 000, so
+/// `testNoStackOverflowWithDefaultEventExecutorA/B` timed out with the JIT on
+/// and passed with `--nojit`. It was never a promise or notification defect:
+/// CratonVM completes HotSpot's own chain lengths in 343 ms / 798 ms against
+/// that 2 s budget.
+///
+/// 4 MiB, set by measurement rather than by analogy. A byte budget does not
+/// translate to a fixed depth — that depends on the compiled frame size, which
+/// is exactly how HotSpot behaves too — so the number is chosen to land the
+/// depth ABOVE the interpreter's own 8192-frame cap and inside HotSpot's range.
+/// On the probe above, 4 MiB gives ~10k-21k frames against HotSpot's
+/// 11.8k-23.3k.
+///
+/// 1 MiB (HotSpot's default `-Xss`) was tried first and is WRONG here: it
+/// produced 2434-5305 frames, i.e. STRICTER than the interpreter, which only
+/// re-opens the tier gap from the other side and could reject recursion that
+/// runs fine under `--nojit`. CratonVM's compiled frames are simply larger than
+/// HotSpot's, so matching HotSpot's byte budget does not match its depth.
+///
+/// 4 MiB is also what the no-OS-bounds fallback below has always assumed, so
+/// the two paths now agree instead of differing by the whole stack size.
+const SELF_CALL_STACK_BUDGET: usize = 4 << 20; // 4 MiB
+
 /// Compute the guard floor for this thread: the lowest stack pointer at which
 /// a compiled self-recursive site may still CALL one level deeper.
 ///
@@ -16201,10 +16328,15 @@ fn thread_stack_bounds() -> Option<(usize, usize)> {
 /// interpreter/exception-table routing above. 1 MiB is generous for all of
 /// those; it is clamped to a quarter of the stack (min 64 KiB) so small
 /// carrier stacks keep most of their space usable.
+///
+/// The result is then raised to at most [`SELF_CALL_STACK_BUDGET`] below the
+/// first observed SP — see that constant for why the whole-stack floor is the
+/// wrong bound. Taking the HIGHER (tighter) of the two keeps the guard-page
+/// headroom guarantee intact: this only ever trips EARLIER, never later.
 #[cold]
 fn compute_self_call_stack_floor(sp_now: usize) -> usize {
     const HEADROOM: usize = 1 << 20; // 1 MiB
-    match thread_stack_bounds() {
+    let guard_floor = match thread_stack_bounds() {
         Some((low, high)) => {
             let size = high - low;
             let margin = HEADROOM.min(size / 4).max(64 * 1024);
@@ -16215,7 +16347,8 @@ fn compute_self_call_stack_floor(sp_now: usize) -> usize {
         // converts unbounded recursion into a catchable error well before
         // a typical guard page.
         None => sp_now.saturating_sub(4 << 20),
-    }
+    };
+    guard_floor.max(sp_now.saturating_sub(SELF_CALL_STACK_BUDGET))
 }
 
 /// Leaf floor query for the INLINE self-recursion check: get-or-compute the
@@ -16645,6 +16778,11 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // target may not be loaded at compile time, so the site is served by a
         // CP-indexed helper. Always wired in production.
         ldc_class_cp: jit_ldc_class_cp as *const () as usize,
+        // JVMS §6.5 covariance check only — the `0x53` lowering keeps its
+        // inline store, its SATB barrier and its card mark and calls out
+        // only for this. `required: true` in `jit-api`, so a `0` here is a
+        // `validate()` failure rather than a silently unchecked store.
+        aastore_type_check: jit_aastore_type_check as *const () as usize,
         // These two existed but were unreachable from the JIT: correct
         // implementations with no table slot, so `ir_lower` had nothing to call
         // and monitors could not be lowered at all.
@@ -16656,12 +16794,6 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         iastore: jit_iastore as *const () as usize,
         aaload: jit_aaload as *const () as usize,
         aastore: jit_aastore as *const () as usize,
-        // Check-only companion; see `jit_aastore_check`. ALWAYS wired in
-        // production, so the `0x53` lowering keeps its inline store and the
-        // `x64/driver.rs` `has_dispatch` computation sees the null-check and
-        // bounds-check stubs that arm emits. A `0` here (hand-built test
-        // tables only) routes the whole opcode back to `aastore`.
-        aastore_check: jit_aastore_check as *const () as usize,
         multianewarray_2d: jit_multianewarray_2d as *const () as usize,
         arraylength: jit_arraylength as *const () as usize,
         getfield: jit_getfield as *const () as usize,
@@ -16852,6 +16984,11 @@ const _: () = {
     let _: HelperFnNewObjectCp = jit_new_object_cp;
     let _: HelperFnAnewarrayObjectCp = jit_anewarray_object_cp;
     let _: HelperFnLdcClassCp = jit_ldc_class_cp;
+    // The compile-time link whose ABSENCE permitted the whole W7-38 /
+    // W8-E11-1 family: with this line, changing `jit_aastore_type_check`'s
+    // signature without the matching `helpers_abi.rs` row is a build error
+    // instead of a comment that quietly stops being true.
+    let _: HelperFnAastoreTypeCheck = jit_aastore_type_check;
     let _: HelperFnMultianewarray2d = jit_multianewarray_2d;
     let _: HelperFnTlabPostInit = jit_post_tlab_init;
 
@@ -16866,11 +17003,6 @@ const _: () = {
     let _: HelperFnIastore = jit_iastore;
     let _: HelperFnAaload = jit_aaload;
     let _: HelperFnAastore = jit_aastore;
-    // The compile-time link whose ABSENCE permitted the whole W7-38 /
-    // W8-E11-1 family: with this line, changing `jit_aastore_check`'s
-    // signature without the matching `helpers_abi.rs` row is a build error
-    // instead of a comment that quietly stops being true.
-    let _: HelperFnAastoreCheck = jit_aastore_check;
     let _: HelperFnArraylength = jit_arraylength;
 
     // Instance fields.

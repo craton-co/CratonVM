@@ -724,9 +724,15 @@ impl ThreadRegistry {
     /// this exists at all.
     pub(crate) const DEPOSIT_LEGEND: &'static str = concat!(
         "  legend: deposit=live        — parked in a blocking native; blocked=/roots=/top= ARE its current state.\n",
-        "          deposit=STALE       — RUNNING bytecode right now. top=/roots= are whatever it deposited at its\n",
+        "          deposit=STALE       — RUNNING right now. top=/roots= are whatever it deposited at its\n",
         "                                LAST blocking call and can be arbitrarily old — read the live\n",
-        "                                \"T19.H1 stack dump\" above for where this thread actually is.\n",
+        "                                \"T19.H1 stack dump\" above for where this thread actually is,\n",
+        "                                UNLESS the row says no-live-dump (see below).\n",
+        "          no-live-dump        — RUNNING, and it produced no live dump: it never reached an\n",
+        "                                interpreter dispatch point during the watchdog's grace period.\n",
+        "                                That means JIT-COMPILED code or a long native call — NOT a\n",
+        "                                deadlock, and NOT evidence about which. Re-run with --nojit:\n",
+        "                                if the live dump then appears, it was compiled code.\n",
         "          deposit=post-mortem — dead. alive=false is authoritative; blocked=/roots=/top= are residue from\n",
         "                                its termination sequence (nothing clears them), NOT evidence of a wait."
     );
@@ -772,13 +778,24 @@ impl ThreadRegistry {
     }
 
     /// T19.H1 watchdog — write [`Self::render_thread_summary`] to stderr.
-    pub fn dump_thread_summary_to_stderr(&self) {
+    ///
+    /// `live_dumped` is the set of thread ids that answered the watchdog with a
+    /// live frame dump. See [`Self::render_thread_summary_for`].
+    pub fn dump_thread_summary_to_stderr(&self, live_dumped: &[u64]) {
         use std::io::Write;
-        let text = self.render_thread_summary();
+        let text = self.render_thread_summary_for(live_dumped);
         let stderr = std::io::stderr();
         let mut h = stderr.lock();
         let _ = h.write_all(text.as_bytes());
         let _ = h.flush();
+    }
+
+    /// [`Self::render_thread_summary_for`] with no live-dump information —
+    /// every RUNNING thread is then reported as `no-live-dump`, which is the
+    /// safe reading when the caller cannot say. Kept for tests and for callers
+    /// outside the watchdog path.
+    pub fn render_thread_summary(&self) -> String {
+        self.render_thread_summary_for(&[])
     }
 
     /// T19.H1 watchdog — a one-line summary of every registered thread (name,
@@ -795,9 +812,25 @@ impl ThreadRegistry {
     /// conclude, and why an untagged chain has repeatedly been misread as a
     /// live wait site.
     ///
+    /// `live_dumped` lists the thread ids that produced a live frame dump in
+    /// response to this watchdog cycle. It is what separates the two very
+    /// different states that both render as `blocked=false`:
+    ///
+    ///  * a RUNNING thread that DID dump — the live dump above is where it is;
+    ///  * a RUNNING thread that did NOT — it never reached an interpreter
+    ///    dispatch point, i.e. it is in JIT-compiled code or a long native
+    ///    call. The summary used to point every such row at a
+    ///    `"T19.H1 stack dump: tid=N"` section that was never emitted, and the
+    ///    absence of that section then read as "blocked somewhere the watchdog
+    ///    cannot reach". It cost
+    ///    `known-issues/netty/brotli-integration-test-hangs-outside-the-interpreter`
+    ///    a whole investigation: the thread was neither blocked nor in native
+    ///    code, it was spinning in a compiled `ByteBuf.writeByte` loop, and
+    ///    `--nojit` produced the full 73-frame dump immediately.
+    ///
     /// Returned as a `String` (rather than written straight out) so the format
     /// is unit-testable — the tags below are the load-bearing part.
-    pub fn render_thread_summary(&self) -> String {
+    pub fn render_thread_summary_for(&self, live_dumped: &[u64]) -> String {
         use std::fmt::Write as _;
         let threads = self.threads.read();
         let mut h = String::new();
@@ -903,6 +936,16 @@ impl ThreadRegistry {
                 Self::deposit_freshness(row.alive, row.blocked),
                 row.top
             );
+            if row.alive && !row.blocked && !live_dumped.contains(&row.tid) {
+                let _ = writeln!(
+                    h,
+                    "        ^ no-live-dump: this thread produced NO \"T19.H1 stack dump: tid={}\" \
+                     section — it never reached an interpreter dispatch point, so it is in \
+                     JIT-compiled code or a long native call. Re-run with --nojit; if the live \
+                     dump appears there, it was compiled code (and it was RUNNING, not stuck).",
+                    row.tid
+                );
+            }
         }
         // Full frame chains, split out from the one-line-per-thread summary
         // above so that table stays scannable. Restricted to `alive` threads
@@ -927,13 +970,21 @@ impl ThreadRegistry {
         for row in live_with_frames {
             let tag = if row.blocked {
                 "[deposit=live — this IS the thread's current wait site]".to_string()
-            } else {
+            } else if live_dumped.contains(&row.tid) {
                 format!(
                     "[deposit=STALE — thread is RUNNING (blocked=false); chain below is from its LAST \
                      blocking call and may be arbitrarily old. Its real position is in the \
                      \"T19.H1 stack dump: tid={}\" section above]",
                     row.tid
                 )
+            } else {
+                // Do NOT send the reader to a section that was never emitted —
+                // its absence is the finding, not a missing feature.
+                "[deposit=STALE + no-live-dump — thread is RUNNING (blocked=false) and answered no \
+                 dump, so it is in JIT-compiled code or a long native call. The chain below is from \
+                 its LAST blocking call and may be arbitrarily old; there is NO live section for \
+                 this thread. Re-run with --nojit to get one.]"
+                    .to_string()
             };
             let _ = writeln!(
                 h,
@@ -3182,6 +3233,101 @@ mod tests {
         assert!(
             text.contains(ThreadRegistry::DEPOSIT_LEGEND),
             "the legend explaining deposit= must accompany the table:\n{text}"
+        );
+    }
+
+    /// A RUNNING thread that produced no live dump must be labelled as such,
+    /// and must NOT be pointed at a `"T19.H1 stack dump: tid=N"` section that
+    /// was never emitted.
+    ///
+    /// That dangling pointer is what
+    /// `known-issues/netty/brotli-integration-test-hangs-outside-the-interpreter`
+    /// was written around: the summary said "its real position is in the live
+    /// stack dump above", the live dump for that thread did not exist because
+    /// the thread was in JIT-compiled code, and the missing section read as
+    /// "blocked somewhere the watchdog cannot reach". The thread was neither
+    /// blocked nor in native code — it was spinning in a compiled
+    /// `ByteBuf.writeByte` loop, and `--nojit` dumped all 73 frames.
+    #[test]
+    fn t19_summary_names_a_running_thread_that_produced_no_live_dump() {
+        let registry = ThreadRegistry::new();
+        let dumped = ThreadId(1);
+        let silent = ThreadId(2);
+        for (tid, name) in [(dumped, "dumped"), (silent, "silent")] {
+            registry.register(tid, name, None);
+            registry.set_frame_trace(
+                tid,
+                Arc::new(Mutex::new(vec![cratonvm_native_api::StackTraceEntry {
+                    class_name: Arc::from("java/lang/Thread"),
+                    method_name: Arc::from("join"),
+                    source_file: Some(Arc::from("Thread.java")),
+                    line_number: crate::runtime::stackwalker::LINE_NUMBER_UNKNOWN,
+                    byte_code_index: 129,
+                    class_id: None,
+                    method_index: None,
+                }])),
+            );
+        }
+
+        // Only tid=1 answered the watchdog.
+        let text = registry.render_thread_summary_for(&[dumped.0]);
+        let row_for = |name: &str| -> String {
+            let lines: Vec<&str> = text.lines().collect();
+            let idx = lines
+                .iter()
+                .position(|l| l.contains(&format!("name={name:?}")) && l.contains("alive="))
+                .unwrap_or_else(|| panic!("no summary row for {name}:\n{text}"));
+            lines[idx..(idx + 2).min(lines.len())].join("\n")
+        };
+
+        assert!(
+            !row_for("dumped").contains("no-live-dump"),
+            "a thread that DID dump must not be flagged: {}",
+            row_for("dumped")
+        );
+        assert!(
+            row_for("silent").contains("no-live-dump"),
+            "a RUNNING thread that produced no dump must say so: {}",
+            row_for("silent")
+        );
+        assert!(
+            row_for("silent").contains("--nojit"),
+            "and must name the one flag that separates compiled code from \
+             native code: {}",
+            row_for("silent")
+        );
+
+        // The chain header for the silent thread must not send the reader to a
+        // section that does not exist.
+        let silent_chain = text
+            .lines()
+            .find(|l| l.contains("name=\"silent\"") && l.contains("frame(s), oldest first"))
+            .unwrap_or_else(|| panic!("no chain header for the silent thread:\n{text}"));
+        assert!(
+            !silent_chain.contains("stack dump: tid=2"),
+            "must not point at a live section that was never emitted: {silent_chain}"
+        );
+        assert!(
+            silent_chain.contains("no-live-dump"),
+            "the silent thread's chain header must carry the tag: {silent_chain}"
+        );
+        let dumped_chain = text
+            .lines()
+            .find(|l| l.contains("name=\"dumped\"") && l.contains("frame(s), oldest first"))
+            .unwrap_or_else(|| panic!("no chain header for the dumped thread:\n{text}"));
+        assert!(
+            dumped_chain.contains("stack dump: tid=1"),
+            "a thread that DID dump keeps the pointer to its live section: {dumped_chain}"
+        );
+
+        // With no ack information at all, every running thread is reported the
+        // safe way rather than the confident-and-wrong way.
+        let blind = registry.render_thread_summary();
+        assert_eq!(
+            blind.matches("no-live-dump").count() >= 2,
+            true,
+            "an empty ack set must not license the 'read the dump above' \
+             phrasing for anyone:\n{blind}"
         );
     }
 

@@ -1519,6 +1519,74 @@ impl FileDescriptorTable {
         Ok(fd)
     }
 
+    /// Bind an already-open UDP socket to `bind_addr`, KEEPING ITS `FdId`.
+    ///
+    /// A bound socket cannot be rebound, so this creates a freshly bound one
+    /// and swaps it into the table under the same id. The id is what matters:
+    /// it is the identity every side table keys on, and in particular the NIO
+    /// selector registers a channel under it — which, for netty, happens
+    /// BEFORE the bind (`AbstractChannel.register0` runs `javaChannel()
+    /// .register(selector, 0)`, and `doBind` comes later). Allocating a fresh
+    /// id here, which is what `close(old)` + `open_udp(addr)` did, left that
+    /// registration keyed on an id nothing answers to and holding a dup of a
+    /// socket that would never become readable again: netty's event loop
+    /// never saw a single inbound datagram.
+    ///
+    /// The previous socket closes when the last `Arc` to it drops, so a
+    /// selector still holding a dup keeps that dup alive until it re-registers
+    /// — the epoll set then drops the old fd on its own.
+    ///
+    /// `reuse_address` reapplies `SO_REUSEADDR`, which is a PRE-bind option:
+    /// whatever was set on the socket this one replaces is not inherited.
+    pub fn udp_rebind(
+        &self,
+        fd: FdId,
+        bind_addr: Option<&str>,
+        reuse_address: bool,
+    ) -> Result<(), io::Error> {
+        use std::net::ToSocketAddrs;
+        // Refuse before creating anything, so a bad fd cannot leak a socket.
+        match self.get_entry(fd) {
+            Some(entry) if matches!(&*entry, FileEntry::UdpSocket(_)) => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fd is not a UDP socket",
+                ))
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "bad fd for udp rebind",
+                ))
+            }
+        }
+        let addr_str = bind_addr.unwrap_or("0.0.0.0:0");
+        let udp = if reuse_address {
+            let sock_addr = addr_str
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addr resolved"))?;
+            let domain = if sock_addr.is_ipv4() {
+                socket2::Domain::IPV4
+            } else {
+                socket2::Domain::IPV6
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&sock_addr.into())?;
+            std::net::UdpSocket::from(socket)
+        } else {
+            std::net::UdpSocket::bind(addr_str)?
+        };
+        disable_udp_connreset(&udp);
+        self.entries
+            .write()
+            .insert(fd, Arc::new(FileEntry::UdpSocket(udp)));
+        Ok(())
+    }
+
     /// Send UDP datagram to a target address. Returns bytes sent.
     pub fn udp_send(&self, fd: FdId, data: &[u8], target: &str) -> Result<usize, io::Error> {
         let entry = self
@@ -2714,6 +2782,128 @@ impl FileDescriptorTable {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
             FileEntry::UdpSocket(s) => s.multicast_ttl_v4(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UDP option READ-BACK
+    //
+    // Every setter above landed without its getter, which is only invisible
+    // while the option surface is write-only. `DatagramChannel.getOption` is
+    // the reader, and without these it would have to answer from a Java-side
+    // side store alone — i.e. report what was last *requested* rather than what
+    // the socket actually carries, and answer a fabricated default for a
+    // channel nothing has set. These ask the socket.
+    // -----------------------------------------------------------------------
+
+    /// The peer a UDP socket is connected to, or an error when it is not
+    /// connected. Backs `DatagramChannel.remoteAddress()` — the package-private
+    /// accessor `sun.nio.ch.DatagramSocketAdaptor.getRemoteSocketAddress()` and
+    /// `getPort()` call, and which had no bridge at all.
+    pub fn udp_peer_addr(&self, fd: FdId) -> Result<String, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.peer_addr().map(|a| a.to_string()),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back SO_REUSEADDR (the setter is `udp_set_reuse_address`).
+    pub fn udp_reuse_address(&self, fd: FdId) -> Result<bool, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).reuse_address(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back SO_RCVBUF.
+    pub fn udp_recv_buffer_size(&self, fd: FdId) -> Result<usize, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).recv_buffer_size(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back SO_SNDBUF.
+    pub fn udp_send_buffer_size(&self, fd: FdId) -> Result<usize, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).send_buffer_size(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back IP_TOS (the setter is `udp_set_tos`).
+    pub fn udp_tos(&self, fd: FdId) -> Result<u32, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).tos(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set IP_MULTICAST_LOOP (IPv4).
+    pub fn udp_set_multicast_loop_v4(&self, fd: FdId, on: bool) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.set_multicast_loop_v4(on),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back IP_MULTICAST_LOOP (IPv4).
+    pub fn udp_multicast_loop_v4(&self, fd: FdId) -> Result<bool, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.multicast_loop_v4(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set IP_MULTICAST_IF (IPv4) to the interface owning `interface_addr`.
+    ///
+    /// The JDK's option value is a `NetworkInterface`; the socket-level option
+    /// is an address, so the caller resolves the interface to one of its IPv4
+    /// addresses first (`native-io`'s `dc_set_option`).
+    pub fn udp_set_multicast_if_v4(
+        &self,
+        fd: FdId,
+        interface_addr: &std::net::Ipv4Addr,
+    ) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).set_multicast_if_v4(interface_addr),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back IP_MULTICAST_IF (IPv4) as the configured interface address.
+    /// `0.0.0.0` means "no interface selected", which the JDK reports as null.
+    pub fn udp_multicast_if_v4(&self, fd: FdId) -> Result<std::net::Ipv4Addr, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).multicast_if_v4(),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }

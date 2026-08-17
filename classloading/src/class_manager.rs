@@ -235,7 +235,7 @@ fn loaded_class_for_requesting_loader(
             }
             None
         }
-        ClassLoaderId::UserDefined(_) => {
+        ClassLoaderId::UserDefined(ns) => {
             if user_own_first {
                 if let Some(id) = loaded_classes_probe(map, requesting_loader, name) {
                     return Some(id);
@@ -249,7 +249,28 @@ fn loaded_class_for_requesting_loader(
             if let Some(id) = loaded_class_via_parent_chain(map, requesting_loader, name) {
                 return Some(id);
             }
-            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+            // The built-in chain this loader's delegation may reach is
+            // bounded by its OWN recorded terminal parent, not always the
+            // whole chain. A `ModifiedClassPathClassLoader` (parent =
+            // platform/Extension, specifically to exclude Application — e.g.
+            // Spring's `@ClassPathExclusions`) must stop at Extension: probing
+            // Application anyway resolves a same-named class through the
+            // wrong loader, which is how a `PropertiesPropertySource` built
+            // by isolated-loader code ended up an `Application`-loaded
+            // instance while its own compiled `checkcast` site (correctly)
+            // named the isolated loader's `EnumerablePropertySource` —
+            // `ClassCastException` between two genuinely different classes.
+            // `None` (parent unrecorded, or the chain did not bottom out) is
+            // the permissive default: probe every built-in loader, as before.
+            let reachable: &[ClassLoaderId] =
+                match crate::loaders::user_loader_builtin_parent(ns) {
+                    Some(terminal) => {
+                        let end = (terminal as usize + 1).min(BUILTIN_LOADER_DELEGATION_CHAIN.len());
+                        &BUILTIN_LOADER_DELEGATION_CHAIN[..end]
+                    }
+                    None => BUILTIN_LOADER_DELEGATION_CHAIN,
+                };
+            for loader_id in reachable {
                 if let Some(id) = loaded_classes_probe(map, *loader_id, name) {
                     return Some(id);
                 }
@@ -7252,6 +7273,47 @@ impl ClassManager {
         out
     }
 
+    /// `true` when [`Self::next_resource_url_from`] can serve `name`.
+    pub fn resource_name_supports_incremental_scan(name: &str) -> bool {
+        crate::class_path::ClassPath::name_supports_incremental_scan(name)
+    }
+
+    /// The incremental form of [`Self::find_all_resource_urls`]: the next URL
+    /// at or after `(segment, index)`, plus the cursor to resume at.
+    ///
+    /// `segment` walks the same three class paths in the same order the
+    /// whole-list version concatenates them — 0 bootstrap, 1 extension, 2
+    /// application — so enumerating from `(0, 0)` to exhaustion yields exactly
+    /// what `find_all_resource_urls` returns, in the same order. It exists so a
+    /// caller that stops early stops the SCAN early; see
+    /// `ClassPath::next_resource_url_from` for the measurement.
+    ///
+    /// A cursor is only meaningful for as long as the classpath is unchanged.
+    /// Appending a root mid-enumeration shifts what an index names, exactly as
+    /// it does for a JDK `Enumeration` held across a `URLClassLoader.addURL`.
+    pub fn next_resource_url_from(
+        &self,
+        name: &str,
+        segment: usize,
+        index: usize,
+    ) -> Option<(String, usize, usize)> {
+        let paths = [
+            self.bootstrap.class_path(),
+            self.extension.class_path(),
+            self.application.class_path(),
+        ];
+        let mut seg = segment;
+        let mut idx = index;
+        while seg < paths.len() {
+            if let Some((url, next)) = paths[seg].next_resource_url_from(name, idx) {
+                return Some((url, seg, next));
+            }
+            seg += 1;
+            idx = 0;
+        }
+        None
+    }
+
     /// with the given name. Parallel to [`find_all_resource_urls`] but returns
     /// content rather than URLs — used by Rust-native resource enumeration
     /// paths (e.g. `ServiceLoader` provider discovery in
@@ -9028,6 +9090,20 @@ impl ClassManager {
         key: (ClassLoaderId, Arc<str>),
         id: ClassId,
     ) -> Option<ClassId> {
+        if let Ok(filter) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_DEFINE_FILTER") {
+            if !filter.is_empty() && key.1.contains(filter.as_str()) {
+                eprintln!(
+                    "[DBG_DEFINE] insert name={} loader={:?} id={}",
+                    key.1, key.0, id.as_u32()
+                );
+                if matches!(key.0, ClassLoaderId::Application) {
+                    eprintln!(
+                        "[DBG_DEFINE_BT] {}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
         let name = Arc::clone(&key.1);
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();
@@ -10931,6 +11007,31 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/ConcurrentHashMap$KeySetView" => "java/util/AbstractSet",
         "java/util/concurrent/ConcurrentSkipListSet" => "java/util/AbstractSet",
 
+        // The carrier classes a map's `values()`/`entrySet()` view is minted
+        // under (native-collections' `MAP_VIEW_CARRIERS`). In the real JDK
+        // every one of them extends `AbstractCollection`; with no class file
+        // the default `java/lang/Object` arm below would leave the view
+        // outside the Collection dispatch chain entirely.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/TreeMap$EntrySet"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => "java/util/AbstractCollection",
+
+        // The SET-shaped half of the same family (native-collections'
+        // `SET_VIEW_CARRIERS`, plus `TreeMap$KeySet`). Every one of them extends
+        // `AbstractSet` in the real JDK; without the arm the default below would
+        // leave `hashMap.keySet()` outside the Set dispatch chain.
+        "java/util/HashMap$KeySet"
+        | "java/util/HashMap$EntrySet"
+        | "java/util/LinkedHashMap$LinkedKeySet"
+        | "java/util/LinkedHashMap$LinkedEntrySet"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet"
+        | "java/util/TreeMap$KeySet"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => "java/util/AbstractSet",
+
         // Concrete List/Queue hierarchy:
         "java/util/ArrayList" => "java/util/AbstractList",
         "java/util/LinkedList" => "java/util/AbstractSequentialList",
@@ -10999,6 +11100,20 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // checkcast/instanceof honest — what this table is for — without
         // putting an aliased field layout into the dispatch chain.
         "cratonvm/synthetic/Process" => &["java/lang/Process"],
+        // The platform MXBean *extension* interfaces. `ManagementFactory
+        // .getThreadMXBean()` / `.getOperatingSystemMXBean()` fabricate their
+        // beans under these names so that `instanceof com.sun.management.…`
+        // answers true, the way it does on every real JVM (see
+        // `native-builtins/src/jmx.rs::alloc_extension_mxbean`). In real-JDK
+        // mode the extends-relation comes from the loaded class file; in
+        // synthetic-JDK mode there is no class file, so without these entries
+        // the fabricated stub would satisfy the extension `instanceof` and
+        // FAIL the base one — trading one broken type test for another, in the
+        // direction that breaks existing callers.
+        "com/sun/management/ThreadMXBean" => &["java/lang/management/ThreadMXBean"],
+        "com/sun/management/OperatingSystemMXBean" => {
+            &["java/lang/management/OperatingSystemMXBean"]
+        }
         "java/lang/String" => &[
             "java/io/Serializable",
             "java/lang/Comparable",
@@ -11025,6 +11140,39 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/util/Collection",
             "java/lang/Iterable",
             "java/io/Serializable",
+        ],
+        // A map view is a `Collection`, and deliberately NOT a `List` — that
+        // divergence (`hashMap.values() instanceof List` answering true) is
+        // half of what giving these views their own carrier class fixes. The
+        // `EntrySet` carrier is a `Set` for the same reason its JDK twin is.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => {
+            &["java/util/Collection", "java/lang/Iterable"]
+        }
+        "java/util/TreeMap$EntrySet"
+        | "java/util/HashMap$KeySet"
+        | "java/util/HashMap$EntrySet"
+        | "java/util/LinkedHashMap$LinkedKeySet"
+        | "java/util/LinkedHashMap$LinkedEntrySet"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        // `TreeMap.keySet()` is declared to return a `NavigableSet`, and the
+        // carrier `native_tm_key_set` mints must satisfy that checkcast — a
+        // plain `Set` here would fail every `(NavigableSet) tm.keySet()`.
+        "java/util/TreeMap$KeySet" => &[
+            "java/util/NavigableSet",
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
         ],
         "java/util/HashMap"
         | "java/util/LinkedHashMap"
@@ -11155,6 +11303,16 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // (WebClientIntegrationTests "[2] JDK", 40 sub-tests).
         "cratonvm/net/HttpBodyReplaySubscription" => &["java/util/concurrent/Flow$Subscription"],
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
+        // The iterator carriers `native_hs_iterator` mints since 2026-08-13
+        // (native-collections' `MAP_KEY_ITR_CARRIERS`), replacing the fabricated
+        // `java/util/HashMap$KeyItr` no JDK declares. In the real JDK they
+        // implement `Iterator` through `HashMap$HashIterator`; with no class
+        // file the default `_ => &[]` would leave `instanceof Iterator` false
+        // and every `(Iterator) set.iterator()` a ClassCastException.
+        "java/util/HashMap$KeyIterator"
+        | "java/util/HashMap$EntryIterator"
+        | "java/util/LinkedHashMap$LinkedKeyIterator"
+        | "java/util/LinkedHashMap$LinkedEntryIterator" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
         // `ArrayList.subList()`'s backed-view object (native-collections'
         // `ASL_CLASS`, allocated under this internal name rather than the
@@ -11171,7 +11329,15 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // the real `java.util.ArrayList$SubList`, which extends
         // `AbstractList` (itself `implements List`) and separately
         // `implements RandomAccess`.
-        "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
+        // Both sublist carriers. `java/util/ArrayList$SubList` is the class
+        // `alloc_asl_view` mints under whenever the real one resolves; in
+        // synthetic-JDK mode there is no class file for it, so without this arm
+        // the fabricated stub would declare no interfaces and every
+        // `(List) list.subList(..)` would be a ClassCastException — the same
+        // failure this entry's internal twin was added for.
+        "cratonvm/internal/ArrayListSubList" | "java/util/ArrayList$SubList" => {
+            &["java/util/List", "java/util/RandomAccess"]
+        }
         // The object `linkedList.listIterator()` hands back. Same reason as the
         // entry above, as `java/util/ArrayList$ListItr` two entries up, and as
         // `cratonvm/synthetic/Process`: with no arm here it fell to this
@@ -12274,6 +12440,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }],
         "java/util/Collections$EmptyEnumeration" => vec![],
         "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => instance_fields(5),
+        // The real nested class declares `root`/`parent`/`offset`/`size` on top
+        // of `AbstractList.modCount`. Fabricated at that width so
+        // `asl_base_checked`'s "`class_num_total_fields + ASL_NUM_FIELDS`"
+        // comparison means the same thing in synthetic-JDK mode as it does
+        // against the real class file.
+        "java/util/ArrayList$SubList" => instance_fields(5),
         // `Arrays.asList(T...)`'s fixed-size view. The real nested class has
         // exactly one field, `private final E[] a`, and derives `size()` from
         // `a.length` — which is what `native_arrays_as_list` and the
@@ -15456,6 +15628,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // arrayMapping.
         "com/sun/jmx/mbeanserver/MappedMXBeanType" => instance_fields(4),
 
+        // Throwable-family fallback: the three slots every Throwable native in
+        // `native-builtins::lang_misc` addresses when a synthetic receiver
+        // resolves neither a cached field index nor a field NAME —
+        // `synthetic_throwable_slot`'s map, which is
+        // `[0] = detailMessage, [1] = cause, [2] = suppressedExceptions`.
+        //
+        // Without this arm those classes reach `_ => vec![]`, i.e. ZERO instance
+        // fields, and every one of those writes is dropped by its own
+        // `slot < object_num_fields(this)` guard. A synthetic stub's superclass
+        // is a blanket `java/lang/Object` unless special-cased (see
+        // `synthetic_superclass`), so a throwable stub does NOT inherit
+        // `java.lang.Throwable`'s layout the way the real hierarchy would.
+        //
+        // Measured: with the constructors registered but this arm absent,
+        // `new ParseException("bad", 5).getMessage()` answered null on a VM that
+        // had just been handed "bad" — the constructor ran and stored nothing.
+        // The classes that already worked (`IllegalStateException`, `IOException`)
+        // are the ones with an explicit entry above; ordering matters, so this
+        // arm must stay LAST and catch only what nothing else claimed.
+        name if name == "java/lang/Throwable"
+            || name.ends_with("Exception")
+            || name.ends_with("Error") =>
+        {
+            instance_fields(3)
+        }
+
         _ => vec![],
     }
 }
@@ -15494,105 +15692,215 @@ fn native_constant_surface_raw_slot_layout_audit() {
     }
 }
 
-/// The `<init>` descriptors a synthetic stub of a **measured** JDK
-/// Throwable-family class must declare, or `None` for a name outside the
-/// measured set.
+/// The four constructor descriptors a throwable-family class is ASSUMED to have
+/// when this table has not measured it.
 ///
-/// THIS IS THE STUB MIRROR OF THE REGISTRY TABLE IN
-/// `native-builtins/src/lang_misc.rs::register_throwable_subclass_natives`.
-/// The two halves are kept identical by
-/// `throwable_ctor_table_matches_the_stub_declarations` below, a source witness
-/// that reads both files out of the working tree — the crate dependency runs
-/// native-builtins → classloading, so classloading cannot import the other
-/// copy, and a silently drifting second copy is exactly the failure this
-/// change is fixing. (The durable fix is one table behind a `pub use` in
-/// `classloading/src/lib.rs`; that file is not this lane's to edit, and the
-/// nomination is in `docs/known-issues/jdk-only/E34-1-*.md`.)
+/// They are the `Throwable` set, and for a class that really does declare all
+/// four (`Exception`, `RuntimeException`, `IOException`, …) they are exactly
+/// right. The assumption is what [`throwable_ctor_descriptors`] exists to stop
+/// applying to classes where it is false.
+pub const THROWABLE_DEFAULT_CTORS: &[&str] = &[
+    "()V",
+    "(Ljava/lang/String;)V",
+    "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    "(Ljava/lang/Throwable;)V",
+];
+
+/// The constructor descriptors JDK 25 declares for a throwable-family class —
+/// measured, not assumed.
 ///
-/// Until 2026-08-13 this arm declared the SAME four descriptors for every name
-/// ending in `Exception`/`Error`. Against JDK 25.0.3+9-LTS that was wrong 103
-/// times over these 62 classes and missed 15 real constructors — worst of all
-/// `AssertionError.<init>(Ljava/lang/Object;)V`, which is what `javac` emits
-/// for both `throw new AssertionError(msg)` and `assert cond : msg`.
+/// # Why this table exists
 ///
-/// REGENERATE with `scratchpad/e34/Gen34.java` on the target JDK: a JDK bump
-/// then shows up as a diff of this literal rather than as drift.
-// THROWABLE-CTOR-TABLE BEGIN
-fn jdk_throwable_ctor_descriptors(name: &str) -> Option<&'static [&'static str]> {
-    // `#[rustfmt::skip]`: one row per class is the INTERFACE — it is what
-    // `Gen34.java` emits, what the source witness parses, and what makes a JDK
-    // bump a one-line-per-class diff. rustfmt would explode each row over six
-    // lines and destroy all three.
-    #[rustfmt::skip]
-    const TABLE: &[(&str, &[&str])] = &[
-        ("java/lang/Throwable", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/Exception", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/RuntimeException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/Error", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/LinkageError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/NoClassDefFoundError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/SecurityException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/ReflectiveOperationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/ClassNotFoundException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/NoSuchMethodError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NoSuchFieldError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NoSuchMethodException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NoSuchFieldException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/CloneNotSupportedException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/InstantiationException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IllegalAccessException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/reflect/InaccessibleObjectException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/reflect/InvocationTargetException", &["()V", "(Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;Ljava/lang/String;)V"]),
-        ("java/lang/InterruptedException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NullPointerException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ArithmeticException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ArrayIndexOutOfBoundsException", &["()V", "(I)V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IndexOutOfBoundsException", &["()V", "(I)V", "(J)V", "(Ljava/lang/String;)V"]),
-        ("java/lang/StringIndexOutOfBoundsException", &["()V", "(I)V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ClassCastException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IllegalArgumentException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/IllegalStateException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/UnsupportedOperationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/TypeNotPresentException", &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/StackOverflowError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/OutOfMemoryError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/NoSuchElementException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/InputMismatchException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/MissingResourceException", &["(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"]),
-        ("java/util/FormatterClosedException", &["()V"]),
-        ("java/io/IOException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/io/FileNotFoundException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/io/UncheckedIOException", &["(Ljava/io/IOException;)V", "(Ljava/lang/String;Ljava/io/IOException;)V"]),
-        ("java/io/NotSerializableException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/io/EOFException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/io/UnsupportedEncodingException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/net/MalformedURLException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/net/UnknownHostException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/NumberFormatException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/ConcurrentModificationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/TimeoutException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/concurrent/RejectedExecutionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/CancellationException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/util/concurrent/CompletionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/ExecutionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/util/concurrent/BrokenBarrierException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/text/ParseException", &["(Ljava/lang/String;I)V"]),
-        ("java/lang/NegativeArraySizeException", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/AssertionError", &["()V", "(C)V", "(D)V", "(F)V", "(I)V", "(J)V", "(Ljava/lang/Object;)V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Z)V"]),
-        ("java/lang/MatchException", &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
-        ("java/lang/IncompatibleClassChangeError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/IllegalAccessError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/ExceptionInInitializerError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/VerifyError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/AbstractMethodError", &["()V", "(Ljava/lang/String;)V"]),
-        ("java/lang/InternalError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
-        ("java/lang/UnsatisfiedLinkError", &["()V", "(Ljava/lang/String;)V"]),
-    ];
-    // THROWABLE-CTOR-TABLE END
-    TABLE
-        .iter()
-        .find(|(cls, _)| *cls == name)
-        .map(|(_, descriptors)| *descriptors)
+/// Both the synthetic stub's method table (below) and the native registry
+/// (`native-builtins::register_throwable_subclass_natives`) used to declare the
+/// same blanket four: `()V`, `(String)V`, `(String,Throwable)V`, `(Throwable)V`.
+/// Reflected against JDK 25 across the 62 classes that registrar names, those
+/// four are **not a declared constructor 103 times**, and **15 constructors
+/// javac actually emits were absent**.
+///
+/// Both halves of that are bugs, and they are different bugs:
+///
+/// * A **missing** descriptor is a `NoSuchMethodError` at a call site that
+///   compiles fine. The worst is `java.lang.AssertionError`: its `(String)V` is
+///   PRIVATE, and both `throw new AssertionError(msg)` and `assert cond : msg`
+///   compile to `<init>:(Ljava/lang/Object;)V` — which was neither registered
+///   nor declared. It is the single most reachable gap in the census: the error
+///   path of anything using `assert`.
+/// * A **dead** descriptor is a fabricated constructor that the real class does
+///   not have. It can only ever win a race it should lose — shadowing real JDK
+///   bytecode in Compatible mode, or, in synthetic-JDK mode, letting code
+///   compile against a shape the JDK would have rejected.
+///
+/// # Declared-and-callable, not merely public
+///
+/// The rule is "every constructor a `javac`-compiled call site can reference",
+/// which is the PUBLIC set plus the PROTECTED ones: a subclass in another
+/// package compiles `super(...)` against a protected constructor, and under
+/// `--jdk-only` the synthetic stub is the only declaration that call will ever
+/// find. So `CompletionException()`, `CompletionException(String)`,
+/// `ExecutionException()`, `ExecutionException(String)` and
+/// `InvocationTargetException()` — all protected, all reachable — are here.
+///
+/// PRIVATE constructors are not, and that is the same rule rather than an
+/// exception to it: `AssertionError(String)` is private, so nothing outside
+/// `AssertionError` itself can name it. Its only caller is
+/// `AssertionError(Object)`'s own bytecode via `this(...)`, and that bytecode
+/// either never runs (synthetic mode: the stub's `<init>` is native) or
+/// resolves against the real class file (Compatible mode). Declaring it would
+/// be a dead descriptor.
+///
+/// Nothing the real class does not declare is in this table.
+///
+/// # One table, two consumers
+///
+/// The stub's method table and the registry MUST agree about which constructors
+/// exist, or a call resolves against a declaration with no implementation (or
+/// the reverse). They are in different crates, so the list lives here — in the
+/// crate `native-builtins` already depends on — and both read it.
+/// `native-builtins`' `every_declared_throwable_ctor_has_a_native` is the gate
+/// that says so out loud: every descriptor named here must have a native body.
+///
+/// # The default is deliberate
+///
+/// An unmeasured name falls back to [`THROWABLE_DEFAULT_CTORS`]. The caller's
+/// `is_throwable_like` test is a NAME heuristic (`ends_with("Exception")`), so
+/// it fires for application classes this table has never seen; those still need
+/// the common four. Narrowing a class whose real constructor set we have NOT
+/// measured would remove answers with nothing to put in their place. Only the
+/// classes measured against a real JDK get an exact answer.
+///
+/// # Provenance
+///
+/// Measured 2026-08-13 against JDK 25 by reflecting `getDeclaredConstructors()`
+/// over the class names the registrar walks — `probes/ThrowableCtorCensusProbe.java`,
+/// cross-checked against `scratchpad/e34/Gen34.java`. Re-run after a JDK bump:
+/// a bump then shows up as a diff of this function rather than as drift.
+pub fn throwable_ctor_descriptors(name: &str) -> &'static [&'static str] {
+    match name {
+        // -- the full four, genuinely --
+        "java/lang/Throwable"
+        | "java/lang/Exception"
+        | "java/lang/RuntimeException"
+        | "java/lang/Error"
+        | "java/lang/SecurityException"
+        | "java/lang/ReflectiveOperationException"
+        | "java/lang/IllegalArgumentException"
+        | "java/lang/IllegalStateException"
+        | "java/lang/UnsupportedOperationException"
+        | "java/util/NoSuchElementException"
+        | "java/io/IOException"
+        | "java/util/ConcurrentModificationException"
+        | "java/util/concurrent/RejectedExecutionException"
+        | "java/lang/InternalError" => THROWABLE_DEFAULT_CTORS,
+
+        // -- the full four as well, but here the no-arg and message forms are
+        //    PROTECTED rather than public. A subclass's `super()` / `super(msg)`
+        //    is a call site `javac` compiles, so the stub must declare them
+        //    (see "Declared-and-callable" above).
+        "java/util/concurrent/CompletionException" | "java/util/concurrent/ExecutionException" => {
+            THROWABLE_DEFAULT_CTORS
+        }
+
+        // -- message-only families: no cause-taking constructor at all --
+        "java/lang/NoClassDefFoundError"
+        | "java/lang/NoSuchMethodError"
+        | "java/lang/NoSuchFieldError"
+        | "java/lang/NoSuchMethodException"
+        | "java/lang/NoSuchFieldException"
+        | "java/lang/CloneNotSupportedException"
+        | "java/lang/InstantiationException"
+        | "java/lang/IllegalAccessException"
+        | "java/lang/reflect/InaccessibleObjectException"
+        | "java/lang/InterruptedException"
+        | "java/lang/NullPointerException"
+        | "java/lang/ArithmeticException"
+        | "java/lang/ClassCastException"
+        | "java/lang/StackOverflowError"
+        | "java/lang/OutOfMemoryError"
+        | "java/util/InputMismatchException"
+        | "java/io/FileNotFoundException"
+        | "java/io/NotSerializableException"
+        | "java/io/EOFException"
+        | "java/io/UnsupportedEncodingException"
+        | "java/net/MalformedURLException"
+        | "java/net/UnknownHostException"
+        | "java/lang/NumberFormatException"
+        | "java/util/concurrent/TimeoutException"
+        | "java/util/concurrent/CancellationException"
+        | "java/util/concurrent/BrokenBarrierException"
+        | "java/lang/NegativeArraySizeException"
+        | "java/lang/IncompatibleClassChangeError"
+        | "java/lang/IllegalAccessError"
+        | "java/lang/VerifyError"
+        | "java/lang/AbstractMethodError"
+        | "java/lang/UnsatisfiedLinkError" => &["()V", "(Ljava/lang/String;)V"],
+
+        "java/lang/LinkageError" => &[
+            "()V",
+            "(Ljava/lang/String;)V",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        ],
+        "java/lang/ClassNotFoundException" => &[
+            "()V",
+            "(Ljava/lang/String;)V",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        ],
+        "java/lang/ExceptionInInitializerError" => {
+            &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/Throwable;)V"]
+        }
+
+        // -- cause-only --
+        "java/lang/TypeNotPresentException" | "java/lang/MatchException" => {
+            &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]
+        }
+        "java/util/FormatterClosedException" => &["()V"],
+
+        // -- the index families: an `int`/`long` overload nobody registered --
+        "java/lang/ArrayIndexOutOfBoundsException"
+        | "java/lang/StringIndexOutOfBoundsException" => {
+            &["()V", "(Ljava/lang/String;)V", "(I)V"]
+        }
+        "java/lang/IndexOutOfBoundsException" => {
+            &["()V", "(Ljava/lang/String;)V", "(I)V", "(J)V"]
+        }
+
+        // -- `AssertionError`: the headline. `(String)V` is PRIVATE and
+        //    `(Throwable)V` does not exist; `(Object)V` is what
+        //    `assert x : msg` compiles to.
+        "java/lang/AssertionError" => &[
+            "()V",
+            "(Ljava/lang/Object;)V",
+            "(Z)V",
+            "(C)V",
+            "(I)V",
+            "(J)V",
+            "(F)V",
+            "(D)V",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        ],
+
+        // -- classes where ALL FOUR blanket descriptors are dead --
+        "java/io/UncheckedIOException" => &[
+            "(Ljava/io/IOException;)V",
+            "(Ljava/lang/String;Ljava/io/IOException;)V",
+        ],
+        "java/util/MissingResourceException" => {
+            &["(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"]
+        }
+        "java/text/ParseException" => &["(Ljava/lang/String;I)V"],
+        // `()V` is PROTECTED here and kept for the same reason as
+        // `CompletionException`'s. `(String)V` and `(String,Throwable)V` are not
+        // declared by this class at all and are gone; the wrapped throwable
+        // lives in this class's own `target` field rather than
+        // `Throwable.cause`, which is what the two remaining natives implement.
+        "java/lang/reflect/InvocationTargetException" => &[
+            "()V",
+            "(Ljava/lang/Throwable;)V",
+            "(Ljava/lang/Throwable;Ljava/lang/String;)V",
+        ],
+
+        _ => THROWABLE_DEFAULT_CTORS,
+    }
 }
 
 fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
@@ -15605,27 +15913,15 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     };
     let is_throwable_like =
         name == "java/lang/Throwable" || name.ends_with("Exception") || name.ends_with("Error");
-    if let Some(descriptors) = jdk_throwable_ctor_descriptors(name) {
-        // A JDK class we have measured: declare exactly what the real class
-        // declares. This is the stub half of the fix in
-        // `native-builtins/src/lang_misc.rs::register_throwable_subclass_natives`
-        // and MUST move with it — the registry and the stub have to agree about
-        // which constructors exist, or a call resolves to a declared-but-native
-        // `<init>` with no registration behind it (still an error, just a
-        // different one).
-        out.extend(descriptors.iter().map(|d| mk_ctor(*d)));
-    } else if is_throwable_like {
-        // Not a class in the table — an application throwable
-        // (`…/DbException`), or a JDK throwable outside the measured set. Keep
-        // the historical four-descriptor guess: it is a guess, but narrowing it
-        // for a class whose real constructor set we have NOT measured would
-        // remove answers with nothing to put in their place.
-        out.extend([
-            mk_ctor("()V"),
-            mk_ctor("(Ljava/lang/String;)V"),
-            mk_ctor("(Ljava/lang/Throwable;)V"),
-            mk_ctor("(Ljava/lang/String;Ljava/lang/Throwable;)V"),
-        ]);
+    if is_throwable_like {
+        // Per class, from the table above — NOT a blanket four. This half and
+        // `native-builtins::register_throwable_subclass_natives` read the same
+        // list on purpose: a declaration here with no registration there is a
+        // method that resolves and then has no body. A name the table has never
+        // measured (an application `…/DbException`) still gets the historical
+        // four — that is what the default arm of `throwable_ctor_descriptors`
+        // is for.
+        out.extend(throwable_ctor_descriptors(name).iter().map(|d| mk_ctor(d)));
     }
     if name == "java/lang/reflect/InvocationTargetException" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
@@ -16230,7 +16526,36 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 mk("isEmpty", "()Z"),
                 mk("iterator", "()Ljava/util/Iterator;"),
                 mk("toArray", "()[Ljava/lang/Object;"),
+                // The rest of the `Collection` contract. A synchronized wrapper
+                // used to reach this VM only via
+                // `Collections.synchronizedCollection(…)`; since 2026-08-13 it
+                // is also what `Hashtable`/`Properties` hand back for
+                // `keySet()`/`entrySet()`/`values()`, so the full read surface
+                // is exercised. Undeclared here, those calls fall through to an
+                // interface-level native that reads the WRAPPER as the
+                // collection and reports it empty. Bodies:
+                // `util_concurrent_ext::sync_collection_delegate`.
+                mk("clear", "()V"),
+                mk("toString", "()Ljava/lang/String;"),
+                mk("stream", "()Ljava/util/stream/Stream;"),
+                mk("spliterator", "()Ljava/util/Spliterator;"),
+                mk("forEach", "(Ljava/util/function/Consumer;)V"),
+                mk("containsAll", "(Ljava/util/Collection;)Z"),
+                mk("addAll", "(Ljava/util/Collection;)Z"),
+                mk("removeAll", "(Ljava/util/Collection;)Z"),
+                mk("retainAll", "(Ljava/util/Collection;)Z"),
+                mk("removeIf", "(Ljava/util/function/Predicate;)Z"),
+                mk("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+                mk(
+                    "toArray",
+                    "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+                ),
             ]);
+            // Only the Set wrapper overrides these in the JDK — see the
+            // registration site for why the Collection wrapper must not.
+            if name == "java/util/Collections$SynchronizedSet" {
+                out.extend([mk("hashCode", "()I"), mk("equals", "(Ljava/lang/Object;)Z")]);
+            }
         }
     }
     if matches!(
@@ -18253,111 +18578,6 @@ mod tests {
         let child = mgr.class_store.get(child_id).unwrap();
         assert_eq!(child.first_field_index, 2);
         assert_eq!(child.num_total_fields, 3);
-    }
-
-    /// The two copies of the Throwable `<init>` descriptor table must agree.
-    ///
-    /// `jdk_throwable_ctor_descriptors` (this file) says which constructors a
-    /// synthetic stub DECLARES; `throwable_ctors` in
-    /// `native-builtins/src/lang_misc.rs::register_throwable_subclass_natives`
-    /// says which constructors are REGISTERED. If those disagree, a call site
-    /// either resolves to a declared-but-unimplemented `<init>` or misses a
-    /// registered one — the exact half-fix shape this table was introduced to
-    /// end. They cannot be one constant: the crate dependency runs
-    /// native-builtins -> classloading, and `classloading/src/lib.rs` (which
-    /// would have to export it) is owned elsewhere. So the copies are kept
-    /// honest here instead of hoped about.
-    ///
-    /// This is a SOURCE witness — it reads the working tree, not the compiled
-    /// tables — because the other copy is in a crate this one cannot link.
-    /// It fails loudly (not vacuously) if either file or either marker is
-    /// missing, and it mutation-checks itself by requiring a plausible row
-    /// count on both sides before comparing.
-    #[test]
-    fn throwable_ctor_table_matches_the_stub_declarations() {
-        // Assembled rather than written as one literal so this test's own text
-        // is not what the scan finds in this file.
-        let begin = format!("// THROWABLE-CTOR-{}-BEGIN", "TABLE").replace("-BEGIN", " BEGIN");
-        let end = format!("// THROWABLE-CTOR-{}-END", "TABLE").replace("-END", " END");
-
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("the classloading crate directory must have a parent")
-            .to_path_buf();
-        assert!(
-            workspace.join("Cargo.toml").is_file(),
-            "workspace root not found at {} — failing rather than comparing nothing",
-            workspace.display()
-        );
-
-        /// Pull every `("class", &["desc", ...]),` row out of a source region.
-        fn rows(text: &str, begin: &str, end: &str, what: &str) -> Vec<(String, Vec<String>)> {
-            let start = text
-                .find(begin)
-                .unwrap_or_else(|| panic!("{what}: start marker {begin:?} not found"));
-            let stop = text[start..]
-                .find(end)
-                .map(|i| start + i)
-                .unwrap_or_else(|| panic!("{what}: end marker {end:?} not found"));
-            let mut out = Vec::new();
-            for line in text[start..stop].lines() {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix("(\"") else {
-                    continue;
-                };
-                let Some((class, tail)) = rest.split_once("\", &[") else {
-                    continue;
-                };
-                let Some((body, _)) = tail.split_once("]),") else {
-                    continue;
-                };
-                let descriptors: Vec<String> = body
-                    .split(',')
-                    .map(|d| d.trim().trim_matches('"').to_string())
-                    .filter(|d| !d.is_empty())
-                    .collect();
-                out.push((class.to_string(), descriptors));
-            }
-            out
-        }
-
-        let stub_src = std::fs::read_to_string(
-            workspace
-                .join("classloading")
-                .join("src")
-                .join("class_manager.rs"),
-        )
-        .expect("this file is readable");
-        let registrar_src = std::fs::read_to_string(
-            workspace
-                .join("native-builtins")
-                .join("src")
-                .join("lang_misc.rs"),
-        )
-        .expect("native-builtins/src/lang_misc.rs is readable");
-
-        let stub = rows(&stub_src, &begin, &end, "stub table (class_manager.rs)");
-        let registrar = rows(
-            &registrar_src,
-            &begin,
-            &end,
-            "registrar table (lang_misc.rs)",
-        );
-
-        // A witness that can pass on an empty parse measures nothing.
-        assert!(
-            stub.len() >= 60 && registrar.len() >= 60,
-            "parsed {} stub rows and {} registrar rows — the extractor is broken, \
-             not the tables",
-            stub.len(),
-            registrar.len()
-        );
-        assert_eq!(
-            stub, registrar,
-            "the synthetic-stub `<init>` table and the native-registry `<init>` \
-             table have drifted. Both are generated by `scratchpad/e34/Gen34.java` \
-             from the target JDK; regenerate and paste the SAME rows into both."
-        );
     }
 
     /// `Class::superclass` may only be written by `ClassStore::set_superclass`.

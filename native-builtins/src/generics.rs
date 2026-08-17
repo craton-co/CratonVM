@@ -584,12 +584,54 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Va
                     if let Some(real) = resolve_declared_type_variable(ctx, scope, name) {
                         return Ok(real);
                     }
-                    match ctx.invoke_virtual(scope, "getDeclaringClass", "()Ljava/lang/Class;", &[])
-                    {
+                    // Climb one lexical level. `getDeclaringClass` is the right
+                    // question for a method/constructor decl and for a MEMBER
+                    // class, but it answers NULL for an ANONYMOUS or LOCAL class
+                    // (JLS: those are not members of their enclosing class), so
+                    // the walk used to stop dead on the first anonymous scope and
+                    // fall through to the synthetic stand-in below — whose
+                    // `genericDeclaration` is then the anonymous class itself
+                    // rather than the class that actually declares the variable.
+                    // `new U<E>() { }` inside `class V<E>` is exactly that shape:
+                    // HotSpot reports `E`'s declaration as `V`, CratonVM reported
+                    // the anonymous `V$1`. netty's
+                    // `ReflectionUtil.resolveTypeParameter` then asks
+                    // `V$1.isAssignableFrom(V$1)` (true instead of false), loops,
+                    // walks off the end of the superclass chain and throws
+                    // "cannot determine the type of the type parameter 'E'" —
+                    // `io.netty.util.internal.TypeParameterMatcherTest.testInnerClass`.
+                    //
+                    // Only consulted when `getDeclaringClass` yields nothing, so a
+                    // `Method`/`Constructor` scope (which always has a declaring
+                    // class, and has no `getEnclosingClass`) never reaches it.
+                    let next = match ctx.invoke_virtual(
+                        scope,
+                        "getDeclaringClass",
+                        "()Ljava/lang/Class;",
+                        &[],
+                    ) {
                         Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
-                            scope = enclosing;
+                            Some(enclosing)
                         }
-                        _ => break,
+                        _ => None,
+                    };
+                    let next = match next {
+                        Some(n) => Some(n),
+                        None => match ctx.invoke_virtual(
+                            scope,
+                            "getEnclosingClass",
+                            "()Ljava/lang/Class;",
+                            &[],
+                        ) {
+                            Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
+                                Some(enclosing)
+                            }
+                            _ => None,
+                        },
+                    };
+                    match next {
+                        Some(enclosing) => scope = enclosing,
+                        None => break,
                     }
                 }
             }

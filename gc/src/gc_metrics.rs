@@ -94,6 +94,45 @@ struct Counters {
     /// Old→young reference slots discovered by the dirty-card scan, summed
     /// over every scan. Ungated.
     old_to_young_edges: AtomicU64,
+    /// G1 post-evacuation CSet verification (audit I-6 / §9 item 2). Objects
+    /// the verifier actually walked, summed over every pause; the pauses it
+    /// ran in; and the number of dangling-into-freed-CSet references it found.
+    ///
+    /// These exist so "the remembered set is complete" stops being a review
+    /// claim. The verifier used to run only under `debug_assertions` or the
+    /// verify flag, i.e. never in a shipping build, which meant the one direct
+    /// check of I-6 produced no evidence at all in the configuration anyone
+    /// actually runs. `objects` against `live_bytes` is what says how much of
+    /// that claim a given run has actually tested.
+    cset_verify_objects: AtomicU64,
+    cset_verify_pauses: AtomicU64,
+    cset_verify_dangling: AtomicU64,
+    /// Pauses in which the verifier hit its budget and stopped early, so the
+    /// pass covered only part of the heap. Coverage accumulates across pauses
+    /// via a rotating start cursor, but a run whose budget is always exhausted
+    /// has never verified the whole heap in one pause, and the difference
+    /// matters when reading a zero `cset_verify_dangling`.
+    cset_verify_truncated: AtomicU64,
+    /// Remembered sets that gave up naming individual source regions and
+    /// coarsened to "any region may point into me" (audit §9 item 5). A
+    /// non-zero value means some pause after it walked every plausible source
+    /// region wholesale, which is correct but is the expensive arm.
+    rset_coarsened: AtomicU64,
+    /// Humongous spans reclaimed by an evacuation pause rather than by a
+    /// concurrent-mark cleanup (`CRATONVM_G1_EAGER_HUMONGOUS`), and the bytes
+    /// they held.
+    ///
+    /// Worth a counter of its own because eager reclaim is the ONLY path that
+    /// frees memory outside the collection set. When a humongous object goes
+    /// missing, the first question is which of the two reclaimers took it, and
+    /// `spans` answers it without a rebuild.
+    humongous_eager_spans: AtomicU64,
+    humongous_eager_bytes: AtomicU64,
+    /// Pauses that had eager reclaim enabled but declined to run it, because
+    /// some precondition (a mark cycle in flight, an evacuation failure, an
+    /// aborted region walk) made "unreferenced" untrustworthy. A high ratio
+    /// against `humongous_eager_spans` is why a heap is not reclaiming.
+    humongous_eager_declined: AtomicU64,
     /// Nanoseconds spent in card refinement (flush + drain + dirty-card scan).
     /// Ungated.
     refinement_nanos: AtomicU64,
@@ -117,6 +156,14 @@ impl Counters {
             duplicate_card_marks: AtomicU64::new(0),
             remembered_set_bytes: AtomicU64::new(0),
             old_to_young_edges: AtomicU64::new(0),
+            cset_verify_objects: AtomicU64::new(0),
+            cset_verify_pauses: AtomicU64::new(0),
+            cset_verify_dangling: AtomicU64::new(0),
+            cset_verify_truncated: AtomicU64::new(0),
+            rset_coarsened: AtomicU64::new(0),
+            humongous_eager_spans: AtomicU64::new(0),
+            humongous_eager_bytes: AtomicU64::new(0),
+            humongous_eager_declined: AtomicU64::new(0),
             refinement_nanos: AtomicU64::new(0),
             refinement_passes: AtomicU64::new(0),
             allocated_objects: AtomicU64::new(0),
@@ -283,6 +330,47 @@ pub fn record_remembered_set_bytes(bytes: u64) {
     });
 }
 
+/// Record one G1 post-evacuation CSet verification pass.
+///
+/// `objects` is how many objects the pass actually walked, `dangling` how many
+/// references into a freed CSet region with no forwarding entry it found, and
+/// `truncated` whether it stopped on its budget rather than on the end of the
+/// heap. See the counter docs for why a *coverage* number is the point: a zero
+/// `dangling` from a pass that walked 300 objects of a 2 M-object heap is not
+/// the same statement as a zero from a full sweep, and before this the two were
+/// indistinguishable because neither was published.
+pub fn record_g1_cset_verify(objects: u64, dangling: u64, truncated: bool) {
+    with_counters(|c| {
+        c.cset_verify_objects.fetch_add(objects, Ordering::Relaxed);
+        c.cset_verify_pauses.fetch_add(1, Ordering::Relaxed);
+        c.cset_verify_dangling.fetch_add(dangling, Ordering::Relaxed);
+        if truncated {
+            c.cset_verify_truncated.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Record an evacuation pause's eager humongous reclaim.
+///
+/// `spans == 0` with `declined == false` is the ordinary "nothing was dead"
+/// outcome; `declined == true` means the pause never asked the question.
+pub fn record_g1_eager_humongous(spans: u64, bytes: u64, declined: bool) {
+    with_counters(|c| {
+        c.humongous_eager_spans.fetch_add(spans, Ordering::Relaxed);
+        c.humongous_eager_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if declined {
+            c.humongous_eager_declined.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Record that one remembered set coarsened (audit §9 item 5).
+pub fn record_g1_rset_coarsened() {
+    with_counters(|c| {
+        c.rset_coarsened.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// Record one refinement pass of `nanos` nanoseconds (card buffer flush +
 /// pending drain + dirty-card scan).
 pub fn record_refinement(nanos: u64) {
@@ -338,6 +426,14 @@ pub struct GcMetricsRaw {
     pub duplicate_card_marks: u64,
     pub remembered_set_bytes: u64,
     pub old_to_young_edges: u64,
+    pub cset_verify_objects: u64,
+    pub cset_verify_pauses: u64,
+    pub cset_verify_dangling: u64,
+    pub cset_verify_truncated: u64,
+    pub rset_coarsened: u64,
+    pub humongous_eager_spans: u64,
+    pub humongous_eager_bytes: u64,
+    pub humongous_eager_declined: u64,
     pub refinement_nanos: u64,
     pub refinement_passes: u64,
     pub allocated_objects: u64,
@@ -492,6 +588,14 @@ pub fn gc_metrics_raw() -> GcMetricsRaw {
         duplicate_card_marks: c.duplicate_card_marks.load(Ordering::Relaxed),
         remembered_set_bytes: c.remembered_set_bytes.load(Ordering::Relaxed),
         old_to_young_edges: c.old_to_young_edges.load(Ordering::Relaxed),
+        cset_verify_objects: c.cset_verify_objects.load(Ordering::Relaxed),
+        cset_verify_pauses: c.cset_verify_pauses.load(Ordering::Relaxed),
+        cset_verify_dangling: c.cset_verify_dangling.load(Ordering::Relaxed),
+        cset_verify_truncated: c.cset_verify_truncated.load(Ordering::Relaxed),
+        rset_coarsened: c.rset_coarsened.load(Ordering::Relaxed),
+        humongous_eager_spans: c.humongous_eager_spans.load(Ordering::Relaxed),
+        humongous_eager_bytes: c.humongous_eager_bytes.load(Ordering::Relaxed),
+        humongous_eager_declined: c.humongous_eager_declined.load(Ordering::Relaxed),
         refinement_nanos: c.refinement_nanos.load(Ordering::Relaxed),
         refinement_passes: c.refinement_passes.load(Ordering::Relaxed),
         allocated_objects: c.allocated_objects.load(Ordering::Relaxed),
@@ -903,6 +1007,32 @@ pub fn collector_decision_report() -> String {
             100.0 * g1_incomplete as f64 / g1_pauses as f64,
         ));
     }
+    // I-6 coverage. Printed whenever the verifier ran at all, including the
+    // budgeted release pass, because the interesting reading is `objects`: a
+    // zero `dangling` means nothing without the number of objects it is a
+    // statement about. `budget_truncated` says how often the budget, rather
+    // than the end of the heap, is what ended the pass.
+    let verify = gc_metrics_raw();
+    if verify.cset_verify_pauses > 0 {
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 cset-verify: pauses={} objects={} dangling={} budget_truncated={} (objects/pause={:.1})",
+            verify.cset_verify_pauses,
+            verify.cset_verify_objects,
+            verify.cset_verify_dangling,
+            verify.cset_verify_truncated,
+            verify.cset_verify_objects as f64 / verify.cset_verify_pauses as f64,
+        ));
+    }
+    if verify.humongous_eager_spans > 0 || verify.humongous_eager_declined > 0 {
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 humongous-eager: spans={} bytes={} declined_pauses={}",
+            verify.humongous_eager_spans,
+            verify.humongous_eager_bytes,
+            verify.humongous_eager_declined,
+        ));
+    }
     s
 }
 
@@ -952,7 +1082,15 @@ pub mod g1_degraded {
     /// holds a conservatively-discovered JIT root or a frozen peer's
     /// un-retired TLAB tail (`jit_pinned_region_set`).
     pub const JIT_PINNED_REGIONS_EXCLUDED: u32 = 1 << 6;
-    /// The experimental parallel evacuator ran (`CRATONVM_G1_PARALLEL_EVAC`).
+    /// The parallel evacuator ran, rather than the single-threaded one.
+    ///
+    /// Unlike its neighbours this is NOT a fail-safe the collector took, and
+    /// since 2026-08-13 it is not an experiment either — parallel evacuation is
+    /// the default. It stays in this word because the question it answers is
+    /// the one every G1 bug report needs answered first: WHICH evacuator ran.
+    /// Reading a cycle record without it is how a parallel-path defect gets
+    /// triaged as a serial-path one, which is most of what went wrong with
+    /// G1-9.
     pub const PARALLEL_EVACUATOR: u32 = 1 << 7;
     /// The collection set came out empty, so the pause did nothing.
     pub const EMPTY_COLLECTION_SET: u32 = 1 << 8;
@@ -994,7 +1132,7 @@ pub mod g1_degraded {
             ),
             (JNI_PINNED_REGIONS_EXCLUDED, "jni-pinned-regions-excluded"),
             (JIT_PINNED_REGIONS_EXCLUDED, "jit-pinned-regions-excluded"),
-            (PARALLEL_EVACUATOR, "experimental-parallel-evacuator"),
+            (PARALLEL_EVACUATOR, "parallel-evacuator"),
             (EMPTY_COLLECTION_SET, "empty-collection-set"),
             (ROOT_COVERAGE_INCOMPLETE, "root-coverage-incomplete-no-evacuation"),
         ];
@@ -1213,6 +1351,17 @@ mod tests {
             duplicate_card_marks: 150,
             remembered_set_bytes: 2_048,
             old_to_young_edges: 200,
+            // The CSet-verify counters are pure observability: they take no
+            // part in any normalization below, so this literal pins them at
+            // zero to say so rather than to exercise them.
+            cset_verify_objects: 0,
+            cset_verify_pauses: 0,
+            cset_verify_dangling: 0,
+            cset_verify_truncated: 0,
+            rset_coarsened: 0,
+            humongous_eager_spans: 0,
+            humongous_eager_bytes: 0,
+            humongous_eager_declined: 0,
             refinement_nanos: 4_000_000,
             refinement_passes: 4,
             allocated_objects: 1_000,

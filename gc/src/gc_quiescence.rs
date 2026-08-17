@@ -1496,6 +1496,59 @@ pub fn watched_referents_snapshot() -> Option<std::collections::HashSet<usize>> 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Root-source attribution hook (diagnostic)
+// ---------------------------------------------------------------------------
+
+/// Installed by the VM when `CRATONVM_DBG_ROOT_SOURCE` is on: "which named
+/// root source handed the marker this address, this cycle?"
+///
+/// Lives here for the same reason the quiescence flag does -- the VM crate
+/// depends on the GC crate, so the GC cannot call into it, and the collector
+/// is where the question gets asked. `vm/src/memory/native_roots.rs` owns the
+/// inventory and the per-cycle table; this is only the doorway.
+///
+/// Answering `None` is meaningful, not a failure: it says NO named source
+/// contributed that exact address, so whatever holds it is reachable some
+/// other way -- a different finding, wanting a different fix.
+static ROOT_SOURCE_HOOK: std::sync::OnceLock<fn(usize) -> Option<&'static str>> =
+    std::sync::OnceLock::new();
+
+/// Install the attribution lookup. First call wins; later calls are ignored,
+/// so a second VM in-process cannot repoint a live collector's diagnostics.
+pub fn install_root_source_hook(f: fn(usize) -> Option<&'static str>) {
+    let _ = ROOT_SOURCE_HOOK.set(f);
+}
+
+/// Which named root source contributed `addr` this cycle, if the hook is
+/// installed and the flag is on.
+pub fn root_source_of(addr: usize) -> Option<&'static str> {
+    ROOT_SOURCE_HOOK.get().and_then(|f| f(addr))
+}
+
+/// Installed by the VM: capture the native return-address chain as
+/// `exe`-relative RVAs, ready to paste into `CRATONVM_SYMBOLIZE`.
+///
+/// `std::backtrace::Backtrace` is useless in this tree's release profile --
+/// fat LTO plus `debug = "line-tables-only"` renders every frame `<unknown>`
+/// -- but the crash handler's `RtlCaptureStackBackTrace` + `exe+RVA` pair
+/// symbolizes fine offline against the matching PDB. That machinery is
+/// Windows FFI living in the VM crate, so the collector reaches it through a
+/// doorway, exactly as with the root-source lookup above.
+static NATIVE_RVA_HOOK: std::sync::OnceLock<fn() -> Vec<usize>> = std::sync::OnceLock::new();
+
+/// Install the RVA capture. First call wins.
+pub fn install_native_rva_hook(f: fn() -> Vec<usize>) {
+    let _ = NATIVE_RVA_HOOK.set(f);
+}
+
+/// `exe`-relative return addresses for the current call chain, innermost
+/// first. Empty when no hook is installed or the platform has none.
+pub fn native_rvas() -> Vec<usize> {
+    NATIVE_RVA_HOOK.get().map(|f| f()).unwrap_or_default()
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
