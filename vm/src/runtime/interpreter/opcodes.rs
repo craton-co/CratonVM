@@ -3488,6 +3488,23 @@ pub(super) fn execute_instruction(
                             &target_binary,
                             shared.mem.heap.class_id_of(obj_ref).as_u32(),
                         );
+                        // WHICH SLOT still holds it. The reporters above say the
+                        // address is wrong and where its object went; they cannot
+                        // say who is naming it, and on the surviving H2
+                        // MVStore-writer residual that is the whole remaining
+                        // question — the stale reference reaches this cast
+                        // without ever being pushed as a vacated address, stored
+                        // into a local as one, or used as a field-read receiver
+                        // as one, because by then the allocator has re-issued the
+                        // address. The frame walk is the one view left, and it
+                        // names the Java slot, hence the bytecode that put it
+                        // there.
+                        crate::memory::reclaim_guard::report_root_slice_provenance(
+                            shared,
+                            thread,
+                            obj_ref.as_ptr() as usize,
+                            "checkcast",
+                        );
                         {
                             let addr = obj_ref.as_ptr() as usize;
                             if let Some((cid, kind, site, seq, fbase, fsize, fflags)) =
