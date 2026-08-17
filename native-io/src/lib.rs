@@ -1502,6 +1502,47 @@ fn io_stream_is_closed(
     matches!(ctx.get_field(this, 0), Value::Int(v) if v < 0)
 }
 
+/// Does a bulk `read`/`write` of ZERO bytes answer without ever consulting the
+/// stream's closed state?
+///
+/// **Yes, on both sides of the family, and it is MEASURED rather than derived.**
+/// Eclipse Adoptium 25.0.3+9-LTS, Windows, 2026-08-17, on streams that had
+/// already been `close()`d:
+///
+/// ```text
+/// fis.read(new byte[4], 0, 0)  after close -> 0        (no throw)
+/// fis.read(new byte[0])        after close -> 0        (no throw)
+/// fos.write(new byte[4], 0, 0) after close -> void     (no throw)
+/// fos.write(new byte[0])       after close -> void     (no throw)
+/// ```
+///
+/// The reason is structural, not incidental: HotSpot's `io_util.c` `readBytes`
+/// and `writeBytes` both do their `NULL` check, then their bounds check, then
+/// `if (len == 0) return 0;` / `return;`, and only *after* that read the
+/// descriptor and raise `"Stream Closed"` for `fd == -1`. So the full precedence
+/// on both sides is
+///
+/// > **null array -> bounds -> zero length -> closed**
+///
+/// and every one of those four steps was measured in that order (a closed
+/// stream still answers `NullPointerException` for a null array and
+/// `IndexOutOfBoundsException` for `(b, -1, 2)`, `(b, 0, 99)` and `(b, 2, -1)`).
+///
+/// This exists because the after-close refusals landed by
+/// `G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md` did not
+/// have this row of the oracle available and put the closed check FIRST on the
+/// output side. A `write(b, 0, 0)` on a closed stream therefore threw where
+/// HotSpot returns quietly — an over-correction in the opposite direction from
+/// the defect being repaired, which is the failure mode every record in this
+/// directory pairs its fixes against. Named once here and cited at all five
+/// call sites rather than re-derived at each.
+///
+/// The single-byte `read()`/`write(int)` forms have no such shortcut, and
+/// neither does `skip` — see `native_fis_skip`.
+fn is_empty_transfer(len: i32) -> bool {
+    len == 0
+}
+
 /// `io_stream_is_closed` for a `FileInputStream` receiver.
 fn fis_is_closed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     io_stream_is_closed(ctx, this, fis_fd_object(ctx, this))
@@ -1737,11 +1778,13 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }),
         )));
     }
-    let off = off as usize;
-    let len = len as usize;
-    if len == 0 {
+    // Zero-length transfers answer before the closed check — see
+    // `is_empty_transfer` for the measurement and the full precedence order.
+    if is_empty_transfer(len) {
         return Ok(Some(Value::Int(0)));
     }
+    let off = off as usize;
+    let len = len as usize;
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
         // See `native_fis_read`: a closed stream is an `IOException`, not EOF.
@@ -1785,6 +1828,14 @@ fn native_fis_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(Some(Value::Int(-1))),
     };
     let len = ctx.array_length(arr);
+    // `read(new byte[0])` is `0` on HotSpot — on an OPEN stream as well as a
+    // closed one — and this body answered `-1` for BOTH, because a zero-length
+    // `read_bytes` returns `Ok(0)` and the `n == 0` arm below maps that onto
+    // EOF. So the empty-array read reported end-of-stream on a stream that had
+    // not been read at all. See `is_empty_transfer`.
+    if is_empty_transfer(len as i32) {
+        return Ok(Some(Value::Int(0)));
+    }
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
         // See `native_fis_read`: a closed stream is an `IOException`, not EOF.
@@ -1899,9 +1950,26 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    if n <= 0 {
-        return Ok(Some(Value::Long(0)));
-    }
+    // ORDER IS LOAD-BEARING: the closed check comes FIRST, before the
+    // non-positive-count shortcut, and that is measured rather than assumed.
+    //
+    // `skip` has no zero-length escape hatch — unlike the bulk `read`/`write`
+    // pair, where `len == 0` answers before the descriptor is ever consulted
+    // (see `is_empty_transfer`). HotSpot's `skip0` reads the descriptor as its
+    // first act and raises `"Stream Closed"` for `fd == -1`; the `toSkip` value
+    // is not looked at until after. Measured on Eclipse Adoptium 25.0.3+9-LTS,
+    // Windows, 2026-08-17, on a stream that had already been closed:
+    //
+    // ```text
+    // fis.skip(0)  after close -> java.io.IOException: Stream Closed
+    // fis.skip(-5) after close -> java.io.IOException: Stream Closed
+    // fis.skip(1)  after close -> java.io.IOException: Stream Closed
+    // ```
+    //
+    // With the `n <= 0` shortcut first, `skip(0)` — which is exactly what a
+    // "have I got anything left" poll spells — answered `0` on a closed stream,
+    // i.e. the same fabricated success this family is being swept for, reached
+    // by the argument value rather than by the descriptor.
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
         // `skip` on a closed stream is `IOException: Stream Closed` (measured),
@@ -1910,6 +1978,14 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Long(0))),
     };
+    // An OPEN stream keeps its previous answer for a non-positive count: HotSpot
+    // `skip(0)` is `0` (measured), and a negative count seeks BACKWARD there,
+    // which this forward-only reader has no counterpart for. Deliberately not
+    // widened — the repair above is about WHEN the descriptor is consulted, not
+    // about growing a backward seek.
+    if n <= 0 {
+        return Ok(Some(Value::Long(0)));
+    }
     // Read and discard up to `n` bytes. `read_bytes` is not guaranteed
     // to fill the whole buffer in a single call (and we cap the scratch
     // buffer at a sane chunk size to bound memory), so loop until `n`
@@ -1966,28 +2042,48 @@ fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // off the census anyway — the shape W7-53 refused for the Windows pipe
     // write.
     //
-    // Only the FLUSH half is propagated here, and the asymmetry with
-    // `native_fos_close` is deliberate rather than an oversight:
+    // BOTH halves are propagated here as of 2026-08-17, so this body now agrees
+    // with its sibling `native_fos_close` instead of being half of it:
     //
     //   * the flush is the byte delivery (writer entries are `BufWriter`s), so
     //     dropping it is lost data reported as success. Its blast radius
     //     outside buffered file writers is provably empty: `FdTable::flush`
     //     ends in `_ => Ok(())` for every non-writable entry, so a read-side
-    //     `FileInputStream.close()` and the `sun.nio.ch.UnixDispatcher.close0`
-    //     socket registration that shares this body cannot start throwing.
-    //   * the CLOSE half is not propagated here. This body is registered for
-    //     three different receivers, one of which is a socket dispatcher; a
-    //     close error there is fd release rather than data loss, and turning it
-    //     into an `IOException` on a path no measurement has covered is the
-    //     kind of blind widening these records exist to refuse. Named, not
-    //     quietly counted.
-    let flush_result = if let Some(fd) = fd {
+    //     `FileInputStream.close()` cannot start throwing.
+    //   * the CLOSE half is now propagated too. It was left open on the stated
+    //     ground that "this body is registered for three different receivers,
+    //     one of which is a socket dispatcher", so a close error there would be
+    //     fd release rather than data loss. **The dump refutes the premise.**
+    //     `--dump-native-registry` in `--jdk-only` on this tree (2026-08-17)
+    //     reports the `sun/nio/ch/UnixDispatcher.close0` registration made
+    //     twenty lines below this function's own registration with
+    //     `owns_slot: false` — `native-io/src/net.rs:4188`'s registration of the
+    //     same triple runs later and wins. So this body serves exactly ONE
+    //     triple, `java/io/FileDescriptor.close0()V` (`owns_slot: true`), whose
+    //     receivers are file-stream descriptors. There is no socket on the
+    //     other end of it.
+    //
+    //     With the premise gone the blast radius is the same provably-empty one
+    //     the flush half already argued: `FdTable::close` answers `Ok(())` for
+    //     `fd < 3` outright, and for every entry kind that is not `FileWrite`
+    //     or `ChildStdinPipe` its match ends in `_ => Ok(())`. A read-side
+    //     `FileInputStream.close()` therefore cannot begin to throw; only a
+    //     buffered writer whose final flush fails can, which is precisely the
+    //     disk-full-at-close that `java.io.FileOutputStream.close()` declares
+    //     `throws IOException` for and that HotSpot lets out.
+    //
+    //     The flush failure WINS over the close failure, matching the sibling
+    //     `native_fos_close` twenty lines further down and the `finally`
+    //     semantics of the JDK's `closeAll`: the descriptor is released on the
+    //     failing path either way, and only the first failure is reported.
+    //     W7-70-printstream-close-noop.md's residual is closed here.
+    let host_result = if let Some(fd) = fd {
         // stdin/stdout/stderr (0..=2) are process-lifetime streams — never
         // release them or a later console write/read would hit a dead fd.
         if fd > 2 {
             let flushed = ctx.fd_table().flush(fd);
-            let _ = ctx.fd_table().close(fd);
-            flushed
+            let closed = ctx.fd_table().close(fd);
+            flushed.and(closed)
         } else {
             Ok(())
         }
@@ -1999,7 +2095,7 @@ fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // retry after a failing close does not re-close.
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
-    flush_result.map_err(io_err)?;
+    host_result.map_err(io_err)?;
     Ok(None)
 }
 
@@ -2012,7 +2108,31 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(fd) => fd,
         None => return Ok(None),
     };
-    let _ = ctx.fd_table().close(fd);
+    // W7-70-printstream-close-noop.md's third and last named residual in this
+    // family. `java.io.FileInputStream.close()` declares `throws IOException`
+    // and catches nothing, so HotSpot lets a close failure out; this was
+    // `let _ = …`.
+    //
+    // The blast radius is not merely small, it is **provably empty on the read
+    // side**: `FdTable::close` returns `Err` only from the `FileWrite` and
+    // `ChildStdinPipe` arms (a `BufWriter`/pipe flush), and its match ends in
+    // `_ => Ok(())` for `FileRead`, `FileReadWrite` and every socket kind. A
+    // `FileInputStream` resolves to a `FileRead` entry, so this `?` cannot fire
+    // for the receiver the triple is registered on. It is landed anyway because
+    // (a) a body that discards a `Result` reads as a decision and this one was
+    // not one, and (b) `fis_get_fd` also answers for the legacy synthetic
+    // slot-0 layout, where nothing constrains which entry kind is on the other
+    // end.
+    //
+    // Where the failure would otherwise be lost is `native_fd_close0` above —
+    // the route the real-JDK `close()` bytecode takes — and that is repaired
+    // there. This triple has NO `--jdk-only` reach at all: its registration
+    // sits inside the `NativeKind::SyntheticStub` block in
+    // `register_io_natives`, which strict mode drops, and
+    // `--dump-native-registry --jdk-only` on this tree accordingly lists no
+    // `java/io/FileInputStream.close()V` row. Compatible and `--synthetic-jdk`
+    // only, and this comment says so rather than letting the census infer it.
+    let close_result = ctx.fd_table().close(fd);
     // Mark the descriptor closed so a double-close / post-close read is a
     // clean EOF rather than reusing a recycled fd id.
     //
@@ -2034,6 +2154,11 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     } else {
         ctx.set_field(this, 0, Value::Int(-1));
     }
+    // Raised AFTER the closed marker is written, for the reason HotSpot's
+    // `FileDescriptor.closeAll` latches `closed = true` before it runs the
+    // delegate: a retry after a failing close must not re-close, and the
+    // double-close must stay the clean `void` the oracle reports.
+    close_result.map_err(io_err)?;
     Ok(None)
 }
 
@@ -2265,6 +2390,11 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             }),
         )));
     }
+    // Zero-length transfers answer before the closed check — see
+    // `is_empty_transfer` for the measurement and the full precedence order.
+    if is_empty_transfer(len) {
+        return Ok(None);
+    }
     let off = off as usize;
     let len = len as usize;
     let fd = match fos_get_fd(ctx, this) {
@@ -2295,6 +2425,11 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
+    // `write(new byte[0])` on a closed stream is `void` on HotSpot — see
+    // `is_empty_transfer`.
+    if is_empty_transfer(len as i32) {
+        return Ok(None);
+    }
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
         // See `native_fos_write_byte`.
@@ -2359,6 +2494,13 @@ fn native_fos_write_bytes_ignore_append(
     // Bounds-check caller-supplied off/len against the array before
     // handing them to the bulk-read intrinsic (mirrors JDK FOS.writeBytes).
     check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    // Zero-length transfers answer before the closed check — see
+    // `is_empty_transfer`. This is the descriptor the real JDK 25
+    // `FileOutputStream.write(byte[],int,int)` bytecode calls, so it is the one
+    // the SHIPPING modes reach: `--jdk-only` included.
+    if is_empty_transfer(len_i) {
+        return Ok(None);
+    }
     let off = off_i as usize;
     let len = len_i as usize;
     let fd = match fos_get_fd(ctx, this) {
@@ -26082,6 +26224,282 @@ mod io_tests {
             table.close(*fd).unwrap();
         }
         table.close(sender).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // G39-1 — the after-close precedence order, and the two close halves.
+    //
+    // Every expected value below was MEASURED on Eclipse Adoptium
+    // 25.0.3+9-LTS, Windows, 2026-08-17. See
+    // docs/known-issues/jdk-only/G39-1-the-close-family-closed-20260817.md.
+    //
+    // Each refusal test is PAIRED with the non-refusal on the same body, so
+    // neither direction can regress silently: a test that only asserted the
+    // throw would pass on a body that threw for everything, which is the
+    // over-correction these fixes are repairing.
+    // -----------------------------------------------------------------------
+
+    /// Build a `FileInputStream`/`FileOutputStream`-shaped receiver whose
+    /// `FileDescriptor` carries the marker a close writes (`fd == -1` AND
+    /// `handle == -1`), which is what `io_stream_is_closed` keys on.
+    fn closed_stream_receiver(ctx: &mut MockNativeContext) -> ObjectRef {
+        let fd_obj = ctx.alloc_object(2);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+        let stream = ctx.alloc_object(2);
+        ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+        stream
+    }
+
+    #[test]
+    fn is_empty_transfer_is_zero_only() {
+        assert!(is_empty_transfer(0));
+        assert!(!is_empty_transfer(1));
+        assert!(!is_empty_transfer(-1));
+    }
+
+    /// `fis.read(b, 0, 0)` after close is `0`, not `IOException`.
+    /// Measured: `CLOSED fis.read(b,0,0) | RET [0]`.
+    #[test]
+    fn fis_read_bytes_zero_length_answers_zero_on_a_closed_stream() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Byte, 4);
+        let zero = native_fis_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        assert_eq!(
+            zero.unwrap(),
+            Some(Value::Int(0)),
+            "a zero-length read must answer 0 before the closed check"
+        );
+        // The pair: a NON-zero-length read on the same receiver still refuses.
+        let refused = native_fis_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(4),
+            ],
+        );
+        assert!(
+            refused.is_err(),
+            "a non-empty read on a closed stream must still raise Stream Closed"
+        );
+    }
+
+    /// `fis.read(new byte[0])` is `0` — on an OPEN stream too, where this body
+    /// used to answer `-1` because a zero-byte `read_bytes` looks like EOF.
+    #[test]
+    fn fis_read_empty_array_answers_zero_not_eof() {
+        let mut ctx = MockNativeContext::new();
+        // No descriptor at all and no closed marker: the "unknown receiver"
+        // case, which must NOT be a refusal and must not be EOF either.
+        let stream = ctx.alloc_object(2);
+        let empty = ctx.new_array(ArrayElementType::Byte, 0);
+        let got = native_fis_read_byte_array(
+            &mut ctx,
+            &[Value::Object(Some(stream)), Value::Object(Some(empty))],
+        );
+        assert_eq!(
+            got.unwrap(),
+            Some(Value::Int(0)),
+            "read(new byte[0]) is 0, never -1"
+        );
+    }
+
+    /// `fos.write(b, 0, 0)` after close is `void`, not `IOException` — on both
+    /// the legacy `write([BII)V` body and the JDK 25 `writeBytes([BIIZ)V` one
+    /// that the SHIPPING modes reach.
+    #[test]
+    fn fos_write_bytes_zero_length_is_void_on_a_closed_stream() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Byte, 4);
+
+        let legacy = native_fos_write_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        assert_eq!(legacy.unwrap(), None, "write([BII) of 0 bytes must be void");
+
+        let shipping = native_fos_write_bytes_ignore_append(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        assert_eq!(
+            shipping.unwrap(),
+            None,
+            "writeBytes([BIIZ) of 0 bytes must be void"
+        );
+
+        // The pair: a real write on the same receiver still refuses, on both.
+        assert!(
+            native_fos_write_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(stream)),
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(4),
+                ],
+            )
+            .is_err(),
+            "a non-empty write([BII) on a closed stream must still refuse"
+        );
+        assert!(
+            native_fos_write_bytes_ignore_append(
+                &mut ctx,
+                &[
+                    Value::Object(Some(stream)),
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(4),
+                    Value::Int(0),
+                ],
+            )
+            .is_err(),
+            "a non-empty writeBytes([BIIZ) on a closed stream must still refuse"
+        );
+    }
+
+    /// `fos.write(new byte[0])` after close is `void`.
+    #[test]
+    fn fos_write_empty_array_is_void_on_a_closed_stream() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        let empty = ctx.new_array(ArrayElementType::Byte, 0);
+        assert_eq!(
+            native_fos_write_byte_array(
+                &mut ctx,
+                &[Value::Object(Some(stream)), Value::Object(Some(empty))],
+            )
+            .unwrap(),
+            None,
+        );
+        // The pair: a one-byte array on the same receiver refuses.
+        let one = ctx.new_array(ArrayElementType::Byte, 1);
+        assert!(native_fos_write_byte_array(
+            &mut ctx,
+            &[Value::Object(Some(stream)), Value::Object(Some(one))],
+        )
+        .is_err());
+    }
+
+    /// `skip` has NO zero-length escape hatch: `skip(0)` and `skip(-5)` on a
+    /// closed stream both raise. Measured:
+    /// `CLOSED fis.skip(0) | THROW java.io.IOException msg=[Stream Closed]`.
+    #[test]
+    fn fis_skip_consults_the_descriptor_before_the_count() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        for n in [0i64, -5, 1] {
+            assert!(
+                native_fis_skip(&mut ctx, &[Value::Object(Some(stream)), Value::Long(n)]).is_err(),
+                "skip({n}) on a closed stream must raise Stream Closed"
+            );
+        }
+        // The pair: an UNKNOWN receiver (no descriptor, no closed marker) keeps
+        // its previous quiet `0` for a non-positive count — the refusal is
+        // gated on the close marker, not on `fis_get_fd` answering `None`.
+        let unknown = ctx.alloc_object(2);
+        assert_eq!(
+            native_fis_skip(&mut ctx, &[Value::Object(Some(unknown)), Value::Long(0)]).unwrap(),
+            Some(Value::Long(0)),
+        );
+    }
+
+    /// `native_fd_close0` writes the closed marker and stays quiet for a
+    /// descriptor whose fd is not in the table — the double-close row
+    /// (`fos.close(); fos.close(); -> void, void`).
+    #[test]
+    fn fd_close0_marks_closed_and_a_second_close_is_quiet() {
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(2);
+        // A high fd that was never opened: `FdTable::close` removes nothing and
+        // answers `Ok(())`, which is the "already released" case HotSpot also
+        // reports as a clean void.
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(9_001));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(9_001));
+        assert_eq!(
+            native_fd_close0(&mut ctx, &[Value::Object(Some(fd_obj))]).unwrap(),
+            None,
+        );
+        assert_eq!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(-1));
+        // Second close: the marker is already there, so no fd is resolved and
+        // nothing is released. Must still be a clean void.
+        assert_eq!(
+            native_fd_close0(&mut ctx, &[Value::Object(Some(fd_obj))]).unwrap(),
+            None,
+        );
+        // And the marker now makes the after-close family refuse.
+        let stream = ctx.alloc_object(2);
+        ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+        assert!(
+            fos_is_closed(&ctx, stream),
+            "the marker native_fd_close0 writes must be the one io_stream_is_closed reads"
+        );
+        assert!(fis_is_closed(&ctx, stream));
+    }
+
+    /// `native_fis_close` writes the marker and propagates its host close. The
+    /// propagation cannot fire on a `FileRead` entry (`FdTable::close` answers
+    /// `Ok(())` for it), so the observable here is the marker plus the clean
+    /// double close.
+    #[test]
+    fn fis_close_marks_closed_and_is_idempotent() {
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(2);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(9_002));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(9_002));
+        let stream = ctx.alloc_object(2);
+        ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+        assert_eq!(
+            native_fis_close(&mut ctx, &[Value::Object(Some(stream))]).unwrap(),
+            None,
+        );
+        assert!(fis_is_closed(&ctx, stream));
+        assert_eq!(
+            native_fis_close(&mut ctx, &[Value::Object(Some(stream))]).unwrap(),
+            None,
+            "a double close must stay a clean void"
+        );
+        // And now the read side refuses rather than answering EOF.
+        assert!(native_fis_read(&mut ctx, &[Value::Object(Some(stream))]).is_err());
+        assert!(native_fis_available(&mut ctx, &[Value::Object(Some(stream))]).is_err());
+    }
+
+    /// `fos.flush()` after close is `void` on HotSpot while `bw.flush()` and
+    /// `osw.flush()` throw. The control row: this body must NOT grow a refusal
+    /// when its neighbours did.
+    #[test]
+    fn fos_flush_after_close_stays_quiet() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        assert_eq!(
+            native_fos_flush(&mut ctx, &[Value::Object(Some(stream))]).unwrap(),
+            None,
+            "FileOutputStream.flush() after close does NOT throw (measured)"
+        );
     }
 }
 
