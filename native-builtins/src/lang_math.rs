@@ -5312,6 +5312,19 @@ mod tests {
             }
         }
     }
+    /// What `Math.log10` is expected to return: the host libm, PLUS the one
+    /// correction the registration applies on top of it — a negative argument
+    /// answers the x86 default QNaN, sign bit SET, which is what HotSpot's
+    /// `_dlog10` stub yields and what this libm does not. The BACKING is still
+    /// libm, which is what the ratchet below is checking; without this the row
+    /// would read that correction as "the split collapsed onto fdlibm".
+    fn math_log10_expected(x: f64) -> f64 {
+        if x < 0.0 {
+            f64::from_bits(0xFFF8_0000_0000_0000)
+        } else {
+            x.log10()
+        }
+    }
 
     /// The other direction of the same rule: the rows HotSpot DOES intrinsify
     /// must stay split, `StrictMath` on fdlibm and `Math` on platform libm.
@@ -5349,20 +5362,6 @@ mod tests {
     /// platform fact — pinning glibc's answer would fail on Windows for a
     /// reason that is not a defect.
     #[test]
-    /// What `Math.log10` is expected to return: the host libm, PLUS the one
-    /// correction the registration applies on top of it — a negative argument
-    /// answers the x86 default QNaN, sign bit SET, which is what HotSpot's
-    /// `_dlog10` stub yields and what this libm does not. The BACKING is still
-    /// libm, which is what the ratchet below is checking; without this the row
-    /// would read that correction as "the split collapsed onto fdlibm".
-    fn math_log10_expected(x: f64) -> f64 {
-        if x < 0.0 {
-            f64::from_bits(0xFFF8_0000_0000_0000)
-        } else {
-            x.log10()
-        }
-    }
-
     fn math_and_strictmath_stay_split_on_intrinsified_rows() {
         let mut math = NativeMethodRegistry::new();
         register_math_natives(&mut math, "java/lang/Math");
