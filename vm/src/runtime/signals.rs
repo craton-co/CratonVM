@@ -1,14 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Signal handling, shutdown hooks, and helpful NullPointerException messages.
+//! Signal action registry, thread dumping, and helpful NullPointerException
+//! messages.
 //!
-//! - **Phase 16.1**: Signal registration, shutdown hook lifecycle, thread dumping.
+//! - **Phase 16.1**: Signal registration and thread dumping.
 //! - **Phase 16.2**: JEP 358 — bytecode-level NPE analysis producing HotSpot-style messages.
+//!
+//! # There is no shutdown-hook mechanism in this file, and there used to be
+//!
+//! Until 2026-08-17 `SignalHandler` also carried `shutdown_hooks`,
+//! `add_shutdown_hook`, `remove_shutdown_hook`, `run_shutdown_hooks`,
+//! `initiate_shutdown`, a `ShutdownHook` struct with a priority and a
+//! `HookState`, and a `ShutdownResult`. **Nothing in the tree ever called any
+//! of it** — the only callers were the unit tests in this file, which passed,
+//! so the whole thing read as a working, tested shutdown facility. W7-92 §9.3
+//! filed it as "wire it or delete it", and it is deleted here rather than
+//! wired, for three reasons:
+//!
+//! * it was `fn()`-valued and ran hooks INLINE on the caller's thread. Java
+//!   shutdown hooks are `Thread`s that run CONCURRENTLY — MEASURED on Temurin
+//!   25.0.3+9 (`HookProbe crosswait`: one hook blocks on a `CountDownLatch`
+//!   another hook counts down, and it is released). An inline runner
+//!   deadlocks that shape, so this was not an unfinished version of the real
+//!   thing; it was a different, wrong thing.
+//! * it ran hooks in PRIORITY order. The JDK has no hook priority and no
+//!   ordering guarantee at all — SOURCE-VERIFIED in
+//!   `ApplicationShutdownHooks.runHooks` (start every hook, then join every
+//!   hook), MEASURED as 2, 1, 4, 0, 3 for five hooks registered 0..4.
+//! * `add_shutdown_hook` refused with the string `"Cannot add shutdown hook:
+//!   shutdown in progress"`; HotSpot throws
+//!   `IllegalStateException("Shutdown in progress")`.
+//!
+//! The real registry, and the only one, is `SHUTDOWN_HOOKS` in
+//! `native-builtins/src/lang_system.rs`, drained by
+//! `lang_system::run_shutdown_hooks`.
+//!
+//! What survives here is the SIGNAL half, `registered_signals` plus
+//! `register_signal`, and it is honest about being a table and nothing more:
+//! no OS handler is installed from it and no signal in this VM is converted
+//! into a call to `lang_system::run_shutdown_hooks`. That door is still shut —
+//! see the NOMINATION on `native-builtins/src/lib.rs`'s
+//! `jdk/internal/misc/Signal.handle0` comment in
+//! `docs/known-issues/jdk-only/G11-1-shutdown-hooks-and-the-process-cluster-20260817.md`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
 
 // ── Signal constants ────────────────────────────────────────────────────────
 
@@ -45,155 +81,28 @@ impl std::fmt::Debug for SignalAction {
     }
 }
 
-// ── Shutdown hooks ──────────────────────────────────────────────────────────
-
-/// Lifecycle state of a shutdown hook.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HookState {
-    Registered,
-    Running,
-    Completed,
-    Failed(String),
-}
-
-/// A registered shutdown hook.
-#[derive(Debug, Clone)]
-pub struct ShutdownHook {
-    pub id: u64,
-    pub name: String,
-    pub priority: i32,
-    pub state: HookState,
-    action: Option<fn()>,
-}
-
-impl ShutdownHook {
-    pub fn new(id: u64, name: String, priority: i32, action: fn()) -> Self {
-        Self {
-            id,
-            name,
-            priority,
-            state: HookState::Registered,
-            action: Some(action),
-        }
-    }
-
-    /// Create a hook without an action (for testing / placeholder purposes).
-    pub fn new_no_action(id: u64, name: String, priority: i32) -> Self {
-        Self {
-            id,
-            name,
-            priority,
-            state: HookState::Registered,
-            action: None,
-        }
-    }
-}
-
-/// Aggregate result of running all shutdown hooks.
-#[derive(Debug, Clone)]
-pub struct ShutdownResult {
-    pub hooks_run: u32,
-    pub hooks_failed: u32,
-    pub total_time_ms: u64,
-    pub errors: Vec<String>,
-}
-
 // ── SignalHandler ───────────────────────────────────────────────────────────
 
-static NEXT_HOOK_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Central registry for signal actions and shutdown hooks.
+/// Registry of the action chosen for each signal number.
+///
+/// A TABLE, and only a table. Building one of these installs no OS handler,
+/// and no signal delivered to this process is routed through it. See the
+/// module header for what used to be bolted onto this struct and why it is
+/// gone.
 pub struct SignalHandler {
     pub registered_signals: HashMap<i32, SignalAction>,
-    pub shutdown_hooks: Vec<ShutdownHook>,
-    pub shutdown_in_progress: AtomicBool,
 }
 
 impl SignalHandler {
     pub fn new() -> Self {
         Self {
             registered_signals: HashMap::new(),
-            shutdown_hooks: Vec::new(),
-            shutdown_in_progress: AtomicBool::new(false),
         }
     }
 
     /// Register (or replace) the action for a given signal number.
     pub fn register_signal(&mut self, signal: i32, action: SignalAction) {
         self.registered_signals.insert(signal, action);
-    }
-
-    /// Allocate a fresh hook id.
-    pub fn next_hook_id() -> u64 {
-        NEXT_HOOK_ID.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Add a shutdown hook.  Fails if shutdown is already in progress.
-    pub fn add_shutdown_hook(&mut self, hook: ShutdownHook) -> Result<(), String> {
-        if self.shutdown_in_progress.load(Ordering::SeqCst) {
-            return Err("Cannot add shutdown hook: shutdown in progress".into());
-        }
-        self.shutdown_hooks.push(hook);
-        Ok(())
-    }
-
-    /// Remove a hook by id.  Returns `true` if found and removed.
-    pub fn remove_shutdown_hook(&mut self, id: u64) -> bool {
-        let before = self.shutdown_hooks.len();
-        self.shutdown_hooks.retain(|h| h.id != id);
-        self.shutdown_hooks.len() < before
-    }
-
-    /// Run all shutdown hooks sorted by priority (lower runs first).
-    pub fn run_shutdown_hooks(&mut self) -> ShutdownResult {
-        let start = Instant::now();
-
-        // Sort by priority — lower value = earlier execution.
-        self.shutdown_hooks.sort_by_key(|h| h.priority);
-
-        let mut hooks_run: u32 = 0;
-        let mut hooks_failed: u32 = 0;
-        let mut errors: Vec<String> = Vec::new();
-
-        for hook in self.shutdown_hooks.iter_mut() {
-            hook.state = HookState::Running;
-            hooks_run += 1;
-
-            if let Some(action) = hook.action {
-                // In a real JVM the hook would be a Thread; here we just call the fn.
-                let result = std::panic::catch_unwind(action);
-                match result {
-                    Ok(()) => {
-                        hook.state = HookState::Completed;
-                    }
-                    Err(_) => {
-                        let msg = format!("Hook '{}' (id={}) panicked", hook.name, hook.id);
-                        hook.state = HookState::Failed(msg.clone());
-                        errors.push(msg);
-                        hooks_failed += 1;
-                    }
-                }
-            } else {
-                // No action — just mark completed.
-                hook.state = HookState::Completed;
-            }
-        }
-
-        let elapsed = start.elapsed();
-        ShutdownResult {
-            hooks_run,
-            hooks_failed,
-            total_time_ms: elapsed.as_millis() as u64,
-            errors,
-        }
-    }
-
-    /// Try to initiate shutdown.  Returns `true` if *this* call is the one
-    /// that actually triggered it (CAS false→true).
-    pub fn initiate_shutdown(&self) -> bool {
-        self.shutdown_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
     }
 }
 
@@ -475,8 +384,6 @@ mod tests {
     fn signal_handler_new_is_empty() {
         let sh = SignalHandler::new();
         assert!(sh.registered_signals.is_empty());
-        assert!(sh.shutdown_hooks.is_empty());
-        assert!(!sh.shutdown_in_progress.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -527,122 +434,6 @@ mod tests {
         assert_eq!(sh.registered_signals.len(), 3);
     }
 
-    // ── Shutdown hooks ──────────────────────────────────────────────────
-
-    #[test]
-    fn add_shutdown_hook_ok() {
-        let mut sh = SignalHandler::new();
-        let hook = ShutdownHook::new_no_action(1, "h1".into(), 0);
-        assert!(sh.add_shutdown_hook(hook).is_ok());
-        assert_eq!(sh.shutdown_hooks.len(), 1);
-    }
-
-    #[test]
-    fn add_shutdown_hook_fails_during_shutdown() {
-        let mut sh = SignalHandler::new();
-        sh.shutdown_in_progress.store(true, Ordering::SeqCst);
-        let hook = ShutdownHook::new_no_action(1, "h1".into(), 0);
-        let res = sh.add_shutdown_hook(hook);
-        assert!(res.is_err());
-        assert!(res.unwrap_err().contains("shutdown in progress"));
-    }
-
-    #[test]
-    fn remove_shutdown_hook_found() {
-        let mut sh = SignalHandler::new();
-        sh.add_shutdown_hook(ShutdownHook::new_no_action(42, "h".into(), 0))
-            .unwrap();
-        assert!(sh.remove_shutdown_hook(42));
-        assert!(sh.shutdown_hooks.is_empty());
-    }
-
-    #[test]
-    fn remove_shutdown_hook_not_found() {
-        let mut sh = SignalHandler::new();
-        assert!(!sh.remove_shutdown_hook(99));
-    }
-
-    #[test]
-    fn run_shutdown_hooks_empty() {
-        let mut sh = SignalHandler::new();
-        let result = sh.run_shutdown_hooks();
-        assert_eq!(result.hooks_run, 0);
-        assert_eq!(result.hooks_failed, 0);
-        assert!(result.errors.is_empty());
-    }
-
-    #[test]
-    fn run_shutdown_hooks_no_action() {
-        let mut sh = SignalHandler::new();
-        sh.add_shutdown_hook(ShutdownHook::new_no_action(1, "a".into(), 0))
-            .unwrap();
-        sh.add_shutdown_hook(ShutdownHook::new_no_action(2, "b".into(), 0))
-            .unwrap();
-        let result = sh.run_shutdown_hooks();
-        assert_eq!(result.hooks_run, 2);
-        assert_eq!(result.hooks_failed, 0);
-    }
-
-    #[test]
-    fn run_shutdown_hooks_with_action() {
-        static CALLED: AtomicBool = AtomicBool::new(false);
-        fn action() {
-            CALLED.store(true, Ordering::SeqCst);
-        }
-        let mut sh = SignalHandler::new();
-        sh.add_shutdown_hook(ShutdownHook::new(1, "act".into(), 0, action))
-            .unwrap();
-        let result = sh.run_shutdown_hooks();
-        assert_eq!(result.hooks_run, 1);
-        assert_eq!(result.hooks_failed, 0);
-        assert!(CALLED.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn run_shutdown_hooks_respects_priority() {
-        let mut sh = SignalHandler::new();
-        sh.add_shutdown_hook(ShutdownHook::new_no_action(1, "low".into(), 10))
-            .unwrap();
-        sh.add_shutdown_hook(ShutdownHook::new_no_action(2, "high".into(), -5))
-            .unwrap();
-        sh.add_shutdown_hook(ShutdownHook::new_no_action(3, "mid".into(), 0))
-            .unwrap();
-        sh.run_shutdown_hooks();
-        // After sort the order should be high (-5), mid (0), low (10).
-        assert_eq!(sh.shutdown_hooks[0].name, "high");
-        assert_eq!(sh.shutdown_hooks[1].name, "mid");
-        assert_eq!(sh.shutdown_hooks[2].name, "low");
-    }
-
-    #[test]
-    fn run_shutdown_hooks_marks_completed() {
-        let mut sh = SignalHandler::new();
-        sh.add_shutdown_hook(ShutdownHook::new_no_action(1, "h".into(), 0))
-            .unwrap();
-        sh.run_shutdown_hooks();
-        assert_eq!(sh.shutdown_hooks[0].state, HookState::Completed);
-    }
-
-    #[test]
-    fn initiate_shutdown_first_call_returns_true() {
-        let sh = SignalHandler::new();
-        assert!(sh.initiate_shutdown());
-    }
-
-    #[test]
-    fn initiate_shutdown_second_call_returns_false() {
-        let sh = SignalHandler::new();
-        assert!(sh.initiate_shutdown());
-        assert!(!sh.initiate_shutdown());
-    }
-
-    #[test]
-    fn next_hook_id_increments() {
-        let a = SignalHandler::next_hook_id();
-        let b = SignalHandler::next_hook_id();
-        assert!(b > a);
-    }
-
     #[test]
     fn signal_handler_default_trait() {
         let sh = SignalHandler::default();
@@ -658,13 +449,6 @@ mod tests {
         fn noop(_: i32) {}
         let h = format!("{:?}", SignalAction::Handle(noop));
         assert_eq!(h, "Handle(<fn>)");
-    }
-
-    #[test]
-    fn hook_state_equality() {
-        assert_eq!(HookState::Registered, HookState::Registered);
-        assert_ne!(HookState::Running, HookState::Completed);
-        assert_eq!(HookState::Failed("x".into()), HookState::Failed("x".into()));
     }
 
     // ── ThreadDumper ────────────────────────────────────────────────────

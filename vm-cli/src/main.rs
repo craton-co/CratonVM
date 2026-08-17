@@ -5939,6 +5939,25 @@ fn main() {
                     // pasted terminal transcript sufficient for triage.
                     eprintln!("[cratonvm] {}", active_jdk_mode_line());
                     let _ = std::io::stderr().flush();
+                    // G11-1: STDOUT too, and only here — this arm ends in
+                    // `std::process::exit`, which runs no destructors, and the
+                    // fd table's fd-1 entry is a `Mutex<io::Stdout>`, i.e. a
+                    // LINE writer. A Java program whose last `System.out`
+                    // write had no trailing newline (`System.out.print`, a
+                    // partial `write`) and which then died on an uncaught
+                    // exception lost those bytes: the stderr flush three lines
+                    // up never touched them. HotSpot does not lose them —
+                    // MEASURED on Temurin 25.0.3+9, `HookProbe noflush` and
+                    // `haltnoflush`, where an unterminated unflushed
+                    // `System.out.print` survives both `System.exit(0)` and
+                    // `Runtime.halt(6)`.
+                    //
+                    // Deliberately additive: no output is produced, no
+                    // ordering changes (stderr is flushed first, as before),
+                    // and the exit code stays 1. `let _` because a broken pipe
+                    // on stdout must not turn a Java-level failure into a
+                    // different one.
+                    let _ = std::io::stdout().flush();
                     std::process::exit(1);
                 }
             }
@@ -5946,6 +5965,11 @@ fn main() {
         .expect("failed to spawn main-vm thread");
     handler.join().unwrap_or_else(|e| {
         eprintln!("main-vm thread panicked: {:?}", e);
+        // Same reason as the `Err` arm above: this is a `process::exit` path.
+        // A VM panic is the case where buffered application output is most
+        // worth having, since it is the evidence for where the VM was.
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         std::process::exit(1);
     });
 }

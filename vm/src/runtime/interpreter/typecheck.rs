@@ -847,14 +847,108 @@ pub(crate) fn aastore_element_assignable(
     //     proxies (java/lang/annotation/AnnotationProxy) implement their target
     //     interfaces at RUNTIME, invisibly to `is_subclass_of`. Storing one into
     //     an interface[] is legal on a real JVM (regression: hibernate-smoke
-    //     stored an AnnotationProxy into an annotation-type array). Fail open.
+    //     stored an AnnotationProxy into an annotation-type array). Fail open —
+    //     but only where the VM genuinely has no record of the interface set.
+    //     `recorded_proxy_interface_set` is what separates the two cases, and
+    //     the block below states why.
+    //
+    // Set by the block below when the value is a generated `$ProxyN` whose
+    // interface set the VM RECORDED, so the `class_chain_reaches_proxy_instance`
+    // hatch further down — which matches the very same values by their
+    // SUPERCLASS — does not re-admit what this block just declined. Two
+    // fail-open guards that can produce the same wrong answer is exactly the
+    // shape `W7-101` §3 was written about: fixing the one you found does not
+    // tell you whether it was the one that fired. Here the name test fires
+    // first and the chain walk fires immediately after it, so BOTH had to move.
+    let mut proxy_interface_set_is_recorded = false;
     {
         let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(value_class_id) {
             let vn: &str = &*cls.name;
-            if vn == "java/lang/annotation/AnnotationProxy"
-                || vn.ends_with("AnnotationProxy")
-                || vn.contains("$Proxy")
+            // A generated `$ProxyN` whose interface set is RECORDED is not a
+            // case of imprecise type information, and the fail-open contract
+            // does not reach it.
+            //
+            // MEASURED on HotSpot 25.0.3+9-LTS (`scratchpad/g12/ProxyStoreProbe.java`,
+            // one execution per shape). The oracle has NO proxy rule for
+            // `aastore` at all — a proxy is an ordinary class whose interface
+            // set is the argument list `Proxy.newProxyInstance` was given and
+            // whose superclass is `java.lang.reflect.Proxy`:
+            //
+            //   A[]            <- proxy(A)      OK
+            //   B[]            <- proxy(A)      ArrayStoreException: $Proxy0
+            //   Runnable[]     <- proxy(A)      ArrayStoreException: $Proxy0
+            //   A[] and B[]    <- proxy(A,B)    OK, both
+            //   SuperI[]       <- proxy(SubI)   OK      (superinterface, transitively)
+            //   SubI[]         <- proxy(SuperI) ArrayStoreException: $Proxy3
+            //   Object[]       <- proxy(A)      OK
+            //   Serializable[] <- proxy(A)      OK      (`Proxy implements Serializable`)
+            //   Cloneable[]    <- proxy(A)      ArrayStoreException: $Proxy0
+            //   Proxy[]        <- proxy(A)      OK      (its superclass)
+            //   $Proxy0[]      <- proxy(A)      OK      (its own class)
+            //   $Proxy1[]      <- proxy(A)      ArrayStoreException: $Proxy0
+            //
+            // `Serializable` really is universal here and it is not a proxy
+            // rule: `java.lang.reflect.Proxy.class.getInterfaces()` is
+            // `[java.io.Serializable]` (measured, same probe), so every proxy
+            // inherits it through its superclass. `Cloneable` is the control
+            // that proves it is inheritance and not a blanket.
+            //
+            // The blanket this replaces was `vn.contains("$Proxy")`, and it is
+            // what `RArrayStoreInterfaces` s12 measured: `Runnable[] <-
+            // Proxy(Marker)` answered no-throw in BOTH tiers where HotSpot
+            // throws, while s25 `Marker[] <- Proxy(Marker)` was right for free.
+            // The blanket never looked at the interface set — and by this point
+            // in the function it does not have to guess at one: the class was
+            // defined from `proxy_gen`'s real bytes with
+            // `interface_id_overrides` carrying the exact `ClassId`s the caller
+            // passed to `Proxy.newProxyInstance`
+            // (`native-builtins/src/reflect_annotations.rs`,
+            // `define_or_get_proxy_class`), and `classify_defined_origin`
+            // records them on `ClassOrigin::GeneratedProxy`.
+            //
+            // The walk below is deliberately NOT a second opinion on
+            // `is_subclass_of`/`is_assignable_to_name` above — it is the same
+            // question asked of the ORIGIN's id list rather than the `Class`'s
+            // `interfaces` vector, so a proxy stays admitted into an array of
+            // an interface it really has even if those two vectors ever drift.
+            // It can only ADMIT; the refusal comes from falling through it.
+            if let Some(ifaces) = recorded_proxy_interface_set(&cls.origin) {
+                proxy_interface_set_is_recorded = true;
+                // Inherited from `java.lang.reflect.Proxy` itself, in every
+                // mode and under `CRATONVM_REAL_PROXY_SUPER=0` (where the super
+                // is the `Proxy$Instance` shim and carries no interfaces of its
+                // own). `class_name_is_proxy_super` is the same shared answer
+                // the dispatch and chain-walk sites use, so the two spellings
+                // cannot drift apart.
+                if comp_name == "java/io/Serializable" || class_name_is_proxy_super(comp_name) {
+                    return true;
+                }
+                for &iface_id in ifaces {
+                    // By NAME, transitively through super-interfaces — the same
+                    // loader-blind walk the component check above uses, for the
+                    // same split-loader reason: a proxy's recorded interface id
+                    // may be the other loader's copy of the component's name.
+                    if cm.is_assignable_to_name(iface_id, comp_name) {
+                        return true;
+                    }
+                }
+            }
+            // The name blanket, now scoped to the population it was written
+            // for: a proxy-shaped value whose interface set this VM does NOT
+            // hold. That population is real and is NOT the generated-proxy
+            // population — `ensure_synthetic_class` fabricates a `$ProxyN` with
+            // `ClassOrigin::GeneratedProxy { interfaces: [] }` (pinned by
+            // `classloading/tests/jdk_only_class_origin.rs`,
+            // `fabricated_generated_names_are_not_compatibility_stubs`), which
+            // is precisely "a proxy name with no interface data" and still
+            // fails open here. So does the `AnnotationProxy` handler carrier,
+            // whose interface set lives on the heap object rather than the
+            // class (see `annotation_proxy_satisfies_target`).
+            if !proxy_interface_set_is_recorded
+                && (vn == "java/lang/annotation/AnnotationProxy"
+                    || vn.ends_with("AnnotationProxy")
+                    || vn.contains("$Proxy"))
             {
                 return true;
             }
@@ -912,11 +1006,26 @@ pub(crate) fn aastore_element_assignable(
             }
         }
     }
-    if class_chain_reaches_proxy_instance(shared, value_class_id) {
+    //   - a value that sits under a proxy SUPERCLASS. Same population as the
+    //     name test above, reached by a different road, so it carries the same
+    //     scope: a generated `$ProxyN` whose interface set the VM recorded has
+    //     already been decided, and re-admitting it here would make the block
+    //     above inert. Everything else that reaches this line — the
+    //     `Proxy$Instance` shim allocated by `ProxyClassOutcome::Degrade` and
+    //     `::Failed`, synthetic-JDK mode's fabricated proxies, a subclass of
+    //     either — genuinely has no recorded interface set and still fails
+    //     open. `class_chain_reaches_proxy_instance` itself is unchanged: it is
+    //     `pub(crate)` and four other callers ask it a different question.
+    if !proxy_interface_set_is_recorded
+        && class_chain_reaches_proxy_instance(shared, value_class_id)
+    {
         return true;
     }
     //   - synthetic classes whose interface relationships are name-based only
     //     (HashMap$Entry, etc.) honour the existing name-based fallback.
+    //     Reached by a generated proxy too, and it declines for one: no arm of
+    //     it keys on a `$ProxyN` name, and the `AnnotationProxy` arm it does
+    //     have matches by exact class name, not by shape.
     if synthetic_implements(shared, value_class_id, comp_name) {
         return true;
     }
@@ -1023,6 +1132,48 @@ pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: Cl
         current = class.superclass;
     }
     false
+}
+
+/// The interface set a generated `$ProxyN` was created for, when the VM
+/// positively RECORDED it — `None` when it did not.
+///
+/// This is the discriminator that lets `aastore_element_assignable` stop
+/// failing open on every `$Proxy`-named value without losing the population
+/// that blanket was written for. The two are genuinely different populations
+/// and the origin is what separates them:
+///
+/// * `define_or_get_proxy_class` (`native-builtins/src/reflect_annotations.rs`)
+///   emits real `proxy_gen` bytes and passes `interface_id_overrides` — the
+///   exact `ClassId`s handed to `Proxy.newProxyInstance` — so
+///   `classify_defined_origin` records a NON-EMPTY list here. The proxy's
+///   interface set is not missing information; it is the proxy's whole
+///   identity, stated by the code that generated it.
+/// * `ensure_synthetic_class` fabricating a `$ProxyN` by name records
+///   `GeneratedProxy { interfaces: [] }` — pinned by
+///   `classloading/tests/jdk_only_class_origin.rs`'s
+///   `fabricated_generated_names_are_not_compatibility_stubs`, which asserts
+///   exactly that origin for `com/example/$Proxy42`. An empty list is "no
+///   record", not "implements nothing", so it answers `None` and the caller
+///   keeps failing open. `vm/src/runtime/interpreter/tests.rs`'s
+///   `jdk/proxy3/$Proxy27` fixture is this shape, and so is the
+///   `AotIntegrationTests` / Spring `TypeMappedAnnotation.adapt` store it
+///   stands for.
+///
+/// Emptiness is therefore load-bearing and not defensive: dropping the
+/// `is_empty` test would turn every fabricated proxy name into a refusal.
+///
+/// Not a method on `ClassOrigin` because the emptiness rule is this predicate's,
+/// not the origin taxonomy's — `--dump-class-origins` reports an empty
+/// `generated-proxy` as a generated proxy and is right to.
+fn recorded_proxy_interface_set(origin: &cratonvm_classloading::ClassOrigin) -> Option<&[ClassId]> {
+    match origin {
+        cratonvm_classloading::ClassOrigin::GeneratedProxy { interfaces }
+            if !interfaces.is_empty() =>
+        {
+            Some(&**interfaces)
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,6 +1627,281 @@ pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, tar
     }
 
     false
+}
+
+/// A generated proxy's RECORDED interface set decides its `aastore` stores.
+///
+/// The defect these pin was MEASURED, not predicted: the orchestrator diffed
+/// `RArrayStoreInterfaces` (108 checks, 27 shapes) against HotSpot 25.0.3+9-LTS
+/// and exactly one row of 108 diverged —
+///
+/// ```text
+/// s12  Runnable[]  <- Proxy(Marker)
+///   HotSpot   cold=[ArrayStoreException]  hot=[ArrayStoreException]
+///   CratonVM  cold=[no-throw]             hot=[no-throw]
+/// ```
+///
+/// — identically in both tiers, i.e. in the shared predicate rather than in
+/// codegen. Its neighbour `s25 Marker[] <- Proxy(Marker)` was green, which is
+/// the whole trap: a blanket that admits every proxy gets every LEGAL proxy row
+/// right for free, so `legalAdmitted=15/15` said nothing at all.
+///
+/// The rows below are the CratonVM-side equivalents of the oracle sweep in
+/// `scratchpad/g12/ProxyStoreProbe.java`, quoted in full at the arm they test.
+/// Every one of them is a class this module fabricates, so no assertion here
+/// depends on a JDK class resolving — the point is the predicate's shape, and a
+/// row that passed vacuously because `java/lang/Runnable` was missing would be
+/// worth nothing.
+#[cfg(test)]
+mod g12_generated_proxy_interface_set {
+    use super::{aastore_element_assignable, recorded_proxy_interface_set};
+    use cratonvm_classloading::ClassOrigin;
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};
+    use std::sync::Arc;
+
+    /// One VM with four fabricated interfaces and two proxy classes.
+    ///
+    /// * `G12Marker`, `G12Other` — unrelated marker interfaces.
+    /// * `G12Sub extends G12Super` — the transitive leg (oracle:
+    ///   `SuperI[] <- proxy(SubI)` is OK, `SubI[] <- proxy(SuperI)` throws).
+    /// * `$Proxy9` — origin `GeneratedProxy { interfaces: [G12Marker] }`, the
+    ///   shape `define_or_get_proxy_class` produces from real `proxy_gen` bytes.
+    /// * `$Proxy8` — origin `GeneratedProxy { interfaces: [] }`, the shape
+    ///   `ensure_synthetic_class` produces from a proxy NAME with no interface
+    ///   data. This is the population the old blanket existed for and it must
+    ///   keep failing open.
+    ///
+    /// Neither proxy class is given a real `interfaces` vector or a proxy
+    /// superclass, deliberately: `is_subclass_of` and `is_assignable_to_name`
+    /// therefore both decline for both of them, so every admission below has to
+    /// come from the arm under test rather than from the hierarchy walk above
+    /// it. That is what makes the legal rows evidence.
+    struct Fixture {
+        shared: Arc<crate::vm::SharedVm>,
+        marker_arr: ObjectRef,
+        other_arr: ObjectRef,
+        sub_arr: ObjectRef,
+        super_arr: ObjectRef,
+        serializable_arr: ObjectRef,
+        recorded_proxy: ObjectRef,
+        unrecorded_proxy: ObjectRef,
+        sub_proxy: ObjectRef,
+        super_proxy: ObjectRef,
+    }
+
+    /// Fabricate an INTERFACE. Separate `fn`s rather than closures throughout
+    /// this module, and every class-manager guard dropped before the next
+    /// statement: `aastore_element_assignable` takes the read lock itself, and a
+    /// write guard kept alive as a statement temporary would deadlock the test
+    /// rather than fail it.
+    fn iface(shared: &crate::vm::SharedVm, name: &str) -> ClassId {
+        let mut cm = shared.classes.class_manager.write();
+        let id = cm
+            .try_ensure_synthetic_class(name, 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.class_store
+            .get_mut(id)
+            .expect("just fabricated")
+            .access_flags |= ClassAccessFlags::INTERFACE;
+        id
+    }
+
+    /// Fabricate a `$ProxyN` and stamp the interface set the VM is to have
+    /// "recorded" for it. An empty `ifaces` leaves the origin as
+    /// `ensure_synthetic_class` already set it — `GeneratedProxy` with an empty
+    /// list — which is the no-record shape.
+    fn proxy_class(shared: &crate::vm::SharedVm, name: &str, ifaces: &[ClassId]) -> ClassId {
+        let mut cm = shared.classes.class_manager.write();
+        let id = cm
+            .try_ensure_synthetic_class(name, 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        if !ifaces.is_empty() {
+            cm.class_store
+                .get_mut(id)
+                .expect("just fabricated")
+                .set_origin(ClassOrigin::GeneratedProxy {
+                    interfaces: Arc::from(ifaces.to_vec()),
+                });
+        }
+        id
+    }
+
+    fn ref_array(shared: &crate::vm::SharedVm, component: ClassId) -> ObjectRef {
+        // A reference array's own class id IS its component class id
+        // (JVMS §4.4.1) — that is how `array_descriptor_of` recovers the
+        // component name.
+        shared
+            .mem
+            .heap
+            .alloc_array(component, ArrayElementType::Reference, 1)
+    }
+
+    fn fixture() -> Fixture {
+        let shared = Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+        let marker = iface(&shared, "cratonvm/test/G12Marker");
+        let other = iface(&shared, "cratonvm/test/G12Other");
+        let sup = iface(&shared, "cratonvm/test/G12Super");
+        let sub = iface(&shared, "cratonvm/test/G12Sub");
+        {
+            let mut cm = shared.classes.class_manager.write();
+            cm.class_store
+                .get_mut(sub)
+                .expect("just fabricated")
+                .interfaces
+                .push(sup);
+        }
+        let serializable = {
+            let mut cm = shared.classes.class_manager_write();
+            cm.load_class("java/io/Serializable")
+                .expect("Compatible mode fabricates")
+        };
+
+        // A digit-suffixed `$ProxyN` simple name is what
+        // `is_generated_proxy_name` matches, so all four of these are already
+        // `GeneratedProxy` before we touch them — the unrecorded one with an
+        // EMPTY list, which is precisely the fabricated-proxy shape.
+        let recorded = proxy_class(&shared, "jdk/proxy9/$Proxy9", &[marker]);
+        let unrecorded = proxy_class(&shared, "jdk/proxy9/$Proxy8", &[]);
+        let super_only = proxy_class(&shared, "jdk/proxy9/$Proxy7", &[sup]);
+        let sub_only = proxy_class(&shared, "jdk/proxy9/$Proxy6", &[sub]);
+
+        Fixture {
+            marker_arr: ref_array(&shared, marker),
+            other_arr: ref_array(&shared, other),
+            sub_arr: ref_array(&shared, sub),
+            super_arr: ref_array(&shared, sup),
+            serializable_arr: ref_array(&shared, serializable),
+            recorded_proxy: shared.mem.heap.alloc_object(recorded, 0),
+            unrecorded_proxy: shared.mem.heap.alloc_object(unrecorded, 0),
+            sub_proxy: shared.mem.heap.alloc_object(sub_only, 0),
+            super_proxy: shared.mem.heap.alloc_object(super_only, 0),
+            shared,
+        }
+    }
+
+    /// `recorded_proxy_interface_set` is the whole discriminator, and the
+    /// emptiness rule is the half that is easy to delete by accident: an
+    /// `ensure_synthetic_class`-fabricated `$ProxyN` carries
+    /// `GeneratedProxy { interfaces: [] }`, so treating "is a GeneratedProxy" as
+    /// the test would refuse every one of them.
+    #[test]
+    fn an_empty_recorded_interface_list_is_no_record_at_all() {
+        assert!(
+            recorded_proxy_interface_set(&ClassOrigin::GeneratedProxy {
+                interfaces: Arc::from(vec![ClassId::new(7)]),
+            })
+            .is_some(),
+            "a generated proxy WITH interfaces is a positive record"
+        );
+        assert!(
+            recorded_proxy_interface_set(&ClassOrigin::GeneratedProxy {
+                interfaces: Arc::from(Vec::new()),
+            })
+            .is_none(),
+            "an EMPTY list is `no interface data recorded`, not `implements \
+             nothing` — a fabricated $ProxyN has exactly this origin and must \
+             keep failing open"
+        );
+        assert!(
+            recorded_proxy_interface_set(&ClassOrigin::VmInternal).is_none(),
+            "`java/lang/reflect/Proxy$Instance` is VmInternal, not a generated \
+             proxy — the shim's interface set lives on the heap object"
+        );
+        assert!(
+            recorded_proxy_interface_set(&ClassOrigin::CompatibilityStub {
+                reason: Arc::from("probe"),
+            })
+            .is_none(),
+        );
+    }
+
+    /// The measured row. `Runnable[] <- Proxy(Marker)`, in the shape this VM
+    /// can fabricate.
+    #[test]
+    fn a_recorded_proxy_is_refused_by_an_interface_it_does_not_implement() {
+        let f = fixture();
+        assert!(
+            !aastore_element_assignable(&f.shared, f.other_arr, f.recorded_proxy),
+            "a proxy generated for G12Marker is not a G12Other; HotSpot 25.0.3 \
+             throws ArrayStoreException for `Runnable[] <- Proxy(Marker)` \
+             (measured, RArrayStoreInterfaces s12) and the `$Proxy` name \
+             blanket admitted it without looking at the interface set"
+        );
+    }
+
+    /// The control, and the row that says the refusal above is a decision and
+    /// not a new blanket in the other direction. `s25` on the fixture.
+    ///
+    /// Note the fixture gives this proxy class NO `interfaces` vector, so
+    /// `is_subclass_of` and `is_assignable_to_name` both declined before the arm
+    /// under test ran: this admission comes from the recorded origin alone.
+    #[test]
+    fn a_recorded_proxy_is_admitted_by_an_interface_it_does_implement() {
+        let f = fixture();
+        assert!(
+            aastore_element_assignable(&f.shared, f.marker_arr, f.recorded_proxy),
+            "a proxy generated for G12Marker must still store into a \
+             G12Marker[] — RArrayStoreInterfaces s25, green today, and a fix \
+             that turns it red has replaced one wrong answer with another"
+        );
+    }
+
+    /// Transitively, through super-interfaces, in both directions.
+    /// MEASURED on HotSpot: `SuperI[] <- proxy(SubI)` is OK and
+    /// `SubI[] <- proxy(SuperI)` throws.
+    #[test]
+    fn the_recorded_walk_is_transitive_and_directional() {
+        let f = fixture();
+        assert!(
+            aastore_element_assignable(&f.shared, f.super_arr, f.sub_proxy),
+            "a proxy over G12Sub is a G12Super — the recorded walk must go \
+             through super-interfaces, not just compare names"
+        );
+        assert!(
+            !aastore_element_assignable(&f.shared, f.sub_arr, f.super_proxy),
+            "a proxy over G12Super is NOT a G12Sub; a walk that answered `true` \
+             here would be matching the pair rather than the direction"
+        );
+    }
+
+    /// The population the blanket was written for, unchanged. This is the
+    /// assertion that fails if the fix is phrased as "refuse every proxy".
+    ///
+    /// `vm/src/runtime/interpreter/tests.rs`'s `jdk/proxy3/$Proxy27` fixture is
+    /// this exact shape, and so is the `AotIntegrationTests` /
+    /// `TypeMappedAnnotation.adapt` store it stands for.
+    #[test]
+    fn a_proxy_with_no_recorded_interface_set_still_fails_open() {
+        let f = fixture();
+        assert!(
+            aastore_element_assignable(&f.shared, f.other_arr, f.unrecorded_proxy),
+            "a $ProxyN whose interface set this VM never recorded is exactly \
+             the imprecise-type-information case the predicate is contractually \
+             required to fail OPEN on; only a RECORDED set makes a refusal \
+             provable"
+        );
+    }
+
+    /// `Serializable` is universal for a proxy and it is not a proxy rule:
+    /// `java.lang.reflect.Proxy.class.getInterfaces()` is `[java.io.Serializable]`
+    /// (MEASURED, `scratchpad/g12/ProxyStoreProbe.java`), so every proxy
+    /// inherits it through its superclass — which the fixture's proxy classes
+    /// deliberately do not have, so this arm has to state it.
+    ///
+    /// `Cloneable` is the control on the oracle side (`Cloneable[] <- proxy(A)`
+    /// throws) and is not asserted here, because in a bare test VM the outcome
+    /// would turn on whether `java/lang/Cloneable` resolves rather than on this
+    /// arm — a row that can pass vacuously is not evidence.
+    #[test]
+    fn every_proxy_is_serializable() {
+        let f = fixture();
+        assert!(
+            aastore_element_assignable(&f.shared, f.serializable_arr, f.recorded_proxy),
+            "Serializable[] <- proxy is OK on HotSpot for every proxy, by \
+             inheritance from java.lang.reflect.Proxy"
+        );
+    }
 }
 
 /// Pure, allocation-free predicates from this file, pinned in-tree.

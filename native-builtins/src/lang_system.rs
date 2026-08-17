@@ -79,28 +79,104 @@ static SHUTDOWN_HOOKS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec:
 static SHUTDOWN_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// The four refusal messages of the shutdown-hook registry, as CONSTANTS.
+//
+// Named rather than inlined for the reason the handoff's §5 gives: "messages
+// often cannot be derived, only transcribed". Every one of these was read off
+// Temurin 25.0.3+9 — three from a run (`HookProbe dup`, `HookProbe addduring`)
+// and all four confirmed against `javap -p -c java.lang.ApplicationShutdownHooks`
+// — and none of them is guessable from the method name. Constants give the
+// unit tests below something to pin, so a later "tidy" of the wording fails a
+// test instead of quietly failing a differential.
+//
+// All four are pure ASCII, and that is checked, not assumed: `HANDOFF-20260814`
+// §7 records a differential that failed with every assertion passing because
+// one em-dash crossed HotSpot's Windows console code page differently.
+
+/// `ApplicationShutdownHooks.add` pc 10 and `remove` pc 10, and
+/// `Shutdown.add` pc 97/120. MEASURED (`HookProbe addduring`) on both
+/// `addShutdownHook` and `removeShutdownHook` called from inside a hook.
+const HOOK_MSG_SHUTDOWN_IN_PROGRESS: &str = "Shutdown in progress";
+
+/// NOT an explicit check — this is HotSpot's helpful-NPE rendering of the
+/// `invokevirtual java/lang/Thread.isAlive` at `ApplicationShutdownHooks.add`
+/// pc 17, which is the first thing that touches the argument. MEASURED
+/// (`HookProbe dup`, `NULL-ADD`). The quoted `hook` is `add`'s parameter name.
+const HOOK_MSG_NULL_ADD: &str =
+    "Cannot invoke \"java.lang.Thread.isAlive()\" because \"hook\" is null";
+
+/// `ApplicationShutdownHooks.add` pc 27. MEASURED (`HookProbe dup`,
+/// `RUNNING-ADD`) by registering a `Thread` that had been `start()`ed and was
+/// parked on a latch.
+const HOOK_MSG_ALREADY_RUNNING: &str = "Hook already running";
+
+/// `ApplicationShutdownHooks.add` pc 47. MEASURED (`HookProbe dup`,
+/// `DUP-ADD`).
+const HOOK_MSG_PREVIOUSLY_REGISTERED: &str = "Hook previously registered";
+
 /// Register `hook` as a shutdown hook, rooting it for the life of the VM.
 ///
-/// Two refusals, both HotSpot contracts measured rather than recalled:
+/// FOUR refusals, in this exact order, and the order is the contract rather
+/// than a preference. SOURCE-VERIFIED against
+/// `javap -p -c java.lang.ApplicationShutdownHooks` on Temurin 25.0.3+9 —
+/// `add(Thread)` is `static synchronized` and its bytecode reads:
 ///
+/// ```text
+///   0: getstatic hooks; ifnonnull 16  -> IllegalStateException "Shutdown in progress"
+///  16: aload_0; invokevirtual Thread.isAlive  -> NPE here when hook == null
+///  20: ifeq 33                        -> IllegalArgumentException "Hook already running"
+///  33: hooks.containsKey(hook)        -> IllegalArgumentException "Hook previously registered"
+///  53: hooks.put(hook, hook)
+/// ```
+///
+/// so:
+///
+/// * shutdown already begun → `IllegalStateException("Shutdown in progress")`,
+///   and it wins over EVERY other refusal including the null check;
+/// * `null` → `NullPointerException`. There is no explicit null check: the NPE
+///   falls out of `invokevirtual Thread.isAlive` at pc 17, which is why
+///   HotSpot's helpful-NPE text names `isAlive()` and the parameter `hook`.
+///   MEASURED (`HookProbe dup`, 25.0.3+9): message is exactly
+///   `Cannot invoke "java.lang.Thread.isAlive()" because "hook" is null`.
+///   This used to be `if let Some(Value::Object(Some(hook)))` at the
+///   registration site — a null was ACCEPTED and silently dropped, which is
+///   the fabricated-success shape this whole record is about;
+/// * an ALREADY RUNNING hook `Thread` →
+///   `IllegalArgumentException("Hook already running")`. MEASURED
+///   (`HookProbe dup`, `RUNNING-ADD`). This VM accepted it, and then
+///   `run_shutdown_hooks` counted it `skipped` — a registration that reports
+///   success and can never run;
 /// * re-registering a hook that is already registered throws
-///   `IllegalArgumentException` (W7-92 §1.3). This used to return silently —
-///   "the conservative choice" — which was invisible while nothing ran the
-///   hooks and becomes a second silent no-op the moment they do.
-/// * registering after shutdown has begun throws `IllegalStateException`.
+///   `IllegalArgumentException("Hook previously registered")` (W7-92 §1.3).
 ///
 /// NOT refused: a hook `Thread` that has already run to completion. It is not
 /// alive, `ApplicationShutdownHooks.add` accepts it, and HotSpot printed
-/// `TERMINATED-ACCEPTED` for exactly that case. `run_shutdown_hooks` will not
-/// re-run it (HotSpot does not either — measured, `RunTerm`), it counts as
+/// `TERMINATED-ADD accepted` for exactly that case. `run_shutdown_hooks` will
+/// not re-run it (HotSpot does not either — measured, `RunTerm`), it counts as
 /// `skipped`.
 fn shutdown_hook_add(
     ctx: &mut dyn NativeContext,
-    hook: ObjectRef,
+    hook: Option<ObjectRef>,
 ) -> Result<(), MethodCallFailed> {
     if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(RuntimeError::IllegalStateException {
-            message: "Shutdown in progress".to_string(),
+            message: HOOK_MSG_SHUTDOWN_IN_PROGRESS.to_string(),
+        }
+        .into());
+    }
+    // Transcribed, not derived — the handoff's §5 rule. HotSpot builds this
+    // string from the bytecode at the faulting site, so it names `isAlive()`
+    // and the `ApplicationShutdownHooks.add` parameter `hook`, not
+    // `Runtime.addShutdownHook`'s.
+    let Some(hook) = hook else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(HOOK_MSG_NULL_ADD.to_string()),
+        }
+        .into());
+    };
+    if ctx.thread_is_alive(hook) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: HOOK_MSG_ALREADY_RUNNING.to_string(),
         }
         .into());
     }
@@ -113,7 +189,7 @@ fn shutdown_hook_add(
             // HotSpot: `ApplicationShutdownHooks.add` throws
             // IllegalArgumentException("Hook previously registered").
             return Err(RuntimeError::IllegalArgumentException {
-                message: "Hook previously registered".to_string(),
+                message: HOOK_MSG_PREVIOUSLY_REGISTERED.to_string(),
             }
             .into());
         }
@@ -129,16 +205,34 @@ fn shutdown_hook_add(
 /// Drop a previously registered hook. Returns true iff it was registered —
 /// `Runtime.removeShutdownHook`'s documented contract — and throws
 /// `IllegalStateException` once shutdown has begun, as HotSpot does.
+///
+/// `null` throws `NullPointerException` **with no message**, and the two
+/// details are both contract. SOURCE-VERIFIED
+/// (`javap -p -c java.lang.ApplicationShutdownHooks`, `remove(Thread)`): the
+/// `hooks == null` test is at pc 0 and the null test is an EXPLICIT
+/// `new NullPointerException()` at pc 20 — no-arg, so `getMessage()` is
+/// `null`, unlike `add`'s helpful NPE. MEASURED (`HookProbe dup`): the two
+/// lines are `NULL-ADD threw=java.lang.NullPointerException msg=Cannot invoke
+/// "java.lang.Thread.isAlive()" because "hook" is null` and `NULL-REMOVE
+/// threw=java.lang.NullPointerException msg=null`. That asymmetry is why the
+/// message here is `None` rather than `Some("")` — `msg=null` and `msg=` are
+/// different cells and the differential prints them differently.
+///
+/// This body used to answer `false` for a null hook: a caller asking "was it
+/// registered?" got a plausible, wrong "no" instead of the throw.
 fn shutdown_hook_remove(
     ctx: &mut dyn NativeContext,
-    hook: ObjectRef,
+    hook: Option<ObjectRef>,
 ) -> Result<bool, MethodCallFailed> {
     if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(RuntimeError::IllegalStateException {
-            message: "Shutdown in progress".to_string(),
+            message: HOOK_MSG_SHUTDOWN_IN_PROGRESS.to_string(),
         }
         .into());
     }
+    let Some(hook) = hook else {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    };
     let handle = {
         let mut hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
         match hooks
@@ -151,6 +245,69 @@ fn shutdown_hook_remove(
     };
     ctx.remove_global_root(handle);
     Ok(true)
+}
+
+/// Decode the `Thread` argument of `Runtime.addShutdownHook` /
+/// `removeShutdownHook` out of the native argument vector.
+///
+/// Returns `Some(None)` for a **Java null** — which the two callers must turn
+/// into a `NullPointerException`, because HotSpot does — and `None` only when
+/// the vector is not the shape the descriptor guarantees (`[receiver, hook]`
+/// for a one-argument instance method).
+///
+/// Those two cases are separated on purpose. Folding them together is what the
+/// previous `if let Some(Value::Object(Some(hook)))` did, and it made a Java
+/// null indistinguishable from a VM-side decoding failure — so both were
+/// answered with silence. An NPE is the right answer to the first and a
+/// **wrong** answer to the second, since it would report a caller error for a
+/// fault inside this VM. The short-vector arm therefore says so on stderr,
+/// unconditionally, and declines to decide; it is not expected to fire, and if
+/// it ever does, the line is the finding.
+fn shutdown_hook_argument(args: &[Value], which: &str) -> Option<Option<ObjectRef>> {
+    match args.get(1) {
+        Some(Value::Object(hook)) => Some(*hook),
+        other => {
+            eprintln!(
+                "[cratonvm] Runtime.{which}: argument vector is not [receiver, Thread] \
+                 (len={len}, slot1={other:?}); the hook was neither registered nor refused. \
+                 This is a VM-side decoding fault, not an application error.",
+                len = args.len()
+            );
+            None
+        }
+    }
+}
+
+/// Push whatever the VM has buffered for fd 1 and fd 2 out to the OS.
+///
+/// Called on every path that is about to end the process, and it is the half
+/// of W7-92 that a working runner still would not have delivered.
+/// `FileDescriptorTable`'s stdout/stderr entries are buffered writers shared by
+/// every Java writer in this VM; `std::process::exit` runs no destructors, so
+/// anything a shutdown hook printed and did not force out is dropped on the
+/// floor by the very call that ends the run.
+///
+/// MEASURED on Temurin 25.0.3+9 that HotSpot does NOT lose those bytes, on
+/// both of the paths that could:
+///
+/// * `HookProbe noflush` — a hook does `System.out.print` with no newline and
+///   no `flush()`, main then calls `System.exit(0)`: `HOOK-PARTIAL-NO-NEWLINE`
+///   is delivered.
+/// * `HookProbe haltnoflush` — `System.out.print` with no newline followed by
+///   `Runtime.halt(6)`, which runs no hooks at all:
+///   `PARTIAL-NO-NEWLINE-BEFORE-HALT` is still delivered, rc 6.
+///
+/// So the flush belongs on the halt path too, and its placement there is not a
+/// "hooks also run on halt" mistake — halt still runs no hooks.
+///
+/// Failures are swallowed deliberately: this runs when the process is already
+/// committed to exiting with a code chosen elsewhere, and a broken pipe on
+/// stdout must not change that code or emit anything new. The one thing it
+/// must not do is *skip* the second stream because the first failed, which is
+/// why the two calls are independent statements rather than a `?` chain.
+pub(crate) fn flush_console_streams(ctx: &dyn NativeContext) {
+    let _ = ctx.fd_table().flush(1);
+    let _ = ctx.fd_table().flush(2);
 }
 
 /// How long `run_shutdown_hooks` waits for a started hook thread to finish.
@@ -198,6 +355,64 @@ pub(crate) fn thread_already_started(ctx: &mut dyn NativeContext, thread: Object
     } else {
         ctx.object_num_fields(thread) > 2 && matches!(ctx.get_field(thread, 2), Value::Long(_))
     }
+}
+
+/// Capture the constructing thread's `InheritableThreadLocal` values against
+/// `child`, at CONSTRUCTION time — the moment HotSpot captures them.
+///
+/// MEASURED on Temurin 25.0.3+9 (`ItlProbe`, 2026-08-16): with
+/// `ITL.set("a"); Thread t = new Thread(r); ITL.set("b"); t.start();` the
+/// child sees `"a"` on HotSpot for BOTH the plain `Thread(Runnable)` shape and
+/// the `Thread(ThreadGroup, Runnable, String)` shape that
+/// `Executors.defaultThreadFactory()` uses; CratonVM sees `"b"` because
+/// `native_thread_start0` was the only capture point. SOURCE-VERIFIED against
+/// `javap -p -c java.lang.Thread`: the copy lives at pc 175..201 of the single
+/// package-private master constructor that all eight public constructors
+/// forward to, so "captured when the Thread object was built" is the whole
+/// contract.
+///
+/// Three properties this function must have, each of them measured:
+///
+/// * It queues even an EMPTY snapshot. `ItlProbe` case 9 — parent `set`s,
+///   `remove`s, constructs, then `set`s again — has the child see `null`. An
+///   absent queue entry would let `native_thread_start0` fall back to the
+///   parent's *current* map and hand the child the later value.
+/// * It must be called with the child's identity already stable, because the
+///   queue is keyed by `identity_hash_code` and drained by the child under its
+///   own `current_thread_object()` identity.
+/// * It is the ONLY thing `native_thread_start0` consults to decide whether to
+///   capture. There is no second flag to drift out of step with the queue.
+///
+/// Callers today: `jdk25_concurrency::…fork`, which builds a subtask worker
+/// Thread and hands it straight to `ctx.thread_start` — bypassing
+/// `native_thread_start0`, so before this its subtasks inherited NOTHING.
+/// HotSpot inherits there (MEASURED, `StsItl`: a subtask forked after
+/// `ITL.set("scope-parent")` reads `scope-parent`). The ordinary
+/// `new Thread(...)` paths cannot call this yet — see the nominations in
+/// `docs/known-issues/jdk-only/G5-1-inheritable-threadlocal-captures-at-
+/// construction-20260816.md` §6, and read that record BEFORE assuming the
+/// `new Thread` timing divergence is closed. It is not.
+pub(crate) fn capture_inheritable_tl_at_construction(
+    ctx: &mut dyn NativeContext,
+    child: ObjectRef,
+) {
+    let child_hash = ctx.identity_hash_code(child);
+    let snapshot = crate::phases_early::snapshot_inheritable_tl_entries(ctx).unwrap_or_default();
+    crate::phases_early::queue_inherited_tl_for_child(child_hash, snapshot);
+}
+
+/// Did some construction-time site already answer the inheritance question for
+/// this child Thread?
+///
+/// Asked of the pending-inheritance queue itself rather than a side flag: an
+/// entry is present if and only if a capture happened, empty entries included,
+/// so the predicate and the data it guards cannot disagree. This tree has a
+/// written record of exactly that species of twin drifting
+/// (`thread_already_started`, just above, exists for the same reason).
+pub(crate) fn inheritable_tl_captured_at_construction(child_thread_hash: i32) -> bool {
+    crate::phases_early::tl_inherited_pending()
+        .lock()
+        .contains_key(&child_thread_hash)
 }
 
 /// Run every registered `Runtime.addShutdownHook` hook, once, before the
@@ -314,6 +529,16 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
     for handle in handles {
         ctx.remove_global_root(handle);
     }
+
+    // The hooks have finished; their bytes have NOT necessarily left this
+    // process. Flush here rather than only at the `std::process::exit` sites,
+    // for two reasons: the launcher's post-`main` path does not go through
+    // either `exit` native at all, and the summary line below is written with
+    // `eprintln!` while a hook's `System.out.println` went through the fd
+    // table, so without this the two streams can be delivered out of order in
+    // a `2>&1` capture — which is how every vector in `regression-suite` is
+    // read. See `flush_console_streams` for what HotSpot was measured to do.
+    flush_console_streams(&*ctx);
 
     if unjoined > 0 {
         eprintln!(
@@ -1299,9 +1524,24 @@ pub(crate) fn native_thread_start0(
     // `drain_inherited_for_current_thread` in phases_early.rs). We do
     // this *before* spawning so there's no race between parent's
     // post-start mutations and the child's drain.
-    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries(ctx) {
-        let child_hash = ctx.identity_hash_code(this);
-        crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
+    //
+    // G5-1: this is a start0-time capture, and HotSpot captures at
+    // CONSTRUCTION time — MEASURED on 25.0.3+9, `ItlProbe` case 1: with
+    // `ITL.set(a); new Thread(r); ITL.set(b); start()` the child sees `a`,
+    // not `b`. A caller that already took the construction-time snapshot
+    // through `capture_inheritable_tl_at_construction` has queued an entry
+    // for this child (possibly an EMPTY one, which is the whole point: the
+    // parent may have `remove()`d before constructing, and `ItlProbe` case 9
+    // measures the child seeing `null` while the parent holds a later value).
+    // Re-snapshotting here would overwrite that with the parent's *current*
+    // map and reintroduce the divergence, so only capture when nothing was
+    // captured at construction.
+    let child_hash = ctx.identity_hash_code(this);
+    let captured_at_construction = inheritable_tl_captured_at_construction(child_hash);
+    if !captured_at_construction {
+        if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries(ctx) {
+            crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
+        }
     }
     // TC0622: inherit the parent (creating) thread's context classloader into
     // the child, mirroring real JDK's `Thread.<init>`, which assigns
@@ -1331,22 +1571,48 @@ pub(crate) fn native_thread_start0(
             ctx.set_field_by_name(this, "contextClassLoader", Value::Object(Some(parent_ccl)));
         }
     }
-    // test-context-round2: real JDK `Thread.<init>`'s InheritableThreadLocal
-    // copy (`this.inheritableThreadLocals = ThreadLocal.createInheritedMap(
-    // parent.inheritableThreadLocals)`) silently doesn't take effect for a
-    // still-unexplained interpreter reason specifically when BOTH the
-    // ThreadGroup and name constructor arguments are explicitly non-null at
-    // the same time — confirmed via minimal repro: `Thread(Runnable)` and
-    // `Thread(ThreadGroup, Runnable)` alone each correctly propagate;
-    // `Thread(ThreadGroup, Runnable, String[, long])` — exactly what
-    // `Executors.defaultThreadFactory()` uses for every pooled worker —
-    // does not, losing the parent's InheritableThreadLocal values entirely
-    // (name/group/priority/contextClassLoader are all unaffected; only this
-    // one field is dropped). The two-condition trigger rules out a native
-    // registration gap (the constructors aren't natively overridden at all;
-    // this is real bytecode misbehaving) — root-causing it further needs
-    // interpreter-level bytecode tracing, out of scope here. Apply the copy
-    // here at start0-time instead, mirroring the TC0622 CCL fix above.
+    // test-context-round2 (ORIGINAL NOTE, CORRECTED BELOW — G5-1, 2026-08-16):
+    // "real JDK `Thread.<init>`'s InheritableThreadLocal copy silently doesn't
+    // take effect for a still-unexplained interpreter reason specifically when
+    // BOTH the ThreadGroup and name constructor arguments are explicitly
+    // non-null at the same time … `Thread(ThreadGroup, Runnable, String[,
+    // long])` — exactly what `Executors.defaultThreadFactory()` uses for every
+    // pooled worker — does not … root-causing it further needs
+    // interpreter-level bytecode tracing, out of scope here."
+    //
+    // That mechanism is impossible, SOURCE-VERIFIED against the oracle's own
+    // bytecode (`javap -p -c java.lang.Thread`, Temurin 25.0.3+9):
+    //
+    //   * ALL EIGHT public constructors are three-to-five instruction
+    //     forwarders. Every one of them ends in the SAME
+    //     `invokespecial Thread.<init>:(Ljava/lang/ThreadGroup;
+    //     Ljava/lang/String;ILjava/lang/Runnable;J)V` — the package-private
+    //     master constructor. There is no overload that skips it, and none
+    //     that reaches a different copy of the code.
+    //   * In that master constructor the ITL block is pc 164..204, and it
+    //     reads exactly three things: `attaching` (`currentThread() == this`),
+    //     `characteristics & 4` (the NO_INHERIT_THREAD_LOCALS bit that
+    //     `Thread(g,r,n,ss,false)` sets), and `parent.inheritableThreadLocals`
+    //     (null- and size-checked at pc 182/189). `group` (local 1) and `name`
+    //     (local 2) are NOT read anywhere between pc 164 and the `putfield` at
+    //     201. The bytecode cannot branch on them.
+    //
+    // The real reason the copy is inert on this VM is one line away:
+    // `ThreadLocal`/`InheritableThreadLocal` `get`/`set`/`remove`/`<init>` are
+    // registered with `NativeKind::Intrinsic`
+    // (`phases_early::register_thread_local_natives`), and §1.4 admits an
+    // `Intrinsic` over real bytecode even under `--jdk-only`
+    // (`resolve_native_dispatch_wave1`, vm/src/vm/vm_exec.rs). Their store is
+    // the Rust-side `TL_MAP`, so NOTHING in this process ever writes
+    // `Thread.inheritableThreadLocals` — for any constructor overload. The
+    // master constructor's `ifnull` at pc 182 therefore always takes the skip
+    // branch, and the block below, which asks the same question from the
+    // native side, is DEAD for the same reason: `get_field_by_name(parent,
+    // "inheritableThreadLocals")` cannot be `Object(Some(_))`. It is retained
+    // (gated) rather than deleted because it becomes live the moment the
+    // nominated fix demotes those Intrinsics — see
+    // `docs/known-issues/jdk-only/G5-1-inheritable-threadlocal-captures-at-
+    // construction-20260816.md` §5.
     //
     // Known trade-off: `characteristics` (which flags an explicit
     // `Thread(group, target, name, stackSize, false)` opt-out of
@@ -1367,7 +1633,11 @@ pub(crate) fn native_thread_start0(
         ctx.get_field_by_name(this, "inheritableThreadLocals"),
         Value::Object(None) | Value::Int(0)
     );
-    if apply_itl_workaround && child_itl_unset {
+    // G5-1: and never when the construction-time capture already answered for
+    // this child. Once the nominated demotion lands, the master constructor
+    // does the copy itself at construction; a start0-time copy on top of it
+    // would be exactly the timing divergence this record exists to remove.
+    if apply_itl_workaround && child_itl_unset && !captured_at_construction {
         let parent = ctx.current_thread_object();
         if let Value::Object(Some(parent_map)) =
             ctx.get_field_by_name(parent, "inheritableThreadLocals")
@@ -1722,6 +1992,11 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     run_shutdown_hooks(ctx, "System.exit");
     sweep_declared_slot_maps_before_exit(&*ctx, "System.exit");
     invoke_pre_exit_hook(code);
+    // LAST, and after the pre-exit hook, because that hook's own job is to
+    // dump diagnostics. `std::process::exit` runs no destructors, so anything
+    // still sitting in the fd table's stdout/stderr buffers dies here. `code`
+    // is untouched: this call cannot fail out and cannot change it.
+    flush_console_streams(&*ctx);
     std::process::exit(code);
 }
 
@@ -1798,9 +2073,19 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Thread;)V",
         |ctx, args| {
             // args[0] = the `Runtime` receiver, args[1] = the hook `Thread`.
-            if let Some(Value::Object(Some(hook))) = args.get(1) {
-                shutdown_hook_add(ctx, *hook)?;
-            }
+            //
+            // The null arm is DELIBERATELY not decided here. It used to be
+            // (`if let Some(Value::Object(Some(hook)))`, else fall through to
+            // `Ok(None)`), which accepted `addShutdownHook(null)` and dropped
+            // it — and HotSpot throws NPE there. Worse, deciding it here would
+            // put the null check ahead of the shutdown-in-progress check, and
+            // the JDK's bytecode orders them the other way round (see
+            // `shutdown_hook_add`). `Option` is threaded through so ONE
+            // function owns the whole refusal ladder in the measured order.
+            let Some(hook) = shutdown_hook_argument(args, "addShutdownHook") else {
+                return Ok(None);
+            };
+            shutdown_hook_add(ctx, hook)?;
             Ok(None)
         },
     );
@@ -1809,10 +2094,10 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "removeShutdownHook",
         "(Ljava/lang/Thread;)Z",
         |ctx, args| {
-            let removed = match args.get(1) {
-                Some(Value::Object(Some(hook))) => shutdown_hook_remove(ctx, *hook)?,
-                _ => false,
+            let Some(hook) = shutdown_hook_argument(args, "removeShutdownHook") else {
+                return Ok(Some(Value::Int(0)));
             };
+            let removed = shutdown_hook_remove(ctx, hook)?;
             Ok(Some(Value::Int(i32::from(removed))))
         },
     );
@@ -3023,6 +3308,8 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
     run_shutdown_hooks(ctx, "Runtime.exit");
     sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.exit");
     invoke_pre_exit_hook(code);
+    // See `native_system_exit` — same reason, same position, same `code`.
+    flush_console_streams(&*ctx);
     std::process::exit(code);
 }
 
@@ -3067,6 +3354,13 @@ pub(crate) fn native_shutdown_halt0(
     eprintln!("[cratonvm] Runtime.halt({code}) called - process terminating");
     sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.halt");
     invoke_pre_exit_hook(code);
+    // NO `run_shutdown_hooks` here, and that is the whole point of `halt`
+    // (MEASURED, `HookProbe halt`: `HOOK-OUT h-1 MUST-NOT-APPEAR` does not
+    // appear, rc 5). The FLUSH is a different question and HotSpot answers it
+    // the other way: `HookProbe haltnoflush` writes an unterminated,
+    // unflushed `System.out.print` and then halts, and the bytes are still
+    // delivered. So flush, run nothing.
+    flush_console_streams(&*ctx);
     std::process::exit(code);
 }
 
@@ -7083,5 +7377,263 @@ mod define_class_error_typing_tests {
             Some(r#"the class_name: "B" is wrong"#)
         );
         assert!(debug_string_field(body, "loader").is_none());
+    }
+}
+
+/// G11-1 (2026-08-17) — the shutdown-hook registration contract.
+///
+/// Everything here is a unit test of the REFUSAL LADDER and the exact text of
+/// its four messages, because that is the part of W7-92's runner that can be
+/// decided without a live VM. What these tests deliberately do NOT prove:
+///
+/// * that a hook ever RUNS. `run_shutdown_hooks` needs `invoke_virtual`, a
+///   thread registry and a real `Thread.start()`; only `RShutdownHooks`
+///   against a built binary can settle that.
+/// * the `Hook already running` arm. `test_utils`' mock answers
+///   `thread_is_alive == false` unconditionally, so that arm is reachable in
+///   the VM and not from here; it is pinned by the constant test instead.
+///
+/// `SHUTDOWN_HOOKS` and `SHUTDOWN_IN_PROGRESS` are PROCESS-global (W7-92 §9.5
+/// nominates fixing that) and `cargo test` runs these on threads of one
+/// process, so every test that touches either takes `hook_registry_guard()`
+/// and restores what it changed. Without that, one test flipping
+/// `SHUTDOWN_IN_PROGRESS` makes a sibling assert the wrong exception.
+#[cfg(test)]
+mod shutdown_hook_contract_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    // `alloc_object` lives on `NativeHeapAccess`, one of the traits
+    // `NativeContext` composes -- so importing `NativeContext` alone does NOT
+    // bring it into scope on a concrete `MockNativeContext`. This is the same
+    // import block every other test module in the crate uses; see
+    // `lang_class.rs`'s `mod tests`.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeHeapAccess, NativeInvokeAccess,
+        NativeSystemAccess, NativeThreadAccess,
+    };
+
+    /// Serialises every test in this module against the two process-global
+    /// statics. Poisoning is ignored on purpose: a panicking test must not
+    /// turn the rest of the module red for the wrong reason.
+    fn hook_registry_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Put the two globals back into the state a fresh VM has.
+    fn reset_registry() {
+        SHUTDOWN_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+        SHUTDOWN_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn hook_count() -> usize {
+        SHUTDOWN_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Unwrap to the `RuntimeError` and assert on the VARIANT and the message
+    /// STRING, never on `format!("{failed:?}")`.
+    ///
+    /// Two reasons, and the first one is a trap this test module fell into on
+    /// its first draft: `Debug` escapes the embedded quotes, so
+    /// `HOOK_MSG_NULL_ADD` — which contains `"java.lang.Thread.isAlive()"` —
+    /// never appears verbatim in a `Debug` rendering and a `.contains()` check
+    /// against it silently fails no matter what the VM does. The second is
+    /// that `Debug` of `Option<String>` is the only way to tell
+    /// `getMessage() == null` from `getMessage() == ""` here, and asserting on
+    /// the `Option` itself says it directly.
+    fn runtime_error(failed: MethodCallFailed) -> RuntimeError {
+        match failed {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(e)) => e,
+            other => panic!("expected a RuntimeError, got {other:?}"),
+        }
+    }
+
+    // -- the four messages, transcribed --------------------------------
+
+    #[test]
+    fn refusal_messages_are_the_measured_hotspot_text() {
+        assert_eq!(HOOK_MSG_SHUTDOWN_IN_PROGRESS, "Shutdown in progress");
+        assert_eq!(HOOK_MSG_ALREADY_RUNNING, "Hook already running");
+        assert_eq!(HOOK_MSG_PREVIOUSLY_REGISTERED, "Hook previously registered");
+        assert_eq!(
+            HOOK_MSG_NULL_ADD,
+            "Cannot invoke \"java.lang.Thread.isAlive()\" because \"hook\" is null"
+        );
+    }
+
+    /// HANDOFF-20260814 §7: a non-ASCII byte in a compared string makes the
+    /// oracle comparison depend on the Windows console code page, and one
+    /// differential once failed on a single em-dash with every assertion
+    /// passing. These four strings cross that boundary, so they are checked
+    /// rather than eyeballed.
+    #[test]
+    fn refusal_messages_are_pure_ascii() {
+        for m in [
+            HOOK_MSG_SHUTDOWN_IN_PROGRESS,
+            HOOK_MSG_NULL_ADD,
+            HOOK_MSG_ALREADY_RUNNING,
+            HOOK_MSG_PREVIOUSLY_REGISTERED,
+        ] {
+            assert!(m.is_ascii(), "non-ASCII in a compared message: {m:?}");
+        }
+    }
+
+    // -- argument decoding ---------------------------------------------
+
+    /// A present-but-null slot 1 is a JAVA null and must reach the NPE arm; a
+    /// short vector is a VM-side decode fault and must NOT be turned into one.
+    /// Before G11-1 both were the same silent `Ok(None)`.
+    #[test]
+    fn a_java_null_and_a_short_vector_decode_differently() {
+        let mut ctx = mock_ctx();
+        let receiver = ctx.alloc_object(cratonvm_types::ClassId::new(0), 2);
+        let hook = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+
+        assert_eq!(
+            shutdown_hook_argument(
+                &[Value::Object(Some(receiver)), Value::Object(Some(hook))],
+                "t"
+            ),
+            Some(Some(hook)),
+            "slot 1 holding a reference is the hook"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[Value::Object(Some(receiver)), Value::Object(None)], "t"),
+            Some(None),
+            "slot 1 holding null is a Java null, not a decode failure"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[Value::Object(Some(receiver))], "t"),
+            None,
+            "a one-slot vector is not [receiver, Thread] and must not be decided"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[], "t"),
+            None,
+            "an empty vector likewise"
+        );
+        assert_eq!(
+            shutdown_hook_argument(&[Value::Object(Some(receiver)), Value::Int(7)], "t"),
+            None,
+            "slot 1 holding a primitive is not a Thread reference"
+        );
+    }
+
+    // -- the refusal ladder --------------------------------------------
+
+    #[test]
+    fn null_add_throws_npe_with_the_helpful_message() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        let mut ctx = mock_ctx();
+
+        let err = shutdown_hook_add(&mut ctx, None).expect_err("null must be refused");
+        match runtime_error(err) {
+            RuntimeError::NullPointerException { message } => assert_eq!(
+                message.as_deref(),
+                Some(HOOK_MSG_NULL_ADD),
+                "add's NPE must carry HotSpot's helpful message verbatim"
+            ),
+            other => panic!("expected NullPointerException, got {other:?}"),
+        }
+        assert_eq!(hook_count(), 0, "a refused hook must not be registered");
+
+        reset_registry();
+    }
+
+    /// `remove`'s NPE is a bare `new NullPointerException()` (pc 20), so its
+    /// `getMessage()` is null — not the empty string, and not `add`'s helpful
+    /// text. MEASURED: `NULL-REMOVE threw=java.lang.NullPointerException
+    /// msg=null`.
+    #[test]
+    fn null_remove_throws_npe_with_no_message_at_all() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        let mut ctx = mock_ctx();
+
+        let err = shutdown_hook_remove(&mut ctx, None).expect_err("null must be refused");
+        match runtime_error(err) {
+            // `None`, NOT `Some("")`. `msg=null` and `msg=` are different
+            // cells and the differential prints them differently.
+            RuntimeError::NullPointerException { message } => assert_eq!(
+                message, None,
+                "remove's NPE is a no-arg `new NullPointerException()` (pc 20)"
+            ),
+            other => panic!("expected NullPointerException, got {other:?}"),
+        }
+
+        reset_registry();
+    }
+
+    /// The JDK tests `hooks == null` at pc 0, BEFORE it touches the argument
+    /// at pc 16/17. So a null hook offered during shutdown gets the ISE, not
+    /// the NPE — on both methods. This is why the null check lives inside
+    /// `shutdown_hook_add`/`_remove` rather than at the registration site.
+    #[test]
+    fn shutdown_in_progress_outranks_the_null_check() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        SHUTDOWN_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut ctx = mock_ctx();
+
+        let added = shutdown_hook_add(&mut ctx, None).expect_err("must refuse");
+        match runtime_error(added) {
+            RuntimeError::IllegalStateException { message } => {
+                assert_eq!(message, HOOK_MSG_SHUTDOWN_IN_PROGRESS)
+            }
+            other => panic!("add during shutdown must answer ISE first, got {other:?}"),
+        }
+
+        let removed = shutdown_hook_remove(&mut ctx, None).expect_err("must refuse");
+        match runtime_error(removed) {
+            RuntimeError::IllegalStateException { message } => {
+                assert_eq!(message, HOOK_MSG_SHUTDOWN_IN_PROGRESS)
+            }
+            other => panic!("remove during shutdown must answer ISE first, got {other:?}"),
+        }
+
+        reset_registry();
+    }
+
+    /// The positive path plus the duplicate refusal, in one test because the
+    /// second only means anything after the first: registering twice must
+    /// throw, and the registry must still hold exactly one entry afterwards.
+    /// The two `remove` rows are `RShutdownHooks`' first two checks, MEASURED
+    /// on the oracle as `REMOVE-1 true` / `REMOVE-2 false`.
+    #[test]
+    fn a_second_registration_of_the_same_hook_throws_and_does_not_grow_the_list() {
+        let _g = hook_registry_guard();
+        reset_registry();
+        let mut ctx = mock_ctx();
+        let hook = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+
+        shutdown_hook_add(&mut ctx, Some(hook)).expect("first registration must be accepted");
+        assert_eq!(hook_count(), 1);
+
+        let err = shutdown_hook_add(&mut ctx, Some(hook)).expect_err("duplicate must be refused");
+        match runtime_error(err) {
+            RuntimeError::IllegalArgumentException { message } => {
+                assert_eq!(message, HOOK_MSG_PREVIOUSLY_REGISTERED)
+            }
+            other => panic!("expected the duplicate IAE, got {other:?}"),
+        }
+        assert_eq!(
+            hook_count(),
+            1,
+            "a refused registration must not leave a second entry"
+        );
+
+        assert!(shutdown_hook_remove(&mut ctx, Some(hook)).expect("must not throw"));
+        assert!(!shutdown_hook_remove(&mut ctx, Some(hook)).expect("must not throw"));
+        assert_eq!(hook_count(), 0);
+
+        reset_registry();
     }
 }

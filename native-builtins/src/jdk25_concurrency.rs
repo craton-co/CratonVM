@@ -926,6 +926,36 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         );
     }
 
+    // G5-1: the worker Thread now exists, so this is its construction moment —
+    // capture the forking thread's `InheritableThreadLocal` values against it
+    // here, before it is started or even tracked.
+    //
+    // Two things are wrong without this call, and only the first is a timing
+    // question:
+    //
+    //  1. `ctx.thread_start(worker)` below goes straight to the VM's thread
+    //     machinery. It does NOT pass through
+    //     `lang_system::native_thread_start0`, which is where every other
+    //     spawn path takes its inheritable-ThreadLocal snapshot — so a forked
+    //     subtask inherited NOTHING at all. HotSpot inherits: MEASURED on
+    //     Temurin 25.0.3+9 (`StsItl`, `--enable-preview`), a subtask forked
+    //     after `ITL.set("scope-parent")` reads back `scope-parent`, because
+    //     `StructuredTaskScope.fork` builds its thread through a
+    //     `Thread.Builder` whose `inheritInheritableThreadLocals` defaults to
+    //     true.
+    //  2. Capturing at construction rather than at start is what HotSpot's
+    //     `Thread.<init>` does (pc 175..201 of the master constructor,
+    //     SOURCE-VERIFIED). For this site the two moments are adjacent, so the
+    //     ordering is not observable HERE — but going through the shared
+    //     construction-time entry point rather than open-coding a snapshot is
+    //     what keeps this path and the `new Thread(...)` paths on one
+    //     definition of when inheritance is decided.
+    //
+    // Placed after BOTH layout arms, because the real-JDK arm's
+    // `Thread.<init>` invoke can allocate and the identity the queue is keyed
+    // by must be the finished object's.
+    crate::lang_system::capture_inheritable_tl_at_construction(ctx, worker);
+
     // Record the (subtask, worker) pair BEFORE starting so a racing fast worker
     // is already tracked when join() runs.
     register_scope_fork(this, subtask, worker);

@@ -30,7 +30,7 @@
 //! unconditional mappings names the defect it shipped with. The VM must answer
 //! what **the JDK on this image** answers, and Rust's `char` tables are a
 //! DIFFERENT, NEWER Unicode than the JDK's. Where the two disagree, Unicode is
-//! not the oracle. [`JDK_UNMAPPED_CASE_CODE_POINTS`] below is the measured
+//! not the oracle. [`JDK_UNMAPPED_CASE_RUNS`] below is the measured
 //! disagreement, and it is now the single definition shared with
 //! `lang_string.rs` rather than a copy per call site — this module had three
 //! sites (both entry points and the `map_locale_dependent` fallback arms) plus
@@ -74,11 +74,11 @@ const CCC_ABOVE: u8 = 230;
 /// those answers came back wrong.
 ///
 /// Note the two shapes, because the *mapping* fix is the same arm for both and
-/// the *property* fix is not: four of the six are UNASSIGNED in the JDK's
+/// the *property* fix is not: four of those six are UNASSIGNED in the JDK's
 /// Unicode version, while `A7D3` (LATIN SMALL LETTER DOUBLE THORN) and `A7D5`
 /// (LATIN SMALL LETTER DOUBLE WYNN) are assigned lowercase letters that simply
 /// have no uppercase partner yet — a newer Unicode added the capitals. See
-/// [`JDK_UNASSIGNED_CASE_CODE_POINTS`] for where the two shapes part company.
+/// [`JDK_UNASSIGNED_CASE_RUNS`] for where the two shapes part company.
 ///
 /// How this was missed the first time, since the method looked exhaustive: the
 /// original exception table was derived by dumping all 65,536 BMP code units
@@ -88,45 +88,86 @@ const CCC_ABOVE: u8 = 230;
 /// that measurement was real; the Rust side was a proxy that was never
 /// validated as one. `[setup lies]` — an exhaustive sweep against the wrong
 /// oracle is still exhaustive.
-pub(crate) const JDK_UNMAPPED_CASE_CODE_POINTS: [u16; 6] =
-    [0xA7CE, 0xA7CF, 0xA7D2, 0xA7D3, 0xA7D4, 0xA7D5];
-
-/// The subset of [`JDK_UNMAPPED_CASE_CODE_POINTS`] that the JDK does not assign
-/// at all (`Character.isDefined == false`, `getType == 0`).
 ///
-/// These four differ from `A7D3`/`A7D5` in every property, not just in the
-/// mapping: the JDK reports them as uncased non-letters where Rust's newer
-/// tables report a cased letter. That distinction is observable through
-/// `Final_Cased`, and it was measured rather than reasoned — lowercasing
-/// `"A" + U+03A3 + X` on OpenJDK 25.0.3+9 gives the FINAL sigma `U+03C2` when
-/// `X` is one of these four (so the JDK sees no cased letter after the sigma)
-/// and the medial `U+03C3` when `X` is `A7D3` or `A7D5`. Identical rows for
-/// `Locale.ROOT`, `tr` and `lt`.
+/// # The list was six code points and the measured set is fifty-six
+///
+/// The paragraph above says the Rust side had never been executed. G9-1
+/// re-derived it by executing Rust's own `char::to_{upper,lower}case` (rustc
+/// 1.97.1, the toolchain this crate builds with) and
+/// `String.to{Upper,Lower}Case(Locale.ROOT)` on OpenJDK 25.0.3+9 over **all
+/// 1,112,064 Unicode scalar values** and classifying every disagreement:
+///
+/// ```text
+///   Rust has a mapping, JDK 25 has NONE   56   <- this table
+///   JDK has a mapping, Rust has none       0
+///   both map, to different things          0
+/// ```
+///
+/// The previous form could not have found the other fifty: it was `[u16; 6]`
+/// behind a `cp <= 0xFFFF` guard, so every supplementary code point was
+/// STRUCTURALLY out of reach. `U+16EA0..U+16EB8` and `U+16EBB..U+16ED3` are a
+/// case pair block that Rust's Unicode knows (delta `+0x1B`) and JDK 25 does
+/// not assign at all — measured `getType == 0`, `isDefined == false` for the
+/// whole of `U+16E9B..U+16EDF`. Same shape as the `A7Cx` rows, one plane up.
+///
+/// Runs, not a flat list, because these are now contiguous spans — but the
+/// spans are the MEASURED ones and are still not bracketable by hand:
+/// `U+A7D0`/`U+A7D1` and `U+A7D6`/`U+A7D7` sit inside the same `A7Cx` region
+/// and ARE case pairs in the JDK, and `U+16EB9`/`U+16EBA` split the
+/// supplementary block in two.
+pub(crate) const JDK_UNMAPPED_CASE_RUNS: [(u32, u32); 4] = [
+    (0xA7CE, 0xA7CF),
+    (0xA7D2, 0xA7D5),
+    (0x16EA0, 0x16EB8),
+    (0x16EBB, 0x16ED3),
+];
+
+/// The subset of [`JDK_UNMAPPED_CASE_RUNS`] that the JDK does not assign at all
+/// (`Character.isDefined == false`, `getType == 0`).
+///
+/// These differ from `A7D3`/`A7D5` in every property, not just in the mapping:
+/// the JDK reports them as uncased non-letters where Rust's newer tables report
+/// a cased letter. That distinction is observable through `Final_Cased`, and it
+/// was measured rather than reasoned — lowercasing `"A" + U+03A3 + X` on
+/// OpenJDK 25.0.3+9 gives the FINAL sigma `U+03C2` when `X` is one of these (so
+/// the JDK sees no cased letter after the sigma) and the medial `U+03C3` when
+/// `X` is `A7D3` or `A7D5`. Identical rows for `Locale.ROOT`, `tr` and `lt`.
+///
+/// G9-1 extended this the same way as its parent: the whole of
+/// `U+16EA0..U+16EB8` and `U+16EBB..U+16ED3` is `getType == 0` on JDK 25, so
+/// all fifty join the four. Only `A7D3` and `A7D5` are unmapped-but-assigned.
 ///
 /// This is deliberately NOT a general "is this code point assigned in the JDK"
 /// predicate — that question is thousands of code points wide and cannot be
-/// answered from Rust's tables at all. It is exactly the four this file already
-/// had to enumerate for the mapping, extended to the properties that the same
-/// four also get wrong.
-const JDK_UNASSIGNED_CASE_CODE_POINTS: [u16; 4] = [0xA7CE, 0xA7CF, 0xA7D2, 0xA7D4];
+/// answered from Rust's tables at all. It is exactly the set this file already
+/// had to enumerate for the mapping, minus the two the JDK does assign.
+const JDK_UNASSIGNED_CASE_RUNS: [(u32, u32); 4] = [
+    (0xA7CE, 0xA7CF),
+    (0xA7D2, 0xA7D2),
+    (0xA7D4, 0xA7D4),
+    (0x16EA0, 0x16ED3),
+];
 
-/// Whether a code unit is one of [`JDK_UNMAPPED_CASE_CODE_POINTS`].
+/// Whether a code point falls in one of [`JDK_UNMAPPED_CASE_RUNS`].
 ///
-/// A contiguous range test would be wrong: `U+A7D0`/`U+A7D1` and
-/// `U+A7D6`/`U+A7D7` sit inside the same span and ARE case pairs in the JDK
-/// (measured: `toUpperCase(U+A7D1) == U+A7D0`, and `"ꟑ".toUpperCase("tr")`
-/// is `U+A7D0`), so the six must be listed, not bracketed.
+/// Takes the FULL `u32` code-point domain. The `cp <= 0xFFFF` guard this
+/// replaced was not a fast path, it was the bug: fifty of the fifty-six
+/// members are supplementary.
 #[inline]
 pub(crate) fn is_jdk_unmapped_case_code_point(cp: u32) -> bool {
-    cp <= 0xFFFF && JDK_UNMAPPED_CASE_CODE_POINTS.contains(&(cp as u16))
+    JDK_UNMAPPED_CASE_RUNS
+        .iter()
+        .any(|&(lo, hi)| cp >= lo && cp <= hi)
 }
 
-/// Whether `c` is one of [`JDK_UNASSIGNED_CASE_CODE_POINTS`] — a character
+/// Whether `c` falls in one of [`JDK_UNASSIGNED_CASE_RUNS`] — a character
 /// Rust's tables know as a cased letter and the JDK does not know at all.
 #[inline]
 fn is_jdk_unassigned(c: char) -> bool {
     let cp = u32::from(c);
-    cp <= 0xFFFF && JDK_UNASSIGNED_CASE_CODE_POINTS.contains(&(cp as u16))
+    JDK_UNASSIGNED_CASE_RUNS
+        .iter()
+        .any(|&(lo, hi)| cp >= lo && cp <= hi)
 }
 
 /// One character's **full** uppercase mapping as the JDK produces it, appended
@@ -157,8 +198,12 @@ pub(crate) fn push_jdk_lower(out: &mut String, c: char) {
 /// `String.toUpperCase()`'s locale-independent full mapping, JDK-correct.
 ///
 /// The scan for a skewed code point is a cheap early-out: every entry in
-/// [`JDK_UNMAPPED_CASE_CODE_POINTS`] is above `U+A7CD`, so essentially all real
-/// text keeps the single bulk `str::to_uppercase` call.
+/// [`JDK_UNMAPPED_CASE_RUNS`] is above `U+A7CD`, so essentially all real text
+/// keeps the single bulk `str::to_uppercase` call.
+///
+/// Uppercasing has no context-dependent rule on either side, so walking
+/// character by character here is exactly `str::to_uppercase` with the skew arm
+/// spliced in. Its lowercase twin below is NOT in that position — see there.
 pub(crate) fn jdk_to_uppercase(s: &str) -> String {
     if !s.chars().any(|c| is_jdk_unmapped_case_code_point(u32::from(c))) {
         return s.to_uppercase();
@@ -170,14 +215,46 @@ pub(crate) fn jdk_to_uppercase(s: &str) -> String {
     out
 }
 
-/// [`jdk_to_uppercase`]'s lowercase twin.
+/// [`jdk_to_uppercase`]'s lowercase twin — and NOT its mirror image, because
+/// lowercasing has one context-dependent rule and uppercasing has none.
+///
+/// `str::to_lowercase` implements Final_Sigma; `char::to_lowercase` cannot,
+/// because a lone `char` has no context. So the character-wise arm below was a
+/// *silent downgrade*: any string that merely CONTAINED a skewed code point
+/// lost the final sigma everywhere else in it. Measured on OpenJDK 25.0.3+9,
+/// printed as code units:
+///
+/// ```text
+///   ("A" + U+03A3 + U+A7CE).toLowerCase()   HotSpot [97, 962, 42958]
+///                                           was     [97, 963, 42958]
+/// ```
+///
+/// `962` is `U+03C2` FINAL SIGMA and `963` is the medial `U+03C3`. The bug was
+/// invisible while the trigger set was six code points nobody types; G9-1's
+/// measurement grew that set to fifty-six, which is what made it worth closing
+/// rather than widening.
+///
+/// [`is_final_cased`] is the JDK's own `ConditionalSpecialCasing` rule, already
+/// in this file for the `tr`/`az`/`lt` path — so this arm now answers the same
+/// way the locale-dependent arm does, which it did not before. It is not
+/// Rust's rule and does not claim to be: Rust skips Case_Ignorable characters
+/// and consults the live `Cased` property, while the JDK stops at a word
+/// boundary and consults a frozen list. Those two disagree on **259** code
+/// points (measured, G9-1); the fast path above still takes Rust's answer for
+/// every string without a skewed code point in it, so this change moves no row
+/// that was previously right.
 pub(crate) fn jdk_to_lowercase(s: &str) -> String {
     if !s.chars().any(|c| is_jdk_unmapped_case_code_point(u32::from(c))) {
         return s.to_lowercase();
     }
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        push_jdk_lower(&mut out, c);
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\u{03A3}' && is_final_cased(&chars, i) {
+            out.push('\u{03C2}');
+        } else {
+            push_jdk_lower(&mut out, c);
+        }
     }
     out
 }
@@ -287,7 +364,7 @@ pub fn to_upper_case(s: &str, lang: &str) -> String {
 ///
 /// The fallback arms go through [`push_jdk_lower`]/[`push_jdk_upper`], not
 /// `char::to_{lower,upper}case` directly. `lang_string.rs` guards its own
-/// non-locale path against [`JDK_UNMAPPED_CASE_CODE_POINTS`] and then calls
+/// non-locale path against [`JDK_UNMAPPED_CASE_RUNS`] and then calls
 /// straight into here for `tr`/`az`/`lt`, so a bare Rust mapping on this line
 /// meant `"ꟓ".toUpperCase(Locale.forLanguageTag("tr"))` was still wrong while
 /// the same string with `Locale.ROOT` was right — the fix next door was
@@ -429,7 +506,7 @@ fn is_final_cased(chars: &[char], index: usize) -> bool {
 ///
 /// The JDK asks a `BreakIterator`, whose word characters are the ones
 /// `Character.isLetterOrDigit` accepts. Measured on OpenJDK 25.0.3+9, that is
-/// `false` for every code point in [`JDK_UNASSIGNED_CASE_CODE_POINTS`] and
+/// `false` for every code point in [`JDK_UNASSIGNED_CASE_RUNS`] and
 /// `true` for `A7D3`/`A7D5`; Rust's `is_alphanumeric` says `true` for all six.
 fn in_word(c: char) -> bool {
     if is_jdk_unassigned(c) {
@@ -445,13 +522,13 @@ fn in_word(c: char) -> bool {
 /// *both* an upper- and a lower-case mapping away from itself.
 ///
 /// The version-skew arm comes FIRST, and it is
-/// [`JDK_UNASSIGNED_CASE_CODE_POINTS`] rather than the wider
-/// [`JDK_UNMAPPED_CASE_CODE_POINTS`]: `A7D3` and `A7D5` ARE cased on
+/// [`JDK_UNASSIGNED_CASE_RUNS`] rather than the wider
+/// [`JDK_UNMAPPED_CASE_RUNS`]: `A7D3` and `A7D5` ARE cased on
 /// OpenJDK 25 (`getType == LOWERCASE_LETTER`), so blanket-excluding all six
 /// here would trade one wrong answer for another. The two shapes need the same
 /// arm for the *mapping* and different arms for the *property* — measured, not
 /// reasoned, via the Final_Sigma rows in
-/// [`JDK_UNASSIGNED_CASE_CODE_POINTS`]'s doc.
+/// [`JDK_UNASSIGNED_CASE_RUNS`]'s doc.
 ///
 /// Without this arm the first line already answered `true` for the four:
 /// Rust classifies `A7CE`/`A7D2`/`A7D4` as uppercase letters and `A7CF` as a
@@ -573,27 +650,87 @@ mod tests {
         assert!(!is_locale_dependent(&normalize_language("EN")));
     }
 
-    /// The six from [`JDK_UNMAPPED_CASE_CODE_POINTS`], through the LOCALE path.
+    /// Every member of [`JDK_UNMAPPED_CASE_RUNS`], through the LOCALE path.
     ///
     /// This is the site the earlier fix in `lang_string.rs` could not reach:
     /// `string_case_impl` tests `is_locale_dependent` first and hands `tr`,
     /// `az` and `lt` to this module, whose fallback arms called Rust's mapping
     /// directly. Every expectation is the verbatim OpenJDK 25.0.3+9 answer.
+    ///
+    /// The loop is over the runs rather than over six literals since G9-1: the
+    /// measured set is 56 code points and 50 of them are supplementary, so a
+    /// `u16`-shaped test would go on passing while proving nothing about them.
     #[test]
     fn the_jdk_unmapped_code_points_are_identity_in_every_locale() {
-        for cp in JDK_UNMAPPED_CASE_CODE_POINTS {
-            let c = char::from_u32(u32::from(cp)).expect("BMP non-surrogate");
-            let s = c.to_string();
-            for lang in ["tr", "az", "lt", "en", "el", ""] {
-                assert_eq!(to_upper_case(&s, lang), s, "toUpperCase(U+{cp:04X}, {lang})");
-                assert_eq!(to_lower_case(&s, lang), s, "toLowerCase(U+{cp:04X}, {lang})");
-            }
-            // ... and embedded in a string the locale path actually rewrites.
-            for lang in ["tr", "az"] {
-                assert_eq!(to_upper_case(&format!("i{c}i"), lang), format!("\u{0130}{c}\u{0130}"));
-                assert_eq!(to_lower_case(&format!("I{c}I"), lang), format!("\u{0131}{c}\u{0131}"));
+        let mut seen = 0usize;
+        for (lo, hi) in JDK_UNMAPPED_CASE_RUNS {
+            for cp in lo..=hi {
+                seen += 1;
+                let c = char::from_u32(cp).expect("scalar value");
+                let s = c.to_string();
+                for lang in ["tr", "az", "lt", "en", "el", ""] {
+                    assert_eq!(to_upper_case(&s, lang), s, "toUpperCase(U+{cp:04X}, {lang})");
+                    assert_eq!(to_lower_case(&s, lang), s, "toLowerCase(U+{cp:04X}, {lang})");
+                }
+                // ... and embedded in a string the locale path actually rewrites.
+                for lang in ["tr", "az"] {
+                    assert_eq!(to_upper_case(&format!("i{c}i"), lang), format!("\u{0130}{c}\u{0130}"));
+                    assert_eq!(to_lower_case(&format!("I{c}I"), lang), format!("\u{0131}{c}\u{0131}"));
+                }
             }
         }
+        assert_eq!(seen, 56, "the measured skew set is 56 code points");
+    }
+
+    /// The same 56, through the LOCALE-INDEPENDENT entry points — which is the
+    /// path `String.toUpperCase()` with no argument takes.
+    ///
+    /// Each expectation is HotSpot's: identity. Before G9-1 the 50
+    /// supplementary members answered Rust's pairing instead — measured
+    /// `("\u{16EBB}").toUpperCase()` was `U+16EA0` where OpenJDK 25.0.3+9
+    /// returns `U+16EBB` unchanged.
+    #[test]
+    fn the_supplementary_half_of_the_skew_is_identity_without_a_locale() {
+        for (lo, hi) in JDK_UNMAPPED_CASE_RUNS {
+            for cp in lo..=hi {
+                let s = char::from_u32(cp).unwrap().to_string();
+                assert_eq!(jdk_to_uppercase(&s), s, "jdk_to_uppercase(U+{cp:04X})");
+                assert_eq!(jdk_to_lowercase(&s), s, "jdk_to_lowercase(U+{cp:04X})");
+                assert!(is_jdk_unmapped_case_code_point(cp), "U+{cp:04X}");
+            }
+        }
+        // The block's own neighbours are NOT in it — the runs are measured
+        // boundaries, not a bracket around the interesting region.
+        for cp in [
+            0xA7CDu32, 0xA7D0, 0xA7D1, 0xA7D6, 0x16E9F, 0x16EB9, 0x16EBA, 0x16ED4,
+        ] {
+            assert!(
+                !is_jdk_unmapped_case_code_point(cp),
+                "U+{cp:04X} is not skewed"
+            );
+        }
+    }
+
+    /// The character-wise arm of [`jdk_to_lowercase`] must keep Final_Sigma.
+    ///
+    /// Regression for the downgrade G9-1 found: the arm runs whenever the
+    /// string contains ANY skewed code point, and `char::to_lowercase` has no
+    /// context, so every sigma in such a string came back medial. Expectations
+    /// measured on OpenJDK 25.0.3+9, printed as code units.
+    #[test]
+    fn the_character_wise_arm_still_finds_the_final_sigma() {
+        // [97, 962, 42958] on HotSpot; this arm used to answer 963 in the middle.
+        assert_eq!(jdk_to_lowercase("A\u{03A3}\u{A7CE}"), "a\u{03C2}\u{A7CE}");
+        assert_eq!(jdk_to_lowercase("A\u{03A3}\u{16EA0}"), "a\u{03C2}\u{16EA0}");
+        // A7D3 IS a cased letter on JDK 25, so the sigma stays MEDIAL — the
+        // control that says this is Final_Cased and not "always final".
+        assert_eq!(jdk_to_lowercase("A\u{03A3}\u{A7D3}"), "a\u{03C3}\u{A7D3}");
+        // A cased letter after the sigma keeps it medial even with a skewed
+        // code point elsewhere in the string.
+        assert_eq!(jdk_to_lowercase("\u{A7CE}A\u{03A3}A"), "\u{A7CE}a\u{03C3}a");
+        // No skewed code point at all: the bulk path, unchanged.
+        assert_eq!(jdk_to_lowercase("A\u{03A3}"), "a\u{03C2}");
+        assert_eq!(jdk_to_lowercase("\u{03A3}\u{03A3}"), "\u{03C3}\u{03C2}");
     }
 
     /// The neighbours that ARE case pairs on OpenJDK 25 — the control that says
@@ -615,13 +752,15 @@ mod tests {
     fn final_sigma_sees_a7d3_and_a7d5_as_cased_and_the_other_four_as_not() {
         for lang in ["tr", "az", "lt"] {
             // Unassigned in the JDK → the sigma is FINAL.
-            for cp in JDK_UNASSIGNED_CASE_CODE_POINTS {
-                let c = char::from_u32(u32::from(cp)).unwrap();
-                assert_eq!(
-                    to_lower_case(&format!("A\u{03A3}{c}"), lang),
-                    format!("a\u{03C2}{c}"),
-                    "U+{cp:04X} must not count as a cased letter after the sigma"
-                );
+            for (lo, hi) in JDK_UNASSIGNED_CASE_RUNS {
+                for cp in lo..=hi {
+                    let c = char::from_u32(cp).unwrap();
+                    assert_eq!(
+                        to_lower_case(&format!("A\u{03A3}{c}"), lang),
+                        format!("a\u{03C2}{c}"),
+                        "U+{cp:04X} must not count as a cased letter after the sigma"
+                    );
+                }
             }
             // Assigned lowercase letters in the JDK → the sigma is MEDIAL.
             for c in ['\u{A7D3}', '\u{A7D5}'] {
