@@ -126,6 +126,28 @@ pub fn loader_pin_addr(class_id: u32) -> Option<usize> {
     store().read().get(&class_id).map(|&(_, addr)| addr)
 }
 
+/// Every pinned loader address, for a marker that cannot ask per class.
+///
+/// # Why a wholesale reader exists
+///
+/// [`loader_pin_addr`] answers "which loader pins THIS class", which is the
+/// question a marker asks while visiting the class's objects. A generational
+/// young cycle never visits an old object at all, so it never asks -- and a
+/// loader whose only reference is one of its own loaded classes would be swept,
+/// taking every mirror and method structure with it. A young cycle therefore
+/// roots the whole registry once instead, which is over-approximate (a loader
+/// pinned for a class that is itself dead survives one more cycle) in the safe
+/// direction.
+///
+/// Mirrors [`crate::metadata_pin::snapshot`], whose own note makes the same
+/// argument about the per-object variant being a shared-cache-line hot spot.
+pub fn all_pinned_loaders() -> Vec<usize> {
+    if !NON_EMPTY.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    store().read().values().map(|&(_, addr)| addr).collect()
+}
+
 /// Replace **`vm`'s** rows from the authoritative side-table snapshot
 /// (`[(class_id, loader_addr)]`). Called by the post-GC reconciliation in
 /// native-builtins after it has remapped/pruned the side-table, so the marker
