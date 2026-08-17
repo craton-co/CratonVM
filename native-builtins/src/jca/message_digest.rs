@@ -112,22 +112,51 @@ fn accumulator_present(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
 }
 
 /// Read a Java-byte array from a `Value::Object(Some(arr))`.
+///
+/// `read_byte_array_into` and not a `get_array_element` loop: the VM override
+/// of that trait method `memcpy`s the array's raw payload, while the loop pays
+/// a `Value`-returning virtual call into the collector **per byte**. On a
+/// `MessageDigest.update(byte[], 0, 64)` microbenchmark those two accessors
+/// (`ZgcRealHeap::get_array_element` + its `NativeContextImpl` wrapper) were
+/// **16% of the whole profile** — see the round-2 note on `read_byte_array_into`
+/// in `native-api/src/registry.rs`, which names exactly these callers.
 fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
     let len = ctx.array_length(arr);
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        if let Value::Int(b) = ctx.get_array_element(arr, i) {
-            out.push(b as u8);
-        }
-    }
+    read_byte_array_range(ctx, arr, 0, len)
+}
+
+/// [`read_byte_array`] for a sub-range, with the same bulk-copy contract.
+///
+/// The returned `Vec` is truncated to what the heap actually yielded, which is
+/// the same shape the per-element loop had (it pushed only the elements that
+/// decoded) — a short read is a bounds problem the caller has already checked
+/// for, not something to fabricate zeros for.
+fn read_byte_array_range(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    off: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let n = ctx.read_byte_array_into(arr, off, &mut out);
+    out.truncate(n);
     out
 }
 
 /// Materialise a Java byte[] populated with `bytes`.
+///
+/// `write_byte_array_from` is the mirror of [`read_byte_array`]'s bulk read;
+/// its VM override is a single `copy_nonoverlapping`. The per-element fallback
+/// remains correct, so a context without the override still works.
 fn make_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+    if !ctx.write_byte_array_from(arr, 0, bytes) {
+        // Bounds/kind refusal on an array this function just allocated at
+        // exactly `bytes.len()` should be unreachable; fall back rather than
+        // hand back a silently empty array.
+        for (i, &b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+        }
     }
     arr
 }
@@ -358,9 +387,15 @@ fn read_algo(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// FINAL on `MessageDigest` — a provider's subclass cannot override them, so
 /// they resolve to the class these natives are registered on and would run this
 /// VM's accumulator against a receiver it never built.
+///
+/// `class_name_arc_of_id`, not `class_name_of_id`: the latter copies the
+/// class's `Arc<str>` name into a fresh `String` every call, and this runs once
+/// per `update`. netty's `AbstractIntegrationTest.testHugeDecompress` feeds
+/// SHA-256 a byte at a time, 268 million times, so the copy alone was 4% of
+/// that test's profile.
 fn md_receiver_is_ours(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    match ctx.class_name_of_id(ctx.class_id_of_object(this)) {
-        Some(name) => name == "java/security/MessageDigest",
+    match ctx.class_name_arc_of_id(ctx.class_id_of_object(this)) {
+        Some(name) => &*name == "java/security/MessageDigest",
         None => true,
     }
 }
@@ -429,12 +464,7 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if off.saturating_add(len) > total {
         return Err(RuntimeError::aioobe_index_only((off + len) as i32).into());
     }
-    let mut bytes = Vec::with_capacity(len);
-    for i in 0..len {
-        if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
-            bytes.push(b as u8);
-        }
-    }
+    let bytes = read_byte_array_range(ctx, arr, off, len);
     append_accumulator(ctx, this, &bytes);
     Ok(None)
 }
@@ -471,12 +501,7 @@ fn md_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         "([B)Ljava/nio/ByteBuffer;",
         &[Value::Object(Some(tmp))],
     )?;
-    let mut bytes = Vec::with_capacity(rem);
-    for i in 0..rem {
-        if let Value::Int(b) = ctx.get_array_element(tmp, i) {
-            bytes.push(b as u8);
-        }
-    }
+    let bytes = read_byte_array_range(ctx, tmp, 0, rem);
     append_accumulator(ctx, this, &bytes);
     Ok(None)
 }
@@ -586,8 +611,10 @@ fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             "insufficient space in the output buffer to store the digest",
         ));
     }
-    for (i, &b) in hash.iter().enumerate() {
-        ctx.set_array_element(buf, offset + i, Value::Int(b as i8 as i32));
+    if !ctx.write_byte_array_from(buf, offset, &hash) {
+        for (i, &b) in hash.iter().enumerate() {
+            ctx.set_array_element(buf, offset + i, Value::Int(b as i8 as i32));
+        }
     }
     // Reset accumulator after digest() per JDK contract (see md_digest).
     write_accumulator(ctx, this, &[]);

@@ -1327,6 +1327,16 @@ pub fn dump_method_stats_to_stderr() {
             gate_hits,
         );
     }
+    // Census-driven thin direct helpers: how many sites each compile door
+    // actually bound. Printed unconditionally (even at 0) because the whole
+    // point is to distinguish "the bind did not help" from "the bind never
+    // happened" — the failure mode `LEAF_NATIVE_HITS` exists for, and the one
+    // that made an earlier ByteBuffer accessor rewrite read as a no-op when in
+    // fact it was on a path with zero invocations.
+    let (check_index_sites, fence_sites) = crate::census_direct_helper_sites();
+    eprintln!(
+        "[cratonvm] JIT thin direct-helper binds: Preconditions.checkIndex={check_index_sites} Reference.reachabilityFence={fence_sites}",
+    );
     let shadow_census = crate::jit_native_shadow_cause_census();
     if !shadow_census.is_empty() {
         eprintln!(

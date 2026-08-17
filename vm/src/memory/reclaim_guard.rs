@@ -260,6 +260,23 @@ fn report_reclaimed_receiver_inner(
             );
         }
     }
+    // Was this address dropped from a root snapshot by the per-bci local
+    // liveness filter? That filter's whole contract is that the slot can never
+    // be read again — so a hit here names the method and slot where the
+    // analysis is wrong, which is the only thing that turns "disable the
+    // filter and the corruption stops" into a fix.
+    if let Some(where_) = cratonvm_gc::gc_quiescence::liveness_filtered_at(addr) {
+        static L: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if L.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                obj = format!("{addr:#x}"),
+                site = site,
+                filtered_at = %where_,
+                "…and the per-bci local-liveness filter DROPPED this address from a root                  snapshot at the frame named here. The filter guarantees such a slot is never                  read again; it was.",
+            );
+        }
+    }
     // ZGC's relocation ledger, when `CRATONVM_DBG_ZGC_CORPSE` armed the run.
     // Unlike everything above it names the address's PREDECESSOR rather than
     // its span: which object the slide moved away from here, where that object

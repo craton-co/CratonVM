@@ -1,5 +1,52 @@
 # All 11 `codec.compression.*IntegrationTest` classes hang — one shared, already-diagnosed cause
 
+**Status: RETIRED 2026-08-17 — the cause this page named was half right, and the
+half it got wrong has been FIXED.**
+
+This page attributed the wall entirely to "the `ByteBuf`/interpreter↔JIT
+per-call-cost workstream" and concluded there was "no per-class work to do here
+beyond that". That is now known to be wrong for the larger share of it.
+`AbstractByteBuf.writeByte` was not paying generic per-call cost; it was paying
+**two `VarHandle.get` calls at ~2 µs each**, through `ensureAccessible()` →
+`RefCnt.isLiveNonVolatile`, because a signature-polymorphic call site is
+unresolvable by its own descriptor and the JIT's per-call-site native cache had
+therefore cached a permanent refusal for every one of them. See
+`fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
+
+| | before | after |
+| --- | ---: | ---: |
+| `ByteBuf.writeByte` (microbenchmark) | 2 440–2 578 ns | **368–654 ns** |
+| `JdkZlibIntegrationTest#testHugeDecompress`, solo, no per-method cap | 1 063 s | **455–528 s** |
+
+**What that does and does not settle.** The root-cause analysis below stands in
+every structural respect — one shared base-class method, `testHugeDecompress`,
+inherited by all eleven classes, building 256 MiB one byte at a time — and the
+per-iteration cost of that loop has come down 4.0–6.6× (the spread is host
+load, not the change; both arms were interleaved in each measurement). It is
+still not under the
+suite's 180 s per-class cap. The residual is `MessageDigest.update(byte)` (268 M
+single-byte SHA-256 updates on the compress side and 268 M more on the
+decompress side, at the ~170 ns native-dispatch floor) plus the codec work
+itself. That floor is not netty's and not this page's: it is
+`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`, whose own
+conclusion — that restructuring `invoke_or_native` cannot be justified by a
+lever too small to measure after it lands — is unchanged.
+
+So the eleven classes will still report HANG at a 180 s cap, and this page still
+answers "why" for whoever sees that. It moves here because the one actionable
+defect inside it has been found and fixed, and because the sentence that would
+have sent the next reader to the wrong workstream is corrected above.
+
+One adjacent fix landed from the same profile:
+`MessageDigest.update(byte[], off, len)` was reading the array one element at a
+time through the collector's generic accessor; it now bulk-copies
+(1 519 ns → 315 ns for a 64-byte update), which is the `update` overload the
+codecs themselves use.
+
+---
+
+*Original text follows, unedited.*
+
 **Status: OPEN** (known cause, not a mystery — see "What's actually needed" below),
 characterised 2026-08-16/17 against `dev` `3ef3eb7441c73b2e40e061e20de2fc2622478eee`.
 Seen HANGing on generational, G1, **and** ZGC alike in today's full 657-class suite
@@ -20,7 +67,7 @@ io.netty.handler.codec.compression.ZstdIntegrationTest
 ```
 
 **This is one bug, not eleven**, and it is not new: it is the same wall
-`fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`
+[`netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`](../../fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md)
 already characterised for `BrotliIntegrationTest` alone, now confirmed to
 reproduce identically across every sibling class in the package because the
 hang lives in code all eleven inherit, not in anything codec-specific.
@@ -169,9 +216,9 @@ regression**.
 
 Nothing codec- or class-specific. The fix belongs entirely to the
 `ByteBuf`/interpreter↔JIT per-call-cost workstream, already tracked at
-`performance/netty-per-call-throughput-20260813.md`
+[`../../performance/netty-per-call-throughput-20260813.md`](../../performance/netty-per-call-throughput-20260813.md)
 (RETIRED, kept as a measurement record) and
-`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`.
+[`../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md).
 When a per-byte `ByteBuf` call chain inlines (or the JIT↔interpreter transition
 cost drops well below the current ~300-700 ns/entry), all eleven classes
 should clear `testHugeDecompress` together — there is no per-class work to do
@@ -203,6 +250,6 @@ printf '%s\n' \
 
 ## Related
 
-* `fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md` — the original per-class diagnosis (watchdog fix + throughput measurement), whose predicted outcome this doc confirms across the whole package.
-* `performance/netty-per-call-throughput-20260813.md` — retired, kept as the measurement record for the underlying `ByteBuf` per-call cost.
-* `performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` — the VM-wide per-call dispatch cost this belongs to.
+* [`netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`](../../fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md) — the original per-class diagnosis (watchdog fix + throughput measurement), whose predicted outcome this doc confirms across the whole package.
+* [`../../performance/netty-per-call-throughput-20260813.md`](../../performance/netty-per-call-throughput-20260813.md) — retired, kept as the measurement record for the underlying `ByteBuf` per-call cost.
+* [`../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md) — the VM-wide per-call dispatch cost this belongs to.
