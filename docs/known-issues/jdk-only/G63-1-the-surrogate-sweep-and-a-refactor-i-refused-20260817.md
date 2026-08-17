@@ -1,11 +1,22 @@
 # G63-1 — sweeping the hazard instead of the row, and a refactor I started and refused
 
-**Status:** MEASURED (defects) / FIXED-PENDING-BUILD (two of them). **Provenance:**
+**Status:** MEASURED throughout, fixes included (see the banner). **Provenance:**
 every row is MEASURED on both VMs. Oracle HotSpot 25.0.3+9-LTS; CratonVM
 `C:/craton/target-rel6` and `target-rel7` under `--jdk-only`. Probes:
 `scratchpad/g63/{SurrSweep,Decomp,Sweep2}.java`, ASCII labels only, every row
 printed as CHAR VALUES rather than text so the console code page cannot affect
 the comparison.
+
+> **MEASURED 2026-08-17 at `048dcb799`.** Both fixes are in a binary and the
+> arm is re-run: `RJdkBridge1` **170 checks, empty diff**, and the full
+> `--jdk-only` suite **99 of 99, 0 failed** with all seven new assertions
+> live.
+>
+> **`String.join` passed with no fix of its own**, which is what the row was
+> written to find out: it is unregistered, so it inherits `String.valueOf`,
+> and §2's "if it does not, the row will say so" resolved in favour of the
+> `valueOf` change carrying it. `StringJoiner` needs no separate work and N3
+> below is closed by measurement rather than by argument.
 
 ---
 
@@ -134,9 +145,10 @@ pass of its own — not a corner of someone else's.
 N1: `java.nio.CharBuffer` is not `native-collections`. Unowned and
 uninvestigated.
 
-**N3 — `String.join` has a vector row and no fix.** If the `valueOf` fix does
-not carry it, `StringJoiner` needs its own look; §1 measured
-`StringJoiner.toString()` losing the unit directly.
+**N3 — CLOSED by measurement.** `String.join` had a vector row and no fix, on
+the prediction that it would inherit `String.valueOf`. It did: green at
+`048dcb799`. Kept here rather than deleted, because a nomination that resolved
+without work is worth as much to the next reader as one that needed it.
 
 **N4 — the sweep is not finished.** 54 rows is two afternoons of surfaces, not
 a corpus. Untouched and known to be reachable: `Base64`, `URLEncoder`/`Decoder`,
