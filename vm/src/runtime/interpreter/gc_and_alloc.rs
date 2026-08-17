@@ -4734,12 +4734,28 @@ pub(crate) fn apply_pointer_map_to_thread(
     }
     // DIAGNOSTIC-ONLY (cceres3): mirror of the wake-time WAKE-STALE verifier;
     // catches a frame slot left stale right after a safepoint-arrival remap.
+    //
+    // THE PREDICATE IS THE POINTER MAP, NOT THE FORWARDING WORD (2026-08-17).
+    // `debug_forwarded_target` reads a forwarding word at the old address, and
+    // ZGC's slide leaves none — `compact_low_to` zeroes what it vacated and the
+    // memmove overwrites the rest — so on the DEFAULT collector this verifier
+    // reported zero whatever the truth was, which is how it stayed silent while
+    // the H2 MVStore-writer residual reproduced under it. `pointer_map` is the
+    // authoritative record of this collection's moves and is right here in
+    // hand.
+    //
+    // This is also the only EXACT place to ask the question. Every address-keyed
+    // instrument outside the pause cannot tell an old reference to the moved
+    // object from a new reference to whatever the allocator has since put at
+    // that address; here, the remap has just run and no mutator on this thread
+    // has resumed, so a frame slot holding a map KEY is unambiguously a slot the
+    // remap did not reach.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
         for (fi, fr) in thread.frames.iter().enumerate() {
             for li in 0..fr.locals_len() {
                 if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = heap.debug_forwarded_target(a) {
+                    if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -4751,7 +4767,7 @@ pub(crate) fn apply_pointer_map_to_thread(
             for si in 0..fr.stack.len() {
                 if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = heap.debug_forwarded_target(a) {
+                    if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
