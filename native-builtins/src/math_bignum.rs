@@ -3053,15 +3053,54 @@ fn native_bd_value_of_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(result?))))
 }
 
+/// `BigDecimal.valueOf(double)` --- specified as
+/// `new BigDecimal(Double.toString(val))`, so both halves of that sentence
+/// have to hold.
+///
+/// This used to render the double with Rust's `format!("{}", d)` and then take
+/// the scale from the position of the `.`. Rust's `Display` for `f64` is not
+/// `Double.toString`: it never uses E-notation and it prints `2.0` as `2`. So
+/// `valueOf(1e100)` produced a scale-0 integer with 101 digits instead of
+/// unscaled 10 at scale -99, and `valueOf(2.0)` lost the trailing zero (scale 0
+/// instead of 1). H2 renders a DOUBLE into JSON through
+/// `ValueDouble.getBigDecimal()` -> `BigDecimal.valueOf(double)` ->
+/// `BigDecimal.toString()`, which is why `CAST(1e100 AS JSON)` came back as 101
+/// literal digits (`datatypes/json.sql:46`, `:49`).
+///
+/// `format_double` is the shared `Double.toString` formatter, and the mantissa
+/// digits + exponent are turned straight into the exact `(unscaled, scale)`
+/// pair rather than going back through a decimal string --- `bd_alloc`'s
+/// string path has no E-notation handling and would strip significant trailing
+/// zeros for a negative scale.
 fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let d = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let s = format!("{}", d);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
+    let (unscaled, scale) = bd_parts_of_java_double_string(&crate::lang_string::format_double(d));
+    let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&unscaled), scale);
     Ok(Some(Value::Object(Some(result?))))
+}
+
+/// Split a `Double.toString`-shaped string into the `(unscaled digits, scale)`
+/// pair `new BigDecimal(String)` would produce.
+///
+/// `Double.toString` output is always `[-]<digit>.<digits>[E[-]<exp>]`, so the
+/// scale is "digits after the point, less the exponent" --- e.g. `1.0E100` ->
+/// (`10`, `1 - 100` = `-99`), `2.0` -> (`20`, `1`), `1.0E-7` -> (`10`, `8`).
+/// Non-finite doubles cannot reach here: `valueOf` on them throws inside the
+/// `Double.toString`-fed `BigDecimal(String)` parse, and H2 screens them out
+/// before the call.
+fn bd_parts_of_java_double_string(s: &str) -> (String, i32) {
+    let (mantissa, exp) = match s.find(['E', 'e']) {
+        Some(i) => (&s[..i], s[i + 1..].parse::<i32>().unwrap_or(0)),
+        None => (s, 0),
+    };
+    let frac_digits = match mantissa.find('.') {
+        Some(p) => (mantissa.len() - p - 1) as i32,
+        None => 0,
+    };
+    (mantissa.replace('.', ""), frac_digits - exp)
 }
 
 fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigint::BigInt, i32) {
