@@ -2454,7 +2454,7 @@ pub(crate) fn s2_legacy_dsa_tls_connect_on(
 /// the posture: the connector still pins a TLS 1.2 minimum of its own, so the
 /// SSLv3/TLS1.0 suites level 1 would otherwise readmit stay out.
 #[cfg(unix)]
-pub(crate) const CLIENT_SECURITY_LEVEL: i32 = 1;
+pub(crate) const CLIENT_SECURITY_LEVEL: u32 = 1;
 
 /// Everything `new13_build_connector` expresses through
 /// `native_tls::TlsConnectorBuilder`, restated for a raw
