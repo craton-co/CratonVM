@@ -18020,7 +18020,19 @@ fn afc_trace_enabled() -> bool {
 macro_rules! afc_trace {
     ($($arg:tt)*) => {
         if afc_trace_enabled() {
-            eprintln!("[dbg-afc] {}", format!($($arg)*));
+            // Millisecond stamp: the one question this family keeps asking is
+            // "how long did that take", and a bare line cannot answer it. The
+            // 2026-08-16 asynchronous-submit experiment turned on exactly this
+            // reading -- `close` entered and `close ... cancelled-pending-io`
+            // 58.5 s later.
+            eprintln!(
+                "[dbg-afc {}] {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() % 1_000_000)
+                    .unwrap_or(0),
+                format!($($arg)*)
+            );
         }
     };
 }
