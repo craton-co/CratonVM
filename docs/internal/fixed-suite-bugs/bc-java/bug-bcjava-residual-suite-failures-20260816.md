@@ -8,12 +8,13 @@ bc-java `AllTests` sweep on Azure host 2 went from
 | run | of the 24 classes CratonVM failed on 2026-08-16 |
 |---|---|
 | CratonVM, `dev` @3ef3eb744 (this page's starting point) | 6 PASS, 17 FAIL, 1 HANG |
-| **CratonVM, after the fixes below** | **16 PASS, 7 FAIL, 1 HANG** |
+| CratonVM, after the JCA fixes below | 16 PASS, 7 FAIL, 1 HANG |
+| **CratonVM, after the JIT exception fix as well** | **17 PASS, 6 FAIL, 1 HANG** |
 | HotSpot 25, same harness | 22 PASS, 2 FAIL |
 
 Newly passing: `cert.cmp`, `cert.crmf`, `cert.test`, `eac`, `i18n`, `its`,
-`mime`, `openssl`, `tsp` — plus `cms` from 121 failing methods to 1,
-`jcajce.provider` from 16 to 3, `pkcs` from 7 to 1.
+`mime`, `openssl`, `tsp`, `jce.provider.test.nist` — plus `cms` from 121 failing
+methods to 1, `jcajce.provider` from 16 to 2, `pkcs` from 7 to 1.
 
 `openssl` now passes on CratonVM where HotSpot 25 runs out of heap at `-Xmx 1g`
 inside `SCrypt.SMix`; that is not a CratonVM defect either way.
@@ -104,23 +105,29 @@ answers `US` where HotSpot answers `Vereinigte Staaten`,
 and month names are correct.
 
 ### Residual D — BouncyCastle core, no JCA involved — RE-HOMED
-`crypto.test`'s `CipherStreamTest` AEAD tamper check is **a JIT defect**, not a
-crypto one: with `CRATONVM_JIT_DENY=org/bouncycastle/crypto/io/CipherInputStream.nextChunk`
-the class passes, and so does `--nojit`. See
-`docs/known-issues/jit/bug-jit-compiled-body-loses-a-callee-thrown-exception-20260817.md`.
+`crypto.test`'s `CipherStreamTest` AEAD tamper check was **a JIT defect**, not a
+crypto one, and is FIXED — see the retired page
+`fixed-suite-bugs/jit/bug-jit-compiled-body-loses-a-callee-thrown-exception-20260817.md`.
+Fixing it exposed the NEXT entry in the same `SimpleTestTest` list, which had
+never been reached: `SymmetricConstraintsTest` fails with "no exception!" (on
+`--nojit` too, so not a JIT problem), and because it leaves a PROCESS-WIDE
+`CryptoServicesRegistrar` constraint set, all 14 `HPKETestVectors` cases after it
+fail with "service does not provide 192 bits of security". One defect, fifteen
+rows.
 
 `eac`'s `signature test failed` was Residual B and is fixed.
 
 ### Residual E — the four not looked at — FIXED or RE-HOMED
 * `cert.cmp`'s `CRMFException: cannot encode key` — Residual A, fixed.
-* `jce.provider.test.nist`'s CertPath message mismatches — **a JIT defect**.
-  Four of them (PKITS 4.3.3/4.3.4/4.3.5/4.3.11) really were a JCA bug:
+* `jce.provider.test.nist`'s CertPath message mismatches — **a JIT defect**, now
+  FIXED; the class passes all 286 vectors.
+  Four of them (PKITS 4.3.3/4.3.4/4.3.5/4.3.11) were a JCA bug instead:
   `X500Principal` answered the RFC 2253 string for all three name forms and
   compared THAT in `equals`, so two DNs differing only in attribute-name case or
   in runs of spaces were unequal and a CRL could not be matched to its issuer.
   That is fixed (canonical form, `hashCode` consistent with it, `toString` with
   the full keyword map). The remaining 35 are the JIT bug above, reproduced from
-  `ProvRevocationChecker.check`.
+  `ProvRevocationChecker.check`, and closed with it.
 * `jcajce.provider`'s `SignatureSetParameterTest` — fixed:
   `Signature.getParameters()` / `getParameter(String)` were unregistered and
   fell through to `SignatureSpi`'s `UnsupportedOperationException`.
@@ -133,14 +140,16 @@ the class passes, and so does `--nojit`. See
 
 | class | what is left | owner |
 |---|---|---|
-| `jce.provider.test.nist` | 35 of 286 | the JIT page above |
-| `crypto.test` | 1 (`CipherStreamTest`) | the JIT page above |
+| `crypto.test` | 1 real (`SymmetricConstraintsTest`: an expected `CryptoServiceConstraintsException` never raised) + the 14 `HPKETestVectors` it poisons | this page |
 | `cms` | 1 (`testKeyTransDESEDE3Short`) | this page |
 | `pkcs` | 1 (`testCreateAES256andSHA256`) | this page |
-| `jce.provider` | 1 (`AESTest`: GCM refuses no key+IV reuse on encrypt) | this page |
-| `jcajce.provider` | 3 (`GeneralKeyTest.testDstu4145`, `BouncyCastleProviderTest.testRegisteredClasses`, `SignatureSetParameterTest.testSetParameterMidUpdateStillRejected`) | this page |
+| `jce.provider` | 1 (`AESTest`: GCM does not refuse a repeated key+IV on encrypt) | this page |
+| `jcajce.provider` | 2 (`GeneralKeyTest.testDstu4145`, `SignatureSetParameterTest.testSetParameterMidUpdateStillRejected`) | this page |
 | `pkix` | 1 CratonVM-only (`IDPRelativeNameTest`, a multi-valued RDN) — the other 5 fail on HotSpot too | this page |
 | `pqc.jcajce.provider` | HANG | the PQC throughput page |
+
+`jce.provider.test.nist` and `CipherStreamTest` are gone from this table: both
+were the JIT defect, and both pass.
 
 ## How to reproduce
 ```bash
