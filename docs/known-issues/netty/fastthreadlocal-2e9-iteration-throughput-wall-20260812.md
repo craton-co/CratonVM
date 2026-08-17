@@ -51,6 +51,20 @@ The constructor dispatch is no longer the gap. **Allocation is**, and at
 ~110 ns/op it is ~236 s for this iteration count on its own — already past the
 netty suite's 180 s per-class wall before anything else is counted.
 
+## What the atomic is NOT
+
+Ruled out on 2026-08-17, from the other direction. The optimizing tier cannot
+emit a call-site intrinsic, so a constructor whose own body calls
+`AtomicInteger.getAndIncrement()` was paying ~120 ns for a 5.8 ns operation
+(`ctorAtomic` 351 -> 165 ns/op once routed to the single-pass backend; see the
+FIXED record). That is a real defect and it is fixed.
+
+**It is not this class's.** `FastThreadLocal.<init>` calls
+`invokestatic InternalThreadLocalMap.nextVariableIndex()I` — the atomic is one
+level deeper — so the constructor legitimately stays on the optimizing tier and
+the real loop is unmoved: interleaved, 279/213/197/204 ns/op before against
+279/260/209/221 after. Recorded here so the next reader does not re-derive it.
+
 ## Why allocation costs what it does
 
 Not because of the gating flags this page tested twice. `emit_inline_tlab_new`

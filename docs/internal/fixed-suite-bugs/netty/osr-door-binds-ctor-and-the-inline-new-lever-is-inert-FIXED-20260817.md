@@ -117,6 +117,73 @@ was. Shipping the real flags on a neutral measurement would be the mistake
 lever exists, is documented, and is off — ready for the day the bump is
 genuinely inline, which is the day it starts paying.
 
+## A third door problem, found while sizing the remainder: the IR tier cannot emit an intrinsic
+
+The shape breakdown after the constructor bind had one number that did not
+add up. On a quiet Windows host:
+
+```
+ctorAtomic   255.8 ns/op     ctorPlain 136.1     allocObject 98.4
+atomicOnly     5.8 ns/op
+```
+
+`ctorAtomic - ctorPlain = 120 ns` for replacing `i = ++staticInt` with
+`i = ATOMIC.getAndIncrement()` inside a constructor — while the *same call*
+in a bare loop is **5.8 ns**. The atomic intrinsic was measured green and was
+not being applied.
+
+`CRATONVM_DBG=intrinsic` named it in one run:
+
+```
+[cratonvm-intrinsic] IR body installed (single-pass call-site intrinsics NOT
+                     registered) CtorShapeRateProbe$CtorAtomic.<init>()V
+```
+
+**Only the single-pass backend can emit a call-site intrinsic.** The
+optimizing tier lowers every invoke it admits into a real call — a direct
+cross-call for a statically-bound site, a MIC/PIC cascade for a virtual one —
+so a method containing an intrinsic site gets *slower* by being optimized.
+Nothing in the pipeline notices: the matcher, the codegen ladder and 1991 unit
+tests all agree the intrinsic exists.
+
+Confirmed by A/B before writing any code —
+`CRATONVM_JIT_IR_CALL_VIRTUAL=0` (which pushes such methods off the IR tier
+wholesale) took `ctorAtomic` **509 -> 183 ns/op**, landing it *level with*
+`ctorPlain` at 189, which is the signature of `lock xadd` actually being
+emitted.
+
+Fixed by refusing the IR tier for a method that contains a call-site intrinsic,
+so it falls back to single-pass. Measured, interleaved, same binary
+(`CRATONVM_JIT_IR_OVER_INTRINSIC=1` as the off-arm):
+
+| | old | fixed |
+|---|---|---|
+| `ctorAtomic` | 351.3 ns/op | **165.0 ns/op** |
+| `ctorPlain` (control, no intrinsic) | 175.9 | 181.4 |
+| `atomicOnly` (control) | 6.7 | 7.5 |
+
+`ctorAtomic` now sits *below* `ctorPlain`, and
+`CTOR-SHAPE-DONE next=24000000 plain=12000000` matches HotSpot exactly, so
+nothing about the counted side effects moved.
+
+### Two traps this one carried
+
+**The refusal has to ask all THREE resolvers.** The first cut gated on
+`try_resolve_intrinsic` alone and measured *zero* — because `AtomicInteger`
+and `String` have their own resolvers (`try_resolve_atomic_intrinsic`,
+`try_resolve_string_intrinsic`), needing a field layout. So the gate missed
+precisely the family that motivated it. Only the engagement trace caught it:
+the body was still logging `IR body installed`.
+
+**And it does NOT help the class this investigation was about.**
+`FastThreadLocal.<init>` calls `invokestatic
+InternalThreadLocalMap.nextVariableIndex()I` — the atomic is one level deeper
+— so the constructor legitimately stays on the IR tier and the real loop is
+unmoved: interleaved, 279/213/197/204 ns/op before against 279/260/209/221
+after, i.e. noise on a loaded host. Kept because it is a real 2.1x on any
+constructor whose own body touches an atomic, and because `String` intrinsics
+were losing the same way; **not** counted toward the FastThreadLocal gap.
+
 ## Where the remaining time goes
 
 `perf record` on `probes/CtorOnly.java` (one loop, so a whole-process profile
