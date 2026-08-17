@@ -3210,7 +3210,7 @@ impl ZgcRealHeap {
         // and `alloc_raw` is the single allocation chokepoint.
         let arena_base = arena.base_ptr() as usize;
         let arena_end = arena_base.saturating_add(arena.capacity());
-        Self {
+        let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(
                 cratonvm_types::FIRST_LAYOUT_DOMAIN,
             ),
@@ -3277,6 +3277,10 @@ impl ZgcRealHeap {
             remembered: remembered::ZRememberedSetTable::new(),
             old_page_ids: Mutex::new(Vec::new()),
             relocation_enabled: AtomicBool::new(Self::relocation_requested_by_default()),
+            // NOTE: the arena's `prefer_bump` is seeded to match at the end of
+            // `with_capacity` -- it cannot be set here because the arena is being
+            // moved into this literal. `set_generational_enabled` keeps the two in
+            // step from then on.
             generational_enabled: AtomicBool::new(zgc_generational_enabled()),
             gen_promotion_age: std::sync::atomic::AtomicU32::new(zgc_gen_promotion_age()),
             gen_minors_per_major: AtomicUsize::new(zgc_gen_minors_per_major()),
@@ -3312,7 +3316,15 @@ impl ZgcRealHeap {
             // grepping `ZgcRealHeap {` across the workspace.
             tlabs: ZArenaTlabRegistry::for_capacity(cap),
             tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
+        };
+        // G2c: seed the arena's allocation policy to match the mode the flag just
+        // chose. `set_generational_enabled` keeps them in step afterwards; doing
+        // it here rather than inside the literal is only because the arena is
+        // being moved into it.
+        if heap.generational_enabled.load(Ordering::Relaxed) {
+            heap.arena.lock().set_prefer_bump(true);
         }
+        heap
     }
 
     // =====================================================================
@@ -5010,6 +5022,26 @@ impl ZgcRealHeap {
     /// them differently.
     pub fn set_generational_enabled(&self, on: bool) {
         self.generational_enabled.store(on, Ordering::Relaxed);
+        // ---- G2c: THE NURSERY HAS TO BE WHERE ALLOCATION GOES -------------
+        //
+        // `Arena::alloc` serves the free list before the bump cursor, and that is
+        // the right default -- after a sweep that could not move survivors, hole
+        // reuse is the only thing keeping the arena from ratcheting. It is the
+        // wrong default for a nursery: a young cycle's sweep is bounded below by
+        // `gen_young_floor`, so an object the free list places BELOW the floor is
+        // in the old region and no young cycle reclaims it. It waits for a major,
+        // which is precisely the cost G2a had to document.
+        //
+        // Bump-first closes that. It is a preference and not a wall -- see
+        // `Arena::prefer_bump` -- so it cannot turn a servable allocation into an
+        // OutOfMemoryError, only change which space serves it; and the holes below
+        // the floor are recovered by the same slide that promotes the nursery's
+        // survivors out.
+        //
+        // Set here rather than in the constructor so the flag and the arena
+        // cannot disagree: every path that turns the mode on or off, including a
+        // test, goes through this one method.
+        self.arena.lock().set_prefer_bump(on);
         if !on {
             self.reset_generational_state();
         }
@@ -15779,6 +15811,86 @@ pub(crate) mod tests {
                     "and the promoted graph survives"
                 );
             },
+        );
+    }
+
+    /// **G2c: with the nursery on, allocation after a collection lands ABOVE the
+    /// floor even when there are holes below it.**
+    ///
+    /// This is the gap G2a had to document as a cost: the free list hands out
+    /// space below the floor, so an object placed in a hole is in the old region
+    /// and no young cycle reclaims it. Bump-first closes it, and the assertion is
+    /// by ADDRESS against the floor — "the objects were reclaimed" would pass
+    /// either way once a major ran.
+    ///
+    /// The paired assertion is that the mode is what turns it on: the same
+    /// fixture with generational mode OFF must put objects in the holes, or this
+    /// test is measuring the allocator's mood rather than the policy.
+    #[test]
+    fn with_the_nursery_on_allocation_lands_above_the_floor() {
+        // ---- generational ON: bump-first, so nothing lands in a hole -------
+        let heap = gen_heap_for_test(16 * 1024 * 1024);
+        assert!(
+            heap.arena.lock().prefer_bump(),
+            "turning the mode on must reach the arena, or the nursery is only              wherever the cursor happened to be"
+        );
+        // Garbage first, so the sweep leaves holes low down.
+        let doomed: Vec<usize> = (0..2_000)
+            .map(|_| heap.alloc_object(ClassId::new(43), 3).as_ptr() as usize)
+            .collect();
+        let keep = heap.alloc_object(ClassId::new(2), 1);
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        let keep = roots[0];
+        assert!(
+            doomed.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "the fixture must have left holes"
+        );
+        let (_, floor, _) = heap.nursery_stats();
+        assert!(floor > heap.arena_base, "a floor was published");
+
+        let fresh: Vec<usize> = (0..500)
+            .map(|_| heap.alloc_object(ClassId::new(44), 3).as_ptr() as usize)
+            .collect();
+        let below = fresh.iter().filter(|a| **a < floor).count();
+        assert_eq!(
+            below, 0,
+            "{below} of 500 fresh objects landed BELOW the floor {floor:#x} -- each              one is in the old region and waits for a major"
+        );
+
+        // And a young cycle reclaims them, which is the point of putting them there.
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that was a minor");
+        assert!(
+            fresh.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "and a young cycle must reclaim what it placed in the nursery"
+        );
+
+        // ---- generational OFF: the default policy reuses the holes --------
+        let plain = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        plain.set_tlab_enabled(false);
+        plain.set_relocation_enabled(false);
+        plain.set_generational_enabled(false);
+        assert!(
+            !plain.arena.lock().prefer_bump(),
+            "the default policy must be unchanged with the mode off"
+        );
+        let doomed2: Vec<usize> = (0..2_000)
+            .map(|_| plain.alloc_object(ClassId::new(43), 3).as_ptr() as usize)
+            .collect();
+        let keep2 = plain.alloc_object(ClassId::new(2), 1);
+        let mut roots2 = [keep2];
+        let _ = gen_collect(&plain, &mut roots2);
+        let low_water = *doomed2.iter().min().expect("non-empty");
+        let high_water = *doomed2.iter().max().expect("non-empty");
+        let reused = (0..200)
+            .map(|_| plain.alloc_object(ClassId::new(44), 3).as_ptr() as usize)
+            .filter(|a| *a >= low_water && *a <= high_water)
+            .count();
+        assert!(
+            reused > 0,
+            "with the mode OFF the allocator must reuse the swept holes -- if it              does not, the ON assertion above proves nothing about the policy"
         );
     }
 

@@ -251,6 +251,40 @@ pub struct Arena {
     /// Blocks pushed since the last [`Arena::coalesce_free_list`], i.e. how
     /// much adjacency a merge could possibly have to collapse. Bumped by every
     /// push (`push_block_routed`), zeroed by the merge.
+    /// Serve from the BUMP cursor before the free list.
+    ///
+    /// # Why a collector would ask for this
+    ///
+    /// `alloc` checks the free list first, and the comment there says why: after
+    /// a sweep that could not move survivors the cursor may already be at the
+    /// high-water mark, so reusing holes is the only thing keeping the arena from
+    /// ratcheting. That is the right default and it stays the default.
+    ///
+    /// A generational collector needs the opposite, and only for its nursery.
+    /// ZGC's young cycle bounds its sweep below by the cursor the last whole-heap
+    /// collection ended on (`ZgcRealHeap::gen_young_floor`), so an object the free
+    /// list places BELOW that floor is inside the old region and no young cycle
+    /// will reclaim it — it waits for a major. Bump-first puts every new object
+    /// above the floor, which is what makes the nursery capture all of the
+    /// allocation it is supposed to.
+    ///
+    /// # It is a preference, not a wall — and that is what makes it safe
+    ///
+    /// This only skips the free-list FAST path. `alloc`'s post-bump retry
+    /// searches both tiers in full and then coalesces and searches again, so a
+    /// request the bump tail cannot serve still gets every hole in the arena.
+    /// Turning this on cannot turn a servable allocation into an
+    /// `OutOfMemoryError`; it can only change which space serves it. The holes
+    /// below the floor are recovered by the compacting slide, which is default-on
+    /// and is also what promotes the nursery's survivors out.
+    ///
+    /// `free_list_after_bump` counts the fall-throughs, so "the nursery is
+    /// leaking into the old region because the bump tail is exhausted" is a
+    /// number rather than an inference.
+    prefer_bump: bool,
+    /// Allocations that took the free list after the bump tail refused them,
+    /// while [`Self::prefer_bump`] was on.
+    free_list_after_bump: usize,
     free_pushed: usize,
     /// Downward bump cursor for the HIGH region: allocations enter at
     /// `capacity` and grow towards [`Self::cursor`]. `capacity` means the
@@ -549,6 +583,8 @@ impl Arena {
             free_bytes_total: 0,
             alloc_anchors: Vec::new(),
             anchor_shift: 0,
+            prefer_bump: false,
+            free_list_after_bump: 0,
             free_pushed: 0,
             coalesce_threshold: COALESCE_THRESHOLD_MIN,
             high_cursor: capacity,
@@ -946,7 +982,11 @@ impl Arena {
         // `total_needed >= size`; if even the (upper bound of the) largest
         // block is smaller than `size`, no block can satisfy the request —
         // skip the scans entirely and go straight to the bump path.
-        if !self.free_is_empty() && alloc_size <= self.max_free_upper {
+        //
+        // SKIPPED ENTIRELY under `prefer_bump` — see that field. The retry below
+        // the bump path is a strictly more thorough search, so skipping this
+        // cannot fail an allocation that would otherwise have succeeded.
+        if !self.prefer_bump && !self.free_is_empty() && alloc_size <= self.max_free_upper {
             let base = self.data.as_ptr() as usize;
             // Tier selection: a request whose worst-case need (size + max
             // alignment padding) reaches LARGE_BLOCK_MIN can never be served
@@ -1022,6 +1062,12 @@ impl Arena {
         if let Some((alloc_offset, remainders)) = hit {
             for r in remainders.into_iter().flatten() {
                 self.push_block_routed(r);
+            }
+            if self.prefer_bump {
+                // The nursery could not serve this and a hole below the floor
+                // did. Counted, because that object is now in the old region and
+                // no young cycle will reclaim it — see `prefer_bump`.
+                self.free_list_after_bump += 1;
             }
             // SAFETY: `alloc_offset + alloc_size` lies within the consumed
             // block, which came from a region inside the buffer.
@@ -1550,6 +1596,22 @@ impl Arena {
     /// epoch-gated cache below makes repeated calls between real changes
     /// O(1); the summation itself is unchanged (same tiers, same order),
     /// so a cache miss recomputes byte-identically to the old behavior.
+    /// Serve from the bump cursor before the free list — see [`Self::prefer_bump`].
+    pub fn set_prefer_bump(&mut self, on: bool) {
+        self.prefer_bump = on;
+    }
+
+    /// Is bump-first on?
+    pub fn prefer_bump(&self) -> bool {
+        self.prefer_bump
+    }
+
+    /// Allocations that fell through the bump tail to the free list while
+    /// bump-first was on — see [`Self::prefer_bump`].
+    pub fn free_list_after_bump(&self) -> usize {
+        self.free_list_after_bump
+    }
+
     pub fn free_list_bytes(&self) -> usize {
         self.free_bytes_total
     }
@@ -2145,6 +2207,108 @@ impl std::fmt::Debug for Arena {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod prefer_bump_tests {
+    use super::*;
+
+    /// **Bump-first must skip a hole the default policy would have taken.**
+    ///
+    /// This is the whole behavioural claim, and it is the one that makes a
+    /// generational nursery possible: an object placed in a hole BELOW the young
+    /// floor is in the old region and no young cycle reclaims it. Asserted by
+    /// address, against the same arena in both policies, because "it allocated
+    /// somewhere" is satisfied by either.
+    #[test]
+    fn bump_first_skips_a_hole_the_default_policy_takes() {
+        // Two identical arenas, one hole each, one request each.
+        let mut with_holes = |prefer_bump: bool| -> (usize, usize) {
+            let mut a = Arena::new(64 * 1024);
+            let base = a.base_ptr() as usize;
+            let first = a.alloc(256, 8).expect("first") as usize;
+            let _second = a.alloc(256, 8).expect("second") as usize;
+            let cursor_before = a.used();
+            // Free the FIRST block, making a hole below the cursor.
+            a.add_free_block(first - base, 256);
+            a.set_prefer_bump(prefer_bump);
+            let next = a.alloc(256, 8).expect("third") as usize;
+            (next - base, cursor_before)
+        };
+
+        let (default_off, hole_off) = with_holes(false);
+        assert_eq!(
+            default_off, 0,
+            "the DEFAULT policy must reuse the hole at offset 0 -- if it does not, \
+             this test is not comparing the two policies"
+        );
+
+        let (bump_off, cursor_before) = with_holes(true);
+        assert!(
+            bump_off >= cursor_before,
+            "bump-first must allocate at or above the cursor ({cursor_before}), not \
+             in the hole at 0 -- got {bump_off}. An object in that hole is below a \
+             generational nursery floor and waits for a major"
+        );
+        let _ = hole_off;
+    }
+
+    /// **Bump-first must NOT be able to cause an OutOfMemoryError.**
+    ///
+    /// It skips only the free-list FAST path; `alloc`'s post-bump retry searches
+    /// both tiers in full and then coalesces and searches again. So once the bump
+    /// tail is exhausted, every hole is still reachable. If that were not true,
+    /// turning the nursery on would turn a servable allocation into an OOM, which
+    /// is the one outcome a layout preference must never have -- on a
+    /// non-compacting heap the layout policy IS the OOM policy.
+    #[test]
+    fn bump_first_still_serves_from_the_free_list_once_the_tail_is_gone() {
+        let mut a = Arena::new(16 * 1024);
+        let base = a.base_ptr() as usize;
+        a.set_prefer_bump(true);
+
+        // Fill the arena by bumping until it refuses.
+        let mut blocks: Vec<usize> = Vec::new();
+        while let Some(p) = a.alloc(512, 8) {
+            blocks.push(p as usize - base);
+        }
+        assert!(blocks.len() > 8, "the fixture must fill the arena: {}", blocks.len());
+        assert!(
+            a.alloc(512, 8).is_none(),
+            "the arena is full, so this must refuse"
+        );
+        assert_eq!(
+            a.free_list_after_bump(),
+            0,
+            "nothing has fallen through yet"
+        );
+
+        // Free two blocks in the middle and ask again. The bump tail is gone, so
+        // only the free list can serve it.
+        a.add_free_block(blocks[3], 512);
+        a.add_free_block(blocks[4], 512);
+        let got = a
+            .alloc(512, 8)
+            .expect("bump-first must fall through to the free list, not OOM");
+        let off = got as usize - base;
+        assert!(
+            off == blocks[3] || off == blocks[4],
+            "it must come from one of the freed holes, got {off}"
+        );
+        assert_eq!(
+            a.free_list_after_bump(),
+            1,
+            "and the fall-through must be COUNTED -- otherwise 'the nursery is \
+             leaking into the old region' is an inference rather than a number"
+        );
+    }
+
+    /// **Off by default**, so no other collector's layout changes.
+    #[test]
+    fn bump_first_is_off_unless_asked_for() {
+        let a = Arena::new(4 * 1024);
+        assert!(!a.prefer_bump(), "the default policy must be unchanged");
+    }
+}
 
 #[cfg(test)]
 mod tests {
