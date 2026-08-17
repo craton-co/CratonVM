@@ -1115,6 +1115,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY` | JIT | `CRATONVM_JIT=dispatch-cache-direct-entry` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` | JIT | `CRATONVM_JIT=dispatch-cache-virtual-direct-entry` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_DUPX_EAGER_CANON` | JIT | `CRATONVM_JIT=dupx-eager-canon` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_EAGER_CALLEE_CHAIN` | JIT | `CRATONVM_JIT=eager-callee-chain` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS` | JIT | `CRATONVM_JIT=enable-callee-saved-gpr-locals` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_ENABLE_INLINE_NEW` | JIT | `CRATONVM_JIT=enable-inline-new` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_FIELD_SITE_CACHE` | JIT | `CRATONVM_JIT=field-site-cache` | opt-in | off | behaviour | snapshot | vm |

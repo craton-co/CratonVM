@@ -1776,7 +1776,21 @@ pub(super) fn compile_osr_artifact(
                 // RBC.2 — a backend bail here is just as permanent as one in
                 // `jit::try_compile`; record it so neither this OSR path nor
                 // the invocation-counter path re-runs the pipeline.
-                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                //
+                // Record the REASON as well, which this door never did.
+                // `jit::try_compile` records one, so `CRATONVM_DBG=jit-method-stats`
+                // can say WHY a permanently uncompilable method is stuck; an OSR
+                // bail reached the same table as `reason=unrecorded`. That is the
+                // bail that matters most — this door compiles a `@Test` method's
+                // hot loop, and a method denied here runs its whole life in the
+                // interpreter with no other diagnostic. See
+                // docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md,
+                // which took a six-arm shape bisect to find for exactly this reason.
+                crate::jit::mark_jit_bail_listed_with_site(
+                    &class_name,
+                    &method_name,
+                    &method_descriptor,
+                );
                 return None;
             };
             cm.compiled_via_osr = true;
@@ -4949,6 +4963,60 @@ pub(super) fn try_jit_compile_wrapped_entry(
 /// GC itself takes none of these during STW (it scans deposited root snapshots),
 /// so the worker's transient holds only matter via the mutator-stall path above.
 #[allow(clippy::type_complexity)]
+/// Deepest nested-compile stack at which the callee resolver will still compile a
+/// not-yet-compiled statically bound callee in order to bind it directly
+/// (`eager-callee-chain`).
+///
+/// Six levels covers the chains that matter in practice — a JUnit `assertEquals`
+/// reaches `AssertionUtils.objectsAreEqual` in three, a `java.nio` absolute
+/// accessor reaches its `ScopedMemoryAccess` leaf in three — while bounding the
+/// worst-case native stack use and the worst-case latency of one tier-up. Past the
+/// bound a site keeps the checked dispatch helper, which is always correct.
+const MAX_EAGER_CALLEE_CHAIN_DEPTH: usize = 6;
+
+/// Transitive callee compiles allowed per TOP-LEVEL compile.
+///
+/// The depth bound alone does not bound fan-out: a method with forty statically
+/// bound sites, each of whose callees has forty of its own, would turn one tier-up
+/// into thousands of compiles and a visible pause. This caps the total. It is
+/// deliberately generous — the chains this exists for are a handful of methods deep
+/// and a handful wide — so an ordinary method never reaches it.
+const MAX_EAGER_CALLEE_CHAIN_PER_COMPILE: u32 = 96;
+
+thread_local! {
+    /// Transitive callee compiles spent under the current top-level compile. Reset
+    /// by [`eager_callee_chain_enter_top_level`], which every entry to
+    /// [`try_jit_compile_callee_slow`] calls; only the entry that finds no compile
+    /// open on this thread actually clears it.
+    static EAGER_CALLEE_CHAIN_SPENT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Start a fresh `eager-callee-chain` budget if this is a top-level compile.
+///
+/// "Top level" is `jit_active_compile_depth() == 0`: the jit crate pushes its
+/// compile-stack entry inside `try_compile`, which this function has not called
+/// yet, so a nested (callee) entry always sees a non-zero depth here and keeps the
+/// outer budget.
+fn eager_callee_chain_enter_top_level() {
+    if cratonvm_jit::jit_active_compile_depth() == 0 {
+        EAGER_CALLEE_CHAIN_SPENT.with(|c| c.set(0));
+    }
+}
+
+/// Charge one transitive callee compile against the current budget. `false` means
+/// the budget is spent and the site must keep dispatch.
+fn eager_callee_chain_try_spend() -> bool {
+    EAGER_CALLEE_CHAIN_SPENT.with(|c| {
+        let spent = c.get();
+        if spent >= MAX_EAGER_CALLEE_CHAIN_PER_COMPILE {
+            false
+        } else {
+            c.set(spent + 1);
+            true
+        }
+    })
+}
+
 pub(super) fn try_jit_compile_callee_slow(
     shared: &SharedVm,
     class_name: &str,
@@ -4961,6 +5029,9 @@ pub(super) fn try_jit_compile_callee_slow(
     cache_negative: &mut bool,
     allow_synchronized_wrapped_entry: bool,
 ) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
+    // `eager-callee-chain`: a top-level compile starts with a fresh transitive
+    // callee-compile budget; a nested one inherits the outer compile's.
+    eager_callee_chain_enter_top_level();
     // RFJP.1 — never JIT a method whose declaring class transitively extends
     // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
     // miscompiles under deep recursion (returns 0 from depth ~10), and the
@@ -5557,14 +5628,86 @@ pub(super) fn try_jit_compile_callee_slow(
         let callee_class_arc: Arc<str> = Arc::from(callee_class);
         let callee_method_arc: Arc<str> = Arc::from(callee_method);
         let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
-        let jit_cache = shared.jit.jit_cache.read();
-        let Some(compiled) = jit_cache.get(
-            &callee_class_arc,
-            &callee_method_arc,
-            &callee_desc_arc,
-            callee_class_id,
-        ) else {
-            dc_no!("callee-not-yet-compiled");
+        // Probe in a scope so the read lock is RELEASED before the transitive
+        // compile below, which takes the same cache for writing.
+        let cached_body = {
+            let jit_cache = shared.jit.jit_cache.read();
+            jit_cache.get(
+                &callee_class_arc,
+                &callee_method_arc,
+                &callee_desc_arc,
+                callee_class_id,
+            )
+        };
+        // TRANSITIVE EAGER CALLEE COMPILE (`eager-callee-chain`).
+        //
+        // This resolver used to stop here with `callee-not-yet-compiled`, which
+        // made eager callee binding exactly ONE level deep: the mutator door's
+        // `callee_compiler` compiled a direct callee, but that callee was itself
+        // compiled through this function, whose resolver bound ITS statically bound
+        // sites to the generic `jit_invoke_dispatch` helper whenever they were not
+        // compiled yet — and a compiled body never re-binds. So the whole chain's
+        // speed depended on the ORDER the tiered manager happened to reach the
+        // methods in, permanently.
+        //
+        // Measured on `probes/org/junit/jupiter/api/CompileOrderProbe.java` (JUnit's
+        // `assertEquals` chain under a hot loop, real-JDK mode, G1): 478 ns/iter
+        // compiling top-down against 73 bottom-up, with `CRATONVM_DBG_MIC_PROF=1`
+        // reporting `disp_calls` 2 003 538 against 3 926 — one helper round trip per
+        // iteration, ~150 ns of it, at ONE site (`CRATONVM_DBG_MIC_TRACE=1` named it:
+        // `AssertEquals.assertEquals(Object,Object,String)`, reached from the
+        // two-argument overload that had been compiled first).
+        //
+        // Compiling the callee here makes the bind order-independent: whichever
+        // method the tiered manager reaches first, its statically bound callees are
+        // compiled before its body is emitted, so the site binds directly.
+        //
+        // Bounded three ways, because this recursion is unbounded in principle:
+        //  * DEPTH — `jit_active_compile_depth`; past the bound the site simply
+        //    keeps dispatch, which is always correct;
+        //  * CYCLES — `jit_active_compile_contains` declines a callee already open
+        //    on this thread's compile stack (the jit crate's own
+        //    `note_jit_recursive_compile_cycle` answers the same question for its
+        //    `callee_compiler`);
+        //  * FAN-OUT — a per-top-level-compile budget, so a method with many call
+        //    sites cannot turn one compile into a whole-program one.
+        //
+        // Every other refusal is unchanged: this arm is reached only when the callee
+        // passed all of the gates above and the ONLY thing missing was a compiled
+        // body.
+        let compiled = match cached_body {
+            Some(compiled) => compiled,
+            None => {
+                if !crate::runtime::env_cache::jit_eager_callee_chain() {
+                    dc_no!("callee-not-yet-compiled");
+                }
+                if cratonvm_jit::jit_active_compile_depth() > MAX_EAGER_CALLEE_CHAIN_DEPTH {
+                    dc_no!("eager-callee-chain-depth");
+                }
+                if cratonvm_jit::jit_active_compile_contains(
+                    callee_class,
+                    callee_method,
+                    callee_desc,
+                ) {
+                    dc_no!("eager-callee-chain-cycle");
+                }
+                if !eager_callee_chain_try_spend() {
+                    dc_no!("eager-callee-chain-budget");
+                }
+                // `optimize` is this compile's own backend selection, so a C1 body's
+                // callees are compiled at C1 and a C2 body's at C2 — the callee never
+                // arrives at a tier its caller was not compiled against.
+                let Some((body, _entry, _needs_ctx)) = try_jit_compile_callee(
+                    shared,
+                    callee_class,
+                    callee_method,
+                    callee_desc,
+                    optimize,
+                ) else {
+                    dc_no!("eager-callee-chain-compile-declined");
+                };
+                body
+            }
         };
         if compiled.has_indy_trap {
             dc_no!("indy-trap");
