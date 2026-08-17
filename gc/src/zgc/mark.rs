@@ -1402,6 +1402,49 @@ pub struct ZMarkTerminator {
     /// `Release` on store / `Acquire` on load so a reader that *does* observe
     /// `true` also observes everything the terminating worker did first.
     terminated_hint: AtomicBool,
+    /// Times a [`Self::wait_for_fixed_point`] wait expired instead of being
+    /// woken by the termination edge.
+    ///
+    /// # Why a counter and not a timing
+    ///
+    /// Every `wait_for` in this module is `wait_for` and never a bare `wait`,
+    /// because a lost notification must cost a poll interval rather than a hang
+    /// -- this codebase has a documented history of GC livelocks presenting as an
+    /// unexplained freeze. That insurance is invisible when it is *load-bearing*:
+    /// a wait that always times out behaves identically to one that is notified,
+    /// only `Z_MARK_PARK_POLL_MS` slower, and no assertion anywhere fires.
+    ///
+    /// So this counts the expiries. **Nonzero on a stop-the-world cycle means a
+    /// notification is missing**, and it is a count rather than a duration, so it
+    /// says so on a loaded host where a timing could not.
+    ///
+    /// It caught exactly that: the mark driver
+    /// (`ZgcConcurrentMarkController::await_fixed_point`) polled a *different*
+    /// condvar, on a 5 ms grid, which nothing ever notified -- so every pass of
+    /// every cycle waited out the full interval before noticing a mark that had
+    /// already finished.
+    park_timeouts: AtomicU64,
+    /// Times a [`Self::wait_for_fixed_point`] wait was released by a
+    /// notification **and found the cycle terminated** — i.e. the termination
+    /// edge itself woke the waiter.
+    ///
+    /// # Why not just count notified wakes
+    ///
+    /// The driver and the workers wait on the same condvar, and `notify_all` is
+    /// also called when a worker publishes work (`work_generation`) and when a
+    /// cycle is armed. A plain "was it notified?" counter would therefore be
+    /// incremented by traffic that has nothing to do with the fixed point, and
+    /// would stay nonzero even with the termination notify removed. Requiring
+    /// `terminated` to be true on wake is what makes this specific.
+    ///
+    /// # Why `park_timeouts == 0` was not a sufficient assertion
+    ///
+    /// It is satisfied by a wait that was never entered, which is exactly what a
+    /// fast mark produces: the driver arrives after the workers have already
+    /// converged, takes the `is_terminated` fast path, and waits zero times. The
+    /// test therefore has to make the mark slow enough that the wait is certain,
+    /// and then assert on THIS — a probe that cannot fail is not a probe.
+    park_termination_wakes: AtomicU64,
 }
 
 impl ZMarkTerminator {
@@ -1417,6 +1460,8 @@ impl ZMarkTerminator {
             }),
             wake: Condvar::new(),
             terminated_hint: AtomicBool::new(true),
+            park_timeouts: AtomicU64::new(0),
+            park_termination_wakes: AtomicU64::new(0),
         }
     }
 
@@ -1616,9 +1661,48 @@ impl ZMarkTerminator {
             if should_stop.load(Ordering::Acquire) || g.terminated {
                 return;
             }
-            self.wake
-                .wait_for(&mut g, Duration::from_millis(Z_MARK_PARK_POLL_MS));
+            let timed_out = self
+                .wake
+                .wait_for(&mut g, Duration::from_millis(Z_MARK_PARK_POLL_MS))
+                .timed_out();
+            if timed_out {
+                // See `park_timeouts`: the timeout is insurance against a lost
+                // notification, and insurance that is load-bearing is
+                // indistinguishable from a working notification except in speed.
+                self.park_timeouts.fetch_add(1, Ordering::Relaxed);
+            } else if g.terminated {
+                // Woken by the termination edge itself -- `g` is re-locked here,
+                // so this is the current state and not a guess. See
+                // `park_termination_wakes` for why "notified" alone is too weak.
+                self.park_termination_wakes.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Waits this terminator's [`Self::wait_for_fixed_point`] has served by
+    /// TIMING OUT rather than by being woken. See the field.
+    pub fn park_timeouts(&self) -> u64 {
+        self.park_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Waits released by the termination edge itself. See the field.
+    pub fn park_termination_wakes(&self) -> u64 {
+        self.park_termination_wakes.load(Ordering::Relaxed)
+    }
+
+    /// Wake everything blocked on this terminator, changing no state.
+    ///
+    /// For a caller that has just set a stop flag of its own and needs a waiter
+    /// parked in [`Self::wait_for_fixed_point`] to observe it now rather than at
+    /// the next poll interval. Spurious wakes are always safe here: every waiter
+    /// re-checks its predicate under the lock in a loop.
+    ///
+    /// Deliberately NOT [`Self::note_work_published`], which is the other way to
+    /// reach this condvar: that bumps `work_generation` and therefore resumes
+    /// idle workers, which is precisely wrong for a stop.
+    pub fn wake_blocked_waiters(&self) {
+        let _g = self.state.lock();
+        self.wake.notify_all();
     }
 
     /// Non-blocking read of the fixed-point flag. Lags; diagnostics only.

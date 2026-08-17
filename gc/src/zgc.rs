@@ -2886,6 +2886,18 @@ pub struct ZgcRealHeap {
     /// Reported beside the budget it is measured against, because "17 MB over" is
     /// meaningless without it.
     gen_nursery_overshoot_max: AtomicUsize,
+    /// Fixed-point waits the mark driver served by TIMING OUT rather than by
+    /// being woken, summed across every cycle — see
+    /// [`mark::ZMarkTerminator::park_timeouts`].
+    ///
+    /// The production reader for that counter. It is here rather than only in a
+    /// test because the failure it detects is a *slowdown*: a driver whose wait
+    /// is never notified behaves identically to one whose wait is, only
+    /// `Z_MARK_PARK_POLL_MS` slower per pass, and it took months to notice. A
+    /// nonzero here on a stop-the-world run means a notification is missing
+    /// again, and it is a count — so it says so on a loaded host, where a per-cycle
+    /// timing could not.
+    mark_park_timeouts: AtomicUsize,
     /// Survivors a relocating cycle promoted by moving them below the nursery
     /// floor, cumulative.
     ///
@@ -3361,6 +3373,7 @@ impl ZgcRealHeap {
             gen_nursery_watermark: AtomicUsize::new(0),
             gen_nursery_triggered: AtomicBool::new(false),
             gen_nursery_triggers: AtomicUsize::new(0),
+            mark_park_timeouts: AtomicUsize::new(0),
             gen_nursery_overshoot_max: AtomicUsize::new(0),
             gen_header_zero_only: AtomicBool::new(zgc_gen_header_zero()),
             gen_dead_runs_enabled: AtomicBool::new(zgc_gen_dead_runs()),
@@ -4073,6 +4086,13 @@ impl ZgcRealHeap {
         self.tlab_retire_skipped_total.load(Ordering::Relaxed)
     }
 
+    /// Mark-driver fixed-point waits that expired instead of being woken. See
+    /// [`Self::mark_park_timeouts`]; nonzero on a stop-the-world run means a
+    /// notification is missing.
+    pub fn mark_park_timeouts(&self) -> usize {
+        self.mark_park_timeouts.load(Ordering::Relaxed)
+    }
+
     pub fn driver_engagement(&self) -> (usize, usize) {
         (
             self.driver_passes.load(Ordering::Relaxed),
@@ -4612,6 +4632,13 @@ impl ZgcRealHeap {
             }
         };
         let stats = coordinator.stats().snapshot();
+        // BEFORE `end_cycle`, and before the coordinator is dropped a few lines
+        // below: this is the only point at which the terminator is still
+        // reachable. See `mark_park_timeouts`.
+        self.mark_park_timeouts.fetch_add(
+            coordinator.shared().terminator().park_timeouts() as usize,
+            Ordering::Relaxed,
+        );
         coordinator.end_cycle();
         self.driver_passes
             .fetch_add(outcome.passes, Ordering::Relaxed);
