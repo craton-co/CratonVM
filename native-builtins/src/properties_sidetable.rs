@@ -25,7 +25,9 @@
 //! The fix: a side-table keyed by the Properties object's pointer
 //! identity, with native overrides for the public API surface used by
 //! `Properties.load`/`getProperty`/`setProperty`.  The side-table is
-//! a `Mutex<FxHashMap<usize, FxHashMap<String, String>>>`; both layers
+//! a `Mutex<FxHashMap<usize, IndexMap<JavaText, JavaText>>>` — see
+//! [`JavaText`] for why the inner text is UTF-16 units and not `String`;
+//! both layers
 //! are bounded by `MAX_PROPS_PER_OBJECT` and `MAX_TOTAL_OBJECTS` to
 //! prevent unbounded memory growth from misbehaving callers.
 //!
@@ -115,7 +117,115 @@ macro_rules! props_diag_eprintln {
 /// singleton, surefire's `store_property_in_sidetable` path);
 /// [`ordered_snapshot_kv`] layers the JDK's actual order on top whenever there
 /// IS such a backing.
-type PropsMap = indexmap::IndexMap<String, String, BuildHasherDefault<FxHasher>>;
+/// The stored form of a `Properties` key or value: raw UTF-16 code units.
+///
+/// # Why not `String`
+///
+/// A Rust `str` cannot hold an *unpaired* surrogate, and `Properties` text is
+/// arbitrary Java `String` content, which can. Storing `String` here meant two
+/// distinct defects, both MEASURED against HotSpot 25 (see
+/// `G55-1-the-key-the-map-could-not-find-again-20260817.md`):
+///
+///   * every read-back — `getProperty`, `get`, `keySet`, `propertyNames`,
+///     `elements`, `stringPropertyNames`, `store`, the `defaults` chain —
+///     substituted `U+FFFD` for the surrogate, so the value came back visibly
+///     wrong; and
+///   * two *distinct* keys that differ only in which unpaired surrogate they
+///     carry both collapsed to the same `U+FFFD` text, so the second
+///     `setProperty` silently overwrote the first and `size()` answered 1 for
+///     two keys. That one is worse: it is a lookup that cannot fail loudly.
+///
+/// Ordering and equality are by code unit, which is what Java's
+/// `String.equals`/`compareTo`/`hashCode` use, so a derived `Ord`/`Eq`/`Hash`
+/// is exactly the Java contract — unlike `String`'s, which orders by code
+/// *point* and therefore sorts a supplementary character after `U+FFFF`
+/// where Java sorts it before.
+///
+/// [`JavaText::to_lossy`] is the deliberate one-way door back to Rust text,
+/// for the places whose destination genuinely is a Rust `&str` (diagnostics,
+/// `System.setProperty`, the cross-module `&str` API below). It is never on
+/// the path back to a Java `String` — that is [`create_property_string`].
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub(crate) struct JavaText(Vec<u16>);
+
+impl JavaText {
+    fn from_units(units: Vec<u16>) -> Self {
+        JavaText(units)
+    }
+
+    fn units(&self) -> &[u16] {
+        &self.0
+    }
+
+    /// Number of UTF-16 code units — the same number `String.length()` answers,
+    /// which is what `MAX_KV_LEN` and the `Properties` size caps mean to Java.
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Rust text for this content, with any unpaired surrogate replaced by
+    /// `U+FFFD`. Lossy BY CONSTRUCTION — call it only where the destination is
+    /// Rust text and never where it is a Java `String`.
+    fn to_lossy(&self) -> String {
+        String::from_utf16_lossy(&self.0)
+    }
+}
+
+impl From<&str> for JavaText {
+    fn from(s: &str) -> Self {
+        JavaText(s.encode_utf16().collect())
+    }
+}
+
+/// Read a Java `String` receiver as code units, or `None` when `obj` is not a
+/// `String` at all.
+///
+/// The guard is the TYPE TEST and nothing else — it decides "is this a
+/// `java.lang.String`", which is exactly the question every caller below used
+/// to put to `ctx.read_string`. The units then come from
+/// `lang_string::read_string_chars`, this crate's units-preserving reader,
+/// which duck-types any object with an array in slot 0 and so cannot be the
+/// guard itself. There is deliberately no third spelling of a String decode.
+///
+/// `java_string_hash_code` is consulted as a second opinion because it is
+/// answered VM-side from the receiver's class identity, so it recognises a
+/// `String` whose content a `str`-returning reader has to refuse. On the VM
+/// `read_string` is lossy rather than refusing, so this pair accepts exactly
+/// what the old `ctx.read_string(...)` call accepted and nothing more.
+fn read_java_text(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<JavaText> {
+    if ctx.read_string(obj).is_none() && ctx.java_string_hash_code(obj).is_none() {
+        return None;
+    }
+    Some(JavaText::from_units(crate::lang_string::read_string_chars(
+        ctx, obj,
+    )))
+}
+
+/// Materialise `text` as a Java `String`.
+///
+/// Well-formed content takes the *unchanged* `create_string` path — same
+/// interning, same object identity behaviour every green `Properties` vector
+/// already measured. Only content a `&str` cannot carry goes the long way
+/// round, through `lang_string::sb_string_from_units` (`new_object` +
+/// `NativeContext::init_string_from_units`), which is the crate's one
+/// units-preserving String constructor.
+fn create_property_string(ctx: &mut dyn NativeContext, text: &JavaText) -> ObjectRef {
+    if !crate::lang_string::has_unpaired_surrogate(text.units()) {
+        return ctx.create_string(&text.to_lossy());
+    }
+    match crate::lang_string::sb_string_from_units(ctx, text.units()) {
+        Ok(obj) => obj,
+        // Only reachable on heap exhaustion. A lossy String beats handing a
+        // null out of a String-typed method.
+        Err(_) => ctx.create_string(&text.to_lossy()),
+    }
+}
+
+type PropsMap = indexmap::IndexMap<JavaText, JavaText, BuildHasherDefault<FxHasher>>;
 
 fn table() -> &'static Mutex<FxHashMap<usize, PropsMap>> {
     static T: OnceLock<Mutex<FxHashMap<usize, PropsMap>>> = OnceLock::new();
@@ -578,32 +688,32 @@ fn drain_input_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<
 /// The parser is intentionally permissive: malformed escapes degrade
 /// to literal characters rather than panicking, and keys without
 /// values yield empty-string values (matching JDK behaviour).
-fn parse_properties(bytes: &[u8]) -> Vec<(String, String)> {
+fn parse_properties(bytes: &[u8]) -> Vec<(JavaText, JavaText)> {
     // Decode as ISO-8859-1 (Java spec for `Properties.load(InputStream)`).
     // Each byte maps to one Unicode code point in 0..=255.
     let raw: String = bytes.iter().map(|&b| b as char).collect();
     parse_properties_text(&raw)
 }
 
-fn parse_properties_strict(bytes: &[u8]) -> Result<Vec<(String, String)>, ()> {
+fn parse_properties_strict(bytes: &[u8]) -> Result<Vec<(JavaText, JavaText)>, ()> {
     // Decode as ISO-8859-1 (Java spec for `Properties.load(InputStream)`).
     // Each byte maps to one Unicode code point in 0..=255.
     let raw: String = bytes.iter().map(|&b| b as char).collect();
     parse_properties_text_strict(&raw)
 }
 
-fn parse_properties_text(raw: &str) -> Vec<(String, String)> {
+fn parse_properties_text(raw: &str) -> Vec<(JavaText, JavaText)> {
     parse_properties_text_inner(raw, false).unwrap_or_default()
 }
 
-fn parse_properties_text_strict(raw: &str) -> Result<Vec<(String, String)>, ()> {
+fn parse_properties_text_strict(raw: &str) -> Result<Vec<(JavaText, JavaText)>, ()> {
     parse_properties_text_inner(raw, true)
 }
 
 fn parse_properties_text_inner(
     raw: &str,
     strict_unicode: bool,
-) -> Result<Vec<(String, String)>, ()> {
+) -> Result<Vec<(JavaText, JavaText)>, ()> {
     let mut out = Vec::new();
     let mut iter = raw.split('\n').peekable();
     let mut continued = String::new();
@@ -705,51 +815,55 @@ fn split_key_value(line: &str) -> (String, String) {
 }
 
 /// Decode Java `.properties` escapes (`\n`, `\t`, `\r`, `\f`, `\\`, `\"`,
-/// `\'`, `\<space>`, `\:`, `\=`, `\uXXXX`).  Unknown escapes degrade
-/// to literal characters.
+/// `\'`, `\<space>`, `\:`, `\=`, `\uXXXX`) to Rust text. Unknown escapes
+/// degrade to literal characters.
 ///
-/// Surrogate handling matches `java.util.Properties.load` as closely as a
-/// `String`-returning helper can:
-///   * A high `\uD800..\uDBFF` immediately followed by a low `\uDC00..\uDFFF`
-///     is combined into the supplementary code point it encodes (the prior
-///     implementation dropped both halves, losing every emoji / CJK-ext char).
-///   * A malformed `\u` (zero or fewer-than-four hex digits) is handled
-///     loudly (warn + best-effort decode of the digits present), not silently
-///     tolerated, mirroring the JDK's "Malformed \\uxxxx encoding" error.
-///
-/// LIMITATION / CROSS-FILE FOLLOW-UP: a *lone* surrogate `\uXXXX` (a high or
-/// low half with no matching pair) is a valid single UTF-16 code unit that a
-/// Rust `String` cannot represent. Exact preservation requires storing the
-/// value as `[u16]` units and materialising the Java string via
-/// `vm::vm_object::create_java_string_from_units` (the "wide-unit path", cf.
-/// the SB-13 GroovyLexer fix). That path is not reachable from this
-/// `String`-typed pipeline (`put_kv`/`get_kv` store `String`, and
-/// `NativeContext::create_string` re-`encode_utf16`s its `&str`), so we
-/// substitute U+FFFD and warn rather than silently dropping the unit. Wiring a
-/// units-aware value channel through the side-table is a separate change.
+/// Lossy form of [`unescape_inner`], for the callers whose destination really
+/// is Rust text: this file's own escape-grammar tests and any diagnostic. An
+/// *unpaired* `\uXXXX` surrogate reads back here as U+FFFD BY CONSTRUCTION.
+/// The `Properties.load` natives do NOT come through here — they take
+/// `unescape_inner`'s units and keep the unit exactly as the file wrote it.
+/// The former "LIMITATION / CROSS-FILE FOLLOW-UP" note that stood here (a
+/// lone surrogate cannot survive a `String`-typed pipeline) is discharged:
+/// the side-table stores [`JavaText`], not `String`.
 fn unescape(s: &str) -> String {
-    unescape_inner(s, false).unwrap_or_default()
+    unescape_inner(s, false).unwrap_or_default().to_lossy()
 }
 
-fn unescape_inner(s: &str, strict_unicode: bool) -> Result<String, ()> {
-    let mut out = String::with_capacity(s.len());
+/// Decode one logical `.properties` field into UTF-16 code units.
+///
+/// Each `\uXXXX` contributes exactly ONE code unit, which is what the JDK's
+/// `Properties.loadConvert` does: it appends the parsed `char` and never looks
+/// at the next escape. The previous version had to greedily pair a high escape
+/// with the low one after it and fold the two into a single Rust `char`,
+/// because a `String` was the only thing it could return — and a `\uD800` with
+/// no partner then had nowhere to go and became U+FFFD. Emitting units deletes
+/// both the pairing special case and the loss: a well-formed pair is two units
+/// that re-encode to the same supplementary character, and an unpaired half is
+/// simply the unit the file asked for.
+fn unescape_inner(s: &str, strict_unicode: bool) -> Result<JavaText, ()> {
+    fn push_char(out: &mut Vec<u16>, c: char) {
+        let mut buf = [0u16; 2];
+        out.extend_from_slice(c.encode_utf16(&mut buf));
+    }
+    let mut out: Vec<u16> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            push_char(&mut out, c);
             continue;
         }
         match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('f') => out.push('\u{000c}'),
-            Some('\\') => out.push('\\'),
-            Some('"') => out.push('"'),
-            Some('\'') => out.push('\''),
-            Some(' ') => out.push(' '),
-            Some(':') => out.push(':'),
-            Some('=') => out.push('='),
+            Some('n') => out.push(b'\n' as u16),
+            Some('t') => out.push(b'\t' as u16),
+            Some('r') => out.push(b'\r' as u16),
+            Some('f') => out.push(0x000c),
+            Some('\\') => out.push(b'\\' as u16),
+            Some('"') => out.push(b'"' as u16),
+            Some('\'') => out.push(b'\'' as u16),
+            Some(' ') => out.push(b' ' as u16),
+            Some(':') => out.push(b':' as u16),
+            Some('=') => out.push(b'=' as u16),
             Some('u') => {
                 // `\uXXXX` — a single UTF-16 code unit. Read the hex digits.
                 let (code, seen) = read_u_escape(&mut chars);
@@ -767,7 +881,7 @@ fn unescape_inner(s: &str, strict_unicode: bool) -> Result<String, ()> {
                         "Malformed \\u escape in .properties value (no hex digits); \
                          preserving 'u' literally"
                     );
-                    out.push('u');
+                    out.push(b'u' as u16);
                     continue;
                 }
                 if seen < 4 {
@@ -784,56 +898,15 @@ fn unescape_inner(s: &str, strict_unicode: bool) -> Result<String, ()> {
                          decoding the hex digits present"
                     );
                 }
-                if (0xD800..=0xDBFF).contains(&code) {
-                    // High surrogate. A valid supplementary code point is
-                    // written in .properties as TWO escapes: a high surrogate
-                    // immediately followed by `\uDC00..\uDFFF`. Combine them
-                    // into one Rust `char` (the previous code dropped BOTH
-                    // halves because each lone half failed `char::from_u32`).
-                    if let Some(low) = peek_low_surrogate(&mut chars) {
-                        let cp = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
-                        if let Some(ch) = char::from_u32(cp) {
-                            out.push(ch);
-                            continue;
-                        }
-                    }
-                    // Lone high surrogate (no matching low half). A Rust
-                    // `String` cannot hold an unpaired UTF-16 surrogate, so
-                    // we cannot preserve it here without the wide-unit path
-                    // (`create_java_string_from_units`, in vm/vm_object.rs)
-                    // which this `String`-returning function can't reach.
-                    // Substitute U+FFFD rather than silently dropping the
-                    // unit. See CROSS-FILE note in the header doc.
-                    tracing::warn!(
-                        target: "cratonvm_vm::props_sidetable",
-                        unit = ?code,
-                        "Lone high surrogate (\\uXXXX) in .properties value; \
-                         cannot be stored as a Rust String — substituting \
-                         U+FFFD (wide-unit storage needed for exact \
-                         preservation)"
-                    );
-                    out.push('\u{FFFD}');
-                } else if (0xDC00..=0xDFFF).contains(&code) {
-                    // Lone low surrogate (no preceding high half). Same
-                    // limitation as the lone-high case above.
-                    tracing::warn!(
-                        target: "cratonvm_vm::props_sidetable",
-                        unit = ?code,
-                        "Lone low surrogate (\\uXXXX) in .properties value; \
-                         cannot be stored as a Rust String — substituting \
-                         U+FFFD (wide-unit storage needed for exact \
-                         preservation)"
-                    );
-                    out.push('\u{FFFD}');
-                } else if let Some(ch) = char::from_u32(code) {
-                    out.push(ch);
-                }
+                // `read_u_escape` reads at most four hex digits, so `code` is
+                // always one code unit and this cast cannot truncate.
+                out.push(code as u16);
             }
-            Some(other) => out.push(other),
+            Some(other) => push_char(&mut out, other),
             None => break,
         }
     }
-    Ok(out)
+    Ok(JavaText::from_units(out))
 }
 
 /// Consume the hex digits of a `\uXXXX` escape (the `\u` prefix has already
@@ -860,38 +933,6 @@ fn read_u_escape<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) -
     (code, seen)
 }
 
-/// If the next two characters are a `\uXXXX` escape whose value is a low
-/// surrogate (`0xDC00..=0xDFFF`), consume them and return that code unit;
-/// otherwise leave the iterator untouched and return `None`.
-///
-/// Used to greedily pair a high surrogate with its trailing low surrogate so
-/// supplementary code points (emoji, CJK-ext, …) round-trip through the
-/// `String`-typed pipeline. We require the full 4-hex-digit form: a short
-/// `\uDC` after a high surrogate is itself malformed and is left for the main
-/// loop to report.
-fn peek_low_surrogate<I>(chars: &mut std::iter::Peekable<I>) -> Option<u32>
-where
-    I: Iterator<Item = char> + Clone,
-{
-    // Speculatively clone the cursor so a non-matching lookahead costs us
-    // nothing — we only advance the real iterator on a confirmed low
-    // surrogate. `Peekable<Chars>` is `Clone` (chars over a &str slice).
-    let mut probe = chars.clone();
-    if probe.next() != Some('\\') || probe.next() != Some('u') {
-        return None;
-    }
-    let (code, seen) = read_u_escape(&mut probe);
-    if seen == 4 && (0xDC00..=0xDFFF).contains(&code) {
-        // Commit: fast-forward the real iterator past `\uXXXX` (6 chars).
-        for _ in 0..6 {
-            chars.next();
-        }
-        Some(code)
-    } else {
-        None
-    }
-}
-
 /// Insert (or overwrite) a key/value pair in the side-table for a
 /// given Properties object.  Enforces per-object and global caps.
 ///
@@ -901,7 +942,17 @@ where
 /// give truly-dead entries a chance to be discovered before falling back to
 /// the (now extremely rare) old silent-drop behavior. See
 /// `register_weak_track` / `drain_reclaimed` above.
+/// Rust-text adapter for [`put_kv_units`].
+///
+/// Kept for the callers whose key/value genuinely IS Rust text — the
+/// cross-module `&str` API, `System.setProperty` mirroring, diagnostics. A
+/// caller that started from a Java `String` must NOT come through here: the
+/// `&str` it holds has already lost any unpaired surrogate.
 fn put_kv(ctx: &mut dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
+    put_kv_units(ctx, obj, &JavaText::from(key), &JavaText::from(value));
+}
+
+fn put_kv_units(ctx: &mut dyn NativeContext, obj: ObjectRef, key: &JavaText, value: &JavaText) {
     if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
         return;
     }
@@ -937,7 +988,8 @@ fn put_kv(ctx: &mut dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
         // configuration file disappears with no error anywhere -- make it
         // visible under CRATONVM_DIAG_PROPERTIES at least.
         props_diag_eprintln!(
-            "[PROPS-DBG] put_kv DROPPED key={key} — side-table at capacity ({} objects)",
+            "[PROPS-DBG] put_kv DROPPED key={} — side-table at capacity ({} objects)",
+            key.to_lossy(),
             table().lock().len()
         );
         ctx.unpin_native_roots(obj_pin);
@@ -948,7 +1000,7 @@ fn put_kv(ctx: &mut dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
         let is_new = !t.contains_key(&k);
         let entry = t.entry(k).or_default();
         if entry.len() < MAX_PROPS_PER_OBJECT || entry.contains_key(key) {
-            entry.insert(key.to_string(), value.to_string());
+            entry.insert(key.clone(), value.clone());
         }
         is_new
     };
@@ -961,6 +1013,10 @@ fn put_kv(ctx: &mut dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
 /// Look up a key in the side-table.  Returns `None` if either the
 /// object isn't tracked or the key is absent.
 fn get_kv(ctx: &dyn NativeContext, obj: ObjectRef, key: &str) -> Option<String> {
+    get_kv_units(ctx, obj, &JavaText::from(key)).map(|v| v.to_lossy())
+}
+
+fn get_kv_units(ctx: &dyn NativeContext, obj: ObjectRef, key: &JavaText) -> Option<JavaText> {
     let k = key_for(ctx, obj);
     table().lock().get(&k)?.get(key).cloned()
 }
@@ -970,6 +1026,10 @@ fn get_kv(ctx: &dyn NativeContext, obj: ObjectRef, key: &str) -> Option<String> 
 /// was absent.  Used by `native_properties_remove` to back the JDK
 /// `Properties.remove(Object) Object` semantics.
 fn remove_kv(ctx: &dyn NativeContext, obj: ObjectRef, key: &str) -> Option<String> {
+    remove_kv_units(ctx, obj, &JavaText::from(key)).map(|v| v.to_lossy())
+}
+
+fn remove_kv_units(ctx: &dyn NativeContext, obj: ObjectRef, key: &JavaText) -> Option<JavaText> {
     let k = key_for(ctx, obj);
     let mut t = table().lock();
     let entry = t.get_mut(&k)?;
@@ -1035,7 +1095,7 @@ pub fn replace_sidetable(ctx: &dyn NativeContext, obj: ObjectRef, entries: &[(St
         if m.len() >= MAX_PROPS_PER_OBJECT {
             break;
         }
-        m.insert(key.clone(), value.clone());
+        m.insert(JavaText::from(key.as_str()), JavaText::from(value.as_str()));
     }
     table().lock().insert(k, m);
 }
@@ -1045,6 +1105,9 @@ pub fn replace_sidetable(ctx: &dyn NativeContext, obj: ObjectRef, entries: &[(St
 /// going through the inner Map field.
 pub fn snapshot_sidetable(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(String, String)> {
     snapshot_kv(ctx, obj)
+        .into_iter()
+        .map(|(k, v)| (k.to_lossy(), v.to_lossy()))
+        .collect()
 }
 
 /// Public re-export of `drain_input_stream` for use from `lib.rs`.
@@ -1053,15 +1116,24 @@ pub fn drain_input_stream_pub(ctx: &mut dyn NativeContext, stream: ObjectRef) ->
 }
 
 /// Public re-export of `parse_properties` for use from `lib.rs`.
+///
+/// Rust-text shaped because every caller (`logmanager`, `test_frameworks`)
+/// feeds the result straight into `&str` APIs. A `\uD800` with no matching
+/// low half degrades to `U+FFFD` here, exactly as it did before the store
+/// became units-typed; the `Properties.load` natives in this file take
+/// [`parse_properties_units`] instead and keep it.
 pub fn parse_properties_pub(bytes: &[u8]) -> Vec<(String, String)> {
     parse_properties(bytes)
+        .into_iter()
+        .map(|(k, v)| (k.to_lossy(), v.to_lossy()))
+        .collect()
 }
 
 /// Snapshot the side-table entries for a Properties object.  Returns
 /// an empty vector if the object isn't tracked.  Used by `keySet`,
 /// `entrySet`, `values`, `keys`, `elements` natives so the iteration
 /// view is decoupled from the live mutable side-table.
-fn snapshot_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(String, String)> {
+fn snapshot_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(JavaText, JavaText)> {
     let k = key_for(ctx, obj);
     match table().lock().get(&k) {
         Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -1097,7 +1169,10 @@ fn snapshot_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(String, String)>
 /// the CHM holds but the side-table does not are the callers' business — they
 /// append them via [`chm_extra_entries`] with the side-table keys as the skip
 /// set, exactly as before.
-fn ordered_snapshot_kv(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) -> Vec<(String, String)> {
+fn ordered_snapshot_kv(
+    ctx: &mut dyn NativeContext,
+    obj: &mut ObjectRef,
+) -> Vec<(JavaText, JavaText)> {
     let side = snapshot_kv(ctx, *obj);
     if side.len() < 2 {
         return side;
@@ -1135,20 +1210,20 @@ fn ordered_snapshot_kv(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) -> Vec<
 /// Every `side` entry appears exactly once in the result, and no entry is
 /// invented — `order` only permutes, never filters. Values always come from
 /// `side`; `order` contributes nothing but position.
-fn reorder_by(side: &[(String, String)], order: &[String]) -> Vec<(String, String)> {
-    let index: FxHashMap<&str, &str> = side.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut out: Vec<(String, String)> = Vec::with_capacity(side.len());
-    let mut used: std::collections::HashSet<&str> =
+fn reorder_by(side: &[(JavaText, JavaText)], order: &[JavaText]) -> Vec<(JavaText, JavaText)> {
+    let index: FxHashMap<&JavaText, &JavaText> = side.iter().map(|(k, v)| (k, v)).collect();
+    let mut out: Vec<(JavaText, JavaText)> = Vec::with_capacity(side.len());
+    let mut used: std::collections::HashSet<&JavaText> =
         std::collections::HashSet::with_capacity(side.len());
     for key in order {
-        if let Some(value) = index.get(key.as_str()) {
-            if used.insert(key.as_str()) {
-                out.push((key.clone(), (*value).to_string()));
+        if let Some(value) = index.get(key) {
+            if used.insert(key) {
+                out.push((key.clone(), (*value).clone()));
             }
         }
     }
     for (k, v) in side {
-        if !used.contains(k.as_str()) {
+        if !used.contains(k) {
             out.push((k.clone(), v.clone()));
         }
     }
@@ -1163,7 +1238,7 @@ fn reorder_by(side: &[(String, String)], order: &[String]) -> Vec<(String, Strin
 /// open-coding a second `entrySet()` walk: that walk's pin discipline has been
 /// corrected twice already (see its `cceres3` comments), and duplicating it
 /// would duplicate the hazard.
-fn chm_key_order(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<String> {
+fn chm_key_order(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<JavaText> {
     chm_extra_entries(ctx, obj, &std::collections::HashSet::new())
         .into_iter()
         .filter_map(|(_key_obj, _value, key_string)| key_string)
@@ -1179,7 +1254,7 @@ fn count_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
 /// The set of keys the String-only side-table holds for `obj`.  Used as the
 /// "already represented" skip set when merging in the CHM-backing entries —
 /// see [`chm_extra_entries`].
-fn side_key_set(ctx: &dyn NativeContext, obj: ObjectRef) -> std::collections::HashSet<String> {
+fn side_key_set(ctx: &dyn NativeContext, obj: ObjectRef) -> std::collections::HashSet<JavaText> {
     match table().lock().get(&key_for(ctx, obj)) {
         Some(m) => m.keys().cloned().collect(),
         None => std::collections::HashSet::new(),
@@ -1211,8 +1286,8 @@ fn side_key_set(ctx: &dyn NativeContext, obj: ObjectRef) -> std::collections::Ha
 fn chm_extra_entries(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-    skip: &std::collections::HashSet<String>,
-) -> Vec<(ObjectRef, Value, Option<String>)> {
+    skip: &std::collections::HashSet<JavaText>,
+) -> Vec<(ObjectRef, Value, Option<JavaText>)> {
     let chm = match ctx.get_field_by_name(this, "map") {
         Value::Object(Some(m)) => m,
         _ => return Vec::new(),
@@ -1237,7 +1312,7 @@ fn chm_extra_entries(
         key_fallback: ObjectRef,
         value: Value,
         value_pin: Option<(usize, ObjectRef)>,
-        key_string: Option<String>,
+        key_string: Option<JavaText>,
     }
 
     let it_pin = ctx.pin_native_root(it);
@@ -1277,7 +1352,7 @@ fn chm_extra_entries(
             _ => None,
         };
         let key_cur = ctx.read_native_pin(key_pin, key_obj);
-        let kstr = ctx.read_string(key_cur);
+        let kstr = read_java_text(ctx, key_cur);
         // cceres3 (unpin-ring provenance, base=6 prev_len=9): do NOT release
         // entry_pin here — key_pin/value_pin were pushed ABOVE it, so this
         // truncate dropped them both and every handle stored in `pinned`
@@ -1337,7 +1412,7 @@ fn chm_extra_entries(
 fn mirror_loaded_entries_to_properties_backend(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-    parsed: &[(String, String)],
+    parsed: &[(JavaText, JavaText)],
 ) {
     let chm = match ctx.get_field_by_name(this, "map") {
         Value::Object(Some(m)) => m,
@@ -1347,8 +1422,8 @@ fn mirror_loaded_entries_to_properties_backend(
                 _ => None,
             }) else {
                 for (k, v) in parsed {
-                    let k_obj = ctx.create_string(k);
-                    let v_obj = ctx.create_string(v);
+                    let k_obj = create_property_string(ctx, k);
+                    let v_obj = create_property_string(ctx, v);
                     let _ = ctx.invoke_special(
                         "java/util/Hashtable",
                         "put",
@@ -1374,8 +1449,8 @@ fn mirror_loaded_entries_to_properties_backend(
     };
 
     for (k, v) in parsed {
-        let k_obj = ctx.create_string(k);
-        let v_obj = ctx.create_string(v);
+        let k_obj = create_property_string(ctx, k);
+        let v_obj = create_property_string(ctx, v);
         let _ = ctx.invoke_virtual(
             chm,
             "put",
@@ -1398,7 +1473,11 @@ fn mirror_loaded_entries_to_properties_backend(
 /// runtime class IS `java/util/Properties`; for genuine subclasses,
 /// dispatch each entry through `put` (a non-overriding subclass lands
 /// back on the registered Properties.put native, same net effect).
-fn store_parsed_entries(ctx: &mut dyn NativeContext, this: ObjectRef, parsed: &[(String, String)]) {
+fn store_parsed_entries(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    parsed: &[(JavaText, JavaText)],
+) {
     let cid = ctx.class_id_of_object(this);
     let is_exact = ctx
         .class_name_of_id(cid)
@@ -1414,7 +1493,7 @@ fn store_parsed_entries(ctx: &mut dyn NativeContext, this: ObjectRef, parsed: &[
     if is_exact {
         for (k, v) in parsed {
             let this_cur = ctx.read_native_pin(this_pin, this);
-            put_kv(ctx, this_cur, k, v);
+            put_kv_units(ctx, this_cur, k, v);
         }
         let this_cur = ctx.read_native_pin(this_pin, this);
         mirror_loaded_entries_to_properties_backend(ctx, this_cur, parsed);
@@ -1425,9 +1504,9 @@ fn store_parsed_entries(ctx: &mut dyn NativeContext, this: ObjectRef, parsed: &[
     // receiver (and the key string, which is allocated before the value
     // string) through pins on each iteration.
     for (k, v) in parsed {
-        let k_obj = ctx.create_string(k);
+        let k_obj = create_property_string(ctx, k);
         let k_pin = ctx.pin_native_root(k_obj);
-        let v_obj = ctx.create_string(v);
+        let v_obj = create_property_string(ctx, v);
         let k_obj = ctx.read_native_pin(k_pin, k_obj);
         let this_cur = ctx.read_native_pin(this_pin, this);
         let _ = ctx.invoke_virtual(
@@ -1489,13 +1568,15 @@ fn native_properties_load(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         bytes.len()
     );
     for (k, v) in &parsed {
-        if k.contains("ApplicationContext") || k.contains("ContextFactory") {
-            let preview_len = v.len().min(80);
+        let k_text = k.to_lossy();
+        if k_text.contains("ApplicationContext") || k_text.contains("ContextFactory") {
+            let v_text = v.to_lossy();
+            let preview: String = v_text.chars().take(80).collect();
             props_diag_eprintln!(
                 "[PROPS-DBG] KEY={} VALUE_LEN={} VALUE_START={}",
-                k,
+                k_text,
                 v.len(),
-                &v[..preview_len]
+                preview
             );
         }
     }
@@ -1710,7 +1791,7 @@ fn props_defaults(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef>
 /// `put`, `Hashtable` methods we do not override) lands only in that map, as
 /// does a `load` whose side-table insert was refused at capacity. Returns the
 /// value's `toString` form, or `None` when there is no backing map / no entry.
-fn chm_get(ctx: &mut dyn NativeContext, this: ObjectRef, key_obj: ObjectRef) -> Option<String> {
+fn chm_get(ctx: &mut dyn NativeContext, this: ObjectRef, key_obj: ObjectRef) -> Option<JavaText> {
     let chm = match ctx.get_field_by_name(this, "map") {
         Value::Object(Some(m)) => m,
         _ => return None,
@@ -1729,7 +1810,7 @@ fn chm_get(ctx: &mut dyn NativeContext, this: ObjectRef, key_obj: ObjectRef) -> 
         Ok(Some(Value::Object(Some(v)))) => {
             let v_pin = ctx.pin_native_root(v);
             let v_cur = ctx.read_native_pin(v_pin, v);
-            ctx.read_string(v_cur)
+            read_java_text(ctx, v_cur)
         }
         _ => None,
     };
@@ -1775,6 +1856,37 @@ fn props_null_put_npe() -> MethodCallFailed {
     RuntimeError::NullPointerException { message: None }.into()
 }
 
+/// The units-preserving twin of `lib.rs`'s `property_key_from_java_string`.
+///
+/// Same normalisation (`normalize_java_property_key` trims ASCII control
+/// characters and NUL from both ends) applied to code units instead of `char`s,
+/// so a key whose only difference from another is which unpaired surrogate it
+/// carries stays a DIFFERENT key. With the `String` form, two such keys were
+/// both `U+FFFD` and the second `setProperty` silently overwrote the first.
+///
+/// Falls back to the `String` reader when the units path yields nothing: that
+/// reader has a second, field-shaped decode for `String` receivers
+/// `read_string` refuses, and dropping it here would narrow what `getProperty`
+/// accepts.
+fn property_key_units(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> JavaText {
+    if let Some(text) = read_java_text(ctx, key_obj) {
+        let units = text.units();
+        let trim = |u: u16| u <= 0x1f || u == 0x7f;
+        let mut start = 0usize;
+        while start < units.len() && trim(units[start]) {
+            start += 1;
+        }
+        let mut end = units.len();
+        while end > start && trim(units[end - 1]) {
+            end -= 1;
+        }
+        if end > start {
+            return JavaText::from_units(units[start..end].to_vec());
+        }
+    }
+    JavaText::from(crate::property_key_from_java_string(ctx, key_obj).as_str())
+}
+
 
 fn native_properties_get_property_1(
     ctx: &mut dyn NativeContext,
@@ -1788,14 +1900,18 @@ fn native_properties_get_property_1(
         Some(Value::Object(Some(k))) => *k,
         _ => return Err(props_null_key_npe()),
     };
-    let key = crate::property_key_from_java_string(ctx, key_obj);
-    if let Some(v) = get_kv(ctx, this, &key) {
+    let key_units = property_key_units(ctx, key_obj);
+    // Rust-text form of the SAME key, for the system-property store and the
+    // diagnostics — both of which are `&str` APIs.
+    let key = key_units.to_lossy();
+    if let Some(v) = get_kv_units(ctx, this, &key_units) {
         tracing::debug!(
             target: "cratonvm_vm::props_sidetable",
-            ?this, key = %key, bytes = v.len(),
+            ?this, key = %key, units = v.len(),
             "PROPS-GET sidetable hit"
         );
-        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        let s = create_property_string(ctx, &v);
+        return Ok(Some(Value::Object(Some(s))));
     }
     // Then the object's REAL backing map, BEFORE the `defaults` chain -- the
     // same order the JDK uses (own entries, then defaults). Reading only the
@@ -1817,10 +1933,11 @@ fn native_properties_get_property_1(
     if let Some(v) = backing {
         tracing::debug!(
             target: "cratonvm_vm::props_sidetable",
-            ?this, key = %key, bytes = v.len(),
+            ?this, key = %key, units = v.len(),
             "PROPS-GET real-backing hit"
         );
-        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        let s = create_property_string(ctx, &v);
+        return Ok(Some(Value::Object(Some(s))));
     }
     // Fall through to the `defaults` chain (recursively, via the defaults
     // Properties' own getProperty). The receiver is no longer used after this,
@@ -1912,21 +2029,27 @@ fn native_properties_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(v))) => *v,
         _ => return Err(props_null_put_npe()),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
-    let val = ctx.read_string(val_obj).unwrap_or_default();
-    let old = get_kv(ctx, this, &key);
-    put_kv(ctx, this, &key, &val);
+    let key = read_java_text(ctx, key_obj).unwrap_or_default();
+    let val = read_java_text(ctx, val_obj).unwrap_or_default();
+    let old = get_kv_units(ctx, this, &key);
+    put_kv_units(ctx, this, &key, &val);
     // Mirror into the real JDK Properties backing (`map` ConcurrentHashMap) so
     // generic Map walkers observe the entry — see native_properties_put's
     // fn-level note for the full rationale (Hibernate's PU-properties merge).
     mirror_loaded_entries_to_properties_backend(ctx, this, &[(key.clone(), val.clone())]);
     // Only the system-properties view propagates to the global store — see
-    // `system_props_keys` for why a blanket mirror cross-contaminates.
+    // `system_props_keys` for why a blanket mirror cross-contaminates. That
+    // store is a `&str` API, so this arm alone is lossy; it is the VM's own
+    // configuration namespace, whose keys and values are never Java text with
+    // an unpaired surrogate in it.
     if is_system_props(ctx, this) {
-        let _ = ctx.set_system_property(&key, &val);
+        let _ = ctx.set_system_property(&key.to_lossy(), &val.to_lossy());
     }
     match old {
-        Some(prev) => Ok(Some(Value::Object(Some(ctx.create_string(&prev))))),
+        Some(prev) => {
+            let s = create_property_string(ctx, &prev);
+            Ok(Some(Value::Object(Some(s))))
+        }
         None => Ok(Some(Value::Object(None))),
     }
 }
@@ -1994,19 +2117,22 @@ fn native_properties_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // the real JDK CHM so size()/entrySet()/get() still observe it. Dropping a
     // non-String key here was the `mergeProperties` bug: a `ManagedProperties`
     // populated with `TypedStringValue` keys silently came back empty.
-    let ks_opt = ctx.read_string(k);
-    let vs_opt = ctx.read_string(v);
+    let ks_opt = read_java_text(ctx, k);
+    let vs_opt = read_java_text(ctx, v);
     if let (Some(ks), Some(vs)) = (ks_opt.as_ref(), vs_opt.as_ref()) {
         if !ks.is_empty() {
             // String→String: store in side-table AND CHM (existing path).
-            let prev = get_kv(ctx, this, ks);
-            put_kv(ctx, this, ks, vs);
+            let prev = get_kv_units(ctx, this, ks);
+            put_kv_units(ctx, this, ks, vs);
             mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
             if is_system_props(ctx, this) {
-                let _ = ctx.set_system_property(ks, vs);
+                let _ = ctx.set_system_property(&ks.to_lossy(), &vs.to_lossy());
             }
             return Ok(Some(match prev {
-                Some(p) => Value::Object(Some(ctx.create_string(&p))),
+                Some(p) => {
+                    let s = create_property_string(ctx, &p);
+                    Value::Object(Some(s))
+                }
                 None => Value::Object(None),
             }));
         }
@@ -2195,17 +2321,17 @@ fn native_properties_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
+    let key = read_java_text(ctx, key_obj).unwrap_or_default();
     if key.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
-    let removed = remove_kv(ctx, this, &key);
+    let removed = remove_kv_units(ctx, this, &key);
     // The system-properties view must propagate removal to the global store,
     // mirroring how `setProperty`/`put` propagate writes — otherwise
     // `System.getProperties().remove(k)` (keycloak ExportImportConfig.reset)
     // leaves `System.getProperty(k)` returning the stale value.
     if is_system_props(ctx, this) {
-        let _ = ctx.remove_system_property(&key);
+        let _ = ctx.remove_system_property(&key.to_lossy());
     }
     // Keep the real JDK `map` CHM backing in sync with the side-table: `put`/
     // `setProperty` mirror INTO it, so a `remove` that touched only the
@@ -2217,7 +2343,10 @@ fn native_properties_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // capture what it actually removed instead of discarding it.
     let chm_removed = remove_from_properties_backend(ctx, this, key_obj);
     match removed {
-        Some(prev) => Ok(Some(Value::Object(Some(ctx.create_string(&prev))))),
+        Some(prev) => {
+            let s = create_property_string(ctx, &prev);
+            Ok(Some(Value::Object(Some(s))))
+        }
         None => Ok(Some(chm_removed)),
     }
 }
@@ -2288,8 +2417,8 @@ fn native_properties_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(k))) => *k,
         _ => return Err(props_null_key_npe()),
     };
-    let key = ctx.read_string(key_obj).unwrap_or_default();
-    if get_kv(ctx, this, &key).is_some() {
+    let key = read_java_text(ctx, key_obj).unwrap_or_default();
+    if get_kv_units(ctx, this, &key).is_some() {
         return Ok(Some(Value::Int(1)));
     }
     // Non-String-valued entries live only in the CHM backing — consult it so
@@ -2359,10 +2488,12 @@ fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(k))) => *k,
         _ => return Err(props_null_key_npe()),
     };
-    let key = crate::property_key_from_java_string(ctx, key_obj);
+    let key_units = property_key_units(ctx, key_obj);
+    let key = key_units.to_lossy();
     // Check the Rust side-table (String→String only).
-    if let Some(v) = get_kv(ctx, this, &key) {
-        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+    if let Some(v) = get_kv_units(ctx, this, &key_units) {
+        let s = create_property_string(ctx, &v);
+        return Ok(Some(Value::Object(Some(s))));
     }
     // Non-String values (e.g. XProperty, MemberDetails) are stored only in
     // the real JDK CHM backing (`map` field).  Check it before falling through
@@ -2448,7 +2579,7 @@ fn native_properties_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn build_string_collection(
     ctx: &mut dyn NativeContext,
     class_name: &str,
-    items: Vec<String>,
+    items: Vec<JavaText>,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let coll = match ctx.new_object(class_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
@@ -2457,7 +2588,7 @@ fn build_string_collection(
     let pin = ctx.pin_native_root(coll);
     let _ = ctx.invoke(class_name, "<init>", "()V", &[Value::Object(Some(coll))]);
     for s in &items {
-        let so = ctx.create_string(s);
+        let so = create_property_string(ctx, s);
         let coll = ctx.read_native_pin(pin, coll);
         let _ = ctx.invoke_virtual(
             coll,
@@ -2536,7 +2667,7 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `vec`.
 fn build_enumeration(
     ctx: &mut dyn NativeContext,
-    items: Vec<String>,
+    items: Vec<JavaText>,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let empty = |ctx: &mut dyn NativeContext| -> Result<ObjectRef, MethodCallFailed> {
         crate::try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)
@@ -2559,7 +2690,7 @@ fn build_enumeration(
         return empty(ctx);
     }
     for s in &items {
-        let so = ctx.create_string(s);
+        let so = create_property_string(ctx, s);
         let vec = ctx.read_native_pin(pin, vec);
         let _ = ctx.invoke_virtual(
             vec,
@@ -2617,8 +2748,8 @@ fn native_properties_string_property_names(
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<JavaText> = std::collections::HashSet::new();
+    let mut names: Vec<JavaText> = Vec::new();
     // Receiver first, so a shadowed name keeps the receiver's position; a
     // depth cap guards a pathological self-referential `defaults` (the JDK
     // chain is acyclic), mirroring `native_properties_property_names`.
@@ -2680,7 +2811,7 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let mut keys: Vec<Value> = Vec::with_capacity(snapshot.len());
     let mut key_pins: Vec<usize> = Vec::with_capacity(snapshot.len());
     for (k, _v) in &snapshot {
-        let ks = ctx.create_string(k);
+        let ks = create_property_string(ctx, k);
         key_pins.push(ctx.pin_native_root(ks));
         keys.push(Value::Object(Some(ks)));
     }
@@ -2695,7 +2826,7 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // after the CHM walk so the key cannot be a stale raw ref from a
         // previous iterator call.
         let k = match kstr {
-            Some(s) => ctx.create_string(&s),
+            Some(s) => create_property_string(ctx, &s),
             None => key_obj,
         };
         key_pins.push(ctx.pin_native_root(k));
@@ -2754,7 +2885,7 @@ fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let mut vals: Vec<Value> = Vec::with_capacity(snapshot.len());
     let mut val_pins: Vec<usize> = Vec::with_capacity(snapshot.len());
     for (_k, v) in &snapshot {
-        let vs = ctx.create_string(v);
+        let vs = create_property_string(ctx, v);
         let vs_pin = ctx.pin_native_root(vs);
         vals.push(Value::Object(Some(vs)));
         val_pins.push(vs_pin);
@@ -2825,7 +2956,7 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         );
     }
     for (k, _v) in snapshot.iter().take(5) {
-        props_diag_eprintln!("[PROPS-DBG]   entry key={}", k);
+        props_diag_eprintln!("[PROPS-DBG]   entry key={}", k.to_lossy());
     }
     // Collect (key, value) pairs: the side-table String entries first, then any
     // CHM-exclusive entries (non-String values, e.g. a `Class` deserializer) so
@@ -2844,14 +2975,14 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(snapshot.len());
     let mut pair_pins: Vec<(usize, usize)> = Vec::with_capacity(snapshot.len());
     for (k, v) in &snapshot {
-        let ks = ctx.create_string(k);
+        let ks = create_property_string(ctx, k);
         let ks_pin = ctx.pin_native_root(ks);
-        let vs = ctx.create_string(v);
+        let vs = create_property_string(ctx, v);
         let vs_pin = ctx.pin_native_root(vs);
         pairs.push((Value::Object(Some(ks)), Value::Object(Some(vs))));
         pair_pins.push((ks_pin, vs_pin));
     }
-    let side_keys: std::collections::HashSet<String> =
+    let side_keys: std::collections::HashSet<JavaText> =
         snapshot.iter().map(|(k, _v)| k.clone()).collect();
     let this_cur = ctx.read_native_pin(this_pin, this);
     for (key_obj, value, _kstr) in chm_extra_entries(ctx, this_cur, &side_keys) {
@@ -2920,7 +3051,7 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let mut this = this;
-    let mut keys: Vec<String> = ordered_snapshot_kv(ctx, &mut this)
+    let mut keys: Vec<JavaText> = ordered_snapshot_kv(ctx, &mut this)
         .into_iter()
         .map(|(k, _v)| k)
         .collect();
@@ -2940,8 +3071,8 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn collect_own_property_names(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-    seen: &mut std::collections::HashSet<String>,
-    out: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<JavaText>,
+    out: &mut Vec<JavaText>,
 ) {
     let mut this = this;
     for (k, _v) in ordered_snapshot_kv(ctx, &mut this) {
@@ -2983,8 +3114,8 @@ fn native_properties_property_names(
             )?))))
         }
     };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<JavaText> = std::collections::HashSet::new();
+    let mut out: Vec<JavaText> = Vec::new();
     // Walk the receiver and its defaults chain. A depth cap guards against a
     // pathological self-referential `defaults` field (the JDK chain is acyclic).
     let mut cur = Some(this);
@@ -3003,7 +3134,7 @@ fn native_properties_property_names(
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
 /// `keys()`, enumerating the side-table values.
 fn native_properties_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let vals: Vec<String> = match args.first() {
+    let vals: Vec<JavaText> = match args.first() {
         Some(Value::Object(Some(o))) => ordered_snapshot_kv(ctx, &mut { *o })
             .into_iter()
             .map(|(_k, v)| v)
@@ -3029,7 +3160,7 @@ fn native_properties_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(v))) => *v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let needle = ctx.read_string(val_obj).unwrap_or_default();
+    let needle = read_java_text(ctx, val_obj).unwrap_or_default();
     let snapshot = snapshot_kv(ctx, this);
     let hit = snapshot.iter().any(|(_k, v)| v == &needle);
     if hit {
@@ -3091,8 +3222,8 @@ fn native_properties_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let mut this = this;
     let snapshot = ordered_snapshot_kv(ctx, &mut this);
     for (k, v) in &snapshot {
-        let ks = ctx.create_string(k);
-        let vs = ctx.create_string(v);
+        let ks = create_property_string(ctx, k);
+        let vs = create_property_string(ctx, v);
         ctx.invoke_virtual(
             action,
             "accept",
@@ -3101,7 +3232,7 @@ fn native_properties_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         )?;
     }
     // CHM-exclusive (non-String-valued) entries, with the real value object.
-    let side: std::collections::HashSet<String> =
+    let side: std::collections::HashSet<JavaText> =
         snapshot.iter().map(|(k, _v)| k.clone()).collect();
     for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
         ctx.invoke_virtual(
@@ -3215,43 +3346,63 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// including the `c > 61 && c < 127` printable-ASCII fast path and the explicit
 /// `=`/`:`/`#`/`!` escapes.
 fn save_convert(s: &str, escape_space: bool, escape_unicode: bool) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for (i, ch) in s.chars().enumerate() {
-        let c = ch as u32;
+    save_convert_units(
+        &JavaText::from(s).units().to_vec(),
+        escape_space,
+        escape_unicode,
+    )
+}
+
+/// Units-typed body of [`save_convert`].
+///
+/// The JDK's `saveConvert` walks `char`s — i.e. UTF-16 code units — so this is
+/// the shape the algorithm was always written in; the `&str` form above merely
+/// re-encodes first. Working on units is also what lets an unpaired surrogate
+/// be *written* at all: it has no `char` in Rust to push into an output
+/// `String`.
+///
+/// One deliberate divergence, for content no `&str` can carry: an unpaired
+/// surrogate is emitted as `\uXXXX` even when `escape_unicode` is false (the
+/// `store(Writer)` overload, where HotSpot writes the raw unit through the
+/// Writer's encoder). The escape re-loads to exactly the same unit, so the
+/// round-trip this function exists to protect is intact; the alternative is
+/// U+FFFD, which is not.
+fn save_convert_units(units: &[u16], escape_space: bool, escape_unicode: bool) -> String {
+    let mut out = String::with_capacity(units.len() * 2);
+    for (i, &unit) in units.iter().enumerate() {
+        let c = unit as u32;
         // Fast path: printable ASCII above '=' (61) and below DEL (127).
         if c > 61 && c < 127 {
-            if ch == '\\' {
+            if unit == b'\\' as u16 {
                 out.push_str("\\\\");
             } else {
-                out.push(ch);
+                out.push(unit as u8 as char);
             }
             continue;
         }
-        match ch {
-            ' ' => {
+        match unit {
+            0x20 => {
                 if i == 0 || escape_space {
                     out.push('\\');
                 }
                 out.push(' ');
             }
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{000c}' => out.push_str("\\f"),
-            '=' | ':' | '#' | '!' => {
+            0x09 => out.push_str("\\t"),
+            0x0a => out.push_str("\\n"),
+            0x0d => out.push_str("\\r"),
+            0x0c => out.push_str("\\f"),
+            0x3d | 0x3a | 0x23 | 0x21 => {
                 out.push('\\');
-                out.push(ch);
+                out.push(unit as u8 as char);
             }
             _ => {
-                if (c < 0x20 || c > 0x7e) && escape_unicode {
-                    // Emit one `\uXXXX` per UTF-16 code unit, so supplementary
-                    // code points round-trip as the surrogate pair the JDK
-                    // writes (our `parse_properties` recombines them on load).
-                    let mut buf = [0u16; 2];
-                    for unit in ch.encode_utf16(&mut buf) {
-                        out.push_str(&format!("\\u{:04x}", unit));
-                    }
-                } else {
+                let is_surrogate = (0xD800..=0xDFFF).contains(&unit);
+                if ((c < 0x20 || c > 0x7e) && escape_unicode) || is_surrogate {
+                    // One `\uXXXX` per code unit, so a supplementary code point
+                    // round-trips as the surrogate PAIR the JDK writes and a
+                    // lone half round-trips as itself.
+                    out.push_str(&format!("\\u{:04x}", unit));
+                } else if let Some(ch) = char::from_u32(c) {
                     out.push(ch);
                 }
             }
@@ -3312,7 +3463,7 @@ fn current_date_string(ctx: &mut dyn NativeContext) -> Option<String> {
 fn collect_via_virtual_entryset(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-) -> Vec<(String, String)> {
+) -> Vec<(JavaText, JavaText)> {
     let this_pin = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(this_pin, this);
     let set = match ctx.invoke_virtual(this_cur, "entrySet", "()Ljava/util/Set;", &[]) {
@@ -3349,11 +3500,11 @@ fn collect_via_virtual_entryset(
         let val_v = ctx.invoke_virtual(entry_cur, "getValue", "()Ljava/lang/Object;", &[]);
         ctx.unpin_native_roots(entry_pin);
         let k = match key_v {
-            Ok(Some(Value::Object(Some(k)))) => ctx.read_string(k),
+            Ok(Some(Value::Object(Some(k)))) => read_java_text(ctx, k),
             _ => None,
         };
         let v = match val_v {
-            Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v),
+            Ok(Some(Value::Object(Some(v)))) => read_java_text(ctx, v),
             _ => None,
         };
         if let (Some(k), Some(v)) = (k, v) {
@@ -3371,7 +3522,10 @@ fn collect_via_virtual_entryset(
 /// use the side-table snapshot (the fast path — `entrySet()` would return the
 /// same data). For a subclass, iterate the virtual `entrySet()` so overrides
 /// (e.g. `SortedProperties`' sorted view) are honored.
-fn collect_store_entries(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+fn collect_store_entries(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Vec<(JavaText, JavaText)> {
     let mut this = this;
     let cid = ctx.class_id_of_object(this);
     let is_exact = ctx
@@ -3392,7 +3546,7 @@ fn collect_store_entries(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(S
 fn render_store_text(
     comments: Option<&str>,
     date: Option<&str>,
-    entries: &[(String, String)],
+    entries: &[(JavaText, JavaText)],
     escape_unicode: bool,
     eol: &str,
 ) -> String {
@@ -3406,9 +3560,9 @@ fn render_store_text(
         text.push_str(eol);
     }
     for (k, v) in entries {
-        text.push_str(&save_convert(k, true, escape_unicode));
+        text.push_str(&save_convert_units(k.units(), true, escape_unicode));
         text.push('=');
-        text.push_str(&save_convert(v, false, escape_unicode));
+        text.push_str(&save_convert_units(v.units(), false, escape_unicode));
         text.push_str(eol);
     }
     text
@@ -3920,7 +4074,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     this = ctx.read_native_pin(this_pin, this);
     if !snapshot.is_empty() || !other_chm_extra.is_empty() {
         for (k, v) in &snapshot {
-            put_kv(ctx, this, k, v);
+            put_kv_units(ctx, this, k, v);
         }
         // Mirror into `this`'s real `map` CHM backing too, so the destination
         // stays consistent for generic Map walkers (cf. native_properties_put).
@@ -3953,7 +4107,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     //    put_non_string_into_chm — never in the side-table.  Storing a ""
     //    sentinel for non-String values would shadow the CHM in
     //    native_properties_get, causing a String→XProperty CCE downstream.
-    let mut str_collected: Vec<(String, String)> = Vec::new();
+    let mut str_collected: Vec<(JavaText, JavaText)> = Vec::new();
     // Use `invoke_virtual` (dispatch on the receiver's actual runtime class),
     // NOT `invoke` (which resolves against the literal interface/class name
     // passed in). `invoke`'s C25 interface retarget correctly redirects e.g.
@@ -4036,9 +4190,9 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         let key_obj = ctx.read_native_pin(key_pin, key_obj);
         it = ctx.read_native_pin(it_pin, it);
         this = ctx.read_native_pin(this_pin, this);
-        let k_opt = ctx.read_string(key_obj);
+        let k_opt = read_java_text(ctx, key_obj);
         let v_str = match val_v {
-            Value::Object(Some(val_obj)) => ctx.read_string(val_obj),
+            Value::Object(Some(val_obj)) => read_java_text(ctx, val_obj),
             _ => None,
         };
         match (k_opt, v_str) {
@@ -4059,7 +4213,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.unpin_native_roots(entry_pin);
     }
     for (k, v) in &str_collected {
-        put_kv(ctx, this, k, v);
+        put_kv_units(ctx, this, k, v);
     }
     mirror_loaded_entries_to_properties_backend(ctx, this, &str_collected);
     ctx.unpin_native_roots(this_pin);
@@ -4174,10 +4328,24 @@ mod tests {
         assert_eq!(props_defaults(&ctx, props), None);
     }
 
-    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(JavaText, JavaText)> {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| (JavaText::from(*k), JavaText::from(*v)))
+            .collect()
+    }
+
+    fn names(items: &[&str]) -> Vec<JavaText> {
+        items.iter().map(|s| JavaText::from(*s)).collect()
+    }
+
+    /// Rust-text view of a parse result, so the escape-grammar tests below can
+    /// keep asserting plain `&str` expectations. Anything ABOUT surrogates must
+    /// assert units instead — see `parse_keeps_a_lone_surrogate_escape_as_its_unit`.
+    fn lossy(pairs: Vec<(JavaText, JavaText)>) -> Vec<(String, String)> {
+        pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_lossy(), v.to_lossy()))
             .collect()
     }
 
@@ -4195,12 +4363,9 @@ mod tests {
             ("commit.id.abbrev", "1b3cec3"),
             ("commit.id.full", "1b3cec34f7ca0a021244452f2cae07a80497a7c7"),
         ]);
-        let order: Vec<String> = ["commit.id.full", "branch", "commit.id.abbrev", "commit.id"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let order = names(&["commit.id.full", "branch", "commit.id.abbrev", "commit.id"]);
         let reordered = reorder_by(&side, &order);
-        let got: Vec<&str> = reordered.iter().map(|(k, _v)| k.as_str()).collect();
+        let got: Vec<String> = reordered.iter().map(|(k, _v)| k.to_lossy()).collect();
         assert_eq!(
             got,
             vec!["commit.id.full", "branch", "commit.id.abbrev", "commit.id"]
@@ -4218,7 +4383,7 @@ mod tests {
     fn reorder_preserves_every_entry() {
         let side = kv(&[("a", "1"), ("b", "2"), ("c", "3")]);
         // `z` is in the CHM but not the side-table; `b` is not named by `order`.
-        let order: Vec<String> = ["z", "c", "a"].iter().map(|s| s.to_string()).collect();
+        let order = names(&["z", "c", "a"]);
         let got = reorder_by(&side, &order);
         assert_eq!(got, kv(&[("c", "3"), ("a", "1"), ("b", "2")]));
         assert_eq!(got.len(), side.len());
@@ -4227,7 +4392,7 @@ mod tests {
     #[test]
     fn reorder_tolerates_a_duplicated_order_key() {
         let side = kv(&[("a", "1"), ("b", "2")]);
-        let order: Vec<String> = ["b", "b", "a"].iter().map(|s| s.to_string()).collect();
+        let order = names(&["b", "b", "a"]);
         assert_eq!(reorder_by(&side, &order), kv(&[("b", "2"), ("a", "1")]));
     }
 
@@ -4245,21 +4410,24 @@ mod tests {
     fn props_map_is_insertion_ordered_across_removal() {
         let mut m = PropsMap::default();
         for k in ["branch", "commit.id", "commit.id.abbrev", "commit.id.full"] {
-            m.insert(k.to_string(), "v".to_string());
+            m.insert(JavaText::from(k), JavaText::from("v"));
         }
-        let keys: Vec<&str> = m.keys().map(|k| k.as_str()).collect();
+        let keys: Vec<String> = m.keys().map(|k| k.to_lossy()).collect();
         assert_eq!(
             keys,
             vec!["branch", "commit.id", "commit.id.abbrev", "commit.id.full"]
         );
         // `shift_remove` (what `remove_kv` uses) keeps the survivors in order;
         // `swap_remove` would teleport the last key into the hole.
-        m.shift_remove("commit.id");
-        let keys: Vec<&str> = m.keys().map(|k| k.as_str()).collect();
+        m.shift_remove(&JavaText::from("commit.id"));
+        let keys: Vec<String> = m.keys().map(|k| k.to_lossy()).collect();
         assert_eq!(keys, vec!["branch", "commit.id.abbrev", "commit.id.full"]);
         // Re-inserting an existing key must NOT move it to the back.
-        m.insert("branch".to_string(), "other".to_string());
-        assert_eq!(m.keys().next().map(|k| k.as_str()), Some("branch"));
+        m.insert(JavaText::from("branch"), JavaText::from("other"));
+        assert_eq!(
+            m.keys().next().map(|k| k.to_lossy()).as_deref(),
+            Some("branch")
+        );
     }
 
     /// `reorder_by` must not depend on the side-table's own iteration order for
@@ -4269,10 +4437,7 @@ mod tests {
     /// orders and require the same answer.
     #[test]
     fn reorder_is_independent_of_side_table_order_for_chm_named_keys() {
-        let order: Vec<String> = ["commit.id.full", "branch", "commit.id.abbrev", "commit.id"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let order = names(&["commit.id.full", "branch", "commit.id.abbrev", "commit.id"]);
         let a = kv(&[
             ("branch", "b"),
             ("commit.id", "i"),
@@ -4364,13 +4529,13 @@ mod tests {
 
     #[test]
     fn parse_simple_kv() {
-        let p = parse_properties(b"key=value\n");
+        let p = lossy(parse_properties(b"key=value\n"));
         assert_eq!(p, vec![("key".to_string(), "value".to_string())]);
     }
 
     #[test]
     fn parse_multiple_kv() {
-        let p = parse_properties(b"a=1\nb=2\nc=3\n");
+        let p = lossy(parse_properties(b"a=1\nb=2\nc=3\n"));
         assert_eq!(
             p,
             vec![
@@ -4383,19 +4548,19 @@ mod tests {
 
     #[test]
     fn parse_comments_skipped() {
-        let p = parse_properties(b"#comment\n!exclamation\nkey=value\n");
+        let p = lossy(parse_properties(b"#comment\n!exclamation\nkey=value\n"));
         assert_eq!(p, vec![("key".to_string(), "value".to_string())]);
     }
 
     #[test]
     fn parse_blank_lines_skipped() {
-        let p = parse_properties(b"\n\nkey=value\n\n");
+        let p = lossy(parse_properties(b"\n\nkey=value\n\n"));
         assert_eq!(p, vec![("key".to_string(), "value".to_string())]);
     }
 
     #[test]
     fn parse_whitespace_separator() {
-        let p = parse_properties(b"key value\n");
+        let p = lossy(parse_properties(b"key value\n"));
         assert_eq!(p, vec![("key".to_string(), "value".to_string())]);
     }
 
@@ -4437,7 +4602,7 @@ mod tests {
             text.push_str(&save_convert(v, false, true));
             text.push('\n');
         }
-        let parsed = parse_properties(text.as_bytes());
+        let parsed = lossy(parse_properties(text.as_bytes()));
         let expected: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -4447,10 +4612,7 @@ mod tests {
 
     #[test]
     fn render_store_text_includes_date_before_first_entry() {
-        let entries = vec![
-            ("code2".to_string(), "message2".to_string()),
-            ("code1".to_string(), "message1".to_string()),
-        ];
+        let entries = kv(&[("code2", "message2"), ("code1", "message1")]);
         let text = render_store_text(
             None,
             Some("Thu Jan 01 00:00:00 UTC 1970"),
@@ -4467,26 +4629,26 @@ mod tests {
 
     #[test]
     fn render_store_text_keeps_user_comment_before_date() {
-        let entries = vec![("key".to_string(), "value".to_string())];
+        let entries = kv(&[("key", "value")]);
         let text = render_store_text(Some("header"), Some("DATE"), &entries, true, "\r\n");
         assert_eq!(text, "#header\r\n#DATE\r\nkey=value\r\n");
     }
 
     #[test]
     fn parse_colon_separator() {
-        let p = parse_properties(b"key:value\n");
+        let p = lossy(parse_properties(b"key:value\n"));
         assert_eq!(p, vec![("key".to_string(), "value".to_string())]);
     }
 
     #[test]
     fn parse_continuation_line() {
-        let p = parse_properties(b"key=long\\\n    value\n");
+        let p = lossy(parse_properties(b"key=long\\\n    value\n"));
         assert_eq!(p, vec![("key".to_string(), "longvalue".to_string())]);
     }
 
     #[test]
     fn parse_unicode_escape() {
-        let p = parse_properties(b"key=\\u00e9\n");
+        let p = lossy(parse_properties(b"key=\\u00e9\n"));
         assert_eq!(p[0].0, "key");
         assert!(p[0].1.starts_with('\u{00e9}'));
     }
@@ -4494,7 +4656,7 @@ mod tests {
     #[test]
     fn parse_keycloak_version_shape() {
         let bytes = b"version=26.2.4\nbuild-time=2025-04-26T13:00:00Z\nresources-version=26.2.4\n";
-        let p = parse_properties(bytes);
+        let p = lossy(parse_properties(bytes));
         assert_eq!(p.len(), 3);
         assert_eq!(p[0], ("version".to_string(), "26.2.4".to_string()));
         assert_eq!(
@@ -4529,7 +4691,7 @@ mod tests {
 
     #[test]
     fn parse_no_separator_yields_empty_value() {
-        let p = parse_properties(b"keyonly\n");
+        let p = lossy(parse_properties(b"keyonly\n"));
         assert_eq!(p, vec![("keyonly".to_string(), String::new())]);
     }
 
@@ -4562,15 +4724,215 @@ mod tests {
 
     #[test]
     fn unescape_lone_surrogate_becomes_replacement_not_dropped() {
-        // A lone surrogate can't live in a Rust String; we substitute U+FFFD
-        // rather than silently dropping the unit (exact preservation needs
-        // the cross-file wide-unit path). The key assertion is that *some*
-        // character survives — the value is not silently lost.
+        // `unescape` is the LOSSY Rust-text view, so U+FFFD is the right answer
+        // HERE and only here: a Rust `String` cannot hold the unit. The store
+        // keeps the unit — `unescape_units_keeps_a_lone_surrogate_as_itself`
+        // below is the assertion that matters, and it is written in units
+        // precisely because this one passes on the broken code too.
         assert_eq!(unescape("\\uD800"), "\u{FFFD}"); // lone high
         assert_eq!(unescape("\\uDC00"), "\u{FFFD}"); // lone low
                                                      // High surrogate followed by a NON-low escape: the high is replaced,
                                                      // and the trailing 'A' (A) is preserved.
         assert_eq!(unescape("\\uD800\\u0041"), "\u{FFFD}A");
+    }
+
+    // -----------------------------------------------------------------------
+    // G55-1 — the surrogate the store could not hold, and the key it could not
+    // find again. MEASURED against Adoptium 25.0.3+9-hotspot on 2026-08-17
+    // (`scratchpad/g55/G55Probe.java`, 158 rows): 21 `Properties` rows diverged,
+    // and they were two distinct defects with one cause — a `String`-typed
+    // store.
+    //
+    // Every assertion below is written in UTF-16 UNITS. A test written through
+    // `unescape`/`read_string`/`to_lossy` PASSES ON THE BROKEN CODE, which is
+    // how this survived: `U+FFFD` is a perfectly good `char`, so a decoded
+    // comparison of two mangled strings agrees with itself.
+    // -----------------------------------------------------------------------
+
+    const HI: u16 = 0xD800;
+    const LO: u16 = 0xDC00;
+
+    #[test]
+    fn unescape_units_keeps_a_lone_surrogate_as_itself() {
+        assert_eq!(
+            unescape_inner("\\uD800", false).unwrap().units(),
+            &[HI],
+            "a lone high surrogate escape is ONE code unit, not U+FFFD"
+        );
+        assert_eq!(unescape_inner("\\uDC00", false).unwrap().units(), &[LO]);
+        assert_eq!(
+            unescape_inner("a\\uD800b", false).unwrap().units(),
+            &[b'a' as u16, HI, b'b' as u16]
+        );
+        // A well-formed pair stays two units — and re-encodes to the single
+        // supplementary character, which is what the lossy view still shows.
+        let pair = unescape_inner("\\uD83D\\uDE00", false).unwrap();
+        assert_eq!(pair.units(), &[0xD83D, 0xDE00]);
+        assert_eq!(pair.to_lossy(), "\u{1F600}");
+        // A high surrogate followed by a NON-low escape keeps both units.
+        assert_eq!(
+            unescape_inner("\\uD800\\u0041", false).unwrap().units(),
+            &[HI, 0x41]
+        );
+    }
+
+    #[test]
+    fn parse_keeps_a_lone_surrogate_escape_as_its_unit() {
+        let parsed = parse_properties(b"k\\ud800=v\\udc00\n");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.units(), &[b'k' as u16, HI]);
+        assert_eq!(parsed[0].1.units(), &[b'v' as u16, LO]);
+    }
+
+    /// **The silent one.** Two keys that differ only in WHICH unpaired
+    /// surrogate they carry are two different Java keys — `equals` is false and
+    /// the hashes differ. Under the `String` store both decoded to `U+FFFD`, so
+    /// the second `setProperty` overwrote the first: MEASURED `size()` = 1 where
+    /// HotSpot says 2, and `getProperty(HI)` answered the LO key's value. No
+    /// exception, no wrong-looking string — just an entry that was never there.
+    #[test]
+    fn two_keys_differing_only_in_their_unpaired_surrogate_stay_two_keys() {
+        let hi = JavaText::from_units(vec![HI]);
+        let lo = JavaText::from_units(vec![LO]);
+        assert_ne!(hi, lo, "distinct code units are distinct keys");
+        assert_eq!(
+            hi.to_lossy(),
+            lo.to_lossy(),
+            "...and the lossy views are EQUAL, which is exactly why a \
+             `String`-keyed store conflated them"
+        );
+
+        let mut m = PropsMap::default();
+        m.insert(hi.clone(), JavaText::from("high"));
+        m.insert(lo.clone(), JavaText::from("low"));
+        assert_eq!(m.len(), 2, "two keys, two entries");
+        assert_eq!(m.get(&hi).map(|v| v.to_lossy()).as_deref(), Some("high"));
+        assert_eq!(m.get(&lo).map(|v| v.to_lossy()).as_deref(), Some("low"));
+        assert_eq!(
+            m.shift_remove(&hi).map(|v| v.to_lossy()).as_deref(),
+            Some("high"),
+            "removing one must not take the other with it"
+        );
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&lo).map(|v| v.to_lossy()).as_deref(), Some("low"));
+    }
+
+    /// `reorder_by` indexes the side-table by key. With `&str` keys the same
+    /// conflation reached the enumeration order — one key would have shadowed
+    /// the other's position and the survivor would have been emitted twice.
+    #[test]
+    fn reorder_does_not_conflate_two_lone_surrogate_keys() {
+        let hi = JavaText::from_units(vec![HI]);
+        let lo = JavaText::from_units(vec![LO]);
+        let side = vec![
+            (hi.clone(), JavaText::from("high")),
+            (lo.clone(), JavaText::from("low")),
+        ];
+        let got = reorder_by(&side, &[lo.clone(), hi.clone()]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0.units(), &[LO]);
+        assert_eq!(got[0].1.to_lossy(), "low");
+        assert_eq!(got[1].0.units(), &[HI]);
+        assert_eq!(got[1].1.to_lossy(), "high");
+    }
+
+    /// `JavaText` orders by code UNIT, which is what `String.compareTo` does.
+    /// Rust's `String` orders by code POINT, which puts a supplementary
+    /// character AFTER `U+FFFF` where Java puts it before — so a `String`-keyed
+    /// sorted view of the same content is in a different order than the JDK's.
+    /// MEASURED on both VMs (`scratchpad/g55/G55Ord.java`).
+    #[test]
+    fn java_text_orders_by_code_unit_where_a_rust_string_orders_by_code_point() {
+        let supplementary = JavaText::from("\u{10000}"); // == [D800, DC00]
+        let ffff = JavaText::from_units(vec![0xFFFF]);
+        assert_eq!(supplementary.units(), &[0xD800, 0xDC00]);
+        assert!(
+            supplementary < ffff,
+            "Java: a surrogate unit (D800) is below U+FFFF, so the \
+             supplementary character sorts FIRST"
+        );
+        assert!(
+            "\u{10000}".to_string() > "\u{FFFF}".to_string(),
+            "Rust `String` sorts it LAST — the divergence this type removes"
+        );
+    }
+
+    #[test]
+    fn save_convert_units_writes_a_lone_surrogate_as_a_reloadable_escape() {
+        // `escape_unicode = false` is the `store(Writer)` overload, where an
+        // ordinary non-ASCII char is written literally — but a lone surrogate
+        // still has to be escaped, because there is no `char` to write.
+        assert_eq!(save_convert_units(&[HI], false, false), "\\ud800");
+        assert_eq!(save_convert_units(&[LO], false, true), "\\udc00");
+        // Round-trip: what `store` writes, `load` reads back as the same units.
+        let mut text = String::new();
+        text.push_str(&save_convert_units(&[b'k' as u16, HI], true, true));
+        text.push('=');
+        text.push_str(&save_convert_units(&[b'v' as u16, LO], false, true));
+        text.push('\n');
+        let parsed = parse_properties(text.as_bytes());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.units(), &[b'k' as u16, HI]);
+        assert_eq!(parsed[0].1.units(), &[b'v' as u16, LO]);
+    }
+
+    #[test]
+    fn save_convert_still_writes_a_well_formed_pair_as_two_escapes() {
+        // The supplementary path must not change: two `\u` escapes, not one.
+        assert_eq!(
+            save_convert_units(&[0xD83D, 0xDE00], false, true),
+            "\\ud83d\\ude00"
+        );
+    }
+
+    /// The writer half. `create_property_string` sends well-formed text down
+    /// the unchanged `create_string` path and only reroutes what a `&str`
+    /// cannot carry — so this asserts the reroute actually preserves the unit,
+    /// read back through `lang_string::read_string_chars` rather than through
+    /// any `String`.
+    #[test]
+    fn create_property_string_materialises_an_unpaired_surrogate_intact() {
+        let mut ctx = mock_ctx();
+        let value = JavaText::from_units(vec![b'v' as u16, b'a' as u16, LO, b'b' as u16]);
+        let obj = create_property_string(&mut ctx, &value);
+        assert_eq!(
+            crate::lang_string::read_string_chars(&ctx, obj),
+            vec![b'v' as u16, b'a' as u16, LO, b'b' as u16],
+            "the value must come back with its unpaired low surrogate intact"
+        );
+    }
+
+    #[test]
+    fn create_property_string_leaves_well_formed_text_on_the_unchanged_path() {
+        let mut ctx = mock_ctx();
+        let obj = create_property_string(&mut ctx, &JavaText::from("v\u{1F600}b"));
+        assert_eq!(
+            crate::lang_string::read_string_chars(&ctx, obj),
+            vec![b'v' as u16, 0xD83D, 0xDE00, b'b' as u16]
+        );
+        // Well-formed content stays on `ctx.create_string`, so whatever
+        // identity/interning behaviour the green `Properties` vectors already
+        // measured is unchanged — the reroute is reached only by content a
+        // `&str` cannot carry.
+        assert!(!crate::lang_string::has_unpaired_surrogate(
+            JavaText::from("v\u{1F600}b").units()
+        ));
+    }
+
+    /// The reader half, on content a `&str` CAN carry — the mock's
+    /// `read_string` is stricter than the VM's (it refuses an unpaired
+    /// surrogate outright where the VM substitutes U+FFFD), so the guard, not
+    /// the decode, is what this pins.
+    #[test]
+    fn read_java_text_reads_units_and_refuses_a_non_string() {
+        let mut ctx = mock_ctx();
+        let s = ctx.create_string("k\u{00e9}");
+        assert_eq!(
+            read_java_text(&ctx, s).map(|t| t.units().to_vec()),
+            Some(vec![b'k' as u16, 0x00e9])
+        );
+        let not_a_string = ctx.alloc_object(ClassId::new(0), 2);
+        assert_eq!(read_java_text(&ctx, not_a_string), None);
     }
 
     #[test]
@@ -4601,7 +4963,7 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         bytes.push(0); // sanity: ensure Vec is mutable / well-formed
         bytes.pop();
-        let parsed = parse_properties(&iso_8859_1_bytes("name=café\n"));
+        let parsed = lossy(parse_properties(&iso_8859_1_bytes("name=café\n")));
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, "name");
         // `parse_properties` decodes 0xE9 back to U+00E9, so the

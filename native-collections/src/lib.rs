@@ -3487,6 +3487,68 @@ fn display_array_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
 
 /// Unbox a wrapper object (Integer, Long, Boolean, etc.) to its primitive Value.
 /// Returns None if the object is not a recognized JDK wrapper type.
+/// True when a `read_string` decode is a FAITHFUL rendering of the receiver's
+/// UTF-16 code units.
+///
+/// A Rust `str` cannot hold an unpaired surrogate, so the VM's reader
+/// substitutes `U+FFFD` for one. Text containing no `U+FFFD` therefore provably
+/// survived the decode; text containing one may be a genuine `U+FFFD` OR a
+/// mangled surrogate, and no `&str`-level comparison can tell those apart.
+///
+/// This crate cannot read code units — `native-collections` has no dependency
+/// on `native-builtins`, whose `lang_string::read_string_chars` is the
+/// units-preserving reader, and adding a second decoder here would be a second
+/// encoding of one concept. So every place that must decide something about
+/// Java text from a `&str` is gated on this predicate and REFUSES rather than
+/// guesses, handing the decision to the units-exact path instead
+/// (`java_strings_equal` / `java_string_hash_code` / a real `compareTo`
+/// dispatch). The two failure modes it closes were both MEASURED against
+/// HotSpot 25 on 2026-08-17: a `TreeSet` that silently merged two distinct
+/// keys, and a `contains` that answered "found" for a string the collection
+/// never held.
+fn decode_is_faithful(text: &str) -> bool {
+    !text.contains('\u{FFFD}')
+}
+
+/// Compare two DECODED Java strings the way `String.compareTo` compares them —
+/// by UTF-16 code unit — or refuse.
+///
+/// `None` means "this comparison was not made": one of the decodes may have
+/// destroyed an unpaired surrogate (see [`decode_is_faithful`]), and two keys
+/// mangled to the same `U+FFFD` text would compare EQUAL, which is how a
+/// natural-order `TreeSet`/`TreeMap` silently drops one of two distinct
+/// elements. The caller must fall back to dispatching the receiver's own
+/// `compareTo`.
+///
+/// The unit comparison is not the same as `str::cmp`, which orders by code
+/// POINT. They disagree above the BMP: a supplementary character starts with a
+/// surrogate unit in `0xD800..=0xDBFF`, below `U+E000..=U+FFFF`, while its code
+/// point is above them. MEASURED on both VMs 2026-08-17: a `TreeSet` of
+/// `{U+10000, U+E000, U+FFFF}` enumerates `[U+10000, U+E000, U+FFFF]` on
+/// HotSpot; `str::cmp` put `U+10000` last.
+fn compare_decoded_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    if !decode_is_faithful(a) || !decode_is_faithful(b) {
+        return None;
+    }
+    Some(a.encode_utf16().cmp(b.encode_utf16()))
+}
+
+/// Build a fast-mode [`TreeKey`] from a DECODED Java string, or refuse.
+///
+/// Same rule as [`compare_decoded_strings`], for the representation rather than
+/// the comparison: a key whose decode may have lost an unpaired surrogate
+/// cannot be stored faithfully, and two such keys would collapse into ONE
+/// `BTreeMap` entry (MEASURED 2026-08-17: `TreeMap.size()` 1 where HotSpot says
+/// 2, with the survivor's value answered for both keys). Refusing sends the
+/// caller to the array path, which keeps the real `ObjectRef` and runs the
+/// receiver's own units-exact `String.compareTo`.
+fn tree_key_from_decoded_string(text: &str) -> Option<TreeKey> {
+    if !decode_is_faithful(text) {
+        return None;
+    }
+    Some(TreeKey::Str(text.encode_utf16().collect()))
+}
+
 fn unbox_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Value> {
     if let Some(result) = ctx.fast_unbox_primitive_wrapper(obj) {
         return result;
@@ -3565,9 +3627,18 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
             if std::ptr::eq(oa.as_ptr(), ob.as_ptr()) {
                 return true;
             }
-            // String value equality
-            if let (Some(sa), Some(sb)) = (ctx.read_string(*oa), ctx.read_string(*ob)) {
-                return sa == sb;
+            // String value equality, asked of the VM so it compares code units.
+            //
+            // This was `read_string(a) == read_string(b)`, and a Rust `str`
+            // cannot hold an unpaired UTF-16 surrogate: both operands decoded
+            // to `U+FFFD` and compared EQUAL. MEASURED 2026-08-17 against
+            // HotSpot 25 — `list.contains`, `list.indexOf`, `Deque.contains`
+            // and `Map.containsValue` all answered "found" for a string that
+            // differs from the stored one in exactly the way `String.equals`
+            // calls different. A false positive, not a miss, so nothing
+            // downstream had any way to notice.
+            if let Some(equal) = ctx.java_strings_equal(*oa, *ob) {
+                return equal;
             }
             // Enum constants: compare by (declaring class, ordinal) so an
             // enum-keyed List/Set still finds a member when the VM produced a
@@ -8990,12 +9061,16 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> Result<i32, Meth
             Ok((bits ^ (bits >> 32)) as i32)
         }
         Value::Object(Some(obj)) => {
-            // String hashCode by value (UTF-16 code units, wrapping mul+add).
-            if let Some(s) = ctx.read_string(*obj) {
-                let mut h: i32 = 0;
-                for cu in s.encode_utf16() {
-                    h = h.wrapping_mul(31).wrapping_add(cu as i32);
-                }
+            // String hashCode by value, asked of the VM so it is computed from
+            // the receiver's own UTF-16 storage. Decoding to a Rust `String`
+            // first and re-encoding — what this did — turns every unpaired
+            // surrogate into `U+FFFD` before the multiply-add ever runs, so a
+            // `Map`/`Set` holding such content reported a stable but WRONG
+            // aggregate hash (MEASURED 2026-08-17: `HashMap.hashCode()` 2124877
+            // where HotSpot says 1839336). `map_hash_key`, one screen up,
+            // already asks the same question this way; the two must not answer
+            // differently about the same String.
+            if let Some(h) = ctx.java_string_hash_code(*obj) {
                 return Ok(h);
             }
             // Primitive wrapper types hash by their boxed primitive value.
@@ -11292,6 +11367,30 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// case user code runs. String hash/equality are final, pure operations, so
 /// handling them here avoids that native-call machinery while preserving the
 /// exact Java `HashMap` hash spreading and content-equality contracts.
+///
+/// # Both operations are asked of the VM, not of a decoded `String`
+///
+/// This path used to derive the hash from `read_string(key).encode_utf16()` and
+/// compare node keys as decoded `&str`. A Rust `str` cannot hold an unpaired
+/// UTF-16 surrogate, so that decode substitutes `U+FFFD` — and the two halves
+/// of the resulting divergence are both silent:
+///
+///   * `put` files the entry under [`map_hash_key`], which asks
+///     `java_string_hash_code` and therefore uses the REAL units. `get` looked
+///     in the `U+FFFD` bucket. MEASURED on 2026-08-17: `m.put(k, v)` followed
+///     by `m.get(k)` — the *same object* — answered `null`. A map that accepts
+///     a key and then cannot find it again is the shape that corrupts an
+///     application without ever raising anything;
+///   * two DIFFERENT keys whose only difference is which unpaired surrogate
+///     they carry both decode to `U+FFFD`, so the `&str` comparison called
+///     them equal and the walk would have returned the wrong node.
+///
+/// `java_string_hash_code` and `java_strings_equal` answer from the receiver's
+/// own character storage, so both defects go away together — and the hash here
+/// is now literally the same call `map_hash_key` makes, which is what makes
+/// "`put` and `get` agree" structural rather than coincidental.
+/// `java_string_hash_code` also IS the "is this a `java.lang.String`" gate it
+/// replaces: the VM answers `None` for anything else.
 fn native_hashmap_get_string_fast(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -11300,13 +11399,18 @@ fn native_hashmap_get_string_fast(
     if let Some(value) = ctx.hashmap_string_node_cache_get_object(this, key) {
         return Some(Ok(Some(value)));
     }
-    let key_text = ctx.read_string(key)?;
-    if let Some(value) = ctx.hashmap_string_node_cache_get(this, &key_text) {
-        return Some(Ok(Some(value)));
-    }
-    let mut raw_hash: i32 = 0;
-    for unit in key_text.encode_utf16() {
-        raw_hash = raw_hash.wrapping_mul(31).wrapping_add(unit as i32);
+    let raw_hash = ctx.java_string_hash_code(key)?;
+    // The second memo is indexed by `&str`, so it may only be consulted for a
+    // key whose decoded text is FAITHFUL. A decode containing no `U+FFFD` is
+    // provably exact; one that does may be either a genuine `U+FFFD` or a
+    // mangled surrogate, and those two must never share a memo entry. Skipping
+    // the memo costs a chain walk; sharing it would resurrect the defect above
+    // one layer up.
+    let key_text = ctx.read_string(key).filter(|t| decode_is_faithful(t));
+    if let Some(text) = key_text.as_deref() {
+        if let Some(value) = ctx.hashmap_string_node_cache_get(this, text) {
+            return Some(Ok(Some(value)));
+        }
     }
     let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
     let (buckets, _, cap) = map_state(ctx, this);
@@ -11318,9 +11422,22 @@ fn native_hashmap_get_string_fast(
             return Some(Ok(Some(Value::Object(None))));
         };
         if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
-            if ctx.read_string(node_key).as_deref() == Some(key_text.as_str()) {
-                ctx.hashmap_string_node_cache_put(this, key, &key_text, node);
-                return Some(Ok(Some(get_node_value(ctx, node))));
+            match ctx.java_strings_equal(node_key, key) {
+                Some(true) => {
+                    if let Some(text) = key_text.as_deref() {
+                        ctx.hashmap_string_node_cache_put(this, key, text, node);
+                    }
+                    return Some(Ok(Some(get_node_value(ctx, node))));
+                }
+                Some(false) => {}
+                // A chain node whose key this comparison could not read is a
+                // lookup this fast path did not make. Hand the whole thing back
+                // to the general equality ladder — answering "absent" for a
+                // pair that was never compared is the mistake
+                // `chm-get-misses-stored-key-in-process-RETIRED-20260804.md`
+                // records, and `native_chm_get_string_chain` refuses the same
+                // way.
+                None => return None,
             }
         }
         node_value = ctx.get_field(node, NODE_FIELD_NEXT);
@@ -33065,11 +33182,28 @@ fn double_compare(a: f64, b: f64) -> i32 {
 fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodCallResult {
     match (a, b) {
         (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
-            // Try string comparison first
+            // Try string comparison first.
+            //
+            // By UTF-16 code UNIT, which is what `String.compareTo` compares —
+            // NOT `String::cmp`, which compares code points. The two disagree
+            // above the BMP: a supplementary character begins with a surrogate
+            // unit below `U+E000`, so Java sorts it BEFORE `U+E000..=U+FFFF`
+            // and Rust sorts it after (MEASURED both VMs, `G55Ord.java`; see
+            // `TreeKey`).
+            //
+            // And a decode that produced `U+FFFD` may have destroyed an
+            // unpaired surrogate, in which case this comparison is not ours to
+            // make: fall through to the real `Comparable.compareTo` dispatch at
+            // the bottom, which runs the receiver's own units-exact
+            // `String.compareTo`. Two keys mangled to the same `U+FFFD` text
+            // would otherwise compare EQUAL and a natural-order
+            // `TreeSet`/`TreeMap` would silently drop one of them.
             let sa = ctx.read_string(*ra);
             let sb = ctx.read_string(*rb);
-            if let (Some(sa), Some(sb)) = (sa, sb) {
-                return Ok(Some(Value::Int(sa.cmp(&sb) as i32)));
+            if let (Some(sa), Some(sb)) = (&sa, &sb) {
+                if let Some(ord) = compare_decoded_strings(sa, sb) {
+                    return Ok(Some(Value::Int(ord as i32)));
+                }
             }
             // Try as primitive wrapper: unbox BOTH receivers and compare the
             // boxed primitives. CRITICAL — gate on `unbox_wrapper` (a SINGLE
@@ -42271,9 +42405,20 @@ const TM_DEFAULT_CAPACITY: usize = 16; // initial entry slots (array len = 32)
 /// (ClassCastException Integer→Character on `Locale.forLanguageTag`). The
 /// per-variant in-memory representation matches each wrapper's natural
 /// `compareTo`: `Char` is unsigned (u16), `Byte`/`Short` are signed.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `Str` holds UTF-16 code UNITS, not a Rust `String`, because
+/// `String.compareTo` compares code units and `String`'s `Ord` compares code
+/// POINTS. Those disagree above the BMP: a supplementary character starts with
+/// a surrogate unit in `0xD800..=0xDBFF`, which is BELOW `U+E000..=U+FFFF`,
+/// where its code point is above them. MEASURED on both VMs 2026-08-17
+/// (`scratchpad/g55/G55Ord.java`): a `TreeSet` of
+/// `{U+10000, U+E000, U+FFFF}` enumerates `[U+10000, U+E000, U+FFFF]` on
+/// HotSpot and enumerated `[U+E000, U+FFFF, U+10000]` here — `firstKey()` and
+/// `lastKey()` both wrong, for ordinary emoji/CJK-ext keys with no surrogate
+/// exotica involved. `Vec<u16>`'s lexicographic `Ord` IS `String.compareTo`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TreeKey {
-    Str(String),
+    Str(Vec<u16>),
     I32(i32),
     I64(i64),
     Char(u16),
@@ -42291,9 +42436,22 @@ fn tree_key_from_value(ctx: &dyn NativeContext, v: &Value) -> Option<TreeKey> {
         Value::Int(i) => Some(TreeKey::I32(*i)),
         Value::Long(l) => Some(TreeKey::I64(*l)),
         Value::Object(Some(o)) => {
-            // String fast path
+            // String fast path.
+            //
+            // `read_string` is the only String reader this crate has, and it
+            // substitutes `U+FFFD` for an unpaired surrogate — so a key that
+            // carries one cannot be represented here faithfully, and two keys
+            // that differ only in WHICH one they carry would collapse into a
+            // single tree entry (MEASURED 2026-08-17: `TreeMap.size()` 1 where
+            // HotSpot says 2, with the survivor's value answered for both
+            // keys). A decode containing no `U+FFFD` is provably exact; one
+            // that does is REFUSED, and the caller falls back to the array
+            // path, which keeps the real `ObjectRef` and runs the receiver's
+            // own units-exact `String.compareTo`. That is slower and correct,
+            // which is the right trade for content this representation cannot
+            // hold.
             if let Some(s) = ctx.read_string(*o) {
-                return Some(TreeKey::Str(s));
+                return tree_key_from_decoded_string(&s);
             }
             // Boxed primitive wrappers: field 0 holds the value. The wrapper
             // CLASS selects the variant so the key reboxes to its original
@@ -43427,7 +43585,13 @@ fn tree_key_to_value(ctx: &mut dyn NativeContext, k: &TreeKey) -> Value {
             .unwrap_or(Value::Object(None))
     };
     match k {
-        TreeKey::Str(s) => Value::Object(Some(ctx.create_string(s))),
+        // `tree_key_from_value` refuses any String whose decode was lossy, so
+        // every `Str` here re-encodes to exactly the text it came from and
+        // `from_utf16_lossy` is lossless in practice for these units.
+        TreeKey::Str(units) => {
+            let text = String::from_utf16_lossy(units);
+            Value::Object(Some(ctx.create_string(&text)))
+        }
         TreeKey::I32(i) => box_via(
             ctx,
             "java/lang/Integer",
@@ -62824,7 +62988,7 @@ pub fn __test_tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
 #[doc(hidden)]
 pub fn __test_tm_fast_put_str(ctx: &dyn NativeContext, this: ObjectRef, key: &str, value: Value) {
     tm_fast_with(ctx, this, |bt| {
-        bt.insert(TreeKey::Str(key.to_string()), value);
+        bt.insert(TreeKey::Str(key.encode_utf16().collect()), value);
     });
 }
 /// Fast-mode TreeMap side-table read shim. Mirror of
@@ -62832,7 +62996,7 @@ pub fn __test_tm_fast_put_str(ctx: &dyn NativeContext, this: ObjectRef, key: &st
 #[doc(hidden)]
 pub fn __test_tm_fast_get_str(ctx: &dyn NativeContext, this: ObjectRef, key: &str) -> Value {
     tm_fast_with(ctx, this, |bt| {
-        bt.get(&TreeKey::Str(key.to_string()))
+        bt.get(&TreeKey::Str(key.encode_utf16().collect()))
             .copied()
             .unwrap_or(Value::Object(None))
     })
@@ -65072,6 +65236,14 @@ mod tests {
             vm_id: usize,
             next_ptr: usize,
             monitors: HashMap<usize, Arc<ObjMonitor>>,
+            /// Modelled `java.lang.String` content, as UTF-16 code UNITS.
+            ///
+            /// Empty by default, which reproduces the previous always-`None`
+            /// `read_string` stub: an object nothing called `define_string` for
+            /// is simply not a String. Units rather than `String` because the
+            /// whole point of the tests that use it is content a Rust `str`
+            /// cannot hold.
+            strings: HashMap<usize, Vec<u16>>,
         }
 
         impl Shared {
@@ -65089,6 +65261,7 @@ mod tests {
                     vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     next_ptr: 8,
                     monitors: HashMap::new(),
+                    strings: HashMap::new(),
                 }
             }
 
@@ -65156,6 +65329,27 @@ mod tests {
                     .unwrap()
                     .class_names
                     .insert(class_id, name.to_string());
+            }
+
+            /// Allocate a modelled `java.lang.String` holding exactly `units`.
+            ///
+            /// The units are the point: a test that builds its fixture from a
+            /// Rust `&str` cannot express an unpaired surrogate at all, and a
+            /// test that then reads it back through `read_string` PASSES ON THE
+            /// BROKEN CODE, because `U+FFFD == U+FFFD`.
+            pub(super) fn define_string(&self, units: &[u16]) -> ObjectRef {
+                let cid = ClassId::new(9_001);
+                self.define_class(cid, "java/lang/String");
+                let mut s = self.shared.lock().unwrap();
+                // Two fields, so `unbox_wrapper`'s one-field probe cannot
+                // mistake a String for a boxed primitive.
+                let obj = s.alloc_entry(HeapEntry::Object {
+                    fields: vec![Value::Int(0); 2],
+                });
+                let ptr = obj.as_ptr() as usize;
+                s.object_classes.insert(ptr, cid);
+                s.strings.insert(ptr, units.to_vec());
+                obj
             }
 
             /// Record `child extends parent`, so `superclass_of` walks.
@@ -65536,8 +65730,34 @@ mod tests {
                 let mut s = self.shared.lock().unwrap();
                 s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
             }
-            fn read_string(&self, _o: ObjectRef) -> Option<String> {
-                None
+            /// LOSSY, exactly as the VM's reader is: an unpaired surrogate
+            /// comes back as `U+FFFD` rather than refusing. That fidelity is
+            /// what lets a test demonstrate the mangling the units-exact
+            /// primitives below avoid.
+            fn read_string(&self, o: ObjectRef) -> Option<String> {
+                let s = self.shared.lock().unwrap();
+                let units = s.strings.get(&(o.as_ptr() as usize))?;
+                Some(String::from_utf16_lossy(units))
+            }
+            /// Answered from the modelled UNITS, as the VM answers it from the
+            /// receiver's own character storage.
+            fn java_string_hash_code(&self, o: ObjectRef) -> Option<i32> {
+                let s = self.shared.lock().unwrap();
+                let units = s.strings.get(&(o.as_ptr() as usize))?;
+                Some(
+                    units
+                        .iter()
+                        .fold(0i32, |h, &u| h.wrapping_mul(31).wrapping_add(u as i32)),
+                )
+            }
+            /// `None` means "not compared" — an operand is not a String — which
+            /// is the contract every caller in this file relies on to fall back
+            /// rather than answer "not equal".
+            fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
+                let s = self.shared.lock().unwrap();
+                let ua = s.strings.get(&(a.as_ptr() as usize))?;
+                let ub = s.strings.get(&(b.as_ptr() as usize))?;
+                Some(ua == ub)
             }
             fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
@@ -65718,6 +65938,244 @@ mod tests {
             fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
                 None
             }
+        }
+
+        // ------------------------------------------------------------------
+        // G55-1 — the key the map could not find again.
+        //
+        // MEASURED against Adoptium 25.0.3+9-hotspot on 2026-08-17
+        // (`scratchpad/g55/G55Probe.java`, 158 rows; `G55Fp.java`; `G55Ord.java`).
+        // A Rust `str` cannot hold an unpaired UTF-16 surrogate, so every
+        // `read_string`-derived hash or comparison in this file silently
+        // rewrote one to `U+FFFD`. Three consequences, all measured:
+        //
+        //   * `HashMap.get` / `Hashtable.get` returned `null` for the SAME
+        //     `String` object the map was just given — `put` filed it under
+        //     `map_hash_key` (units), `get` looked in the `U+FFFD` bucket;
+        //   * `List.contains` / `indexOf`, `Deque.contains` and
+        //     `Map.containsValue` answered "found" for a string that differs
+        //     from the stored one exactly where `String.equals` says different;
+        //   * `Map.hashCode()` / `Set.hashCode()` came out stable and wrong.
+        //
+        // Every assertion below is written in UTF-16 UNITS. Written through
+        // `read_string` they all PASS ON THE BROKEN CODE, because two mangled
+        // strings are equal to each other — which is precisely how this class
+        // of defect survives review.
+        // ------------------------------------------------------------------
+
+        const HI: u16 = 0xD800; // unpaired high surrogate
+        const LO: u16 = 0xDC00; // unpaired low surrogate
+
+        fn java_hash(units: &[u16]) -> i32 {
+            units
+                .iter()
+                .fold(0i32, |h, &u| h.wrapping_mul(31).wrapping_add(u as i32))
+        }
+
+        fn spread(raw: i32) -> i32 {
+            raw ^ ((raw as u32) >> 16) as i32
+        }
+
+        /// The bucket half of the silent miss. `put` hashes through
+        /// `map_hash_key`; the `get` fast path used to hash the DECODED text.
+        /// Pin that both are the receiver's own units, so the two cannot drift
+        /// apart again — and that the number is genuinely different from the
+        /// `U+FFFD` one, or the test would prove nothing.
+        #[test]
+        fn a_lone_surrogate_key_hashes_by_its_units_not_by_a_replacement_char() {
+            let mut ctx = MockCtx::new(1);
+            let key = ctx.define_string(&[b'k' as u16, HI]);
+
+            let units_hash = java_hash(&[b'k' as u16, HI]);
+            let mangled_hash = java_hash(&[b'k' as u16, 0xFFFD]);
+            assert_ne!(
+                units_hash, mangled_hash,
+                "fixture check: the two hashes must differ or nothing below is a test"
+            );
+
+            assert_eq!(ctx.java_string_hash_code(key), Some(units_hash));
+            assert_eq!(
+                map_hash_key(&mut ctx, key).unwrap(),
+                spread(units_hash),
+                "the bucket `put` files this key under"
+            );
+            assert_eq!(
+                element_hash_code(&mut ctx, &Value::Object(Some(key))).unwrap(),
+                units_hash,
+                "the raw hash the Map/Set hashCode contracts aggregate"
+            );
+        }
+
+        /// The equality half. Two keys that differ only in WHICH unpaired
+        /// surrogate they carry are different keys — and their decoded text is
+        /// identical, which is why a `&str` comparison called them equal.
+        #[test]
+        fn two_different_lone_surrogates_are_not_the_same_key_or_the_same_value() {
+            let mut ctx = MockCtx::new(1);
+            let high = ctx.define_string(&[b'a' as u16, HI, b'b' as u16]);
+            let low = ctx.define_string(&[b'a' as u16, LO, b'b' as u16]);
+
+            assert_eq!(
+                ctx.read_string(high),
+                ctx.read_string(low),
+                "fixture check: the DECODED forms are equal — this is the trap"
+            );
+
+            assert!(
+                !map_keys_equal(&mut ctx, high, low).unwrap(),
+                "HashMap must keep two distinct surrogate keys apart"
+            );
+            assert!(
+                !values_equal(&ctx, &Value::Object(Some(high)), &Value::Object(Some(low))),
+                "List.contains / Deque.contains / Map.containsValue must not \
+                 report a match for a value the collection does not hold"
+            );
+            assert_ne!(
+                map_hash_key(&mut ctx, high).unwrap(),
+                map_hash_key(&mut ctx, low).unwrap()
+            );
+        }
+
+        /// The other direction, so the test above cannot be satisfied by a
+        /// comparison that always answers "not equal": two DISTINCT objects
+        /// with the same units are still the same key and the same value.
+        #[test]
+        fn two_equal_lone_surrogate_strings_are_still_equal() {
+            let mut ctx = MockCtx::new(1);
+            let a = ctx.define_string(&[b'a' as u16, LO, b'b' as u16]);
+            let b = ctx.define_string(&[b'a' as u16, LO, b'b' as u16]);
+            assert_ne!(a.as_ptr(), b.as_ptr(), "fixture check: two objects");
+            assert!(map_keys_equal(&mut ctx, a, b).unwrap());
+            assert!(values_equal(
+                &ctx,
+                &Value::Object(Some(a)),
+                &Value::Object(Some(b))
+            ));
+            assert_eq!(
+                map_hash_key(&mut ctx, a).unwrap(),
+                map_hash_key(&mut ctx, b).unwrap()
+            );
+        }
+
+        /// `java_strings_equal` answering `None` means "not compared", and a
+        /// caller must fall through rather than conclude "not equal". A String
+        /// against a non-String must still reach the rest of the ladder.
+        #[test]
+        fn a_string_compared_against_a_non_string_falls_through_rather_than_deciding() {
+            let mut ctx = MockCtx::new(1);
+            let text = ctx.define_string(&[b'1' as u16]);
+            let not_a_string = ctx.alloc_object(ClassId::new(7001), 2);
+            assert_eq!(ctx.java_strings_equal(text, not_a_string), None);
+            assert!(!values_equal(
+                &ctx,
+                &Value::Object(Some(text)),
+                &Value::Object(Some(not_a_string))
+            ));
+        }
+
+        /// The fast-mode TreeMap key. A decode that may have lost a surrogate
+        /// is REFUSED, so the caller keeps the real object and the receiver's
+        /// own `compareTo` decides — rather than two distinct keys collapsing
+        /// into one `BTreeMap` entry.
+        #[test]
+        fn tree_key_refuses_a_string_whose_decode_may_have_lost_a_surrogate() {
+            let ctx = MockCtx::new(1);
+            let lone = ctx.define_string(&[HI]);
+            assert!(
+                tree_key_from_value(&ctx, &Value::Object(Some(lone))).is_none(),
+                "an unrepresentable key must fall back to the compareTo path, \
+                 not be stored under its U+FFFD rendering"
+            );
+            // A well-formed supplementary character is representable and IS
+            // taken — refusing everything would be a different defect.
+            let supplementary = ctx.define_string(&[0xD800, 0xDC00]);
+            assert_eq!(
+                tree_key_from_value(&ctx, &Value::Object(Some(supplementary))),
+                Some(TreeKey::Str(vec![0xD800, 0xDC00]))
+            );
+        }
+
+        /// `String.compareTo` is by code UNIT. `str::cmp` is by code POINT, and
+        /// the two disagree above the BMP — which is an ordinary emoji/CJK-ext
+        /// key, not surrogate exotica. MEASURED on both VMs: HotSpot enumerates
+        /// `[U+10000, U+E000, U+FFFF]`; this crate used to enumerate
+        /// `[U+E000, U+FFFF, U+10000]`.
+        #[test]
+        fn tree_keys_order_by_code_unit_where_a_rust_string_orders_by_code_point() {
+            let supplementary = TreeKey::Str("\u{10000}".encode_utf16().collect());
+            let e000 = TreeKey::Str(vec![0xE000]);
+            let ffff = TreeKey::Str(vec![0xFFFF]);
+            let mut bt = std::collections::BTreeMap::new();
+            bt.insert(ffff.clone(), 3);
+            bt.insert(e000.clone(), 2);
+            bt.insert(supplementary.clone(), 1);
+            let order: Vec<i32> = bt.values().copied().collect();
+            assert_eq!(
+                order,
+                vec![1, 2, 3],
+                "the supplementary key sorts FIRST, as HotSpot orders it"
+            );
+            assert!(
+                "\u{10000}".to_string() > "\u{FFFF}".to_string(),
+                "...and a Rust String would have sorted it LAST"
+            );
+        }
+
+        /// Two lone surrogates are two tree keys, not one.
+        #[test]
+        fn tree_keys_keep_two_lone_surrogates_apart() {
+            let mut bt = std::collections::BTreeMap::new();
+            bt.insert(TreeKey::Str(vec![HI]), "high");
+            bt.insert(TreeKey::Str(vec![LO]), "low");
+            assert_eq!(bt.len(), 2);
+            assert_eq!(bt.get(&TreeKey::Str(vec![HI])), Some(&"high"));
+            assert_eq!(bt.get(&TreeKey::Str(vec![LO])), Some(&"low"));
+        }
+
+        /// The two extracted rules, directly. One predicate, two callers — a
+        /// second spelling of "was this decode faithful" is how the two would
+        /// drift.
+        #[test]
+        fn the_faithful_decode_rule_gates_both_the_key_and_the_comparison() {
+            assert!(decode_is_faithful("plain"));
+            assert!(
+                decode_is_faithful("\u{1F600}"),
+                "a well-formed pair is fine"
+            );
+            assert!(!decode_is_faithful("a\u{FFFD}b"));
+
+            assert_eq!(tree_key_from_decoded_string("a\u{FFFD}b"), None);
+            assert_eq!(
+                tree_key_from_decoded_string("ab"),
+                Some(TreeKey::Str(vec![b'a' as u16, b'b' as u16]))
+            );
+
+            assert_eq!(compare_decoded_strings("a\u{FFFD}", "b"), None);
+            assert_eq!(compare_decoded_strings("b", "a\u{FFFD}"), None);
+            assert_eq!(
+                compare_decoded_strings("\u{10000}", "\u{FFFF}"),
+                Some(std::cmp::Ordering::Less),
+                "code-unit order, not code-point order"
+            );
+            assert_eq!(
+                compare_decoded_strings("a", "a"),
+                Some(std::cmp::Ordering::Equal)
+            );
+        }
+
+        /// The array-path comparator, end to end through `natural_compare`.
+        #[test]
+        fn natural_compare_puts_a_supplementary_string_before_u_ffff() {
+            let mut ctx = MockCtx::new(1);
+            let supplementary = ctx.define_string(&[0xD800, 0xDC00]);
+            let ffff = ctx.define_string(&[0xFFFF]);
+            let got = natural_compare(
+                &mut ctx,
+                &Value::Object(Some(supplementary)),
+                &Value::Object(Some(ffff)),
+            )
+            .unwrap();
+            assert_eq!(got, Some(Value::Int(-1)));
         }
 
         #[test]
