@@ -971,6 +971,16 @@ impl VmHeap {
     // =====================================================================
 
     pub fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        // `CRATONVM_DBG_VACATED_FRAMES`: is the RECEIVER of this read an
+        // address the collector moved an object away from?
+        //
+        // This is the consumption point neither the stack-push nor the
+        // frame-local detector can see, and the one the H2 residual's surviving
+        // witnesses point at: a stale receiver makes every field read off it
+        // return whatever now occupies that memory — a perfectly VALID object
+        // of the wrong class, which is why the value being pushed looks clean
+        // and the `checkcast` one instruction later does not.
+        crate::gc_quiescence::report_vacated_receiver(obj.as_ptr() as usize, "get_field");
         dispatch!(self, get_field(obj, index))
     }
 

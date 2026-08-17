@@ -1937,6 +1937,40 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     *dests = to;
 }
 
+/// Report a heap access whose RECEIVER is an address this collector moved an
+/// object away from, with the Rust caller chain.
+///
+/// A stale receiver is worse than a stale value: every field read off it
+/// returns whatever now occupies the memory, which is a perfectly valid object
+/// of an unrelated class. The value that reaches the operand stack therefore
+/// looks clean to every other instrument, and only the `checkcast` one
+/// instruction later disagrees.
+#[inline(always)]
+pub fn report_vacated_receiver(addr: usize, site: &'static str) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    if let Some(moved_to) = was_vacated(addr) {
+        report_vacated_receiver_cold(addr, moved_to, site);
+    }
+}
+
+#[cold]
+fn report_vacated_receiver_cold(addr: usize, moved_to: usize, site: &'static str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 12 {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        moved_to = format!("{moved_to:#x}"),
+        site,
+        backtrace = %std::backtrace::Backtrace::force_capture(),
+        "a heap access RECEIVER is an address the collector moved an object away from —          every field read through it returns whatever now occupies that memory. The          backtrace names the VM code holding it."
+    );
+}
+
 /// Forget every address in `addrs` — the allocator has re-issued it, so a
 /// reference to it is no longer evidence of anything. Called from the
 /// allocation paths; a no-op unless the ledger is armed.
