@@ -1158,7 +1158,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_METRICS` | JIT | `CRATONVM_JIT=metrics` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_METRICS_OUT` | JIT | `CRATONVM_JIT=metrics-out` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_METRICS_RING` | JIT | `CRATONVM_JIT=metrics-ring` | opt-in | off | behaviour | snapshot | jit, types |
-| `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH` | JIT | `CRATONVM_JIT=mic-exc-table-publish` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH` | JIT | `CRATONVM_JIT=mic-exc-table-publish` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_MY_SCRATCH_FLUSH` | JIT | `CRATONVM_JIT=my-scratch-flush` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_MY_SELFCALL_PROOF` | JIT | `CRATONVM_JIT=my-selfcall-proof` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_MY_SHADOW_EMISSION` | JIT | `CRATONVM_JIT=my-shadow-emission` | default-on | on | behaviour | snapshot | jit, vm |

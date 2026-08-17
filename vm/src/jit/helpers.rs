@@ -2358,48 +2358,72 @@ fn site_alias_detect_enabled() -> bool {
 }
 
 /// May a callee that declares an exception table be published into the
-/// machine-code MIC/PIC after all?
+/// machine-code MIC/PIC? **Yes, by default since 2026-08-17.**
 ///
-/// The ban exists because the inline cascade in `jit/src/x64.rs` CALLs the
+/// The ban existed because the inline cascade in `jit/src/x64.rs` CALLs the
 /// cached entry directly, so an `i64::MIN` deopt/exception sentinel from the
 /// callee had no Rust frame to notice it and route it through the *callee's*
 /// own exception table — it surfaced at the caller's epilogue as the caller's
 /// own deopt.
 ///
 /// That hole is closed. `Compiler::emit_inline_callee_deopt_check` is emitted
-/// after **every** inline direct-entry CALL (both PIC slots and the MIC arm)
-/// and hands a sentinel to `jit_service_callee_deopt`, which is a thin wrapper
-/// over the same [`handle_compiled_callee_deopt_sentinel`] every helper arm
-/// uses. It landed later, for the H2 `MVMap`/`DataType.read` case, and the ban
-/// was never revisited against it. Cost on the hit path is a `MOV imm64` +
-/// `CMP` + a not-taken `JNE`.
+/// after **every** inline direct-entry CALL (both PIC slots and the MIC arm,
+/// and the megamorphic hashed stub's `emit_callee_deopt_check` twin) and hands
+/// the sentinel to `jit_service_callee_deopt`, a thin wrapper over the same
+/// [`handle_compiled_callee_deopt_sentinel`] every helper arm uses. It landed
+/// later, for the H2 `MVMap`/`DataType.read` case, and the ban was never
+/// revisited against it.
 ///
-/// Keeping the ban is not free: nothing ever writes the MIC's class id for
-/// such a callee, so *every* call to it lands in the cache-miss arm — a
-/// compile probe, an exception-table probe and `invoke_or_native`, forever.
-/// That is the whole of doc 23's residual `LazyCsCache` gap
-/// (`probes/LazyArmVariants.java` V7 vs V8: identical delegates differing only
-/// by a never-taken `try`/`catch`, 8362 vs 45613 ns/op at ten threads).
+/// **The mechanism is measured, not assumed.** `probes/CalleeExceptionTable/// SemanticsProbe.java` drives six exception-table callees (implicit AIOOBE /
+/// NPE / divide, an explicit athrow, a table that does NOT cover what it
+/// throws, and a `finally`) through a monomorphic interface site, with every
+/// throwing call INSIDE the hot loop so it goes through the published cache.
+/// Four arms, one binary:
 ///
-/// **The ban is nevertheless kept ON by default**, because lifting it buys
-/// nothing measurable once the Rust-level cache above exists. A/B on one
-/// binary, three interleaved rounds on an idle host, ten threads
-/// (`probes/LazyArmVariants.java`, ns/op):
+/// | arm | result |
+/// |---|---|
+/// | HotSpot 25 (the oracle) | PASS |
+/// | ban kept | PASS |
+/// | ban lifted | PASS |
+/// | ban lifted + `CRATONVM_JIT_SP_IC_DEOPT_CHECK=0` | **`ArithmeticException` escapes `Div.apply`'s own `catch` to `main`** |
 ///
-/// | variant                | ban kept          | ban lifted        |
-/// |------------------------|-------------------|-------------------|
-/// | V0 real `CharsetCache` | 11545/9865/9683   | 9272/10737/9441   |
-/// | V8 delegate with `try` | 9705/9779/9855    | 8740/10229/9278   |
+/// The fourth arm is the point: deleting the sentinel check is the only way to
+/// make the lifted ban wrong, which is what says the check is what makes it
+/// right. `SP_IC_DEOPT_CHECK` is therefore an INTERLOCK below, not a separate
+/// knob — publishing while the check is suppressed is unsound, and `SkipVoid`
+/// suppresses it for exactly the void callees whose return register carries no
+/// value.
 ///
-/// Indistinguishable. Doc 23's own precedent applies: a change that carries a
-/// correctness risk for zero measured throughput does not land. What is
-/// recorded here is that the *reason* for the ban has expired, so the next
-/// person can lift it on evidence rather than re-deriving the argument —
-/// set `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1` to try.
+/// **What it buys.** `probes/NativeFunnelFloorProbe.java`, ABBA on one binary,
+/// two interleaved rounds, ns/op:
+///
+/// | rung | ban kept | ban lifted |
+/// |---|---:|---:|
+/// | interface call, callee has no exception table (control) | 15.75 / 15.91 | 15.65 / 15.60 |
+/// | interface call, callee has `try`/`catch` | **125.98 / 125.94** | **14.35 / 14.56** |
+///
+/// 8.7x, with the control rung unmoved — the whole Rust helper route measured
+/// against the inline cascade the callee was barred from. The older note here
+/// recorded the opposite ("indistinguishable") from `probes/LazyArmVariants.java`
+/// at ten threads; that probe measures a ten-thread lock-contention shape where
+/// the dispatch round trip is not the limiter, so it could not see this. Do not
+/// re-derive the ban from it.
+///
+/// `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=0` restores the ban.
 fn mic_publish_exception_table_callees() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH").is_some()
+        // INTERLOCK. `emit_inline_callee_deopt_check` is the entire reason
+        // publishing is sound; if the codegen is not emitting it at every
+        // direct-entry CALL, publishing must not happen. Pairing the two here
+        // means a future reader cannot turn one off and leave the other on.
+        if cratonvm_jit::sp_ic_deopt_check_mode() != cratonvm_jit::SpIcDeoptCheck::On {
+            return false;
+        }
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
 }
 
@@ -3278,15 +3302,27 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
     let Some((thread, _guard)) = jit_thread_mut() else {
         return i64::MIN;
     };
-    // The receiver's class id, for the callee-exception-table probe. `Object`
-    // arg 0 is the receiver for every invoke kind the inline cascade emits
-    // (virtual/interface); a non-object or absent arg 0 simply misses the
-    // probe, which then behaves as "no local handler".
-    let receiver_class_id = args_slice
-        .first()
-        .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
-        .map(|obj| vm.mem.heap.class_id_of_validated(obj))
-        .unwrap_or_else(|| ClassId::new(0));
+    // The receiver's class id, for the callee-exception-table probe.
+    //
+    // Only kinds 0/2 have one. For a statically bound site (`invokestatic` /
+    // `invokespecial`) arg 0 is an ordinary argument, and reading it as a
+    // receiver resolves the callee from whatever class that argument happens to
+    // point at — a different method with the same name and descriptor, or none.
+    // `route_implicit_exc_through_callee` and `resolve_callee_cached` both
+    // already branch on `invoke_kind` for exactly this reason; this arm did
+    // not, and the direct-call door (`x64/bytecode_walk.rs`, the
+    // `emit_inline_callee_deopt_check` after a baked `invokestatic` CALL) is a
+    // live caller of it. `ClassId::new(0)` is the "no receiver" value the
+    // callee-side probe below reads as "resolve by name".
+    let receiver_class_id = if matches!(info.invoke_kind, 0 | 2) {
+        args_slice
+            .first()
+            .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
+            .map(|obj| vm.mem.heap.class_id_of_validated(obj))
+            .unwrap_or_else(|| ClassId::new(0))
+    } else {
+        ClassId::new(0)
+    };
     match handle_compiled_callee_deopt_sentinel(vm, thread, info, receiver_class_id, args_slice) {
         Some(v) => v,
         None => {
@@ -3350,7 +3386,15 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     } else {
         usize::MAX
     };
-    let has_handler = mic_callee_has_exception_table(vm, receiver_class_id, info);
+    // Same split as `route_implicit_exc_through_callee`: resolve from the
+    // receiver for a virtual/interface site, by name for a statically bound
+    // one. Asking the receiver-based probe about an `invokestatic` callee reads
+    // arg 0 as a class, which is not one.
+    let has_handler = if matches!(info.invoke_kind, 0 | 2) {
+        mic_callee_has_exception_table(vm, receiver_class_id, info)
+    } else {
+        callee_has_exception_table(vm, info)
+    };
     if has_handler {
         if let Some(exc) = signals.exception {
             if let Ok(v) = try_run_callee_handler(

@@ -942,10 +942,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "metrics", on_key: Some("CRATONVM_JIT_METRICS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-out", on_key: Some("CRATONVM_JIT_METRICS_OUT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-ring", on_key: Some("CRATONVM_JIT_METRICS_RING"), off_key: None, off_word: None },
-    // The two virtual-MIC levers in `vm::jit::helpers`. `mic-exc-table-publish`
-    // is default-OFF (an expired ban the next person may lift on evidence);
-    // `mic-rust-entry-cache` is default-ON with only an opt-out spelling.
-    E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
+    // The two virtual-MIC levers in `vm::jit::helpers`. Both are default-ON.
+    // `mic-exc-table-publish` was default-OFF until 2026-08-17: the ban's stated
+    // reason had already expired (`emit_inline_callee_deopt_check` closed the
+    // hole), and lifting it is 8.7x on the exception-table rung of
+    // `probes/NativeFunnelFloorProbe.java` with the control rung unmoved. It is
+    // INTERLOCKED with `sp-ic-deopt-check`: publishing is refused outright when
+    // that check is not being emitted, so `=0` on either one is safe.
+    E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
