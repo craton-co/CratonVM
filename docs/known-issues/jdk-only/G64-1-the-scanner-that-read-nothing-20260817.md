@@ -1,9 +1,23 @@
 # G64-1 — the Scanner that read nothing, and a duck test that could not quack
 
-**Status:** MEASURED (defect) / FIXED-PENDING-BUILD. **Provenance:** every row
+**Status:** MEASURED throughout, fix included (see the banner). **Provenance:** every row
 MEASURED on both VMs; oracle HotSpot 25.0.3+9-LTS, CratonVM
 `C:/craton/target-rel7` under `--jdk-only`. Probes:
 `scratchpad/g63/{Sweep3,ScanProbe,CbufProbe}.java`, ASCII labels only.
+
+> **MEASURED 2026-08-17 at `561e0b5b5`.** The fix is in a binary:
+> `new Scanner(new StringReader("hello world"))` now answers `hasNext() = true`
+> and `next() = "hello"`, matching HotSpot on all four probe rows.
+>
+> **A 29-row FUNCTIONAL sweep run at the same time is an EMPTY diff** —
+> `BufferedReader.readLine`/`lines`, `StringTokenizer`, eight `Stream`
+> collectors, `Comparator.comparing`, `Map.computeIfAbsent`/`merge`,
+> `EnumMap`/`EnumSet`, `BitSet`, `UUID`, seeded `Random`, `ArrayDeque` as a
+> stack, `ListIterator.set`, `Objects.requireNonNull` messages, overlapping
+> `System.arraycopy`, `Files` temp round-trip and `readAllLines`,
+> try-with-resources, `printf` width, `Iterator.remove`, `subList`, `TreeMap`
+> navigation and `Collections.unmodifiable`. **A clean sweep is a result too**,
+> and it is recorded here so the next person does not re-probe those 29.
 
 ---
 
