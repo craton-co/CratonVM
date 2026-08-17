@@ -180,7 +180,10 @@ public final class CalleeExceptionTableSemanticsProbe {
         check("Uncovered: min round body runs", uRunsBest, n);
         check("Uncovered: max round body runs", uRunsWorst, n);
 
-        // Finally: 1 + 1 + 1 + (-6), and the finally block runs on every call.
+        // Finally: `A` has length 1, so only i&3 == 0 reads in range; the other
+        // three indices (1, 2 and BAD == 9) all throw and are caught by the
+        // callee, giving 1 + (-6) + (-6) + (-6) per group of four. The finally
+        // block runs on every call, thrown or not.
         Op f = new Finally();
         BAD = 9;
         long fBest = Long.MAX_VALUE, fWorst = Long.MIN_VALUE;
@@ -192,8 +195,8 @@ public final class CalleeExceptionTableSemanticsProbe {
             finBest = Math.min(finBest, Finally.finallyRuns);
             finWorst = Math.max(finWorst, Finally.finallyRuns);
         }
-        check("Finally: min round accumulator", fBest, (long) q * (1 + 1 + 1 - 6));
-        check("Finally: max round accumulator", fWorst, (long) q * (1 + 1 + 1 - 6));
+        check("Finally: min round accumulator", fBest, (long) q * (1 - 6 - 6 - 6));
+        check("Finally: max round accumulator", fWorst, (long) q * (1 - 6 - 6 - 6));
         check("Finally: min round finally runs", finBest, n);
         check("Finally: max round finally runs", finWorst, n);
 
