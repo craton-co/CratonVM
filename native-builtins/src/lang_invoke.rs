@@ -150,12 +150,24 @@ fn vh_type_desc(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Cow<'static, str>
 /// table. Hot natives (`varhandle_get`/`_set`/`_compare_and_set`) call
 /// `vh_meta_get` exactly once and pass the bound `Arc` down to here, so a
 /// single VH op no longer pays 2–3 mutex traversals.
+///
+/// The single-character arm answers with a `&'static str` rather than an owned
+/// copy: it used to `clone()` the field descriptor, i.e. heap-allocate and
+/// free a one-byte `String` on **every** `VarHandle` get/set/CAS. The eight
+/// primitive descriptors are a closed set, so there is nothing to own.
 fn vh_type_desc_from_meta(meta: &VarHandleMeta) -> Cow<'static, str> {
-    if meta.field_desc.len() == 1 {
-        Cow::Owned(meta.field_desc.clone())
-    } else {
-        Cow::Borrowed(DESC_REF)
-    }
+    Cow::Borrowed(match meta.field_desc.as_bytes() {
+        [b'I'] => "I",
+        [b'J'] => "J",
+        [b'F'] => "F",
+        [b'D'] => "D",
+        [b'Z'] => "Z",
+        [b'B'] => "B",
+        [b'S'] => "S",
+        [b'C'] => "C",
+        [b'V'] => "V",
+        _ => DESC_REF,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +316,55 @@ pub(crate) fn vh_meta_get(
     let t = vh_meta_table().lock();
     // Refcount bump only — no per-field String clone.
     t.get(&key).cloned()
+}
+
+/// What a `VarHandle` access mode reduces to when the handle names an
+/// ordinary INSTANCE field whose slot is already resolved: one field read at
+/// `field_index`, decoded against `value_desc`.
+///
+/// Exposed so a caller that already holds the heap — the JIT's per-call-site
+/// native fast path — can serve `VarHandle.get` as a field load instead of
+/// entering the native funnel, allocating a wrapper for the erased `Object`
+/// return, and unboxing it straight back out. See
+/// `vm::jit::helpers::try_varhandle_instance_field_read` for the semantics it
+/// is obliged to keep, and the refusals it makes instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarHandleInstanceFieldPlan {
+    /// Slot in the receiver's field array.
+    pub field_index: u32,
+    /// Single-character value descriptor — `b'I'`, `b'J'`, `b'F'`, `b'D'`,
+    /// `b'Z'`, `b'B'`, `b'S'`, `b'C'`, or `b'L'` standing for any reference
+    /// (which is exactly the collapse `vh_type_desc_from_meta` performs
+    /// before handing the descriptor to `box_value`).
+    pub value_desc: u8,
+}
+
+/// Look a [`VarHandleInstanceFieldPlan`] up by the VarHandle's GC-stable
+/// identity hash — the same key [`vh_meta_get`] uses, so a handle this
+/// answers for is exactly a handle `varhandle_get` would have served from the
+/// side table.
+///
+/// `None` for every shape the plan cannot describe, and each of those is a
+/// case the funnel still has to run: a static-field handle, an array-element
+/// or byte-array/ByteBuffer-view handle (all distinct `kind`s), a handle
+/// whose field slot has not been resolved yet, and a `SegmentVarHandle`
+/// (a real JDK class, never in this table at all).
+pub fn varhandle_instance_field_plan(identity_hash: i32) -> Option<VarHandleInstanceFieldPlan> {
+    let table = vh_meta_table().lock();
+    let meta = table.get(&identity_hash)?;
+    if meta.kind != VH_KIND_INSTANCE || meta.field_index < 0 {
+        return None;
+    }
+    let bytes = meta.field_desc.as_bytes();
+    let value_desc = match bytes.first().copied()? {
+        c @ (b'I' | b'J' | b'F' | b'D' | b'Z' | b'B' | b'S' | b'C') if bytes.len() == 1 => c,
+        b'L' | b'[' => b'L',
+        _ => return None,
+    };
+    Some(VarHandleInstanceFieldPlan {
+        field_index: meta.field_index as u32,
+        value_desc,
+    })
 }
 
 pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: ObjectRef, idx: i32) {

@@ -1,10 +1,20 @@
 # `CertificateBuilderTest` "FAIL on all 3 collectors" is the documented FIXED state, not a reopening
 
-**Status: NOT A BUG — closing the question, no doc needed in the OPEN sense.**
+**Status: RETIRED 2026-08-17 — moved here from `docs/known-issues/` because
+there was never an open issue to hold there.** Its verdict below is unchanged
+and needed no fix: CratonVM's failing set for this class is byte-for-byte
+HotSpot 25's own, in both directions, and the alarming `FAIL` label is the
+suite runner reporting `failed > 0` for a class HotSpot itself fails 28 of.
+The page's value is that it stops the next reader re-opening the question, and
+it does that just as well from here. Re-verified only to the extent that
+nothing in the 2026-08-17 `VarHandle` work touches JCA certificate paths; the
+per-test diff below was not re-taken.
+
+**Status (as written): NOT A BUG — closing the question, no doc needed in the OPEN sense.**
 Written 2026-08-16/17, commit `3ef3eb744`, Windows host, `cratonvm.exe`
 release build, to head off future sessions re-investigating this as a
 reopening of
-`fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`.
+`../../fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`.
 
 Same shape as this session's sibling finding,
 `pemencodedtest-aborted-status-not-a-regression-20260816.md` — a different
@@ -58,10 +68,10 @@ be zero.
 
 ## Related
 
-- `fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`
+- `../../fixed-suite-bugs/netty/pkitesting-pqc-and-initverify-FIXED-20260813.md`
   — the fix this doc confirms is still holding, exactly.
-- `fixed-suite-bugs/netty/keypairgenerator-getinstance-accepts-any-algorithm-FIXED-20260813.md`
-  and `fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`
+- `../../fixed-suite-bugs/netty/keypairgenerator-getinstance-accepts-any-algorithm-FIXED-20260813.md`
+  and `../../fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`
   — the other two records read for this triage; neither's described symptoms
   (lenient `getInstance`, the `X509CertImpl.getAlgorithm()` receiver
   confusion, the Inet6/SHA-1-OID causes) reappear here — today's failing set
