@@ -2275,6 +2275,53 @@ pub fn register(r: &mut NativeMethodRegistry) {
         sig_get_provider_null,
     );
 
+    // `getParameters()` / `getParameter(String)`. Neither was registered, so
+    // both fell through to the real `java.security.Signature` bytecode, which
+    // calls `this.engineGetParameters()` — and `this` is a synthetic
+    // `java.security.Signature`, whose inherited `SignatureSpi.engineGetParameters`
+    // is `throw new UnsupportedOperationException()`. Every bc-java
+    // `SignatureSetParameterTest` case that reads back the context it had just
+    // set died there. The application SPI, when there is one, is the only thing
+    // that knows the answer; without one there are no parameters to report and
+    // `null` is the value the method is declared to return.
+    r.register(
+        cls,
+        "getParameters",
+        "()Ljava/security/AlgorithmParameters;",
+        |ctx, args| {
+            let this = this_arg(args)?;
+            if let Some(spi) = sig_user_spi_obj(ctx, this) {
+                return user_spi_call(
+                    ctx,
+                    spi,
+                    "engineGetParameters",
+                    "()Ljava/security/AlgorithmParameters;",
+                    &[],
+                );
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        cls,
+        "getParameter",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = this_arg(args)?;
+            if let Some(spi) = sig_user_spi_obj(ctx, this) {
+                let name = args.get(1).copied().unwrap_or(Value::Object(None));
+                return user_spi_call(
+                    ctx,
+                    spi,
+                    "engineGetParameter",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[name],
+                );
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
     r.register(
         cls,
         "setParameter",
