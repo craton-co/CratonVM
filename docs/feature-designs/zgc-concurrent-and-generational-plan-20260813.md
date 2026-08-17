@@ -339,6 +339,87 @@ alongside it.
 
 ---
 
+## 2b. What concurrent marking actually measured — 2026-08-16
+
+Interleaved, 3 reps per arm, 8-core Azure box, JIT on (so relocation was
+refused throughout, `relocation_skipped_jit`), `probes/ZgcConcMarkProbe.java`
+at `-Xmx900m` and `probes/ZgcConcMarkThreadsProbe.java` at `-Xmx1200m`.
+`mark=` and `cycles_started` were read on every row, so no arm is a
+did-it-even-run guess.
+
+| probe | arm | cycles | mean pause | median | wall clock |
+|---|---|---:|---:|---:|---:|
+| single-threaded | stop-the-world | 6 | 370 ms | 366 ms | 5.35 s |
+| single-threaded | concurrent, 1 worker | **12** | **230 ms** | 209 ms | 8.31 s |
+| single-threaded | concurrent, 2 workers | **12** | 254 ms | 233 ms | 9.70 s |
+| 8 mutator threads | stop-the-world | 3 | 609 ms | 599 ms | 11.8 s |
+| 8 mutator threads | concurrent, 1 worker | 5 | 388 ms | 325 ms | 16.8 s |
+| 8 mutator threads | concurrent, 2 workers | 5 | **253 ms** | 261 ms | 16.2 s |
+
+**Per-cycle pause falls 38–58%.** That is the property Phase C was written for
+and it is real: every concurrent row reports `mark=concurrent` on every cycle,
+and the multi-threaded arms report `black_allocations=16.5M`,
+`satb_replayed=4.1M`, `BAD=0` — the graph survived eight concurrent mutators
+with its self-tags intact.
+
+**Two things beside it say this is not a default.**
+
+* **The cycle count roughly doubles** (6 → 12, 3 → 5). Everything allocated
+  after mark start is floating garbage for that cycle, so each collection
+  reclaims less and the next arrives sooner. On the single-threaded probe that
+  turns a 38% per-cycle win into a **worse total pause** (2.22 s → 2.76 s); on
+  the multi-threaded one the total still improves (1.83 s → 1.27 s). A pause
+  measurement that quoted only the per-cycle figure would have hidden that,
+  which is why the cycle count is in the table.
+* **Wall clock rises 37–55%.** Two causes the arms can separate only partly:
+  the mark workers compete with mutators that already saturate the box (1
+  worker is cheaper than 2 on the single-threaded probe, where the mutator is
+  alone; 2 is cheaper than 1 on the multi-threaded one, where the marker has to
+  keep up), and the store and allocation paths grew work — 22.4M allocate-black
+  claims and 1.4M SATB publications on the single-threaded probe.
+
+**So it ships behind `CRATONVM_ZGC_CONC_START=60` and the default is `0`.**
+This tree shipped a ZGC marking feature default-ON verified only for
+correctness once already — parallel STW marking, 2026-08-14, +31% at one worker
+and +153% at four, reverted the same day. That lesson is written down in this
+very file (§C5's method note); this is it being followed rather than quoted.
+
+**What would move the default**, in the order the numbers point at:
+
+1. **The floating-garbage cost**, which is the one that turns a pause win into
+   a total-pause loss. A generational cycle (Phase G) is the structural answer;
+   a cheaper one is to start the cycle later, since the window only has to be
+   long enough to trace the live set once.
+2. **The per-allocation and per-store telemetry.** `conc_black_allocations` and
+   `mark_ingress_pushes` are `fetch_add`s on shared cache lines taken tens of
+   millions of times per run. Both are only counters; the second is also the
+   handoff trigger, and both are on the hottest paths in the VM.
+3. **C5's contention**, unchanged and still unaddressed: `ZMarkStripeSet` takes
+   a mutex per publish and per steal, and `visit_refs` clones an `Arc` out of an
+   `RwLock` for the reference skip set on **every object**.
+
+**Method note, again.** The first run of this measurement reported no
+difference between the arms — and it was measuring nothing: at `-Xmx1500m` the
+collection threshold is ~1125 MB and the whole workload allocated ~360 MB, so
+neither arm collected once. `cycles_started=0` in the summary is what caught
+it; a pause table alone would have read as "concurrency does not help". The
+second run then showed `cycles_started=0` on the *single-threaded* probe only,
+which is how the JIT trigger gap (below) was found. **Put the engagement
+counter next to the number, or the number is not evidence.**
+
+**The JIT trigger gap, found by that counter.** `maybe_gc` is the
+*interpreter's* allocation hook. A JIT-compiled allocation loop never reaches
+it — `jit_newarray` calls `heap.try_alloc_array_full`, which succeeds until the
+heap is full, so a compiled `new byte[128]` loop consults no occupancy
+predicate at all and its collections arrive by allocation *failure*. The
+multi-threaded probe engaged only because its peers still run interpreted code.
+`jit_new_object` and `jit_newarray` now carry the check themselves. The JIT
+safepoint poll is not an alternative: `emit_safepoint_poll` fires only once
+`stw_requested` is set, which is a consequence of a collection rather than a
+cause of one.
+
+---
+
 ## 3. Phase G — generational
 
 Everything here already exists as *accounting*; what is missing is a cycle that

@@ -1,7 +1,8 @@
 # Production ZGC
 
-**Status:** Partial, and the default collector. Its **marking is concurrent**
-as of 2026-08-16 and it **compacts** as of 2026-08-13; the sweep is still
+**Status:** Partial, and the default collector. It can **mark concurrently**
+as of 2026-08-16 (opt-in, `CRATONVM_ZGC_CONC_START=60`) and it **compacts** as
+of 2026-08-13; the sweep is still
 stop-the-world, marking is snapshot-at-the-beginning rather than ZGC's load
 barrier, and the generational machinery is written, unit-tested and **not
 adopted**. See

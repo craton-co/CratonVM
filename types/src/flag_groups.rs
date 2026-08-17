@@ -1162,11 +1162,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-16 with genuine concurrent marking. `conc-start` is the
     // percentage of the collection threshold at which a CONCURRENT mark cycle
-    // opens, and its parser reads `0` as "never" -- so `0` really is the
-    // falsey word and the kill switch, exactly like `zgc-parmark`'s worker
-    // count. `conc-workers` is a count with no meaningful off state: a
-    // concurrent cycle with zero workers would open and never trace, so `0` is
-    // clamped up to 1 and the token carries no `off_word`.
+    // opens, and its parser reads `0` as "never". It is DEFAULT-OFF (the
+    // default IS 0), so unlike the four rows below it the `off_word` is not
+    // load-bearing -- it is here because the token would otherwise have no way
+    // to be spelled negatively at all, and `CRATONVM_GC=-zgc-conc-start`
+    // should stay meaningful if the default ever flips. `conc-workers` is a
+    // count with no meaningful off state: a concurrent cycle with zero workers
+    // would open and never trace, so `0` is clamped up to 1 and the token
+    // carries no `off_word`.
     E { group: Group::GC, token: "zgc-conc-start", on_key: Some("CRATONVM_ZGC_CONC_START"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-conc-workers", on_key: Some("CRATONVM_ZGC_CONC_WORKERS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },

@@ -2526,9 +2526,15 @@ pub struct ZgcRealHeap {
     /// cycle is open.
     conc_mark_started_at: AtomicU64,
     /// `allocated` at which a concurrent cycle opens, precomputed from
-    /// [`Self::conc_start_percent`] and [`Self::gc_threshold`]. `0` means
-    /// concurrent marking is off for this heap.
-    conc_start_bytes: usize,
+    /// [`conc_start_percent_setting`] and [`Self::gc_threshold`]. `0` means
+    /// concurrent marking is off for this heap, which is the default.
+    ///
+    /// Atomic only so a test can arrange a trigger without setting a process-
+    /// wide environment variable -- `conc_start_percent_setting` caches its
+    /// answer in a `OnceLock`, so a test that set `CRATONVM_ZGC_CONC_START`
+    /// would decide the value for every other test in the binary. Nothing
+    /// writes it at runtime.
+    conc_start_bytes: AtomicUsize,
     /// Phase 4: the barrier's good mask, and the phase machine behind it.
     ///
     /// `Z_REMAPPED` — "no mark parity is good; addresses are plain" — until a
@@ -2921,14 +2927,14 @@ impl ZgcRealHeap {
             conc_ingress_replayed: AtomicUsize::new(0),
             conc_phase_nanos: AtomicU64::new(0),
             conc_mark_started_at: AtomicU64::new(0),
-            conc_start_bytes: {
+            conc_start_bytes: AtomicUsize::new({
                 let pct = conc_start_percent_setting();
                 if pct == 0 {
                     0
                 } else {
                     (cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100) / 100 * pct
                 }
-            },
+            }),
             mark_ingress_pushes: AtomicUsize::new(0),
             barrier_good_mask: AtomicU64::new(vaddr::Z_REMAPPED),
             relocate_active: AtomicBool::new(false),
@@ -3034,34 +3040,6 @@ impl ZgcRealHeap {
         heap
     }
 
-    /// The fraction of [`Self::gc_threshold`] at which a concurrent cycle
-    /// opens, in percent.
-    ///
-    /// # Why not 100
-    ///
-    /// At 100 the cycle would open at the instant the collection is needed and
-    /// there would be no concurrent phase at all. The gap between this and 100
-    /// is the whole of the time the marker gets to run with mutators alive, so
-    /// it must be big enough to hold a full transitive closure of the live set
-    /// at the allocation rate the workload actually has.
-    ///
-    /// # Why not much lower
-    ///
-    /// Everything allocated after mark start is floating garbage for this
-    /// cycle (allocate-black), and the SATB barrier's slow path is armed for
-    /// the whole window. Opening at 10% would mark a heap that is mostly about
-    /// to become garbage and would arm the barrier for most of the program's
-    /// life.
-    ///
-    /// 60% of the collection threshold -- i.e. 45% of capacity at the default
-    /// `ZGC_REAL_GC_THRESHOLD_PERCENT` of 75 -- leaves the marker 40% of the
-    /// threshold's worth of allocation to finish in. `CRATONVM_ZGC_CONC_START`
-    /// overrides it; `0` disables concurrent marking outright and is the kill
-    /// switch this feature is required to ship with.
-    fn conc_start_percent(&self) -> usize {
-        conc_start_percent_setting()
-    }
-
     /// How many mark workers a CONCURRENT cycle should use.
     ///
     /// Deliberately a different knob from [`Self::parallel_mark_workers`],
@@ -3102,16 +3080,28 @@ impl ZgcRealHeap {
     pub fn should_start_concurrent_mark(&self) -> bool {
         // `0` is the kill switch (`CRATONVM_ZGC_CONC_START=0`) AND the
         // disabled-by-default state, so this is the first and cheapest test.
-        if self.conc_start_bytes == 0 {
+        let trigger = self.conc_start_bytes.load(Ordering::Relaxed);
+        if trigger == 0 {
             return false;
         }
         let a = self.allocated.load(Ordering::Relaxed);
         // The `< gc_threshold` clause is not redundant. Above the collection
         // threshold a collection is already due, and opening a cycle there
         // would pay a mark-start pause for a concurrent phase of zero length.
-        a >= self.conc_start_bytes
+        a >= trigger
             && a < self.gc_threshold
             && !self.conc_cycle_active.load(Ordering::Relaxed)
+    }
+
+    /// Arrange the concurrent-start trigger. **Test seam.**
+    ///
+    /// Production sets this once, in the constructor, from
+    /// `CRATONVM_ZGC_CONC_START`. A test cannot go through the variable
+    /// because the reader caches in a `OnceLock` and would fix the value for
+    /// every other test in the binary.
+    #[cfg(test)]
+    pub(crate) fn dbg_set_conc_start_bytes(&self, bytes: usize) {
+        self.conc_start_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Is a concurrent mark cycle in flight?
@@ -7410,10 +7400,45 @@ const Z_PARMARK_MAX_WORKERS: usize = 64;
 const Z_PARMARK_RESTART_BUDGET: usize = 1;
 
 /// Default for `CRATONVM_ZGC_CONC_START`: the percentage of the collection
-/// threshold at which a CONCURRENT mark cycle opens. See
-/// [`ZgcRealHeap::conc_start_percent`] for the argument for this number and
-/// for what `0` means.
-const Z_CONC_START_PERCENT_DEFAULT: usize = 60;
+/// threshold at which a CONCURRENT mark cycle opens. `0` is OFF.
+///
+/// # Why the default is 0, on a feature that works
+///
+/// Concurrent marking is built, reachable end to end and correct -- and the
+/// measurement says it is not ready to be what every user's workload pays for.
+/// Interleaved, 3 reps, 8-core Azure box, 2026-08-16:
+///
+/// | probe | arm | cycles | mean pause | wall clock |
+/// |---|---|---:|---:|---:|
+/// | single-threaded | stop-the-world | 6 | 370 ms | 5.35 s |
+/// | single-threaded | concurrent, 1 worker | **12** | **230 ms** | 8.31 s |
+/// | single-threaded | concurrent, 2 workers | **12** | 254 ms | 9.70 s |
+/// | 8 mutator threads | stop-the-world | 3 | 609 ms | 11.8 s |
+/// | 8 mutator threads | concurrent, 1 worker | 5 | 388 ms | 16.8 s |
+/// | 8 mutator threads | concurrent, 2 workers | 5 | **253 ms** | 16.2 s |
+///
+/// The per-cycle pause falls 38-58%, which is the property the phase was
+/// written for and it is real. Two things beside it are not acceptable as a
+/// default:
+///
+/// * **The cycle COUNT roughly doubles** (6 -> 12, 3 -> 5). Everything
+///   allocated after mark start is floating garbage for that cycle, so each
+///   collection reclaims less and the next arrives sooner. On the
+///   single-threaded probe that turns a 38% per-cycle win into a *worse* total
+///   pause (2.22 s -> 2.76 s); on the multi-threaded one the total still
+///   improves (1.83 s -> 1.27 s).
+/// * **Wall clock rises 37-55%.** The mark workers compete with mutators that
+///   already saturate the box, and the store and allocation paths grew work:
+///   22.4M allocate-black claims and 1.4M SATB publications on the
+///   single-threaded probe, 16.5M and 4.1M on the multi-threaded one.
+///
+/// This tree has shipped a ZGC marking feature default-ON verified only for
+/// correctness before -- parallel STW marking, 2026-08-14, which cost +31% at
+/// one worker and +153% at four and was reverted. The lesson is written down;
+/// this is it being followed. `CRATONVM_ZGC_CONC_START=60` opts in, and the
+/// numbers above say which workloads that is a good trade for: many mutator
+/// threads, a large live set, and pause sensitivity.
+const Z_CONC_START_PERCENT_DEFAULT: usize = 0;
 
 /// Mark-end restart budget for the CONCURRENT cycle's closing handshake.
 ///
@@ -7435,12 +7460,32 @@ const Z_CONC_MARK_END_RESTART_BUDGET: usize = 8;
 /// however hard the workload stores.
 const Z_SATB_HANDOFF_INTERVAL: usize = 8192;
 
-/// `CRATONVM_ZGC_CONC_START`, read once per process.
+/// `CRATONVM_ZGC_CONC_START` -- the percentage of the collection threshold at
+/// which a concurrent mark cycle opens -- read once per process.
 ///
 /// A free function rather than a method because the constructor needs it
-/// before there is a `self` to call it on -- the answer is turned into
+/// before there is a `self` to call it on: the answer is turned into
 /// `ZgcRealHeap::conc_start_bytes` there, so nothing on the allocation path
 /// ever divides.
+///
+/// # What the number means, at either end
+///
+/// At **100** the cycle would open at the instant the collection is needed and
+/// there would be no concurrent phase at all. The gap between the setting and
+/// 100 is the whole of the time the marker gets to run with mutators alive, so
+/// it has to be big enough to hold one transitive closure of the live set at
+/// the allocation rate the workload actually has.
+///
+/// Going much **lower** is not free either: everything allocated after mark
+/// start is floating garbage for that cycle (allocate-black), and the SATB
+/// barrier is armed for the whole window. Opening at 10% would mark a heap
+/// that is mostly about to become garbage, and arm the barrier for most of the
+/// program's life.
+///
+/// `60` -- i.e. 45% of capacity at the default `ZGC_REAL_GC_THRESHOLD_PERCENT`
+/// of 75 -- is the value the 2026-08-16 measurement was taken at, and the one
+/// to opt in with. `0` is the default and means never; see
+/// [`Z_CONC_START_PERCENT_DEFAULT`] for the numbers behind that.
 fn conc_start_percent_setting() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -15363,25 +15408,37 @@ pub(crate) mod tests {
     /// `CRATONVM_ZGC_CONC_START=0` is a real kill switch.
     ///
     /// Reads the threshold arithmetic directly rather than through the env
-    /// var: `conc_start_percent` caches its answer in a process-wide
+    /// var: `conc_start_percent_setting` caches its answer in a process-wide
     /// `OnceLock`, so a test that set the variable would decide the value for
     /// every other test in the binary.
     #[test]
     fn the_concurrent_start_trigger_brackets_the_collection_threshold() {
         let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
         let threshold = heap.gc_threshold;
-        let pct = heap.conc_start_percent();
-        assert!(pct > 0 && pct < 100, "the default must leave a real window");
 
-        // Below the start point: no cycle.
-        heap.allocated
-            .store(threshold / 100 * pct / 2, Ordering::Relaxed);
-        assert!(!heap.should_start_concurrent_mark());
+        // SHIPPED DEFAULT: off. Asserted rather than assumed, because the
+        // whole feature is one number away from being on for every user and
+        // the measurement in `Z_CONC_START_PERCENT_DEFAULT` is what decided
+        // it. A change to that constant must come with a re-measurement, and
+        // this is the line that makes it deliberate.
+        assert_eq!(Z_CONC_START_PERCENT_DEFAULT, 0);
+        heap.allocated.store(threshold / 2, Ordering::Relaxed);
+        assert!(
+            !heap.should_start_concurrent_mark(),
+            "with the default the trigger never fires -- the collector is \
+             stop-the-world until an operator opts in"
+        );
 
-        // In the window: open.
-        heap.allocated
-            .store(threshold / 100 * pct + 1, Ordering::Relaxed);
-        assert!(heap.should_start_concurrent_mark());
+        // ...and with a trigger arranged, it brackets the collection
+        // threshold on both sides.
+        let trigger = threshold / 100 * 60;
+        heap.dbg_set_conc_start_bytes(trigger);
+
+        heap.allocated.store(trigger / 2, Ordering::Relaxed);
+        assert!(!heap.should_start_concurrent_mark(), "below the start point");
+
+        heap.allocated.store(trigger + 1, Ordering::Relaxed);
+        assert!(heap.should_start_concurrent_mark(), "inside the window");
 
         // At or above the collection threshold: refuse. A cycle opened here
         // would get no concurrent phase, only the mark-start pause.
@@ -15389,8 +15446,7 @@ pub(crate) mod tests {
         assert!(!heap.should_start_concurrent_mark());
 
         // And a cycle already in flight is not re-opened.
-        heap.allocated
-            .store(threshold / 100 * pct + 1, Ordering::Relaxed);
+        heap.allocated.store(trigger + 1, Ordering::Relaxed);
         heap.conc_cycle_active.store(true, Ordering::Relaxed);
         assert!(!heap.should_start_concurrent_mark());
         heap.conc_cycle_active.store(false, Ordering::Relaxed);
