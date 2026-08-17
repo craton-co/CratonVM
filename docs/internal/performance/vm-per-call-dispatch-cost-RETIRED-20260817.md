@@ -5,7 +5,7 @@
 | **Status** | RETIRED — every item it left open is answered, and the residual it named has a mechanism, a count and a named fix class |
 | **Opened** | 2026-08-13; retired 2026-08-13, **reopened 2026-08-17** as the named residual of live netty failures |
 | **Closed by** | `perf/per-call-dispatch-residuals-20260817` |
-| **Measured effect** | **-9.2% CPU** on `BigEndianHeapByteBufTest`, ABBA n=3/arm, no overlap; **-21%** on the page's own `MessageDigest.update(byte)` specimen |
+| **Measured effect** | **-4% to -9% CPU** on `BigEndianHeapByteBufTest` (two ABBA rounds, neither overlapping); **-7.4%** on the page's own `MessageDigest.update(byte)` specimen, with the leaf rung as an unmoved control |
 
 The page was reopened because it was the stated cause of three netty classes
 over the suite's 180 s per-class cap, and because its own §3 conclusion — that
@@ -114,33 +114,56 @@ bar §3 sets, rather than shaving instructions off a path that runs.
 
 ### What they are worth
 
-**Items 1, 2, 3 and 5 only** — the thread-state collapse landed after this pair
-was measured and is priced against its own control in §4 instead.
-`BigEndianHeapByteBufTest`, Azure Linux, CPU (user+sys), ABBA in the order
-A B B A A B, 414/414 in every arm:
+**Read the counters and the in-run controls first.** They are immune to this
+host, and the class-level clock is not: the SAME baseline binary measured
+52.3 s, 56.9 s, 67.8 s and 72.5 s of CPU on this class during one afternoon —
+a 39% spread on a fixed configuration, which is larger than the effect being
+measured.
 
-| arm | runs | mean |
-| --- | --- | ---: |
-| baseline | 70.05, 65.65, 67.82 | 67.84 s |
-| fixed | 64.10, 61.48, 59.23 | **61.60 s** |
+*Load-immune — engagement and refusal counts, one run each:*
 
-The worst fixed run beats the best baseline run, so the arms do not overlap.
-**-9.2%**, against the page's own stated measurability floor of ~5%.
-
-The page's own specimen, `probes/NativeFunnelFloorProbe.java`, ABBA a1/b1/b1/a1
-on the Windows box, with in-process controls in the same run:
-
-| rung | baseline | fixed |
+| | before | after |
 | --- | ---: | ---: |
-| `MessageDigest.update(byte)` | 172.85 / 173.98 | **138.10 / 136.84** |
-| `System.identityHashCode` | 130.86 / 108.10 | 113.75 / 118.52 |
-| `AtomicInteger.get` (leaf) | 122.49 / 104.61 | 109.57 / 112.56 |
-| control: plain Java call | 11.21 / 11.11 | 10.63 / 12.18 |
-| control: no call | 2.05 / 2.19 | 2.04 / 1.98 |
+| dispatches reusing the owner they already held | — | **111 564 628** (against 37 484 registry pins — 99.97%) |
+| compile probes that ran and were refused | 76 985 | **2 424** (32x, with `probe_memo_skips=74 469`) |
+| `[DISP_CENSUS] out_tail` — reaching `invoke_or_native` | 259 051 | 255 124 (0.23% either way; lever 2 was never the path) |
 
-The specimen separates cleanly — both fixed runs beat both baseline runs, -21%
-— and the controls do not move, which is what says the change is the dispatch
-path and not the box.
+*Load-immune — the thread-state pair against its own control, SAME run, four
+passes:* `current_state()` + 2x `record_transition` **9.2 / 8.1 / 11.0 / 9.9 ns**
+against the same pair as one `NativeStateSpan` **4.0 / 4.3 / 3.7 / 3.4 ns**.
+
+*Class level, three ABBA rounds on `BigEndianHeapByteBufTest`, CPU (user+sys),
+order A B B A A B, 414/414 in every arm of every round:*
+
+| round | baseline | fixed | |
+| --- | --- | --- | ---: |
+| items 1,2,3,5 | 70.05, 65.65, 67.82 | 64.10, 61.48, 59.23 | **-9.2%**, no overlap |
+| all five, round 1 | 52.28, 67.47, 72.48 | 50.25, 56.23, 57.13 | *discarded* — the host drifted 39% across the round |
+| all five, round 2 | 56.65, 56.12, 56.85 | 54.66, 55.25, 52.58 | **-4.2%**, no overlap |
+
+**-4% to -9%** is the honest range: the two rounds whose arms do not overlap.
+The middle round is reported and discarded rather than dropped silently — its
+-14.9% is the number a single un-paired pair would have produced, and it is the
+one number here that is certainly wrong.
+
+The page's own specimen, `probes/NativeFunnelFloorProbe.java`, six arms in the
+order A B B A A B on the Windows box with all five fixes in, every rung in the
+same process:
+
+| rung | baseline (3 runs) | fixed (3 runs) | |
+| --- | ---: | ---: | ---: |
+| `MessageDigest.update(byte)` | 118.21 / 117.40 / 117.37 | **106.29 / 111.52 / 108.92** | **-7.4%** |
+| `System.identityHashCode` | 92.01 / 92.40 / 109.22 | **87.89 / 86.83 / 88.38** | **-10.4%** |
+| `AtomicInteger.get` — **LEAF** | 86.62 / 84.93 / 87.63 | 87.21 / 86.22 / 91.56 | — |
+| control: plain Java call | 8.64 / 8.56 / 8.32 | 8.50 / 8.82 / 11.04 | — |
+| control: no call | 1.49 / 1.52 / 1.52 | 1.61 / 1.90 / 1.90 | — |
+
+Both non-leaf rungs separate with no overlap — the worst fixed run beats the
+best baseline run on each. **The leaf rung is the attribution**, and it is not a
+control chosen after the fact: `safe_native_call_leaf` does not record a
+thread-state transition at all (see its doc table), so a fix to that pair
+CANNOT move it, and it does not. The two rungs that pay the transition move; the
+one that does not, does not.
 
 ## 4. The floor, decomposed
 
@@ -151,29 +174,39 @@ never split it. The in-tree step profiles do (`jit_native_dispatch_profile` and
 **The funnel, priced against its own controls in one run**
 (`native_funnel_profile`, four passes, read the last):
 
-| step | ns |
-| --- | ---: |
-| the bare callback, no funnel at all | 0.3 |
-| `safe_native_call`, no arguments | 27.4-29.0 |
-| `safe_native_call`, one object argument | 34.8-36.3 |
-| `safe_native_call`, four arguments | 41.1-42.8 |
-| **`current_state()` + 2x `record_transition`** | **10.8-14.4** |
-| `heap.load_and_forward(obj)` | 6.3-6.6 |
-| the two `INLINE_NATIVE_ARGS` scratch arrays | 3.6-3.8 |
-| `young_spill_pressure()` | 2.3-2.4 |
-| `catch_unwind` around the callback | 1.5-1.7 |
-| `current_state()` **alone** | 0.9-1.1 |
-| `native_diag_mask()`, the pin push, the STW probe, the JNI drain, `native_oom` | ≤ 0.7 each |
+| step | before | after |
+| --- | ---: | ---: |
+| the bare callback, no funnel at all | 0.3 | 0.3 |
+| `safe_native_call`, no arguments | 27.4-29.0 | 19.7-22.3 |
+| `safe_native_call`, one object argument | 34.8-36.3 | 22.5-26.2 |
+| `safe_native_call`, four arguments | 41.1-42.8 | 27.6-29.0 |
+| `safe_native_call_prevalidated`, one object argument | 35.4-36.2 | 23.3-24.0 |
+| **`current_state()` + 2x `record_transition`** | **10.8-14.4** | 8.1-11.0 |
+| **… the same pair as one `NativeStateSpan`** | — | **3.4-4.3** |
+| `heap.load_and_forward(obj)` | 6.3-6.6 | 4.5-4.7 |
+| the two `INLINE_NATIVE_ARGS` scratch arrays | 3.6-3.8 | 2.8-2.9 |
+| `young_spill_pressure()` | 2.3-2.4 | 1.7-2.1 |
+| `catch_unwind` around the callback | 1.5-1.7 | 1.3-1.4 |
+| `current_state()` **alone** | 0.9-1.1 | 0.6 |
+| `native_diag_mask()`, the pin push, the STW probe, the JNI drain, `native_oom` | ≤ 0.7 | ≤ 0.6 |
 
-The thread-state trio is **35-40% of the whole funnel**, and `current_state()`
-alone at 0.9 ns is what says the cost is the *repetition*, not the read: the
-funnel reached `SELF_CELL` three times per call. It now reaches it once —
-`thread_state::enter_native_state` records `NativeRunning` and hands back a
-`NativeStateSpan` that restores through a raw pointer to the same cell, which
-this thread's TLS handle and the census registry both keep alive for longer
-than any native call can last. The old trio stays in the profile as the control
-rung beside the new one, because "the new one is faster" is only a claim next
-to it.
+**Read the two middle rows, not the two columns.** The columns are separate
+runs on a shared box and every row moved, which is the ±20% §6 warns about; the
+two middle rows are the OLD pair and the NEW pair measured against each other
+in the SAME run, and that is the only comparison here immune to the host:
+**9.9 ns against 3.4 ns, 2.6-2.9x**, or about 6.5 ns off every native call in
+the VM.
+
+The thread-state trio was 35-40% of the whole funnel — larger than
+`catch_unwind`, the pinning, both GC probes and the diagnostic mask put
+together — and `current_state()` alone at 0.9 ns is what says the cost was the
+*repetition*, not the read: the funnel reached `SELF_CELL` three times per call.
+It now reaches it once. `thread_state::enter_native_state` records
+`NativeRunning` and hands back a `NativeStateSpan` that restores through a raw
+pointer to the same cell, which this thread's TLS handle and the census registry
+both keep alive for longer than any native call can last. The old trio stays in
+the profile as the control rung beside the new one, because "the new one is
+faster" is only a claim next to it.
 
 **The dispatch preamble around it** (`jit_native_dispatch_profile`, a different
 run — read the shape, not a cross-run subtraction; the same box put
@@ -250,7 +283,31 @@ gate rather than by attribution.
   a clean descriptor with no allocation, so the 13.2 M negatives are ~0.1 s of a
   461 s run.
 
-## 7. What did NOT convert — the original §3, unretracted
+## 7. What this does NOT close
+
+**The three netty classes are still over the 180 s cap.** They were the reason
+the page was reopened, and they remain over it: `AdaptiveByteBufAllocatorTest`
+is 127/127 in 461 s on the baseline, and nothing here is worth more than the
+~9-10% the ABBA measured. Being honest about that is the point of retiring the
+page rather than leaving it open:
+
+* what the page was, was a *characterisation* — "the per-call cost is the whole
+  answer" — with two levers it had measured and declined;
+* what replaces it is a *mechanism with a count*: 1 394 statically bound call
+  sites that could not bind a direct callee, producing 98.4% of the dispatch
+  helper's traffic, because binding is decided once at the caller's compile and
+  the callee is not compiled yet at that instant;
+* and a *second, larger one*: 11.4x for an exception table in the callee, with a
+  one-flag repro.
+
+Neither of those is this page's to build — one is call-site re-binding, the
+other is the inline cascade's exception routing, and both are JIT codegen. A
+page whose every open item is answered and whose residual is a named mechanism
+owned elsewhere belongs in `internal`, not in `known-issues`. **A page that says
+"this is the VM's per-call cost, and here are two levers not worth building" is
+not a bug report; it was a measurement record all along.**
+
+## 8. What did NOT convert — the original §3, unretracted
 
 Nothing in the reopened page's §3 is withdrawn. The three changes it recorded
 still measured what it said they measured, and its rule still holds for what it
@@ -264,7 +321,7 @@ the `VarHandle` fix and §5 above both demonstrate:
 > the five fixes in §3 was found by a counter or a step profile that did not
 > exist, or had never been run, when the page was written.
 
-## 8. Repro
+## 9. Repro
 
 ```bash
 cd apps/netty-suite-runner
@@ -287,7 +344,7 @@ cargo test --release -p cratonvm-vm --lib jit_native_dispatch -- --ignored --noc
 cargo test --release -p cratonvm-vm --lib funnel_cost_breakdown -- --ignored --nocapture
 ```
 
-## 9. Measurement hygiene — unchanged, and it earned its keep again
+## 10. Measurement hygiene — unchanged, and it earned its keep again
 
 This box runs many concurrent agents; load moved between 5 and 31 during this
 work. Every timing above is ABBA-interleaved on ONE binary with an in-process

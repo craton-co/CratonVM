@@ -13741,9 +13741,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // `flush_class_identity_dispatch_memos` have revalidated the cache against
     // the current generations, and `redefine_jit_quiesced` carries the
     // redefinition epoch. `cached_cid != receiver_cid` keeps the MIC's own
-    // machine-callable entry first when it has one; a non-plain-object receiver
-    // is excluded here for the same reason it is never published
-    // (`cacheable_receiver`).
+    // machine-callable entry first when it has one.
+    //
+    // The consult it replaces was additionally gated on `cacheable_receiver &&
+    // globally_named`, and dropping those here is sound rather than convenient:
+    // both are PUBLICATION conditions (`publish_mic_rust_cached_entry` is called
+    // under them), and the key carries the receiver's own class id — so a hit
+    // means a compiled callee was published for exactly this `(site, receiver
+    // class)` pair while those conditions held. Re-testing them would mean
+    // calling `virtual_dispatch_target_cached`, which is the work this hoist
+    // exists to skip. What is kept is the receiver guard the MIC's own fast path
+    // uses one branch below — `receiver_is_plain_object` — so this arm is no
+    // weaker than the machine-code entry it stands in for.
     //
     // Worth 11x on a monomorphic interface call whose callee holds a never-taken
     // `try`/`catch`: 220 ns against 19 ns for the identical call without one

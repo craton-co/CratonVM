@@ -1319,6 +1319,68 @@ mod tests {
         .expect("recorder test thread must not panic");
     }
 
+    /// The span must be indistinguishable from the pair it replaced, in both
+    /// directions — during the call AND after it.
+    ///
+    /// The `NativeRunning` half is not decoration: that is the state the STW
+    /// census deliberately WAITS for, because a running native holds raw
+    /// `ObjectRef`s in Rust locals that a copying collector must not relocate
+    /// under it. A span that skipped the store would leave every native call
+    /// looking like ordinary Java execution to the collector, and nothing in a
+    /// timing would show it.
+    #[test]
+    fn a_native_state_span_matches_the_pair_it_replaces() {
+        std::thread::spawn(|| {
+            bind_current_thread(9101);
+            let _ = try_record_transition(ThreadExecState::JavaRunning, "test::seed");
+
+            let span = enter_native_state("test::enter");
+            assert_eq!(
+                current_state(),
+                ThreadExecState::NativeRunning,
+                "the span must record NativeRunning for the duration of the call"
+            );
+            assert_eq!(span.prior(), ThreadExecState::JavaRunning);
+            span.restore("test::return");
+            assert_eq!(
+                current_state(),
+                ThreadExecState::JavaRunning,
+                "and must put the caller's state back"
+            );
+
+            // Nested, the shape a re-entrant native takes: the inner span
+            // restores `NativeRunning` (a legal self-edge), not `JavaRunning`.
+            let outer = enter_native_state("test::outer");
+            let inner = enter_native_state("test::inner");
+            assert_eq!(inner.prior(), ThreadExecState::NativeRunning);
+            inner.restore("test::inner-return");
+            assert_eq!(current_state(), ThreadExecState::NativeRunning);
+            outer.restore("test::outer-return");
+            assert_eq!(current_state(), ThreadExecState::JavaRunning);
+        })
+        .join()
+        .expect("span test thread must not panic");
+    }
+
+    /// A thread the recorder has never observed reads `Starting`, and
+    /// `Starting -> NativeRunning` is deliberately absent from the table. The
+    /// span must resume such a thread as `JavaRunning` — the state it
+    /// demonstrably reached — or it would assert an edge the code cannot take,
+    /// once per native call, for the life of that thread.
+    #[test]
+    fn a_span_on_an_unobserved_thread_resumes_as_java_running() {
+        std::thread::spawn(|| {
+            bind_current_thread(9102);
+            assert_eq!(current_state(), ThreadExecState::Starting);
+            let span = enter_native_state("test::first-ever");
+            assert_eq!(span.prior(), ThreadExecState::JavaRunning);
+            span.restore("test::return");
+            assert_eq!(current_state(), ThreadExecState::JavaRunning);
+        })
+        .join()
+        .expect("first-observation span test thread must not panic");
+    }
+
     #[test]
     fn an_illegal_transition_is_reported_and_still_recorded() {
         std::thread::spawn(|| {
