@@ -4574,6 +4574,18 @@ fn run() -> Result<()> {
              invokestatic sites those ladders examined)",
             cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
         );
+        // Why a compiled callee is reached through a Rust helper at all.
+        //
+        // The netty census (`[DISP_CENSUS]`, `CRATONVM_DBG=mic-prof`) says 98.4%
+        // of `jit_invoke_dispatch` calls are `DISPATCH_CACHE` hits — a callee
+        // that IS compiled, entered through the helper on every call. These two
+        // say why: a statically bound site is offered a direct `CALL` exactly
+        // once, while its caller is being compiled, and a callee that is not
+        // compiled yet at that instant leaves the site on the helper forever.
+        let (bind_hits, bind_misses) = cratonvm_jit::direct_callee_bind_counts();
+        eprintln!(
+            "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the              dispatch helper (statically bound sites where a ladder asked for a direct target)"
+        );
     }
 
     // JDK-ONLY-WAVE2 §8/§11 census dumps (`CRATONVM_DBG_CHECK_OVERRIDE=1`).
