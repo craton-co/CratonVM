@@ -27,8 +27,10 @@ use super::*;
 /// The Java method computes `x mod m` — via `BigInteger.valueOf(m)`,
 /// `BigInteger.mod`, then `intValue()` — for ten ~32-bit moduli, each a
 /// product of consecutive small primes, and tests the remainder against every
-/// prime in the group. With `org/bouncycastle/*` JIT-banned this runs
-/// interpreted: ~10 BigInteger allocations + 10 limb-division calls per
+/// prime in the group. (The `org/bouncycastle/*` JIT ban this was written under
+/// is long gone — no ban list names the package today — but the allocation cost
+/// below is what motivates the intrinsic and does not depend on it.)
+/// ~10 BigInteger allocations + 10 limb-division calls per
 /// candidate, over hundreds of candidates per RSA prime, which dominates
 /// `RSAKeyPairGenerator.chooseRandomPrime` (see `RSATest.test_CVE_2017_15361`,
 /// the documented RSA non-finish — `comparison-handoff/
@@ -8489,6 +8491,115 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
             for (i, &word) in state.iter().enumerate() {
                 ctx.set_array_element(state_arr, i, Value::Int(word as i32));
             }
+            Ok(None)
+        },
+    );
+
+    r.set_category(__prev_cat);
+}
+
+/// Read `SHA256Digest`'s `X[64]` scratch array field, validating its length.
+fn bc_sha256_x_array(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let arr = match ctx.get_field_by_name(this, "X") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "SHA256Digest: missing X".into(),
+            }
+            .into())
+        }
+    };
+    if ctx.array_length(arr) < 64 {
+        return Err(RuntimeError::aioobe_index_only(64).into());
+    }
+    Ok(arr)
+}
+
+/// The eight chaining words `H1..H8`, in order.
+const BC_SHA256_STATE_FIELDS: [&str; 8] = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"];
+
+/// Native `org.bouncycastle.crypto.digests.SHA256Digest.processBlock()`.
+///
+/// # Why this one and not `MessageDigest`
+///
+/// BouncyCastle's LMS/HSS (`pqc.crypto.lms`) builds `new SHA256Digest()`
+/// directly — see that package's `DigestUtil.createDigest` — so this VM's
+/// native JCA SHA-256 is on a path the workload never takes, and HotSpot has no
+/// intrinsic for BouncyCastle's class either. Both VMs run the round schedule as
+/// real bytecode; measurement put CratonVM at ~37x HotSpot on that kernel with
+/// the JIT fully engaged and nothing stuck in the interpreter. This replaces the
+/// one leaf that owns the cost.
+///
+/// # Why `processBlock` is the right seam
+///
+/// It is a `protected` leaf with no arguments and no calls out: every input is a
+/// field of the receiver (`H1..H8`, `X`), and the kernel reproduces its exact
+/// post-state including the expanded schedule left in `X[16..64]` and the
+/// cleared `X[0..16]`. Buffering, padding, length encoding, `reset`, `copy` and
+/// `getEncodedState` all stay real bytecode.
+///
+/// `SHA256Digest` has no subclasses in BouncyCastle, so the superclass walk in
+/// `intercept_force_registered_native` cannot divert some other digest's
+/// `processBlock` here. Tagged `Intrinsic`, not a stub: it computes the method's
+/// exact result rather than standing in for it.
+pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    r.register(
+        "org/bouncycastle/crypto/digests/SHA256Digest",
+        "processBlock",
+        "()V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let x_arr = bc_sha256_x_array(ctx, this)?;
+
+            let mut state = [0u32; 8];
+            for (slot, name) in state.iter_mut().zip(BC_SHA256_STATE_FIELDS) {
+                match ctx.get_field_by_name(this, name) {
+                    Value::Int(v) => *slot = v as u32,
+                    _ => {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: format!("SHA256Digest: malformed {name}"),
+                        }
+                        .into())
+                    }
+                }
+            }
+
+            // One bulk read of all 64 words rather than 64 `get_array_element`
+            // round trips — the per-element path costs a virtual dispatch plus a
+            // `Value` box per word, which is most of what this native exists to
+            // remove. Only `X[0..16]` is live input; the tail is read so the
+            // single bulk write-back below can restore the whole array.
+            let mut words = [0i32; 64];
+            if ctx.read_int_array_into(x_arr, 0, &mut words) != 64 {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "SHA256Digest: X is not a 64-word int[]".into(),
+                }
+                .into());
+            }
+            let mut x = [0u32; 64];
+            for (dst, src) in x.iter_mut().zip(words.iter()) {
+                *dst = *src as u32;
+            }
+
+            cratonvm_native_builtins_crypto::bc_digest::sha256_process_block(&mut state, &mut x);
+
+            for (word, name) in state.iter().zip(BC_SHA256_STATE_FIELDS) {
+                ctx.set_field_by_name(this, name, Value::Int(*word as i32));
+            }
+            for (dst, src) in words.iter_mut().zip(x.iter()) {
+                *dst = *src as i32;
+            }
+            ctx.write_int_array_from(x_arr, 0, &words);
+            // BouncyCastle's `xOff = 0`, which `processWord` reads to decide
+            // when the next block is full. Omitting it would leave the digest
+            // permanently mid-block.
+            ctx.set_field_by_name(this, "xOff", Value::Int(0));
             Ok(None)
         },
     );

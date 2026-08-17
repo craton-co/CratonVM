@@ -11745,6 +11745,90 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         n
     }
 
+    fn read_int_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [i32]) -> usize {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return 0;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return 0;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if src_off > len {
+            return 0;
+        }
+        let available = len - src_off;
+        let n = available.min(dst.len());
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: bounds checked above. Int arrays are a flat 4-bytes-per-element
+        // payload (`element_byte_size`), so `n * 4` bytes from `base + src_off*4`
+        // is exactly elements `src_off..src_off+n`, in host order — the same
+        // convention the char twin above relies on. `dst` is caller-owned and
+        // cannot alias the heap arena.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    base.add(src_off * 4),
+                    dst.as_mut_ptr() as *mut u8,
+                    n * 4,
+                );
+            },
+            // G1 humongous int[]: region-safe per-element read, same fallback
+            // shape as the byte/char twins.
+            None => {
+                for (i, slot) in dst.iter_mut().take(n).enumerate() {
+                    match self.shared.mem.heap.get_array_element(arr, src_off + i) {
+                        Ok(Value::Int(x)) => *slot = x,
+                        _ => return i,
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    fn write_int_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[i32]) -> bool {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return false;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return false;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if dst_off.checked_add(src.len()).map_or(true, |end| end > len) {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: bounds checked above; see `read_int_array_into` for the
+        // 4-bytes-per-element layout argument.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    base.add(dst_off * 4),
+                    src.len() * 4,
+                );
+            },
+            None => {
+                for (i, v) in src.iter().enumerate() {
+                    if self
+                        .shared
+                        .mem
+                        .heap
+                        .set_array_element(arr, dst_off + i, Value::Int(*v))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return 0;

@@ -16,6 +16,7 @@
 // See audits/jdk-only-ambient-category-audit.md.
 pub mod bc_aes;
 pub mod bc_chacha;
+pub mod bc_digest;
 pub mod bc_newhope;
 mod bc_newhope_tables;
 /// The fail-loud error type shared by every kernel in this crate. See
