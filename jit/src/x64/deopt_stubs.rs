@@ -709,7 +709,7 @@ impl Compiler {
     /// stash. None is a Java callee, so this fails nothing there.
     pub(super) fn fail_unserviced_java_direct_call(
         &mut self,
-        info_ptr: Option<&crate::JitInvokeInfo>,
+        info_ptr: Option<*const crate::JitInvokeInfo>,
         service_args_base: Option<i32>,
     ) {
         if info_ptr.is_some() && service_args_base.is_none() {
