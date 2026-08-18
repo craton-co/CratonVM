@@ -445,9 +445,61 @@
 //! mutation, which is the one ordering that can tell a retired native from a live
 //! one.
 //!
-//! `iterator()`, `toArray()`, `isEmpty()` and `contains()` are NOT retired here
-//! and the `iterator()` result above is why: the dial says at least one of them
-//! is load-bearing, and separating which needs its own per-triple trial.
+//! ## The four this record first held back, and why the evidence was wrong
+//!
+//! `iterator`, `toArray` (both overloads), `isEmpty` and `contains` were held on
+//! the strength of that `ConcurrentModificationException` — "the dial says at
+//! least one of them is load-bearing". **It says no such thing, and the reason
+//! is worth more than the four entries.**
+//!
+//! MEASURED 2026-08-17, one binary, three arms
+//! (`probes/JdkOnlyValuesViewProbe.java`'s `carrier.*` lines, which did not
+//! exist when the dial arm was first run): the eleven values-view carriers are
+//! IDENTICAL in `--real-jdk`, `--jdk-only` and `--jdk-only` + the dial. Nothing
+//! about the dial turns a view into an `ArrayList`. So where did a real
+//! `ArrayList$Itr` come from?
+//!
+//! ```text
+//!                           HotSpot                       CratonVM, EVERY mode
+//!   values()                java.util.HashMap$Values      java.util.HashMap$Values
+//!   values().iterator()     java.util.HashMap$ValueIterator   java.util.ArrayList$Itr
+//!   keySet().iterator()     java.util.HashMap$KeyIterator     java.util.HashMap$KeyIterator
+//! ```
+//!
+//! The view is real; its ITERATOR is not. `register_interface_natives` answers
+//! `java/util/Collection.iterator` with a native that hands back an
+//! `ArrayList$Itr` over a snapshot list, and that snapshot's `modCount` is not
+//! the map's. Arm the dial and the real `ArrayList$Itr.next()` starts running
+//! `checkForComodification` against it — hence the CME. The dial was measuring
+//! **the interface door**, which this table's own "the door this table cannot
+//! close" section warns about, and attributing it to
+//! `java/util/ArrayList.iterator`.
+//!
+//! With the per-triple instrument instead — a trial binary carrying all five
+//! registrations, `CRATONVM_DBG_DROPPED_STUBS=1` confirming each is
+//! `[JDK-ONLY-REFUSED]` rather than inert:
+//!
+//! ```text
+//!   probes/JdkOnlyValuesViewProbe.java, 67 checks   IDENTICAL to HotSpot
+//!   --jdk-only  corpus   98 passed / 2 failed of 100   verdict-neutral
+//!   SUITE=all   corpus   93 passed / 7 failed of 100   verdict-neutral
+//! ```
+//!
+//! The probe's `four.*` section is written for exactly these five and exercises
+//! them on three receiver shapes — a plain `ArrayList`, an `Arrays.asList` view
+//! and the `java.util.List` interface door — including the two rows a native
+//! that allocates rather than fills gets wrong without changing any length:
+//! `toArray(new String[6])` on a 4-element list must be length 6 with a null
+//! terminator at index 4, and a structural change during iteration must still
+//! throw.
+//!
+//! **The interface-door defect the dial exposed is REAL and is not fixed here.**
+//! `map.values().iterator()` is not fail-fast in either mode — a structural
+//! modification mid-iteration throws `ConcurrentModificationException` on
+//! HotSpot and nothing here. `Iterator.remove()` does write through, and
+//! `keySet()`/`entrySet()` iterators are correct, so it is narrow. Filed as
+//! `jdk-only/G63-1-the-values-view-iterator-is-not-fail-fast-20260817.md`;
+//! retiring these five neither causes nor fixes it, measured both ways.
 //!
 //! # `Properties.getProperty` — asked, MEASURED, and NOT retired
 //!
@@ -526,15 +578,25 @@ static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
     ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
     ("java/util/ArrayList", "clear", "()V"),
-    // `get` and `size`, retired 2026-08-17 — the two rows G60-1 §5 N1 asked
-    // about. They were held in the 2026-08-12 wave because `Map.values()` was
+    ("java/util/ArrayList", "contains", "(Ljava/lang/Object;)Z"),
+    // `contains`, `get`, `isEmpty`, `iterator`, `size` and both `toArray`
+    // overloads, retired 2026-08-17 — G60-1 §5 N1's two rows and the four its
+    // resolution then held back. All seven are ONE measurement: the probe is
+    // byte-identical to HotSpot with all of them refused, and the strict and
+    // Compatible corpora are verdict-neutral. See the G60-1 sections of this
+    // module's docs, including why the evidence that held four of them back was
+    // an artefact of the instrument. They were held in the 2026-08-12 wave because `Map.values()` was
     // answered as an `ArrayList` with its source map stashed in a trailing
     // capacity slot, making these two the view's implementation. **That is no
     // longer what happens, and the hold also imported a Compatible-mode hazard
     // into a strict-only decision.** See the G60-1 section of this module's
     // docs for the four arms and the eleven carrier classes.
     ("java/util/ArrayList", "get", "(I)Ljava/lang/Object;"),
+    ("java/util/ArrayList", "isEmpty", "()Z"),
+    ("java/util/ArrayList", "iterator", "()Ljava/util/Iterator;"),
     ("java/util/ArrayList", "size", "()I"),
+    ("java/util/ArrayList", "toArray", "()[Ljava/lang/Object;"),
+    ("java/util/ArrayList", "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
     ("java/util/Arrays$ArrayList", "iterator", "()Ljava/util/Iterator;"),
     ("java/util/Collections", "synchronizedMap", "(Ljava/util/Map;)Ljava/util/Map;"),
     // NOT here, and MEASURED not to be retirable: `java/util/Properties`'s two
@@ -735,7 +797,7 @@ mod tests {
     fn the_table_is_not_empty() {
         assert!(
             RETIRED_SHADOW_TRIPLES.len() >= 80,
-            "expected 88 java.util.logging triples + 9 java.util collections = 97, got {}",
+            "expected 88 java.util.logging triples + 14 java.util collections = 102, got {}",
             RETIRED_SHADOW_TRIPLES.len()
         );
     }
@@ -786,13 +848,11 @@ mod tests {
             ("java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
             ("java/util/HashSet", "iterator", "()Ljava/util/Iterator;"),
             ("java/util/LinkedList", "add", "(Ljava/lang/Object;)Z"),
-            // `size` and `get` came OFF this list on 2026-08-17 — see
-            // `the_two_rows_g60_1_asked_about`. `iterator` stays, and the
-            // measurement that separates them is in the module docs: with the
-            // whole class dialled to yield, `values().iterator()` after a `put`
-            // throws `ConcurrentModificationException` from real
-            // `ArrayList$Itr.checkForComodification`.
-            ("java/util/ArrayList", "iterator", "()Ljava/util/Iterator;"),
+            // `size`, `get`, `contains`, `isEmpty`, `iterator` and both
+            // `toArray` overloads ALL came off this list on 2026-08-17. What is
+            // left of the family is the ITERATOR CLASS, not the list methods:
+            // `ArrayList$Itr` still keeps `cursor`/`lastRet`/`expectedModCount`
+            // through `al_itr_slots`, and no per-triple trial has been run on it.
             ("java/util/ArrayList$Itr", "next", "()Ljava/lang/Object;"),
             // Load-bearing FOR the retirements above.
             ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;"),
@@ -824,27 +884,53 @@ mod tests {
         }
     }
 
-    /// G60-1 §5's two `java/util/ArrayList` nominations, and the boundary next
-    /// to them.
+    /// G60-1 §5's two `java/util/ArrayList` nominations, plus the four its
+    /// resolution held back and then retired on 2026-08-17.
     ///
-    /// The pair is retired; `iterator` is not, and that split is the finding
-    /// rather than an oversight. With the whole class dialled to yield,
-    /// `Map.values().iterator()` after a `put` throws
-    /// `ConcurrentModificationException` out of real
-    /// `ArrayList$Itr.checkForComodification`, while `size()`/`get()` retired on
-    /// their own are byte-identical to HotSpot across 42 checks. A later wave
-    /// that reaches for `iterator` needs its own per-triple trial and must not
-    /// read this test as permission.
+    /// Seven triples, one measurement: the probe is byte-identical to HotSpot
+    /// with all of them refused and both corpora are verdict-neutral. The four
+    /// were held for a day on the strength of a `ConcurrentModificationException`
+    /// under `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/ArrayList`, and the module
+    /// docs record why that was the wrong reading — the exception came from the
+    /// `java/util/Collection.iterator` INTERFACE DOOR handing back an
+    /// `ArrayList$Itr` over a snapshot, not from this class's `iterator`.
     #[test]
-    fn the_two_rows_g60_1_asked_about() {
-        assert!(triple_is_retired_shadow(
-            "java/util/ArrayList",
-            "get",
-            "(I)Ljava/lang/Object;"
-        ));
-        assert!(triple_is_retired_shadow("java/util/ArrayList", "size", "()I"));
+    fn the_seven_array_list_rows_g60_1_settled() {
+        for (m, d) in [
+            ("contains", "(Ljava/lang/Object;)Z"),
+            ("get", "(I)Ljava/lang/Object;"),
+            ("isEmpty", "()Z"),
+            ("iterator", "()Ljava/util/Iterator;"),
+            ("size", "()I"),
+            ("toArray", "()[Ljava/lang/Object;"),
+            ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+        ] {
+            assert!(
+                triple_is_retired_shadow("java/util/ArrayList", m, d),
+                "retired 2026-08-17 on a per-triple trial: {m}{d}"
+            );
+        }
+    }
+
+    /// The boundary the seven above stop at, and it is not arbitrary.
+    ///
+    /// `ArrayList$Itr` is a different receiver with its own state — `cursor`,
+    /// `lastRet` and `expectedModCount` through `al_itr_slots` — and no
+    /// per-triple trial has been run on it. Retiring the LIST methods says
+    /// nothing about the ITERATOR class, and this test exists so a later reader
+    /// does not take the seven as covering it.
+    #[test]
+    fn the_iterator_class_is_a_separate_question() {
         assert!(!triple_is_retired_shadow(
-            "java/util/ArrayList",
+            "java/util/ArrayList$Itr",
+            "next",
+            "()Ljava/lang/Object;"
+        ));
+        // And the interface door, which is where the values-view iterator
+        // actually comes from (G63-1). Retiring it is a different change with a
+        // much wider blast radius, and this table does not make it.
+        assert!(!triple_is_retired_shadow(
+            "java/util/Collection",
             "iterator",
             "()Ljava/util/Iterator;"
         ));
