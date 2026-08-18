@@ -167,9 +167,15 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    it exposed a resolver bug worth more than the feature — the native-shadow
    gate was refusing every override of a shadowed method, which also affects
    PGO-02's guarded-virtual path in the default build. The guarded splice still
-   does not fire; one uninstrumented early return in
-   `resolve_inline_site_from` is all that is left between the evidence and the
-   emitter. Details and the full trace are on the sibling page.
+   does not fire, and the reason is now a FACT rather than a gate to hunt: with
+   every resolver and planner gate cleared, the emitter rolls the splice back
+   (`outer-splice-rolled-back=2`, every nested arm 0) because
+   `objectsAreEqual` carries a value across a branch merge
+   (`iconst_1; goto L; iconst_0; L: ireturn`), which `try_emit_inline_body` has
+   refused since commit 419a6f5. The call this work is about, at pc 16, is never
+   reached. **The next lever is operand-stack merging in the inline emitter**,
+   not more evidence or more binding. Details and the full trace are on the
+   sibling page.
 
    The chain's first two steps were VM work rather than compiler work: an artifact
    carrying an inlined caller scope cannot be OSR-entered at all
