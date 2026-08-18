@@ -632,6 +632,7 @@ export inherited from a parent shell.
 | `never-free-code` | `CRATONVM_JIT_NEVER_FREE_CODE` |
 | `old-sweep-jit` | `CRATONVM_OLD_SWEEP_JIT` |
 | `osr` | `CRATONVM_JIT_OSR` |
+| `osr-athrow` | `CRATONVM_JIT_OSR_ATHROW` |
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |

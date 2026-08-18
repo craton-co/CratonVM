@@ -1757,14 +1757,22 @@ pub fn compile_with_param_slots(
         // The exception table MUST be modelled: these snapshots are taken at
         // pcs inside protected ranges, and a local only the handler reads is
         // otherwise computed dead exactly there.
-        let (liveness, covered) = crate::regalloc::live_locals_per_pc_with_handlers(
+        // `_all`, not `_with_handlers`: the latter answers for slots 0..63
+        // only, and a method with more than 64 locals then cannot drop a dead
+        // local above slot 63 from the snapshot — which publishes `Unsupported`
+        // for it and costs the whole method its OSR entry. Window 0 of this is
+        // bit-for-bit the old answer, so a method with 64 locals or fewer is
+        // unchanged.
+        let (liveness, covered, words) = crate::regalloc::live_locals_per_pc_all(
             code,
             code_len,
             num_params,
             param_jvm_slots,
             &exception_ranges,
+            compiler.num_locals,
         );
         compiler.local_liveness = liveness;
+        compiler.local_liveness_words = words;
         compiler.local_liveness_covered = covered;
         compiler.exception_ranges_dbg_len = exception_ranges.len();
     }
