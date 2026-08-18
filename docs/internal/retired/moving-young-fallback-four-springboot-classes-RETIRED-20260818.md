@@ -1,44 +1,74 @@
-# Four Spring Boot classes are red because of the JIT-triggered `[moving-young]` fallback, not because of the 300s budget
+# ✅ RETIRED — the `[moving-young]` fallback spiral on four Spring Boot classes
 
-**Status: all four classes are GREEN on the shipped default as of 2026-08-11 —
-see ["Re-measured on current dev under all three
-collectors"](#2026-08-11-re-measured-on-current-dev-under-all-three-collectors),
-which is the only table on this page taken under one protocol on an idle host.
-The mechanism below is confirmed, unfixed, and now GENERATIONAL-ONLY. Everything
-in the body of this page is still accurate about that collector and is kept for
-it; what changed is that the collector stopped being the default on 2026-08-10,
-so `default` in every older table below means `Generational`. Supersedes the
-"margin exhausted", "recurring timeout" and "cumulative
-`ModifiedClassPathExtension` cost" framings of the classes below, whose own docs
-are retired to `fixed-suite-bugs/springboot/`.**
+## Status
 
-> **`Integration` is GREEN under Generational too, as of 2026-08-11, and the A5
-> repair this page assigns it is priced against a number that does not hold
-> still.** Four Windows binaries, one host, one protocol — see
-> ["Integration, re-measured"](#2026-08-11-integration-re-measured-under-generational-across-four-commits).
-> The short version: this page's own commit still reproduces its row exactly
-> (TIMEOUT@700s, peak #1024), so the measurement was sound; 36 commits later the
-> class completes, and `unregistered-jit-frame-on-stack` — 100% of cycles at the
-> first commit — is **0%** at the second, with **no change to the collector or
-> to the A5 probe in between**.
+**RETIRED 2026-08-18.** The mechanism this page documents — a JIT-triggered
+`[moving-young]` fallback that escalates to peaks of #2048-#16384 and turns four
+Spring Boot classes into timeouts and OOMs — **no longer reproduces**. It was
+closed by work filed elsewhere, not by this page's own prescriptions.
 
-> **The conclusion holds; three of the four rows were re-measured after
-> `67fadfdd8` and their numbers changed.** The `f695ca875` binary the Flyway,
-> Integration and Quartz rows were taken on **predates** `67fadfdd8`
-> ("an object hashed while locked kept that hash after the unlock") by 90
-> minutes; the Log4J2 row's `6365de194` already has it. That defect gave
-> `HashMap` a second entry per re-`put` of a locked-then-unlocked key, which is
-> its own unbounded-growth path to an OOM. Re-measuring on a post-fix binary
-> leaves the mechanism and the "don't add `slowClasses`" verdict intact but
-> moves every affected number — Flyway is no longer slower than `--nojit` at
-> all. See ["Re-measured on a post-fix binary"](#re-measured-on-a-post-fix-binary-2026-08-10).
+Re-measured on `dev` `24a5d4528`, Azure Linux, one class per process,
+`--Xmx 2g`, JIT on, real JDK 25 backend, the three load-bearing suite env vars,
+400 s cap. HotSpot 25 on the same host as the control.
 
-> **A 300s log is too short to see this.** `Log4J2LoggingSystemTests` was first
-> read as *not* an instance of this bug, precisely because its 300s suite log
-> contains **zero** fallback lines. Given a 3600s budget the same class reaches
-> **#4096** and still never finishes. The escalation outlasts the budget that
-> kills the process, so absence of the warning in a timed-out log is not
-> evidence of absence — re-run with a real budget before ruling a class out.
+| Class | HotSpot | ZGC (shipped default) | `-XX:+UseGenerationalGC` | fallback peak, gen |
+|---|---|---|---|---:|
+| `FlywayAutoConfigurationTests` | ✓73/73, 9 s | ✓73/73, 79 s | 18 FAIL, 78 s | **#3** |
+| `IntegrationAutoConfigurationTests` | ✓34/34, 11 s | ✓34/34, 85 s | 11 FAIL, 76 s | **#5** |
+| `Log4J2LoggingSystemTests` | ✓63/63, 9 s | ✓63/63, 51 s | ✓63/63, 72 s | **#1** |
+| `QuartzEndpointWebIntegrationTests` | ✓45/45, 18 s | OOM-killed | OOM-killed | 0 |
+
+**The fallback peaks are #1-#5 where this page records #2048 and no completion
+in 700 s, and all three classes that used to spiral now finish inside the 300 s
+suite budget on both collectors.** By this page's own triage rule — "single
+digits → harmless, thousands → death spiral" — the spiral is closed.
+
+### What closed it, and what this page got right
+
+Not the three repairs this page priced. Two merged changes did it, and both are
+already recorded on their own pages: the young-pause-goal fix (`eb6e603f7`,
+which this page itself measured at cycles 557 → 42) and the indirect-call
+identity repair (`fix/moving-young-fallback-indirect-call-20260810`, measured
+here at Log4J2 1238 cycles → 0). Both are on `dev`.
+
+What this page got right is the part worth carrying forward. It refused to
+generalise from a single-threaded probe; it priced three separate repairs
+against real per-cycle obligation sets and reported all three at zero rather
+than building the one that looked good on a microbenchmark; and it recorded the
+A5 false-positive rate at 87% and then **declined to build the filter anyway**,
+because suppressing an unshaped hit is unsound in exactly A5's own scenario. It
+also called the risk that closed it: *"the fix might just move the failure."*
+
+### It moved the failure. Twice.
+
+Both successors are filed, and neither is this page's mechanism:
+
+* **`docs/known-issues/gc/generational-young-relocation-nulls-live-string-references-20260818.md`**
+  — with the refusals gone the young collector now actually relocates on these
+  classes, and Flyway and Integration fail 18/73 and 11/34 under Generational
+  with live `String` references reading back **null**
+  (`Method.getName()` returning null, a local NPEing as its own receiver). Both
+  pass under ZGC on the same binary. The fallback was refusing compaction
+  whenever the root set could not be verified; it was load-bearing.
+* **`docs/known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.md`**
+  — Quartz now dies on **every** collector, growing ~350 MB/s of native memory
+  to 22 GB with `--Xmx` having no effect and **zero** `[moving-young]` lines in
+  the log. `--nojit` passes it. Three hypotheses tested and refuted there.
+
+So the honest summary of this page is: the spiral it named is gone, its refusal
+to build a per-reason repair was correct, and the two things underneath it are
+now visible and separately filed.
+
+## Everything below is the page as it stood, kept for the mechanism
+
+The body is unchanged. It is accurate about the Generational collector as of
+2026-08-11 and is the only written description of the fallback machinery, the
+obligation sets, the conservative-root pricing (~50 roots per parked peer,
+linear) and why a semispace has nowhere to pin. Read it before touching
+`gen_heap.rs` or `xt_root_scan.rs`. Its *conclusions about which classes are
+red* are superseded by the table above.
+
+---
 
 ## 2026-08-11: `Integration`, re-measured under Generational across four commits
 
