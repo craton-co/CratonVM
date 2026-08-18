@@ -553,9 +553,16 @@ interleaved in the same rounds so a shared host cannot bias one against another,
 | `dev` @ `36433bf5d` | 49.12 / 46.61 / 49.23 |
 | **the same, with the gate cached** | **14.11 / 13.46 / 14.49** |
 
-**3.5x, recovered by one line.** An ablation build with the neighbouring
-`GETFIELD_HELPER_CALLS` counter removed instead moved it ~2 ns, which is what
-says the atomic was not the problem either.
+**3.5x, recovered by one line.** Re-verified after merging current `dev`, same
+interleaving: `bc01a0066` 13.02 / 13.48 / 14.09, `dev` 50.57 / 50.08 / 45.80,
+fixed 14.47 / 13.39 / 13.00 — back to baseline.
+
+The neighbouring `GETFIELD_HELPER_CALLS` atomic is a second, much smaller cost:
+an ablation build put it at ~2-3 ns of a then-9 ns read on a quiet host, and
+below the noise floor under load. It is now gated behind the flags that
+actually read it, and `jit_getfield_helper_calls()` returns `Option<u64>` so a
+gated counter cannot be printed as a confident `0` — which would look exactly
+like a fast path that never fell through.
 
 ### What this invalidates
 
