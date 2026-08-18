@@ -263,7 +263,7 @@ source witnesses were each verified to fail when the defect is reintroduced.
   different mechanism. The sweep's two sibling pages (the OSR exception-table
   refusal and the inline trap inside a protected range) were retired
   independently on dev the same day.
-* `apps/commons-math/RESULTS-20260817.md` — the suite run this was found from.
+* retired/commons-math-suite-run-RETIRED-20260818.md — the suite run this was found from, now closed.
   Its verdict table lists four of this doc's witness classes under the retired
   root-map reading.
 * `W7-38-jit-aastore-never-called-its-own-check.md` — the same shape: one
