@@ -225,7 +225,31 @@ the stream demands them — which is why its line in the table below is flat and
 ours is not, and why `findFirst` (what Mockito uses) is nearly free there and
 full price here.
 
-That is the fix, and it is the only one on this page with the right ceiling: a
+And `populate_stack_frame` (`reflect_invoke.rs:2456`) is not cheap per frame. It
+does, for EVERY frame:
+
+* `try_alloc_concurrent_synthetic("java/lang/StackWalker$StackFrame", 8)` — the
+  by-name class resolution funnel, per frame (the same per-allocation name
+  lookup that was worth ~6% when it was memoized out of the bignum natives);
+* **four** `create_string` calls — `class_name.replace('/', ".")` (a Rust
+  `String` too), `method_name`, `source_file`, and the internal-form class name
+  again for `toStackTraceElement()`'s fallback;
+* `get_class_mirror(cid)`, eagerly, with a comment explaining that it must be
+  eager *at population time* to avoid a by-name lookup failing later;
+* five pins, five pin re-reads, eight `set_field`s.
+
+At the Quartz stack depth (~53) that is **~200 Java string allocations per mock
+invocation**, and Mockito reads at most a couple of frames before `findFirst`
+short-circuits. HotSpot builds the strings in the getters, on demand.
+
+So there are two independent lazinesses to recover, and the second is the
+smaller change: make the frame's Strings and mirror lazy (store `class_id` /
+`method_index` / bci in the slots and build the derived values in the getter
+natives that already exist) even while keeping the eager array. That alone
+should take the common `filter(..).findFirst()` shape from `O(depth)` string
+allocations to `O(frames actually inspected)`.
+
+The full fix, and the only one on this page with the right ceiling: a
 lazy `Stream<StackFrame>` — a spliterator that pulls a batch at a time through a
 `fetchFrames(from, count)` native — instead of an eagerly populated array. It is
 a real change (a new synthetic spliterator class, a batching native, and the
