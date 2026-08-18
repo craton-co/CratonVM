@@ -1182,6 +1182,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` | JIT | `CRATONVM_JIT=callee-oop-flush` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP2_X2` | JIT | `CRATONVM_JIT=dup2-x2` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUPX` | JIT | `CRATONVM_JIT=dupx` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD` | JIT | `CRATONVM_JIT=trusted-oop-getfield` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP_X1` | JIT | `CRATONVM_JIT=dup-x1` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP_X2` | JIT | `CRATONVM_JIT=dup-x2` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_EXC_TABLE_C2` | JIT | `CRATONVM_JIT=exc-table-c2` | opt-out | on | behaviour | snapshot | jit |

@@ -2326,12 +2326,26 @@ fn reloc_emit_enabled() -> bool {
     /// The shape mirrors `x64.rs`'s arm exactly, and deliberately keeps the
     /// property that stops the stale-receiver SIGSEGV: never dereference a
     /// receiver that is not null-free, 8-aligned and inside a published GC
-    /// region. Everything else — null, unaligned, out-of-heap, a legacy
-    /// (non-compact) instance of a compact class, or a width this arm does not
-    /// emit — branches to the helper, whose NPE / `i64::MIN` semantics are
-    /// unchanged. The one simplification against the single-pass version: the
-    /// legacy-layout receiver takes the helper rather than a second inline
-    /// path.
+    /// region. Everything else — null, unaligned, out-of-heap, or a width this
+    /// arm does not emit — branches to the helper, whose NPE / `i64::MIN`
+    /// semantics are unchanged.
+    ///
+    /// **The legacy-layout receiver reads inline too, since 2026-08-18.** It
+    /// used to take the helper — "the one simplification against the
+    /// single-pass version" — and that simplification turned out to be 100% of
+    /// this helper's calls on the Generational collector. `init_object_header`,
+    /// the TLAB fast path that serves ~99% of allocations for both the
+    /// interpreter and `jit_new_object`, writes `array_length = 0` and no
+    /// `GC_FLAG_COMPACT` unconditionally: it never consults
+    /// `plan_object_alloc`, so a class with a perfectly good registered compact
+    /// layout is still allocated legacy. An arm that inlines only compact
+    /// receivers therefore inlines almost nothing. See
+    /// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+    ///
+    /// The legacy read is the uniform 16-byte `Value` cell at
+    /// `HEADER_SIZE + field_index * SLOT_SIZE`, transcribed from the
+    /// single-pass arm's own legacy branch so the two cannot disagree about
+    /// payload offsets or sign-extension.
     fn emit_inline_compact_getfield(
         &mut self,
         node_pc: Option<usize>,
@@ -2341,22 +2355,64 @@ fn reloc_emit_enabled() -> bool {
         slot: i32,
     ) -> bool {
         if self.getfield == 0 {
+            crate::metrics::note_ir_getfield_decline(0);
             return false;
         }
         let Some(pc) = node_pc else {
+            crate::metrics::note_ir_getfield_decline(1);
             return false;
         };
         let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+            crate::metrics::note_ir_getfield_decline(2);
             return false;
         };
         if crate::x64::narrow_oops_block_inline_fields() {
+            crate::metrics::note_ir_getfield_decline(3);
             return false;
         }
         let raw_mode = crate::x64::inline_getfield_enabled();
         let guarded = crate::x64::guarded_inline_getfield_enabled() && self.region_bounds_addr != 0;
         if !raw_mode && !guarded {
+            crate::metrics::note_ir_getfield_decline(4);
             return false;
         }
+        // Trusted-oop receiver: null check only, no containment.
+        //
+        // The single-pass backend has had this since
+        // `emit_trusted_oop_receiver_check` landed — "a value whose
+        // operand-stack type is already proven to be an oop cannot be an
+        // unaligned integer or an arbitrary out-of-heap address without an
+        // earlier JIT/GC correctness failure, so repeating the six arena-bound
+        // comparisons at every field access is redundant". The IR tier never
+        // got it, and that is why ZGC and G1 — which deliberately publish NO
+        // region bounds — fail the containment clause on 100% of receivers
+        // here while the single-pass arm sails through on its proven oops.
+        //
+        // The IR's proof is its own type lattice: `Op::Load`'s base node is
+        // typed `IrType::Ref`. That is at least as strong as the single-pass
+        // `stack_oop_marks` argument this reuses.
+        //
+        // **Restricted to PRIMITIVE fields, deliberately.** Dropping
+        // containment for a REFERENCE load would inline-read a word that, under
+        // ZGC, may be `Z_COLORED_TAG | colour | offset` rather than a pointer —
+        // the un-barriered colored word `heap.rs::read_prim_element` panics on
+        // by design, and `zgc-jit-load-barrier.md` (risk J1) rates the silent
+        // version worse than a SIGSEGV. Primitives need neither a load barrier
+        // nor narrow-oop decoding, so they are the whole safe set.
+        //
+        // Note what this does NOT do: it does not publish `JIT_REGION_BOUNDS`
+        // on a non-publishing collector. That table's emptiness is load-bearing
+        // — per `audits/g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
+        // every inline reference-STORE fast path unreachable under G1/ZGC, so a
+        // JNI-pinned CSet-excluded region cannot lose its remembered-set edge.
+        // Filling it to speed up loads would silently re-enable those stores.
+        // `node_ty != Ref` is `!ref_node`, computed here because `ref_node`
+        // is not bound until the descriptor-agreement check below — which
+        // still runs, and still refuses the site, before anything is emitted.
+        let trusted_oop_receiver = node_ty != IrType::Ref
+            && !raw_mode
+            && crate::x64::trusted_oop_receiver_getfield_enabled()
+            && self.graph.nodes[base as usize].ty == IrType::Ref;
         // The node type and the resolved descriptor must agree. They can only
         // disagree through a resolver that fabricated a compact slot — the
         // WildFly Host Controller SIGSEGV — and the consequence of trusting it
@@ -2364,9 +2420,29 @@ fn reloc_emit_enabled() -> bool {
         let ref_node = node_ty == IrType::Ref;
         let ref_tag = matches!(type_tag, b'L' | b'[');
         if ref_node != ref_tag || ref_tag != c_is_ref {
+            crate::metrics::note_ir_getfield_decline(5);
             return false;
         }
-        if !ref_node && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+        // Width agreement, per descriptor. `J`/`D`/`F` were refused outright
+        // until 2026-08-17; measurement showed that refusal was ~88% of every
+        // `jit_getfield` call in a field-dense run — four sites falling back to
+        // an UNGUARDED helper CALL, which is why the count was identical on
+        // ZGC, Generational and G1. A `long` field on a hot path
+        // (BouncyCastle's `GeneralDigest.byteCount`) is not an exotic shape.
+        //
+        // Each is admitted only when the IR node's own type agrees with the
+        // resolved descriptor — the same defence the ref/non-ref check above
+        // applies, and for the same reason: a resolver that fabricated a
+        // compact slot must not steer a load width.
+        let width_ok = match type_tag {
+            b'I' | b'Z' | b'B' | b'C' | b'S' => node_ty == IrType::Int,
+            b'J' => node_ty == IrType::Long,
+            b'D' => node_ty == IrType::Double,
+            b'F' => node_ty == IrType::Float,
+            _ => false,
+        };
+        if !ref_node && !width_ok {
+            crate::metrics::note_ir_getfield_decline(6);
             return false;
         }
 
@@ -2377,7 +2453,7 @@ fn reloc_emit_enabled() -> bool {
         // 1. null → slow (the helper raises the NPE).
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow.push(self.emit_jcc_rel32(0x84)); // JZ
-        if guarded && !raw_mode {
+        if guarded && !raw_mode && !trusted_oop_receiver {
             // 2. alignment: the low three bits must be clear.
             self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
             self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
@@ -2403,15 +2479,17 @@ fn reloc_emit_enabled() -> bool {
             self.patch_rel32_to_here(ok1);
         }
         // 4. per-OBJECT compactness. A class with a registered compact layout
-        //    can still have legacy 16-byte-cell instances (an allocation whose
-        //    `num_fields` disagrees with the layout falls back to the uniform
-        //    plan), and reading one at the packed offset yields a mangled
-        //    {tag, half-pointer} word.
+        //    can still have legacy 16-byte-cell instances — and in practice
+        //    almost all of them are, because the TLAB fast path writes a legacy
+        //    header unconditionally (see this function's doc comment). Reading
+        //    one at the packed offset yields a mangled {tag, half-pointer}
+        //    word, so the two layouts get two reads, exactly as the single-pass
+        //    arm does.
         self.buf.emit(&[0xF6, 0x80]); // TEST byte [RAX + disp32], imm8
         self.buf
             .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
         self.buf.emit_byte(cratonvm_types::GC_FLAG_COMPACT);
-        slow.push(self.emit_jcc_rel32(0x84)); // JZ → slow (legacy instance)
+        let legacy_patch = self.emit_jcc_rel32(0x84); // JZ → legacy inline read
 
         // 5. the read itself. A compact reference field is the bare 8-byte
         //    pointer at the cell base; a primitive is its tagless descriptor
@@ -2425,12 +2503,64 @@ fn reloc_emit_enabled() -> bool {
                 b'B' => self.buf.emit(&[0x48, 0x0F, 0xBE, 0x80]), // MOVSX RAX, byte
                 b'C' => self.buf.emit(&[0x48, 0x0F, 0xB7, 0x80]), // MOVZX RAX, word
                 b'S' => self.buf.emit(&[0x48, 0x0F, 0xBF, 0x80]), // MOVSX RAX, word
-                _ => self.buf.emit(&[0x48, 0x63, 0x80]),          // MOVSXD RAX, dword
+                // `long` and `double` are 8-byte compact cells; both leave the
+                // raw 64 bits in RAX, which is exactly what the helper returns
+                // (`Value::Long(l) => l`, `Value::Double(d) => d.to_bits()`),
+                // so the shared tail below stores and (for FP) republishes them
+                // identically.
+                b'J' | b'D' => self.buf.emit(&[0x48, 0x8B, 0x80]), // MOV RAX, qword
+                // `float` is a 4-byte cell and the helper ZERO-extends it
+                // (`f.to_bits() as i64` widens a u32). A 32-bit MOV zeroes the
+                // upper half; MOVSXD would sign-extend and corrupt every
+                // negative-signed bit pattern.
+                b'F' => self.buf.emit(&[0x8B, 0x80]), // MOV EAX, dword (zero-extends)
+                _ => self.buf.emit(&[0x48, 0x63, 0x80]), // MOVSXD RAX, dword
             }
             self.buf.emit(&cell_off.to_le_bytes());
         }
         self.buf.emit_byte(0xE9); // JMP rel32 → done
         let done_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+
+        // --- legacy path: the uniform 16-byte `Value` cell. Transcribed from
+        //     the single-pass arm's legacy branch; the payload sub-offsets and
+        //     the sign-extension choice are that arm's, not a re-derivation. ---
+        self.patch_rel32_to_here(legacy_patch);
+        let legacy_cell_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
+        if ref_node {
+            // A reference descriptor always reads the cell's 64-bit pointer
+            // payload — never the 32-bit MOVSXD below, which would
+            // sign-extend half a pointer into a bogus non-null receiver.
+            self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+            self.buf
+                .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
+        } else {
+            match type_tag {
+                b'J' | b'D' => {
+                    self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, qword
+                    self.buf
+                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
+                }
+                // `float` is stored as a 32-bit payload and the helper
+                // ZERO-extends it (`f.to_bits() as i64`), so a 32-bit MOV;
+                // MOVSXD would corrupt every float with bit 31 set.
+                b'F' => {
+                    self.buf.emit(&[0x8B, 0x80]); // MOV EAX, dword (zero-extends)
+                    self.buf
+                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes());
+                }
+                // Every int-category descriptor: the cell holds a `Value::Int`
+                // payload already narrowed on store, so sign-extending it is
+                // what the helper returns.
+                _ => {
+                    self.buf.emit(&[0x48, 0x63, 0x80]); // MOVSXD RAX, dword
+                    self.buf
+                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes());
+                }
+            }
+        }
+        self.buf.emit_byte(0xE9); // JMP rel32 → done
+        let done_legacy_patch = self.buf.pos();
         self.buf.emit(&[0; 4]);
 
         // --- slow path: the checked helper, byte-identical to the arm this
@@ -2451,6 +2581,7 @@ fn reloc_emit_enabled() -> bool {
         self.push_call_exc_patch(exc_patch);
 
         self.patch_rel32_to_here(done_patch);
+        self.patch_rel32_to_here(done_legacy_patch);
         self.store_rax(slot);
         true
     }
@@ -4536,6 +4667,7 @@ fn reloc_emit_enabled() -> bool {
                     return;
                 }
                 if self.getfield != 0 {
+                    crate::metrics::note_getfield_arm(5);
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);

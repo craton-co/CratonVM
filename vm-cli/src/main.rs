@@ -138,6 +138,55 @@ fn maybe_dump_shutdown_reports() {
 
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
+        // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
+        // guarded inline `getfield` is emitted at dozens of sites and can still
+        // never take its inline branch; only this counter distinguishes
+        // "emitted" from "ran". Pair it with the compile-time
+        // `[compact-inline] MISS` census under CRATONVM_DBG_COMPACT_INLINE:
+        // MISS names the SITES that cannot inline, this names the ACCESSES that
+        // paid the helper's `is_object_address` walk. See
+        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+        eprintln!(
+            "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_helper_calls(),
+            cratonvm_jit::metrics::getfield_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // The RECEIVER-SHAPE census: which guard clause each helper call
+        // actually failed, counted at EXECUTION on the one path every
+        // fall-through crosses. The two lines above count EMISSIONS, which is
+        // the question that cost this page four dead hypotheses. Needs
+        // `CRATONVM_DBG_GETFIELD_RECEIVERS=1`; all-zero means it was not on.
+        eprintln!(
+            "[cratonvm] getfield receiver shapes: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_receiver_shapes()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let legacy_classes = cratonvm_vm::jit::helpers::jit_getfield_legacy_receiver_classes();
+        if !legacy_classes.is_empty() {
+            eprintln!(
+                "[cratonvm] getfield legacy receivers by class: {}",
+                legacy_classes
+                    .iter()
+                    .map(|(n, id, c)| format!("{n}(id={id})={c}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        eprintln!(
+            "[cratonvm] IR-tier inline-getfield refusals: {}",
+            cratonvm_jit::metrics::ir_getfield_declines()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The bytecode loop rewriter's admission tally, on the same switch and
         // for the same reason: it is what the compiler did, read at exit. The
         // counters themselves are always collected (they do not consult

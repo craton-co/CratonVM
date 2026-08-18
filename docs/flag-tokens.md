@@ -566,6 +566,7 @@ export inherited from a parent shell.
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
 | `dup2-x2` | `CRATONVM_JIT_NO_DUP2_X2` |
 | `dupx` | `CRATONVM_JIT_NO_DUPX` |
+| `trusted-oop-getfield` | `CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD` |
 | `dupx-eager-canon` | `CRATONVM_JIT_DUPX_EAGER_CANON` |
 | `eager-callee-chain` | `CRATONVM_JIT_EAGER_CALLEE_CHAIN` |
 | `enable-callee-saved-gpr-locals` | `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS` |
