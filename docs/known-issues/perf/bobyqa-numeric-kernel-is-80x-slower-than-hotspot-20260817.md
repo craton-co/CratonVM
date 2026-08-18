@@ -196,11 +196,19 @@ of those exists, **`BOBYQAOptimizer`'s accessors — `ArrayRealVector.data` and
 `Array2DRowRealMatrix.data` are both reference fields — cannot inline on the
 default collector**, and that is the whole of what is left of this page.
 
-One observation offered with its caveat: the same probe on the same host read
-`receiverFieldTax=13.23` before those two commits and 25.2 after, i.e. the
-reference-field path appears to have got *slower* even as the primitive path
-got 8.7x faster. That is one before/after pair on one host, not a bisect, so it
-is a thing to check rather than a claim.
+One observation was offered here with its caveat — that the reference-field path
+appeared to have got *slower* (13.23 → 25.2) even as the primitive path got 8.7x
+faster — and it has since been bisected. **It was real, and it was a
+diagnostic.** `1794c8e81` put an uncached `runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")`
+inline in `jit_getfield`: a string-keyed flag lookup on the hottest helper in
+the VM, 3.4x on every reference-field read, fixed by caching it in a `OnceLock`
+like the line above it. See the CORRECTION section of the getfield page.
+
+So the numbers in the table above are inflated on the ZGC row only (a primitive
+field inlines and never enters the helper). Re-measured with the gate cached:
+**ZGC reference 12.5-15.3 ns, Generational reference 2.1-3.4 ns** — the residual
+is ~5x, not 26x. Every conclusion above holds in direction; the magnitude is
+five times smaller than published.
 
 ## What would fix it
 
