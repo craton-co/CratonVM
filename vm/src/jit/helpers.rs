@@ -11331,6 +11331,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     info,
                     args_slice,
                     vm_ptr,
+                    // This door has no inline-cache slot to install into: it is
+                    // reached from a call site the codegen did not give one.
+                    None,
                 ) {
                     return result;
                 }
@@ -13804,6 +13807,91 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     }
 }
 
+/// Give this SAM call site an inline-cache entry of its own.
+///
+/// The Rust arm below answers a lambda dispatch in ~190 ns; a named class's
+/// call site answers one in ~12, because after its first miss the inline cache
+/// holds the callee and the emitted cascade never re-enters Rust
+/// (`mic_calls=1` across 2 200 000 dispatches, `CRATONVM_DBG=mic-prof`). The
+/// only thing keeping a lambda out of that slot was an argument shuffle — the
+/// call site has `(proxy, samArgs…)` and a non-capturing lambda's impl wants
+/// `(samArgs…)` — so `lambda_adapter` emits a thunk that performs the shuffle
+/// and tail-jumps, and the slot holds THAT.
+///
+/// Installed only for shapes the thunk can serve without touching memory:
+///
+/// * **no captures** — reading a captured field from a hand-emitted thunk would
+///   mean reproducing the compact/legacy body-layout branch (`GC_FLAG_COMPACT`)
+///   and every per-type width the `getfield` arms handle. A capturing lambda
+///   keeps the Rust arm.
+/// * **no `checkcast`** — a generic call site's cast is a class-hierarchy
+///   question, not a register move.
+/// * **a static impl**, which "no captures" already implies for javac's output;
+///   asserted rather than assumed because the thunk drops the receiver outright.
+/// * **an arity the register ABI can carry**, receiver and context included —
+///   `lambda_adapter_entry` refuses the rest.
+///
+/// Both slots are written, because the emitted cascade prefers the PIC when the
+/// codegen allocated one and never consults the MIC in that case.
+///
+/// Everything after installation is the ordinary cached-call path: the
+/// cascade's own null and `ObjectKind::Object` guards run before the call, its
+/// `i64::MIN` callee-deopt check after it, and an escaping exception is left in
+/// `jit_pending_exception` for the caller's post-invoke check. This arm
+/// participates in none of it any more, which is the point.
+#[allow(clippy::too_many_arguments)]
+unsafe fn install_lambda_inline_cache(
+    vm: &SharedVm,
+    site: &crate::runtime::interpreter::LambdaJitSite,
+    receiver_class_id: ClassId,
+    code: &cratonvm_jit::RetainedCode,
+    mic_ptr: i64,
+    pic_ptr: i64,
+) {
+    if !crate::runtime::env_cache::jit_lambda_adapter() {
+        return;
+    }
+    if site.num_captures() != 0 || site.has_checkcasts() || !site.is_static_impl() {
+        return;
+    }
+    if !site.claim_adapter_install() {
+        return;
+    }
+    let Some(entry) = cratonvm_jit::lambda_adapter::lambda_adapter_entry(
+        receiver_class_id.as_u32(),
+        code.arc(),
+        site.total_args(),
+    ) else {
+        return;
+    };
+    let class_id = receiver_class_id.as_u32();
+    let class_name = site.impl_class_name();
+    let needs_ctx = code.needs_context();
+    let jdk_only = crate::vm::dispatch_policy(vm).is_jdk_only();
+    let mut installed = false;
+    if mic_ptr != 0 {
+        let mic = &*(mic_ptr as *const JitMICSlot);
+        mic.update(class_id, class_name, entry as u64, needs_ctx, jdk_only);
+        installed = true;
+    }
+    if pic_ptr != 0 {
+        let pic = &*(pic_ptr as *const JitPICSlot);
+        pic.install(class_id, class_name, entry as u64, needs_ctx, jdk_only);
+        installed = true;
+    }
+    if installed {
+        crate::runtime::interpreter::lambda_site_bump_adapter();
+        if mic_prof::enabled() {
+            eprintln!(
+                "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
+                 sam_args={} entry={entry:#x} impl={}",
+                site.total_args(),
+                class_name,
+            );
+        }
+    }
+}
+
 /// A compiled caller's SAM call, served straight from the lambda call site's
 /// own cached target.
 ///
@@ -13840,6 +13928,7 @@ unsafe fn try_lambda_site_direct_call(
     info: &JitInvokeInfo,
     args_slice: &[i64],
     vm_ptr: i64,
+    ic_slots: Option<(i64, i64)>,
 ) -> Option<i64> {
     const MAX_DIRECT_ARGS: usize = 8;
     let site = crate::runtime::interpreter::lambda_jit_site(
@@ -13877,6 +13966,9 @@ unsafe fn try_lambda_site_direct_call(
         // `ClassCastException` it has always raised, message and all.
         crate::runtime::interpreter::lambda_site_bump_refused();
         return None;
+    }
+    if let Some((mic_ptr, pic_ptr)) = ic_slots {
+        install_lambda_inline_cache(vm, &site, receiver_class_id, &code, mic_ptr, pic_ptr);
     }
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
     crate::runtime::interpreter::lambda_jit_site_capture_args(
@@ -14512,6 +14604,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             info,
             args_slice,
             vm_ptr,
+            Some((mic_ptr, pic_ptr)),
         ) {
             return result;
         }
