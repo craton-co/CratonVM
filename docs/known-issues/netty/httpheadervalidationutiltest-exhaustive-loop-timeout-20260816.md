@@ -146,10 +146,21 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    baseline but does not beat it, because the chain's terminal
    `UNKNOWN.equals(k)` is an `invokevirtual` and cannot nest.
 
-   **So the lever for this class's 21 ns has moved once more, and it is now
-   named precisely: direct-bind a spliced call**, and devirtualise inside a
-   splice. Both are on the sibling page. Neither is a correctness risk of the
-   kind steps 1-4 were — they are refusals that cost reach, not wrong stacks.
+   **Direct-binding a spliced call landed later the same day, and it is the
+   first thing in this line of work that made anything faster**: six
+   interleaved rounds, 6/6 faster, 45.1 -> 39.1 ns/iter on the assertion chain
+   (-13%), with `disp_calls` back to ~3 870 in every arm. On the sibling class
+   it turned an opaque `HANG` with `started=0` into `13 started, 12 ok`.
+
+   Devirtualising inside a splice also landed and is **inert**, which the
+   engagement counters say outright (`nested-splice-guarded=0`, and
+   `nested-splice=0` — so nesting has never fired either). Two causes: profiling
+   is default-OFF behind `CRATONVM_TIER_PGO`, and with it on the receiver map is
+   still EMPTY at the sites that matter, because the eager-callee-chain compiles
+   those methods before they run their virtual calls interpreted. The next lever
+   is therefore a data problem: read the already-compiled callee's MIC/PIC slot,
+   which holds the receiver class the profile never recorded. Details and the
+   full trace are on the sibling page.
 
    The chain's first two steps were VM work rather than compiler work: an artifact
    carrying an inlined caller scope cannot be OSR-entered at all

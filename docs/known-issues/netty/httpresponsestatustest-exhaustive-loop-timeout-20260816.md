@@ -406,30 +406,106 @@ The order is therefore:
    direct calls out of an ~47 ns iteration is inside this probe's round-to-round
    noise, which is itself ~±15 ns on this host.
 
-### What steps 4-5 actually bought, and what is next
+### Direct-binding a spliced call — LANDED 2026-08-18, and it is the win
 
-Not speed, yet. What they bought is that **the inliner can now nest at all**,
-and a measured statement of what the next lever has to be:
+The lever the step-4 measurement named, and the first thing in this whole line
+of work that made the class faster.
 
-* **Direct-bind a spliced call.** The top level resolves an already-compiled
-  callee to a raw `CALL` (`direct_calls` / `JitDirectCall`); a spliced call has
-  no equivalent and falls to the blind helper, which is the whole finding above.
-  Giving `emit_inline_invoke` the same treatment — resolve the target's compiled
-  entry at plan time, record the invalidation dependency, emit the register-ABI
-  call — is what would let a call-carrying splice pay for itself without needing
-  the whole chain to collapse. It is also the thing that would make the
-  `INLINE_CALL_DISPATCH` arm unnecessary rather than merely off.
-* **Devirtualise inside a splice.** Needed for `valueOf` and for the chain's
-  terminal `equals`. PGO-02 already resolves a guarded monomorphic body from a
-  receiver profile; the missing piece is a profile keyed by (caller pc, callee
-  pc) rather than caller pc alone.
+`resolve_inline_site_from` now consults the SAME direct-bind resolver the
+top-level `direct_calls` planning uses (`callee_compiler` on the mutator door,
+`direct_callee_lookup` on the background one), so a call inside a spliced body
+is emitted as a raw `CALL` to the callee's compiled entry instead of the blind
+`jit_invoke_dispatch`. Every refusal gate applies unchanged and in the same
+order, and the baked entry is registered in
+`CompiledMethod::_direct_callee_entries` — which is what pins the callee
+artifact and what the invalidation reverse closure walks. Omitting that
+registration has no symptom until the callee tiers up, so a test asserts it.
 
-Neither is a correctness risk of the kind steps 1-4 were — both are refusals
-that cost reach, not wrong stacks.
+`probes/AssertChainProbe`, one binary, six interleaved rounds, `assertFull`:
 
-Steps 1-4 are correctness-critical, and their failure mode is a silent wrong
-stack rather than a slow loop. That is the honest size of "needs an inliner that
-can nest", and the inliner is the last item on the list rather than the first.
+| round | base | + direct-bound spliced calls |
+|---|---:|---:|
+| 1 | 45.56 | **39.12** |
+| 2 | 44.45 | **40.19** |
+| 3 | 45.45 | **39.13** |
+| 4 | 44.78 | **39.04** |
+| 5 | 68.98 | **38.97** |
+| 6 | 44.35 | **39.00** |
+
+**6 of 6 rounds faster, ~45.1 -> ~39.1 ns/iter (-13%)** — and far more stable
+(range 1.2 ns against the base's 24.6), which is what removing dispatch round
+trips looks like. `CRATONVM_DBG=mic-prof`: `disp_calls` is ~3 870 in every arm
+now, including the arm that still permits the blind-dispatch fallback. The
+2 003 361 blind dispatches step 4 introduced are gone.
+
+**And the class moved.** codec-http, 93 classes, same binary, flags off vs on:
+
+| | `HttpResponseStatusTest` |
+|---|---|
+| off | `HANG` — `found=0 started=0 ok=0`, process killed at the 180 s wall |
+| on | `found=13 started=13 ok=12 failed=1`, 171 s |
+
+12 of its 13 tests now run and pass where the whole class was previously an
+opaque hang with nothing started. The one remaining failure is
+`testHttpStatusClassValueOf` hitting JUnit's own 120 s `@Timeout` — this page's
+exhaustive loop, still over budget, which is what a 13% improvement against a
+2.2x gap predicts. Every other class in the suite is unchanged (87 PASS, same
+set, same per-test counts).
+
+### Devirtualising inside a splice — LANDED, MEASURED, and INERT
+
+Also implemented: `NestedInlineSite::guard_class_id`, a receiver class-id guard
+around a nested splice with the miss edge taking the ordinary call —
+PGO-02's shape one level down (`emit_guarded_nested_inline`).
+
+Both pages predicted this needed "a profile keyed by (caller pc, callee pc)".
+That was the wrong shape: receiver types are recorded against the bci of the
+method that is EXECUTING, so a call inside `objectsAreEqual` is already profiled
+under `objectsAreEqual`'s own `MethodKey` at its own bci — exactly the (method,
+pc) pair a nested site names.
+
+**It fires zero times, and the engagement counters are what say so.** Timing put
+`devirt` within noise of `nest` (41.1/39.2 against 39.4/39.5), which is
+consistent with two completely different findings. `CRATONVM_DBG=jit-method-stats`
+now prints, unfiltered:
+
+```
+inline call arms: spliced-call-direct=12 spliced-call-dispatch=0
+                  nested-splice=0 nested-splice-guarded=0
+                  nested-splice-guarded-refused=0
+```
+
+`spliced-call-direct=12` is the win above. `nested-splice=0` and
+`nested-splice-guarded=0` mean **nesting has never fired either** — so the
+step-5 "recovers the baseline" reading from 2026-08-18 was measuring the
+direct-bind path, not nesting. `nested-splice-guarded-refused=0` further says
+these were refused at the RESOLVER, not at emission.
+
+`CRATONVM_DBG_JITC` names each refusal, and there are two causes:
+
+* **Profiling is default-OFF** behind `CRATONVM_TIER_PGO`, so the first
+  devirt measurement had no profile at all — the feature reported itself on
+  while being structurally inert, the same shape as the field-site cache that
+  shipped switched off.
+* **With `CRATONVM_TIER_PGO=1` the profile exists and is EMPTY at the sites that
+  matter**: `nest-virtual java/lang/Object.equals -> profile has no receivers at
+  that pc (pcs: [])` for `AssertionUtils.objectsAreEqual`, and no profile at all
+  for `AssertEquals.failNotEqual` (the failure path never runs). The
+  eager-callee-chain compiles these methods before they execute their virtual
+  calls interpreted, so the receiver map never fills.
+
+  That cascades: `objectsAreEqual` cannot be nested because it CONTAINS a
+  virtual call with no profile, `failNotEqual` likewise, and
+  `AssertionFailureBuilder.assertionFailure()` contains a `new`, which the
+  resolver refuses outright. Every static-nesting refusal in the trace reduces
+  to one of those.
+
+**So the next lever is a data problem, not an emitter one.** The receiver
+evidence exists, in the wrong place: an already-compiled `objectsAreEqual` has a
+MIC/PIC slot at its `equals` site holding the class it actually dispatches to.
+Reading the callee artifact's inline-cache slot — real runtime evidence,
+available exactly where the profile is not — is what would make the guarded
+splice fire. The emitter half is done and tested.
 
 ## What is left, in order
 
