@@ -5101,6 +5101,13 @@ fn execute_frame_from_index(
     // still re-checked per-bytecode inside `fire_jvmti_single_step` when a listener
     // is active.
     let single_step_active = crate::runtime::jvmti::any_single_step_listener_active();
+    // Hoisted for the same reason as `pgo_enabled` above: the `if_acmpne`
+    // fast-path arm declines while the `CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE`
+    // diagnostic is armed, so the decoded arm (which owns that instrument)
+    // still runs. Reading the cached gate once per `execute_frame` keeps the
+    // arm's admission test to a register compare. Arming it mid-method is
+    // observed on the next call/return, the accepted pgo-style tradeoff.
+    let acmp_identity_trace = crate::runtime::env_cache::active_profiles_identity_trace();
     // When a fast-path bytecode needs to throw a RuntimeError (AIOOBE, NPE, etc.),
     // it sets this to Some(...) and breaks out of the fast-path match instead of
     // returning directly. The main loop then converts it to a catchable Java exception.
@@ -5158,6 +5165,92 @@ fn execute_frame_from_index(
     // the fall-through hint only bought one popcount on the fall-through path
     // at the cost of a compare on every branch, back-edge, handler entry and
     // switch target. `resolve()` is the hint-free form.)
+    // ── Conditional-branch arm, written once ──────────────────────────────
+    //
+    // Each of the interpreter's conditional-branch fast-path arms is the same
+    // twenty lines around a one-line predicate: record the branch outcome for
+    // PGO, take the branch or fall through, and — when the target is BACKWARD
+    // — record the back edge, bump `Frame::backward_count`, and offer the
+    // frame to `try_osr_with_backoff`.
+    //
+    // It is written once here because the copied form had already lost a whole
+    // opcode family. `ifnull` (0xc6), `ifnonnull` (0xc7), `if_acmpeq` (0xa5)
+    // and `if_acmpne` (0xa6) had no fast-path arm at all, so they fell through
+    // to the decoded handler in `opcodes.rs` — which sets `frame.pc` and
+    // nothing else. A loop closed by one of those four therefore:
+    //
+    //   * never recorded a PGO back edge,
+    //   * never incremented `Frame::backward_count`, so it could not reach the
+    //     `OSR_THRESHOLD` and could never enter an OSR-compiled body, and
+    //   * never earned whole-method tier-up credit either, because
+    //     `pop_and_recycle_frame_with_reason` feeds `ProfileStore::add_loop_work`
+    //     from that same counter.
+    //
+    // That is the ordinary shape of `do { … } while (p != null)`, of
+    // `do { … } while (o != sentinel)`, and of every `for`/`while` emitted by a
+    // frontend that puts the loop test at the BOTTOM (ECJ, and the Kotlin and
+    // Scala backends) rather than at the top with a closing `goto` the way
+    // javac does. The comment on `try_osr_with_backoff` calls itself "the one
+    // funnel all fourteen back-edge sites go through" — fourteen was the count
+    // of arms that had been written, not of branches that can close a loop.
+    //
+    // `frame`, `saved_pc`, `b1` and `b2` are parameters rather than captures:
+    // `macro_rules!` gives local-variable identifiers definition-site hygiene
+    // and those four are bound inside the dispatch loop, below this point.
+    // Everything else the body touches (`shared`, `thread`, `frame_idx`,
+    // `initial_frame_idx`, `pgo_enabled`, `pending_java_exception`) is already
+    // in scope here.
+    macro_rules! cond_branch_arm {
+        ($frame:expr, $saved_pc:expr, $b1:expr, $b2:expr, $taken:expr) => {{
+            let taken = $taken;
+            if pgo_enabled {
+                let (cid, mn, md) = method_key_parts($frame);
+                shared
+                    .jit
+                    .profile_store
+                    .record_branch_borrowed(cid, mn, md, $saved_pc, taken);
+            }
+            if taken {
+                // Cast: bytecode operand decoding
+                let offset = (($b1 as i16) << 8) | ($b2 as i16);
+                // Cast: signed branch offset arithmetic
+                $frame.pc = ($saved_pc as isize + offset as isize) as usize;
+                if offset < 0 {
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts($frame);
+                        shared
+                            .jit
+                            .profile_store
+                            .record_backedge_borrowed(cid, mn, md, $saved_pc);
+                    }
+                    $frame.backward_count += 1;
+
+                    let entry_pc = $frame.pc;
+                    let _ = $frame;
+                    match try_osr_with_backoff(
+                        shared,
+                        thread,
+                        &mut frame_idx,
+                        initial_frame_idx,
+                        entry_pc,
+                    ) {
+                        OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                        OsrBackoffOutcome::ContinueDispatch => continue,
+                        OsrBackoffOutcome::ThrowJava(exc) => {
+                            pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                            continue;
+                        }
+                        OsrBackoffOutcome::Skip => {}
+                    }
+                    safepoint_check(shared, thread);
+                }
+            } else {
+                $frame.pc = $saved_pc + 3;
+            }
+            continue;
+        }};
+    }
+
     loop {
         // Route callee-thrown Java exceptions before the safepoint poll below.
         // `pending_java_exception` is only a Rust local between the callee's
@@ -5730,7 +5823,17 @@ fn execute_frame_from_index(
                 // the prior `Value::Int(_)` match — falling through to the slow
                 // path on type-mismatch is unnecessary because verified
                 // bytecode guarantees Int at this site).
-                0x84 => {
+                // iinc — the local index is the raw bytecode operand and the
+                // accessors below index `frame.locals` without a bounds check,
+                // so this arm needs the same `b1 < max_locals` admission test
+                // its `iload`/`istore`/`astore` neighbours carry. Without it a
+                // per-class `skip_verification` class (which the global
+                // `use_fast_path` gate does NOT cover) reaches
+                // `set_local_int_unchecked` with an out-of-range index and
+                // PANICS on the `Vec` index — the one outcome this module's
+                // zero-panic gate exists to prevent. Out of range falls through
+                // to the bounds-checked decoded handler, unchanged.
+                0x84 if (b1 as usize) < frame.max_locals as usize => {
                     let idx = b1 as usize; // Cast: bytecode operand decoding
                     let inc = b2 as i8 as i32; // Cast: bytecode operand decoding
                     let v = frame.get_local_int_unchecked(idx);
@@ -5829,247 +5932,31 @@ fn execute_frame_from_index(
                 0xa1 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va < vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va < vb);
                 }
                 // if_icmple
                 0xa4 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va <= vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va <= vb);
                 }
                 // if_icmpgt
                 0xa3 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va > vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va > vb);
                 }
                 // if_icmpne
                 0xa0 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va != vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va != vb);
                 }
                 // if_icmpeq
                 0x9f => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va == vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va == vb);
                 }
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
@@ -6272,290 +6159,32 @@ fn execute_frame_from_index(
                 // ifle — AUDIT CRIT-4
                 0x9e => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val <= 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val <= 0);
                 }
                 // ifge
                 0x9c => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val >= 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val >= 0);
                 }
                 // ifgt
                 0x9d => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val > 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val > 0);
                 }
                 // iflt
                 0x9b => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val < 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val < 0);
                 }
                 // ifne
                 0x9a => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val != 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val != 0);
                 }
                 // ifeq
                 0x99 => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val == 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val == 0);
                 }
                 // i2l — AUDIT CRIT-4: int-typed pop avoids the 8-arm Value match.
                 0x85 => {
@@ -7704,6 +7333,313 @@ fn execute_frame_from_index(
                         },
                     }
                 }
+                // ── Fast-path coverage completion (interpreter audit
+                // 2026-08-18) ────────────────────────────────────────────
+                //
+                // Everything below reached the decoded handler until now: the
+                // quickened stream had to resolve `saved_pc` (instruction-start
+                // bitmap + per-block popcount), the ~200-arm `Instruction` match
+                // in `opcodes.rs` had to be entered, and each arm re-indexed
+                // `thread.frames[frame_idx]` — bounds-checked, `imul` by
+                // `size_of::<Frame>()` — once per operand it touched.
+                //
+                // The gaps were not chosen, they are what the fast path grew up
+                // around: `ishl`/`ishr`/`iushr` had arms but `lshl`/`lshr`/`lushr`
+                // did not, `ineg`/`lneg` did but `fneg`/`dneg` did not,
+                // `irem`/`lrem` did but `frem`/`drem` did not, `lcmp` did but
+                // `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` did not, `i2l`/`i2f`/`i2d`/`l2i`
+                // did but the eight remaining conversions did not, and `dup`/`pop`
+                // did but the six other shuffles did not. The long shifts alone
+                // are the whole of a 64-bit hash mixer (`h ^= h >>> 33`) and of
+                // most of the bit-twiddling in the crypto suites this VM runs.
+
+                // ── Reference comparisons: if_acmpeq / if_acmpne ──────────
+                // These close a loop in `do { … } while (a != b)` and in any
+                // bottom-test frontend's output; see `cond_branch_arm!` for
+                // what having no arm here used to cost such a loop.
+                0xa5 => {
+                    let vb = frame.stack.pop_unchecked();
+                    let va = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, refs_equal(&va, &vb));
+                }
+                // The `active_profiles_identity_trace` diagnostic lives on the
+                // decoded `IfAcmpne` arm and prints class names for both
+                // operands. Decline the fast path while it is armed rather than
+                // duplicating it, so turning the flag on still reaches it.
+                0xa6 if !acmp_identity_trace => {
+                    let vb = frame.stack.pop_unchecked();
+                    let va = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, !refs_equal(&va, &vb));
+                }
+                // ── Null tests: ifnull / ifnonnull ────────────────────────
+                // `ref_operand_is_null` (not `Value::is_null`) so a JNI jobject
+                // null carried as `Value::Long(0)` reads as null — identical to
+                // the decoded arm this replaces.
+                0xc6 => {
+                    let v = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, ref_operand_is_null(&v));
+                }
+                0xc7 => {
+                    let v = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, !ref_operand_is_null(&v));
+                }
+
+                // ── Long shifts (JVMS: shift distance masked to 6 bits) ───
+                0x79 => {
+                    let sh = frame.stack.pop_int_unchecked() & 0x3F;
+                    let v = frame.stack.pop_long_unchecked();
+                    frame.stack.push_long_unchecked(v << sh);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x7b => {
+                    let sh = frame.stack.pop_int_unchecked() & 0x3F;
+                    let v = frame.stack.pop_long_unchecked();
+                    frame.stack.push_long_unchecked(v >> sh);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x7d => {
+                    let sh = frame.stack.pop_int_unchecked() & 0x3F;
+                    // Widening: unsigned conversion for the logical shift
+                    let v = frame.stack.pop_long_unchecked() as u64;
+                    // Cast: JIT ABI -- i64 register convention
+                    frame.stack.push_long_unchecked((v >> sh) as i64);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── Float / double negate and remainder ───────────────────
+                // Rust's `%` on floats is fmod, which is exactly what JVMS
+                // §6.5 frem/drem specify (NOT the IEEE 754 remainder).
+                0x72 => {
+                    let vb = frame.stack.pop_float_unchecked();
+                    let va = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(va % vb);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x73 => {
+                    let vb = frame.stack.pop_double_unchecked();
+                    let va = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(va % vb);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x76 => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(-v);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x77 => {
+                    let v = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(-v);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── The eight remaining primitive conversions ─────────────
+                // Narrowings to integer defer to the same saturation helpers
+                // the decoded arms use (JVMS §2.8.3: NaN → 0, +inf → MAX,
+                // -inf → MIN); widenings are plain casts.
+                0x89 => {
+                    let v = frame.stack.pop_long_unchecked();
+                    // JVM spec: l2f may lose precision
+                    frame.stack.push_float_unchecked(v as f32);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8a => {
+                    let v = frame.stack.pop_long_unchecked();
+                    // JVM spec: l2d may lose precision above 2^53
+                    frame.stack.push_double_unchecked(v as f64);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8b => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_int_unchecked(float_to_int(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8c => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_long_unchecked(float_to_long(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8d => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_double_unchecked(f64::from(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8e => {
+                    let v = frame.stack.pop_double_unchecked();
+                    frame.stack.push_int_unchecked(double_to_int(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8f => {
+                    let v = frame.stack.pop_double_unchecked();
+                    frame.stack.push_long_unchecked(double_to_long(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x90 => {
+                    let v = frame.stack.pop_double_unchecked();
+                    // JVM spec: d2f may lose precision
+                    frame.stack.push_float_unchecked(v as f32);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── Float / double comparisons ────────────────────────────
+                // `l` and `g` differ only in the NaN answer.
+                0x95 | 0x96 => {
+                    let vb = frame.stack.pop_float_unchecked();
+                    let va = frame.stack.pop_float_unchecked();
+                    let nan_result = if opcode == 0x95 { -1 } else { 1 };
+                    let result = if va.is_nan() || vb.is_nan() {
+                        nan_result
+                    } else if va > vb {
+                        1
+                    } else if va == vb {
+                        0
+                    } else {
+                        -1
+                    };
+                    frame.stack.push_int_unchecked(result);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x97 | 0x98 => {
+                    let vb = frame.stack.pop_double_unchecked();
+                    let va = frame.stack.pop_double_unchecked();
+                    let nan_result = if opcode == 0x97 { -1 } else { 1 };
+                    let result = if va.is_nan() || vb.is_nan() {
+                        nan_result
+                    } else if va > vb {
+                        1
+                    } else if va == vb {
+                        0
+                    } else {
+                        -1
+                    };
+                    frame.stack.push_int_unchecked(result);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── Operand-stack shuffles ────────────────────────────────
+                // Every one of these moves slot bits AND the kind mark, which
+                // is the whole reason they use `*_with_kind_unchecked` rather
+                // than a `Value` round-trip: `ValueStack::is_cat2_kind` reads
+                // the mark to decide whether a NaN-tag-colliding long is one
+                // logical category-2 value or two category-1 slots, and the GC
+                // reads it to decide whether a pointer-shaped slot is a
+                // reference. Structure mirrors the decoded arms exactly.
+                0x58 => {
+                    let (val, kind) = frame.stack.pop_with_kind_unchecked();
+                    if !crate::runtime::ValueStack::is_cat2_kind(kind, val) {
+                        frame.stack.pop_with_kind_unchecked();
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5a => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    frame.stack.push_with_kind_unchecked(v1, k1);
+                    frame.stack.push_with_kind_unchecked(v2, k2);
+                    frame.stack.push_with_kind_unchecked(v1, k1);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5b => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    if crate::runtime::ValueStack::is_cat2_kind(k2, v2) {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5c => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    if crate::runtime::ValueStack::is_cat2_kind(k1, v1) {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5d => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    if crate::runtime::ValueStack::is_cat2_kind(k1, v1) {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5e => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    let v1c2 = crate::runtime::ValueStack::is_cat2_kind(k1, v1);
+                    let v2c2 = crate::runtime::ValueStack::is_cat2_kind(k2, v2);
+                    if v1c2 && v2c2 {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else if v1c2 {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else if v2c2 {
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        let (v4, k4) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v4, k4);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
                 _ => { /* fall through to slow path */ }
             }
         }
@@ -7956,7 +7892,58 @@ fn execute_frame_from_index(
 
         #[allow(unreachable_patterns)]
         match exec_result {
-            Ok(InstructionResult::Continue) => continue,
+            Ok(InstructionResult::Continue) => {
+                // ── Decoded-path back-edge accounting ───────────────────
+                //
+                // The raw-bytecode arms above account for their own branches.
+                // Anything that reaches the decoded handler and jumps BACKWARDS
+                // had no accounting at all: `goto_w`, `tableswitch`,
+                // `lookupswitch`, `ret`, and — under `-noverify`, where
+                // `use_fast_path` is false — every branch in the instruction
+                // set. A loop closed by one of those was invisible to back-edge
+                // OSR and to the loop-work tier-up credit
+                // `pop_and_recycle_frame_with_reason` computes from
+                // `Frame::backward_count`.
+                //
+                // Testing the resulting pc rather than enumerating opcodes is
+                // deliberate: it is the property that actually matters, it
+                // cannot be forgotten when an opcode is added, and it is one
+                // compare against a value already in hand — on the slow path
+                // only, since a fast-path arm never reaches here.
+                //
+                // `Continue` is the only result this can key off: `FramePushed`
+                // and `Return` change the frame under `frame_idx`, and a thrown
+                // exception leaves through `Err`, so a handler landing pad
+                // below `saved_pc` is not mistaken for a loop back edge.
+                let new_pc = thread.frames[frame_idx].pc;
+                if new_pc < saved_pc {
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+                        shared
+                            .jit
+                            .profile_store
+                            .record_backedge_borrowed(cid, mn, md, saved_pc);
+                    }
+                    thread.frames[frame_idx].backward_count += 1;
+                    match try_osr_with_backoff(
+                        shared,
+                        thread,
+                        &mut frame_idx,
+                        initial_frame_idx,
+                        new_pc,
+                    ) {
+                        OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                        OsrBackoffOutcome::ContinueDispatch => continue,
+                        OsrBackoffOutcome::ThrowJava(exc) => {
+                            pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                            continue;
+                        }
+                        OsrBackoffOutcome::Skip => {}
+                    }
+                    safepoint_check(shared, thread);
+                }
+                continue;
+            }
             Ok(InstructionResult::FramePushed) => {
                 // A new bytecode frame was pushed — execute it iteratively
                 frame_idx = thread.frames.len() - 1;
@@ -8711,6 +8698,13 @@ fn refs_equal(a: &Value, b: &Value) -> bool {
             (Value::Int(va), Value::Int(vb)) => va == vb,
             (Value::Int(0), Value::Object(None)) | (Value::Object(None), Value::Int(0)) => true,
             (Value::Long(0), Value::Object(None)) | (Value::Object(None), Value::Long(0)) => true,
+            // Both sides a JNI-smuggled null handle. `ref_operand_is_null`
+            // already calls `Value::Long(0)` the null reference, and the arm
+            // above says a `Long(0)` equals an `Object(None)` — so leaving this
+            // pair out made `if_acmpeq(nullHandle, nullHandle)` answer FALSE
+            // while both `if_acmpeq(nullHandle, null)` and `ifnull(nullHandle)`
+            // answered TRUE. Equality on the same value has to be reflexive.
+            (Value::Long(0), Value::Long(0)) => true,
             _ => false,
         },
         _ => false,
