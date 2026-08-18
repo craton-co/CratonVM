@@ -108,15 +108,21 @@
 //! (`emit_safepoint_poll_prologue`). By the first safepoint the value is a local
 //! the impl's own root map covers.
 //!
-//! What the thunk cannot answer is a *read barrier*, because it is baked once
-//! and ZGC arms its barrier per cycle. So it makes the same commitment the
-//! compiler makes at the same moment: [`lambda_adapter_entry`] refuses to emit a
-//! reference capture load while `narrow_oops_block_inline_fields()` holds —
-//! compressed oops on, or the ZGC read barrier armed — exactly as the inline
-//! `getfield` codegen refuses. A *primitive* capture is unaffected by either and
-//! is served unconditionally, which is the difference between "capturing lambdas
-//! are excluded" and "reference-capturing lambdas are excluded while a barrier
-//! is armed".
+//! The other question a baked thunk cannot answer is a *read barrier*, since
+//! ZGC arms its own per cycle — and this emitter briefly refused a reference
+//! capture whenever `narrow_oops_block_inline_fields()` held, by analogy with
+//! the inline `getfield` codegen.
+//!
+//! **The analogy was wrong.** That predicate guards a COMPACT slot read, which
+//! this emitter never emits: the compact-layout refusal in
+//! [`lambda_adapter_entry`] guarantees every capture load addresses a legacy
+//! 16-byte `Value` cell, and a legacy cell is neither narrowed under compressed
+//! oops (`narrow_oop::ref_field_size` is documented as the width of a *compact*
+//! field) nor barriered by ZGC (`load_barrier_slot` is applied in
+//! `get_array_element`; `get_field`'s legacy arm is a bare
+//! `std::ptr::read::<Value>`). The refusal sent a reference capture to a Rust
+//! arm that reads the same word the same way, at ~120 ns a call, and bought
+//! nothing. `gc/tests/lambda_proxy_capture_word.rs` is what keeps that true.
 //!
 //! # Invalidation
 //!
@@ -195,6 +201,15 @@ impl CaptureLoad {
     }
 
     /// Does emitting this load mean emitting a raw reference read?
+    ///
+    /// [`CaptureLoad::Reference`] and [`CaptureLoad::Wide`] encode identically
+    /// — both are the cell's 8-byte payload — so this distinction currently
+    /// changes no byte of emitted code. It is kept, and kept separate, because
+    /// it is the hook any future decode would need: if a legacy cell ever gains
+    /// a narrowed or coloured reference representation, this is the predicate
+    /// that says which loads must change, and
+    /// `gc/tests/lambda_proxy_capture_word.rs` is the test that would fail
+    /// first.
     fn is_reference(self) -> bool {
         matches!(self, Self::Reference)
     }
@@ -343,19 +358,45 @@ pub fn max_sam_args(needs_context: bool) -> usize {
 /// captured values, in impl-parameter order — and `sam_args` counts the SAM's
 /// own arguments, EXCLUDING the receiver.
 ///
-/// Four things are refused here rather than at the call site, because each is a
+/// Three things are refused here rather than at the call site, because each is a
 /// question about what can be *emitted*:
 ///
 /// * a capture descriptor with no load ([`CaptureLoad::from_descriptor`]);
-/// * a REFERENCE capture while `narrow_oops_block_inline_fields()` holds, which
-///   is the same gate and the same moment the inline `getfield` codegen uses;
 /// * a proxy class with a registered compact layout, which would put the
 ///   captures somewhere other than where this emits (it never happens — see the
-///   module note — and this is how the feature notices if that changes);
+///   module note — and this is the ONE guard that keeps every emission legacy,
+///   which is what the removed one below turned out to depend on);
 /// * an arity the register file cannot carry on EITHER side. Both sides bind:
 ///   incoming is `context + receiver + samArgs`, outgoing is
 ///   `context + captures + samArgs`, and a thunk with no frame cannot build a
 ///   stack argument the impl would look for.
+///
+/// # The fourth refusal, and why it is gone
+///
+/// A REFERENCE capture used to be refused whenever
+/// `narrow_oops_block_inline_fields()` held — compressed oops on, or ZGC's read
+/// barrier armed — by analogy with the inline `getfield` codegen, which refuses
+/// under exactly that condition.
+///
+/// The analogy did not hold. That predicate guards the emission of a COMPACT
+/// slot read: a compact reference field narrows to four bytes under compressed
+/// oops, and it is the compact/array decode paths that ZGC's colouring reaches.
+/// This emitter never emits one — the compact-layout refusal above is what
+/// guarantees that — and a legacy 16-byte `Value` cell is neither narrowed nor
+/// barriered. `narrow_oop::ref_field_size()` is documented as the width of a
+/// *compact* instance field; ZGC applies `load_barrier_slot` in
+/// `get_array_element` and not in `get_field`, whose legacy arm is a bare
+/// `std::ptr::read::<Value>`.
+///
+/// So the refusal diverted a reference capture to a Rust arm that reads the
+/// identical word in the identical way, at a cost of ~120 ns a call. It bought
+/// nothing.
+///
+/// That is a claim about two other crates, so it is pinned executably rather
+/// than argued here: `gc/tests/lambda_proxy_capture_word.rs` compares this
+/// emitter's baked address and width against each collector's own `get_field`,
+/// with compressed oops on and with the ZGC barrier armed. If either fact ever
+/// changes, that file fails and names this function.
 pub fn lambda_adapter_entry(
     proxy_class_id: u32,
     impl_owner: &Arc<CompiledMethod>,
@@ -367,11 +408,7 @@ pub fn lambda_adapter_entry(
     let leading = usize::from(needs_context);
     let mut captures = Vec::with_capacity(capture_descs.len());
     for &tok in capture_descs {
-        let load = CaptureLoad::from_descriptor(tok)?;
-        if load.is_reference() && crate::x64::narrow_oops_block_inline_fields() {
-            return None;
-        }
-        captures.push(load);
+        captures.push(CaptureLoad::from_descriptor(tok)?);
     }
     if !captures.is_empty()
         && cratonvm_types::class_layout_for_fields(proxy_class_id, captures.len() as u32) // Cast: field count
