@@ -184,9 +184,60 @@ third view that disagrees with `keySet().size()`. `testRegisteredClasses` walks
 with null messages — the two unmessaged `assertTrue(... instanceof String)`
 calls.
 
-Fixing this means giving `Provider` one store. Note what that then exposes: the
-test instantiates every registered `org.bouncycastle.*` class, ~2000 of them, so
-a faithful map view is the START of that work rather than the end of it.
+**The split is exactly which methods were intercepted.** In
+`jca/provider_chain.rs` the registrar projects the side table for `put`,
+`parseLegacyPut`, `putService`, `getService`, `getServices`, `containsKey`,
+`get` and `getProperty` — and stops there. `size`, `isEmpty`, `keySet`,
+`entrySet`, `values`, `keys` and `elements` are NOT registered, so they fall
+through to the inherited `Hashtable` bytecode operating on a map that only
+`putId` ever wrote to. That is the whole defect, and it names the fix: either
+project the same table through the Map views too, or have `put` write through
+to the real map.
+
+This is worth fixing beyond this test. `for (Object k : provider.keySet())` is
+an ordinary idiom, and today it sees 4 entries where a real JDK shows 5153 —
+silently, with no error anywhere.
+
+Note what a faithful map view then exposes rather than resolves: the test goes
+on to instantiate every registered `org.bouncycastle.*` class, ~2000 of them.
+The map view is the START of that work.
+
+### `Serialisation` — `readClassDescriptor()` returns a stub and reads nothing
+
+Fails `NullPointerException` at `ObjectInputStream.readNonProxyDesc:1927`, and
+**fails identically on pristine `origin/dev`**, so it is not from this lane's
+work. The cause is nevertheless identified, because the stack says it plainly:
+
+```text
+readNonProxyDesc(ObjectInputStream.java:1927)   <- NPE
+readClassDesc(ObjectInputStream.java:1785)
+readNonProxyDesc(ObjectInputStream.java:1927)
+readClassDesc(ObjectInputStream.java:1785)
+readOrdinaryObject(ObjectInputStream.java:2101)
+```
+
+Line 1927 is `desc.initNonProxy(readDesc, cl, resolveEx, readClassDesc(false))`
+and `desc` cannot be null — it is `new ObjectStreamClass()` twenty lines up. The
+recursion is the tell: `readNonProxyDesc` is reading the SAME class descriptor
+twice.
+
+`serialization.rs` registers `ObjectInputStream.readClassDescriptor()` as:
+
+```rust
+let desc = alloc_stream_class_stub(ctx, "java/lang/Object")?;
+Ok(Some(Value::Object(Some(desc))))
+```
+
+It ignores the stream entirely — always `java/lang/Object`, and **consumes no
+bytes**. So the stream position never advances, the next read sees the same
+`TC_CLASSDESC` byte and recurses, and `initNonProxy` is handed a descriptor
+describing a class the stream never mentioned.
+
+The JDK's own `readClassDescriptor` is a documented extension point whose
+default reads the descriptor from the stream; a constant is not a
+simplification of that, it is a different function. Fixing it means parsing the
+serialized class descriptor properly, which is why it is recorded here rather
+than patched alongside the JCA work.
 
 ### CLOSED: the `dev` defect — `Mac.getInstance(name, Provider)`
 
