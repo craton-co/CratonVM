@@ -2376,6 +2376,43 @@ fn reloc_emit_enabled() -> bool {
             crate::metrics::note_ir_getfield_decline(4);
             return false;
         }
+        // Trusted-oop receiver: null check only, no containment.
+        //
+        // The single-pass backend has had this since
+        // `emit_trusted_oop_receiver_check` landed — "a value whose
+        // operand-stack type is already proven to be an oop cannot be an
+        // unaligned integer or an arbitrary out-of-heap address without an
+        // earlier JIT/GC correctness failure, so repeating the six arena-bound
+        // comparisons at every field access is redundant". The IR tier never
+        // got it, and that is why ZGC and G1 — which deliberately publish NO
+        // region bounds — fail the containment clause on 100% of receivers
+        // here while the single-pass arm sails through on its proven oops.
+        //
+        // The IR's proof is its own type lattice: `Op::Load`'s base node is
+        // typed `IrType::Ref`. That is at least as strong as the single-pass
+        // `stack_oop_marks` argument this reuses.
+        //
+        // **Restricted to PRIMITIVE fields, deliberately.** Dropping
+        // containment for a REFERENCE load would inline-read a word that, under
+        // ZGC, may be `Z_COLORED_TAG | colour | offset` rather than a pointer —
+        // the un-barriered colored word `heap.rs::read_prim_element` panics on
+        // by design, and `zgc-jit-load-barrier.md` (risk J1) rates the silent
+        // version worse than a SIGSEGV. Primitives need neither a load barrier
+        // nor narrow-oop decoding, so they are the whole safe set.
+        //
+        // Note what this does NOT do: it does not publish `JIT_REGION_BOUNDS`
+        // on a non-publishing collector. That table's emptiness is load-bearing
+        // — per `audits/g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
+        // every inline reference-STORE fast path unreachable under G1/ZGC, so a
+        // JNI-pinned CSet-excluded region cannot lose its remembered-set edge.
+        // Filling it to speed up loads would silently re-enable those stores.
+        // `node_ty != Ref` is `!ref_node`, computed here because `ref_node`
+        // is not bound until the descriptor-agreement check below — which
+        // still runs, and still refuses the site, before anything is emitted.
+        let trusted_oop_receiver = node_ty != IrType::Ref
+            && !raw_mode
+            && crate::x64::trusted_oop_receiver_getfield_enabled()
+            && self.graph.nodes[base as usize].ty == IrType::Ref;
         // The node type and the resolved descriptor must agree. They can only
         // disagree through a resolver that fabricated a compact slot — the
         // WildFly Host Controller SIGSEGV — and the consequence of trusting it
@@ -2416,7 +2453,7 @@ fn reloc_emit_enabled() -> bool {
         // 1. null → slow (the helper raises the NPE).
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow.push(self.emit_jcc_rel32(0x84)); // JZ
-        if guarded && !raw_mode {
+        if guarded && !raw_mode && !trusted_oop_receiver {
             // 2. alignment: the low three bits must be clear.
             self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
             self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
