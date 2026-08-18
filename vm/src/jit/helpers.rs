@@ -10884,6 +10884,35 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // Lambda proxies are synthetic and therefore cannot participate in the
     // class-store MIC. Give the erased primitive adapter its own receiver-guarded
     // direct path before allocating decoded Values for the generic fallback.
+    //
+    // The lambda call site's own cached invoke target goes FIRST and takes any
+    // arity — this is the SECOND door into lambda dispatch from compiled code
+    // (`jit_invoke_virtual_mic` is the other), and a fast path wired into only
+    // one of them is a fast path that a workload can miss entirely for reasons
+    // that have nothing to do with its shape.
+    if matches!(info.invoke_kind, 0 | 2) && !args_slice.is_empty() {
+        if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
+            let proxy_class_id = vm.mem.heap.class_id_of_validated(proxy);
+            if vm
+                .classes
+                .lambda_proxies
+                .read()
+                .contains_key(&proxy_class_id)
+            {
+                if let Some(result) = try_lambda_site_direct_call(
+                    vm,
+                    thread,
+                    proxy,
+                    proxy_class_id,
+                    info,
+                    args_slice,
+                    vm_ptr,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
     if matches!(info.invoke_kind, 0 | 2) && args_slice.len() == 2 {
         if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
             let proxy_class_id = vm.mem.heap.class_id_of_validated(proxy);
@@ -13430,13 +13459,18 @@ unsafe fn try_lambda_site_direct_call(
     jit_args[site.num_captures()..site.total_args()].copy_from_slice(sam_args);
     let entry = code.entry_ptr() as usize;
     let needs_ctx = code.needs_context();
-    let rc = try_call_compiled_entry_reentrant_owned(
+    let Some(rc) = try_call_compiled_entry_reentrant_owned(
         &code,
         entry,
         needs_ctx,
         vm_ptr,
         &jit_args[..site.total_args()],
-    )?;
+    ) else {
+        // The callee's arity is past what the register tables cover. Nothing
+        // ran; the generic path takes it.
+        crate::runtime::interpreter::lambda_site_bump_arity();
+        return None;
+    };
     if rc == i64::MIN {
         // `i64::MIN` is either a deopt sentinel or a `long` that really is
         // `Long.MIN_VALUE`, and only the out-of-band signals can tell them
