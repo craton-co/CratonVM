@@ -16,7 +16,9 @@ one is now closed:
 | re-filed as a general VM throughput gap, not a commons-math defect | 1 | `BOBYQAOptimizerTest` |
 | confirmed pre-existing test flakiness (fails on HotSpot too) | 4 | `LogitTest`, `UnivariatePeriodicInterpolatorTest`, `MultiStartMultivariateOptimizerTest`, `CorrelatedVectorFactoryTest` |
 
-Nothing on this page is open. The two throughput pages it hands off to are
+Nothing on this page is open. The closing sweep covers all six modules the
+original run did — 351 classes, HotSpot run alongside as the control. The two
+throughput pages it hands off to are
 `docs/known-issues/perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`
 and
 `docs/known-issues/perf/bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md`.
@@ -29,18 +31,31 @@ Azure Linux (8 core), `dev` at `c6299ca2a` plus
 per process through `CratonRunner`, 90 s per-class cap — the same harness and
 budget the original run used, so the two are comparable.
 
-Population: **all 310 test classes of `commons-math-legacy`**. That is the
-module every one of the 11 lives in; the original run's 309 spanned six modules,
-so the totals below are not the same denominator as the original headline table
-and are not compared to it.
+Population: **all six modules the original run covered** — 310 classes of
+`commons-math-legacy` (the module every one of the 11 lives in) plus the 41
+classes of `core`, `legacy-core`, `legacy-exception`, `neuralnet` and
+`transform`. 351 classes, HotSpot run alongside as the control.
 
-| status | count |
-|---|---:|
-| PASS | **303** |
-| HANG (>90 s) | 2 |
-| FAIL | 5 |
+| | CratonVM | HotSpot |
+|---|---:|---:|
+| PASS | **341** | 344 |
+| HANG (>90 s) | **3** | 0 |
+| FAIL | 7 | 7 |
 
-**Every non-PASS is accounted for, and none of the seven is a new CratonVM
+Both VMs fail seven classes, and they are **not the same seven** — the two lists
+share three, and every class in the symmetric difference is an unseeded-RNG
+tolerance check that flips from run to run on whichever VM happens to draw a bad
+sample. Failing-class COUNT is therefore not a VM-quality signal on this suite;
+only a per-class, repeated, both-VM comparison is, which is what the table below
+is.
+
+| | classes |
+|---|---|
+| fail on BOTH | `UnivariatePeriodicInterpolatorTest`, `LevenbergMarquardtOptimizerTest`, `SimplexOptimizerTest` |
+| CratonVM only, this run | `MiniBatchKMeansClustererTest`, `CMAESOptimizerTest`, `FastCosineTransformerTest`, `FastSineTransformerTest` |
+| HotSpot only, this run | `MultiStartMultivariateOptimizerTest`, `SimplexOptimizerNelderMeadTest`, `FastCosineTransformerTest` (2 of 3 repeats) |
+
+**Every non-PASS is accounted for, and none of CratonVM's ten is a new
 correctness defect:**
 
 | class | CratonVM | HotSpot, same session | verdict |
@@ -49,9 +64,18 @@ correctness defect:**
 | `stat.descriptive.rank.PSquarePercentileTest` | HANG | PASS | throughput cliff, already investigated and reduced 2.6x — fixed-suite-bugs/bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816-FIXED.md. Terminates correctly given a large enough budget; 90 s is below the cost of the work |
 | `optim…noderiv.CMAESOptimizerTest` | FAIL | FAIL | unseeded `RandomSource.MT_64.create()`. Repeated 3x per arm: fails 1/3 on CratonVM, **2/3 on HotSpot** |
 | `optim…noderiv.SimplexOptimizerTest` | FAIL | FAIL | fails identically on HotSpot |
-| `ml.clustering.MiniBatchKMeansClustererTest` | FAIL | FAIL | fails identically on HotSpot |
+| `ml.clustering.MiniBatchKMeansClustererTest` | FAIL | FAIL when run alone | fails on HotSpot too when the class is run on its own |
 | `fitting.leastsquares.LevenbergMarquardtOptimizerTest` | FAIL | FAIL | fails identically on HotSpot |
 | `analysis.interpolation.UnivariatePeriodicInterpolatorTest` | FAIL | FAIL | unseeded `RandomSource.KISS.create()`; flips on both VMs across runs |
+| `legacy.core.jdkmath.AccurateMathTest` | HANG | PASS | the other half of the PSquare throughput cliff, same fixed-suite-bugs record, same verdict: correct given a large enough budget, and 90 s is below the cost of the work |
+| `transform.FastCosineTransformerTest` | FAIL | FAIL | unseeded `RandomSource.MWC_256.create()` (`RealTransformerAbstractTest:39`). Repeated 3x per arm: 0-1 failures on the fixed binary, 0-2 on `dev` base, **1-2 on HotSpot** |
+| `transform.FastSineTransformerTest` | FAIL on `dev` base and once on HotSpot | — | same unseeded RNG; the deltas are ~1e-16 absolute against a 1e-13/1e-14 relative tolerance |
+
+The transform pair is worth one line of method, because the first read of a
+single sweep was "CratonVM fails a transform test HotSpot passes". Grepping for
+the RNG before filing anything settled it: `RandomSource.MWC_256.create()` takes
+no seed, so the two VMs are not running the same numbers, and repeating each arm
+three times has HotSpot failing at least as often as CratonVM.
 
 ## The eleven, one row each
 
@@ -115,10 +139,25 @@ compiled `CratonRunner` in `/data/cm-runner`. `apps/netty-suite-runner/CratonRun
 is the runner source.
 
 ```bash
+# the legacy module, from a class list
 /data/cm-sweep.sh <cratonvm-binary> /data/cm-legacy-test-list.txt /data/cm-out 90
 /data/cm-sweep.sh hotspot           /data/cm-legacy-test-list.txt /data/cm-out-hs 90
-awk -F'\t' '$3!="PASS"' /data/cm-out/results.tsv
+
+# the other five modules, discovering classes from target/test-classes
+for m in core legacy-core legacy-exception neuralnet transform; do
+  /data/cm-sweep-mod.sh $m <cratonvm-binary> /data/cm-out-mods/$m 90
+  /data/cm-sweep-mod.sh $m hotspot           /data/cm-out-mods-hs/$m 90
+done
+
+awk -F'\t' '$3!="PASS"' /data/cm-out/results.tsv /data/cm-out-mods/*/results.tsv
 ```
+
+`cm-sweep-mod.sh` puts `junit-platform-launcher` on the classpath explicitly —
+the per-module `cm-commons-math-<mod>-cp.txt` files do not carry it, and without
+it every class in those modules dies with `NoClassDefFoundError:
+SummaryGeneratingListener` and scores CRASH. That is a harness gap that looks
+exactly like a VM defect; check for the launcher before believing a whole module
+crashed.
 
 Maven is not needed to re-run: `commons-math-legacy`'s `target/classes` and
 `target/test-classes` are already built under
