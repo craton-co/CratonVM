@@ -37,6 +37,32 @@
  *                        `plainGetter` vs this is the cost of the table alone,
  *                        with the call held constant.
  *   * `matrixGetter`   — the 2-D shape, table and `athrow` included.
+ *   * `emptyCall`      — `raw`'s loop plus a call to a STATIC method whose body
+ *                        is `return 0.0;`. The EMPTIEST possible callee: no
+ *                        receiver, no argument, no field, no array, nothing to
+ *                        inline away but the call itself. `raw` vs this is the
+ *                        pure cost of entering and leaving a compiled method.
+ *   * `virtualEmpty`    — the same empty body as an INSTANCE method on `Vec`.
+ *                        `emptyCall` vs this is virtual dispatch alone, with the
+ *                        callee body held at nothing.
+ *   * `staticArrayGet`  — a STATIC `get(double[], int)` doing the array load.
+ *                        `emptyCall` vs this is argument passing plus the array
+ *                        load in a callee, with no receiver and no `getfield`.
+ *                        `staticArrayGet` vs `plainGetter` is then what the
+ *                        receiver `getfield` really costs — the subtraction the
+ *                        first draft of this probe got wrong by comparing a
+ *                        no-arg static against a one-arg virtual and calling the
+ *                        whole difference "the field".
+ *   * `primFieldGet`    — the same shape reading a PRIMITIVE `int` field instead
+ *                        of the `double[]` reference. Under ZGC a compact
+ *                        reference slot holds `Z_COLORED_TAG | colour | offset`
+ *                        rather than a pointer, so an inline raw load of a
+ *                        REFERENCE field is barred where a primitive one is not
+ *                        (`zgc_read_barrier_blocks_inline_fields`,
+ *                        known-issues/jit/every-jit-getfield-takes-the-helper-…).
+ *                        `primFieldGet` vs `plainGetter` is that distinction
+ *                        priced, and it is what says whether the fix is a
+ *                        per-field-KIND gate or something larger.
  *
  * Every arm walks the same indices and accumulates the same closed-form sum, so
  * a wrong answer is a mismatch rather than a judgement call, and each is called
@@ -67,10 +93,16 @@ public final class AccessorDispatchProbe {
     /** `ArrayRealVector`'s accessor shape, exception table and all. */
     static final class Vec {
         private final double[] data;
+        /** A PRIMITIVE field, so `primFieldGet` differs from `plainGetter` in
+         *  the field's KIND and nothing else. */
+        private final int len;
         Vec(int n) {
             data = new double[n];
+            len = n;
             for (int i = 0; i < n; i++) { data[i] = i; }
         }
+        /** Reads a primitive field — the reference-vs-primitive discriminator. */
+        int getLen() { return len; }
         /** Byte-identical in shape to `ArrayRealVector.getEntry(int)`. */
         double getEntry(int index) {
             try {
@@ -91,6 +123,8 @@ public final class AccessorDispatchProbe {
             }
         }
         double[] raw() { return data; }
+        /** An empty INSTANCE method — virtual dispatch with nothing in it. */
+        double vzero() { return 0.0; }
     }
 
     /** `Array2DRowRealMatrix`'s accessor shape — note the `athrow` in the handler. */
@@ -121,11 +155,17 @@ public final class AccessorDispatchProbe {
      *  which would make this probe measure that instead of the exception table. */
     static final String MSG = "index out of range";
 
+    /** The emptiest callee there is — see the `emptyCall` arm. */
+    static double zero() { return 0.0; }
+
+    /** The array load with the receiver and the `getfield` removed. */
+    static double get(double[] d, int i) { return d[i]; }
+
     static double sink;
     static int failures;
     /** Per-arm best and worst ns/iter over its rounds, filled by `timed`. */
-    static double[] best = new double[8];
-    static double[] worst = new double[8];
+    static double[] best = new double[9];
+    static double[] worst = new double[9];
 
     static void check(String what, double got, double want) {
         boolean ok = got == want;
@@ -187,6 +227,53 @@ public final class AccessorDispatchProbe {
         return a;
     }
 
+    static double emptyCall(int rounds, int per, Vec v, int mask) {
+        double[] d = v.raw();
+        double a = 0;
+        for (int r = 0; r < rounds; r++) {
+            long s = System.nanoTime();
+            for (int i = 0; i < per; i++) { a += d[i & mask] + zero(); }
+            record(5, System.nanoTime() - s, per);
+        }
+        return a;
+    }
+
+    static double virtualEmpty(int rounds, int per, Vec v, int mask) {
+        double[] d = v.raw();
+        double a = 0;
+        for (int r = 0; r < rounds; r++) {
+            long s = System.nanoTime();
+            for (int i = 0; i < per; i++) { a += d[i & mask] + v.vzero(); }
+            record(6, System.nanoTime() - s, per);
+        }
+        return a;
+    }
+
+    static double staticArrayGet(int rounds, int per, Vec v, int mask) {
+        double[] d = v.raw();
+        double a = 0;
+        for (int r = 0; r < rounds; r++) {
+            long s = System.nanoTime();
+            for (int i = 0; i < per; i++) { a += get(d, i & mask); }
+            record(7, System.nanoTime() - s, per);
+        }
+        return a;
+    }
+
+    static double primFieldGet(int rounds, int per, Vec v, int mask) {
+        double[] d = v.raw();
+        double a = 0;
+        for (int r = 0; r < rounds; r++) {
+            long s = System.nanoTime();
+            // `getLen()` returns the length, so `% v.getLen()` would change the
+            // arithmetic; multiply by zero instead, which keeps the closed form
+            // while forcing the call and the primitive field read to happen.
+            for (int i = 0; i < per; i++) { a += d[i & mask] + v.getLen() * 0.0; }
+            record(8, System.nanoTime() - s, per);
+        }
+        return a;
+    }
+
     static double matrixGetter(int rounds, int per, Mat m, int mask) {
         double a = 0;
         for (int r = 0; r < rounds; r++) {
@@ -219,9 +306,14 @@ public final class AccessorDispatchProbe {
         check("tableGetter", tableGetter(rounds, per, v, mask), wantVec);
         check("matrixRaw", matrixRaw(rounds, per, m, mask), wantMat);
         check("matrixGetter", matrixGetter(rounds, per, m, mask), wantMat);
-        sink += best[0] + best[1] + best[2] + best[3] + best[4];
+        check("emptyCall", emptyCall(rounds, per, v, mask), wantVec);
+        check("virtualEmpty", virtualEmpty(rounds, per, v, mask), wantVec);
+        check("staticArrayGet", staticArrayGet(rounds, per, v, mask), wantVec);
+        check("primFieldGet", primFieldGet(rounds, per, v, mask), wantVec);
+        for (int i = 0; i < 9; i++) { sink += best[i]; }
 
-        String[] names = {"raw", "plainGetter", "tableGetter", "matrixRaw", "matrixGetter"};
+        String[] names = {"raw", "plainGetter", "tableGetter", "matrixRaw", "matrixGetter",
+                "emptyCall", "virtualEmpty", "staticArrayGet", "primFieldGet"};
         StringBuilder line = new StringBuilder("ns/iter ");
         StringBuilder spread = new StringBuilder("spread  ");
         for (int i = 0; i < names.length; i++) {
@@ -230,8 +322,16 @@ public final class AccessorDispatchProbe {
         }
         System.out.println(line);
         System.out.println(spread);
-        System.out.println("callTax=" + String.format("%.2f", best[1] - best[0])
-                + " tableTax=" + String.format("%.2f", best[2] - best[1]));
+        // The decomposition the page needs, as three subtractions rather than
+        // three arguments: what an empty call costs, what the getter adds on
+        // top of it, and what the exception table adds on top of that.
+        System.out.println("callTax=" + String.format("%.2f", best[5] - best[0])
+                + " virtualTax=" + String.format("%.2f", best[6] - best[5])
+                + " argsAndLoadTax=" + String.format("%.2f", best[7] - best[5])
+                + " receiverFieldTax=" + String.format("%.2f", best[1] - best[7])
+                + " tableTax=" + String.format("%.2f", best[2] - best[1])
+                + " primFieldTax=" + String.format("%.2f", best[8] - best[6])
+                + " totalGetterTax=" + String.format("%.2f", best[1] - best[0]));
         System.out.println("sinkNonZero=" + (sink != 0 ? 1 : 0));
         System.out.println("failures=" + failures);
         System.out.println("OK");
