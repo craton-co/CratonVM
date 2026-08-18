@@ -45,6 +45,35 @@ pub struct ExternalRootProvider {
     pub roots_for_matching_owners: fn(&OwnerPredicate<'_>) -> Vec<ObjectRef>,
     pub remap: fn(&cratonvm_types::PointerMap),
     pub prune: fn(&OwnerPredicate<'_>),
+    /// `(fast_path_hits, mutex_fallthroughs, disabled)` for a provider that
+    /// gates [`Self::roots_for_owner`] before doing real work.
+    ///
+    /// # Why the provider reports and `gc` does not measure
+    ///
+    /// `roots_for_owner` runs once per marked object and was **20–29% of mark
+    /// samples on both the serial and the one-worker parallel arm** (2026-08-17
+    /// `perf record`). A provider that gates it returns an empty `Vec` either way,
+    /// so from this side a gate that works and a gate that is inert are
+    /// indistinguishable — and the previous attempt at that optimisation was
+    /// measured inert, so this is not a hypothetical. Only the provider can count
+    /// it, and `gc` cannot call into the provider's crate because the dependency
+    /// runs the other way.
+    ///
+    /// `None` for a provider with no gate.
+    pub gate_stats: Option<fn() -> (u64, u64, bool)>,
+}
+
+/// Every registered provider's gate counters, for the shutdown report. See
+/// [`ExternalRootProvider::gate_stats`].
+pub fn provider_gate_stats() -> Vec<(&'static str, u64, u64, bool)> {
+    if PROVIDER_COUNT.load(Ordering::Relaxed) == 0 {
+        return Vec::new();
+    }
+    PROVIDERS
+        .read_recursive()
+        .iter()
+        .filter_map(|p| p.gate_stats.map(|f| { let (h, m, d) = f(); (p.name, h, m, d) }))
+        .collect()
 }
 
 static PROVIDERS: LazyLock<RwLock<Vec<ExternalRootProvider>>> =
@@ -207,6 +236,7 @@ mod tests {
             roots_for_matching_owners: matching,
             remap,
             prune,
+            gate_stats: None,
         }
     }
 

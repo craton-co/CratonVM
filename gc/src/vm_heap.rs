@@ -2610,6 +2610,21 @@ impl VmHeap {
             // came to poll a never-notified condvar on a 5 ms grid for months.
             // Nonzero here means it is back. A count, so it reads the same on a
             // loaded host as on a quiet one.
+            // THE OVERLAY GATE, asked of the provider rather than measured here
+            // -- see `ExternalRootProvider::gate_stats`. `roots_for_owner` runs
+            // once per marked object and was 20-29% of mark samples on both the
+            // serial and the parallel arm (2026-08-17 `perf record`). A gate that
+            // works and a gate that is inert return the same empty `Vec`, and the
+            // previous attempt at this optimisation WAS inert, so `hits` is the
+            // only thing that separates them. `disabled=true` means an owner was
+            // registered with no class id and the gate has failed safe.
+            for (name, hits, misses, disabled) in
+                crate::external_roots::provider_gate_stats()
+            {
+                eprintln!(
+                    "[GC] zgc-overlay-gate: provider={name} hits={hits}                      misses={misses} disabled={disabled}",
+                );
+            }
             eprintln!(
                 "[GC] zgc-mark-wait: park_timeouts={}",
                 h.mark_park_timeouts(),
