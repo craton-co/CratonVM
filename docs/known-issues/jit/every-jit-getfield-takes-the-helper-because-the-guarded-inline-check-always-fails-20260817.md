@@ -1,16 +1,32 @@
 # Every JIT `getfield` takes the checked helper — TWO independent guard clauses fail, one per collector family
 
 ## Status
-**PARTLY FIXED 2026-08-18, and fully diagnosed.** The Generational defect is
-closed: 68 722 450 helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). On all
-three collectors the inline path is now engaged for **every primitive field
+**FIXED for every collector that can be fixed today; ZGC's residual is blocked
+on a different design and is tracked here.** Two independent defects, one per
+collector family, and both of the actionable ones are closed:
+
+* **Generational** (`legacy-layout-receiver`, defect 2) — closed 2026-08-18 on
+  the reader side: 68 722 450 helper calls -> **0**, 3.07x.
+* **G1** (`outside-published-bounds`, defect 1) — closed 2026-08-18 by the
+  READ-side bounds table item 2 below specifies: **56 929 530 helper calls ->
+  0**, and 4111 ms -> 1747 ms on the same workload (2.35x). G1 now lands on
+  Generational's number, which is what "only G1 was left paying" predicted.
+* **ZGC** — still 56.9M, still 100% `outside-published-bounds`, and
+  deliberately so. A compact reference slot there holds
+  `Z_COLORED_TAG | colour | offset`, not a pointer, so inlining its load is the
+  use-after-free `feature-designs/zgc-jit-load-barrier.md` exists to stop. ZGC
+  publishes nothing into the read table for exactly that reason. **This page
+  stays open only as the record of that residual**; the fix is the ZGC JIT load
+  barrier, not anything in the getfield arms.
+
+On all three collectors the inline path is engaged for **every primitive field
 read** — 0 primitive misses, measured two independent ways — and the entire
-remainder is **reference** reads. On ZGC those are blocked on the JIT load
-barrier (a compact reference slot there is a colored word, not a pointer) and
-this page is finished. On **G1** they are blocked by nothing: no colored
-pointers, plain-pointer reference fields, 56.9M pure containment failures. That
-is the one actionable item left, and it narrows item 2 from "the general
-containment fix" to "a G1 fix".
+remainder is **reference** reads.
+
+This title has been wrong twice and is now half-wrong a third time: it says
+"every" and "always", and after 2026-08-18 that is true only on ZGC. Left as
+written because it is the string people search for; the Status block is the
+authority.
 
 This title has now been wrong twice. The original blamed the containment check;
 the first correction concluded it was "NOT because the guarded inline check
@@ -464,6 +480,32 @@ Partial, and named as such.
    at all. ZGC must wait for the load barrier; **G1 could be fixed today**, and
    that makes item 2 a G1 fix rather than the general containment fix it was
    written up as.
+2. **DONE 2026-08-18 — the READ-SIDE bounds table.** Landed as
+   `JIT_READ_BOUNDS` (`gc/src/gen_heap.rs`) + `read_bounds_addr` (helper ABI
+   v6). What follows is the design as written before the change, kept because
+   the reasoning is what made it safe; the two places reality differed from it
+   are marked **[REVISED]**.
+
+   *What it bought.* SHA256Digest x200 000, two binaries from the same tree,
+   medians of 3:
+
+   | collector | baseline | patched | helper calls |
+   |---|---:|---:|---|
+   | Generational | 1552 ms | 1609 ms | 0 -> 0 |
+   | **G1** | **4111 ms** | **1747 ms** | **56 929 530 -> 0** |
+   | ZGC | 3473 ms | 3513 ms | 56 931 604 -> unchanged |
+
+   *The instrument mattered, again.* The first A/B used
+   `CRATONVM_JIT_GETFIELD_HELPER=1` as the "before" — one binary, no rebuild,
+   and the switch this page's own transferable section praises. It reported a
+   1.42x improvement **on ZGC**, a collector this change does not touch. The
+   switch also disables the trusted-oop shortcut, which already worked there.
+   A kill switch answers "is this whole path worth anything", which is the
+   question this page asked in August; it cannot answer "is THIS EDIT worth
+   anything". Two binaries was the only way. The same reading error this page
+   is about — a number that agrees with the hypothesis for an unrelated reason
+   — nearly closed it a second time.
+
 2. **The proper fix for containment under a non-publishing collector is a
    separate READ-SIDE bounds table.** This is a design, not a bug fix, and
    deserves its own page — but the shape is settled enough to write down, so
@@ -484,7 +526,7 @@ Partial, and named as such.
    |---|---|---|
    | Generational | the three arenas, as today | already refreshed at GC start/end |
    | ZGC | `ZgcRealHeap::conservative_addr_span()` → `[arena_base, arena_end)` | "allocated once in `with_capacity` and never grown", read without the arena lock |
-   | G1 | the reserved heap range | needs checking — G1 has N regions and the table has 3 slots, so this is the one that may not fit |
+   | G1 | the reserved heap range | **[REVISED]** it fits, and easily: G1's N regions are carved from ONE contiguous `Box` arena, so `[arena_base, arena_end)` in slot 0 covers every region and slots 1-2 stay zero. Published in `G1Collector::new`, cleared in a `Drop` impl G1 did not previously have |
 
    `region_bounds_are_live` keeps reading the OLD table and keeps gating the
    store paths; only `emit_guarded_getfield_receiver_check` and
@@ -501,6 +543,16 @@ Partial, and named as such.
    from the other side and must be revisited in the same change: it returns a
    constant `true` and says so **only** while no inline reference emission
    happens under an armed barrier.
+
+   **[REVISED]** ZGC ended up publishing NOTHING into the read table, so the
+   per-field-kind gate was never needed. Not publishing is a strictly stronger
+   discharge of the same obligation — it keeps ZGC's PRIMITIVE reads on the
+   helper too — and it costs G1 nothing, because G1's split is 0% primitive.
+   `zgc_codegen_honours_read_barrier` was re-examined rather than assumed and
+   stays `true`, now for two independent reasons (ZGC publishes nothing; and
+   `narrow_oops_block_inline_fields` suppresses the EMISSION outright while a
+   barrier is armed). Both are written down at the function, along with which
+   one survives someone later deciding ZGC should publish after all.
 
    *What it is worth, now that item 1 is measured.* **G1 only, and there it is
    worth all 56.9M.** The split came back 100% reference / 0% primitive, so:
@@ -541,6 +593,14 @@ whether the inline *branch* was ever taken, and the answer was no.
 `narrow_oops_block_inline_fields`, `compact_ref_fields_enabled`,
 `guarded_inline_getfield_enabled` and `region_bounds_addr != 0` produced a
 plausible story that was wrong. `CRATONVM_JIT_GETFIELD_HELPER=1` settled it.
+
+**And then the same kill switch was the wrong instrument for the fix.** It
+scopes to "the whole guarded path", which is the right scope for *is this worth
+building* and the wrong one for *did my edit do anything* — it also disables the
+trusted-oop shortcut, so it credited this change with a 1.42x speedup on ZGC,
+which it does not touch at all. An instrument is only as good as the question,
+and the two questions were one clause apart. Two binaries from the same tree
+cost ten minutes and had no such gap.
 
 **A 100% failure rate makes its own count uninformative.** This is the one that
 cost the most. Every collector A/B here returned the same number, and that was
