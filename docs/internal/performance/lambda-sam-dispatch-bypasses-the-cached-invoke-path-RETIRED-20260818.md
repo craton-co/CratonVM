@@ -260,11 +260,13 @@ into the registers the slide vacated, tail-jump. The arguments now move by
 and the slide runs in whichever direction reads each register before the step
 that writes it.
 
-One genuine restriction survives, and it is about the collector rather than the
-layout: a REFERENCE capture is refused while `narrow_oops_block_inline_fields()`
-holds — compressed oops on, or ZGC's read barrier armed — which is the same gate
-and the same moment the inline `getfield` codegen makes its own commitment. A
-primitive capture is unaffected by either.
+One restriction appeared to survive, about the collector rather than the layout:
+a REFERENCE capture was refused while `narrow_oops_block_inline_fields()` held —
+compressed oops on, or ZGC's read barrier armed — by analogy with the inline
+`getfield` codegen. **It was removed on the same day, because the analogy did
+not hold and the gate was inert anyway.** See "The reference-capture gate"
+below; there is now no capture shape this thunk refuses on the collector's
+account.
 
 `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` is the kill switch, kept separate from
 `CRATONVM_JIT_LAMBDA_ADAPTER` so a same-binary A/B can hold the non-capturing
@@ -323,6 +325,68 @@ sense and javac inlines it before desugaring the lambda, so the obvious way to
 write this file produces seventeen NON-capturing lambdas whose comments claim
 otherwise. `javap -p` on the class is the check — every `lambda$main$N` must
 take more parameters than its SAM.
+
+#### The reference-capture gate: inert AND unnecessary
+
+The capturing thunk shipped with one restriction — a REFERENCE capture was
+refused whenever `narrow_oops_block_inline_fields()` held (compressed oops on,
+or ZGC's read barrier armed), by analogy with the inline `getfield` codegen,
+which refuses under exactly that condition.
+
+Two things were wrong with it, pointing in opposite directions.
+
+**It was inert.** Compressed oops is opt-in (`CRATONVM_COMPRESSED_OOPS`) and
+ZGC's barrier never arms in a default run, so the predicate is false throughout
+and reference captures were already being thunked. Nothing about the default
+configuration changed when the gate came out, and no number below should be read
+as saying otherwise.
+
+**It was also unnecessary where it did fire.** That predicate guards the
+emission of a COMPACT slot read — a compact reference field narrows to four
+bytes under compressed oops, and it is the compact and array decode paths that
+ZGC's colouring reaches. This emitter never emits one: the compact-layout
+refusal above guarantees every capture load addresses a legacy 16-byte `Value`
+cell. A legacy cell is neither narrowed (`narrow_oop::ref_field_size` is
+documented as the width of a *compact* instance field) nor barriered — ZGC
+applies `load_barrier_slot` in `get_array_element`, while `get_field`'s legacy
+arm is a bare `std::ptr::read::<Value>`. The refusal diverted a reference
+capture to a Rust arm that reads the identical word in the identical way.
+
+`gc/tests/lambda_proxy_capture_word.rs` makes that a checked claim rather than a
+code reading: it compares the emitter's baked address and width against **each
+collector's own `get_field`**, with compressed oops on and with the ZGC barrier
+armed, having first asserted a proxy is legacy-laid-out on every backend so the
+rest cannot agree about the wrong object. Reading the wide payload at the tag
+word instead turns five of its six tests red.
+
+One binary, four arms, `A B C D D C B A` per round, three rounds, on a busier
+box than the table above — hence the wider spreads; the separation is 15x and
+the noise is 2x:
+
+| row | A: default, thunk | B: default, Rust | C: **oops on**, thunk | D: oops on, Rust |
+|---|---:|---:|---:|---:|
+| `klass` (control) | 7.9 | 8.0 | 8.8 | 9.4 |
+| `lambda` | 8.6 | 8.9 | 8.8 | 8.5 |
+| `cap` (`int` capture) | 9.1 | 154.8 | 9.2 | 156.6 |
+| **`capref` (reference capture)** | **9.9** | 150.8 | **8.7** | 148.0 |
+
+Column C is the configuration the gate used to refuse; a reference capture costs
+the same there as anywhere else. All 96 runs printed `sink=71449096416`.
+
+Engagement, from the pair that states it best — `capref` under compressed oops,
+20 000 000 dispatches:
+
+* thunk ON: **zero** `[LAMBDA-JIT]` census lines. The census prints every N
+  *direct* calls and there were none, so Rust is not on the path at all.
+* thunk OFF: `site_calls=20100000 site_direct=20100000 site_cap_adapters=0` —
+  every one of them through Rust.
+
+That asymmetry is the engagement statement here, and it is the shape
+`lambda_site_prof::SITE_ADAPTERS`'s own comment predicts: a per-call counter
+necessarily goes quiet exactly when the fast path starts working.
+`jit::lambda_adapter`'s
+`a_reference_capture_is_still_served_under_compressed_oops` pins the behaviour
+directly, since nothing in a default run can tell the two versions apart.
 
 #### What the fixture had to learn
 
