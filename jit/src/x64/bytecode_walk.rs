@@ -4100,9 +4100,53 @@ impl Compiler {
                     let throw_bci = self.orig_bci(pc);
                     self.emit_mov_imm32_sx(ARG_REGS[1], throw_bci as i32); // Cast: bci fits i32
                     self.emit_call_absolute(self.helpers.throw_exception);
-                    // Helper returned the i64::MIN sentinel in RAX —
+                    // Helper returned the i64::MIN sentinel in RAX -
                     // propagate it as the method's return value.
-                    self.emit_epilogue();
+                    //
+                    // RBC.6 `athrow` admission: inside a protected range the
+                    // sentinel alone is not enough. `jit_throw_exception` has
+                    // stashed the exception and this bci, but nothing has
+                    // recorded where this frame's non-parameter locals live, so
+                    // a handler that reads one would resume it as 0/null. Route
+                    // through the reason-9 stub instead of returning directly:
+                    // it spills the trapping registers, materializes the precise
+                    // exceptional frame from the snapshot recorded here, and
+                    // then runs exactly the epilogue this arm would have run.
+                    // The unconditional `JMP rel32` is patched by
+                    // `emit_deopt_stubs` the same way a `Jcc rel32` guard is -
+                    // both end in the same four displacement bytes.
+                    //
+                    // `flush_scratch_registers` above ran before the call, so
+                    // any local the snapshot places in a caller-saved register
+                    // has already been spilled to its frame slot; this is the
+                    // same ordering `emit_post_invoke_exception_check` relies on.
+                    //
+                    // Keyed on the EMITTER pc, never on `throw_bci`: every
+                    // `*_box_ptr_by_bci` map, `build_and_record_deopt_point`'s
+                    // analysis lookups and `emit_deopt_stubs`' stub sharing are
+                    // all in emitter coordinates, and each applies `orig_bci`
+                    // itself for the value it hands the runtime. Handing an
+                    // already-translated bci in would double-apply it under a
+                    // bytecode loop rewrite (identity, and byte-identical, on an
+                    // ordinary compile).
+                    let precise_athrow_stub =
+                        self.precise_exception_frames && self.pc_is_protected(pc);
+                    if precise_athrow_stub {
+                        if !self.exc_frame_box_ptr_by_bci.contains_key(&pc) {
+                            let box_ptr = self.build_and_record_deopt_point(
+                                pc,
+                                crate::deopt::DeoptReason::PendingException,
+                            );
+                            self.exc_frame_box_ptr_by_bci.insert(pc, box_ptr);
+                        }
+                        // JMP rel32 (E9) - patched to the reason-9 stub.
+                        self.buf.emit_byte(0xE9);
+                        let patch_offset = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((patch_offset, pc, 9));
+                    } else {
+                        self.emit_epilogue();
+                    }
                     self.reset_spills();
                     self.emitted_athrow = true;
                     dead = true;
@@ -6921,6 +6965,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws
@@ -9091,6 +9136,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws (or
@@ -11006,25 +11052,52 @@ impl Compiler {
                     let dim2_slot = self.pop_stack(); // inner dimension
                     let dim1_slot = self.pop_stack(); // outer dimension
 
-                    // Look up resolved leaf element type for this PC
-                    let leaf_et = self
+                    // The packed `(holder_class_id | cp_idx << 32)` site
+                    // descriptor for this pc. The helper resolves the array
+                    // class from it at run time, loader-faithfully, through the
+                    // same `interpreter::multianewarray_alloc` the interpreter
+                    // uses — so both tiers stamp the same component classes
+                    // into the allocated levels.
+                    //
+                    // This used to be a bare leaf element-type code, which
+                    // carried no class at all; the helper then allocated every
+                    // level with `ClassId(0)` and a compiled `new String[a][b]`
+                    // came back as `[Ljava.lang.Object;`. A site with no entry
+                    // cannot be compiled correctly at all now (there is no
+                    // "default" array class), so bail rather than emit a call
+                    // that would allocate the wrong type.
+                    let Some(&(_, site)) = self
                         .multianewarray_info
                         .iter()
                         .find(|(p, _)| *p == pc)
-                        .map(|(_, et)| *et as i32) // Cast: x86-64 immediate encoding
-                        .unwrap_or(10); // default T_INT
+                    else {
+                        return false;
+                    };
 
-                    // Call jit_multianewarray_2d(heap_ptr, leaf_et, dim1, dim2)
+                    // Call jit_multianewarray_2d(heap_ptr, site, dim1, dim2)
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    self.emit_mov_imm32_sx(ARG_REGS[1], leaf_et);
+                    self.emit_mov_imm64(ARG_REGS[1], site);
                     self.load_slot_to_reg(ARG_REGS[2], dim1_slot);
                     self.load_slot_to_reg(ARG_REGS[3], dim2_slot);
                     // Round-8 wave-3: defensive callee-saved spill
                     // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.multianewarray_2d);
+                    // Resolution can run a user `ClassLoader.loadClass`, i.e.
+                    // arbitrary Java on this thread — republish the frame
+                    // afterwards exactly as the `new`/`anewarray` CP-indexed
+                    // arms do.
+                    crate::runtime_lowering::emit_post_call_frame_republish(
+                        &mut self.buf,
+                        self.helpers.frame_record,
+                    );
                     // T1.1.2 — multianewarray is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Negative dimension / OOM / failed resolution all come back
+                    // as the 0/null sentinel with a pending exception; bail into
+                    // the method's exception table instead of pushing the null
+                    // and dereferencing it.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // The result is a reference array.
                     self.mark_top_as_oop();

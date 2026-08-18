@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-453 tokens.
+455 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -266,6 +266,7 @@ export inherited from a parent shell.
 | `jit-ldc` | `CRATONVM_DBG_JIT_LDC` |
 | `loop-work` | `CRATONVM_DBG_LOOP_WORK` |
 | `field-site` | `CRATONVM_DBG_FIELD_SITE` |
+| `g1-live-memo` | `CRATONVM_DBG_G1_LIVE_MEMO` |
 | `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
@@ -397,6 +398,7 @@ export inherited from a parent shell.
 | `raf-getfd` | `CRATONVM_DBG_RAF_GETFD` |
 | `raf-init` | `CRATONVM_DBG_RAF_INIT` |
 | `rbc6` | `CRATONVM_DBG_RBC6` |
+| `rbc6-emit` | `CRATONVM_DBG_RBC6_EMIT` |
 | `re5` | `CRATONVM_DBG_RE5` |
 | `refersto` | `CRATONVM_DBG_REFERSTO` |
 | `reflection-factory` | `CRATONVM_DBG_REFLECTION_FACTORY` |
@@ -519,7 +521,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-182 tokens.
+185 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -598,6 +600,7 @@ export inherited from a parent shell.
 | `ir-isel-verify` | `CRATONVM_JIT_IR_ISEL_VERIFY` |
 | `precise-field-ops` | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` |
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
+| `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
@@ -617,6 +620,7 @@ export inherited from a parent shell.
 | `metrics-out` | `CRATONVM_JIT_METRICS_OUT` |
 | `metrics-ring` | `CRATONVM_JIT_METRICS_RING` |
 | `mic-exc-table-publish` | `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH` |
+| `direct-exc-table-publish` | `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` |
 | `mic-rust-entry-cache` | `CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE` |
 | `my-scratch-flush` | `CRATONVM_JIT_MY_SCRATCH_FLUSH` |
 | `my-selfcall-proof` | `CRATONVM_JIT_MY_SELFCALL_PROOF` |
@@ -659,6 +663,7 @@ export inherited from a parent shell.
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
+| `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
 | `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |
 | `field-site-cache-loader` | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` |
@@ -709,7 +714,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-55 tokens.
+56 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -724,6 +729,7 @@ export inherited from a parent shell.
 | `exact-refproc-survival` | `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` |
 | `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
+| `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
@@ -866,7 +872,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_SECURITY`
 
-13 tokens.
+14 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -882,6 +888,7 @@ export inherited from a parent shell.
 | `reflect-export-gate` | `CRATONVM_REFLECT_NO_EXPORT_GATE` |
 | `require-policy` | `CRATONVM_REQUIRE_POLICY` |
 | `trust-pem` | `CRATONVM_TRUST_PEM` |
+| `tls-openssl-client` | `CRATONVM_TLS_OPENSSL_CLIENT` |
 | `untrusted-code` | `CRATONVM_UNTRUSTED_CODE` |
 
 ## `CRATONVM_COMPAT`

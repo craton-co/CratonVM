@@ -3445,14 +3445,32 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // java.text.Normalizer.Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3
             // (declaration order in the JDK enum — NOT alphabetical).
             let form_ordinal = normalizer_form_ordinal(ctx, args.get(1));
-            let normalized = match form_ordinal {
-                0 => input.nfd().collect::<String>(),  // NFD
-                1 => input.nfc().collect::<String>(),  // NFC
-                2 => input.nfkd().collect::<String>(), // NFKD
-                3 => input.nfkc().collect::<String>(), // NFKC
-                _ => input,
+            let one = |run: &str| -> String {
+                match form_ordinal {
+                    0 => run.nfd().collect::<String>(),  // NFD
+                    1 => run.nfc().collect::<String>(),  // NFC
+                    2 => run.nfkd().collect::<String>(), // NFKD
+                    3 => run.nfkc().collect::<String>(), // NFKC
+                    _ => run.to_string(),
+                }
             };
-            let s = ctx.create_string(&normalized);
+            // `unicode_normalization` takes `&str`, which cannot hold an
+            // unpaired surrogate, so the whole input used to be decoded and
+            // every lone unit became U+FFFD. MEASURED on both VMs:
+            //
+            //   Normalizer.normalize("a<U+D800>b", NFC)
+            //     HotSpot   61,d800,62      CratonVM   61,fffd,62
+            //
+            // Splitting at each unpaired surrogate is CORRECT rather than
+            // approximate: an unpaired surrogate is an unassigned code point
+            // with combining class 0 that composes with nothing, so it is a
+            // normalization boundary — no composition or reordering can cross
+            // it, and the runs either side normalize independently.
+            //
+            // Input with no unpaired surrogate is a single run, so the common
+            // path is exactly what it was.
+            let out = normalize_units_by_run(&input, one);
+            let s = crate::lang_string::sb_string_from_units(ctx, &out)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -3470,13 +3488,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             };
             // Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3 (JDK enum order).
             let form_ordinal = normalizer_form_ordinal(ctx, args.get(1));
-            let normalized = match form_ordinal {
-                0 => is_nfd_quick(input.chars()) == IsNormalized::Yes,
-                1 => is_nfc_quick(input.chars()) == IsNormalized::Yes,
-                2 => is_nfkd_quick(input.chars()) == IsNormalized::Yes,
-                3 => is_nfkc_quick(input.chars()) == IsNormalized::Yes,
-                _ => true,
-            };
+            // Run-wise, for the same reason `normalize` is: an unpaired
+            // surrogate is a normalization boundary, and it is itself
+            // normalized under every form (unassigned, combining class 0), so
+            // the answer is "every representable run is normalized".
+            let normalized = normalizer_runs(&input).into_iter().all(|run| {
+                match form_ordinal {
+                    0 => is_nfd_quick(run.chars()) == IsNormalized::Yes,
+                    1 => is_nfc_quick(run.chars()) == IsNormalized::Yes,
+                    2 => is_nfkd_quick(run.chars()) == IsNormalized::Yes,
+                    3 => is_nfkc_quick(run.chars()) == IsNormalized::Yes,
+                    _ => true,
+                }
+            });
             Ok(Some(Value::Int(if normalized { 1 } else { 0 })))
         },
     );
@@ -3494,16 +3518,93 @@ pub fn register(registry: &mut NativeMethodRegistry) {
 /// `ArrayIndexOutOfBoundsException` in `Character.codePointAt` on the
 /// now-empty array. Real `String` is read directly; everything else goes
 /// through its own `toString()`, which every `CharSequence` must provide.
-fn normalizer_read_char_sequence(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+/// A `CharSequence` argument's raw UTF-16 code units.
+///
+/// Units rather than a `String` because a Rust `str` cannot hold an unpaired
+/// surrogate and this is the reader every `Normalizer` entry point uses; see
+/// the `normalize` registration for the measured rows.
+fn normalizer_read_char_sequence(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u16> {
     if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(obj)) {
-        if let Some(s) = ctx.read_string(obj) {
-            return s;
-        }
+        return crate::lang_string::read_string_chars(&*ctx, obj);
     }
     match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+        Ok(Some(Value::Object(Some(s)))) => crate::lang_string::read_string_chars(&*ctx, s),
+        _ => Vec::new(),
     }
+}
+
+/// Normalize `units` by applying `one` to each maximal run of representable
+/// text, passing every unpaired surrogate through untouched.
+///
+/// See the `normalize` registration for why an unpaired surrogate is a
+/// normalization boundary and this is exact rather than a best effort. A run
+/// contains no unpaired surrogate by construction, so `from_utf16_lossy` over
+/// it is lossless.
+/// The maximal representable runs of `units`, with every unpaired surrogate
+/// acting as a separator. Shared by `normalize` and `isNormalized` so the two
+/// cannot disagree about where a run ends.
+fn normalizer_runs(units: &[u16]) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    let mut run: Vec<u16> = Vec::new();
+    let mut i = 0usize;
+    while i < units.len() {
+        let u = units[i];
+        let high = (0xD800..=0xDBFF).contains(&u);
+        let low = (0xDC00..=0xDFFF).contains(&u);
+        if high && i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+            run.push(u);
+            run.push(units[i + 1]);
+            i += 2;
+            continue;
+        }
+        if high || low {
+            if !run.is_empty() {
+                runs.push(String::from_utf16_lossy(&run));
+                run.clear();
+            }
+            i += 1;
+            continue;
+        }
+        run.push(u);
+        i += 1;
+    }
+    if !run.is_empty() {
+        runs.push(String::from_utf16_lossy(&run));
+    }
+    runs
+}
+
+fn normalize_units_by_run(units: &[u16], one: impl Fn(&str) -> String) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut run: Vec<u16> = Vec::new();
+    let mut flush = |run: &mut Vec<u16>, out: &mut Vec<u16>| {
+        if !run.is_empty() {
+            out.extend(one(&String::from_utf16_lossy(run)).encode_utf16());
+            run.clear();
+        }
+    };
+    let mut i = 0usize;
+    while i < units.len() {
+        let u = units[i];
+        let high = (0xD800..=0xDBFF).contains(&u);
+        let low = (0xDC00..=0xDFFF).contains(&u);
+        if high && i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+            run.push(u);
+            run.push(units[i + 1]);
+            i += 2;
+            continue;
+        }
+        if high || low {
+            flush(&mut run, &mut out);
+            out.push(u);
+            i += 1;
+            continue;
+        }
+        run.push(u);
+        i += 1;
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// Read a `java.text.Normalizer.Form` enum argument's ordinal (NFC=0, NFD=1,

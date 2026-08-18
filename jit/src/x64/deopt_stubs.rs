@@ -690,6 +690,33 @@ impl Compiler {
         );
     }
 
+    /// A raw JIT-to-JIT call whose callee CAN stash a deopt frame, but for which
+    /// the emitter could not reserve the contiguous service-argument slots the
+    /// sentinel check needs, is the unserviced edge `dbg_unserviced_direct_call`
+    /// exists to name: the callee traps, stashes a frame keyed to ITSELF, returns
+    /// `i64::MIN`, and nothing at this site can attribute it.
+    ///
+    /// Until now that site was emitted anyway and the hazard was only printed
+    /// under `CRATONVM_DBG_DEOPT`. Fail the compile instead, so "the ladder bound
+    /// this callee directly" implies "the trap is serviced here" with no
+    /// remaining case — which is the precondition
+    /// `direct_call_exc_table_publish_enabled` needs before a callee that
+    /// declares its own exception table may be bound this way at all.
+    ///
+    /// Measured cost of the stricter rule: on netty's `BigEndianHeapByteBufTest`
+    /// all 49 unserviced direct calls carry `info=false`, i.e. they are inline
+    /// intrinsics and thin native helpers with no `JitInvokeInfo` and no way to
+    /// stash. None is a Java callee, so this fails nothing there.
+    pub(super) fn fail_unserviced_java_direct_call(
+        &mut self,
+        info_ptr: Option<*const crate::JitInvokeInfo>,
+        service_args_base: Option<i32>,
+    ) {
+        if info_ptr.is_some() && service_args_base.is_none() {
+            self.fail("direct-call-service-slots");
+        }
+    }
+
     pub(super) fn emit_inline_callee_deopt_check(
         &mut self,
         info: *const crate::JitInvokeInfo,
@@ -1021,6 +1048,17 @@ impl Compiler {
         // cheaper, and the stash stays quiet on straight-line invokes.
         let throw_bci = self.dbg_last_pc;
         let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if crate::rbc6_emit_dbg() {
+            eprintln!(
+                "[rbc6-emit] post_invoke_exc_check method={} bci={} ret={} precise_req={} protected={} -> {}",
+                self.method_key,
+                throw_bci,
+                ret_type as char,
+                self.precise_exception_frames,
+                self.pc_is_protected(throw_bci),
+                if precise_exc_stub { "REASON9" } else { "shared-sentinel" },
+            );
+        }
         if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
             let box_ptr = self.build_and_record_deopt_point(
                 throw_bci,
@@ -1092,15 +1130,48 @@ impl Compiler {
     /// `i64::MIN` deopt sentinel and runs the epilogue; the interpreter's
     /// post-JIT drain then throws the stashed OOME through the method's
     /// exception table (catchable, matching the interpreter's allocation paths).
+    ///
+    /// **Inside a protected range this guard publishes a precise exceptional
+    /// frame**, exactly as `emit_post_invoke_exception_check` does, instead of
+    /// branching to the shared sentinel-only stub. That is what makes `new`
+    /// (0xbb) admissible to RBC.6 - see `precise_alloc_ops_enabled` in
+    /// `jit/src/lib.rs` for the argument that this is the whole obligation, and
+    /// the netty adaptive-allocator throughput page for the method it was
+    /// refusing (`AdaptivePoolingAllocator$Magazine.allocate`,
+    /// `reason=rbc6-handler-reads-unsafe-local(pc=338,op=0xbb)`).
+    ///
+    /// The bci keyed here is the ALLOCATING instruction's own, not its
+    /// successor: a reason-9 frame is consumed by `route_jit_signal_exception`,
+    /// which range-tests the bci as the THROW pc against `[start_pc, end_pc)`.
+    /// `emit_post_invoke_exception_check` carries the full argument for that
+    /// choice, and javac ends a protected range at the successor of its last
+    /// instruction often enough that keying on the successor puts the throw
+    /// outside its own handler.
     pub(super) fn emit_post_alloc_oom_check(&mut self) {
+        // Same shape as `emit_post_invoke_exception_check`: a frame is only
+        // useful where this method's own exception table can catch, so outside
+        // every protected range the cheaper shared sentinel exit stays.
+        let throw_bci = self.dbg_last_pc;
+        let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
+            let box_ptr = self.build_and_record_deopt_point(
+                throw_bci,
+                crate::deopt::DeoptReason::PendingException,
+            );
+            self.exc_frame_box_ptr_by_bci.insert(throw_bci, box_ptr);
+        }
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
         // JZ rel32 → shared exception-check stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.exception_check_stubs
-            .push((patch_offset, self.dbg_last_pc));
+        if precise_exc_stub {
+            self.deopt_stubs.push((patch_offset, throw_bci, 9));
+        } else {
+            self.exception_check_stubs
+                .push((patch_offset, self.dbg_last_pc));
+        }
         // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
         // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
         // allocation-failure GC and to construct the OOME — which only the

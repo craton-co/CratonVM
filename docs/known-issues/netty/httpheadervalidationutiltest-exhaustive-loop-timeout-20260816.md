@@ -108,13 +108,30 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    today — the method-entry path re-enters the interpreter at the handler too
    (`route_jit_exception_through_method`) — so this is not OSR-specific and would
    pay off well beyond this class.
-2. **Two cheap, measured items on the OSR round trip**, worth doing even if (1)
-   lands, because they are pure waste: `osr_exit_policy` is recomputed on every
-   entry though it is a pure function of the artifact (3.3%), and `try_osr`
-   allocates three `String`s and three `Arc<str>`s per entry attempt (part of the
-   8.6% in the allocator).
-3. **21 ns/iteration** still needs the nesting inliner the sibling page is about.
-   Roughly ten call frames at ~6 ns each does not fit in 21 ns on its own.
+2. ~~Two cheap, measured items on the OSR round trip.~~ **DONE 2026-08-17.**
+   `osr_exit_policy` was recomputed on every entry though it is a pure function
+   of the artifact (3.3% of the profile); it is memoised on the artifact now.
+   `try_osr` allocated three `String`s and three `Arc<str>`s per entry attempt
+   (part of the 8.6% in the allocator); the frame already held all three as
+   `Arc<str>`, so those are refcount bumps now. Worth **~8% at a 1/8 throw rate
+   and ~6% at 1/1** on `OsrExcRateProbe`, interleaved, two rounds, both agreeing
+   in direction — which is about what the profile predicted, and is also the
+   ceiling on this kind of work. The remaining round-trip cost is item (1).
+3. **21 ns/iteration** still needs the nesting inliner the sibling page is about,
+   and the floor is now measured rather than assumed. `probes/CallArgCostProbe.java`
+   (Azure host, deltas over its own no-call control): a compiled static call is
+   **4.13 ns**, one taking a reference **6.46**, a virtual one **8.19-8.96** —
+   against HotSpot's ~0, because HotSpot inlines all of them. Roughly ten call
+   frames therefore cost 40-80 ns before any of them does any work, and the whole
+   budget for the iteration is 21. No arrangement of real calls fits; not making
+   the calls is the only lever. The sibling page carries the sequenced blocker,
+   and its first two steps are VM work rather than compiler work: an artifact
+   carrying an inlined caller scope cannot be OSR-entered at all
+   (`osr_exit_policy` refuses `caller.is_some()`, because the in-place OSR-exit
+   transfer is single-frame), and both these classes' hot methods are `@Test`
+   bodies for which OSR is the only door. So multi-frame resume and a multi-frame
+   OSR transfer come before inline scopes, calls inside spliced bodies, and
+   nesting — same work for both classes.
 
 An honest reading is that this class remains the furthest from reach of the three
 `codec-http` walls — which is what the 2026-08-17 revision concluded — but the

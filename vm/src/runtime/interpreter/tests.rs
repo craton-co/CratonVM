@@ -5243,15 +5243,19 @@ fn b3_gate_scans_full_production_body_of_interpreter() {
 /// way a fixed line band would.
 #[test]
 fn multianewarray_arm_guards_the_component_bracket_subtraction() {
+    // The arm's body was extracted into `interpreter::multianewarray_alloc` so
+    // the JIT's `jit_multianewarray_2d` helper could stop carrying a second,
+    // component-class-less transcription of it. The guard travelled with the
+    // subtraction it protects, so this witness follows it there.
     let src = std::fs::read_to_string(format!(
-        "{}/src/runtime/interpreter/opcodes.rs",
+        "{}/src/runtime/interpreter.rs",
         env!("CARGO_MANIFEST_DIR")
     ))
-    .expect("read opcodes.rs");
+    .expect("read interpreter.rs");
 
     let arm = src
-        .find("Instruction::Multianewarray { index, dimensions } =>")
-        .expect("the multianewarray arm must still exist");
+        .find("pub(crate) fn multianewarray_alloc(")
+        .expect("the shared multianewarray allocator must still exist");
     // Anchor on the whole binding, not the bare expression: the guard's own
     // explanatory comment quotes `total_array_depth - d - 1`, and matching that
     // would find the comment (which sits *before* the guard) instead of the code.
@@ -5280,5 +5284,21 @@ fn multianewarray_arm_guards_the_component_bracket_subtraction() {
         guarded.contains("LinkageError::VerifyError"),
         "the multianewarray depth guard must raise a catchable VerifyError, \
          not clamp the dimension count or fall through"
+    );
+
+    // And the opcode arm must still route through it rather than growing a
+    // second copy: the whole reason the body moved is that two copies drifted.
+    let opcodes = std::fs::read_to_string(format!(
+        "{}/src/runtime/interpreter/opcodes.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read opcodes.rs");
+    let opcode_arm = opcodes
+        .find("Instruction::Multianewarray { index, dimensions } =>")
+        .expect("the multianewarray arm must still exist");
+    assert!(
+        opcodes[opcode_arm..opcode_arm + 2000].contains("multianewarray_alloc("),
+        "the interpreter's multianewarray arm must call the shared \
+         `multianewarray_alloc`, not re-implement the component-class resolution"
     );
 }

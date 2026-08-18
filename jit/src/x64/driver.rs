@@ -89,7 +89,7 @@ pub fn compile(
     num_params: usize,
     max_locals: usize,
     needs_heap: bool,
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     field_info: Vec<(usize, usize, u8)>,
     typecheck_info: Vec<(usize, *const u8, usize)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
@@ -292,7 +292,7 @@ pub fn compile_with_param_slots(
     num_params: usize,
     max_locals: usize,
     needs_heap: bool,
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     field_info: Vec<(usize, usize, u8)>,
     typecheck_info: Vec<(usize, *const u8, usize)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
@@ -458,6 +458,18 @@ pub fn compile_with_param_slots(
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    if crate::rbc6_emit_dbg() {
+        eprintln!(
+            "[rbc6-emit] driver took precise_exception_frames={precise_exception_frames}              exception_ranges={} protected_ranges_pending={}",
+            exception_ranges.len(),
+            PROTECTED_RANGES_REQUEST.with(|c| {
+                let v = c.take();
+                let n = v.as_ref().map(|r| r.len()).unwrap_or(0);
+                c.set(v);
+                n
+            }),
+        );
+    }
     // Same one-shot discipline as the flag above.
     let protected_ranges = PROTECTED_RANGES_REQUEST
         .with(|c| c.take())
