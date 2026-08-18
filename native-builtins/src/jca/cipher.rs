@@ -2339,6 +2339,15 @@ fn try_delegate_cipher_to_chain(
         // one provider's problem, not the chain's — a real `ProviderList` walk
         // moves on to the next candidate — so keep looking.
         if let Ok(true) = try_delegate_cipher_to_named_provider(ctx, &provider, algo, obj) {
+            // Record WHICH provider answered. `Cipher.getProvider()` reports
+            // this engine's own identity unless told otherwise, so a chain walk
+            // that found a third-party SPI produced a working cipher that named
+            // the wrong provider — `SlotTwoTest` decrypts correctly and then
+            // fails on `decrypt.getProvider().getName()`, expecting `BC` and
+            // getting `SunJCE`. The named-provider overloads have always
+            // recorded it; the anonymous chain walk did not.
+            let obj = ctx.read_native_pin(pin, cipher_obj);
+            crate::jca::provider_chain::record_requested_provider(ctx, obj, &provider);
             ctx.unpin_native_roots(pin);
             return Ok(true);
         }
