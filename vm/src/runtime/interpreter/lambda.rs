@@ -1988,6 +1988,7 @@ pub(super) fn try_invoke_cached_lambda_impl(
                             .class_redefine_generation_handle(cached.declaring_class_id),
                     );
                     let _ = try_jit_upgrade_with_gate(shared, &cached, gate);
+                    lambda_jit::bump(&lambda_jit::NOMINATIONS);
                 } else if should_attempt {
                     ensure_bg_compiler_started(shared);
                     let tiered_key = crate::jit::tiered::MethodKey::new(

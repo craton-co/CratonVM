@@ -49,6 +49,27 @@ public final class LambdaJitTierUp {
 
     private LambdaJitTierUp() {}
 
+    /**
+     * Every SAM call in this file goes through here, and that is deliberate.
+     *
+     * The two halves of the lambda tier-up serve different CALLERS: a compiled
+     * caller's SAM call is answered by the JIT-side direct arm, an interpreted
+     * caller's by the interpreter's one-shot. Which half a fixture exercises is
+     * therefore decided by whether its calling frame is compiled — and a loop
+     * sitting directly in a `*Checksum` body, called once, leaves that to an
+     * OSR race the test cannot see or control.
+     *
+     * A one-line static hop is called once per iteration, so with inline
+     * compilation (`CRATONVM_BG_COMPILE=0`) it compiles deterministically at
+     * the invocation threshold and every later SAM call comes out of compiled
+     * code. That is what lets `lambda_jit_tierup_tests` cover the JIT-side arm
+     * and `lambda_jit_oneshot_tests` — which turns that arm off — cover the
+     * interpreted one, with neither depending on a race.
+     */
+    private static int step(IntUnaryOperator op, int v) {
+        return op.applyAsInt(v);
+    }
+
     private static int addOne(int x) {
         return x + 1;
     }
@@ -88,7 +109,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator plus1 = v -> v + 1;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += plus1.applyAsInt(i);
+            sum += step(plus1, i);
         }
         return sum;
     }
@@ -99,7 +120,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator capAdd = v -> v + k;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += capAdd.applyAsInt(i);
+            sum += step(capAdd, i);
         }
         return sum;
     }
@@ -109,7 +130,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator mref = LambdaJitTierUp::addOne;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += mref.applyAsInt(i);
+            sum += step(mref, i);
         }
         return sum;
     }
@@ -125,7 +146,7 @@ public final class LambdaJitTierUp {
         for (int i = 0; i < N; i++) {
             int v = (i > 2000 && i % 5000 == 0) ? 999 : i;
             try {
-                sum += MAYBE_THROW.applyAsInt(v);
+                sum += step(MAYBE_THROW, v);
             } catch (RuntimeException e) {
                 caught++;
             }
@@ -139,7 +160,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator composed = base.andThen(v -> v * 2);
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += composed.applyAsInt(i);
+            sum += step(composed, i);
         }
         return sum;
     }
@@ -175,7 +196,7 @@ public final class LambdaJitTierUp {
         int caught = 0;
         for (int i = 0; i < N; i++) {
             try {
-                sum += DIVIDER.applyAsInt(i + 1);
+                sum += step(DIVIDER, i + 1);
             } catch (ArithmeticException e) {
                 caught++;
             }
@@ -205,7 +226,7 @@ public final class LambdaJitTierUp {
         int caught = 0;
         for (int i = 0; i < N; i++) {
             try {
-                sum += INDEXER.applyAsInt(i);
+                sum += step(INDEXER, i);
             } catch (ArrayIndexOutOfBoundsException e) {
                 caught++;
             }
@@ -217,7 +238,7 @@ public final class LambdaJitTierUp {
     public static int selfCatchingChecksum() {
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += SELF_CATCHING.applyAsInt(i);
+            sum += step(SELF_CATCHING, i);
         }
         return sum;
     }
@@ -228,7 +249,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator outer = v -> inner.applyAsInt(v) + 1;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += outer.applyAsInt(i);
+            sum += step(outer, i);
         }
         return sum;
     }
@@ -266,7 +287,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator plus1 = v -> v + 3;
         int sum = 0;
         for (int i = 0; i < 400_000; i++) {
-            sum += plus1.applyAsInt(i & 0xFF);
+            sum += step(plus1, i & 0xFF);
         }
         return sum;
     }

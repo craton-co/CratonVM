@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Proof that `lambda_jit_tierup_tests` is testing something.
+//! Proof that `lambda_jit_oneshot_tests` is testing something.
 //!
 //! Those tests assert that a lambda-dense fixture produces the same numbers
 //! CratonVM and a real JDK both produce. Every one of them would ALSO pass on a
@@ -42,7 +42,7 @@ fn real_jdk_vm() -> Option<Vm> {
 }
 
 #[test]
-fn test_lambda_tier_up_actually_engages() {
+fn test_lambda_one_shot_actually_engages() {
     if !std::path::Path::new(&format!(
         "{}/cratonvm/LambdaJitTierUp.class",
         test_resources_dir()
@@ -60,6 +60,9 @@ fn test_lambda_tier_up_actually_engages() {
     // "the body is compiled well before 400 000 iterations are done" is a fact.
     // SAFETY: as above.
     std::env::set_var("CRATONVM_BG_COMPILE", "0");
+    // ...and the JIT-side arm OFF, so the interpreted one-shot is what serves.
+    // SAFETY: as above.
+    std::env::set_var("CRATONVM_JIT_LAMBDA_SITE", "0");
 
     let Some(mut vm) = real_jdk_vm() else {
         eprintln!(
@@ -84,13 +87,11 @@ fn test_lambda_tier_up_actually_engages() {
          compiled body — every correctness test in lambda_jit_tierup_tests is \
          therefore green about a path it never took"
     );
-    // And specifically the JIT-SIDE arm, which is the half this configuration
-    // (default `CRATONVM_JIT_LAMBDA_SITE`) exists to cover: the fixture's `step`
-    // hop compiles at the invocation threshold, so from then on every SAM call
-    // comes out of compiled code. `lambda_jit_oneshot_engagement_tests` pins the
-    // other half the same way.
+    // And specifically the INTERPRETED arm, the half this configuration
+    // (`CRATONVM_JIT_LAMBDA_SITE=0`) exists to cover — the mirror of the
+    // assertion in `lambda_jit_engagement_tests`.
     assert!(
-        site_direct > 100_000,
-        "only {site_direct} of 400 000 dispatches took the JIT-side direct \n         arm (the interpreted one-shot took {fast_returns}) — \n         lambda_jit_tierup_tests would then be testing the interpreted \n         half twice and the JIT-side arm not at all"
+        fast_returns > 100_000,
+        "only {fast_returns} of 400 000 dispatches took the interpreted one-shot          (the JIT-side arm took {site_direct}) — lambda_jit_oneshot_tests would          then be testing the JIT-side arm twice and the one-shot not at all"
     );
 }
