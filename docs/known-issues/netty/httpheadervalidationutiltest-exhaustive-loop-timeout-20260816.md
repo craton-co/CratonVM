@@ -113,8 +113,16 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    entry though it is a pure function of the artifact (3.3%), and `try_osr`
    allocates three `String`s and three `Arc<str>`s per entry attempt (part of the
    8.6% in the allocator).
-3. **21 ns/iteration** still needs the nesting inliner the sibling page is about.
-   Roughly ten call frames at ~6 ns each does not fit in 21 ns on its own.
+3. **21 ns/iteration** still needs the nesting inliner the sibling page is about,
+   and the floor is now measured rather than assumed. `probes/CallArgCostProbe.java`
+   (Azure host, deltas over its own no-call control): a compiled static call is
+   **4.13 ns**, one taking a reference **6.46**, a virtual one **8.19-8.96** —
+   against HotSpot's ~0, because HotSpot inlines all of them. Roughly ten call
+   frames therefore cost 40-80 ns before any of them does any work, and the whole
+   budget for the iteration is 21. No arrangement of real calls fits; not making
+   the calls is the only lever. The sibling page carries the sequenced blocker
+   (inline scopes in deopt metadata, then a real call inside a spliced body, then
+   nesting) — it is the same work for both classes.
 
 An honest reading is that this class remains the furthest from reach of the three
 `codec-http` walls — which is what the 2026-08-17 revision concluded — but the
