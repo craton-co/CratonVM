@@ -2702,7 +2702,19 @@ pub(super) fn execute_instruction(
             // is loader-faithful in its own way and nothing here should be the
             // first to assume otherwise.
             if let Some(epochs_at_entry) = new_site_epochs {
-                if class_name.starts_with('[') || referencing_class_has_loader_namespace(
+                // The initialization state must be `Initialized`, not merely
+                // "`ensure_class_initialized_shared` returned Ok". Those differ
+                // in exactly one window: that call also answers Ok for a class
+                // THIS thread is already initializing, i.e. a `new C()` reached
+                // from C's own `<clinit>`. If that `<clinit>` then fails, C is
+                // Erroneous and every later `new C()` must throw
+                // NoClassDefFoundError — which an entry filled from inside the
+                // window would silently allocate past. Both real states are
+                // terminal, so filling only from `Initialized` is what makes
+                // the hit path's skip sound rather than nearly sound.
+                if !crate::vm::is_class_initialized_via_manager(shared, target_class_id) {
+                    site_stats::bump(site_stats::NEW_REJECT_LOADER);
+                } else if class_name.starts_with('[') || referencing_class_has_loader_namespace(
                     shared,
                     referencing_class_id,
                 ) {
