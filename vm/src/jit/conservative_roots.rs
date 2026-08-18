@@ -3032,16 +3032,69 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     // check itself is unchanged and still runs under moving-young.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     if cratonvm_jit::jit_code_range_count() > 0 {
+        let code_ranges = cratonvm_jit::jit_code_range_count();
         let cover_hi = JIT_ENTRY_CHAIN
             .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
             .unwrap_or(scanner_sp);
         let search_lo = scanner_sp.max(cover_hi);
         let high = current_thread_stack_high();
-        let hit = if high > search_lo {
-            native_stack_has_jit_frame(search_lo, high)
-        } else {
-            None
+        // PERF (2026-08-18): consult the SAME memo the detection scan below
+        // uses. `UnregMemo`'s own doc comment already named this call site as
+        // the binding cost — "the probes that dominate this workload come from
+        // `refresh_moving_young_coverage_for_current_thread`, which consults no
+        // memo at all" — measured while proving a different memo rule was NOT
+        // binding. It is binding here: on `probes/StackWalkerTerminationProbe`
+        // (Mockito's per-mock-invocation `StackWalker.walk`, the shape that
+        // makes `QuartzEndpointWebIntegrationTests` look like a hang)
+        // `native_stack_has_jit_frame` is 17.9% of the whole process.
+        //
+        // The memo's safety argument is a property of the THREAD's stack, not
+        // of the caller: nothing above the current stack pointer can change
+        // while this thread is nested below it, so a band already proven free
+        // of return-addresses-into-JIT stays free, and only the incremental
+        // band that has appeared since needs scanning. Both call sites ask the
+        // identical question (`native_stack_has_jit_frame` over
+        // `[scanner_sp.max(cover_hi), stack_high)`) on the same thread, so the
+        // argument transfers verbatim. A new compilation still invalidates.
+        //
+        // Conservative in the safe direction: `AlreadyClean` is only ever
+        // returned for a band this thread already scanned and found clean, and
+        // any doubt (first call, shallower start, new code ranges) falls back
+        // to the full scan. A missed hit here would re-arm the moving-young
+        // corruption this probe exists to prevent, so the memo may only ever
+        // skip work it has already done.
+        let hiwater_on = unreg_memo_hiwater_enabled();
+        let decision = UNREG_JIT_MEMO.with(|c| {
+            let mut m = c.get();
+            let d = m.observe(search_lo, code_ranges, hiwater_on);
+            c.set(m);
+            d
+        });
+        let hit = match decision {
+            UnregScan::AlreadyClean => None,
+            UnregScan::Detect { hi: memo_hi } => {
+                // Bounded by the memo's clean FLOOR when it has one, so stack
+                // rewritten while this thread was shallower is still rescanned.
+                let scan_hi = match memo_hi {
+                    Some(floor) if floor <= high => floor,
+                    _ => high,
+                };
+                if scan_hi > search_lo {
+                    native_stack_has_jit_frame(search_lo, scan_hi)
+                } else {
+                    None
+                }
+            }
         };
+        // A clean verdict extends the verified boundary down to here, exactly
+        // as the detection scan's own `mark_clean` does.
+        if hit.is_none() {
+            UNREG_JIT_MEMO.with(|c| {
+                let mut m = c.get();
+                m.mark_clean(search_lo, code_ranges);
+                c.set(m);
+            });
+        }
         // Price the frame-shape filter without branching on it: for every cycle
         // this probe diverts, say how many band words looked like JIT return
         // addresses and how many of those sat at a slot with real frame shape.
