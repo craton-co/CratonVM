@@ -4352,7 +4352,7 @@ impl Compiler {
                             !narrow_oops_block_inline_fields()
                                 && (inline_getfield_enabled()
                                     || (guarded_inline_getfield_enabled()
-                                        && self.helpers.region_bounds_addr != 0))
+                                        && self.helpers.read_bounds_addr != 0))
                         })
                     {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
@@ -4443,7 +4443,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
@@ -4593,7 +4593,7 @@ impl Compiler {
                             (inline_getfield_enabled()
                                 && !cratonvm_types::compact_ref_fields_enabled())
                                 || (guarded_inline_getfield_enabled()
-                                    && self.helpers.region_bounds_addr != 0)
+                                    && self.helpers.read_bounds_addr != 0)
                         })
                     {
                         // Inline field load — the field index and type tag are
@@ -4642,7 +4642,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
