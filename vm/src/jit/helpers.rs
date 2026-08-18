@@ -13392,13 +13392,19 @@ unsafe fn try_lambda_site_direct_call(
     )?;
     crate::runtime::interpreter::lambda_site_bump_calls();
     // `args_slice[0]` is the proxy receiver; the SAM's own arguments follow it.
+    if !site.direct_enabled() {
+        // This site's body deoptimized once already; the interpreter's one-shot
+        // path owns it from here (see `LambdaJitSite::direct_disabled`).
+        crate::runtime::interpreter::lambda_site_bump_deopted();
+        return None;
+    }
     if args_slice.is_empty() || site.total_args() > MAX_DIRECT_ARGS {
-        crate::runtime::interpreter::lambda_site_bump_refused();
+        crate::runtime::interpreter::lambda_site_bump_arity();
         return None;
     }
     let sam_args = &args_slice[1..];
     if site.num_captures() + sam_args.len() != site.total_args() {
-        crate::runtime::interpreter::lambda_site_bump_refused();
+        crate::runtime::interpreter::lambda_site_bump_arity();
         return None;
     }
     let Some(code) = crate::runtime::interpreter::lambda_jit_site_code(vm, &site) else {
@@ -13407,22 +13413,7 @@ unsafe fn try_lambda_site_direct_call(
         crate::runtime::interpreter::lambda_site_bump_no_code();
         return None;
     };
-    // A body that can DEOPT is left to the generic path. The sentinel it
-    // returns is indistinguishable here from a `long` whose value happens to be
-    // `Long.MIN_VALUE`, and the shared sentinel handler cannot rescue this one:
-    // it identifies the trapped callee by the CALL SITE's name
-    // (`try_resume_trapped_callee` compares `info.method_name`), which for a SAM
-    // call is `apply`, never the `lambda$...` body that actually trapped. It
-    // would refuse the resume, re-stash the deopt flag, and the compiled CALLER
-    // would then read the callee's deopt as its own — de-speculating an
-    // innocent method and leaving a frame nobody can claim. The interpreter's
-    // own one-shot path (`execute_jit_call_oneshot`) knows the impl's identity
-    // and handles all of that correctly, so a deopt-capable body simply goes
-    // there instead.
-    if !code.deopt_points.is_empty() || code.can_deopt_resume {
-        crate::runtime::interpreter::lambda_site_bump_refused();
-        return None;
-    }
+
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
     crate::runtime::interpreter::lambda_jit_site_capture_args(
         vm,
@@ -13440,22 +13431,67 @@ unsafe fn try_lambda_site_direct_call(
         vm_ptr,
         &jit_args[..site.total_args()],
     )?;
-    crate::runtime::interpreter::lambda_site_bump_direct();
     if rc == i64::MIN {
-        // A directly-dispatched callee deopts exactly like a monomorphically
-        // dispatched one; returning its sentinel to the compiled caller would
-        // have the caller read it as its OWN deopt. Same handler, same reason.
-        if let Some(v) = handle_compiled_callee_deopt_sentinel(
-            vm,
-            thread,
-            info,
-            receiver_class_id,
-            args_slice,
-        ) {
-            return Some(v);
+        // `i64::MIN` is either a deopt sentinel or a `long` that really is
+        // `Long.MIN_VALUE`, and only the out-of-band signals can tell them
+        // apart. Draining them is safe here BECAUSE this arm called exactly one
+        // method: whatever they say happened, happened inside this site's impl.
+        //
+        // The shared sentinel handler cannot be used for this: it identifies
+        // the trapped callee by the CALL SITE's name (`try_resume_trapped_callee`
+        // compares `info.method_name`), which for a SAM call is `apply` — never
+        // the `lambda$...` body that actually trapped. It would refuse the
+        // resume, re-stash the deopt flag, and the compiled CALLER would then
+        // read the callee's deopt as its own, de-speculating an innocent method
+        // and leaving a reconstructed frame nobody can claim.
+        let sig = take_all_jit_signals(thread);
+        let stashed = cratonvm_jit::deopt::take_last_deopt();
+        if sig.exception.is_some() || (stashed.is_none() && !sig.deopt) {
+            // Not a deopt: an escaping exception (which propagates through
+            // `jit_pending_exception`, exactly as it does out of the MIC hit
+            // path) or a genuine `Long.MIN_VALUE`. Put every signal back the
+            // way it was found and hand the value on.
+            restash_jit_signals(thread, sig);
+            crate::runtime::interpreter::lambda_site_bump_direct();
+            return Some(rc);
         }
+        // A deopt. The body did not complete, so its signals describe an
+        // attempt that is being abandoned and are dropped with it, and the
+        // reconstructed frame is consumed here rather than left for a later
+        // call to mis-claim. This site leaves the direct arm for good; the
+        // generic path below re-runs the body, and every later call goes
+        // through the interpreter's one-shot, which can resume such a frame
+        // precisely because it knows the impl's own identity.
+        drop(stashed);
+        site.disable_direct();
+        crate::runtime::interpreter::lambda_site_bump_deopted();
+        return None;
     }
+    crate::runtime::interpreter::lambda_site_bump_direct();
     Some(rc)
+}
+
+/// Put a drained [`DrainedJitSignals`] back exactly as it was found.
+///
+/// The direct lambda arm has to DRAIN the signals to tell a deopt sentinel from
+/// a `long` equal to `Long.MIN_VALUE`, and when the answer is "not a deopt" the
+/// signals still belong to the compiled caller's own post-invoke checks.
+fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
+    if let Some(exc) = sig.exception {
+        set_jit_pending_exception(thread, exc);
+    }
+    if let Some((index, length)) = sig.aioobe {
+        stash_jit_pending_aioobe(index, length);
+    }
+    if sig.npe {
+        stash_jit_pending_npe();
+    }
+    if sig.arithmetic {
+        stash_jit_pending_arithmetic();
+    }
+    if sig.deopt {
+        set_jit_deopt_pending();
+    }
 }
 
 // SAFETY: the JIT invoke metadata and the validated proxy receiver originate

@@ -1328,6 +1328,16 @@ pub(crate) struct LambdaJitSite {
     /// feature under one kill switch.
     code: std::cell::RefCell<Option<cratonvm_jit::RetainedCode>>,
     code_generation: std::cell::Cell<u64>,
+    /// Latched the first time this site's compiled body DEOPTS.
+    ///
+    /// A deopt means the body did not complete, and the direct arm has no way
+    /// to resume it: the reconstructed frame belongs to the `lambda$...` impl,
+    /// while the compiled caller this arm returns into only understands its own
+    /// deopts. The interpreter's one-shot path knows the impl's identity and
+    /// resumes such a frame precisely, so from the first deopt on, this site
+    /// sends its calls there instead. One latch, never cleared: a body that
+    /// deopted once under this call site will do it again.
+    direct_disabled: std::cell::Cell<bool>,
 }
 
 impl LambdaJitSite {
@@ -1342,6 +1352,17 @@ impl LambdaJitSite {
 
     pub(crate) fn total_args(&self) -> usize {
         self.total_args
+    }
+
+    /// May the direct compiled arm still serve this site? See
+    /// [`LambdaJitSite::direct_disabled`].
+    pub(crate) fn direct_enabled(&self) -> bool {
+        !self.direct_disabled.get()
+    }
+
+    /// Latch this site off the direct arm after its body deoptimized.
+    pub(crate) fn disable_direct(&self) {
+        self.direct_disabled.set(true);
     }
 }
 
@@ -1498,6 +1519,7 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         gate,
         code: std::cell::RefCell::new(None),
         code_generation: std::cell::Cell::new(u64::MAX),
+        direct_disabled: std::cell::Cell::new(false),
     }))
 }
 
@@ -1566,6 +1588,10 @@ pub(crate) mod lambda_site_prof {
     pub(crate) static SITE_DIRECT: AtomicU64 = AtomicU64::new(0);
     pub(crate) static SITE_NO_CODE: AtomicU64 = AtomicU64::new(0);
     pub(crate) static SITE_REFUSED: AtomicU64 = AtomicU64::new(0);
+    /// Refused because the body had already deoptimized under this site.
+    pub(crate) static SITE_DEOPTED: AtomicU64 = AtomicU64::new(0);
+    /// Refused because the argument shape did not match the site's.
+    pub(crate) static SITE_ARITY: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(crate) fn bump(counter: &AtomicU64) {
@@ -1576,11 +1602,13 @@ pub(crate) mod lambda_site_prof {
 
     pub(crate) fn line() -> String {
         format!(
-            "site_calls={} site_direct={} site_no_code={} site_refused={}",
+            "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} site_arity={}",
             SITE_CALLS.load(Ordering::Relaxed),
             SITE_DIRECT.load(Ordering::Relaxed),
             SITE_NO_CODE.load(Ordering::Relaxed),
             SITE_REFUSED.load(Ordering::Relaxed),
+            SITE_DEOPTED.load(Ordering::Relaxed),
+            SITE_ARITY.load(Ordering::Relaxed),
         )
     }
 }
@@ -1603,6 +1631,14 @@ pub(crate) fn lambda_site_bump_no_code() {
 #[inline]
 pub(crate) fn lambda_site_bump_refused() {
     lambda_site_prof::bump(&lambda_site_prof::SITE_REFUSED);
+}
+#[inline]
+pub(crate) fn lambda_site_bump_deopted() {
+    lambda_site_prof::bump(&lambda_site_prof::SITE_DEOPTED);
+}
+#[inline]
+pub(crate) fn lambda_site_bump_arity() {
+    lambda_site_prof::bump(&lambda_site_prof::SITE_ARITY);
 }
 
 /// Build (or re-derive) the `CachedBytecodeMethod` for a lambda implementation
