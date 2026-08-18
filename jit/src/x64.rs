@@ -151,7 +151,7 @@ pub use bytecode_compat::*;
 // declared visibility, so nothing here became more public than it was.
 mod licm;
 pub use licm::*;
-mod stack_kinds;
+pub(crate) mod stack_kinds;
 // ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
 // ---------------------------------------------------------------------------

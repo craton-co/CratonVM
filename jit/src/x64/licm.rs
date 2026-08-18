@@ -2465,10 +2465,14 @@ pub(super) fn compute_local_oop_masks(
 /// math.ec` AllTests, and as a bad pointer the young-gen GC scavenge later
 /// follows into a SEGV.
 ///
-/// `jit_scan` already ACCEPTS `dup2` (it only advances `pc`), and the five
-/// other type-dependent stack ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`,
-/// `dup2_x2`) are not implemented by codegen and safely bail. Only `dup2` is
-/// both accepted AND (mis-)implemented, so it is the lone miscompile.
+/// `jit_scan` already ACCEPTS `dup2` (it only advances `pc`), and at the time
+/// this was written the five other type-dependent stack ops (`pop2`,
+/// `dup_x1`, `dup_x2`, `dup2_x1`, `dup2_x2`) were not implemented by codegen
+/// and safely bailed, so `dup2` was the lone miscompile. **All five have
+/// since grown codegen arms**, each proving its form before shuffling —
+/// `dup2_x2` last, in 2026-08-18. Do not read the sentence above as a live
+/// statement about the codegen's repertoire; this whole helper is retained
+/// for reference only (see the NOTE below).
 ///
 /// ## The fix
 ///
@@ -2661,12 +2665,14 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // --- stack manipulation (the crux) ---
             //
             // POLICY: this analyzer's ONLY purpose is to reject methods whose
-            // `dup2` (0x5C, the single ambiguous stack op the codegen actually
-            // implements) operates on a CATEGORY-2 value. The other ambiguous
-            // ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`, `dup2_x2`) are NOT
-            // implemented by codegen — they hit the `_ => return false` bail in
-            // `compile_bytecode` and the method safely stays interpreted, so we
-            // do NOT reject for them here. An imprecisely-modeled state is
+            // `dup2` (0x5C) operates on a CATEGORY-2 value. When it was
+            // written, the other ambiguous ops (`pop2`, `dup_x1`, `dup_x2`,
+            // `dup2_x1`, `dup2_x2`) had no codegen arm — they hit the
+            // `_ =>` bail in `compile_bytecode` and the method safely stayed
+            // interpreted — so we did not reject for them here. They all have
+            // arms now, which does not change this helper's policy (it is no
+            // longer wired into `jit_scan` at all), but does mean the
+            // parenthetical is history, not a fact about today's codegen. An imprecisely-modeled state is
             // handled by CLEARING the abstract stack (treat subsequent values
             // as unknown) rather than rejecting outright, preserving JIT
             // coverage up to the next ambiguity. A `dup2` reached against a
@@ -2681,8 +2687,8 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 pop!();
                 pc += 1;
             }
-            // pop2: two cat-1 OR one cat-2 — codegen's `pop2` is unimplemented
-            // (bails), so we only need to keep the model's height roughly sane.
+            // pop2: two cat-1 OR one cat-2. This model only needs the height
+            // roughly sane; the codegen's own `pop2` arm proves its form.
             0x58 => {
                 match widths.last().copied() {
                     Some(2) => {
@@ -2701,9 +2707,10 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 push!(w);
                 pc += 1;
             }
-            // dup_x1 / dup_x2 — unimplemented by codegen (safe bail); just
-            // resync the model loosely. Clear so we do not mis-evaluate a later
-            // dup2 against a now-shuffled stack we no longer model precisely.
+            // dup_x1 / dup_x2 — both have codegen arms now; this model still
+            // cannot follow the shuffle, so resync loosely. Clear so we do not
+            // mis-evaluate a later dup2 against a now-shuffled stack we no
+            // longer model precisely.
             0x5a | 0x5b => {
                 widths.clear();
                 pc += 1;
@@ -2758,8 +2765,10 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 }
                 pc += 1;
             }
-            // dup2_x1 / dup2_x2 — unimplemented by codegen (safe bail); resync
-            // the model loosely by clearing.
+            // dup2_x1 / dup2_x2 — both have codegen arms now, but their form
+            // depends on the width of entries this descriptor-less model
+            // cannot see. Resync loosely by clearing, which is still sound
+            // here: a later `dup2` against a cleared top is REJECTED.
             0x5d | 0x5e => {
                 widths.clear();
                 pc += 1;
