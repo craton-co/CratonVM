@@ -6890,24 +6890,6 @@ pub fn jit_panic_to_exception(
 /// Resolution starts at the CONSTANT-POOL class, which is the right answer for
 /// `invokestatic`/`invokespecial` and the wrong one for a guarded virtual or
 /// interface site — see [`resolve_receiver_inline_site`].
-/// How many dispatches an inline cache must have served before its cached class
-/// counts as evidence for a devirtualised splice.
-///
-/// A site called three times says nothing about the fourth. 64 is well below
-/// the invocation counts a method reaching the inline planner has already
-/// accumulated, and well above the handful a cold path sees.
-const MIN_MIC_DEVIRT_SAMPLES: u64 = 64;
-
-/// The hit rate an inline cache must hold to count as monomorphic, matching the
-/// 80% dominance bar the top-level guarded-virtual planner applies to a
-/// receiver profile.
-///
-/// Below it the cache is thrashing and `cached_class_id` is whichever receiver
-/// happened to arrive last — the megamorphic shape a shared dispatch hop
-/// produces. Guarding on that spends a compare and a branch to reach the
-/// ordinary call anyway.
-const MIN_MIC_DEVIRT_HIT_PCT: u64 = 80;
-
 /// The plan-time direct-bind resolver an inline site consults for the calls
 /// inside the body it is about to splice.
 ///
@@ -7689,11 +7671,7 @@ fn resolve_inline_site_from(
                                 declaring_id,
                             );
                             let from_cache = artifact.as_ref().and_then(|cm| {
-                                cm.dominant_receiver_at_bci(
-                                    *ipc,
-                                    MIN_MIC_DEVIRT_SAMPLES,
-                                    MIN_MIC_DEVIRT_HIT_PCT,
-                                )
+                                cm.dominant_receiver_at_bci(*ipc)
                             });
                             match from_cache {
                                 Some(d) => (d, "mic"),
