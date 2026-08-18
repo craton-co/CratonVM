@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-458 tokens.
+459 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -521,10 +521,11 @@ export inherited from a parent shell.
 | `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
 | `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+| `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-189 tokens.
+191 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -565,8 +566,8 @@ export inherited from a parent shell.
 | `dup-x1` | `CRATONVM_JIT_NO_DUP_X1` |
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
 | `dup2-x2` | `CRATONVM_JIT_NO_DUP2_X2` |
-| `dupx` | `CRATONVM_JIT_NO_DUPX` |
 | `trusted-oop-getfield` | `CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD` |
+| `dupx` | `CRATONVM_JIT_NO_DUPX` |
 | `dupx-eager-canon` | `CRATONVM_JIT_DUPX_EAGER_CANON` |
 | `eager-callee-chain` | `CRATONVM_JIT_EAGER_CALLEE_CHAIN` |
 | `enable-callee-saved-gpr-locals` | `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS` |
@@ -723,7 +724,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-58 tokens.
+59 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -743,6 +744,7 @@ export inherited from a parent shell.
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
 | `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
+| `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |

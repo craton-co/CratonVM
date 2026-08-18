@@ -558,26 +558,61 @@ thread_local! {
     /// behaviour is unchanged.
     #[cfg(debug_assertions)]
     static JIT_THREAD_BORROWED: Cell<bool> = const { Cell::new(false) };
+
+    /// Debug-only: where the currently-live `jit_thread_mut` borrow was taken.
+    ///
+    /// The `debug_assert!` in `jit_thread_mut` says two borrows overlap; it
+    /// cannot say WHICH two, and with 58 call sites in this file that is the
+    /// whole difficulty. Populated only when
+    /// `CRATONVM_DBG_JIT_BORROW_SITES=1`, because capturing a backtrace on
+    /// every borrow costs far more than the borrow.
+    ///
+    /// `Cell<Option<Box<..>>>` rather than `RefCell`: the one place this is
+    /// read is the aliasing trip itself, which is by definition a reentrant
+    /// moment, and a `RefCell` double-borrow panic there would replace the
+    /// diagnosis with a different panic.
+    #[cfg(debug_assertions)]
+    static JIT_THREAD_BORROW_SITE: Cell<Option<Box<std::backtrace::Backtrace>>> =
+        const { Cell::new(None) };
+}
+
+/// Debug-only: is the borrow-site backtrace capture switched on?
+#[cfg(debug_assertions)]
+fn jit_borrow_site_capture_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_BORROW_SITES").is_some()
+    })
 }
 
 /// Debug-only: snapshot the borrow flag and clear it, so a nested JIT entry
 /// (the interpreter re-entering JIT from inside a bail) starts a fresh borrow
 /// level. Returns the previous value for [`restore_jit_borrow`]. No-op in
 /// release builds.
+///
+/// Carries the recorded borrow SITE along with the flag. Without that, the
+/// nested case leaves `flag = true` restored over `site = None` (the inner
+/// guard's drop cleared it), and a trip in the outer level then reports "no
+/// site recorded" while the capture is switched on — an instrument that goes
+/// quiet exactly where it is needed.
 #[cfg(debug_assertions)]
-fn suspend_jit_borrow() -> bool {
-    JIT_THREAD_BORROWED.with(|b| {
+fn suspend_jit_borrow() -> (bool, Option<Box<std::backtrace::Backtrace>>) {
+    let prev = JIT_THREAD_BORROWED.with(|b| {
         let prev = b.get();
         b.set(false);
         prev
-    })
+    });
+    let site = JIT_THREAD_BORROW_SITE.with(|s| s.take());
+    (prev, site)
 }
 
 /// Debug-only: restore the borrow flag suspended by [`suspend_jit_borrow`]
 /// once the nested JIT call has returned. No-op in release builds.
 #[cfg(debug_assertions)]
-fn restore_jit_borrow(prev: bool) {
-    JIT_THREAD_BORROWED.with(|b| b.set(prev));
+fn restore_jit_borrow(prev: (bool, Option<Box<std::backtrace::Backtrace>>)) {
+    let (flag, site) = prev;
+    JIT_THREAD_BORROWED.with(|b| b.set(flag));
+    JIT_THREAD_BORROW_SITE.with(|s| s.set(site));
 }
 
 /// Debug-only RAII guard that marks the `jit_thread_mut` borrow as released
@@ -591,6 +626,8 @@ impl Drop for JitThreadGuard {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
         JIT_THREAD_BORROWED.with(|b| b.set(false));
+        #[cfg(debug_assertions)]
+        JIT_THREAD_BORROW_SITE.with(|s| s.set(None));
     }
 }
 
@@ -610,7 +647,7 @@ pub struct JitThreadScope {
     /// no-op there.
     saved_shadow_top: Option<usize>,
     #[cfg(debug_assertions)]
-    prev_borrow: bool,
+    prev_borrow: (bool, Option<Box<std::backtrace::Backtrace>>),
 }
 
 /// DIAGNOSTIC: read the current dispatched JIT callee name.
@@ -1335,6 +1372,24 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
             // flag around that boundary so the legitimate nesting does NOT trip
             // here. (Empirically verified: DaCapo avrora drives ~1100 such
             // nested borrows and completes cleanly with no UB.)
+            if b.get() {
+                // Name BOTH sides before tripping. The assertion's own message
+                // asserts this is "a genuine sibling fabrication"; that claim
+                // is only checkable if the prior borrow's site is printed
+                // next to this one's.
+                let prior = JIT_THREAD_BORROW_SITE.with(|s| s.take());
+                match prior {
+                    Some(bt) => eprintln!(
+                        "[jit-borrow] PRIOR borrow was taken here:\n{bt}\n\
+                         [jit-borrow] SECOND borrow is being taken here:\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    ),
+                    None => eprintln!(
+                        "[jit-borrow] aliasing borrow detected; re-run with \
+                         CRATONVM_DBG_JIT_BORROW_SITES=1 to see both sites"
+                    ),
+                }
+            }
             debug_assert!(
                 !b.get(),
                 "jit_thread_mut: aliasing &mut JvmThread borrow detected \
@@ -1342,6 +1397,11 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
                  level — this is a genuine sibling fabrication, not a re-entry)"
             );
             b.set(true);
+            if jit_borrow_site_capture_enabled() {
+                JIT_THREAD_BORROW_SITE.with(|s| {
+                    s.set(Some(Box::new(std::backtrace::Backtrace::force_capture())))
+                });
+            }
         });
         Some((
             &mut *ptr,
@@ -10885,7 +10945,27 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // a call with nothing to compile and nothing to dispatch: a field read, an
     // atomic, or a constant. Everything after this point is per-call work that
     // such a site was paying for no reason. See `NativeSiteCache`.
-    if let Some(result) = try_jit_site_cached_native_dispatch(vm, info, info_key, args_slice) {
+    // Unlike the `jit_invoke_virtual_mic` call site, no borrow is live here —
+    // the nearest one above is scoped to an `if let` that has already closed —
+    // so this one acquires it, and the guard's scope is exactly the call.
+    //
+    // The borrow is passed as an `Option` rather than being required, so a run
+    // with no JIT thread installed still ENTERS the callee and still runs its
+    // counted pre-resolution bails; the `?` inside consumes the `None` at the
+    // same point the callee's own `jit_thread_mut()?` used to. Requiring it
+    // here instead would have skipped those `site_refusal::note_and_decline`
+    // counters, which the callee's own comment calls out as the thing that
+    // made its first cut unexplainable.
+    let mut thread_and_guard = jit_thread_mut();
+    let site_native = try_jit_site_cached_native_dispatch(
+        vm,
+        thread_and_guard.as_mut().map(|(t, _)| &mut **t),
+        info,
+        info_key,
+        args_slice,
+    );
+    drop(thread_and_guard);
+    if let Some(result) = site_native {
         disp_census::note(disp_census::OUT_SITE_NATIVE);
         return result;
     }
@@ -11735,6 +11815,29 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 /// by `forward_jit_reference_args` in the caller.
 unsafe fn try_jit_site_cached_native_dispatch(
     vm: &SharedVm,
+    // BORROWED FROM THE CALLER, never re-derived here.
+    //
+    // This used to do its own `jit_thread_mut()?` at the top of the leaf-native
+    // arm. That is sound from `jit_invoke_dispatch`, whose own borrow is scoped
+    // to an `if let` that closes before the call — and UNSOUND from
+    // `jit_invoke_virtual_mic`, which takes `(thread, _jit_thread_guard)` and
+    // holds the guard for the whole function. Two `&mut JvmThread` derived from
+    // the same raw pointer were live at once, with no `set_jit_thread` boundary
+    // between them to make the inner one a child reborrow — a genuine sibling,
+    // which is exactly what `jit_thread_mut`'s debug assertion says when it
+    // fires. And the outer reference is USED after the inner one is created
+    // (`safe_native_call`, `handle_jit_dispatch_error`, … all take it as
+    // `&mut`), so the invalidated borrow is not merely held but dereferenced.
+    //
+    // The `debug_assert!` is `#[cfg(debug_assertions)]`; the aliasing is not.
+    // Release built the same two derivations and simply did not look.
+    //
+    // `Option`, not `&mut`, and consumed at exactly the point the old
+    // `jit_thread_mut()?` stood — several counted bails
+    // (`site_refusal::note_and_decline`) run before it, and hoisting the
+    // thread requirement above them would silently stop counting a refusal
+    // whenever no JIT thread is installed.
+    thread: Option<&mut JvmThread>,
     info: &JitInvokeInfo,
     info_key: JitSiteKey,
     args_slice: &[i64],
@@ -11809,7 +11912,9 @@ unsafe fn try_jit_site_cached_native_dispatch(
         }
     }
 
-    let (thread, _guard) = jit_thread_mut()?;
+    // The old `let (thread, _guard) = jit_thread_mut()?;` stood here. Same
+    // position, same early-out, but the reference is the caller's.
+    let thread = thread?;
     if entry.kind == LeafNativeKind::ThreadCurrentThread {
         // The mirror is a per-thread GC root the collector remaps, and handing
         // it to the caller roots it again with no allocation in between. When
@@ -14428,6 +14533,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
+        Some(thread),
         info,
         jit_site_key(vm.vm_identity, info_ptr as usize),
         args_slice,

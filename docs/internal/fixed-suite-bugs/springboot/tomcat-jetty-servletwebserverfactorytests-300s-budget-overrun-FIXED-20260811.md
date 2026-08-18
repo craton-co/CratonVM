@@ -91,7 +91,7 @@ across that gap is `[moving-young] fallback #512 … #1024 … #2048` followed b
 a flood of `young non-moving sweep: the header at this offset claims an extent
 that SUBSUMES a live (marked) object`. That is the separately-tracked
 non-moving-sweep fallback spiral
-(`known-issues/springboot/moving-young-fallback-turns-four-classes-red-20260810.md`),
+(`known-issues/retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md`),
 not anything about these classes, and it does not occur under the current
 default collector. The one failure it produced —
 `shouldUpdateSslWhenReloadingSslBundles`, `SSLHandshakeException: handshake

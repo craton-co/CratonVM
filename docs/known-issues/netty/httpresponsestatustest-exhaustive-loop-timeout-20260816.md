@@ -280,22 +280,60 @@ The order is therefore:
 
    Still to do here: the other two sinks (`build_deopt_frame_inner` and the
    OSR-exit transfer, which is item 2 below).
-2. **Multi-frame OSR-exit transfer**, and only then relax `osr_exit_policy`'s
-   `caller.is_some()` refusal. Steps 1 and 2 are what make an inlined artifact
-   usable by an OSR-only method at all.
-3. **Inline scopes in deopt metadata** — give `FrameState::caller` a producer.
-   The IR-side representation is already built and tested
-   (`docs/jit/deopt-inline-scopes.md`: `InlineScopeTable`, `caller_chain_for`,
-   `lower_inner_with_scopes`, chain-aware `frame_state_is_resumable`); what is
-   missing for THIS backend is the single-pass scope stack, "pushed at the splice
-   and popped at the callee's return", replacing
-   `build_and_record_deopt_point`'s hard-coded `caller: None`.
-4. **A real call inside a spliced body.** With scopes recorded and resumable,
-   `try_emit_inline_body` can emit the ordinary dispatch/direct-call sequence for
-   `0xb6`/`0xb8`/`0xb9` instead of bailing, and the postcondition above relaxes
-   from "published any metadata" to "published metadata with no caller scope".
-   Note this needs BOTH gates opened: `resolve_inline_site_from` rejects those
-   opcodes outright too, so a site is never even planned.
+2. ~~Multi-frame OSR-exit transfer, then relax `osr_exit_policy`.~~ **DONE
+   2026-08-18.** `transfer_osr_exit_chain_into_live_frame` handles the two
+   halves a chain has, which are not alike: the outermost scope IS the OSR'd
+   method, so its frame already exists and is written in place, parked at the
+   SUCCESSOR of its invoke; every scope beneath it is pushed. All the fallible
+   work happens before the live frame is touched, because a partial success here
+   would leave a live frame describing one method and a pushed frame describing
+   another.
+
+   Admission relaxed exactly as far: a deopt point may carry a chain up to
+   `MAX_OSR_INLINE_RESUME_DEPTH`, defined once in the jit crate and consumed by
+   the VM so the two cannot drift. The **entry contract** keeps its blanket
+   refusal — an OSR entry pc is always an outer-scope block start, so a contract
+   naming an inlined scope is malformed rather than deep. Those were two rules
+   wearing one tag, and 08-17's pinning test caught its own drift by continuing
+   to pass for the wrong reason after the relaxation.
+3. ~~Inline scopes in deopt metadata.~~ **DONE 2026-08-18.** The single-pass
+   backend has a scope stack: `push_inline_scope` captures the enclosing frame
+   at the invoke (dropping `callee_num_args` stack slots, because a caller scope
+   is parked mid-`invoke`), and `build_and_record_deopt_point` fills
+   `FrameState::caller` from it instead of hard-coding `None`.
+   `try_emit_inline_site`'s postcondition now asks whether a published point
+   *says* it came from inside a splice, rather than whether anything was
+   published at all.
+4. **A real call inside a spliced body** — and the blocker here is NOT what
+   this page said it was. Measured 2026-08-18 with the per-splice trace step 3
+   added: **no splice publishes a deopt point at all, and that is structural.**
+   Precise exception frames and inlining are mutually exclusive
+   (`try_compile_inner`'s unconditional `inline_sites.clear()`, mirrored by
+   `InlineRefusal::PreciseExceptionFrames`), which rules out both precise-frame
+   producers; array ops and `invokedynamic` are rejected at the site resolver,
+   which rules out the bounds-check guard and the indy trap; and OSR exit maps
+   are emitted at the enclosing method's loop headers, not inside a splice.
+
+   So the deopt-metadata postcondition was a *guard*, not the reason invokes are
+   not spliced. The real work is:
+
+   * **write the arm.** `try_emit_inline_body` has no `0xb6`/`0xb8`/`0xb9` case
+     — they hit its catch-all bail — and `resolve_inline_site_from` rejects
+     those opcodes before a site is ever planned. Both gates have to open.
+   * **the exception-check stub's throw pc.** Outside a protected range (or with
+     precise frames off, which is every inlining compile),
+     `emit_post_invoke_exception_check` records `(patch_offset, dbg_last_pc)` on
+     `exception_check_stubs` rather than publishing a frame. Inside a spliced
+     body `dbg_last_pc` is the CALLEE's pc, and the VM routes that throw pc
+     through the ENCLOSING method's exception table — the same "callee bci in
+     the caller's frame" class of defect as the deopt one, in the exception
+     path instead. The tractable first cut is to admit a call-carrying splice
+     only where the enclosing method has no exception table, or where the splice
+     site lies outside every protected range. `testHttpStatusClassValueOf` has no
+     `try` at all, so it qualifies.
+   * **callee handlers.** `resolve_inline_site_from` already refuses a callee
+     whose own `exception_table` is non-empty; splicing one would need the
+     caller to carry its ranges. Leave that refusal in place for the first cut.
 5. **Nesting.** `InlineSite` grows a `nested_sites: HashMap<callee_pc,
    InlineSite>`, `resolve_inline_site_from` fills it recursively under a depth
    budget, and the emitter recurses. Statically bound callees are the tractable
