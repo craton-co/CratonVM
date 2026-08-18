@@ -8475,6 +8475,88 @@ pub static DIRECT_CALLEE_BIND_HITS: std::sync::atomic::AtomicU64 =
 pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Why a statically bound site was NOT offered a direct `CALL`, one counter per
+/// refusal reason.
+///
+/// `DIRECT_CALLEE_BIND_MISSES` alone says a site stayed on the Rust dispatch
+/// helper; it does not say WHICH gate refused, and the gates are not
+/// interchangeable — "the callee was not compiled at that instant" is a
+/// compile-ORDER accident that a re-bind can repair, while "the callee declares
+/// an exception table" is a standing policy that no amount of re-binding
+/// touches. A single number cannot be used to choose between those two fixes,
+/// which is exactly the choice
+/// `internal/performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
+/// left open, and which this counter is what closed.
+///
+/// Compile-time only: one relaxed `fetch_add` per refused site per compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum DirectBindRefusal {
+    FjpBlocklist = 0,
+    NativeShadow = 1,
+    CalleeClassNotFound = 2,
+    CalleeMethodNotFound = 3,
+    Synchronized = 4,
+    CalleeExceptionTable = 5,
+    DeclaringClassNotInitialized = 6,
+    CalleeNotYetCompiled = 7,
+    EagerChainDepth = 8,
+    EagerChainCycle = 9,
+    EagerChainBudget = 10,
+    EagerChainCompileDeclined = 11,
+    IndyTrap = 12,
+    /// The mutator-side `callee_compiler` door, which returns a bare `None`
+    /// from several arms that have no separate reason string.
+    MutatorDoorOther = 13,
+}
+
+/// Names in `DirectBindRefusal` declaration order — index IS the discriminant.
+pub const DIRECT_BIND_REFUSAL_NAMES: [&str; DIRECT_BIND_REFUSAL_COUNT] = [
+    "fjp-blocklist",
+    "native-shadow",
+    "callee-class-not-found",
+    "callee-method-not-found",
+    "synchronized",
+    "callee-exception-table",
+    "declaring-class-not-initialized",
+    "callee-not-yet-compiled",
+    "eager-callee-chain-depth",
+    "eager-callee-chain-cycle",
+    "eager-callee-chain-budget",
+    "eager-callee-chain-compile-declined",
+    "indy-trap",
+    "mutator-door-other",
+];
+
+pub const DIRECT_BIND_REFUSAL_COUNT: usize = 14;
+
+pub static DIRECT_CALLEE_BIND_REFUSALS: [std::sync::atomic::AtomicU64;
+    DIRECT_BIND_REFUSAL_COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; DIRECT_BIND_REFUSAL_COUNT];
+
+/// Tally one refusal. Called from the VM crate's two `callee_compiler` doors.
+#[inline]
+pub fn note_direct_callee_bind_refusal(reason: DirectBindRefusal) {
+    DIRECT_CALLEE_BIND_REFUSALS[reason as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(reason, count)` for every reason with a non-zero count, largest first.
+pub fn direct_callee_bind_refusal_reasons() -> Vec<(&'static str, u64)> {
+    let mut out: Vec<(&'static str, u64)> = DIRECT_BIND_REFUSAL_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            (
+                *name,
+                DIRECT_CALLEE_BIND_REFUSALS[i].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
 /// `(bound, unbound)` — see [`DIRECT_CALLEE_BIND_HITS`].
 pub fn direct_callee_bind_counts() -> (u64, u64) {
     (
@@ -14017,6 +14099,45 @@ pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
             Ok("void") => SpIcDeoptCheck::SkipVoid,
             _ => SpIcDeoptCheck::On,
         }
+    })
+}
+
+/// May a STATICALLY BOUND site bake a direct `CALL` to a callee that declares
+/// its own exception table?
+///
+/// The sibling of `mic_publish_exception_table_callees` (`vm/src/jit/helpers.rs`)
+/// for the other door. Both `callee_compiler` ladders refuse such a callee for
+/// the same stated reason — a raw `CALL` has no Rust frame to notice the
+/// `i64::MIN` sentinel and run the callee's own handler — and that reason has
+/// the same answer: `emit_inline_callee_deopt_check` is emitted after the baked
+/// `CALL` too (`x64/bytecode_walk.rs`, the `invokestatic` and `invokespecial`
+/// direct-call arms), and `jit_service_callee_deopt` resolves a statically bound
+/// callee by name.
+///
+/// Two interlocks, because a direct `CALL` has one precondition the inline
+/// cascade does not:
+///
+///  * `sp_ic_deopt_check_mode() == On`, exactly as the MIC gate requires; and
+///  * the emitter must have been able to reserve the contiguous service-argument
+///    slots that check needs. A site that could not is now a compile failure
+///    (`direct-call-service-slots`) rather than an unserviced raw edge, so
+///    "bound" implies "serviced" for every Java callee.
+///
+/// Default-OFF pending its own measurement: on netty's
+/// `BigEndianHeapByteBufTest` this gate accounts for 16 of 892 refused binds,
+/// against 736 for the native shadow, so it is a much smaller population than
+/// the virtual-site ban and is not worth defaulting on unmeasured.
+/// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1` opts in.
+pub fn direct_call_exc_table_publish_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        if sp_ic_deopt_check_mode() != SpIcDeoptCheck::On {
+            return false;
+        }
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH").as_deref(),
+            Ok("1") | Ok("true")
+        )
     })
 }
 

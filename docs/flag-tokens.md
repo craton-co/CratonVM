@@ -519,7 +519,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-182 tokens.
+183 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -616,6 +616,7 @@ export inherited from a parent shell.
 | `metrics-out` | `CRATONVM_JIT_METRICS_OUT` |
 | `metrics-ring` | `CRATONVM_JIT_METRICS_RING` |
 | `mic-exc-table-publish` | `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH` |
+| `direct-exc-table-publish` | `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` |
 | `mic-rust-entry-cache` | `CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE` |
 | `my-scratch-flush` | `CRATONVM_JIT_MY_SCRATCH_FLUSH` |
 | `my-selfcall-proof` | `CRATONVM_JIT_MY_SELFCALL_PROOF` |
