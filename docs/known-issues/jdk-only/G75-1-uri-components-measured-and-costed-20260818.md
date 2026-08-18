@@ -91,6 +91,23 @@ means:
 
 So the cost is the caller chain, not the parser.
 
+**CORRECTION — the costing above is too low, measured 2026-08-18.** It counts
+`url_parse` and its callers. It missed that **the URI getters are themselves
+parsers**. `URI.getPath()` does not read the `path` field: it calls
+`uri_raw_string(ctx, this)` — a `read_string` — then runs its own
+`uri_select_raw_path` over the result and percent-decodes it, preferring the
+`path` field only when that field passes a slot-collision sanity check, and
+reading THAT with `read_string` too. `getQuery`, `getFragment` and the
+scheme-specific-part getters are built the same way, each registered
+separately in `net_phase_e.rs`.
+
+So a converted `url_parse` alone would fix nothing observable: every getter
+would re-lose the unit on its own raw read. The real scope is `url_parse` +
+its ten callers + every URI getter + the percent-decoder they share. That is
+materially more than §2 claimed, and it is the reason N1 stays unstarted
+rather than "one more pass" — I would rather correct my own estimate than let
+someone begin on it.
+
 ## 3. Why it was not started here
 
 It is a whole pass, and a half-converted parse is worse than an unconverted
