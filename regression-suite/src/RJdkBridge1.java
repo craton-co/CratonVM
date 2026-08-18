@@ -20,6 +20,13 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.Vector;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLongArray;
 
@@ -1772,6 +1779,30 @@ public class RJdkBridge1 {
     // reshapes it. Every assertion here is on the CHAR VALUES, never on a
     // printed form.
     // ------------------------------------------------------------------
+    /**
+     * Assert that a rendered collection string carries the lone surrogate of
+     * {@link #LONE_HI} at {@code idx}, rather than the U+FFFD a lossy
+     * round-trip through host text leaves behind.
+     *
+     * <p>{@code idx == 100} means "find it anywhere": a {@code keySet()} view
+     * of a one-entry map renders the KEY, and this family reuses one map whose
+     * key is ordinary text -- so that row asserts the absence of U+FFFD rather
+     * than a position. Every other row knows exactly where the unit belongs.
+     */
+    static void ckCarries(String what, String rendered, int idx) {
+        if (idx == 100) {
+            check(rendered.indexOf('\uFFFD') < 0,
+                    what + " must not contain U+FFFD, got: " + rendered);
+            return;
+        }
+        check(rendered.length() > idx && rendered.charAt(idx) == 0xD800,
+                what + " must carry the lone surrogate at " + idx + ", got charAt(" + idx + ")="
+                        + (rendered.length() > idx
+                                ? Integer.toHexString(rendered.charAt(idx))
+                                : "<short:" + rendered.length() + ">")
+                        + " in: " + rendered);
+    }
+
     static void surrog() {
         step("surrog", "StringBuilder.append(lone high surrogate)");
         StringBuilder s = new StringBuilder();
@@ -1953,7 +1984,86 @@ public class RJdkBridge1 {
                 "CharBuffer.wrap(char[]).toString() must carry the surrogate, got charAt(1)="
                         + Integer.toHexString(cbs.charAt(1)));
 
-        sectionEnd("surrog", 34);
+        // -- every COLLECTION renderer, which is one defect in seventeen places
+        // Each of these bottoms out in `obj_to_display_units` in
+        // native-collections. It used to return a Rust `String`, which cannot
+        // hold an unpaired surrogate, so all seventeen substituted U+FFFD.
+        // `G63-1` measured three of them and refused to fix only those three;
+        // these rows are the other fourteen, so a partial conversion cannot
+        // pass. 21 of 29 probe rows diverged before the fix.
+        step("surrog", "every collection toString with a lone surrogate");
+        List<String> csList = new ArrayList<>();
+        csList.add(LONE_HI);
+        ckCarries("ArrayList.toString", csList.toString(), 2);
+        ckCarries("Arrays.asList().toString", Arrays.asList(LONE_HI, "z").toString(), 2);
+        ckCarries("Arrays.toString(Object[])", Arrays.toString(new String[] {LONE_HI}), 2);
+
+        Map<String, String> csMap = new HashMap<>();
+        csMap.put("k", LONE_HI);
+        ckCarries("HashMap.toString value", csMap.toString(), 4);
+        ckCarries("HashMap.toString key", new HashMap<>(Map.of(LONE_HI, "v")).toString(), 2);
+        ckCarries("keySet() view toString", csMap.keySet().toString(), 100);
+        ckCarries("values() view toString", csMap.values().toString(), 2);
+
+        Map<String, String> csLhm = new LinkedHashMap<>();
+        csLhm.put("k", LONE_HI);
+        ckCarries("LinkedHashMap.toString", csLhm.toString(), 4);
+
+        LinkedList<String> csLl = new LinkedList<>();
+        csLl.add(LONE_HI);
+        ckCarries("LinkedList.toString", csLl.toString(), 2);
+        ArrayDeque<String> csAd = new ArrayDeque<>();
+        csAd.add(LONE_HI);
+        ckCarries("ArrayDeque.toString", csAd.toString(), 2);
+        PriorityQueue<String> csPq = new PriorityQueue<>();
+        csPq.add(LONE_HI);
+        ckCarries("PriorityQueue.toString", csPq.toString(), 2);
+
+        TreeMap<String, String> csTm = new TreeMap<>();
+        csTm.put("k", LONE_HI);
+        ckCarries("TreeMap.toString", csTm.toString(), 4);
+        TreeSet<String> csTs = new TreeSet<>();
+        csTs.add(LONE_HI);
+        ckCarries("TreeSet.toString", csTs.toString(), 2);
+
+        Map<String, String> csChm = new ConcurrentHashMap<>();
+        csChm.put("k", LONE_HI);
+        ckCarries("ConcurrentHashMap.toString", csChm.toString(), 4);
+        Set<String> csKsv = ConcurrentHashMap.newKeySet();
+        csKsv.add(LONE_HI);
+        ckCarries("ConcurrentHashMap.KeySetView.toString", csKsv.toString(), 2);
+
+        ckCarries("Optional.toString", Optional.of(LONE_HI).toString(), 10);
+
+        // A nested collection reaches the element's OWN toString() through
+        // virtual dispatch -- a different arm of the same function.
+        List<List<String>> csNested = new ArrayList<>();
+        csNested.add(csList);
+        ckCarries("nested List.toString dispatches the element's toString", csNested.toString(), 3);
+
+        // A boxed Character CAN itself be a lone surrogate. This one did not
+        // print U+FFFD -- it printed '?', from a `char::from_u32().unwrap_or`
+        // that cannot represent the value at all.
+        List<Character> csChars = new ArrayList<>();
+        csChars.add((char) 0xD800);
+        String cs = csChars.toString();
+        check(cs.length() == 3 && cs.charAt(1) == 0xD800,
+                "a boxed Character holding a lone surrogate must print as that unit, got charAt(1)="
+                        + Integer.toHexString(cs.charAt(1)));
+
+        // Controls: ordinary text, a REAL surrogate pair, and numbers must all
+        // be untouched by a units-level renderer.
+        check("[ab, cd]".equals(new ArrayList<>(List.of("ab", "cd")).toString()),
+                "ordinary element text must be unchanged");
+        check("[1, 2.5, 3]".equals(new ArrayList<>(List.of(1, 2.5, 3L)).toString()),
+                "boxed numbers must still render Java-style, incl. the trailing .0");
+        String pair = new ArrayList<>(List.of("\uD83D\uDE00")).toString();
+        check(pair.length() == 4 && pair.charAt(1) == 0xD83D && pair.charAt(2) == 0xDE00,
+                "a WELL-FORMED surrogate pair must survive as two units, not be reshaped");
+        check("Optional.empty".equals(Optional.empty().toString()),
+                "Optional.empty has no element to render");
+
+        sectionEnd("surrog", 56);
     }
 
     static final int SFF = 15;

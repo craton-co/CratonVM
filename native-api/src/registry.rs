@@ -3143,7 +3143,46 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     }
 
     /// Read a Java String object back to a Rust String.
+    ///
+    /// LOSSY BY CONSTRUCTION for one input: a Rust `String` cannot hold an
+    /// unpaired UTF-16 surrogate, so any text containing one comes back with
+    /// U+FFFD substituted. That is fine wherever the result is only inspected
+    /// (a class name, a charset name, a flag) and wrong wherever it is handed
+    /// back to Java. Use [`read_string_units`] there.
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
+
+    /// Read a Java String object as UTF-16 code units, losing nothing.
+    ///
+    /// The units-exact counterpart of [`read_string`], and the fourth member of
+    /// the units-exact family beside [`read_char_array_into`],
+    /// [`write_char_array_from`] and [`init_string_from_units`]. `G55-1` N3
+    /// nominated it because `native-collections` cannot decode a String itself
+    /// -- it does not depend on `native-builtins`, and a local decoder would be
+    /// a second encoding of the compact-string layout.
+    ///
+    /// The default is deliberately LOSSY -- it is `read_string` widened -- so
+    /// that no implementation regresses by not overriding it, and so the
+    /// surrogate hazard stays exactly where it already was for anyone who does
+    /// not. The VM overrides it with the real reader.
+    fn read_string_units(&self, obj: ObjectRef) -> Option<Vec<u16>> {
+        self.read_string(obj).map(|s| s.encode_utf16().collect())
+    }
+
+    /// Build a fresh Java String from UTF-16 code units, losing nothing.
+    ///
+    /// The write half of [`read_string_units`], and the reason a units-exact
+    /// READER alone would not have been enough: a value read without loss and
+    /// then written back through [`create_string`] is lossy again at the last
+    /// step. NOT [`init_string_from_units`], which fills an ALREADY-ALLOCATED
+    /// receiver and assumes the `char[]` layout -- a real JDK `String` is
+    /// `byte[]` plus a coder, so that default is wrong for the mode this
+    /// matters most in.
+    ///
+    /// Default is lossy for the same reason as above.
+    fn create_string_from_units(&mut self, units: &[u16]) -> ObjectRef {
+        let text = String::from_utf16_lossy(units);
+        self.create_string(&text)
+    }
 
     /// Return the raw Java `String.hashCode()` for a confirmed String object.
     /// `None` means "no hash was computed": `obj` is not a String, or an
