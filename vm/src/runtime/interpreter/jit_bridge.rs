@@ -6877,6 +6877,7 @@ pub(super) fn resolve_inline_site(
         callee_class,
         callee_method,
         callee_desc,
+        0,
     )
 }
 
@@ -6920,6 +6921,7 @@ pub(super) fn resolve_receiver_inline_site(
         cp_class,
         callee_method,
         callee_desc,
+        0,
     )
 }
 
@@ -6929,6 +6931,12 @@ pub(super) fn resolve_receiver_inline_site(
 /// resolves from `callee_class` (constant-pool resolution), `Some` starts the
 /// selection walk at that runtime class and applies the override-legality
 /// checks documented on [`resolve_receiver_inline_site`].
+///
+/// `nest_depth` is how many splices already enclose this one: `0` for a site
+/// spliced directly into a compiled method, `1` for a body spliced into that
+/// body, and so on. It bounds the RECURSION this function performs on its own
+/// callee's calls (`cratonvm_jit::MAX_INLINE_NEST_DEPTH`) — see the nested-site
+/// resolution near the end.
 fn resolve_inline_site_from(
     shared: &SharedVm,
     requesting_class_id: ClassId,
@@ -6936,6 +6944,7 @@ fn resolve_inline_site_from(
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
+    nest_depth: usize,
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
@@ -7103,6 +7112,17 @@ fn resolve_inline_site_from(
     // inlining; the blanket 0xb7 rejection made every ctor un-inlineable,
     // so each `new C(args)` paid a full dispatch round trip per allocation.
     let mut special_sites: Vec<(usize, u16)> = Vec::new();
+    // Calls the callee body makes, deferred exactly like `special_sites`
+    // because resolving them needs the CALLEE's constant pool, which is only
+    // reachable once `callee_class_info` is fetched below:
+    // `(callee_pc, cp_idx, opcode)`.
+    //
+    // Gated: with `CRATONVM_JIT_INLINE_CALLS` off every `invoke*` still
+    // rejects the whole site outright, which is the behaviour every release
+    // before this one had. The gate is read ONCE here rather than per-opcode so
+    // a site cannot be admitted under one answer and emitted under another.
+    let inline_calls_allowed = crate::runtime::env_cache::jit_inline_calls();
+    let mut invoke_sites: Vec<(usize, u16, u8)> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
             0xaa | 0xab => return None,        // tableswitch, lookupswitch
@@ -7110,8 +7130,32 @@ fn resolve_inline_site_from(
             0xbf => return None,               // athrow
             0xc0 | 0xc1 => return None,        // checkcast, instanceof
             0xc2 | 0xc3 => return None,        // monitorenter, monitorexit
-            0xb6 | 0xb9 => return None,        // invokevirtual, invokeinterface
-            0xb8 => return None,               // invokestatic
+            // invokevirtual / invokestatic / invokeinterface inside the
+            // spliced body. These used to reject the site outright — the
+            // emitter had no arm for them and, more fundamentally, nothing
+            // resolved them: every other piece of callee metadata is keyed by
+            // callee pc against the CALLEE's constant pool, and invokes had no
+            // such entry. Both halves exist now (`invoke_targets` here,
+            // `try_emit_inline_body`'s invoke arm there), so record the site
+            // and resolve it below.
+            //
+            // `invokeinterface` is FIVE bytes (cp_idx, count, 0); the other two
+            // are three. Advancing by the wrong width would desync the scan and
+            // read operands as opcodes, which is the same class of bug the
+            // `wide`-aware length below exists to prevent.
+            0xb6 | 0xb8 | 0xb9 => {
+                if !inline_calls_allowed {
+                    return None;
+                }
+                let width = if code[scan_pc] == 0xb9 { 5 } else { 3 };
+                if scan_pc + width > code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                invoke_sites.push((scan_pc, cp_idx, code[scan_pc]));
+                scan_pc += width;
+                continue;
+            }
             0xb7 => {
                 // invokespecial — defer: elidable no-op super-ctor calls are
                 // allowed (validated below), everything else rejects.
@@ -7196,19 +7240,92 @@ fn resolve_inline_site_from(
             .get_class_name(ref_class_idx)?;
         let (target_name, target_desc) =
             callee_class_info.constant_pool.get_name_and_type(nat_idx)?;
-        if target_name != "<init>" || target_desc != "()V" {
-            return None;
-        }
-        let elidable = target_class == "java/lang/Object" || {
-            match cm.find_class_by_name_for_class(target_class, declaring_id) {
-                Some(tid) => is_elidable_construction(shared, &cm, tid),
-                None => false,
-            }
-        };
+        // An invokespecial that is NOT a provable no-op super-constructor call
+        // used to reject the whole site, because the emitter's only 0xb7 arm is
+        // the elision. With call splicing on there is a second arm — the
+        // dispatch helper — so route it there instead of losing the site.
+        let is_noop_ctor_shape = target_name == "<init>" && target_desc == "()V";
+        let elidable = is_noop_ctor_shape
+            && (target_class == "java/lang/Object" || {
+                match cm.find_class_by_name_for_class(target_class, declaring_id) {
+                    Some(tid) => is_elidable_construction(shared, &cm, tid),
+                    None => false,
+                }
+            });
         if !elidable {
-            return None;
+            if !inline_calls_allowed {
+                return None;
+            }
+            invoke_sites.push((spc, cp_idx, 0xb7));
+            continue;
         }
         elided_invoke_pcs.push(spc);
+    }
+
+    // Resolve the callee's own calls against the CALLEE's constant pool.
+    //
+    // Everything needed is textual — the name triple, the argument count and
+    // the return byte — so this stays inside the `cm` guard with the field and
+    // ldc scans; unlike `resolve_field_ref` it re-locks nothing. What it does
+    // NOT do is find a body: `jit_invoke_dispatch` resolves the target at run
+    // time from exactly these four fields, which is what makes a spliced call
+    // behave identically to the same call in an un-spliced body (same handler,
+    // same `<clinit>` barrier, same loader identity via `declaring_class_id`).
+    //
+    // `declaring_class_id` is the CALLEE's declaring class, not the enclosing
+    // method's: a class NAME is not a class identity
+    // (BUG-JIT-INVOKESPECIAL-LOADER-20260726), and the pool that named this
+    // target belongs to the callee. Handing the dispatcher the enclosing
+    // method's id would resolve a two-loader duplicate through the wrong copy.
+    //
+    // A site with even ONE unresolvable invoke is refused whole — the same
+    // contract `ldc` follows ("the callee still compiles and is still CALLED,
+    // it just is not spliced"), and the only alternative would be to splice a
+    // body with a hole in it.
+    let mut invoke_targets: Vec<(usize, cratonvm_jit::InlineInvokeTarget)> = Vec::new();
+    for &(ipc, cp_idx, opcode) in &invoke_sites {
+        let (ref_class_idx, nat_idx) = match callee_class_info.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            })
+            | Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index),
+            _ => return None,
+        };
+        let target_class = callee_class_info
+            .constant_pool
+            .get_class_name(ref_class_idx)?;
+        let (target_name, target_desc) =
+            callee_class_info.constant_pool.get_name_and_type(nat_idx)?;
+        let invoke_kind: u8 = match opcode {
+            0xb6 => 0,
+            0xb7 => 1,
+            0xb9 => 2,
+            0xb8 => 3,
+            _ => return None,
+        };
+        // Receiver-included, one slot per parameter regardless of category —
+        // the count `JitInvokeInfo::num_jit_args` carries and the count the
+        // emitter pops, since the JIT operand stack holds one i64 per value.
+        let num_jit_args =
+            count_method_params(target_desc) + if opcode == 0xb8 { 0 } else { 1 };
+        invoke_targets.push((
+            ipc,
+            cratonvm_jit::InlineInvokeTarget {
+                class_name: target_class.to_string(),
+                method_name: target_name.to_string(),
+                descriptor: target_desc.to_string(),
+                num_jit_args,
+                return_type: cratonvm_jit::return_type(target_desc),
+                invoke_kind,
+                declaring_class_id: declaring_id.as_u32(),
+            },
+        ));
     }
 
     // Lock-order discipline (audit follow-up to the H2 ABBA fix): collect
@@ -7344,7 +7461,13 @@ fn resolve_inline_site_from(
     let num_params = count_method_params(callee_desc);
     let callee_num_args = num_params + if is_static { 0 } else { 1 };
     let return_type = cratonvm_jit::return_type(callee_desc);
-    let needs_heap = has_field_ops || has_static_field_ops;
+    // A spliced call goes through `jit_invoke_dispatch`, whose first argument
+    // is the VM context the emitter loads from `heap_local_offset`. Without
+    // this the enclosing compile may not establish that slot at all and the
+    // dispatch reads garbage. `needs_heap` is ORed across every spliced site
+    // by the planner, so one call-carrying callee is enough to turn it on for
+    // the whole method — the same way one field-touching callee already does.
+    let needs_heap = has_field_ops || has_static_field_ops || !invoke_targets.is_empty();
 
     let padded = crate::runtime::frame::padded_bytecode(&code_bytes);
 
@@ -7384,6 +7507,70 @@ fn resolve_inline_site_from(
         }
     }
 
+    // Nesting: a call inside the spliced body that is itself worth splicing.
+    //
+    // Resolved AFTER `drop(cm)`, and it must be: this recurses into
+    // `resolve_inline_site_from`, which takes its own `class_manager.read()`.
+    // parking_lot's RwLock is not reentrant, and a writer queued between the
+    // two reads deadlocks the thread against itself — the same lock-order
+    // obligation the field-resolution phase above was split out for.
+    //
+    // Only STATICALLY BOUND calls are candidates. `invokestatic` and
+    // `invokespecial` name their target through the constant pool, which is
+    // what `resolve_inline_site` resolves; `invokevirtual` / `invokeinterface`
+    // select on the runtime receiver, and this planning context has no receiver
+    // profile for a callee-internal pc (the profile is keyed by the enclosing
+    // method's bci). Those keep the dispatch helper — which is step 4's whole
+    // point, and is why nesting does not need them.
+    //
+    // A nested site is ADDITIVE: the pc keeps its `invoke_targets` entry too,
+    // so a nested splice that bails mid-body inside the emitter falls back to
+    // the ordinary call rather than failing the outer splice.
+    let mut nested_sites: Vec<(usize, cratonvm_jit::InlineSite)> = Vec::new();
+    if nest_depth + 1 < cratonvm_jit::MAX_INLINE_NEST_DEPTH
+        && crate::runtime::env_cache::jit_inline_nest()
+    {
+        for (ipc, target) in &invoke_targets {
+            if target.invoke_kind != 1 && target.invoke_kind != 3 {
+                continue;
+            }
+            if let Some(nested) = resolve_inline_site_from(
+                shared,
+                declaring_id,
+                None,
+                &target.class_name,
+                &target.method_name,
+                &target.descriptor,
+                nest_depth + 1,
+            ) {
+                nested_sites.push((*ipc, nested));
+            }
+        }
+    }
+
+    // A spliced call must not be WORSE than the call it replaced.
+    //
+    // Measured 2026-08-18 (see `jit_inline_call_dispatch`): the chain this
+    // whole line of work targets is already direct-bound, so emitting an
+    // admitted call through the blind dispatch helper traded a ~4 ns raw CALL
+    // for a ~175 ns name resolution — `assertFull` 47 -> 163-266 ns/iter, with
+    // `disp_calls` going from 3 870 to 2 003 361 over 2 000 000 iterations.
+    // Splicing away one frame does not pay for downgrading the call inside it.
+    //
+    // So unless the fallback is explicitly re-enabled, refuse any site with a
+    // call that is not itself spliced, and then CLEAR `invoke_targets` — which
+    // removes the emitter's fallback as well, so a nested splice that bails
+    // during emission bails the enclosing splice instead of quietly becoming a
+    // dispatch. Refusing costs the site its inline; admitting it costs 3.5x.
+    let mut invoke_targets = invoke_targets;
+    if !invoke_targets.is_empty() && !crate::runtime::env_cache::jit_inline_call_dispatch() {
+        let nested_pcs: Vec<usize> = nested_sites.iter().map(|(pc, _)| *pc).collect();
+        if invoke_targets.iter().any(|(pc, _)| !nested_pcs.contains(pc)) {
+            return None;
+        }
+        invoke_targets.clear();
+    }
+
     Some(cratonvm_jit::InlineSite {
         callee_code: padded.to_vec(),
         callee_code_len: code_len,
@@ -7401,6 +7588,12 @@ fn resolve_inline_site_from(
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
         elided_invoke_pcs,
+        invoke_targets,
+        // Interned by `try_compile_inner` right before backend emission; a
+        // resolver never fills this, and an `InlineSite` that never reaches a
+        // compile keeps it empty, which makes the emitter's invoke arm bail.
+        resolved_invoke_infos: Vec::new(),
+        nested_sites,
     })
 }
 

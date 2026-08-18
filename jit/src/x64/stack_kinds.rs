@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(m.get(4), None, "the jsr's successor must have no answer");
     }
 
-    /// The defect behind `osr-refused-for-a-loop-inline-in-main-20260810`: a
+    /// The defect behind `osr-refused-for-a-loop-inline-in-main-FIXED-20260818`: a
     /// numeric `ldc` answered `Unknown`, the deopt snapshot recorded it
     /// `Unsupported`, and `osr_exit_policy`'s artifact-wide veto then refused
     /// OSR entry at every pc of the method — 180 ns/iter against 1 compiled.

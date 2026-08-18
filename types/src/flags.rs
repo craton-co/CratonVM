@@ -2638,12 +2638,61 @@ pub fn runtime_var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError
 #[inline]
 pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     let key = key.as_ref();
+    // Per-name read census (`CRATONVM_DBG_FLAGREADS=1`). Kept because it is the
+    // instrument that found the `CRATONVM_DBG_COMPACT_INLINE` read in
+    // `jit_getfield` — `perf` put `runtime_var_os` at 1.21% of a `BigDecimal`
+    // benchmark, but inlining defeated stack attribution and a dwarf capture
+    // pointed at the callee side of the JIT->heap boundary. The KEY names the
+    // caller directly, and did so in one run. Off, it is one relaxed atomic load.
+    flag_read_census(key);
     if let Some(name) = key.to_str() {
         if declared_flag_names().contains(name) {
             return flags().legacy_var_os(name);
         }
     }
     std::env::var_os(key)
+}
+
+/// Per-flag-name read census — see the call in [`runtime_var_os`].
+///
+/// `CRATONVM_DBG_FLAGREADS=1` prints the top offenders every 200k reads. A flag
+/// read is supposed to be rare (every gate is expected to cache its answer), so
+/// a name appearing here in the millions IS the bug — which is exactly how
+/// `CRATONVM_DBG_COMPACT_INLINE` was found at 4,560,891 of 4,600,000 reads
+/// (99.1%) on a 50k-iteration `BigDecimal` run, uncached inside `jit_getfield`.
+/// After that fix the same run does not reach the first 200k report at all.
+fn flag_read_census(key: &OsStr) {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
+    let gate = match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            // std::env directly: reading through this module would recurse.
+            let on = std::env::var_os("CRATONVM_DBG_FLAGREADS").is_some();
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    };
+    if !gate {
+        return;
+    }
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static COUNTS: OnceLock<std::sync::Mutex<HashMap<String, u64>>> = OnceLock::new();
+    let map = COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let name = key.to_string_lossy().into_owned();
+    let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut g) = map.lock() {
+        *g.entry(name).or_insert(0) += 1;
+        if n % 200_000 == 0 {
+            let mut v: Vec<(String, u64)> = g.iter().map(|(k, c)| (k.clone(), *c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("[flagreads] total={n}");
+            for (k, c) in v.iter().take(8) {
+                eprintln!("[flagreads]   {c:>10}  {k}");
+            }
+        }
+    }
 }
 
 /// Publish an explicitly-built configuration.

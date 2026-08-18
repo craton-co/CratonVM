@@ -136,6 +136,18 @@ fn maybe_dump_shutdown_reports() {
     // nothing incremented it.
     cratonvm_classloading::define_census::dump();
 
+    // The lambda tier-up / inline-cache-thunk census, on
+    // `CRATONVM_DBG=lambda-jit`.
+    //
+    // At exit and not merely periodically, because the periodic report fires
+    // every 200 000 eligible dispatches (or 100 000 direct calls) and no
+    // ordinary application workload comes near either: a census over 24 Tomcat
+    // JUnit classes — 129 s of real work, one of them driving 21 HTTP tests
+    // against a live connector — printed nothing whatsoever, and "no lambda
+    // activity" is not a reading that silence can support. See
+    // `runtime::interpreter::report_lambda_census_at_exit`.
+    cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
@@ -148,7 +160,9 @@ fn maybe_dump_shutdown_reports() {
         // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
         eprintln!(
             "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
-            cratonvm_vm::jit::helpers::jit_getfield_helper_calls(),
+            cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<not counted>".to_string()),
             cratonvm_jit::metrics::getfield_arm_emits()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
@@ -6334,6 +6348,7 @@ fn main() {
             maybe_dump_shutdown_reports();
             match result {
                 Ok(()) => {
+                    cratonvm_vm::jit::conservative_roots::report_a5_engagement();
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();
                 }

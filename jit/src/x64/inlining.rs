@@ -1471,13 +1471,53 @@ impl Compiler {
                 // stack-model adjustment, no machine code — and continue.
                 // This is what admits CONSTRUCTOR bodies to inlining. Any
                 // other invokespecial bails to the dispatch fallback.
-                0xb7 => {
-                    if cpc + 2 >= callee_len || !site.elided_invoke_pcs.contains(&cpc) {
+                //
+                // Everything else — and every 0xb6/0xb8/0xb9 — is either
+                // SPLICED IN TURN (`site.nested_sites`) or emitted as the
+                // ordinary dispatch call (`site.resolved_invoke_infos`). A pc
+                // in neither map still bails, which is what the whole arm did
+                // before either map existed.
+                0xb6 | 0xb7 | 0xb8 | 0xb9 => {
+                    // invokeinterface is 5 bytes; the rest are 3.
+                    let width = if op == 0xb9 { 5 } else { 3 };
+                    if cpc + width > callee_len {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    let _ = self.pop_stack();
-                    cpc += 3;
+                    if op == 0xb7 && site.elided_invoke_pcs.contains(&cpc) {
+                        let _ = self.pop_stack();
+                        cpc += width;
+                        prev_was_terminator = false;
+                        continue;
+                    }
+
+                    // Nesting first: a body is strictly better than a call,
+                    // and a nested bail falls back to the call below because
+                    // `try_emit_nested_inline` rolls itself back completely.
+                    if let Some((_, nested)) = site.nested_sites.iter().find(|(p, _)| *p == cpc) {
+                        if self.try_emit_nested_inline(nested) {
+                            cpc += width;
+                            prev_was_terminator = false;
+                            continue;
+                        }
+                    }
+
+                    let Some(&(_, info_addr)) =
+                        site.resolved_invoke_infos.iter().find(|(p, _)| *p == cpc)
+                    else {
+                        // No resolved target: either the gate is off (the
+                        // resolver refused the site and this is unreachable) or
+                        // an `InlineSite` reached the emitter without passing
+                        // through `try_compile_inner`'s interning step. Bail to
+                        // the real call rather than guess a target.
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !self.emit_inline_invoke(info_addr) {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    cpc += width;
                 }
 
                 // Unsupported opcode in inline context — bail out
@@ -1537,5 +1577,185 @@ impl Compiler {
         self.next_spill_offset = next_spill;
 
         true
+    }
+
+    /// Emit a call the SPLICED body makes, as the ordinary
+    /// `jit_invoke_dispatch` sequence.
+    ///
+    /// `info_addr` is a `*const JitInvokeInfo` parked as a `usize` in
+    /// [`crate::InlineSite::resolved_invoke_infos`] — resolved against the
+    /// CALLEE's constant pool and interned into this compile's own arena by
+    /// `try_compile_inner`, so the address stays valid for as long as the
+    /// emitted code that bakes it.
+    ///
+    /// This is deliberately the *plain* dispatch, not the MIC/PIC ladder the
+    /// top-level `invokevirtual` arm uses: an inline cache slot is allocated
+    /// per CALLER pc, and a callee-internal pc has none. The win being bought
+    /// here is not a cheaper call — it is that the ENCLOSING body becomes
+    /// inlineable at all, which it never was while any `invoke*` refused the
+    /// whole site.
+    ///
+    /// Mirrors the top-level `invokestatic` dispatch site instruction for
+    /// instruction: contiguous args buffer built at the pre-pop spill cursor,
+    /// four-argument helper call, oop map for the safepoint, post-invoke
+    /// exception check, cursor reclaimed to the popped-args depth, then the
+    /// result pushed. Returns `false` (having emitted nothing that matters —
+    /// the caller rolls back) when the spill region cannot hold the buffer.
+    ///
+    /// EXCEPTION ROUTING. `emit_post_invoke_exception_check` keys the shared
+    /// sentinel exit on `dbg_last_pc`, which is assigned only by the OUTER
+    /// bytecode walk and therefore still holds the CALLER's invoke pc for the
+    /// whole splice. That is the correct attribution, not an accident of
+    /// bookkeeping: an exception escaping an inlined body belongs to the call
+    /// site in the enclosing method, and the enclosing method's exception table
+    /// is the one that must be searched. The already-shipped spliced `getfield`
+    /// / `getstatic` / `arraycopy` sites rely on exactly the same thing.
+    fn emit_inline_invoke(&mut self, info_addr: usize) -> bool {
+        // SAFETY: see the doc comment — the pointee is owned by this compile's
+        // `_jit_invoke_infos` arena and outlives the code being emitted.
+        let info = info_addr as *const crate::JitInvokeInfo;
+        let (num_args, return_type) = {
+            let info_ref = unsafe { &*info };
+            (info_ref.num_jit_args, info_ref.return_type)
+        };
+
+        // A call boundary: no caller-live value may sit in a scratch GPR or an
+        // XMM temporary across it. Same reason `try_emit_inline_body` flushes
+        // on entry.
+        self.flush_scratch_registers();
+
+        if self.stack.len() < num_args {
+            return false;
+        }
+        // Deliberately NO `snapshot_pre_intrinsic_call` here, unlike the
+        // top-level dispatch sites. That snapshot publishes a deopt point keyed
+        // by BCI, and inside a splice the only bci available is the callee's —
+        // a different bytecode space from the one the enclosing artifact's
+        // metadata is indexed by. Publishing one would also trip
+        // `try_emit_inline_site`'s postcondition and refuse the splice. The
+        // cost of omitting it is reach, not correctness: a trap that would have
+        // resumed at this site instead leaves the whole method to the
+        // interpreter.
+        let pre_pop_spill = self.next_spill_offset;
+        let mut arg_slots = Vec::with_capacity(num_args);
+        for _ in 0..num_args {
+            arg_slots.push(self.pop_stack());
+        }
+        arg_slots.reverse();
+        let post_pop_spill = self.next_spill_offset;
+
+        let args_base_offset = pre_pop_spill;
+        if num_args > 0 {
+            let Some(args_end) = self.checked_spill_range_end(args_base_offset, num_args) else {
+                return false;
+            };
+            self.next_spill_offset = args_end;
+            // Descending offsets = ascending addresses, because
+            // `modrm_rbp_disp` negates the offset: arg[0] must end up at the
+            // LOWEST address for the helper to read the buffer in order.
+            for (i, slot) in arg_slots.iter().enumerate() {
+                let buf_offset = args_base_offset + ((num_args - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
+                self.load_slot_to_reg(RAX, *slot);
+                self.emit_store_local(buf_offset, RAX);
+            }
+        }
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.emit_mov_imm64(ARG_REGS[1], info as i64); // Cast: function pointer for JIT call target
+        if num_args > 0 {
+            let buf_start = args_base_offset + ((num_args as i32) - 1) * 8; // Cast: x86-64 immediate encoding
+            self.emit_lea_frame_slot(ARG_REGS[2], buf_start);
+        } else {
+            self.emit_xor_reg_self(ARG_REGS[2]);
+        }
+        self.emit_mov_imm32_sx(ARG_REGS[3], num_args as i32); // Cast: x86-64 immediate encoding
+        self.emit_pre_safepoint_spill();
+        self.emit_call_absolute(self.helpers.invoke_dispatch);
+        // A dispatched callee can allocate, so this is a full safepoint. The
+        // caller's operand stack below `caller_base_depth` is covered
+        // precisely by its oop marks; the CALLEE's locals live in this frame's
+        // spill area, below `next_spill_offset`, and are covered by the same
+        // conservative frame sweep (`scan_one_frame_precise`) that already
+        // covers every other spill slot — over-approximate, hence pinned by a
+        // moving collector, which is the fail-closed direction.
+        self.emit_oop_map_for_safepoint();
+        self.emit_post_invoke_exception_check(return_type);
+        self.next_spill_offset = post_pop_spill;
+
+        if return_type != b'V' {
+            if matches!(return_type, b'D' | b'F') {
+                self.push_from_rax_as_xmm0();
+            } else {
+                self.push_from_rax();
+                if return_type == b'L' || return_type == b'[' {
+                    self.mark_top_as_oop();
+                }
+            }
+        }
+        true
+    }
+
+    /// Splice a body into a body: `try_emit_inline_site`'s rollback contract,
+    /// for a call site whose pc lives in a CALLEE's bytecode space.
+    ///
+    /// Two things differ from the outer wrapper, both because the pc is a
+    /// callee pc:
+    ///
+    ///  * no `push_inline_scope`. A scope is built by `build_frame_state_at`,
+    ///    which reads the ENCLOSING method's locals at a bci — and a callee pc
+    ///    indexes a different bytecode. There is no honest frame to record
+    ///    here, so none is recorded.
+    ///  * consequently the postcondition stays the STRICT one the outer
+    ///    wrapper used before inline scopes existed: any deopt metadata at all
+    ///    refuses the nested splice. Nothing on this path publishes (the
+    ///    invoke arm deliberately omits `snapshot_pre_intrinsic_call`, precise
+    ///    exception frames and inlining are mutually exclusive, and every
+    ///    trap-carrying opcode is refused by the resolver), so the rule is
+    ///    inert — which is exactly why it is cheap to keep as a ratchet
+    ///    against a future edit that starts publishing.
+    ///
+    /// A `false` return leaves the emitter byte-identical to before the
+    /// attempt, so the invoke arm falls through to the ordinary dispatch call.
+    fn try_emit_nested_inline(&mut self, site: &crate::InlineSite) -> bool {
+        let buf_checkpoint = self.buf.pos();
+        let stack_checkpoint = self.stack.clone();
+        let oop_marks_checkpoint = self.stack_oop_marks.clone();
+        let spill_checkpoint = self.next_spill_offset;
+        let exception_check_stubs_checkpoint = self.exception_check_stubs.len();
+        let deopt_stubs_checkpoint = self.deopt_stubs.len();
+        let deopt_points_checkpoint = self.deopt_points.len();
+        let forward_patches_checkpoint = self.forward_patches.len();
+        let jump_table_patches_checkpoint = self.jump_table_patches.len();
+        let self_call_patches_checkpoint = self.self_call_patches.len();
+        let bounds_check_stubs_checkpoint = self.bounds_check_stubs.len();
+        let null_check_store_stubs_checkpoint = self.null_check_store_stubs.len();
+
+        // `try_emit_inline_body` reads no per-pc state off `self` for the
+        // OUTER pc it is handed — it uses it only for the `CRATONVM_DBG_JITC`
+        // trace — so passing the enclosing splice's pc keeps that trace
+        // pointing at the caller-visible call site.
+        let outer_pc = self.dbg_last_pc;
+        let inline_ok = self.try_emit_inline_body(outer_pc, site);
+        let published = self.deopt_stubs.len() > deopt_stubs_checkpoint
+            || self.deopt_points.len() > deopt_points_checkpoint;
+        if inline_ok && !published {
+            return true;
+        }
+        self.buf.rewind_to(buf_checkpoint);
+        self.stack = stack_checkpoint;
+        self.stack_oop_marks = oop_marks_checkpoint;
+        self.next_spill_offset = spill_checkpoint;
+        self.exception_check_stubs
+            .truncate(exception_check_stubs_checkpoint);
+        self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+        self.deopt_points.truncate(deopt_points_checkpoint);
+        self.forward_patches.truncate(forward_patches_checkpoint);
+        self.jump_table_patches
+            .truncate(jump_table_patches_checkpoint);
+        self.self_call_patches.truncate(self_call_patches_checkpoint);
+        self.bounds_check_stubs
+            .truncate(bounds_check_stubs_checkpoint);
+        self.null_check_store_stubs
+            .truncate(null_check_store_stubs_checkpoint);
+        false
     }
 }

@@ -6,6 +6,7 @@
 | **Opened** | 2026-08-17 as `known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`; §5 added the same day |
 | **Closed by** | `fix/lambda-sam-jit-tierup-20260817`, then `perf/lambda-mic-adapter-20260818`, then `perf/lambda-capturing-adapter-20260818` for the capturing residual |
 | **Measured effect** | **37x** on `probes/SamHotLoopProbe.java`'s lambda row — 379 → 10.2 ns/op, against a named-class control of 10.3 — same binary, three-arm ABBA, six runs an arm. The gap this page was filed about is GONE, not narrowed. The capturing row followed on 2026-08-18: **17.4x**, 125.1 → 7.2 ns/op against a control of 6.6 (see §4) |
+| **…on a real workload** | **Not measurable.** On Tomcat's JUnit suite the feature engages (7 of 24 classes install thunks, a third of them capturing) but the capturing thunk moves wall time 2% with fully overlapping ranges — a few hundred `site_calls` per process against a ~140 ns saving is tens of microseconds in a 45-second run. Quote the ns/op figures as microbenchmark numbers, not workload numbers; see §4 "Does any of this reach a real workload?" |
 | **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (everything), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller Rust arm), `CRATONVM_JIT_LAMBDA_ADAPTER=0` (the inline-cache thunk), `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` (just the capturing half of it) |
 
 The page asked for one thing in its §4 — *"giving lambda call sites a cached
@@ -260,11 +261,13 @@ into the registers the slide vacated, tail-jump. The arguments now move by
 and the slide runs in whichever direction reads each register before the step
 that writes it.
 
-One genuine restriction survives, and it is about the collector rather than the
-layout: a REFERENCE capture is refused while `narrow_oops_block_inline_fields()`
-holds — compressed oops on, or ZGC's read barrier armed — which is the same gate
-and the same moment the inline `getfield` codegen makes its own commitment. A
-primitive capture is unaffected by either.
+One restriction appeared to survive, about the collector rather than the layout:
+a REFERENCE capture was refused while `narrow_oops_block_inline_fields()` held —
+compressed oops on, or ZGC's read barrier armed — by analogy with the inline
+`getfield` codegen. **It was removed on the same day, because the analogy did
+not hold and the gate was inert anyway.** See "The reference-capture gate"
+below; there is now no capture shape this thunk refuses on the collector's
+account.
 
 `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` is the kill switch, kept separate from
 `CRATONVM_JIT_LAMBDA_ADAPTER` so a same-binary A/B can hold the non-capturing
@@ -323,6 +326,130 @@ sense and javac inlines it before desugaring the lambda, so the obvious way to
 write this file produces seventeen NON-capturing lambdas whose comments claim
 otherwise. `javap -p` on the class is the check — every `lambda$main$N` must
 take more parameters than its SAM.
+
+#### The reference-capture gate: inert AND unnecessary
+
+The capturing thunk shipped with one restriction — a REFERENCE capture was
+refused whenever `narrow_oops_block_inline_fields()` held (compressed oops on,
+or ZGC's read barrier armed), by analogy with the inline `getfield` codegen,
+which refuses under exactly that condition.
+
+Two things were wrong with it, pointing in opposite directions.
+
+**It was inert.** Compressed oops is opt-in (`CRATONVM_COMPRESSED_OOPS`) and
+ZGC's barrier never arms in a default run, so the predicate is false throughout
+and reference captures were already being thunked. Nothing about the default
+configuration changed when the gate came out, and no number below should be read
+as saying otherwise.
+
+**It was also unnecessary where it did fire.** That predicate guards the
+emission of a COMPACT slot read — a compact reference field narrows to four
+bytes under compressed oops, and it is the compact and array decode paths that
+ZGC's colouring reaches. This emitter never emits one: the compact-layout
+refusal above guarantees every capture load addresses a legacy 16-byte `Value`
+cell. A legacy cell is neither narrowed (`narrow_oop::ref_field_size` is
+documented as the width of a *compact* instance field) nor barriered — ZGC
+applies `load_barrier_slot` in `get_array_element`, while `get_field`'s legacy
+arm is a bare `std::ptr::read::<Value>`. The refusal diverted a reference
+capture to a Rust arm that reads the identical word in the identical way.
+
+`gc/tests/lambda_proxy_capture_word.rs` makes that a checked claim rather than a
+code reading: it compares the emitter's baked address and width against **each
+collector's own `get_field`**, with compressed oops on and with the ZGC barrier
+armed, having first asserted a proxy is legacy-laid-out on every backend so the
+rest cannot agree about the wrong object. Reading the wide payload at the tag
+word instead turns five of its six tests red.
+
+One binary, four arms, `A B C D D C B A` per round, three rounds, on a busier
+box than the table above — hence the wider spreads; the separation is 15x and
+the noise is 2x:
+
+| row | A: default, thunk | B: default, Rust | C: **oops on**, thunk | D: oops on, Rust |
+|---|---:|---:|---:|---:|
+| `klass` (control) | 7.9 | 8.0 | 8.8 | 9.4 |
+| `lambda` | 8.6 | 8.9 | 8.8 | 8.5 |
+| `cap` (`int` capture) | 9.1 | 154.8 | 9.2 | 156.6 |
+| **`capref` (reference capture)** | **9.9** | 150.8 | **8.7** | 148.0 |
+
+Column C is the configuration the gate used to refuse; a reference capture costs
+the same there as anywhere else. All 96 runs printed `sink=71449096416`.
+
+Engagement, from the pair that states it best — `capref` under compressed oops,
+20 000 000 dispatches:
+
+* thunk ON: **zero** `[LAMBDA-JIT]` census lines. The census prints every N
+  *direct* calls and there were none, so Rust is not on the path at all.
+* thunk OFF: `site_calls=20100000 site_direct=20100000 site_cap_adapters=0` —
+  every one of them through Rust.
+
+That asymmetry is the engagement statement here, and it is the shape
+`lambda_site_prof::SITE_ADAPTERS`'s own comment predicts: a per-call counter
+necessarily goes quiet exactly when the fast path starts working.
+`jit::lambda_adapter`'s
+`a_reference_capture_is_still_served_under_compressed_oops` pins the behaviour
+directly, since nothing in a default run can tell the two versions apart.
+
+#### Does any of this reach a real workload? Mostly not — measured
+
+Every number above is a microbenchmark. `getResources` laziness was 20x on its
+microbench and 0% on the workload it was built for, so the question has to be
+asked rather than assumed.
+
+**First the instrument had to be fixed, and how it failed is the more useful
+half.** `CRATONVM_DBG=lambda-jit` printed every 200 000 *eligible* dispatches or
+100 000 *direct* calls — thresholds sized for a probe doing millions of one
+shape. A census over 24 Tomcat JUnit classes (129 s of real work) printed
+**nothing at all**, and the obvious reading — "no lambda activity" — is one the
+instrument cannot support: 199 999 eligible dispatches with fifty installed
+thunks looks identical. Silence below a threshold no application reaches is not
+evidence. The census now also dumps once at exit
+(`report_lambda_census_at_exit`), which is what made everything below
+measurable.
+
+With that, real Tomcat code does reach the feature:
+
+| class | eligible | fast_returns | site_calls | adapters | **capturing** |
+|---|---:|---:|---:|---:|---:|
+| `TestFilterValve` | 3 498 | 719 | 90 | 6 | **2** |
+| `TestHttpServletDoHead…1024` | 87 086 | 82 111 | 771 | 4 | **1** |
+| `TestHttp11InputBuffer` | 8 308 | 4 622 | 358 | 3 | **1** |
+
+Across the 24-class sample, 7 classes installed thunks, 24 sites in all, and
+roughly a third of those are capturing. So capturing SAM sites are not a
+microbenchmark artefact — ordinary framework code has them, and they do get
+thunks.
+
+**And it does not matter.** Same binary, kill switches, `A B C C B A`, three
+rounds, on the class with the most lambda traffic in the census:
+
+| arm | wall (ms) | range |
+|---|---:|---|
+| A — everything on | 45 655 | [39 386 … 53 373] |
+| B — capture thunk off | 46 646 | [38 767 … 51 551] |
+| C — whole lambda tier-up off | 50 646 | [44 902 … 58 766] |
+
+A against B is 2%, with ranges that overlap almost entirely: **the capturing
+thunk's effect on this workload is below the noise floor**, and the honest
+statement is that this measurement cannot see it. A against C suggests ~10% for
+the feature family as a whole, but those ranges overlap too and six runs on a
+shared box that varies 39–58 s for identical work cannot resolve it — it is a
+hypothesis for a quieter box, not a result.
+
+The arithmetic says why, and would have predicted it: `site_calls` is in the
+hundreds per process, and the thunk saves ~140 ns a call. That is tens of
+microseconds against a 45-second run. The microbenchmark is 2 000 000 calls of
+one shape; a JUnit class is a few hundred, because a short-lived process barely
+compiles its callers — note `fast_returns=82111` against `site_direct=197` on
+the DoHead class, i.e. the *interpreter's* one-shot arm served four hundred
+times more lambda calls than the JIT-side one did.
+
+**So the value of this work is not in Tomcat's test suite.** It is in the shape
+of workload where a SAM call site is genuinely hot and the caller is genuinely
+compiled — a long-lived server loop, a stream pipeline over a large collection —
+which is what the microbenchmark stands in for and what this suite is not. That
+is a claim about applicability and it is still unmeasured; anyone extending this
+page should measure a long-running workload before quoting the 17x as anything
+other than what it is.
 
 #### What the fixture had to learn
 

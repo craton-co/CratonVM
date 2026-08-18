@@ -4352,7 +4352,7 @@ impl Compiler {
                             !narrow_oops_block_inline_fields()
                                 && (inline_getfield_enabled()
                                     || (guarded_inline_getfield_enabled()
-                                        && self.helpers.region_bounds_addr != 0))
+                                        && self.helpers.read_bounds_addr != 0))
                         })
                     {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
@@ -4443,7 +4443,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
@@ -4593,7 +4593,7 @@ impl Compiler {
                             (inline_getfield_enabled()
                                 && !cratonvm_types::compact_ref_fields_enabled())
                                 || (guarded_inline_getfield_enabled()
-                                    && self.helpers.region_bounds_addr != 0)
+                                    && self.helpers.read_bounds_addr != 0)
                         })
                     {
                         // Inline field load — the field index and type tag are
@@ -4642,7 +4642,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
@@ -8528,15 +8528,33 @@ impl Compiler {
                         }
 
                         // --- indexOf(I)I ----------------------------------
+                        // DEAD as of E27-1 (2026-08): `try_resolve_string_intrinsic`
+                        // no longer hands out `JitIntrinsic::StringIndexOfChar`, so
+                        // the guard below can never be true. Kept, not deleted,
+                        // because it is the starting point for N2b — see
+                        // docs/known-issues/jdk-only/
+                        // E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md
+                        //
                         // Scan the receiver for the first code unit equal to
-                        // `(ch & 0xFFFF)`, from index 0. Bit-identical to
-                        // `native_string_index_of`, which likewise masks the
-                        // argument to a single UTF-16 code unit — supplementary
-                        // code points therefore match their masked low half
-                        // (no surrogate special-casing, by design of the
-                        // oracle). The deopt stub is reached only for a null
-                        // receiver or a null backing `value` array. Uses only
-                        // caller-saved registers, so no PUSH/POP is needed.
+                        // `(ch & 0xFFFF)`, from index 0. This comment used to
+                        // call that "bit-identical to `native_string_index_of`,
+                        // which likewise masks the argument". BOTH HALVES WERE
+                        // FALSE, and that is why this is spelled out rather than
+                        // trimmed: E27-1's finding is that dead code reading as a
+                        // working implementation is how four copies of this rule
+                        // survived. The JDK does not narrow `ch` — it gates on
+                        // `Character.isValidCodePoint` FIRST, then matches a
+                        // supplementary `ch` as a surrogate PAIR; and the native
+                        // side stopped masking at E18-1, which put the rule in
+                        // one place (`lang_string.rs`'s `code_point_needle`).
+                        // Restoring this scan means fronting it with a runtime
+                        // range screen (`ch < 0 || ch > 0xFFFF` -> deopt), inside
+                        // which the mask IS the identity and the single-code-unit
+                        // scan IS the whole JDK answer. That is N2b.
+                        //
+                        // The deopt stub is reached only for a null receiver or a
+                        // null backing `value` array. Uses only caller-saved
+                        // registers, so no PUSH/POP is needed.
                         if self.string_layout.is_some()
                             && callee_entry == crate::JitIntrinsic::StringIndexOfChar.as_entry()
                         {

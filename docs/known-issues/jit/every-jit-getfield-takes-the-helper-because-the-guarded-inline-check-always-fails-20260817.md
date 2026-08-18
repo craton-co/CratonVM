@@ -1,16 +1,33 @@
 # Every JIT `getfield` takes the checked helper — TWO independent guard clauses fail, one per collector family
 
 ## Status
-**PARTLY FIXED 2026-08-18, and fully diagnosed.** The Generational defect is
-closed: 68 722 450 helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). On all
-three collectors the inline path is now engaged for **every primitive field
+**FIXED for every collector that can be fixed today; ZGC's residual is blocked
+on a different design and is tracked here.** Two independent defects, one per
+collector family, and both of the actionable ones are closed:
+
+* **Generational** (`legacy-layout-receiver`, defect 2) — closed 2026-08-18 on
+  the reader side: 68 722 450 helper calls -> **0**, 3.07x.
+* **G1** (`outside-published-bounds`, defect 1) — closed 2026-08-18 by the
+  READ-side bounds table item 2 below specifies: **56 930 918 helper calls ->
+  0**. Wall clock improved in 6 of 6 pinned interleaved pairs, 1.33x-2.14x; see
+  item 2 for why that is quoted as a range and why the first version of this
+  line said 2.35x.
+* **ZGC** — still 56.9M, still 100% `outside-published-bounds`, and
+  deliberately so. A compact reference slot there holds
+  `Z_COLORED_TAG | colour | offset`, not a pointer, so inlining its load is the
+  use-after-free `feature-designs/zgc-jit-load-barrier.md` exists to stop. ZGC
+  publishes nothing into the read table for exactly that reason. **This page
+  stays open only as the record of that residual**; the fix is the ZGC JIT load
+  barrier, not anything in the getfield arms.
+
+On all three collectors the inline path is engaged for **every primitive field
 read** — 0 primitive misses, measured two independent ways — and the entire
-remainder is **reference** reads. On ZGC those are blocked on the JIT load
-barrier (a compact reference slot there is a colored word, not a pointer) and
-this page is finished. On **G1** they are blocked by nothing: no colored
-pointers, plain-pointer reference fields, 56.9M pure containment failures. That
-is the one actionable item left, and it narrows item 2 from "the general
-containment fix" to "a G1 fix".
+remainder is **reference** reads.
+
+This title has been wrong twice and is now half-wrong a third time: it says
+"every" and "always", and after 2026-08-18 that is true only on ZGC. Left as
+written because it is the string people search for; the Status block is the
+authority.
 
 This title has now been wrong twice. The original blamed the containment check;
 the first correction concluded it was "NOT because the guarded inline check
@@ -464,6 +481,66 @@ Partial, and named as such.
    at all. ZGC must wait for the load barrier; **G1 could be fixed today**, and
    that makes item 2 a G1 fix rather than the general containment fix it was
    written up as.
+2. **DONE 2026-08-18 — the READ-SIDE bounds table.** Landed as
+   `JIT_READ_BOUNDS` (`gc/src/gen_heap.rs`) + `read_bounds_addr` (helper ABI
+   v6). What follows is the design as written before the change, kept because
+   the reasoning is what made it safe; the two places reality differed from it
+   are marked **[REVISED]**.
+
+   *What it bought — the counter.* SHA256Digest x200 000, two binaries built
+   from `dev`@`1f41cb193` +/- this change:
+
+   | collector | baseline | patched |
+   |---|---:|---:|
+   | Generational | 0 | 0 |
+   | **G1** | **56 930 918**, 100% `outside-published-bounds` | **0** |
+   | ZGC | 56 930 768 | 56 930 752 (unchanged, by design) |
+
+   Reproduced exactly on three separate runs against two different base trees.
+   This is the load-bearing result: it is a COUNT, so host load cannot move it.
+
+   *What it bought — the clock, quoted carefully.* The host was shared and at
+   load ~6/8 throughout, so this is six pinned (`taskset -c 6,7`) base/patched
+   pairs run back-to-back, reported as a sign test and a range rather than a
+   point estimate:
+
+   | collector | pairs favouring patched | ratio range | median |
+   |---|---|---|---|
+   | **G1** (changed) | **6 / 6** | 1.33x - 2.14x | **1.39x** |
+   | Generational (unchanged) | 3 / 6 | 0.95x - 1.19x | 1.01x |
+   | ZGC (unchanged) | 4 / 6 | 0.92x - 1.81x | 1.31x |
+
+   The two control rows are the point. Both emit byte-identical code before and
+   after this change, so their spread IS the noise floor, and ZGC's is nearly as
+   wide as G1's effect — its concurrent threads make it the most contention-
+   sensitive of the three on two pinned cores. Generational, which is neither
+   concurrent nor changed, gives the honest floor at 0.95-1.19x, and G1's
+   1.33-2.14x sits outside it in every pair. A cleaner number needs a quiet
+   host; the counter above does not.
+
+   *The first timing table on this page was wrong, and the reason is worth
+   more than the number was.* It read G1 4111 ms -> 1747 ms (2.35x), measured
+   against a base tree that predated `c88ee725a` — "jit_getfield read an
+   environment flag on every call", a 3.4x cost INSIDE the very helper this
+   change is about avoiding. So the baseline arm was paying a tax that `dev`
+   had already removed, and the change looked roughly twice as good as it is.
+   Nothing about the measurement was sloppy; the base commit was simply four
+   days stale on a file under active repair by someone else. **Re-base the
+   baseline before quoting a speedup, especially when the function under test
+   is somewhere other people are also working.** The counter was immune,
+   because a count of calls does not care what each call costs.
+
+   *The instrument mattered, again.* The first A/B used
+   `CRATONVM_JIT_GETFIELD_HELPER=1` as the "before" — one binary, no rebuild,
+   and the switch this page's own transferable section praises. It reported a
+   1.42x improvement **on ZGC**, a collector this change does not touch. The
+   switch also disables the trusted-oop shortcut, which already worked there.
+   A kill switch answers "is this whole path worth anything", which is the
+   question this page asked in August; it cannot answer "is THIS EDIT worth
+   anything". Two binaries was the only way. The same reading error this page
+   is about — a number that agrees with the hypothesis for an unrelated reason
+   — nearly closed it a second time.
+
 2. **The proper fix for containment under a non-publishing collector is a
    separate READ-SIDE bounds table.** This is a design, not a bug fix, and
    deserves its own page — but the shape is settled enough to write down, so
@@ -484,7 +561,7 @@ Partial, and named as such.
    |---|---|---|
    | Generational | the three arenas, as today | already refreshed at GC start/end |
    | ZGC | `ZgcRealHeap::conservative_addr_span()` → `[arena_base, arena_end)` | "allocated once in `with_capacity` and never grown", read without the arena lock |
-   | G1 | the reserved heap range | needs checking — G1 has N regions and the table has 3 slots, so this is the one that may not fit |
+   | G1 | the reserved heap range | **[REVISED]** it fits, and easily: G1's N regions are carved from ONE contiguous `Box` arena, so `[arena_base, arena_end)` in slot 0 covers every region and slots 1-2 stay zero. Published in `G1Collector::new`, cleared in a `Drop` impl G1 did not previously have |
 
    `region_bounds_are_live` keeps reading the OLD table and keeps gating the
    store paths; only `emit_guarded_getfield_receiver_check` and
@@ -501,6 +578,16 @@ Partial, and named as such.
    from the other side and must be revisited in the same change: it returns a
    constant `true` and says so **only** while no inline reference emission
    happens under an armed barrier.
+
+   **[REVISED]** ZGC ended up publishing NOTHING into the read table, so the
+   per-field-kind gate was never needed. Not publishing is a strictly stronger
+   discharge of the same obligation — it keeps ZGC's PRIMITIVE reads on the
+   helper too — and it costs G1 nothing, because G1's split is 0% primitive.
+   `zgc_codegen_honours_read_barrier` was re-examined rather than assumed and
+   stays `true`, now for two independent reasons (ZGC publishes nothing; and
+   `narrow_oops_block_inline_fields` suppresses the EMISSION outright while a
+   barrier is armed). Both are written down at the function, along with which
+   one survives someone later deciding ZGC should publish after all.
 
    *What it is worth, now that item 1 is measured.* **G1 only, and there it is
    worth all 56.9M.** The split came back 100% reference / 0% primitive, so:
@@ -528,6 +615,82 @@ Partial, and named as such.
    the JIT's inline TLAB allocator; the interpreter/`jit_new_object` TLAB path
    still has none, and that is the path that matters most.
 
+## CORRECTION 2026-08-18: every ZGC number on this page was inflated 3.4x by a diagnostic added to this page
+
+`1794c8e81` ("dump the receiver beside the live bounds table on helper entry")
+gated its `#[cold]`, 8-line-bounded dump on a bare
+
+```rust
+if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+```
+
+**inline in `jit_getfield`** — an uncached, string-keyed flag lookup on the path
+this VM takes tens of millions of times a second. The line directly above it
+caches its flag in a `OnceLock`; this one did not. The dump was never the cost.
+The gate was.
+
+Two sessions found this independently within an hour, by different routes, and
+both are worth keeping: a per-key flag-read census on `BigDecimalBench` counted
+**4 560 891 of 4 600 000 flag reads (99.1%) for this one name**, ~91 per
+benchmark iteration; and the bisect below priced it. The census says how often,
+the bisect says how much.
+
+Bisected on an Azure host with `probes/AccessorDispatchProbe.java`, all arms
+interleaved in the same rounds so a shared host cannot bias one against another,
+`receiverFieldTax` (one reference-field read):
+
+| binary | ns |
+|---|---|
+| `bc01a0066` — before the diagnostics | 13.30 / 13.85 / 13.05 |
+| `9c74737a6` — after the four `diag` commits | 52.75 / 51.97 / 50.20 |
+| `dev` @ `36433bf5d` | 49.12 / 46.61 / 49.23 |
+| **the same, with the gate cached** | **14.11 / 13.46 / 14.49** |
+
+**3.5x, recovered by one line.** Re-verified after merging current `dev`, same
+interleaving: `bc01a0066` 13.02 / 13.48 / 14.09, `dev` 50.57 / 50.08 / 45.80,
+fixed 14.47 / 13.39 / 13.00 — back to baseline.
+
+The neighbouring `GETFIELD_HELPER_CALLS` atomic is a second, much smaller cost:
+an ablation build put it at ~2-3 ns of a then-9 ns read on a quiet host, and
+below the noise floor under load. It is now gated behind the flags that
+actually read it, and `jit_getfield_helper_calls()` returns `Option<u64>` so a
+gated counter cannot be printed as a confident `0` — which would look exactly
+like a fast path that never fell through.
+
+### What this invalidates
+
+Every ZGC/G1 timing on this page was taken between `1794c8e81` and this fix, so
+each carries ~33 ns of flag lookup on the helper path. **Only the paths that
+CALL the helper are affected** — a primitive field inlines and never enters it —
+so the corrections are one-sided and the reference-vs-primitive comparisons here
+overstate the gap:
+
+| | as published | re-measured with the gate cached |
+|---|---:|---:|
+| ZGC, reference field | 25.2 ns | **12.5 – 15.3** |
+| Generational, reference field | 0.95 ns | 2.1 – 3.4 |
+| ZGC, primitive field | 1.51 ns | 1.8 – 1.9 |
+| **ZGC-vs-Generational reference gap** | **26x** | **~5x** |
+
+The direction of every conclusion survives — reference reads under ZGC really do
+take the helper, really are the residual, and Generational really does inline
+them. The *magnitude* does not: it is 5x, not 26x, and the case for the
+read-side bounds table has to be argued at 5x.
+
+Counts are unaffected: `helper_calls` is a count, not a timing, and every
+engagement figure on this page still stands exactly as printed.
+
+### The methodological point, which this page is the right home for
+
+This page's own thesis is that an instrument can be the thing you end up
+measuring. It then measured itself for a day. The tell was available the whole
+time and was read as noise: the "before" number kept coming out at 13 while
+every later arm sat at 25-50, and that was attributed to host load — on a box
+that genuinely was loaded, which is what made the excuse plausible. What settled
+it was interleaving all arms inside one round so load could not favour one, and
+the discipline that catches this in general is: **when a diagnostic lands on a
+hot path, price it in the same run that uses it.**
+
 ## The transferable part
 
 **A fast path that is emitted is not a fast path that runs**, and it took a
@@ -541,6 +704,14 @@ whether the inline *branch* was ever taken, and the answer was no.
 `narrow_oops_block_inline_fields`, `compact_ref_fields_enabled`,
 `guarded_inline_getfield_enabled` and `region_bounds_addr != 0` produced a
 plausible story that was wrong. `CRATONVM_JIT_GETFIELD_HELPER=1` settled it.
+
+**And then the same kill switch was the wrong instrument for the fix.** It
+scopes to "the whole guarded path", which is the right scope for *is this worth
+building* and the wrong one for *did my edit do anything* — it also disables the
+trusted-oop shortcut, so it credited this change with a 1.42x speedup on ZGC,
+which it does not touch at all. An instrument is only as good as the question,
+and the two questions were one clause apart. Two binaries from the same tree
+cost ten minutes and had no such gap.
 
 **A 100% failure rate makes its own count uninformative.** This is the one that
 cost the most. Every collector A/B here returned the same number, and that was

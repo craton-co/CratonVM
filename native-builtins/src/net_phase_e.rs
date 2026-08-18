@@ -22530,6 +22530,24 @@ mod tests {
         );
     }
 
+    /// The `HttpHeaders` carrier that `HttpRequest.headers()` hands back: one
+    /// field, and field 0 is the request's own `"key: value"` array.
+    ///
+    /// `re5_header_groups` reads that carrier, which is why the sibling test
+    /// `header_lines_group_case_insensitively_in_first_seen_order` builds a
+    /// one-field object. A builder cannot be passed to it directly: a request
+    /// keeps its lines at `RE5_REQUEST_HEADERS` (3) and field 0 is
+    /// `RE5_REQUEST_METHOD`, so the scan reads the method name, finds no array,
+    /// and returns no groups at all.
+    fn re5_headers_view(ctx: &mut MockNativeContext, request: ObjectRef) -> ObjectRef {
+        // Allocate before reading the field: the read must not be carried
+        // across an allocation.
+        let view = ctx.alloc_object(ClassId::new(0), 1);
+        let lines = ctx.get_field(request, RE5_REQUEST_HEADERS);
+        ctx.set_field(view, 0, lines);
+        view
+    }
+
     /// The header array was a fixed 32 entries and `header()` stopped writing
     /// when it filled up. MEASURED on HotSpot, a request with 40 headers reports
     /// `map().size() == 40`, so the 33rd was being dropped in silence.
@@ -22541,7 +22559,8 @@ mod tests {
         for i in 0..40 {
             re5_builder_append_header(&mut ctx, holder, &format!("H{i}: v{i}"));
         }
-        let groups = re5_header_groups(&ctx, holder);
+        let view = re5_headers_view(&mut ctx, holder);
+        let groups = re5_header_groups(&ctx, view);
         assert_eq!(
             groups.len(),
             40,
@@ -22562,7 +22581,8 @@ mod tests {
         re5_builder_append_header(&mut ctx, holder, "X-Foo: keep");
         re5_builder_append_header(&mut ctx, holder, "accept: b");
         re5_builder_set_header(&mut ctx, holder, "Accept", "z");
-        let groups = re5_header_groups(&ctx, holder);
+        let view = re5_headers_view(&mut ctx, holder);
+        let groups = re5_header_groups(&ctx, view);
         assert_eq!(
             groups,
             vec![

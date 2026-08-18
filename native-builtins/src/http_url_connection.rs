@@ -5695,7 +5695,16 @@ mod http_url_connection_tests {
         assert!(is_default_hostname_verifier(Some(
             "javax/net/ssl/HostnameVerifier"
         )));
-        assert!(is_default_hostname_verifier(None));
+        // NOT `None`. By the time a name reaches this predicate the caller has
+        // already returned for "no verifier installed at all"
+        // (`let Some(verifier0) = verifier0 else { ... }`), so `None` here means
+        // "a verifier object exists whose class this VM could not name" — a
+        // lambda, which is an APPLICATION verifier and must be consulted.
+        // `an_unnameable_verifier_is_not_a_default_stand_in` is the regression
+        // guard for exactly that, with the HotSpot measurement behind it; this
+        // line used to assert the opposite and the two directly contradicted
+        // each other.
+        //
         // Anything else is a genuine application verifier and must be
         // consulted (as a fallback) rather than skipped.
         assert!(!is_default_hostname_verifier(Some("com/example/PinningHV")));

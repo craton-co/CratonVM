@@ -1546,6 +1546,86 @@ pub fn jit_region_bounds_addr() -> usize {
     &JIT_REGION_BOUNDS as *const _ as usize
 }
 
+/// Process-global **read-side** mirror of whatever address range this heap has
+/// mapped — same six-word `[b0, e0, b1, e1, b2, e2]` layout as
+/// [`JIT_REGION_BOUNDS`], so the emitted containment sequence is byte-identical
+/// and only the baked address differs.
+///
+/// # Why a second table rather than filling the first
+///
+/// [`JIT_REGION_BOUNDS`] is doing two jobs. Its *documented* job is the
+/// READ-side question "is this address mapped, so a raw load cannot fault".
+/// Its load-bearing job since `audits/g1-audit.md` §8.1 (G1-2) is the
+/// STORE-side question "may an inline reference store skip the collector's
+/// write barrier" — and G1/ZGC answer that by leaving the table **empty**, so
+/// that under those collectors no inline reference-store fast path is
+/// reachable and a JNI-pinned, CSet-excluded region cannot lose its
+/// remembered-set edge.
+///
+/// One table, two questions, opposite answers: filling it to make *loads*
+/// inline would silently re-enable those *stores*. Hence the sibling. Only
+/// `emit_guarded_getfield_receiver_check` and `ir_lower`'s copy of it read
+/// this one; `region_bounds_are_live` keeps reading [`JIT_REGION_BOUNDS`] and
+/// keeps gating every store path.
+///
+/// # Who publishes, and who deliberately does not
+///
+/// * **Generational** — its three arenas, alongside the store-side publish.
+/// * **G1** — the single contiguous backing arena, in slot 0. G1's N regions
+///   are carved out of one `Box` (`arena_base + i*region_size`), so one
+///   `[base, end)` pair covers all of them and the three slots are ample. A
+///   reference field under G1 is a plain pointer, so admitting inline
+///   reference loads there is sound.
+/// * **ZGC** — **not published, on purpose.** A compact reference slot under
+///   ZGC holds `Z_COLORED_TAG | colour | offset`, not a pointer; inlining a
+///   reference load there would read the un-barriered colored word that
+///   `heap.rs::read_prim_element` panics on by design. ZGC's residual misses
+///   wait for the JIT load barrier, and this table must not land ahead of it.
+///
+/// All-zero matches nothing, so an unpublished collector degrades to exactly
+/// today's behaviour: every guarded site falls through to the checked helper.
+#[repr(C)]
+pub struct JitReadBoundsTable {
+    pub words: [AtomicUsize; 6],
+}
+
+pub static JIT_READ_BOUNDS: JitReadBoundsTable = JitReadBoundsTable {
+    words: [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ],
+};
+
+/// Address of [`JIT_READ_BOUNDS`] for the JIT helpers table
+/// (`JitRuntimeHelpers::read_bounds_addr`).
+pub fn jit_read_bounds_addr() -> usize {
+    &JIT_READ_BOUNDS as *const _ as usize
+}
+
+/// Publish one `[base, end)` pair into [`JIT_READ_BOUNDS`] slot `slot` (0..3).
+///
+/// Separate from the generational publisher because G1 has no `store_region_
+/// bounds_locked` and no three arenas — it has one span and publishes once.
+pub fn publish_jit_read_bounds(slot: usize, base: usize, end: usize) {
+    if slot >= 3 {
+        return;
+    }
+    JIT_READ_BOUNDS.words[slot * 2].store(base, Ordering::Release);
+    JIT_READ_BOUNDS.words[slot * 2 + 1].store(end, Ordering::Release);
+}
+
+/// Zero the whole read table — the teardown counterpart, so a dropped heap can
+/// never leave bounds that would admit a load into freed arena memory.
+pub fn clear_jit_read_bounds() {
+    for w in JIT_READ_BOUNDS.words.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
 /// How many identity hash codes a thread claims per global `fetch_add`.
 /// See [`GenerationalHeap::next_hash`] for the trade-off this number sets.
 const IDENTITY_HASH_BLOCK: i32 = 64;
@@ -1599,6 +1679,7 @@ impl Drop for GenerationalHeap {
         for w in JIT_REGION_BOUNDS.words.iter() {
             w.store(0, Ordering::Release);
         }
+        clear_jit_read_bounds();
     }
 }
 
@@ -2038,6 +2119,10 @@ impl GenerationalHeap {
             // getfield bakes as an absolute address (see JIT_REGION_BOUNDS).
             JIT_REGION_BOUNDS.words[i * 2].store(base, Ordering::Release);
             JIT_REGION_BOUNDS.words[i * 2 + 1].store(base.wrapping_add(cap), Ordering::Release);
+            // ...and the read-side sibling. Same values on this backend; the
+            // two tables only diverge on G1 (read-only publish) and ZGC
+            // (neither). See `JIT_READ_BOUNDS`.
+            publish_jit_read_bounds(i, base, base.wrapping_add(cap));
         }
     }
 

@@ -395,6 +395,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcphase", on_key: Some("CRATONVM_DBG_GCPHASE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcwrite", on_key: Some("CRATONVM_DBG_GCWRITE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "getfield-receivers", on_key: Some("CRATONVM_DBG_GETFIELD_RECEIVERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "getresources", on_key: Some("CRATONVM_DBG_GETRESOURCES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "getstatic-prof", on_key: Some("CRATONVM_DBG_GETSTATIC_PROF"), off_key: None, off_word: None },
     // Per-snapshot trace of the typed operand stack (x64::stack_kinds): what
@@ -463,6 +464,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-disasm", on_key: Some("CRATONVM_DBG_JIT_DISASM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-dispatch", on_key: Some("CRATONVM_DBG_JIT_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-entry", on_key: Some("CRATONVM_DBG_JIT_ENTRY"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-borrow-sites", on_key: Some("CRATONVM_DBG_JIT_BORROW_SITES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-gen", on_key: Some("CRATONVM_DBG_JIT_GEN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-ldc", on_key: Some("CRATONVM_DBG_JIT_LDC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loop-work", on_key: Some("CRATONVM_DBG_LOOP_WORK"), off_key: None, off_word: None },
@@ -500,6 +502,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "linker", on_key: Some("CRATONVM_DBG_LINKER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loadclass", on_key: Some("CRATONVM_DBG_LOADCLASS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loader-chain", on_key: Some("CRATONVM_DBG_LOADER_CHAIN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "getfield-receivers", on_key: Some("CRATONVM_DBG_GETFIELD_RECEIVERS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-borrow-sites", on_key: Some("CRATONVM_DBG_JIT_BORROW_SITES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loader-trace", on_key: Some("CRATONVM_DBG_LOADER_TRACE"), off_key: None, off_word: None },
     // Restores the pre-fix load-time transform behaviour: offer every class to
     // the `ClassFileTransformer` chain on every constant-pool resolution rather
@@ -580,6 +584,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-match", on_key: Some("CRATONVM_DBG_NPE_MATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "a5-engagement", on_key: Some("CRATONVM_DBG_A5_ENGAGEMENT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "unreg-memo-audit", on_key: Some("CRATONVM_DBG_UNREG_MEMO_AUDIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "redefine-dump", on_key: Some("CRATONVM_DBG_REDEFINE_DUMP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-stack", on_key: Some("CRATONVM_DBG_NPE_STACK"), off_key: None, off_word: None },
@@ -994,6 +999,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None },
     // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
     // the contrast is the reason these two carry a comment at all.
     // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
@@ -1054,6 +1062,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "new-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-hiwater", on_key: Some("CRATONVM_JIT_UNREG_MEMO_HIWATER"), off_key: None, off_word: None },

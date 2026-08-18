@@ -365,6 +365,36 @@ pub fn zgc_read_barrier_blocks_inline_fields() -> bool {
 /// inline reference emission is ever re-enabled under an armed barrier, this
 /// must go back to `false`**, or `zgc_relocation_permitted` silently starts
 /// allowing a relocating cycle to hand JIT code stale pointers.
+///
+/// # Re-examined 2026-08-18, when `JIT_READ_BOUNDS` landed
+///
+/// The read-side bounds table exists precisely to make the guarded inline
+/// `getfield` containment check PASS under a collector that publishes no
+/// region bounds -- which is the condition that had been keeping inline
+/// reference reads unreachable under ZGC. So it is exactly the kind of change
+/// this obligation is about, and it was checked rather than assumed.
+///
+/// Still `true`, by TWO independent mechanisms, either of which alone suffices:
+///
+/// 1. **ZGC does not publish.** `JIT_READ_BOUNDS` is filled by
+///    `GenerationalHeap` and `G1Collector` only; under ZGC its six words stay
+///    zero for the process's life, so the containment check rejects every
+///    receiver and every field read keeps the barriered helper. This was the
+///    deliberate scoping decision: the read table is a G1 fix. Not publishing
+///    is a STRICTLY STRONGER discharge than the per-field-kind gate the
+///    design sketch proposed -- it keeps primitives on the helper too -- and
+///    it costs G1 nothing, whose measured containment-failure split is 100%
+///    reference / 0% primitive.
+/// 2. **Emission is blocked outright while the barrier is armed.** Every
+///    inline compact-field site is gated on
+///    [`narrow_oops_block_inline_fields`], which is
+///    `narrow_oops_enabled() || zgc_read_barrier_blocks_inline_fields()`. An
+///    armed barrier therefore suppresses the emission, not merely the branch.
+///
+/// Mechanism 2 is the one that would survive someone later deciding ZGC should
+/// publish its `conservative_addr_span()` after all. Mechanism 1 is the one
+/// that holds during the window between a cycle disarming the barrier and the
+/// next arming it. The obligation above is unchanged and still binds.
 #[inline]
 pub fn zgc_codegen_honours_read_barrier() -> bool {
     true
@@ -579,8 +609,16 @@ pub fn inline_getfield_enabled() -> bool {
 /// — never dereference a receiver outside the always-mapped GC arenas — at
 /// inline-check cost: null/alignment bit-tests plus the same three-region
 /// `[base, end)` containment check that `is_object_address` uses as its
-/// gate, reading the GC's process-global `JIT_REGION_BOUNDS` table whose
-/// address the helpers table carries in `region_bounds_addr`. Receivers that
+/// gate, reading the GC's process-global `JIT_READ_BOUNDS` table whose
+/// address the helpers table carries in `read_bounds_addr`.
+///
+/// The READ table, not `JIT_REGION_BOUNDS`, since 2026-08-18: that table's
+/// emptiness under G1/ZGC is what keeps inline reference STORES unreachable
+/// (`audits/g1-audit.md` 8.1), so it could never be filled to make inline
+/// READS reachable. `JIT_READ_BOUNDS` answers only the read question -- is
+/// this address mapped -- and G1 fills it with its single contiguous arena
+/// span. ZGC still publishes nothing, which keeps this path unreachable
+/// there, as `zgc_codegen_honours_read_barrier` requires. Receivers that
 /// pass are raw-loaded inline (a mapped-arena read cannot fault); everything
 /// else — null, unaligned garbage, out-of-heap bits, or a backend that does
 /// not publish bounds (G1/ZGC → table all zeros) — branches to the checked
