@@ -167,6 +167,52 @@ JCA change without running the same binary several times.
 The same shape very likely explains `BlockCipherTest`'s residual
 `Threefish-256/EAX` flake (about one run in four).
 
+#### Located: the victim is a CALL RETURN VALUE, and the snapshot predates it
+
+The guard prints more than the two fields quoted above. In full (one of the two
+events in a completed `RegressionTest` run):
+
+```text
+obj="0x200461a5438" site="checkcast" in_published_snapshot=false
+published_roots=332 last_publish_at_collection=0 collections_now=1
+last_publish_pc=9 holder=<not found in frames> in_blocked_region=false frames=8
+top_frame=org/bouncycastle/jcajce/provider/symmetric/util/IvAlgorithmParameters.engineInit pc=15
+```
+
+`javap` on that method — the `(byte[], String)` overload — lines the fields up
+exactly:
+
+```text
+ 9: invokestatic  ASN1Primitive.fromByteArray([B)…   <- last_publish_pc=9
+12: checkcast     ASN1OctetString                     <- site="checkcast"
+15: astore_3                                          <- top_frame pc=15
+```
+
+So the reclaimed object is **the return value of the call at pc=9**. The
+snapshot this thread published was published AT that call, before the callee
+allocated the object it returns; the object then lands on this frame's operand
+stack, and the `checkcast` one instruction later trips over a reclaimed
+address. `collections_now=1` against `last_publish_at_collection=0` says a
+collection completed in between, and `in_blocked_region=false` says this thread
+was RUNNING while it did — so the collector marked this thread from a snapshot
+that could not contain the object.
+
+Two readings are ruled out by the same line:
+
+* **Not the `CompactValue` kind-filter degradation.** `holder=` prints
+  `<not found in frames>`, not the `DEGRADED decoded_as=Long` variant the
+  reporter emits for a local whose reference no longer decodes as one.
+* **Not a missing operand-stack scan.** `scan_frame_roots` calls
+  `frame.stack.scan_object_refs` as well as `scan_local_objects`, so the stack
+  IS covered — when the snapshot is taken. The gap is WHEN, not WHAT.
+
+That makes this a publish-freshness question rather than a scan-coverage one,
+which is a different fix from either thing this page previously guessed. It is
+GC-lane work, not JCA: recorded here because the two bc-java residuals
+(`CipherStreamTest2`, and very likely `Serialisation`, which also only fails
+under a long run and also presents as a null where an object should be) both
+sit on it.
+
 ### CLOSED: `Provider` had three disagreeing views of its own contents
 
 `java.security.Provider` IS a `Properties`, and applications read it as one.

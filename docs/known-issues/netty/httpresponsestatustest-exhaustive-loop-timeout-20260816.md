@@ -506,6 +506,6 @@ java @common.args ProgressRunner \
   prices `Enum.ordinal`/`Object.equals` above.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)
   — same family of finding, with per-component throughput measurements.
-* [`../jit/osr-refused-for-a-loop-inline-in-main-20260810.md`](../jit/osr-refused-for-a-loop-inline-in-main-20260810.md)
+* `fixed-bugs/osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md`
   — the shape this looks like and is not; OSR is entered here
   (`osr_entered` non-zero, `osr_refused_entry=0`, `deopts=0`).

@@ -106,6 +106,10 @@ const ALLOWED: &[(&str, &str)] = &[
     // `is_comment_line` already drops, and a row for it would be dead on
     // arrival under `the_allowlist_has_no_dead_rows`.
     (
+        "CRATONVM_DBG_FLAGREADS",
+        "kind 3: the one flag that CANNOT be served from the snapshot, because          it instruments the snapshot's own reads. `types/src/flags.rs` reads it          with `std::env::var_os` directly and says why on the line above:          `reading through this module would recurse`. Declaring it would make          the flag machinery call itself to decide whether to trace a call to          itself.",
+    ),
+    (
         "CRATONVM_NONEXISTENT_VAR_12345",
         "kind 2: `vm.rs`'s System.getenv coverage needs a name that is \
          guaranteed absent",

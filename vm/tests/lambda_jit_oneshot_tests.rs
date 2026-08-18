@@ -74,7 +74,21 @@ macro_rules! require_class_files {
 /// effect if the call happens to win the race to initialise it — and the VM
 /// reads it from threads this test never created, which is what rules out the
 /// thread-scoped variant.
+///
+/// SERIALISED, because process scope is not free: `override_process` swaps one
+/// process-wide slot and its docs make serialising against other
+/// process-scoped overrides the caller's job — "nesting is supported,
+/// concurrent installs are not". `cargo test` runs the twelve tests in this
+/// binary in parallel by default, so without this lock two of them install
+/// concurrently: the second reads the first's pointer as `previous`, and when
+/// they unwind in the other order the restore puts the FIRST override back and
+/// leaves it installed for the rest of the process. Nothing crashes (the
+/// snapshots are leaked, so the stale pointer stays valid) and the flag is the
+/// same value in every test here, which is exactly why it would never be
+/// noticed — it would just quietly stop reverting.
 fn checksum(method: &str) -> i32 {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     cratonvm_types::flags::with_process_overrides(
         &[("CRATONVM_JIT_LAMBDA_SITE", Some("0"))],
         || {

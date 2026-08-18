@@ -355,12 +355,14 @@ fn string_equals_registered_only_with_a_layout() {
 }
 
 #[test]
-fn string_search_compare_and_index_of_register_with_a_layout() {
-    // compareTo / indexOf(I) / indexOf(String) are inlined — they register
-    // when a StringFieldLayout is present and bail (return None) without one.
+fn string_search_compare_and_index_of_str_register_with_a_layout() {
+    // compareTo / indexOf(String) are inlined — they register when a
+    // StringFieldLayout is present and bail (return None) without one.
+    //
+    // `indexOf(I)` is NOT in this list, and its absence is asserted rather
+    // than merely implied — see `string_index_of_char_is_not_intrinsified`.
     for &(name, desc) in &[
         ("compareTo", "(Ljava/lang/String;)I"),
-        ("indexOf", "(I)I"),
         ("indexOf", "(Ljava/lang/String;)I"),
     ] {
         assert!(
@@ -425,53 +427,6 @@ fn compile_obj_arg(name: &str, descriptor: &str) -> impl Fn(i64, i64) -> i64 {
     move |this: i64, other: i64| unsafe {
         compiled.try_call(&[this, other]).expect("test JIT call")
     }
-}
-
-/// JIT-compile `int f(String this, int ch)` whose body is
-/// `aload_0; iload_1; invokevirtual indexOf; ireturn` — for `indexOf(I)`.
-fn compile_index_of_char() -> impl Fn(i64, i64) -> i64 {
-    let entry =
-        try_resolve_string_intrinsic("java/lang/String", "indexOf", "(I)I", Some(string_layout()))
-            .expect("indexOf(I) must register with a layout")
-            .0;
-    // aload_0 (2a), iload_1 (1b), invokevirtual (b6 00 01), ireturn (ac).
-    let code: Vec<u8> = vec![0x2a, 0x1b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
-    let compiled = compile(
-        &code,
-        code.len(),
-        2,
-        2,
-        false,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        vec![(
-            2,
-            JitDirectCall {
-                entry,
-                needs_context: false,
-                num_params: 1,
-                return_type: b'I',
-                guard_class_id: 0,
-            },
-        )],
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        HashMap::new(),
-        HashMap::new(),
-        &helpers(),
-        HashSet::new(),
-        HashMap::new(),
-        Some(string_layout()),
-    )
-    .expect("indexOf(I) wrapper compilation failed");
-    move |this: i64, ch: i64| unsafe { compiled.try_call(&[this, ch]).expect("test JIT call") }
 }
 
 /// Reference `compareTo` — the `native_string_compare_to` oracle.
@@ -555,50 +510,27 @@ fn string_compare_to_null_argument_deopts() {
 // --- indexOf(I) -----------------------------------------------------------
 
 #[test]
-fn string_index_of_char_differential() {
-    let f = compile_index_of_char();
-    let haystacks = [
-        "",
-        "a",
-        "hello",
-        "banana",
-        "caf\u{e9}",
-        "A\u{4e2d}Z\u{4e2d}",
-    ];
-    // Code-unit needles: present, absent, first/last char, supplementary
-    // (masked to its low half by both the native oracle and the JIT).
-    let needles: [i32; 8] = [
-        'a' as i32,
-        'z' as i32,
-        'o' as i32,
-        '\u{e9}' as i32,
-        '\u{4e2d}' as i32,
-        0,
-        0x1_0000 + ('a' as i32), // supplementary; & 0xFFFF == 'a'
-        '\u{ff}' as i32,
-    ];
-    for h in haystacks {
-        for &ch in &needles {
-            let (s, _ss) = string_of(h);
-            let got = f(s.ptr(), ch as i64) as i32;
-            let needle = (ch & 0xFFFF) as u16;
-            let want = h
-                .encode_utf16()
-                .position(|c| c == needle)
-                .map(|i| i as i32)
-                .unwrap_or(-1);
-            assert_eq!(got, want, "indexOf({h:?}, {ch:#x})");
-        }
-    }
-}
-
-#[test]
-fn string_index_of_char_null_receiver_deopts() {
-    let _guard = deopt_lock();
-    let f = compile_index_of_char();
-    let before = clear_deopt_signals();
-    assert_eq!(f(0, 'a' as i64), i64::MIN, "null receiver must deopt");
-    assert_one_deopt_after(before, "indexOf(I) null receiver");
+fn string_index_of_char_is_not_intrinsified() {
+    // `indexOf(I)` is deliberately NOT intrinsified: the inline body masks the
+    // needle to `ch & 0xFFFF` and the JDK does not. The gate is
+    // `Character.isValidCodePoint`, applied BEFORE any narrowing, and a
+    // supplementary `ch` matches the surrogate PAIR. Measured on OpenJDK
+    // 25.0.3+9: `"abc".indexOf(0x10061)` is -1, and `"\u{FFFF}q".indexOf(-1)`
+    // is -1 even though `(char) -1 == 0xFFFF` and the receiver holds 0xFFFF.
+    // The rule lives once, in `lang_string.rs`'s `code_point_needle`; this
+    // door reaches it through ordinary dispatch rather than owning a copy.
+    //
+    // This assertion is the retirement's only guard. Without it the absence is
+    // just a missing match arm, and the next reader adds it back. See
+    // docs/known-issues/jdk-only/
+    // E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md
+    assert!(
+        try_resolve_string_intrinsic("java/lang/String", "indexOf", "(I)I", Some(string_layout()))
+            .is_none(),
+        "indexOf(I) must NOT be intrinsified — the inline body masks to (ch & 0xFFFF)",
+    );
+    // And not through the layout-free door either.
+    assert!(cratonvm_jit::try_resolve_intrinsic("java/lang/String", "indexOf", "(I)I").is_none());
 }
 
 // --- indexOf(String) ------------------------------------------------------

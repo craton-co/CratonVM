@@ -601,10 +601,16 @@ struct Lowerer<'a> {
     /// when the hardening first landed; the IR tier still paid it, which is why
     /// a forced-C2 bt18 ran 1.85x slower than the C1 body it replaced.
     compact_fields: HashMap<usize, (u32, bool, u8)>,
-    /// Address of the GC's published `JIT_REGION_BOUNDS` table, for the guarded
+    /// Address of the GC's published `JIT_READ_BOUNDS` table, for the guarded
     /// receiver check. Zero ⇒ no inline field read (the guard cannot be
     /// emitted, so the helper stays).
-    region_bounds_addr: usize,
+    ///
+    /// The READ table, not `JIT_REGION_BOUNDS`: this tier emits no inline
+    /// reference STORE, so it asks only "is this address mapped, so a raw load
+    /// cannot fault". The store question -- which G1/ZGC answer by leaving
+    /// `JIT_REGION_BOUNDS` empty (`audits/g1-audit.md` 8.1) -- has no site
+    /// here to ask it.
+    read_bounds_addr: usize,
     /// Emitted shadow push / reload sequence counts.
     ///
     /// Every push must have exactly one reload: a push advances the thread's
@@ -1070,7 +1076,7 @@ impl<'a> Lowerer<'a> {
             thread_fetch_span: None,
             shadow_pushed_any: false,
             compact_fields: compact_fields.clone(),
-            region_bounds_addr: helpers.region_bounds_addr,
+            read_bounds_addr: helpers.read_bounds_addr,
             shadow_pushes: 0,
             shadow_reloads: 0,
             locals_size,
@@ -2371,7 +2377,7 @@ fn reloc_emit_enabled() -> bool {
             return false;
         }
         let raw_mode = crate::x64::inline_getfield_enabled();
-        let guarded = crate::x64::guarded_inline_getfield_enabled() && self.region_bounds_addr != 0;
+        let guarded = crate::x64::guarded_inline_getfield_enabled() && self.read_bounds_addr != 0;
         if !raw_mode && !guarded {
             crate::metrics::note_ir_getfield_decline(4);
             return false;
@@ -2459,8 +2465,8 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
             slow.push(self.emit_jcc_rel32(0x85)); // JNZ
                                                   // 3. containment in one of the three published regions.
-                                                  //    RDX = &JIT_REGION_BOUNDS = [b0, e0, b1, e1, b2, e2].
-            self.emit_mov_reg_imm64(RDX, self.region_bounds_addr as u64);
+                                                  //    RDX = &JIT_READ_BOUNDS = [b0, e0, b1, e1, b2, e2].
+            self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
             self.emit_cmp_rax_mem_rdx(0);
             let below_b0 = self.emit_jcc_rel32(0x82); // JB → try region 1
             self.emit_cmp_rax_mem_rdx(8);
