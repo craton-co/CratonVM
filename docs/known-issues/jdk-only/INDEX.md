@@ -994,3 +994,17 @@ Three of those are worth reading before acting anywhere in this tree:
   `sb.append(e)` loop and `StringBuilder.append(Object)` was still calling the
   lossy reader — whose units-exact twin was built by `G26` and sits directly
   above it, unused. A family fix that stops at the crate boundary is not whole.
+* **`G71-1`** — surrogate sweep 8, and the first sweep whose NEGATIVE result is
+  the bigger half: **38 of 42 rows were already exact**, including every
+  `StringBuilder`/`StringBuffer` `append`/`insert` overload, `Base64`,
+  `URLEncoder`, `Collator`, `MessageDigest`, `java.time` and
+  `chars()`/`codePoints()`. `G70-1` N2 supposed those siblings were suspect;
+  they were not. The four that failed share one shape — **the value never IS a
+  String**, so the units path that already carries a String argument was never
+  on: a boxed `Character` (which rendered `?`, not U+FFFD), `%s` of any
+  non-String object, and `CharBuffer.wrap(CharSequence)`, which lost the units
+  twice in one branch. `Scanner.nextLine()` is the fourth and is **left
+  unfixed and unrowed** — its buffer is host text end to end. Also read §
+  "toolchain" before trusting a build failure here: `-C lto=fat` crashes rustc
+  on this tree AND on unmodified HEAD, so a red build is not evidence about a
+  change.
