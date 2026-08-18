@@ -1042,3 +1042,15 @@ Three of those are worth reading before acting anywhere in this tree:
   buffer. **RETRACTED: the fat-LTO build was never broken.** Four commits say a
   release binary could not be produced on this host; that was `G72-1`'s own
   leaked `cratonvm.exe`, and `-C lto=fat` builds clean once it is gone.
+* **`G75-1`** — `URI`/`URL` components and unpaired surrogates, measured on a
+  26-row probe and split into two defects that looked like one. **N2 is FIXED**:
+  `URL.toString()`/`toExternalForm()` rebuilt the external form as host text,
+  while `getPath()`/`getFile()` were exact — under `--jdk-only` the real JDK
+  constructor fills the components and only the reconstruction is ours. **N1 is
+  measured, costed and deliberately NOT started**: the URI parse loses the unit
+  three steps upstream of `url_parse`, in ten callers that read their arguments
+  with `read_string`, and a half-converted parse mis-slices EVERY URI rather
+  than only the ones with surrogates. Read §3 before reaching for the
+  positional-substitution trick — it works and it is a trick. Read the N2 entry
+  before editing any `URL`/`URI` native: I fixed the wrong twin first, and the
+  registry dump would have said so in one command.

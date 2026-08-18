@@ -1,7 +1,8 @@
 # G75-1 — URI components, measured properly and costed
 
-**Status:** MEASURED, **NOT FIXED**, and deliberately not started — §3 says why
-and what it would take. **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS;
+**Status:** MEASURED. **N2 FIXED** (`URL.toString`/`toExternalForm`); **N1 NOT
+started** — §3 says why and what it would take. 13 rows diverged, 2 are fixed,
+11 remain and all 11 are N1. **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS;
 CratonVM `C:/craton/target-rel13` (fat-LTO release), `--jdk-only`. Probe:
 `regression-suite/probes/Sweep12UriComponents.java`, 26 rows, every row printed
 as UTF-16 unit values.
@@ -40,7 +41,12 @@ ordinary text, and a WELL-FORMED surrogate pair   EXACT
 ```
 
 `URL.getPath()` being right while `URL.toString()` is wrong is the row that
-locates the defect: the component storage is not the problem, the parse is.
+locates the defect — and it turned out to locate a DIFFERENT one than I first
+wrote here. My original sentence read "the component storage is not the
+problem, the parse is". Wrong for URL: the components are filled by real JDK
+bytecode and are exact, and what was ours was the external-form
+RECONSTRUCTION. See N2. The row was the right clue and I drew the wrong
+conclusion from it until I followed it.
 
 ## 1. Where the unit is actually lost
 
