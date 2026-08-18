@@ -1789,6 +1789,15 @@ mod tests {
         // `max_fd_leak_count`**, so every subset of two or more samples already
         // shows the leak. The subject of this test is the leak ANALYSIS, not the
         // sampling cadence, so nothing it exists to check is weakened by that.
+        //
+        // To reproduce the starved case deliberately — no host load needed, and
+        // this is how the fix was proven rather than argued — set this arm's
+        // `sample_interval` LONGER than its `duration` (e.g. 1000 ms against
+        // 30 ms). The gate then fires never, so the run collects exactly the two
+        // samples it is guaranteed: the initial one and the final one. With
+        // `FD_STEP` back at 1 that fails, and says why —
+        //     samples collected=2 fd first=Some(20) last=Some(21) (threshold 5)
+        // — and with `FD_STEP` at 6 the same forced worst case passes.
         const FD_STEP: u32 = 6;
         const MAX_FD_LEAK: u32 = 5;
         assert!(
