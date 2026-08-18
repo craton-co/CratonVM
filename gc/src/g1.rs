@@ -570,7 +570,17 @@ impl<'a> SharedEvac<'a> {
             if tlab.dest_type == RegionType::Survivor {
                 region.age = 1;
             }
-            // Freshly-Free regions are zero-filled (reset) with cursor 0.
+            // G1AUD-10: a freshly-Free region is NO LONGER zero-filled — `reset`
+            // stopped scrubbing (see its note; it was 42% of a young pause and
+            // redundant with the allocator). This path does not need it and
+            // never did: every byte below the cursor this TLAB finally writes
+            // back is a whole object placed by `evacuate`'s
+            // `copy_nonoverlapping`, and the align-to-8 below is always a no-op
+            // because every object size is a multiple of 8 — so the TLAB leaves
+            // no gap for a walker to interpret. Objects are copied in, not
+            // default-initialised, which is what separates this from
+            // `bump_alloc` (whose zeroing IS load-bearing, for Java's
+            // default-zero fields).
             tlab.region_idx = Some(idx);
             tlab.base = region.data.addr();
             tlab.len = region.data.len();
@@ -1384,42 +1394,59 @@ impl G1Region {
         // reallocated (only `fill(0)`'d) so the bitmap's base address
         // remains valid.
         self.mark_bitmap.clear();
-        // Zero the backing storage — but only the bytes that can actually be
-        // dirty.
+        // G1AUD-10 — DO NOT scrub the freed bytes. The allocator already does
+        // it, and this was the single most expensive phase of a young pause.
         //
-        // G1AUD-9 (redundant scrub). Every byte handed out of a region is
-        // already zeroed by `bump_alloc` (the single establishment of the TLAB
-        // zeroing contract), and `alloc_humongous_locked` re-zeroes a whole
-        // span before handing it out. So the only thing this fill establishes
-        // is the *residual* invariant "a Free region is entirely zero", and the
-        // only bytes that can violate it are the ones some allocation actually
-        // committed. Those are exactly `[0, cursor)`:
+        // MEASURED, and that is how it was found. The per-phase `[GC-STAT]`
+        // breakdown (`G1PausePhases`) on `probes/G1ChurnPauseProbe 96 900` at
+        // `-Xmx2048m` put a 330 ms young pause at: roots 0.7%, remembered-set
+        // walks 0.03%, Cheney closure 38%, whole-heap fix-up 10-18%, and
+        // **freeing the collection set 42%** — the largest phase in the pause,
+        // larger than the closure that does all the copying. `bytes_freed` was
+        // 1.61 GB against a 135 ms free phase: 11.9 GB/s, which is memset
+        // bandwidth and nothing else.
         //
-        //   * after a `reset` the whole slice is zero;
-        //   * `bump_alloc` zeroes `[offset_in_region, cursor)` on every carve,
-        //     and the alignment padding it steps over was already zero;
-        //   * nothing else writes into a region.
+        // WHY IT IS REDUNDANT. Every byte a region ever hands out is zeroed by
+        // the ALLOCATOR at the moment it is handed out:
         //
-        // so `[cursor, len)` is zero already and re-zeroing it is pure memset
-        // of memory that is provably clean. It is not a small quantity: a
-        // 1 MiB region recycled by every young pause was memset in full here
-        // *and* again, byte for byte, by the `bump_alloc`s that refilled it —
-        // the whole young generation zeroed twice per cycle. (The same shape
-        // ZGC's sweep scrub had.)
+        //   * `G1Region::bump_alloc` zeroes exactly the range it returns — the
+        //     single establishment of the TLAB zeroing contract, which is what
+        //     gives a fresh Java object its default-zero fields and a TLAB
+        //     carve its zeroed body (the inline JIT `new` depends on this);
+        //   * `alloc_humongous_locked` zeroes the whole span it reserves,
+        //     precisely because a continuation slice may still hold stale
+        //     collected data.
         //
-        // Two region kinds do not follow the `[0, cursor)` rule and are handled
-        // explicitly:
+        // and no byte is left between objects for a walker to trip over,
+        // because every object size is a multiple of 8: a compact body is
+        // rounded (`classloading/src/class.rs`, "Rounding the tail keeps the
+        // next header aligned"), a legacy body is `num_slots * SLOT_SIZE` with
+        // `SLOT_SIZE` 8 or 16, and array data is rounded by
+        // `array_data_size_checked`. So `bump_alloc`'s align-to-8 is always a
+        // no-op, there is no inter-object padding, and every byte below a live
+        // region's `cursor` belongs to exactly one object that was fully
+        // written. Nothing reads a `Free` region at all — every walker skips
+        // `RegionType::Free`, and `is_addr_in_live_region` /
+        // `classify_candidate_header` reject it outright.
         //
-        //   * `HumongousStart` carries `cursor = <whole object size>`, which
-        //     runs past its own slice — clamped to `len` below;
-        //   * `HumongousContinuation` carries `cursor = 0` while its bytes hold
-        //     the start object's payload, so it must be zeroed in full.
-        let dirty = if was_humongous_continuation {
-            self.data.len()
-        } else {
-            prev_cursor.min(self.data.len())
-        };
-        self.data[..dirty].fill(0);
+        // WHAT IS LOST. Only a debugging property: a use-after-free read of a
+        // reclaimed region now sees stale object bytes instead of zeros. That
+        // is what `CRATONVM_G1_SCRUB_FREE=1` restores — and restoring it is the
+        // FIRST thing to try if a G1 heap-corruption investigation wants the
+        // old world back, because it also makes this the single-binary A/B for
+        // the change. (HotSpot does not eagerly zero reclaimed regions either.)
+        if gc_flags().g1_scrub_free {
+            // `HumongousContinuation` carries `cursor = 0` while its bytes hold
+            // the START object's payload, so bounding by its own cursor would
+            // scrub nothing; `HumongousStart` carries the whole object size,
+            // which runs past its own slice, so it is clamped.
+            let dirty = if was_humongous_continuation {
+                self.data.len()
+            } else {
+                prev_cursor.min(self.data.len())
+            };
+            self.data[..dirty].fill(0);
+        }
     }
 
     /// Bump-allocate `size` bytes (with alignment) in this region.
@@ -1575,6 +1602,44 @@ pub struct G1PauseRecord {
     pub bytes_copied: usize,
     /// Bytes reclaimed.
     pub bytes_freed: usize,
+    /// Where the pause went. See [`G1PausePhases`].
+    pub phases: G1PausePhases,
+}
+
+/// G1AUD-10 — per-phase breakdown of one evacuation pause, in microseconds.
+///
+/// `pause_us` alone cannot answer the question every G1 pause investigation
+/// starts with: WHICH phase is long. The collector's phases have very
+/// different scaling — the root scan is O(roots), the Cheney closure is
+/// O(young live), and the reference fix-up is O(WHOLE HEAP) — so a single
+/// total cannot even distinguish "the young set grew" from "the old
+/// generation grew", which call for opposite responses.
+///
+/// This is not a debug-flag feature. It is filled unconditionally (four
+/// `Instant::elapsed` calls on a path that already takes one) and rendered on
+/// every `--verbose:gc` `[GC-STAT]` line, because the phase whose cost is
+/// unmeasured is the phase that stays unfixed: the whole-heap fix-up walk had
+/// been described in the audit as a structural limit for months with no number
+/// attached to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct G1PausePhases {
+    /// Phase 1 + 1b — root evacuation and marking keep-alive.
+    pub roots_us: u64,
+    /// Phase 2 — remembered-set source region walks.
+    pub rset_us: u64,
+    /// Phase 3 (+3.5) — the Cheney closure over evacuated objects.
+    pub closure_us: u64,
+    /// Phase 4 — the whole-heap reference fix-up, remembered-set rebuild and
+    /// humongous census. The one phase that scales with the LIVE HEAP rather
+    /// than with the collection set.
+    pub fixup_us: u64,
+    /// Phase 5 + eager humongous reclaim — freeing the collection set.
+    pub free_us: u64,
+    /// Non-CSet regions the fix-up walked, and bytes it walked over them.
+    /// The denominator for `fixup_us`: without it a long fix-up cannot be
+    /// told from a large old generation.
+    pub fixup_regions: u32,
+    pub fixup_bytes: u64,
 }
 
 /// Percentile reduction of the recorded pauses, split by collection type
@@ -3318,6 +3383,11 @@ impl G1Collector {
         // Phase 1: Scan roots and evacuate reachable objects from CSet
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
         let mut work_list: Vec<*mut u8> = Vec::new();
+        // G1AUD-10 — per-phase breakdown. Five `Instant`s on a path that
+        // already takes one; see `G1PausePhases` for why this is not
+        // debug-gated.
+        let mut phases = G1PausePhases::default();
+        let mut phase_mark = std::time::Instant::now();
 
         // Process root references
         for root in roots.iter_mut() {
@@ -3378,6 +3448,9 @@ impl G1Collector {
                 self.push_gray_or_mark(&regions, new_ptr as usize);
             }
         }
+
+        phases.roots_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
 
         // Phase 2: Scan remembered sets for references into CSet
         // (Collect rset sources before mutating regions)
@@ -3462,6 +3535,9 @@ impl G1Collector {
             );
         }
 
+        phases.rset_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
+
         // Phase 3: Cheney-style scan of evacuated objects
         let mut scan_idx = 0;
         while scan_idx < work_list.len() {
@@ -3494,8 +3570,15 @@ impl G1Collector {
             &mut work_list,
         );
 
+        phases.closure_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
+
         // Phase 4: Update forwarding pointers in non-CSet regions
         let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
+        phases.fixup_regions = census.walked_regions;
+        phases.fixup_bytes = census.walked_bytes;
+        phase_mark = std::time::Instant::now();
 
         // Phase 5: Free evacuated regions
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
@@ -3518,6 +3601,7 @@ impl G1Collector {
         // any slot still pointing into a freed CSet region with no
         // forwarding entry (incomplete remembered set => UAF). No-op on
         // the release/quiet path; aborts in debug.
+        phases.free_us = phase_mark.elapsed().as_micros() as u64;
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         // Env-gated diagnostics (no-ops unless CRATONVM_G1_DBG_HEADERS /
         // CRATONVM_G1_DBG_ZERO are set) — same coverage the parallel path has,
@@ -3601,7 +3685,12 @@ impl G1Collector {
             bytes_copied,
             bytes_freed,
         };
-        self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
+        self.record_collection_with_phases(
+            G1CollectionType::YoungOnly,
+            pause_us,
+            &stats,
+            phases,
+        );
         crate::gc_metrics::record_g1_cycle(
             crate::gc_metrics::g1_cycle_kind::YOUNG,
             cset.len() as u32,
@@ -5914,6 +6003,9 @@ impl G1Collector {
             let base = regions[i].data.as_mut_ptr();
             let mut offset = 0usize;
             let mut trail = WalkTrail::default();
+            // G1AUD-10: the fix-up's own denominator.
+            census.walked_regions = census.walked_regions.saturating_add(1);
+            census.walked_bytes = census.walked_bytes.saturating_add(cursor as u64);
             // New holder — the memo above is keyed on target alone.
             seen_targets.clear();
 
@@ -8812,6 +8904,25 @@ impl G1Collector {
     /// so the pause sink and the `[GC ...]` log stay in lock-step. `pause_us`
     /// is `Instant::elapsed().as_micros()` — see `G1PauseRecord`.
     fn record_collection(&self, collection_type: G1CollectionType, pause_us: u64, stats: &GcStats) {
+        self.record_collection_with_phases(
+            collection_type,
+            pause_us,
+            stats,
+            G1PausePhases::default(),
+        )
+    }
+
+    /// [`Self::record_collection`] plus the per-phase breakdown (G1AUD-10).
+    /// The evacuation paths call this; everything else keeps the plain form,
+    /// which records an all-zero breakdown meaning "not instrumented" rather
+    /// than "took no time".
+    fn record_collection_with_phases(
+        &self,
+        collection_type: G1CollectionType,
+        pause_us: u64,
+        stats: &GcStats,
+        phases: G1PausePhases,
+    ) {
         // Relaxed ordering: these are statistics counters for monitoring /
         // logging only. They guard no data and a slightly stale read is
         // harmless.
@@ -8830,6 +8941,7 @@ impl G1Collector {
                 objects_copied: stats.objects_copied,
                 bytes_copied: stats.bytes_copied,
                 bytes_freed: stats.bytes_freed,
+                phases,
             });
         }
 
@@ -8837,10 +8949,16 @@ impl G1Collector {
         // cost against `max_gc_pause_ms`.
         self.update_young_target(collection_type, pause_us, stats);
 
-        self.log_gc_event(collection_type, pause_us, stats);
+        self.log_gc_event(collection_type, pause_us, stats, &phases);
     }
 
-    fn log_gc_event(&self, collection_type: G1CollectionType, pause_us: u64, stats: &GcStats) {
+    fn log_gc_event(
+        &self,
+        collection_type: G1CollectionType,
+        pause_us: u64,
+        stats: &GcStats,
+        phases: &G1PausePhases,
+    ) {
         if !self.gc_log_enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -8858,8 +8976,28 @@ impl G1Collector {
             stats.bytes_copied,
             stats.bytes_freed,
         );
+        // G1AUD-10: the phase breakdown rides on the same line. `fixup` is
+        // the one that scales with the LIVE HEAP rather than the collection
+        // set, so its share is printed beside its own denominator (regions and
+        // bytes walked) — a long fix-up on a big old generation and a long
+        // fix-up on a small one are different problems.
+        let phase_note = if *phases == G1PausePhases::default() {
+            String::new()
+        } else {
+            format!(
+                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  fixup_regions={} fixup_bytes={}",
+                phases.roots_us,
+                phases.rset_us,
+                phases.closure_us,
+                phases.fixup_us,
+                phases.free_us,
+                phases.fixup_regions,
+                phases.fixup_bytes,
+            )
+            .replace("                 ", "")
+        };
         eprintln!(
-            "[GC-STAT] type={:?} pause_us={pause_us} objects_copied={} bytes_copied={} bytes_freed={}{}",
+            "[GC-STAT] type={:?} pause_us={pause_us} objects_copied={} bytes_copied={} bytes_freed={}{phase_note}{}",
             collection_type,
             stats.objects_copied,
             stats.bytes_copied,
@@ -12146,6 +12284,11 @@ struct HumongousCensus {
     referenced: std::collections::HashSet<usize>,
     /// Every region the walk was supposed to cover ran to its natural end.
     complete: bool,
+    /// G1AUD-10 — how much heap the fix-up walk actually covered: non-CSet
+    /// regions visited and bytes stepped over. `fixup_us` without this cannot
+    /// distinguish a slow walk from a big old generation.
+    walked_regions: u32,
+    walked_bytes: u64,
 }
 
 /// The `HumongousStart` index of the span containing `idx`, if any.
@@ -15439,7 +15582,10 @@ mod tests {
     /// to the cursor and the reset must remove every one of them. Bound the
     /// fill by anything shorter than `cursor` and the tail survives.
     #[test]
-    fn reset_zeroes_every_byte_below_the_cursor() {
+    fn the_opt_in_scrub_zeroes_every_byte_below_the_cursor() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_G1_SCRUB_FREE", Some("1"))],
+            || {
         let mut region = G1Region::new(64 * 1024);
         let len = region.data.len();
         region.region_type = RegionType::Eden;
@@ -15452,9 +15598,11 @@ mod tests {
         assert_eq!(region.cursor, 0);
         assert!(
             region.data.iter().all(|&b| b == 0),
-            "a Free region must be entirely zero after reset"
+            "under CRATONVM_G1_SCRUB_FREE a Free region must be entirely zero"
         );
         assert_eq!(len, region.data.len(), "reset must not resize the region");
+            },
+        );
     }
 
     /// The continuation half of the same contract. A `HumongousContinuation`
@@ -15462,18 +15610,90 @@ mod tests {
     /// a fill bounded by its own cursor alone would zero NOTHING and leave a
     /// whole region of stale payload in the Free pool.
     #[test]
-    fn reset_zeroes_a_humongous_continuations_whole_slice_despite_its_zero_cursor() {
+    fn the_opt_in_scrub_covers_a_humongous_continuations_whole_slice() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_G1_SCRUB_FREE", Some("1"))],
+            || {
+                let mut region = G1Region::new(64 * 1024);
+                region.region_type = RegionType::HumongousContinuation;
+                region.data.fill(0xBB);
+                region.cursor = 0; // as `alloc_humongous_locked` leaves it
+
+                region.reset(7);
+
+                assert!(
+                    region.data.iter().all(|&b| b == 0),
+                    "a humongous continuation's payload is dirty above its (zero) \
+                     cursor, so bounding the scrub by its own cursor would clear \
+                     nothing"
+                );
+            },
+        );
+    }
+
+    /// G1AUD-10 — the DEFAULT is not to scrub, because the allocator already
+    /// did it. This is the measurement's payload: the scrub was 42% of a young
+    /// pause and every byte it wrote was written again by `bump_alloc`.
+    #[test]
+    fn reset_leaves_the_freed_bytes_alone_by_default() {
         let mut region = G1Region::new(64 * 1024);
-        region.region_type = RegionType::HumongousContinuation;
-        region.data.fill(0xBB);
-        region.cursor = 0; // as `alloc_humongous_locked` leaves it
+        region.region_type = RegionType::Eden;
+        region.data[..4096].fill(0xAA);
+        region.cursor = 4096;
 
         region.reset(7);
 
+        assert_eq!(region.region_type, RegionType::Free);
+        assert_eq!(region.cursor, 0, "the region is empty regardless");
         assert!(
-            region.data.iter().all(|&b| b == 0),
-            "a humongous continuation's payload is dirty above its (zero) cursor \
-             and must still be scrubbed"
+            region.data[..4096].iter().any(|&b| b == 0xAA),
+            "freeing a region must NOT memset it — that is the allocator's job \
+             and it does it on every carve"
+        );
+    }
+
+    /// …and this is the property that makes the above safe: whatever stale
+    /// bytes a reclaimed region still holds, the ALLOCATOR hands out zeroes.
+    ///
+    /// Java requires default-zero fields, and the inline JIT `new` writes only
+    /// the header and relies on the TLAB body already being zero — so if this
+    /// ever stopped holding, every freshly allocated object would come back
+    /// carrying a dead object's payload. Verified against genuinely dirty
+    /// memory: the region is filled with 0xAA, reclaimed WITHOUT a scrub, then
+    /// re-typed and allocated from.
+    #[test]
+    fn an_allocation_out_of_an_unscrubbed_recycled_region_is_still_zeroed() {
+        let mut region = G1Region::new(64 * 1024);
+        region.region_type = RegionType::Eden;
+        region.data.fill(0xAA);
+        region.cursor = 32 * 1024;
+
+        region.reset(7);
+        assert!(
+            region.data.iter().any(|&b| b == 0xAA),
+            "precondition: the reclaimed region is genuinely dirty"
+        );
+
+        // Re-typed and allocated from, exactly as `alloc_in_region` /
+        // `refill_tlab` / `alloc_in_type_locked` do.
+        region.region_type = RegionType::Eden;
+        let (ptr, off) = region
+            .bump_alloc(512, 8, "test:carve")
+            .expect("the empty region must serve the carve");
+        assert_eq!(off, 0, "a reset region allocates from offset 0");
+        let carve = unsafe { std::slice::from_raw_parts(ptr, 512) };
+        assert!(
+            carve.iter().all(|&b| b == 0),
+            "the allocator must hand out zeroed memory even when the region it \
+             came from was never scrubbed — this is the contract the removed \
+             scrub was duplicating, and Java default-zero fields depend on it"
+        );
+        // And the bytes it did NOT hand out are still dirty, which is the whole
+        // point: only what is allocated is paid for.
+        let untouched = unsafe { std::slice::from_raw_parts(ptr.add(512), 512) };
+        assert!(
+            untouched.iter().any(|&b| b == 0xAA),
+            "bytes beyond the carve must not have been zeroed"
         );
     }
 

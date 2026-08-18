@@ -404,6 +404,54 @@ fn resolve_relative(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
+/// The one kind of line that may spell the internal prefix in full, and why.
+///
+/// A **filesystem path that code uses to LOCATE a file at run time** is not a
+/// citation. This guard is a text scan and cannot tell the two apart, and the
+/// difference matters in exactly the wrong direction: dropping the prefix from
+/// a citation repairs a dead link, while dropping it from a probe path breaks
+/// the lookup — today, in the tree where `docs/internal/` still exists.
+///
+/// Each row is `(file, the exact trimmed line, why)`. The match is on the LINE,
+/// not the file, so a new `docs/internal/` line in the same file is still
+/// caught. [`the_not_a_citation_rows_are_all_live`] stops the row from becoming
+/// a standing permission by requiring the line to still be there.
+///
+/// Nothing else belongs here. A citation that is merely awkward to reword is
+/// still a citation.
+const NOT_A_CITATION: &[(&str, &str, &str)] = &[(
+    "vm/tests/jck_conformance.rs",
+    "format!(\"{manifest_dir}/../docs/internal/gaps/jdk-regression-baseline.md\"),",
+    "`baseline_document()`'s FIRST candidate path, probed with `read_to_string` \
+     and falling back to the repo-root `gaps/` copy. It is what keeps the gate \
+     working while `docs/internal/` is removed from history, so the literal is \
+     a path being tolerated, not a link being offered.",
+)];
+
+/// A `NOT_A_CITATION` row whose line is gone is permission nobody needs — the
+/// same defect the resolve-bypass allowlist's dead-row test names.
+#[test]
+fn the_not_a_citation_rows_are_all_live() {
+    let root = workspace_root();
+    let mut stale = Vec::new();
+    for (file, line, reason) in NOT_A_CITATION {
+        let present = std::fs::read_to_string(root.join(file))
+            .map(|t| t.lines().any(|l| l.trim() == *line))
+            .unwrap_or(false);
+        if !present {
+            stale.push(format!("{file}: the exempted line is gone ({reason})"));
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "{} exemption(s) no longer describe the tree. Delete them — an \
+         exemption for a line nobody wrote is permission for the next one to \
+         appear:\n  {}",
+        stale.len(),
+        stale.join("\n  ")
+    );
+}
+
 #[test]
 fn no_source_file_links_into_docs_internal() {
     let root = workspace_root();
@@ -443,9 +491,17 @@ fn no_source_file_links_into_docs_internal() {
             .to_string_lossy()
             .replace('\\', "/");
         for (n, line) in text.lines().enumerate() {
-            if line.contains("docs/internal/") {
-                offenders.push(format!("{rel}:{}\n    {}", n + 1, line.trim()));
+            if !line.contains("docs/internal/") {
+                continue;
             }
+            // A run-time filesystem probe is not a citation; see NOT_A_CITATION.
+            if NOT_A_CITATION
+                .iter()
+                .any(|(f, l, _)| *f == rel && *l == line.trim())
+            {
+                continue;
+            }
+            offenders.push(format!("{rel}:{}\n    {}", n + 1, line.trim()));
         }
     }
 

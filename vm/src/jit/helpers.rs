@@ -357,6 +357,14 @@ pub mod mic_prof {
         // unexplained. No-op unless `CRATONVM_DBG=callee-probe` is also set.
         crate::runtime::interpreter::jit_bridge::dump_callee_probe_tally();
         super::disp_census::report();
+        // The guarded inline `getfield`'s miss count, printed next to the
+        // dispatch census because it answers the same class of question about a
+        // different fast path: not "was it emitted" but "did it ever run".
+        // `probes/AccessorDispatchProbe.java` supplies an exact denominator.
+        eprintln!(
+            "[GETFIELD_CENSUS] helper_calls={}",
+            super::GETFIELD_HELPER_CALLS.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -6205,6 +6213,12 @@ unsafe fn jit_field_cell_ptr(
     ((obj_ptr as *mut u8).add(HEADER_SIZE + off), storage)
 }
 
+/// How many compiled `getfield` reads fell through the inline guard into
+/// [`jit_getfield`]. See the counter's own comment there, and
+/// `dispatch_counters`' neighbours for the house style.
+pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // obj_ptr may be 0 (null), a valid heap pointer, or stale/corrupt raw bits from
 // a miscompiled JIT frame; this helper validates it against the live heap before
@@ -6213,6 +6227,28 @@ unsafe fn jit_field_cell_ptr(
 // variants (ObjectRef).
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
+    // ENGAGEMENT COUNTER for the guarded inline `getfield` fast path.
+    //
+    // Reaching this function AT ALL means the inline guard
+    // (`emit_guarded_getfield_receiver_check`, and the compact-layout tag test
+    // that follows it) fell through: every compiled `getfield` either takes its
+    // inline branch or lands here, so this count IS the fast path's miss count.
+    //
+    // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md
+    // asks for exactly this as its step 1 — "a fix priced on anything but that
+    // counter is a guess" — because three separate signals (the gates are
+    // default-on, 35 sites were emitted, the codegen arm has unit tests) all
+    // report EMISSION, and none of them asks whether the inline branch ever
+    // runs. `probes/AccessorDispatchProbe.java` makes the denominator exact: an
+    // arm does `rounds * per` field reads and nothing else, so
+    // `getfield_helper_calls / (rounds * per)` is the miss RATE rather than a
+    // number needing interpretation.
+    //
+    // Relaxed, and unconditional so it cannot be on in one build and off in the
+    // measured one. It costs one uncontended increment on a path that already
+    // pays `note_jit_boundary`, `is_object_address` and a layout lookup — the
+    // measured `receiverFieldTax` is 8.2 ns, and this is not visible in it.
+    GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
