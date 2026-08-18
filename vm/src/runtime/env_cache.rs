@@ -455,6 +455,110 @@ pub fn osr_exception_table_allowed() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_INLINE_CALLS` — allow a call INSIDE a spliced (inlined) body.
+/// **Default: OFF.**
+///
+/// Until this existed, `resolve_inline_site_from` rejected any callee
+/// containing an `invoke*`, so inlining reached only call-free leaves. That is
+/// what made a JUnit assertion chain un-collapsible: every rung of
+/// `assertEquals(int,int)` -> `assertEquals(Object,Object)` -> `objectsAreEqual`
+/// is small enough to splice, but each one CALLS the next, so none of them was
+/// ever eligible and every rung paid a full dispatch round trip.
+///
+/// With the gate on, such a call is emitted as the ordinary
+/// `jit_invoke_dispatch` sequence — the same helper, the same post-invoke
+/// exception check, the same oop map — resolved against the CALLEE's constant
+/// pool (`InlineSite::invoke_targets`). It is not a cheaper call; the win is
+/// that the ENCLOSING body becomes inlineable at all.
+///
+/// Default-OFF because the inline emitter's failure mode is a silent wrong
+/// answer, and because the gate is what makes a bisect possible: one binary,
+/// two arms. Read once and cached.
+#[inline]
+pub fn jit_inline_calls() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_CALLS"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_INLINE_CALL_DISPATCH` — let a call inside a spliced body fall
+/// back to the blind `jit_invoke_dispatch` helper. **Default: OFF, and the
+/// default is a MEASURED one.**
+///
+/// The first cut of [`jit_inline_calls`] emitted every admitted call that way.
+/// Measured on `probes/AssertChainProbe`, Azure Linux, release, one binary,
+/// three interleaved rounds:
+///
+/// | arm | `assertFull` ns/iter |
+/// |---|---:|
+/// | base | 47.2 / 45.3 / 47.9 |
+/// | + main inline | 50.3 / 79.8 / 58.9 |
+/// | + inline calls (dispatch fallback) | **163.3 / 266.6 / 172.2** |
+/// | + nesting | 47.3 / 59.6 / 80.2 |
+///
+/// and the counter that names the mechanism, `CRATONVM_DBG=mic-prof` over
+/// 2 000 000 iterations: `disp_calls` **3 870 -> 2 003 361**, `cyc_disp_total`
+/// **1.86M -> 1 049M cycles**. One blind dispatch per iteration, ~524 cycles
+/// each.
+///
+/// The reason is structural, not a tuning miss. The chain this was built for is
+/// already DIRECT-BOUND: each rung is a raw `CALL` to a compiled entry, a few
+/// nanoseconds. Splicing the enclosing body removes one frame and converts its
+/// inner call from that direct call into the blind helper, which resolves by
+/// name on every execution. The frame saved is worth ~4 ns; the call downgraded
+/// costs ~175. **Splicing a body is only worth it when the call inside it does
+/// not get worse.**
+///
+/// So with this off, a callee containing a call is admitted ONLY when every one
+/// of those calls is itself spliced (`InlineSite::nested_sites`), and the
+/// dispatch fallback is not merely unused but not planned — `invoke_targets` is
+/// cleared, so a nested splice that bails at emission time bails the enclosing
+/// splice too rather than silently degrading to the helper.
+///
+/// Kept as a flag rather than deleted because it is the arm that REPRODUCES the
+/// measurement above, and because it is what a direct-binding follow-up (give a
+/// spliced call the `direct_calls` treatment the top level already has) would
+/// replace rather than remove. Read once and cached.
+#[inline]
+pub fn jit_inline_call_dispatch() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_CALL_DISPATCH"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_INLINE_NEST` — splice a call that is itself inside a spliced
+/// body, up to `cratonvm_jit::MAX_INLINE_NEST_DEPTH` levels. **Default: OFF.**
+///
+/// Requires [`jit_inline_calls`]: nesting resolves its candidates out of
+/// `InlineSite::invoke_targets`, which stays empty with that gate off. Kept
+/// SEPARATE from it so a regression can be bisected to "calls inside splices"
+/// versus "splices inside splices" — two different emitter paths with two
+/// different failure modes.
+///
+/// Only statically-bound calls (`invokestatic`, `invokespecial`) nest; a
+/// virtual or interface call inside a spliced body keeps the dispatch helper,
+/// because selecting its body needs a runtime receiver and the receiver
+/// profile is keyed by the ENCLOSING method's bci, not a callee-internal pc.
+/// Read once and cached.
+#[inline]
+pub fn jit_inline_nest() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_NEST"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.

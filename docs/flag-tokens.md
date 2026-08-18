@@ -645,6 +645,9 @@ export inherited from a parent shell.
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
+| `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
+| `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
+| `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |
 | `osr-seed-frame-slots` | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` |
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
