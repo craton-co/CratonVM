@@ -141,7 +141,7 @@ coincidence of the replacement function's arity, on a security-relevant path.
 Recorded so the next person does not have to re-derive that it is possible, and
 does not mistake possible for advisable.
 
-## 5. The one row left: `URI.relativize`
+## 5. The one row left: `URI.relativize` — since CLOSED, see N3
 
 `relativize` is not an accessor. It runs `uri_remove_dot_segments` and
 `uri_recompose` over `&str` — a genuine ALGORITHM on path segments, not a
@@ -163,7 +163,25 @@ fields they prefer was sufficient — one splitter, one decoder, and the `&str`
 helpers reduced to wrappers. Two cost estimates in a row were wrong because
 both assumed the parse was on the critical path and neither checked.
 
-**N3 — `URI.relativize`, §5.** The last row, a distinct algorithm.
+**N3 — DONE (`G78-1` follow-on). `URI.relativize`, §5.** The cost estimate in
+§5 held: two helpers, both splitting on ASCII `/`, converted to units with the
+`&str` spellings kept as wrappers. Three things §5 did not foresee, all found
+by writing it rather than by re-reading it:
+
+* the BASE path needed units too, not just the target's. It is prefix-matched
+  against the target, so a lossy base fails to match a target that legitimately
+  starts with it — the bug would have been a silently un-relativized URI;
+* `make_uri` was a third sink. It takes a `&str`, so the recomposed units were
+  lost on the way into the new URI. `make_uri_units` applies the same
+  correction `URL.toURI()` already used, deliberately spelled the same way;
+* scheme and authority stay TEXT, and that is the point rather than an
+  omission: `relativize` only ever compares them, and G78-1's rule is that a
+  value which is inspected may stay text. Only what is handed back needs units.
+
+`resolve` and `normalize` still call the `&str` wrappers. Both measured exact
+on the 26-row probe, so this is a residue and not a known defect — but it is a
+residue: they are exact today because their probe inputs happen not to exercise
+the lossy edge, not because they are converted.
 
 **N2 — CLOSED. It WAS the second, narrower defect.** `URL.toString()` and
 `toExternalForm()` share one native that reconstructs the external form; it

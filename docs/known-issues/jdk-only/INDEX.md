@@ -1088,3 +1088,4 @@ Three of those are worth reading before acting anywhere in this tree:
   hunt has reached diminishing returns — see §4 N2 for the three question
   SHAPES never asked (concurrency, GC pressure, scale), which is where a next
   sweep should go rather than at another subject.
+- [G78-1](G78-1-the-read-string-audit-and-the-file-that-merged-20260818.md) — the `read_string` caller audit: 2904 grep hits narrowed to 18 by dataflow and registry measurement; `java.io.File` lost the unit three times over and MERGED two distinct paths in equals/hashCode/compareTo. Closes G70-1 N1. 18 rows -> 2.

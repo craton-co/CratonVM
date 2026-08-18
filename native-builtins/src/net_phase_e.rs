@@ -3391,28 +3391,55 @@ fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) ->
 
 /// RFC 3986 §5.2.4 — remove `.` and `..` segments from a path.
 fn uri_remove_dot_segments(path: &str) -> Result<String, MethodCallFailed> {
-    let absolute = path.starts_with('/');
+    let units: Vec<u16> = path.encode_utf16().collect();
+    Ok(String::from_utf16_lossy(&uri_remove_dot_segments_units(&units)?))
+}
+
+/// [`uri_remove_dot_segments`] in code units — the implementation of both.
+///
+/// Segments split on ASCII `/`, and the only two segments with meaning, `.` and
+/// `..`, are ASCII. Every other segment is copied as an opaque run of units, so
+/// text this function has no opinion about passes through untouched.
+///
+/// That matters here more than anywhere else in the URI family: `relativize` is
+/// the one operation that REBUILDS a path from segments instead of selecting a
+/// range of one, and rebuilding is exactly where a lossy spelling puts the
+/// substitution back after the accessors have avoided it (G75-1 N3).
+fn uri_remove_dot_segments_units(path: &[u16]) -> Result<Vec<u16>, MethodCallFailed> {
+    let slash = u16::from(b'/');
+    let dot = u16::from(b'.');
+    let is_dot = |s: &[u16]| s == [dot];
+    let is_dotdot = |s: &[u16]| s == [dot, dot];
+
+    let absolute = path.first() == Some(&slash);
+    let segs: Vec<&[u16]> = path.split(|&c| c == slash).collect();
     // A path whose final segment is "." or ".." resolves to a directory, so
     // the output must end with '/' (RFC 3986 §5.2.4 behaviour, matches JDK).
-    let segs: Vec<&str> = path.split('/').collect();
-    let trailing_slash = path.ends_with('/') || matches!(segs.last(), Some(&".") | Some(&".."));
-    let mut out: Vec<&str> = Vec::new();
+    let trailing_slash =
+        path.last() == Some(&slash) || segs.last().is_some_and(|l| is_dot(l) || is_dotdot(l));
+    let mut out: Vec<&[u16]> = Vec::new();
     for seg in &segs {
-        match *seg {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            s => out.push(s),
+        if seg.is_empty() || is_dot(seg) {
+            continue;
         }
+        if is_dotdot(seg) {
+            out.pop();
+            continue;
+        }
+        out.push(seg);
     }
-    let mut result = String::new();
+    let mut result: Vec<u16> = Vec::new();
     if absolute {
-        result.push('/');
+        result.push(slash);
     }
-    result.push_str(&out.join("/"));
-    if trailing_slash && !result.ends_with('/') {
-        result.push('/');
+    for (i, seg) in out.iter().enumerate() {
+        if i > 0 {
+            result.push(slash);
+        }
+        result.extend_from_slice(seg);
+    }
+    if trailing_slash && result.last() != Some(&slash) {
+        result.push(slash);
     }
     Ok(result)
 }
@@ -3823,6 +3850,38 @@ fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFail
 }
 
 /// RFC 3986 §5.3 — recompose component parts into a URI string.
+/// [`uri_recompose`] in code units. Scheme and authority stay `&str`: they are
+/// ASCII by the URI grammar, and `relativize` only ever COMPARES them. That is
+/// the audit's own rule from G78-1 — a value that is inspected may stay text;
+/// only what is handed back needs units.
+fn uri_recompose_units(
+    scheme: &Option<String>,
+    authority: &Option<String>,
+    path: &[u16],
+    query: &Option<Vec<u16>>,
+    fragment: &Option<Vec<u16>>,
+) -> Vec<u16> {
+    let mut s: Vec<u16> = Vec::new();
+    if let Some(sc) = scheme {
+        s.extend(sc.encode_utf16());
+        s.push(u16::from(b':'));
+    }
+    if let Some(a) = authority {
+        s.extend("//".encode_utf16());
+        s.extend(a.encode_utf16());
+    }
+    s.extend_from_slice(path);
+    if let Some(q) = query {
+        s.push(u16::from(b'?'));
+        s.extend_from_slice(q);
+    }
+    if let Some(f) = fragment {
+        s.push(u16::from(b'#'));
+        s.extend_from_slice(f);
+    }
+    s
+}
+
 fn uri_recompose(
     scheme: &Option<String>,
     authority: &Option<String>,
@@ -3860,6 +3919,37 @@ fn uri_recompose(
 fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodCallFailed> {
     let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
     uri_publish_named(ctx, uri_obj, raw, None);
+    Ok(uri_obj)
+}
+
+/// [`make_uri`] from code units.
+///
+/// `uri_publish_named` takes a `&str`, so it is handed the lossy spelling to
+/// set the ASCII-only components (scheme, authority, port) and the three
+/// text-carrying ones are then rewritten from the units. This is the same
+/// correction `URL.toURI()` applies, for the same reason, and is deliberately
+/// spelled the same way so the two cannot drift.
+fn make_uri_units(
+    ctx: &mut dyn NativeContext,
+    raw: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
+    let lossy = String::from_utf16_lossy(raw);
+    uri_publish_named(ctx, uri_obj, &lossy, None);
+    let raw_obj = ctx.create_string_from_units(raw);
+    ctx.set_field_by_name(uri_obj, "string", Value::Object(Some(raw_obj)));
+    if let Some(pu) = uri_select_raw_path_units(raw) {
+        let o = ctx.create_string_from_units(&pu);
+        ctx.set_field_by_name(uri_obj, "path", Value::Object(Some(o)));
+    }
+    if let Some(q) = uri_query_units(raw) {
+        let o = ctx.create_string_from_units(&q);
+        ctx.set_field_by_name(uri_obj, "query", Value::Object(Some(o)));
+    }
+    if let Some(f) = uri_fragment_units(raw) {
+        let o = ctx.create_string_from_units(&f);
+        ctx.set_field_by_name(uri_obj, "fragment", Value::Object(Some(o)));
+    }
     Ok(uri_obj)
 }
 
@@ -4683,10 +4773,26 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let base = uri_raw_string(ctx, this);
-            let target = uri_raw_string(ctx, other);
+            // G75-1 N3, the last diverging row of that probe. `relativize` is
+            // not an accessor: it REBUILDS a path from segments rather than
+            // selecting a range of one, which is why it outlived the accessor
+            // conversion.
+            //
+            // Scheme and authority stay text — ASCII by grammar, and only
+            // COMPARED below. BOTH paths are carried in units, not just the
+            // target's: the base path is prefix-matched against the target, so
+            // a lossy base would fail to match a target that legitimately
+            // starts with it.
+            let base_u = uri_raw_units(ctx, this);
+            let base = String::from_utf16_lossy(&base_u);
+            let target_u = uri_raw_units(ctx, other);
+            let target = String::from_utf16_lossy(&target_u);
             let (b_scheme, b_auth, b_path, _b_query, _b_frag) = uri_split(&base);
-            let (t_scheme, t_auth, t_path, t_query, t_frag) = uri_split(&target);
+            let (t_scheme, t_auth, t_path, _t_q_text, _t_f_text) = uri_split(&target);
+            let b_path_u = uri_select_raw_path_units(&base_u).unwrap_or_default();
+            let t_path_u = uri_select_raw_path_units(&target_u).unwrap_or_default();
+            let t_query = uri_query_units(&target_u);
+            let t_frag = uri_fragment_units(&target_u);
             let b_opaque = b_scheme.is_some() && b_auth.is_none() && !b_path.starts_with('/');
             let t_opaque = t_scheme.is_some() && t_auth.is_none() && !t_path.starts_with('/');
             if b_opaque
@@ -4696,21 +4802,22 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             {
                 return Ok(Some(Value::Object(Some(other))));
             }
-            let b_norm = uri_remove_dot_segments(&b_path)?;
-            let t_norm = uri_remove_dot_segments(&t_path)?;
+            let b_norm = uri_remove_dot_segments_units(&b_path_u)?;
+            let t_norm = uri_remove_dot_segments_units(&t_path_u)?;
             if !t_norm.starts_with(&b_norm) {
                 return Ok(Some(Value::Object(Some(other))));
             }
+            let slash = u16::from(b'/');
             let rel = &t_norm[b_norm.len()..];
             if rel.is_empty() {
                 return Ok(Some(Value::Object(Some(make_uri(ctx, "")?))));
             }
-            if !b_norm.ends_with('/') && !rel.starts_with('/') {
+            if b_norm.last() != Some(&slash) && rel.first() != Some(&slash) {
                 return Ok(Some(Value::Object(Some(other))));
             }
-            let rel = rel.strip_prefix('/').unwrap_or(rel);
-            let recomposed = uri_recompose(&None, &None, rel, &t_query, &t_frag);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
+            let rel = if rel.first() == Some(&slash) { &rel[1..] } else { rel };
+            let recomposed = uri_recompose_units(&None, &None, rel, &t_query, &t_frag);
+            Ok(Some(Value::Object(Some(make_uri_units(ctx, &recomposed)?))))
         },
     );
 

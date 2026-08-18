@@ -126,7 +126,7 @@ both at baseline with failure sets identical **by name**.
 
 ## 6. NOMINATIONS
 
-**N1 — `read_string` has ~2,900 other callers and most of them are fine.**
+**N1 — DONE (`G78-1`). `read_string` has ~2,900 other callers and most of them are fine.**
 The two new trait methods make the units path available everywhere, which is
 not the same as everywhere being converted. `read_string` remains correct
 wherever the result is only INSPECTED — a class name, a charset name, a flag,
@@ -135,6 +135,16 @@ separated the two, and the grep alone will not: the distinction is what the
 value is used FOR. `G63-1` N4's remaining surfaces (`Base64`, `URLEncoder`,
 `Collator`, `MessageDigest` over text, every `java.time` formatter) are the
 places to start, because they are known to be reachable.
+
+> **Closed by `G78-1` on 2026-08-18.** The nomination was right that no grep
+> makes the judgement, and right that the surfaces above were the place to
+> start — but they were not where the defect was. Two filters cut 2904 hits to
+> **18** without making any judgement at all: keep only blocks that both read
+> and CREATE a string (dataflow), then keep only registrations the registry
+> dump shows as live and owning under `--jdk-only` (reachability). Of the
+> eighteen, `Base64`/`URLEncoder`/`Collator`/`MessageDigest`/`java.time` were
+> all exact; `java.io.File` was the whole defect, losing the unit three times
+> over and MERGING two distinct paths in `equals`/`hashCode`/`compareTo`.
 
 **N2 — `StringBuffer` and `AbstractStringBuilder` share the fixed handler,
 but the other `append` overloads were not swept.** `append(CharSequence)`,

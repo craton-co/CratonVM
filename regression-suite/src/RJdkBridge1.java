@@ -1,6 +1,7 @@
 import java.nio.CharBuffer;
 import java.text.Normalizer;
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.StringReader;
@@ -2185,7 +2186,151 @@ public class RJdkBridge1 {
             throw new AssertionError("control URI construction must succeed: " + e);
         }
 
-        sectionEnd("surrog", 82);
+
+        // -- java.io.File is a STRING WRAPPER, and the string round-tripped --
+        // G70-1 N1. The read_string caller audit narrowed 2904 grep hits to the
+        // 18 sites that both round-trip a value to Java AND are invoked under
+        // --jdk-only (a static scan joined to --dump-native-registry counts).
+        // java.io.File was the dominant family. `<init>` normalises the path
+        // and writes it straight BACK into a Java field, so the value is not
+        // inspected -- it is handed back, three times over: at construction, at
+        // the field read, and once more in getName(), which went through
+        // std::path + to_string_lossy.
+        step("surrog", "java.io.File path round trip with a lone surrogate");
+        char sep = File.separatorChar;
+        File lone = new File("d/" + LONE_HI);
+        // "d" sep "a" D800 "b" -- the unit lands at index 3.
+        ckCarries("File.getPath()", lone.getPath(), 3);
+        ckCarries("File.toString()", lone.toString(), 3);
+        ckCarries("File.getName()", lone.getName(), 1);
+        ckCarries("File.getParent()", new File(LONE_HI + "/x").getParent(), 1);
+        ckCarries("new File(String,String).getPath()", new File("p", LONE_HI).getPath(), 3);
+        ckCarries("new File(File,String).getPath()",
+                new File(new File("p"), LONE_HI).getPath(), 3);
+
+        // The substitution was not only a rendering fault. equals/hashCode/
+        // compareTo are computed FROM the path, so a file named with a lone
+        // surrogate and one named with a literal U+FFFD COLLIDED: equal, same
+        // hash, compareTo 0. A substitution in a key is a merge, not a typo.
+        File fffd = new File("d/a�b");
+        check(!lone.equals(fffd),
+                "a lone-surrogate path must NOT equal the same path with U+FFFD");
+        check(lone.hashCode() != fffd.hashCode(),
+                "distinct paths must not share a hash once the unit survives");
+        check(lone.compareTo(fffd) != 0,
+                "compareTo must separate a lone surrogate from U+FFFD");
+        check(lone.equals(new File("d/" + LONE_HI)),
+                "an equal path must still be equal to itself");
+
+        // File.hashCode is `path.hashCode() ^ 1234321` (WinNTFileSystem folds
+        // case first). The old body hashed UTF-8 BYTES and omitted the mixing
+        // constant, so new File("AB") answered 2081 where HotSpot answers
+        // 1235376. Both halves are asserted here, per platform.
+        boolean win = sep == '\\';
+        int want = (win ? "ab".hashCode() : "AB".hashCode()) ^ 1234321;
+        check(new File("AB").hashCode() == want,
+                "File.hashCode must be path.hashCode() ^ 1234321 (case-folded on "
+                        + "Windows), got " + new File("AB").hashCode() + " want " + want);
+        check(new File("ab").equals(new File("AB")) == win,
+                "File equality is case-insensitive on Windows and exact elsewhere");
+
+        // Controls: an ASCII path and a WELL-FORMED pair must be untouched by
+        // the units conversion -- the rows that would catch it breaking what
+        // already worked.
+        check(new File("d/plain.txt").getPath().equals("d" + sep + "plain.txt"),
+                "an ordinary ASCII path must be unchanged by the units conversion");
+        check("plain.txt".equals(new File("d/plain.txt").getName()),
+                "an ordinary basename must be unchanged");
+        String fpair = new File("d/😀").getPath();
+        check(fpair.length() == 4 && fpair.charAt(2) == 0xD83D && fpair.charAt(3) == 0xDE00,
+                "a well-formed pair in a path must stay two units");
+
+
+        // The root prefix is where a units conversion of the path helpers can
+        // silently regress, and no relative-path row can see it: `getParent`
+        // and `getName` both consult java.io.File's `prefixLength`, so `C:\`
+        // has a NULL parent and an EMPTY name while `C:x` has parent `C:` with
+        // no separator present at all. The first conversion got all three
+        // wrong. These rows exist so the next one cannot.
+        step("surrog", "File root-prefix contracts (getParent/getName)");
+        String BS = String.valueOf((char) 92);
+        File absF = win ? new File("C:" + BS + "x") : new File("/x");
+        check((win ? "C:" + BS : "/").equals(absF.getParent()),
+                "the parent of a root-anchored path is the root itself, got " + absF.getParent());
+        File rootF = win ? new File("C:" + BS) : new File("/");
+        check(rootF.getParent() == null,
+                "a root has no parent, got " + rootF.getParent());
+        check("".equals(rootF.getName()),
+                "a root has an empty name, got [" + rootF.getName() + "]");
+        check(win ? "C:".equals(new File("C:x").getParent())
+                  : new File("x").getParent() == null,
+                "a drive-relative path has a parent with no separator in it");
+
+        // -- URI.relativize REBUILDS a path, and rebuilt it as text -----------
+        // G75-1 N3. The accessor conversion (N1) fixed twelve of thirteen rows
+        // and left this one, because relativize is the single URI operation
+        // that reassembles a path from segments instead of selecting a range of
+        // one -- dot-segment removal and recomposition, both splitting on ASCII
+        // '/'. Reassembly is where a lossy spelling puts the substitution back.
+        step("surrog", "URI.relativize with a lone surrogate");
+        URI relBase;
+        URI relTarget;
+        URI relBase2;
+        URI relTarget2;
+        try {
+            relBase = URI.create("http://h.example/");
+            relTarget = new URI("http://h.example/" + LONE_HI);
+            relBase2 = URI.create("http://h.example/d/");
+            relTarget2 = new URI("http://h.example/d/" + LONE_HI + "?q=" + LONE_HI
+                    + "#f" + LONE_HI);
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+        ckCarries("URI.relativize().toString()", relBase.relativize(relTarget).toString(), 1);
+        ckCarries("URI.relativize().getPath()", relBase.relativize(relTarget).getPath(), 1);
+        // The query and the fragment ride through the SAME recomposition.
+        URI rel2 = relBase2.relativize(relTarget2);
+        ckCarries("relativize().getQuery()", rel2.getQuery(), 3);
+        ckCarries("relativize().getFragment()", rel2.getFragment(), 2);
+        ckCarries("relativize().toString() with query+fragment", rel2.toString(), 1);
+
+        // Controls: relativization itself must still work, including the
+        // dot-segment removal the units rewrite touched.
+        try {
+            check("x/y".equals(URI.create("http://h.example/d/")
+                            .relativize(new URI("http://h.example/d/x/y")).toString()),
+                    "ordinary relativization must be unchanged");
+            check("c".equals(URI.create("http://h.example/a/")
+                            .relativize(new URI("http://h.example/a/b/../c")).toString()),
+                    "dot-segment removal must still collapse b/.. -> nothing");
+            check("http://other.example/z".equals(URI.create("http://h.example/")
+                            .relativize(new URI("http://other.example/z")).toString()),
+                    "a non-prefix target must come back unchanged");
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+
+
+        // The FOURTH File constructor, and the one the audit did not reach: it
+        // was invoked zero times across the corpus, so it never entered the
+        // live set that the dataflow-plus-registry filter produced. G70-1 N2
+        // says a sibling next to a fixed method is not thereby fixed. It was
+        // asked rather than assumed, and it diverged.
+        step("surrog", "new File(URI) with a lone surrogate");
+        File uriFile;
+        File uriPlain;
+        try {
+            uriFile = new File(new URI("file:///d/" + LONE_HI));
+            uriPlain = new File(new URI("file:///d/p.txt"));
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+        ckCarries("new File(URI).getPath()", uriFile.getPath(), 4);
+        check(uriPlain.getPath().endsWith("d" + BS + "p.txt")
+                        || uriPlain.getPath().endsWith("d/p.txt"),
+                "an ordinary file: URI must still yield its path, got " + uriPlain.getPath());
+
+        sectionEnd("surrog", 111);
     }
 
     static final int SFF = 15;
