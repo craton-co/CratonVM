@@ -895,6 +895,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_RAF_GETFD` | DBG | `CRATONVM_DBG=raf-getfd` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_RAF_INIT` | DBG | `CRATONVM_DBG=raf-init` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_RBC6` | DBG | `CRATONVM_DBG=rbc6` | opt-in | off | diag | snapshot | jit, vm |
+| `CRATONVM_DBG_RBC6_EMIT` | DBG | `CRATONVM_DBG=rbc6-emit` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_RE5` | DBG | `CRATONVM_DBG=re5` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_READ0LAT` | DBG | `CRATONVM_DBG=read0-latency` | opt-in | off | diag | snapshot | native-io |
 | `CRATONVM_DBG_REDEFINE_DUMP` | DBG | `CRATONVM_DBG=redefine-dump` | opt-in | off | diag | snapshot | classloading |

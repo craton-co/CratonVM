@@ -3087,18 +3087,37 @@ unsafe fn route_implicit_exc_through_callee(
     // Re-entering at bytecode 0 replays every prefix side effect (and was the
     // source of the old finally/counter leak).
     if let Some((thread, _guard)) = jit_thread_mut() {
-        // Drop any exceptional frame the abandoned compiled attempt published
-        // BEFORE materializing the exception. `create_exception_object`
-        // allocates on the Java heap and can therefore run a young collection,
-        // and a `ReconstructedFrame` is not a GC root — its object words would
-        // survive as stale addresses. `run_jit_callee_handler` reads that frame
-        // (that is how a handler recovers its non-parameter locals), so leaving
-        // a pre-allocation frame standing here would hand it relocated
-        // pointers. Without one it applies its `handler_reads_non_param_local`
-        // guard instead and refuses rather than reconstructing a params-only
-        // frame it cannot justify — which is exactly the conservative answer
-        // for this branch.
-        cratonvm_jit::deopt::clear_exceptional_frame();
+        // The exceptional frame the compiled attempt published is KEPT across
+        // the allocation below. It used to be dropped here, and that is what
+        // made RBC.6's `getfield`/`putfield` admission a miscompile: the
+        // compiled body publishes a correct reason-9/10 frame at the trapping
+        // bci, this line threw it away, and `run_jit_callee_handler` — finding
+        // nothing — refused the handler and let the exception propagate past a
+        // `catch` that catches it.
+        //
+        // The reason it was dropped no longer holds. `create_exception_object`
+        // does allocate, and an allocation is a safepoint, but a
+        // `ReconstructedFrame` in `LAST_EXCEPTIONAL` **is** a GC root now: the
+        // scan half runs in `memory/roots.rs` §10
+        // (`for_each_stashed_deopt_object`) and the remap half in
+        // `memory/gc.rs` (`remap_stashed_deopt_objects`), paired by a debug
+        // assertion that refuses one without the other. Both land on the thread
+        // that owns the stash, which is this thread. `docs/jit/
+        // deopt-thread-local-roots.md` names THIS window as the shortest
+        // instance of the hazard it closed — a reason-9 frame published by
+        // `emit_post_invoke_exception_check` whose sink allocates the throwable
+        // before draining it — so keeping the frame here is precisely what that
+        // wiring was for.
+        //
+        // Dropping it was never the "conservative" answer its old comment
+        // claimed. Refusing to enter a handler is not a safe subset of entering
+        // it: JVMS requires the handler to run, so the refusal is a wrong
+        // answer that happens to be loud (an escaping exception) instead of
+        // quiet (zeroed locals). The three OTHER `clear_exceptional_frame`
+        // calls in this function are different and stay: each of them runs on a
+        // path where the compiled attempt is FINISHED or ABANDONED, so its
+        // frame can never be legitimately claimed and must not be left for a
+        // later drain to mis-match.
         let exc = match (aioobe, npe) {
             (Some((index, length)), _) => {
                 let msg = format!("Index {index} out of bounds for length {length}");

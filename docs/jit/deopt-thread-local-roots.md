@@ -1,9 +1,23 @@
 # The deopt stashes are thread-local heap references
 
-**Status:** the `jit/` half is landed (visitors + tests in `jit/src/deopt.rs`).
-The `vm/` half is **not wired** — until the four call sites in "Outstanding"
-land, `LAST_DEOPT` and `LAST_EXCEPTIONAL` are still neither scanned nor
-remapped, exactly as before. `jit/src/ir_verify.rs`: swept, nothing to fix.
+**Status: BOTH halves are landed.** The `jit/` half is the visitors + tests in
+`jit/src/deopt.rs`; the `vm/` half is the four call sites this page listed under
+"Outstanding", and they are wired — the scan in `memory/roots.rs` §10
+(`for_each_stashed_deopt_object`) and `vm/vm_exec.rs`'s pre-park deposit, the
+remap in `memory/gc.rs` (`remap_stashed_deopt_objects`) and its `vm_exec.rs`
+sibling. `jit/src/ir_verify.rs`: swept, nothing to fix.
+
+**This status line was stale, and the staleness had a cost.** While it read
+"not wired", `route_implicit_exc_through_callee` carried a
+`clear_exceptional_frame()` immediately before `create_exception_object`,
+justified in its own comment by "a `ReconstructedFrame` is not a GC root". That
+defence outlived its cause: it discarded the reason-9 frame the compiled body
+had just published, so RBC.6's `getfield`/`putfield` admission let a
+NullPointerException escape a handler that catches it, for every compiled
+`try`-wrapped field access in the tree. Fixed 2026-08-18 by keeping the frame —
+see `fixed-bugs/rbc6-getfield-putfield-npe-escape-FIXED-20260818.md`. A status
+line is load-bearing; this one was read as permission to defend against a
+hazard that was already closed.
 
 This is the `jit/`-crate sibling of
 `fixed-bugs/jit-signals-root-gap.md`, which moved the JIT's pending
