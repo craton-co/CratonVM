@@ -710,6 +710,7 @@ export inherited from a parent shell.
 | `verify-ir` | `CRATONVM_JIT_VERIFY_IR` |
 | `verify-memory-chain` | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` |
 | `lambda-adapter` | `CRATONVM_JIT_LAMBDA_ADAPTER` |
+| `lambda-capture-adapter` | `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER` |
 | `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
 | `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
