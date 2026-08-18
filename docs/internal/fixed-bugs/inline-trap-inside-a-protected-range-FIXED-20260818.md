@@ -166,8 +166,9 @@ replay" until one of them lands.
 * `unresumable-unconditional-trap-mvmap-FIXED-20260802.md` — the same error
   shape, a third distinct producer (`Op::Div` scheduling). Its warning against
   a blind publish-side rule is what shaped this fix's two narrowing terms.
-* `known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md`
-  — the invoke-site reason-9 machinery. Still not the mechanism here: the open
-  page was right that this shape falls outside it, and wrong about what catches
-  it instead.
+* `../fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`
+  — the invoke-site reason-9 machinery, fixed separately and merged into `dev`
+  while this change was in flight. Still not the mechanism here: the open page
+  was right that this shape falls outside it, and wrong about what catches it
+  instead.
 * `apps/commons-math/RESULTS-20260817.md` — the suite run this came from.
