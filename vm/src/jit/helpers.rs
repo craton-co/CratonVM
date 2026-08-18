@@ -6291,6 +6291,30 @@ pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
 /// [`JIT_GETFIELD_RECEIVER_SHAPE`]. Off by default: the classification re-reads
 /// the bounds table and the object header on a path taken tens of millions of
 /// times, so it must not be in the measured configuration.
+/// Cached `CRATONVM_DBG_COMPACT_INLINE` gate for the `jit_getfield` guard-failure
+/// dump.
+///
+/// PERF (2026-08-18, the `BigDecimalBench` flag-read census): this gate was read
+/// through `runtime_var_os` on EVERY `jit_getfield` helper call, and that is not
+/// a cheap read — it hashes the name against the declared-flag set and then
+/// falls through to `std::env::var_os`. A per-key census of a 50k-iteration
+/// `BigDecimal` run counted **4,560,891 of 4,600,000 flag reads (99.1%) for this
+/// one name**, ~91 per benchmark iteration.
+///
+/// Worth noting where it sat: the comment on `GETFIELD_HELPER_CALLS` directly
+/// above the call site argues that one relaxed atomic increment is too cheap to
+/// show up in the measured 8.2 ns `receiverFieldTax` — and it is right. The
+/// uncached environment lookup on the very next line was the expensive one.
+///
+/// Same `OnceLock` idiom as [`getfield_receiver_census_enabled`] immediately
+/// below, which is the sibling gate on the same path and was always cached.
+fn compact_inline_dbg() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some()
+    })
+}
+
 fn getfield_receiver_census_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -6644,7 +6668,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     if getfield_receiver_census_enabled() {
         note_getfield_receiver_shape(obj_ptr, field_index);
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+    if compact_inline_dbg() {
         dump_getfield_guard_failure(obj_ptr);
     }
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
