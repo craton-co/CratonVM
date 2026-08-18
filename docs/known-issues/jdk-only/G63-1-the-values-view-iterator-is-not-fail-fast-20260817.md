@@ -1,5 +1,21 @@
 # G63-1 — `map.values().iterator()` is not fail-fast, in either mode
 
+> **ID COLLISION — there are TWO records numbered `G63-1`, written the same day
+> by two lanes that could not see each other.** This one is the values-view
+> fail-fast defect. The other is
+> `G63-1-the-surrogate-sweep-and-a-refactor-i-refused-20260817.md`.
+>
+> Cite by title rather than number: "G63-1 N1" has already been read as the
+> wrong record's N1 once. Neither file was renamed, because both are cited by
+> number in landed commit messages where a rename cannot follow.
+>
+> **See also `G67-1`**, which measured the same defect family from the other
+> side — `keySet()`, `HashSet` and `TreeMap` iterators — and reached the same
+> mechanism (`modCount` is maintained nowhere for maps; the iterators
+> snapshot). This record's "one row of five diverges" and `G67-1`'s "three of
+> four collections diverge" are the same finding through different probes.
+
+
 **Status:** MEASURED, NOT FIXED. **Provenance:** Linux, Azure `vm1`, JDK 25.0.4+7
 (`/data/toolchain/jdk-25`), binary built from
 `claude/jdk-only-mode-completion-1351c0` at `1d8e11741`. Probes:
