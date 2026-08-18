@@ -1418,8 +1418,6 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_ZGC_CONC_START` | GC | `CRATONVM_GC=zgc-conc-start` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_CONC_WORKERS` | GC | `CRATONVM_GC=zgc-conc-workers` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GENERATIONAL` | GC | `CRATONVM_GC=zgc-generational` | default-on | on | behaviour | snapshot | gc |
-| `CRATONVM_ZGC_GEN_DEAD_RUNS` | GC | `CRATONVM_GC=zgc-gen-dead-runs` | default-on | on | behaviour | snapshot | gc |
-| `CRATONVM_ZGC_GEN_HEADER_ZERO` | GC | `CRATONVM_GC=zgc-gen-header-zero` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` | GC | `CRATONVM_GC=zgc-gen-minors-per-major` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` | GC | `CRATONVM_GC=zgc-gen-nursery-percent` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GEN_PROMOTION_AGE` | GC | `CRATONVM_GC=zgc-gen-promotion-age` | opt-in | off | behaviour | snapshot | gc |
@@ -1427,5 +1425,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_ZGC_PARMARK` | GC | `CRATONVM_GC=zgc-parmark` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_RELOCATE` | GC | `CRATONVM_GC=zgc-relocate` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_STARTBITS` | GC | `CRATONVM_GC=zgc-startbits` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_SWEEP_DEAD_RUNS` | GC | `CRATONVM_GC=zgc-sweep-dead-runs` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_SWEEP_HEADER_ZERO` | GC | `CRATONVM_GC=zgc-sweep-header-zero` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_TLAB` | GC | `CRATONVM_GC=zgc-tlab` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZIP_MAX_ENTRY_BYTES` | IO | `CRATONVM_IO=zip-max-entry-bytes` | opt-in | off | behaviour | snapshot | types |

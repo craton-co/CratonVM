@@ -2840,23 +2840,23 @@ pub struct ZgcRealHeap {
     /// practice. That was the state before 2026-08-17.
     gen_nursery_triggers: AtomicUsize,
     /// Zero only a dead object's header on a young sweep — see
-    /// [`zgc_gen_header_zero`]. Per heap so a test can A/B it without deciding
+    /// [`zgc_sweep_header_zero`]. Per heap so a test can A/B it without deciding
     /// the question for every other test in the binary.
     gen_header_zero_only: AtomicBool,
     /// Hand the free list one span per run of adjacent dead objects on a young
-    /// sweep — see [`zgc_gen_dead_runs`]. Per heap for the same reason.
+    /// sweep — see [`zgc_sweep_dead_runs`]. Per heap for the same reason.
     gen_dead_runs_enabled: AtomicBool,
-    /// Bytes a young sweep did NOT memset because it zeroed headers only.
+    /// Bytes a sweep did NOT memset because it zeroed headers only.
     ///
-    /// The engagement counter for [`zgc_gen_header_zero`]: zero here with
+    /// The engagement counter for [`zgc_sweep_header_zero`]: zero here with
     /// `young_cycles` above zero means every dead object was still being memset
     /// in full, i.e. the switch is on and inert. It is reported as *bytes* and
     /// not as a count because bytes are the cost — the whole point is that this
     /// term was O(reclaimed volume) rather than O(objects).
     gen_zero_bytes_skipped: AtomicUsize,
-    /// Free-list spans a young sweep handed over, and dead objects they covered.
+    /// Free-list spans a sweep handed over, and dead objects they covered.
     ///
-    /// The engagement pair for [`zgc_gen_dead_runs`]: `runs == objects` means no
+    /// The engagement pair for [`zgc_sweep_dead_runs`]: `runs == objects` means no
     /// two dead objects were ever adjacent, so the merge is on and buying
     /// nothing. One number cannot say that — a small `runs` is equally
     /// consistent with a cycle that found little garbage — which is why both are
@@ -3375,8 +3375,8 @@ impl ZgcRealHeap {
             gen_nursery_triggers: AtomicUsize::new(0),
             mark_park_timeouts: AtomicUsize::new(0),
             gen_nursery_overshoot_max: AtomicUsize::new(0),
-            gen_header_zero_only: AtomicBool::new(zgc_gen_header_zero()),
-            gen_dead_runs_enabled: AtomicBool::new(zgc_gen_dead_runs()),
+            gen_header_zero_only: AtomicBool::new(zgc_sweep_header_zero()),
+            gen_dead_runs_enabled: AtomicBool::new(zgc_sweep_dead_runs()),
             gen_zero_bytes_skipped: AtomicUsize::new(0),
             gen_dead_runs: AtomicUsize::new(0),
             gen_dead_objects: AtomicUsize::new(0),
@@ -5240,13 +5240,13 @@ impl ZgcRealHeap {
     /// Survivors promoted by a slide -- G2's engagement counter. See
     /// [`Self::gen_promotions_by_slide`].
     /// Zero only a dead object's header on a young sweep — see
-    /// [`zgc_gen_header_zero`]. Seeded from `CRATONVM_ZGC_GEN_HEADER_ZERO`.
+    /// [`zgc_sweep_header_zero`]. Seeded from `CRATONVM_ZGC_SWEEP_HEADER_ZERO`.
     pub fn set_gen_header_zero_only(&self, on: bool) {
         self.gen_header_zero_only.store(on, Ordering::Relaxed);
     }
 
-    /// Merge adjacent dead spans on a young sweep — see [`zgc_gen_dead_runs`].
-    /// Seeded from `CRATONVM_ZGC_GEN_DEAD_RUNS`.
+    /// Merge adjacent dead spans on a young sweep — see [`zgc_sweep_dead_runs`].
+    /// Seeded from `CRATONVM_ZGC_SWEEP_DEAD_RUNS`.
     pub fn set_gen_dead_runs_enabled(&self, on: bool) {
         self.gen_dead_runs_enabled.store(on, Ordering::Relaxed);
     }
@@ -9032,7 +9032,7 @@ fn zgc_gen_minors_per_major() -> usize {
     })
 }
 
-/// `CRATONVM_ZGC_GEN_HEADER_ZERO` -- on a young sweep, zero a dead object's
+/// `CRATONVM_ZGC_SWEEP_HEADER_ZERO` -- on a young sweep, zero a dead object's
 /// **header** rather than its whole body. **Default on**; `0`/`off`/`false`/`no`
 /// restores the whole-body memset byte for byte.
 ///
@@ -9072,10 +9072,10 @@ fn zgc_gen_minors_per_major() -> usize {
 /// only that this lands during a gauntlet sweep, and the arm being measured is
 /// the one that is already opt-in. Promoting it is one condition, with its own
 /// measurement.
-fn zgc_gen_header_zero() -> bool {
+fn zgc_sweep_header_zero() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_GEN_HEADER_ZERO") {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_SWEEP_HEADER_ZERO") {
             Some(raw) => {
                 let v = raw.to_string_lossy().trim().to_ascii_lowercase();
                 !matches!(v.as_str(), "0" | "off" | "false" | "no")
@@ -9085,7 +9085,7 @@ fn zgc_gen_header_zero() -> bool {
     })
 }
 
-/// `CRATONVM_ZGC_GEN_DEAD_RUNS` -- on a young sweep, hand the free list one span
+/// `CRATONVM_ZGC_SWEEP_DEAD_RUNS` -- on a young sweep, hand the free list one span
 /// per **run** of adjacent dead objects rather than one per object. **Default
 /// on**; `0`/`off`/`false`/`no` restores the per-object calls.
 ///
@@ -9109,10 +9109,10 @@ fn zgc_gen_header_zero() -> bool {
 ///
 /// What it removes is the churn: 4.8M `push_block_routed` calls and a
 /// 4.8M-element sort inside the pause, replaced by a few thousand of each.
-fn zgc_gen_dead_runs() -> bool {
+fn zgc_sweep_dead_runs() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_GEN_DEAD_RUNS") {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_SWEEP_DEAD_RUNS") {
             Some(raw) => {
                 let v = raw.to_string_lossy().trim().to_ascii_lowercase();
                 !matches!(v.as_str(), "0" | "off" | "false" | "no")
@@ -12101,12 +12101,24 @@ impl GarbageCollector for ZgcRealHeap {
         //  * a `push_block_routed` per object, and then a sort over all of them
         //    in `coalesce_free_list`.
         //
-        // Both are removed below. `zgc_gen_header_zero` and `zgc_gen_dead_runs`
+        // Both are removed below. `zgc_sweep_header_zero` and `zgc_sweep_dead_runs`
         // carry the arguments; both are read here once rather than per object,
         // and both are ANDed with `young_cycle` so a whole-heap sweep is
         // byte-for-byte what it was.
-        let zero_header_only = young_cycle && self.gen_header_zero_only.load(Ordering::Relaxed);
-        let merge_dead_runs = young_cycle && self.gen_dead_runs_enabled.load(Ordering::Relaxed);
+        // EVERY CYCLE, not just a young one. Both were scoped to `young_cycle`
+        // when they landed on 2026-08-17, for one reason that has since expired:
+        // they went in mid-gauntlet and a default run had to stay byte-for-byte
+        // unchanged. Neither ARGUMENT was ever young-specific -- the body is
+        // unreachable behind a zeroed header whatever the cycle kind, and the
+        // walk is ascending on both paths.
+        //
+        // And §3d says the restriction pointed them away from the cost. A young
+        // cycle's sweep is 6.3 ms of a 112 ms pause (5.6%); a WHOLE-HEAP cycle's
+        // is 170 ms of 265 ms (64%), because it walks 13.0M dead objects against
+        // a young cycle's 137k. The measured -30% was being applied to the small
+        // one.
+        let zero_header_only = self.gen_header_zero_only.load(Ordering::Relaxed);
+        let merge_dead_runs = self.gen_dead_runs_enabled.load(Ordering::Relaxed);
         // The run being accumulated, ARENA-RELATIVE, and the two engagement
         // counters. `None` between runs and after a flush.
         let mut dead_run: Option<(usize, usize)> = None;
@@ -12173,7 +12185,7 @@ impl GarbageCollector for ZgcRealHeap {
                     // and return the span to the arena free list.
                     //
                     // THE HEADER IS THE WHOLE REASON -- see
-                    // `zgc_gen_header_zero`. `HEADER_SIZE` is the entire
+                    // `zgc_sweep_header_zero`. `HEADER_SIZE` is the entire
                     // `ObjectHeader`, so this leaves `class_id=0, num_slots=0`,
                     // which is the identical corpse a reader of a vacated span
                     // met before; and the body is only reachable through that
@@ -12203,7 +12215,7 @@ impl GarbageCollector for ZgcRealHeap {
                             // ONE SPAN PER RUN. The walk is ascending, so a dead
                             // object adjacent to the previous one extends it;
                             // anything else flushes and starts a new run. See
-                            // `zgc_gen_dead_runs` for why the post-coalesce
+                            // `zgc_sweep_dead_runs` for why the post-coalesce
                             // result is the same either way.
                             dead_in_runs += 1;
                             match dead_run {
@@ -15650,7 +15662,7 @@ pub(crate) mod tests {
     /// reader can reach the bytes this stops writing.
     ///
     /// What it removes is a memset of the whole reclaimed volume, inside the
-    /// pause, on every cycle. See `zgc_gen_header_zero`.
+    /// pause, on every cycle. See `zgc_sweep_header_zero`.
     ///
     /// Asserted on the BODY and not on a counter, because a counter would pass
     /// against a sweep that skipped the memset *and* the header.
@@ -15733,7 +15745,7 @@ pub(crate) mod tests {
         assert_eq!(
             gen_body_words(doomed_addr),
             (0, 0),
-            "with CRATONVM_ZGC_GEN_HEADER_ZERO=0 the whole body must be memset \
+            "with CRATONVM_ZGC_SWEEP_HEADER_ZERO=0 the whole body must be memset \
              again -- if this fails, the sweep is not reaching this object and \
              the test above is vacuous"
         );
@@ -15923,6 +15935,61 @@ pub(crate) mod tests {
         assert_eq!(
             via_arc, via_bridge,
             "the two context paths must mark identically -- the change is which              object the coordinator holds, not what it traces"
+        );
+    }
+
+    /// **A WHOLE-HEAP sweep gets both cost reductions too — with generational
+    /// mode off entirely.**
+    ///
+    /// This is the property the 2026-08-18 widening added, and until it existed
+    /// nothing tested it: every other test here drives a young cycle, so all of
+    /// them passed just as well when both features were `young_cycle && …` and
+    /// therefore unreachable on a default run.
+    ///
+    /// It matters because of where the cost is. §3d measured a young cycle's
+    /// sweep at 6.3 ms of a 112 ms pause and a whole-heap cycle's at 170 ms of
+    /// 265 ms — the restriction was applying a −30% to the small one. A default
+    /// run performs only whole-heap cycles, so this is the arm that decides
+    /// whether either feature is worth anything to anybody.
+    #[test]
+    fn a_whole_heap_sweep_gets_the_cost_reductions_with_generational_off() {
+        let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        heap.set_relocation_enabled(false);
+        assert!(
+            !heap.generational_enabled(),
+            "this test is about the DEFAULT configuration, so generational must \
+             be off -- otherwise it re-tests the young path"
+        );
+
+        // A keeper so the collection has a root, and a run of adjacent garbage.
+        let keeper = heap.alloc_object(ClassId::new(1), 1);
+        for _ in 0..64 {
+            let doomed = heap.alloc_object(ClassId::new(3), 2);
+            heap.set_field(doomed, 0, Value::Long(0x5A5A_5A5A_5A5A_5A5A));
+        }
+
+        let mut roots = [keeper];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(
+            heap.generational_stats().0,
+            0,
+            "no young cycle may have run -- this must be a whole-heap sweep"
+        );
+
+        let (zero_skipped, runs, objects) = heap.gen_sweep_cost_stats();
+        assert!(
+            zero_skipped >= 16,
+            "a whole-heap sweep must skip the body memset too: {zero_skipped}"
+        );
+        assert!(
+            objects >= 64,
+            "the fixture must give the sweep its garbage: {objects}"
+        );
+        assert!(
+            runs >= 1 && runs < objects,
+            "and adjacent dead objects must still collapse into runs: {runs} for \
+             {objects}"
         );
     }
 
