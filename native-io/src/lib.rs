@@ -4995,6 +4995,116 @@ fn native_scanner_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
+/// `Scanner(Readable)` — its own body, because the `InputStream` one cannot
+/// serve it and silently produced an EMPTY scanner.
+///
+/// MEASURED on both VMs, `--jdk-only`, ASCII input and no surrogate involved:
+///
+/// ```text
+///   new Scanner(new StringReader("hello world")).next()
+///     HotSpot    "hello"
+///     CratonVM   NoSuchElementException      hasNext() == false
+///   new Scanner("hello world").next()          works on both
+/// ```
+///
+/// WHY THE OLD REGISTRATION LOOKED PLAUSIBLE AND WAS NOT. This descriptor was
+/// pointed at `native_scanner_init_inputstream`, which duck-types a
+/// `ByteArrayInputStream` from the real-JDK layout `{buf, pos, mark, count}`.
+/// A `StringReader`'s layout is `{str, length, next, mark}` — field 0 is an
+/// object, field 1 an int, field 3 an int — so it MATCHES that shape test and
+/// takes the byte-array branch, reading array elements out of a `String`. The
+/// duck test cannot tell the two apart, which is why the wrong body produced
+/// an empty scanner instead of an error.
+///
+/// `java.lang.Readable` declares only `read(CharBuffer)`, but every Readable
+/// that reaches this in practice is a `java.io.Reader`, which also declares
+/// `read(char[], int, int)`. That is what this drains, in 4 KiB chunks rather
+/// than a character at a time — the same text through `read()I` would be one
+/// re-entrant bytecode call per character.
+///
+/// A non-`Reader` `Readable` (`CharBuffer` is the one in the JDK) falls back
+/// to `toString()`, which is exactly right for `CharBuffer` and is recorded as
+/// a limitation for anything else.
+fn native_scanner_init_readable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this0 = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let source0 = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            scan_set_source(ctx, this0, "");
+            return Ok(None);
+        }
+    };
+
+    // Walk the hierarchy by name rather than resolving `java/io/Reader` to a
+    // ClassId: the class may not be loaded yet, and a miss there would look
+    // like "not a Reader" and re-introduce the empty scanner.
+    let mut is_reader = false;
+    let mut cid = Some(ctx.class_id_of_object(source0));
+    while let Some(c) = cid {
+        if ctx.class_name_of_id(c).as_deref() == Some("java/io/Reader") {
+            is_reader = true;
+            break;
+        }
+        cid = ctx.superclass_of(c);
+    }
+
+    // GC: `invoke_virtual` runs bytecode, which allocates and can relocate
+    // every one of these. All three are pinned and re-read across each call.
+    let this_pin = ctx.pin_native_root(this0);
+    let source_pin = ctx.pin_native_root(source0);
+
+    let text = if is_reader {
+        const CHUNK: usize = 4096;
+        let buf0 = ctx.new_array(ArrayElementType::Char, CHUNK);
+        let buf_pin = ctx.pin_native_root(buf0);
+        let mut units: Vec<u16> = Vec::new();
+        loop {
+            let source = ctx.read_native_pin(source_pin, source0);
+            let buf = ctx.read_native_pin(buf_pin, buf0);
+            let n = match ctx.invoke_virtual(
+                source,
+                "read",
+                "([CII)I",
+                &[
+                    Value::Object(Some(buf)),
+                    Value::Int(0),
+                    Value::Int(CHUNK as i32),
+                ],
+            )? {
+                Some(Value::Int(n)) => n,
+                // A Reader that answers something other than an int is not one
+                // this can drain; stop rather than spin.
+                _ => -1,
+            };
+            if n <= 0 {
+                break;
+            }
+            let buf = ctx.read_native_pin(buf_pin, buf0);
+            for i in 0..(n as usize).min(CHUNK) {
+                if let Value::Int(u) = ctx.get_array_element(buf, i) {
+                    units.push(u as u16);
+                }
+            }
+        }
+        ctx.unpin_native_roots(buf_pin);
+        String::from_utf16_lossy(&units)
+    } else {
+        let source = ctx.read_native_pin(source_pin, source0);
+        match ctx.invoke_virtual(source, "toString", "()Ljava/lang/String;", &[])? {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    };
+
+    let this = ctx.read_native_pin(this_pin, this0);
+    scan_set_source(ctx, this, &text);
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
+}
+
 fn native_scanner_init_inputstream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7548,7 +7658,7 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         c,
         "<init>",
         "(Ljava/lang/Readable;)V",
-        native_scanner_init_inputstream,
+        native_scanner_init_readable,
     );
 
     // Token reading
