@@ -10184,13 +10184,6 @@ pub struct JitPICSlot {
     pub hits: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
     /// Total cache misses (receiver not in any entry).
     pub misses: std::sync::atomic::AtomicU64,
-    /// The bytecode index this slot's call site lives at, or `usize::MAX` for a
-    /// slot with no site. Mirrors [`JitMICSlot::bci`] and exists for the same
-    /// reason: the artifact keeps only the boxes, so a bci not carried inside
-    /// the slot is lost at publication. Read by
-    /// [`CompiledMethod::dominant_receiver_at_bci`] to refuse a site the
-    /// adaptive recompiler already declared polymorphic.
-    pub bci: usize,
     /// Compact hashed/vtable cache used after the four inline PIC guards miss.
     /// These arrays are part of the generated-code-visible prefix. Entries are
     /// installed once (entry/ABI first, class id last) and never evicted, so a
@@ -10207,6 +10200,18 @@ pub struct JitPICSlot {
     compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_PIC_ENTRIES],
     /// Strong owners for the generated hashed table's raw entry pointers.
     mega_compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_MEGA_ENTRIES],
+    /// The bytecode index this slot's call site lives at, or `usize::MAX` for a
+    /// slot with no site. Mirrors [`JitMICSlot::bci`]; read by
+    /// [`CompiledMethod::dominant_receiver_at_bci`] to refuse a site the
+    /// adaptive recompiler already declared polymorphic.
+    ///
+    /// LAST FIELD, and it has to be. Everything above it up to and including
+    /// the `mega_*` arrays is addressed by generated code at the fixed offsets
+    /// in `MEGA_CLASS_IDS_OFFSET` and friends. Putting this after `misses` —
+    /// where it reads naturally — moved `MEGA_CLASS_IDS_OFFSET` from 96 to 104
+    /// and every megamorphic-stub load with it.
+    /// `test_jit_mega_offsets_match_generated_stub_contract` caught it.
+    pub bci: usize,
 }
 
 /// Miss count on a `JitMICSlot` at which the adaptive recompiler
