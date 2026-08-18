@@ -213,3 +213,17 @@ workspace = true
 # Only the legacy DSA server fallback needs OpenSSL's per-context security
 # policy API. Keeping it Unix-scoped preserves the Windows dependency graph.
 openssl = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# The Windows half of the same need OpenSSL answers on Unix: the peer's FULL
+# certificate chain, which `native_tls` cannot hand out on any backend.
+#
+# This is NOT a new dependency. `schannel` is already in `Cargo.lock` at this
+# version because native-tls IS this crate on Windows -- its `imp/schannel.rs`
+# is a ~60-line wrapper over the same `SchannelCred` + `tls_stream::Builder`
+# used here. Naming it directly buys the one thing the wrapper does not
+# re-export: the remote certificate's attached store
+# (`CertContext::cert_store`), which is where SChannel puts the intermediates
+# the peer sent. The Windows dependency GRAPH is unchanged; only this crate's
+# view of it is.
+schannel = "0.1"

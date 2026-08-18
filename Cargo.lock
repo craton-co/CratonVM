@@ -675,6 +675,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "rustls-pki-types",
+ "schannel",
  "sha1",
  "sha2",
  "sha3",
