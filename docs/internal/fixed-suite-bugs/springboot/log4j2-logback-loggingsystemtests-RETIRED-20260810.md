@@ -4,7 +4,7 @@
 
 Supersedes `docs/known-issues/springboot/log4j2-logback-loggingsystemtests-modifiedclasspath-throughput-hang-20260807.md`.
 The `Log4J2LoggingSystemTests` half is now covered by
-[`moving-young-fallback-turns-four-classes-red-20260810.md`](../../../known-issues/springboot/moving-young-fallback-turns-four-classes-red-20260810.md).
+[`retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md`](../../../known-issues/retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md).
 
 The retired doc was careful and explicit that its root cause was a hypothesis.
 It ran the three experiments it named as missing, and the answers split the two
