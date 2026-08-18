@@ -19142,6 +19142,25 @@ fn try_compile_inner(
                                 receiver_callee_resolver: Some(&receiver_body),
                             });
                             inline_tally.record(&plan);
+                            // Name the planner's verdict per site. The RESOLVER
+                            // names its own refusals now; this is the other half
+                            // — a site whose body resolved fine can still be
+                            // refused here on budget or policy, and a bare
+                            // `nested-splice=0` cannot tell the two apart.
+                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+                            {
+                                eprintln!(
+                                    "[cratonvm-jitc] inline-plan pc={pc} {}.{}{}: {:?} (cost={:?} budget_left={})",
+                                    class_name,
+                                    method_name,
+                                    descriptor,
+                                    plan.verdict,
+                                    cp_site
+                                        .as_ref()
+                                        .and_then(crate::inline_site_expansion_cost),
+                                    inline_budget_remaining,
+                                );
+                            }
                             // PGO-02: the backend emits both speculative
                             // verdicts now — Monomorphic (one guard) and
                             // Bimorphic (a two-guard chain sharing one receiver
