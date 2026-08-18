@@ -194,6 +194,32 @@ Two changes were written, built, measured interleaved, and reverted
    4,911 / 5,009 / 5,001 ms. **Inert.** (It also means the Spring suite was
    already getting whatever this buys, which is nothing here.)
 
+4. **Make the per-frame method-slot memo thread-local.**
+   `find_method_index_memoized` takes a shared `RwLock` read once per FRAME of
+   every capture and is the largest symbol in the Quartz profile (18.1%), so it
+   looked like the thing that explains the depth scaling. Interleaved: depth 40
+   3,028 / 3,921 ms base vs 3,982 / 3,873 ms thread-local; depth 120
+   13,816 / 12,200 vs 11,969 / 15,114. **Inert** — an uncontended `parking_lot`
+   read is nanoseconds, so that 18% is the hashing and the per-hit verification,
+   not the lock. Reverted.
+
+### The scaling, measured — and why it is not one symbol
+
+| stack depth | CratonVM | HotSpot | ratio |
+|---:|---:|---:|---:|
+| 2 | 527 ms | 57 ms | 9x |
+| 10 | 893 ms | 80 ms | 11x |
+| 40 | 3,752 ms | 108 ms | 35x |
+| 120 | 17,098 ms | 187 ms | **91x** |
+
+CratonVM's capture cost is **linear in stack depth**; HotSpot's is nearly flat
+(3.3x for 60x the depth, because its walk is lazy and `findFirst` stops at the
+first match while ours materialises every frame). So the gap is not a fixed
+per-call tax that one memo can remove — it is per-frame work, spread across
+`entry_from_frame`'s Arc clones, class lookup, memo probe and line-number scan,
+with no member big enough to matter alone. That is why four separate attempts to
+remove one member each measured zero.
+
 **The arithmetic that should have come first.**
 `native_stack_has_jit_frame` is ~17.9% of this workload, so deleting it
 *entirely* buys **1.2x against a 38x gap**. No amount of memoizing that symbol
