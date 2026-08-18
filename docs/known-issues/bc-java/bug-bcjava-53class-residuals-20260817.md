@@ -121,7 +121,7 @@ component instead of asking it**.
 
 | class | what is left | shape |
 |---|---|---|
-| `jce.provider.test` | `CipherStreamTest2` (flaky), `PKCS12Store`, `RSATest`, `SlotTwo` | see below |
+| `jce.provider.test` | `PKCS12Store`, `RSATest`, `SlotTwo` every run, plus `CipherStreamTest2` in 1 run of 3 | see below |
 | `jcajce.provider` | `BouncyCastleProviderTest.testRegisteredClasses` | `Provider`'s Map view |
 | `pkix` | `IDPRelativeNameTest.testMultiValuedRelativeNameRoundTrip` | multi-valued RDN |
 
