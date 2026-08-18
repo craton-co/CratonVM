@@ -6231,6 +6231,25 @@ pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
 /// [`JIT_GETFIELD_RECEIVER_SHAPE`]. Off by default: the classification re-reads
 /// the bounds table and the object header on a path taken tens of millions of
 /// times, so it must not be in the measured configuration.
+/// `CRATONVM_DBG_COMPACT_INLINE` — whether to dump the first few guard
+/// failures (see [`dump_getfield_guard_failure`]). Cached, like its neighbour
+/// below, and for a reason worth stating: this gate used to be a bare
+/// `runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")` **inline in `jit_getfield`**,
+/// i.e. a string-keyed flag lookup on a path this VM takes tens of millions of
+/// times a second. Measured on `probes/AccessorDispatchProbe.java`, one
+/// reference-field read: **13.4 ns before it, 46 ns after** — a 3.4x regression
+/// on the hottest helper in the VM, introduced by a diagnostic added to study
+/// that very helper.
+///
+/// The dump itself was already `#[cold]` and bounded to 8 lines. It was never
+/// the cost; the gate was.
+fn getfield_guard_dump_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some()
+    })
+}
+
 fn getfield_receiver_census_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -6584,7 +6603,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     if getfield_receiver_census_enabled() {
         note_getfield_receiver_shape(obj_ptr, field_index);
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+    if getfield_guard_dump_enabled() {
         dump_getfield_guard_failure(obj_ptr);
     }
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
