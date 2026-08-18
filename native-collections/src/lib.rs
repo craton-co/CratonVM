@@ -649,8 +649,129 @@ fn overlay_owner_keys() -> &'static Mutex<StdHashMap<usize, Vec<usize>>> {
     INDEX.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
+/// Words in [`OVERLAY_OWNER_CLASS_BITS`] — 65,536 class ids at 8 KB, which is
+/// more classes than any run this VM has loaded.
+const OVERLAY_CLASS_BITMAP_WORDS: usize = 1024;
+
+/// Class ids that have EVER owned a collection overlay, as a bitmap.
+///
+/// # The question this answers, and why a CLASS gate is the right shape
+///
+/// `gc_overlay_roots_for_collection` is called **once per marked object** — from
+/// `ZgcRealHeap::visit_refs` and from `collect_garbage`'s serial loop — and asks
+/// "does this object own overlay state?". It answered it by taking a
+/// `std::sync::Mutex` and hashing the address into `overlay_owner_keys`. Measured
+/// with `perf record` on 2026-08-17: that call plus its caller
+/// `external_roots_for_owner` were **20–29% of samples on both the serial and the
+/// one-worker parallel mark**, i.e. the largest single cost in the marker.
+///
+/// Two cheaper gates were considered and rejected on the evidence:
+///
+/// * **"is the index empty?"** — built, and measured **inert**. Every
+///   native-backed collection operation registers an owner through
+///   `widened_obj_key`, and the JDK bootstrap performs enough of them that the
+///   index is non-empty from startup. "No native collections" is not a state a
+///   real run is ever in.
+/// * **a Bloom filter over owner ADDRESSES** — would saturate. Membership is per
+///   *instance*, so a long-running app sets every bit and the filter degrades to
+///   "always maybe"; and addresses are recycled, so removal cannot clear bits
+///   without risking a false negative.
+///
+/// A **class** gate has neither problem. The set of classes that can own an
+/// overlay is a handful (the native-backed `java.util` collections) and does not
+/// grow with instance count, so it cannot saturate; and class ids are stable, so
+/// address reuse is irrelevant. On an object graph of ordinary classes — which is
+/// what the overwhelming majority of marked objects are, even in a Spring app —
+/// every query is two relaxed loads and no lock.
+///
+/// # Why it cannot produce a false negative
+///
+/// Bits are only ever SET, never cleared, and the bit is set **before** the owner
+/// is inserted into `overlay_owner_keys` (see `register_overlay_owner_key`). So a
+/// reader that does not observe the bit ran before the insert it would have been
+/// looking for, and a reader that does observe it takes the lock exactly as
+/// before. Dropping an overlay edge here would be a use-after-free on the
+/// contents of a live collection, so the direction of error is the whole design:
+/// too permissive costs a lock, too strict corrupts the heap.
+static OVERLAY_OWNER_CLASS_BITS: [std::sync::atomic::AtomicU64; OVERLAY_CLASS_BITMAP_WORDS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; OVERLAY_CLASS_BITMAP_WORDS];
+
+/// Disables the class gate wholesale: an owner was registered whose class is
+/// unknown, or whose class id is outside the bitmap.
+///
+/// Fail-safe by construction — with no class to test, the only sound answer is
+/// "maybe", which is what the mutex path already gives.
+static OVERLAY_OWNER_CLASS_UNKNOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Per-object overlay lookups the class gate answered with no lock.
+static OVERLAY_CLASS_GATE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-object overlay lookups that fell through the gate to the mutex.
+static OVERLAY_CLASS_GATE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record that `owner_class` owns overlay state. **Call before publishing the
+/// owner** — see [`OVERLAY_OWNER_CLASS_BITS`] for why the order is the proof.
 #[inline]
-fn register_overlay_owner_key(owner_addr: usize, key: usize) -> usize {
+fn note_overlay_owner_class(owner_class: Option<u32>) {
+    let Some(cid) = owner_class else {
+        // No class to gate on. See `OVERLAY_OWNER_CLASS_UNKNOWN`.
+        OVERLAY_OWNER_CLASS_UNKNOWN.store(true, std::sync::atomic::Ordering::Release);
+        return;
+    };
+    let idx = (cid as usize) / 64;
+    if idx >= OVERLAY_CLASS_BITMAP_WORDS {
+        OVERLAY_OWNER_CLASS_UNKNOWN.store(true, std::sync::atomic::Ordering::Release);
+        return;
+    }
+    OVERLAY_OWNER_CLASS_BITS[idx].fetch_or(
+        1u64 << ((cid as usize) % 64),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Could an object of `class_id` own overlay state? `false` is definitive.
+#[inline]
+fn overlay_owner_class_possible(class_id: u32) -> bool {
+    if OVERLAY_OWNER_CLASS_UNKNOWN.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    let idx = (class_id as usize) / 64;
+    if idx >= OVERLAY_CLASS_BITMAP_WORDS {
+        return true;
+    }
+    OVERLAY_OWNER_CLASS_BITS[idx].load(std::sync::atomic::Ordering::Acquire)
+        & (1u64 << ((class_id as usize) % 64))
+        != 0
+}
+
+/// `(gate_hits, gate_misses)` — per-object overlay lookups answered without the
+/// mutex, and those that fell through to it.
+///
+/// The engagement pair. `gate_hits == 0` on a run with a live heap means the gate
+/// is on and inert, and the *result* is identical either way (an empty `Vec`), so
+/// nothing but this can tell the two apart. Reported at shutdown on
+/// `[GC] zgc-overlay-gate:`.
+pub fn overlay_class_gate_stats() -> (u64, u64) {
+    (
+        OVERLAY_CLASS_GATE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        OVERLAY_CLASS_GATE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Is the class gate disabled? See [`OVERLAY_OWNER_CLASS_UNKNOWN`].
+pub fn overlay_class_gate_disabled() -> bool {
+    OVERLAY_OWNER_CLASS_UNKNOWN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[inline]
+fn register_overlay_owner_key(owner_addr: usize, key: usize, owner_class: Option<u32>) -> usize {
+    // THE BIT BEFORE THE INSERT. A reader that misses the bit therefore ran
+    // before the insert, so there was nothing for it to find -- see
+    // `OVERLAY_OWNER_CLASS_BITS`.
+    note_overlay_owner_class(owner_class);
     let mut index = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -709,6 +830,80 @@ fn overlay_owner_still_at(owner_addr: usize, key: usize) -> bool {
 mod overlay_owner_liveness_tests {
     use super::*;
 
+    /// **The class gate answers an ordinary class with no lock, and never gates
+    /// away a class that DOES own overlay state.**
+    ///
+    /// # Why the counter is the assertion and the result cannot be
+    ///
+    /// `gc_overlay_roots_for_collection` returns an empty `Vec` for a
+    /// non-owning object either way — through the gate or through the mutex — so
+    /// no assertion on the return value can distinguish them. That is exactly the
+    /// shape of a change that is on and inert, which the *previous* attempt at
+    /// this optimisation turned out to be. The engagement counters are the only
+    /// instrument.
+    ///
+    /// # The half that matters is the second one
+    ///
+    /// Too permissive costs a lock. Too strict drops an overlay edge, which frees
+    /// the contents of a live collection. So the test registers an owner under a
+    /// class and then asserts that queries for that class do **not** take the
+    /// fast path.
+    #[test]
+    fn the_class_gate_skips_the_mutex_for_a_class_that_owns_nothing() {
+        // Relative to a baseline: this bitmap is process-global and cargo runs
+        // tests in parallel threads, so an absolute count would be a flake.
+        let never_owns: u32 = 51_001;
+        assert!(
+            !overlay_class_gate_disabled(),
+            "no test in this binary may register an owner with an unknown class --              that trips the process-global fail-safe and makes this assertion              depend on execution order. See TEST_OWNER_CLASS"
+        );
+        assert!(
+            !overlay_owner_class_possible(never_owns),
+            "a class that has never owned an overlay must be gated out"
+        );
+        let (h0, m0) = overlay_class_gate_stats();
+        assert!(gc_overlay_roots_for_collection(0x7000_0000, Some(never_owns)).is_empty());
+        let (h1, m1) = overlay_class_gate_stats();
+        assert_eq!(h1, h0 + 1, "the gate must have answered it");
+        assert_eq!(m1, m0, "and it must not have fallen through to the mutex");
+
+        // Now the direction that would corrupt the heap if it were wrong.
+        let owns: u32 = 51_002;
+        let key = register_overlay_owner_key(0x7000_1000, 0xFEED, Some(owns));
+        assert!(
+            overlay_owner_class_possible(owns),
+            "registering an owner must open the gate for its class -- the bit is              set BEFORE the map insert, so a reader can never miss an owner that              is already published"
+        );
+        let (h2, m2) = overlay_class_gate_stats();
+        let _ = gc_overlay_roots_for_collection(0x7000_1000, Some(owns));
+        let (h3, m3) = overlay_class_gate_stats();
+        assert_eq!(
+            h3, h2,
+            "a class that DOES own overlay state must never be gated out -- that              would free the contents of a live collection"
+        );
+        assert_eq!(m3, m2 + 1, "it must fall through to the mutex");
+
+        // And `None` cannot be gated: there is no class to test.
+        let (h4, _) = overlay_class_gate_stats();
+        let _ = gc_overlay_roots_for_collection(0x7000_2000, None);
+        assert_eq!(
+            overlay_class_gate_stats().0,
+            h4,
+            "a lookup with no class id must not take the fast path"
+        );
+
+        remove_overlay_owner_key(0x7000_1000, key);
+    }
+
+    /// A class id these tests register owners under.
+    ///
+    /// Deliberately a REAL id and not `None`: registering with no class trips
+    /// `OVERLAY_OWNER_CLASS_UNKNOWN`, which is process-global and would disable
+    /// the class gate for every other test in this binary -- making the gate's own
+    /// engagement test flaky depending on execution order. Fail-safe is the right
+    /// production behaviour and the wrong test fixture.
+    const TEST_OWNER_CLASS: u32 = 4242;
+
     fn object(addr: usize) -> ObjectRef {
         unsafe { ObjectRef::from_raw(addr as *mut u8) }
     }
@@ -720,7 +915,7 @@ mod overlay_owner_liveness_tests {
     fn dead_tenant_is_still_recorded_at_its_address() {
         let addr = 0x5EAD_0100_usize;
         let key = 0x5EAD_0101_usize;
-        register_overlay_owner_key(addr, key);
+        register_overlay_owner_key(addr, key, Some(TEST_OWNER_CLASS));
         assert!(
             overlay_owner_still_at(addr, key),
             "a tenant that has not been pruned must still be recorded at its address"
@@ -736,7 +931,7 @@ mod overlay_owner_liveness_tests {
         let old_addr = 0x5EAD_0200_usize;
         let new_addr = 0x5EAD_0300_usize;
         let key = 0x5EAD_0201_usize;
-        register_overlay_owner_key(old_addr, key);
+        register_overlay_owner_key(old_addr, key, Some(TEST_OWNER_CLASS));
         assert!(overlay_owner_still_at(old_addr, key));
 
         let mut pointer_map = cratonvm_types::PointerMap::default();
@@ -765,7 +960,7 @@ mod overlay_owner_liveness_tests {
         let old_addr = 0x5EAD_0400_usize;
         let new_addr = 0x5EAD_0500_usize;
         let key = 0x5EAD_0401_usize;
-        register_overlay_owner_key(old_addr, key);
+        register_overlay_owner_key(old_addr, key, Some(TEST_OWNER_CLASS));
         hm_int_fast_shard_for(key)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -830,7 +1025,7 @@ mod overlay_owner_liveness_tests {
         // this only ever bites on a compacting cycle.)
         let mut pointer_map = cratonvm_types::PointerMap::default();
         for i in 0..HOPS {
-            register_overlay_owner_key(addr(i), key(i));
+            register_overlay_owner_key(addr(i), key(i), Some(TEST_OWNER_CLASS));
             pointer_map.insert(addr(i), addr(i + 1));
         }
 
@@ -984,7 +1179,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     //    `gc_update_collection_overlay_refs` pass advances every relocated slot's
     //    `last_ptr` to the new address before the object is next observed.
     if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr && s.vm == vm) {
-        return register_overlay_owner_key(ptr, pack_obj_key(hash, slot.generation));
+        return register_overlay_owner_key(ptr, pack_obj_key(hash, slot.generation), Some(class_id));
     }
 
     // 2. Lone occupant of this hash bucket whose recorded pointer differs.
@@ -1029,7 +1224,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         let i = mine_idx.expect("mine_count == 1 implies an index was recorded");
         if slots[i].class_id == class_id {
             slots[i].last_ptr = ptr;
-            return register_overlay_owner_key(ptr, pack_obj_key(hash, slots[i].generation));
+            return register_overlay_owner_key(ptr, pack_obj_key(hash, slots[i].generation), Some(class_id));
         }
         // Different-class recycle: re-key + clear the stale overlay state.
         let stale_key = pack_obj_key(hash, slots[i].generation);
@@ -1044,7 +1239,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         // and cannot deadlock against a concurrent side-table op.
         drop(reg);
         clear_overlay_entries_for_key(stale_key, stale_owner);
-        return register_overlay_owner_key(ptr, pack_obj_key(hash, generation));
+        return register_overlay_owner_key(ptr, pack_obj_key(hash, generation), Some(class_id));
     }
 
     // 3. Genuine 32-bit collision among several simultaneously-live objects, or
@@ -1073,7 +1268,7 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         class_id,
         vm,
     });
-    register_overlay_owner_key(ptr, pack_obj_key(hash, generation))
+    register_overlay_owner_key(ptr, pack_obj_key(hash, generation), Some(class_id))
 }
 
 /// Pack a 32-bit identity hash and a 32-bit generation into the full-width
@@ -4289,7 +4484,9 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// of `iterator()` / `hasNext()` / `next()` to "no more elements". Measured
 /// 2026-08-11 on the pre-built binary against Temurin 25.0.3.9:
 ///
-///     new ArrayList<>(List.of("a","b","c")).equals(linkedList)
+/// ```text
+/// new ArrayList<>(List.of("a","b","c")).equals(linkedList)
+/// ```
 ///
 /// answered `true` on HotSpot and in `Compatible`, and **`false`** under
 /// `--jdk-only` — silently, no exception — because the `NoClassDefFoundError:
@@ -44145,6 +44342,7 @@ fn register_gc_root_provider() {
             roots_for_matching_owners: gc_overlay_roots_for_matching_owners,
             remap: gc_update_collection_overlay_refs,
             prune: gc_prune_dead_collection_overlays,
+            gate_stats: Some(|| { let (h, m) = overlay_class_gate_stats(); (h, m, overlay_class_gate_disabled()) }),
         },
     );
 }
@@ -44189,6 +44387,18 @@ pub fn gc_overlay_roots_for_collection(
     owner_addr: usize,
     owner_class_id: Option<u32>,
 ) -> Vec<ObjectRef> {
+    // THE CLASS GATE, before the mutex -- see `OVERLAY_OWNER_CLASS_BITS`. This
+    // runs once per MARKED OBJECT, and on any ordinary class the answer is a
+    // definitive no from two relaxed loads. `None` cannot be gated (there is no
+    // class to test) and falls through, which is correct: that caller is the
+    // per-OWNER predicate seed, not the per-object path.
+    if let Some(cid) = owner_class_id {
+        if !overlay_owner_class_possible(cid) {
+            OVERLAY_CLASS_GATE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Vec::new();
+        }
+        OVERLAY_CLASS_GATE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let keys = {
         let index = overlay_owner_keys()
             .lock()

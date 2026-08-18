@@ -1189,6 +1189,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_OSR` | JIT | `CRATONVM_JIT=osr` | opt-in | off | behaviour | snapshot | difftest, vm |
 | `CRATONVM_JIT_OSR_DEAD_LOCALS` | JIT | `CRATONVM_JIT=osr-dead-locals` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` | JIT | `CRATONVM_JIT=osr-dead-mask-blanket` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_OSR_EXC_TABLE` | JIT | `CRATONVM_JIT=osr-exc-table` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` | JIT | `CRATONVM_JIT=osr-seed-frame-slots` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_SINGLE_PC` | JIT | `CRATONVM_JIT=osr-single-pc` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` | JIT | `CRATONVM_JIT=osr-strip-all-high-halves` | opt-in | off | behaviour | snapshot | jit |
@@ -1422,6 +1423,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` | GC | `CRATONVM_GC=zgc-gen-minors-per-major` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` | GC | `CRATONVM_GC=zgc-gen-nursery-percent` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GEN_PROMOTION_AGE` | GC | `CRATONVM_GC=zgc-gen-promotion-age` | opt-in | off | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_MARK_CTX_DIRECT` | GC | `CRATONVM_GC=zgc-mark-ctx-direct` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_PARMARK` | GC | `CRATONVM_GC=zgc-parmark` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_RELOCATE` | GC | `CRATONVM_GC=zgc-relocate` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_STARTBITS` | GC | `CRATONVM_GC=zgc-startbits` | default-on | on | behaviour | snapshot | gc |

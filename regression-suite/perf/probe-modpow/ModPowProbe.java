@@ -6,7 +6,11 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.SecureRandom;
 import java.security.Signature;
+import java.util.Arrays;
 import java.util.Random;
+import javax.crypto.BadPaddingException;
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
 
 /**
  * The probe behind {@code perf/biginteger-modpow-has-no-montgomery-reduction-20260817}.
@@ -32,6 +36,7 @@ public final class ModPowProbe {
         probablePrime1024();
         rsaKeygen(reps);
         signSha256WithRsa();
+        rsaCipherDecrypt();
     }
 
     // ------------------------------------------------------------------
@@ -229,5 +234,50 @@ public final class ModPowProbe {
         }
         long ms = (System.nanoTime() - t0) / 1_000_000;
         System.out.println("SHA256withRSA sign x10: " + ms + " ms");
+    }
+
+    /**
+     * RSA private-key DECRYPT — the other half of the private-key path, and the
+     * one that reaches it through {@code javax.crypto.Cipher} rather than
+     * {@code Signature}. Gated on a round trip and on a corrupted ciphertext
+     * still raising {@link BadPaddingException}, because a CRT private op that
+     * silently returns a wrong value would otherwise show up here only as a
+     * pleasing number.
+     */
+    private static void rsaCipherDecrypt() throws Exception {
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+        kpg.initialize(2048);
+        KeyPair kp = kpg.generateKeyPair();
+        byte[] msg = "the other half of the private-key path".getBytes("UTF-8");
+
+        Cipher enc = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+        enc.init(Cipher.ENCRYPT_MODE, kp.getPublic());
+        byte[] ct = enc.doFinal(msg);
+
+        Cipher dec = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+        dec.init(Cipher.DECRYPT_MODE, kp.getPrivate());
+        if (!Arrays.equals(dec.doFinal(ct), msg)) {
+            throw new AssertionError("RSA decrypt did not round-trip");
+        }
+        // A flipped byte must still be refused, not decrypted to something.
+        byte[] bad = ct.clone();
+        bad[200] ^= 0x01;
+        try {
+            Cipher d2 = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+            d2.init(Cipher.DECRYPT_MODE, kp.getPrivate());
+            d2.doFinal(bad);
+            throw new AssertionError("a corrupted ciphertext must not decrypt");
+        } catch (BadPaddingException | IllegalBlockSizeException expected) {
+            // ok
+        }
+
+        long t0 = System.nanoTime();
+        for (int i = 0; i < 10; i++) {
+            Cipher d = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+            d.init(Cipher.DECRYPT_MODE, kp.getPrivate());
+            d.doFinal(ct);
+        }
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        System.out.println("RSA decrypt x10: " + ms + " ms");
     }
 }

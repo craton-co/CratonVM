@@ -230,10 +230,13 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 .into());
             };
             // An `Alg.Alias.Mac.<oid>` spelling resolves to the primary name
-            // first — see `provider_chain::canonical_service_algorithm`. The
-            // anonymous overload searches the chain in chain order.
-            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
-                None,
+            // first — but only through a provider this VM implements. A
+            // THIRD-PARTY provider's alias row names that provider's own MAC,
+            // not a rename this engine may answer; see
+            // `provider_chain::canonical_if_unrecognised_native_only`. The
+            // anonymous overload then searches the chain in chain order below,
+            // which is what hands such a name to its owner.
+            let algo = crate::jca::provider_chain::canonical_if_unrecognised_native_only(
                 "Mac",
                 &algo,
                 &mac_algorithm_supported,

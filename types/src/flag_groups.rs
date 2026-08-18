@@ -976,6 +976,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
     // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
     // the contrast is the reason these two carry a comment at all.
     // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
@@ -1232,6 +1233,11 @@ pub const INVENTORY: &[E] = &[
     // and not a rebuild.
     E { group: Group::GC, token: "zgc-gen-header-zero", on_key: Some("CRATONVM_ZGC_GEN_HEADER_ZERO"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-gen-dead-runs", on_key: Some("CRATONVM_ZGC_GEN_DEAD_RUNS"), off_key: None, off_word: Some("0") },
+    // C5 (2026-08-18). Hand the mark coordinator the heap's own `Arc` instead of
+    // a forwarding wrapper -- one fewer indirect call per marked object on the
+    // parallel path. Default-on and `0` restores the wrapper, so the A/B is one
+    // binary; the whole path is already opt-in behind `zgc-parmark`.
+    E { group: Group::GC, token: "zgc-mark-ctx-direct", on_key: Some("CRATONVM_ZGC_MARK_CTX_DIRECT"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
