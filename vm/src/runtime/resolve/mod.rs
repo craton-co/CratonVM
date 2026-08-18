@@ -97,7 +97,7 @@ pub use cratonvm_native_api::VmId;
 use crate::classloading::resolution::{ResolvedField, ResolvedMember, ResolvedMethod};
 use crate::classloading::{find_field_recursive, find_method_recursive, ClassId, ClassManager};
 use crate::error::{LinkageError, MethodCallFailed, VmError};
-use crate::types::ObjectRef;
+use crate::types::{ObjectRef, Value};
 use crate::vm::SharedVm;
 
 // ===========================================================================
@@ -811,6 +811,72 @@ impl<'a> MemberResolver<'a> {
             Some(hit) => CacheProbe::Hit(self.scope(hit.clone())),
             None => CacheProbe::Miss,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Constant-pool constants (`CONSTANT_Dynamic` and friends)
+    // -----------------------------------------------------------------
+
+    /// Ask the per-`(class, cp-index)` record for an already-resolved
+    /// `CONSTANT_Dynamic`, `CONSTANT_MethodType` or `CONSTANT_MethodHandle`.
+    ///
+    /// JVMS §5.4.3 resolves a symbolic reference **once** per constant-pool
+    /// entry and records the result; these three tags share one store because a
+    /// CP index has exactly one tag, so their keys cannot collide. This pair is
+    /// the entry point the bypass allowlist's `constants.rs` row named as
+    /// missing — before it, `ldc` reached `shared.classes.resolution_cache`
+    /// directly, and each new constant tag that learned to cache added another
+    /// raw reach (`CONSTANT_MethodType` and `CONSTANT_MethodHandle` took the
+    /// row from 2 sites to 5 without anyone deciding to).
+    ///
+    /// Returns [`CacheProbe::Miss`] when nothing is recorded. As with
+    /// [`Self::probe_method_ref`], there is no encoding of "recorded: absent" —
+    /// only successful resolutions are stored.
+    pub fn probe_constant(
+        &self,
+        caller: VmScoped<ClassId>,
+        cp_index: u16,
+    ) -> CacheProbe<VmScoped<Value>> {
+        let Ok(caller_id) = self.adopt(caller) else {
+            return CacheProbe::Miss;
+        };
+        match self
+            .shared
+            .classes
+            .resolution_cache
+            .read()
+            .get_condy(caller_id, cp_index)
+        {
+            Some(hit) => CacheProbe::Hit(self.scope(*hit)),
+            None => CacheProbe::Miss,
+        }
+    }
+
+    /// Record the result of resolving one constant-pool constant.
+    ///
+    /// The write half of [`Self::probe_constant`]. A `Value` here is a live
+    /// heap reference for the object tags, which is why it is `VmScoped`: the
+    /// collector scans and remaps this store (`for_each_condy_root` /
+    /// `update_condy_refs`) as roots of **this** VM, so a value from another
+    /// VM's heap recorded here would be remapped against the wrong heap.
+    ///
+    /// A caller that cannot prove the VM silently records nothing rather than
+    /// recording it against the wrong one — the same fail-closed direction the
+    /// probes take.
+    pub fn record_constant(
+        &self,
+        caller: VmScoped<ClassId>,
+        cp_index: u16,
+        value: VmScoped<Value>,
+    ) {
+        let (Ok(caller_id), Ok(value)) = (self.adopt(caller), self.adopt(value)) else {
+            return;
+        };
+        self.shared
+            .classes
+            .resolution_cache
+            .write()
+            .put_condy(caller_id, cp_index, value);
     }
 
     // -----------------------------------------------------------------
