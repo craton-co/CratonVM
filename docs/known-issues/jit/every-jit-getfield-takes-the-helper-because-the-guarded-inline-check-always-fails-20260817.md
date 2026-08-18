@@ -729,3 +729,54 @@ faithfully reported every legacy allocation that went through
 legacy receivers — because the TLAB fast path, ~99% of all allocations, does not
 call the planner. An absence in a census is only evidence if you know the census
 covers the path.
+
+## ZGC residual, part 1: stop asking `is_object_address` (2026-08-18, ~1.05x)
+
+The walk is **validation**, not correctness — it defends against a stale
+receiver from a miscompiled frame. Where the IR types the base node `Ref` we
+already have that proof; it is the same proof the PRIMITIVE trusted-oop arm
+relies on, and that arm goes further and does a raw inline load off the very
+same receiver. So the reference slow path now tells the helper to skip it.
+
+**This is not the thing the page refused to do.** The colouring hazard is about
+the loaded VALUE; containment validates the RECEIVER. Nothing here inlines a
+coloured load, publishes `JIT_REGION_BOUNDS`, or touches the inline path.
+
+Carried as a bit in `field_index` (`GETFIELD_RECEIVER_PROVEN_OOP`), not a new
+helper slot: `helpers_abi.rs` pins the table's field count, byte size and golden
+offsets with const assertions plus an ABI version, all so the offsets the JIT
+bakes cannot move. A first attempt added a slot and the guards refused it,
+correctly.
+
+| check | result |
+|---|---|
+| engagement | **34 470 791 of 34 470 791** helper calls take it — 100% |
+| checksum, all three collectors | **MATCH** |
+| ZGC wall, 3 interleaved rounds | 5708→5420, 5646→5448, 5653→5378 — **~1.05x** |
+| Generational / G1 | **0 helper calls** — unaffected, and measured so rather than argued |
+
+### Why only 5% when the walk profiled at 20.6%
+
+Because `getfield` was only about half of it. After the change:
+
+| symbol | before | after |
+|---|---|---|
+| `ZObjectStarts::contains` | 11.08% | **6.40%** |
+| `ZgcRealHeap::is_object_address` | 9.54% | **5.57%** |
+
+Roughly half the membership-walk traffic survives, from **other** helpers
+(`jit_putfield_*`, the array helpers) that still validate their receiver the
+same way. Extending the same proven-oop argument to them is the obvious next
+step and is not done here.
+
+**The Generational A/B rounds also moved (~2-6%) and that was noise**, not an
+effect: the engagement counter reads 0 helper calls there, so this change cannot
+reach it. Recorded because a 6% shift on a shared host is exactly the size that
+invites a false claim — on this page a configuration A/B has already produced
+one.
+
+### What now dominates on ZGC
+
+`try_jit_site_cached_native_dispatch` 8.81% + `safe_native_call_impl` 8.33% —
+per-call native dispatch, a different page — and `jit_getfield`'s own remaining
+body at 16.31%. The membership walk is no longer the single largest item.
