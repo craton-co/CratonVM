@@ -135,7 +135,33 @@ The fix is a per-thread POSITIVE memo which answers only "yes":
 
 Kill switch `CRATONVM_G1_NO_LIVE_REGION_MEMO=1`. Engagement counter
 `CRATONVM_DBG_G1_LIVE_MEMO=1`, where a hit is one `regions.lock()` that did not
-happen.
+happen. On 3 000 pcap iterations it reads:
+
+```
+[g1-live-memo] FINAL hit=42223615 miss=553301 hit_rate=98.7%
+```
+
+**42.2 million mutex acquire/release pairs removed from one 3 000-iteration
+run** — about 14 000 per iteration. Read that second number twice: it is not a
+statement about the memo, it is a statement about how often this VM asks
+"is this address a live object?" at all, and it is the larger residual (§4).
+
+Do not time a run with that counter on. It is 42 M contended atomic increments
+that the OFF arm does not pay, which makes the instrument a variable of its own
+comparison — the same trap as timing a build with one arm instrumented. The
+load-independent measurement is the profile share, taken with the counter off,
+`-F 199 -g`, 4 000 iterations:
+
+| symbol | memo OFF | memo ON |
+|---|---:|---:|
+| `is_addr_in_live_region` | **11.64%** | 6.32% |
+| `is_object_address` | 1.43% | 4.43% |
+| **the pair** | **13.07%** | **10.75%** |
+
+Both rows have to be read together: with the memo on, the early return inlines
+back into its caller, so part of what leaves one row reappears in the other.
+The pair is the honest figure — **-2.3 percentage points of the whole
+process**, or about a sixth of what that pair used to cost.
 
 ### 2b. The interpreted `new` re-resolved its class on every execution
 
@@ -166,7 +192,22 @@ filled in that window could otherwise allocate past a class that went
 Erroneous.
 
 Kill switch `CRATONVM_JIT_NO_NEW_SITE_CACHE=1`. `CRATONVM_DBG=field-site` now
-reports a `new:` arm beside the other two.
+reports a `new:` arm beside the other two, and on the pcap loop it reads
+`new: hit=5269 miss=1651 fill=1651 reject_loader=0` — a 76% hit rate.
+
+**That count is also this fix's own limit, and it is worth stating plainly.**
+Once §1 lets `Magazine.allocate` compile, only about seven thousand `new`s in
+the whole run are still interpreted, because a compiled `new` uses the JIT's
+own inline-TLAB path and never reaches this arm. On THIS workload the cache is
+therefore a small effect that the host cannot resolve. Its reach is on
+class-loading-heavy and interpreter-heavy work, where the same counter will
+report a much larger population; it is landed here because the defect is real
+and the profile named it, not because this loop is where it pays.
+
+It is also withdrawn automatically whenever `CRATONVM_DBG_H2TRACE`,
+`CRATONVM_DBG_LOADER_TRACE` or `CRATONVM_NSEE_TRACE` is armed: a hit skips the
+class-name derivation all three print from, and an instrument that silently
+reports a SUBSET of the sites it is asked about is worse than none.
 
 ## 3. The correction — `new Object()` was never 674 ns of allocation
 
@@ -217,17 +258,33 @@ closing that. What it no longer contains is a mystery:
 * `perf-bintrees-9x-gap-characterised` is the same question on a different
   workload and stays open on its own terms.
 
-**A note on this host for whoever measures next.** The shared Azure box has no
-PMU — `perf stat -e instructions` answers `<not supported>` — and its load
-average moved between 6 and 33 during this work, which is far more than any of
-these effects. A wall-clock A/B of the reduced loop put ON ahead of OFF in 4 of
-5 interleaved rounds, mean 1243 → 1144 µs/iteration (**-8.0%**), at load ~12; a
-later leave-one-out round at load ~30 could not separate the arms at all and
-put `all-off` ahead of `all-on` in one round out of four. Do not read that
-second round as a null result for the fixes — read it as the instrument
-failing. **Every claim on this page is a count, a profile share, or a
-controlled ratio, and each fix ships with the counter that says whether it
-fired.** Size anything here with those first.
+* The call VOLUME behind §2a — **~14 000 `is_object_address` queries per pcap
+  iteration** — is untouched by this work and is the bigger of the two
+  quantities. The memo made each query cheaper; nothing here asked why there
+  are that many. That is the next question on this workload, and it is a
+  question about the conservative root scan and the native-call pin path, not
+  about G1.
+
+**A note on this host, for whoever measures next — this is the reusable part.**
+
+The shared Azure box has **no PMU**: `perf stat -e instructions` answers
+`<not supported>`, so the obvious load-independent instrument is unavailable.
+Its load average moved between 6 and 33 during this work.
+
+A first 5-round interleaved wall-clock A/B looked clean — ON ahead in 4 of 5
+rounds, 1243 → 1144 µs/iteration, **-8.0%**. A later 24-run set with the SAME
+configuration measured twice per round says that number was luck: the two
+identical `all-on` arms within one round differed by up to **1.6x**, and across
+rounds the same arm spread **1.9x** (655 to 1223 µs). **The instrument's
+repeatability is larger than every effect on this page.** The -8.0% is not
+reported above as a result, and should not be quoted as one.
+
+That is why every claim here is a **count**, a **profile share**, or a
+**controlled ratio**, and why each fix ships with the counter that says whether
+it fired: `hot_but_stuck_in_interpreter`, `new: hit/miss/fill`,
+`[g1-live-memo] hit/miss`. An inert change reads as `hit=0` in a second,
+whatever the clock says. Size anything here with those first, and do not open a
+wall-clock A/B on this box for anything under about 2x.
 
 ## Repro
 
