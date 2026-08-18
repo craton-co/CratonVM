@@ -128,10 +128,37 @@ const METHOD_SLOT_MEMO_CAP: usize = 8192;
 
 /// Maps `(ClassId, fnv1a64(name, descriptor))` to an index into
 /// [`Class::methods`].
-fn method_slot_memo() -> &'static RwLock<FxHashMap<(u32, u64), u32>> {
-    static MEMO: std::sync::OnceLock<RwLock<FxHashMap<(u32, u64), u32>>> =
-        std::sync::OnceLock::new();
-    MEMO.get_or_init(|| RwLock::new(fx_hashmap()))
+///
+/// PERF (2026-08-18): THREAD-LOCAL, not a shared `RwLock<FxHashMap<..>>`.
+///
+/// This memo is consulted once per FRAME of every stack capture, so a shared
+/// lock is taken `depth` times per `Thread.getStackTrace()` /
+/// `StackWalker.walk` / throwable construction. That is what makes capture cost
+/// scale with stack depth: measured on `probes/StackWalkerTerminationProbe`,
+/// CratonVM went 527 ms at depth 2 to 17,098 ms at depth 120 (32x for 60x the
+/// depth) where HotSpot went 57 ms to 187 ms (3.3x) — and
+/// `find_method_index_memoized` was the single largest symbol in the
+/// `QuartzEndpointWebIntegrationTests` profile at 18.1%.
+///
+/// Going thread-local is a pure win here and changes no semantics:
+///
+/// * The memo is **advisory**. Every hit is re-verified against the live class
+///   (`class.methods[idx]`'s name and descriptor must match) before it is used,
+///   and a miss falls through to the authoritative linear scan. A per-thread
+///   map that has not yet seen an entry another thread has behaves exactly like
+///   a cold memo, which is already a supported state.
+/// * The retention argument is unchanged — the value is a `u32`, `ClassId`s are
+///   monotonic and never reused, and `class_store.get` fails before the memo is
+///   consulted for an unloaded class.
+/// * The cap is now per thread. `METHOD_SLOT_MEMO_CAP` entries at 16 bytes is
+///   ~128 KiB per thread that actually captures stacks, against a global map
+///   every capturing thread contended on.
+fn with_method_slot_memo<R>(f: impl FnOnce(&mut FxHashMap<(u32, u64), u32>) -> R) -> R {
+    thread_local! {
+        static MEMO: std::cell::RefCell<FxHashMap<(u32, u64), u32>> =
+            std::cell::RefCell::new(fx_hashmap());
+    }
+    MEMO.with(|m| f(&mut m.borrow_mut()))
 }
 
 /// FNV-1a over `name` then `descriptor`, with a separator so
@@ -170,7 +197,7 @@ fn find_method_index_memoized(
 ) -> Option<u32> {
     let key = (class_id.as_u32(), signature_hash(name, descriptor));
 
-    let memoized = method_slot_memo().read().get(&key).copied();
+    let memoized = with_method_slot_memo(|m| m.get(&key).copied());
     if let Some(idx) = memoized {
         if let Some(m) = class.methods.get(idx as usize) {
             if &*m.name == name && &*m.descriptor == descriptor {
@@ -188,13 +215,12 @@ fn find_method_index_memoized(
         .position(|m| &*m.name == name && &*m.descriptor == descriptor)?;
     let idx = u32::try_from(idx).ok()?;
 
-    {
-        let mut w = method_slot_memo().write();
-        if w.len() >= METHOD_SLOT_MEMO_CAP {
-            w.clear();
+    with_method_slot_memo(|m| {
+        if m.len() >= METHOD_SLOT_MEMO_CAP {
+            m.clear();
         }
-        w.insert(key, idx);
-    }
+        m.insert(key, idx);
+    });
     Some(idx)
 }
 
@@ -215,7 +241,7 @@ fn find_method_memoized<'a>(
 /// correctness (every hit is verified) — exists so unit tests can assert the
 /// cold path and the warm path agree.
 pub fn clear_method_slot_memo() {
-    method_slot_memo().write().clear();
+    with_method_slot_memo(|m| m.clear());
 }
 
 /// Look up the source-line corresponding to `bci` in the method's
@@ -798,9 +824,9 @@ mod tests {
         // Absent method: must not be memoized (a redefinition may add it).
         assert_eq!(line_number_for_bci(&store, cid, "absent", "()V", 0), None);
         assert!(
-            !method_slot_memo()
-                .read()
-                .contains_key(&(cid.as_u32(), signature_hash("absent", "()V"))),
+            !with_method_slot_memo(|m| {
+                m.contains_key(&(cid.as_u32(), signature_hash("absent", "()V")))
+            }),
             "a failed lookup must never be memoized"
         );
     }
