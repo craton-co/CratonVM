@@ -513,6 +513,304 @@ use cratonvm_types::access_flags::{
 // written out rather than derived from one another for that reason.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The identity a JDK reflection message NAMES, and the five grammars that
+// print it (G69-1)
+// ---------------------------------------------------------------------------
+//
+// Every refusal on the `Field` path names the FIELD -- its declaring class, its
+// name, its type and its modifiers -- and most of them also name the value or
+// the receiver that was rejected. None of ours did. `Field.setInt` on a
+// `static final int` answered
+//
+//     Can not set static final field via Field.set: Field typed setter
+//
+// where HotSpot answers
+//
+//     Can not set static final int field PD$H.I to (int)9
+//
+// -- the internal operation label where the field belongs, and, on the ranks
+// that print a descriptor, the raw JVM spelling (`I`, `Ljava/lang/String;`)
+// where a Java type name belongs.
+//
+// The exception TYPES and the precedence lattice above were already right: 71
+// of 71 probe rows agreed on both, and every one of them disagreed on the text.
+// So nothing here changes what is thrown or when -- only what it says. That is
+// not cosmetic. A reflective write that fails is diagnosed by reading the
+// message, and ours named neither the field nor the value.
+//
+// FIVE grammars, measured on Temurin 25.0.3
+// (`scratchpad/g71/{PD,PE,PF,PG}.java`). They are NOT uniform, and the
+// simplification anyone would reach for is wrong in three separate places:
+//
+//   1. "Can not set[ static][ final] <ty> field <Q> to <attempted>"
+//        ranks 3, 5 and 6, plus the GENERIC setter's rank 4.
+//   2. "Can not set[ static][ final] <ty> field <Q> on <recvClass>"
+//        the TYPED setter's rank 4.
+//   3. "Can not get[ static][ final] <ty> field <Q> on <recvClass>"
+//        every getter's rank 4.
+//   4. "Attempt to get <ty> field \"<Q>\" with illegal data type conversion to
+//      <target>" -- every getter's rank 3. The name is QUOTED here and nowhere
+//      else, and this grammar carries NO modifiers: measured on a
+//      `static final int`, which prints `Attempt to get int field "PD$H.I"`.
+//      Grammars 1-3 DO carry them -- including on a final instance field's
+//      bad-receiver row, which is the one place a `final` can reach rank 4.
+//   5. `NullPointerException` with a NULL message for a null receiver --
+//      except the generic `Field.set`, which is HotSpot's helpful NPE naming
+//      the JDK's own local: `Cannot invoke "Object.getClass()" because "o" is
+//      null`.
+//
+// And one quirk nobody derives: the generic `set(Object,Object)` given a
+// wrong-typed RECEIVER prints that receiver after `to`, not after `on` --
+//
+//     f.set(new Other(), "ARG")   ->   Can not set int field PF$H.nf to PF$Other
+//
+// -- naming the receiver in the sentence position that every other rank-6 row
+// fills with the VALUE. Confirmed against a distinctive `String` argument and
+// against a `null` one; both still print `PF$Other`.
+
+/// `Class.getName()` for a field descriptor -- the spelling every JDK
+/// reflection message uses for a field's type.
+///
+/// Deliberately NOT [`array_descriptor_to_type_name`], which renders `int[]`:
+/// these messages come from `Field.getType().getName()`, so an array field
+/// prints `[I` and `[[Ljava.lang.String;`. `G68-1` section 3a reached for the
+/// `int[]` speller in `NoSuchMethodException` and was wrong for exactly this
+/// reason -- the helper that already exists is not the helper that is wanted,
+/// and its existence is what makes the wrong one look right.
+pub(crate) fn descriptor_get_name(desc: &str) -> String {
+    if let Some(p) = primitive_descriptor_name(desc) {
+        return p.to_string();
+    }
+    if desc.starts_with('[') {
+        return desc.replace('/', ".");
+    }
+    match desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        Some(inner) => inner.replace('/', "."),
+        None => desc.replace('/', "."),
+    }
+}
+
+/// The internal (slash-form) class name of an ARRAY object: `[I`,
+/// `[Ljava/lang/String;`, `[[Ljava/lang/String;`.
+///
+/// An array's `class_id_of_object` is NOT its own class: for a reference array
+/// it is the COMPONENT's id, and for a primitive array it is `ClassId(0)`. So
+/// `class_name_of_id` on an array answers `java.lang.Object` for an `int[]` and
+/// silently drops a dimension from a `String[][]` -- which is exactly what the
+/// reflection messages printed before this existed.
+///
+/// `Object.getClass()` has always known this and computed the descriptor
+/// itself. This IS that computation, lifted so the two cannot disagree; the
+/// `Cow` keeps the eight primitive cases allocation-free, which is the property
+/// its comment in `native_object_get_class` was protecting.
+pub(crate) fn array_class_internal_name(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+) -> std::borrow::Cow<'static, str> {
+    use cratonvm_types::ArrayElementType as A;
+    use std::borrow::Cow;
+    match ctx.heap_element_type_of(arr) {
+        A::Boolean => Cow::Borrowed("[Z"),
+        A::Char => Cow::Borrowed("[C"),
+        A::Float => Cow::Borrowed("[F"),
+        A::Double => Cow::Borrowed("[D"),
+        A::Byte => Cow::Borrowed("[B"),
+        A::Short => Cow::Borrowed("[S"),
+        A::Int => Cow::Borrowed("[I"),
+        A::Long => Cow::Borrowed("[J"),
+        A::Reference => {
+            // The component class id lives in the array header.
+            let comp = ctx
+                .class_name_of_id(ctx.class_id_of_object(arr))
+                .unwrap_or_else(|| "java/lang/Object".to_string());
+            if comp.starts_with('[') {
+                Cow::Owned(format!("[{comp}"))
+            } else {
+                Cow::Owned(format!("[L{comp};"))
+            }
+        }
+    }
+}
+
+/// `obj.getClass().getName()`, arrays included.
+fn class_get_name_of(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        return array_class_internal_name(ctx, obj).replace('/', ".");
+    }
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+        .map(|n| n.replace('/', "."))
+        .unwrap_or_default()
+}
+
+/// The generic `set(Object,Object)`'s rendering of the value it refused:
+/// `arg.getClass().getName()`, or the literal `null value` for a null.
+fn attempted_value_name(ctx: &dyn NativeContext, v: Value) -> String {
+    match v {
+        Value::Object(None) => "null value".to_string(),
+        Value::Object(Some(o)) => class_get_name_of(ctx, o),
+        // A bare primitive cannot reach `Field.set(Object,Object)` from Java
+        // bytecode -- the call site boxes. Render the box class rather than
+        // leaving a hole for a hand-assembled call to fall into.
+        Value::Int(_) => "java.lang.Integer".to_string(),
+        Value::Long(_) => "java.lang.Long".to_string(),
+        Value::Float(_) => "java.lang.Float".to_string(),
+        Value::Double(_) => "java.lang.Double".to_string(),
+        _ => "null value".to_string(),
+    }
+}
+
+/// The typed accessors' rendering of the value they refused, as it appears
+/// inside `(int)9`.
+///
+/// Rendered at the type NAMED IN THE MESSAGE, which is not always the field's.
+/// A LEGAL widening reports the FIELD's type and the widened value --
+/// `setChar('z')` into an `int` field prints `(int)122`, the numeric value,
+/// not `z`. An ILLEGAL one is refused at rank 3 before any conversion and
+/// reports the SETTER's type and the unconverted value -- `setLong(9L)` into
+/// an `int` field prints `(long)9`. Both measured; neither follows from the
+/// other.
+fn render_prim_as(ty: &str, v: Value) -> String {
+    let as_i64 = |v: Value| -> i64 {
+        match v {
+            Value::Int(i) => i as i64,
+            Value::Long(l) => l,
+            Value::Float(f) => f as i64,
+            Value::Double(d) => d as i64,
+            _ => 0,
+        }
+    };
+    match ty {
+        "boolean" => (as_i64(v) != 0).to_string(),
+        "char" => char::from_u32((as_i64(v) as u32) & 0xFFFF)
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        "float" => cratonvm_types::java_float_to_string(match v {
+            Value::Float(f) => f,
+            Value::Double(d) => d as f32,
+            other => as_i64(other) as f32,
+        }),
+        "double" => cratonvm_types::java_double_to_string(match v {
+            Value::Double(d) => d,
+            Value::Float(f) => f as f64,
+            other => as_i64(other) as f64,
+        }),
+        _ => as_i64(v).to_string(),
+    }
+}
+
+/// The field identity the grammars above are built from, read once per accessor
+/// call and threaded down the lattice in place of the bare operation label the
+/// ranks used to carry.
+///
+/// Threading a struct rather than widening each helper's `&str` is what keeps
+/// the ranks honest: every rank now prints the same field the same way, so the
+/// spellings of a refusal cannot drift apart the way the message and the
+/// exception type already had.
+pub(crate) struct FieldIdent {
+    /// `PD$H.I` -- `declaringClass.getName() + "." + name`.
+    qualified: String,
+    /// `int`, `java.lang.String`, `[I` -- `getType().getName()`.
+    ty: String,
+    is_static: bool,
+    is_final: bool,
+}
+
+impl FieldIdent {
+    /// Grammars 1-3: `Can not <verb>[ static][ final] <ty> field <Q> <prep> <what>`.
+    fn cannot(&self, verb: &str, prep: &str, what: &str) -> String {
+        let mut s = String::from("Can not ");
+        s.push_str(verb);
+        if self.is_static {
+            s.push_str(" static");
+        }
+        if self.is_final {
+            s.push_str(" final");
+        }
+        s.push(' ');
+        s.push_str(&self.ty);
+        s.push_str(" field ");
+        s.push_str(&self.qualified);
+        s.push(' ');
+        s.push_str(prep);
+        s.push(' ');
+        s.push_str(what);
+        s
+    }
+
+    /// Grammar 1 -- the value a write was refused for.
+    fn set_to(&self, attempted: &str) -> String {
+        self.cannot("set", "to", attempted)
+    }
+
+    /// Grammar 4 -- quoted name, and NO modifiers. See the block above; making
+    /// this match grammars 1-3 is the plausible wrong answer.
+    fn get_conversion(&self, target: &str) -> String {
+        format!(
+            "Attempt to get {} field \"{}\" with illegal data type conversion to {}",
+            self.ty, self.qualified, target
+        )
+    }
+
+    /// Grammar 1 for a TYPED setter, whose value prints as `(<ty>)<value>`.
+    fn set_to_prim(&self, ty: &str, v: Value) -> String {
+        self.set_to(&format!("({}){}", ty, render_prim_as(ty, v)))
+    }
+
+    /// The field's own type name, for the rank-5 rendering of a legal widening.
+    fn ty(&self) -> &str {
+        &self.ty
+    }
+}
+
+#[cfg(test)]
+impl FieldIdent {
+    /// For the pure-Rust helper tests below, which have no VM to read a real
+    /// `Field` from.
+    fn for_test(qualified: &str, ty: &str, modifiers: i32) -> Self {
+        FieldIdent {
+            qualified: qualified.to_string(),
+            ty: ty.to_string(),
+            is_static: (modifiers & ACC_STATIC) != 0,
+            is_final: (modifiers & ACC_FINAL) != 0,
+        }
+    }
+}
+
+/// Read the identity once, from the meta the accessor already resolved.
+fn field_ident(
+    ctx: &dyn NativeContext,
+    field_obj: ObjectRef,
+    class_id: ClassId,
+    descriptor: &str,
+    modifiers: i32,
+) -> FieldIdent {
+    let decl = ctx
+        .class_name_of_id(class_id)
+        .map(|n| n.replace('/', "."))
+        .unwrap_or_default();
+    let name = match ctx.get_field_by_name(field_obj, "name") {
+        Value::Object(Some(n)) => ctx.read_string(n).unwrap_or_default(),
+        _ => String::new(),
+    };
+    FieldIdent {
+        qualified: format!("{decl}.{name}"),
+        ty: descriptor_get_name(descriptor),
+        is_static: (modifiers & ACC_STATIC) != 0,
+        is_final: (modifiers & ACC_FINAL) != 0,
+    }
+}
+
+/// HotSpot's helpful `NullPointerException` for the generic `Field.set` with a
+/// null receiver, naming the JDK's own local variable in `ensureObj`.
+///
+/// Transcribed rather than derived, and brittle by nature: it is produced by
+/// the real JDK's own bytecode, so it is pinned to the oracle this suite runs
+/// against. The typed setters and every getter answer a NULL message on the
+/// same input -- which is why this is a constant at one call site rather than
+/// one rule for all five entry points.
+const ENSURE_OBJ_NPE: &str = "Cannot invoke \"Object.getClass()\" because \"o\" is null";
+
 /// WP2.1-field вЂ” final-field write check for `Field.set*`.
 ///
 /// RANK 5 of the precedence lattice above: below the typed accessor's descriptor
@@ -532,34 +830,23 @@ use cratonvm_types::access_flags::{
 ///     fine-grained record/hidden-class differentiation belongs in a
 ///     follow-up вЂ” for now we conservatively reject the write.
 fn check_final_for_set(
-    modifiers: i32,
+    ident: &FieldIdent,
     accessible: bool,
-    member_desc: &str,
+    attempted: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    if (modifiers & ACC_FINAL) == 0 {
+    if !ident.is_final {
         return Ok(());
     }
-    let is_static = (modifiers & ACC_STATIC) != 0;
-    // Static-final: hard-disallowed regardless of `setAccessible`.
-    if is_static {
+    // Both refusals print GRAMMAR 1, differing only by whether `static` appears
+    // in the modifier run -- which `FieldIdent` already knows. They used to
+    // print two different internal labels, and neither named the field.
+    //
+    // The CONDITION is unchanged: a static final is refused regardless of
+    // `setAccessible`, an instance final only without it.
+    if ident.is_static || !accessible {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalAccessException {
-                message: format!(
-                    "Can not set static final field via Field.set: {}",
-                    member_desc,
-                ),
-            }
-            .into(),
-        );
-    }
-    // Instance-final: requires `setAccessible(true)`.
-    if !accessible {
-        return Err(
-            cratonvm_types::error::RuntimeError::IllegalAccessException {
-                message: format!(
-                    "Can not set final field without setAccessible(true): {}",
-                    member_desc,
-                ),
+                message: ident.set_to(attempted),
             }
             .into(),
         );
@@ -781,13 +1068,19 @@ fn reflective_target_class_id(
 fn null_receiver_on_instance_field(
     is_static: bool,
     receiver: Option<ObjectRef>,
-    operation: &str,
+    npe_message: Option<&str>,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if is_static || receiver.is_some() {
         return Ok(());
     }
+    // GRAMMAR 5. Four of the five entry points answer a NULL message here; only
+    // the generic `Field.set` carries text, and that text is HotSpot's own
+    // helpful NPE rather than anything of ours. Taking the message as an
+    // argument instead of building it from an operation label is what lets the
+    // five differ -- composing it here is what made all five identical, and
+    // wrong.
     Err(cratonvm_types::error::RuntimeError::NullPointerException {
-        message: Some(format!("{operation}: null receiver for instance field")),
+        message: npe_message.map(|m| m.to_string()),
     }
     .into())
 }
@@ -844,7 +1137,9 @@ fn reflective_receiver_type_check(
     is_static: bool,
     declaring_class_id: ClassId,
     receiver: Option<ObjectRef>,
-    operation: &str,
+    ident: &FieldIdent,
+    verb: &str,
+    prep: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if is_static || declaring_class_id.as_u32() == UNRESOLVED_DECLARING_CLASS_ID {
         return Ok(());
@@ -859,8 +1154,14 @@ fn reflective_receiver_type_check(
     if crate::lang_reflect::is_subclass_or_unreadable(ctx, receiver_cid, declaring_class_id) {
         return Ok(());
     }
-    Err(illegal_arg_exc(format!(
-        "{operation}: object is not an instance of declaring class"
+    // GRAMMARS 2 and 3 -- and the quirk that forces `prep` to be a parameter:
+    // the GENERIC setter passes `"to"` here, so a wrong-typed receiver prints in
+    // the sentence position every other rank-6 row fills with the VALUE. The
+    // typed setters and all the getters pass `"on"`. Measured, not derived.
+    Err(illegal_arg_exc(ident.cannot(
+        verb,
+        prep,
+        &class_get_name_of(&*ctx, recv),
     )))
 }
 
@@ -5081,6 +5382,33 @@ pub(crate) fn coerce_arg_strict(
     context: &str,
     near: Option<cratonvm_types::ClassId>,
 ) -> Result<Value, MethodCallFailed> {
+    coerce_arg_strict_msg(ctx, value, expected_desc, context, near, None)
+}
+
+/// [`coerce_arg_strict`] with the mismatch message chosen by the caller.
+///
+/// `argument type mismatch` is JDK-faithful for `Method.invoke` and
+/// `Constructor.newInstance` -- and ONLY for those. `Field.set` refuses the same
+/// values with a sentence that names the field and the value
+/// (`Can not set int field P$H.nf to java.lang.String`), so it passes its own in
+/// rather than inheriting a message written for a different caller. The note
+/// below is still right about where it came from; it was just being applied one
+/// caller too widely, which is the same shape as `G66-1` and `G68-1` section 2.
+pub(crate) fn coerce_arg_strict_msg(
+    ctx: &dyn NativeContext,
+    value: Value,
+    expected_desc: &str,
+    context: &str,
+    near: Option<cratonvm_types::ClassId>,
+    mismatch_message: Option<&str>,
+) -> Result<Value, MethodCallFailed> {
+    let mismatch = || {
+        illegal_arg_exc(
+            mismatch_message
+                .unwrap_or("argument type mismatch")
+                .to_string(),
+        )
+    };
     // WP2.1-field вЂ” operand-stack tag-erasure recovery for J/D.
     //
     // `CompactValue::to_value()` on an untagged 64-bit slot cannot tell
@@ -5126,19 +5454,19 @@ pub(crate) fn coerce_arg_strict(
                     // a descriptive message would diverge from HotSpot.
                     let _ = src;
                     widen_primitive_value(value, src, expected_desc)
-                        .ok_or_else(|| illegal_arg_exc("argument type mismatch".to_string()))
+                        .ok_or_else(|| mismatch())
                 }
                 Value::Object(Some(obj)) => {
                     let wrapper_cid = ctx.class_id_of_object(obj);
                     let wrapper_name = ctx.class_name_of_id(wrapper_cid).unwrap_or_default();
                     let src_prim = wrapper_to_prim_desc(&wrapper_name).ok_or_else(|| {
                         // JDK-faithful "argument type mismatch" (see note above).
-                        illegal_arg_exc("argument type mismatch".to_string())
+                        mismatch()
                     })?;
                     if !wrapper_matches_primitive(&wrapper_name, expected_desc)
                         && !widening_allowed(src_prim, expected_desc)
                     {
-                        return Err(illegal_arg_exc("argument type mismatch".to_string()));
+                        return Err(mismatch());
                     }
                     // WP2.2 fix: read the wrapper's `value` field by name.
                     // Slot 0 is unreliable when the real JDK Byte/Short/Integer
@@ -5152,9 +5480,9 @@ pub(crate) fn coerce_arg_strict(
                         v => v,
                     };
                     widen_primitive_value(raw, src_prim, expected_desc)
-                        .ok_or_else(|| illegal_arg_exc("argument type mismatch".to_string()))
+                        .ok_or_else(|| mismatch())
                 }
-                Value::Object(None) => Err(illegal_arg_exc("argument type mismatch".to_string())),
+                Value::Object(None) => Err(mismatch()),
                 _ => Err(illegal_arg_exc(format!(
                     "{context}: unexpected VM value for primitive {expected_desc}"
                 ))),
@@ -5248,9 +5576,7 @@ pub(crate) fn coerce_arg_strict(
                                             near.map(|n| ctx.loader_id_of_class(n)),
                                         );
                                     }
-                                    return Err(illegal_arg_exc(
-                                        "argument type mismatch".to_string(),
-                                    ));
+                                    return Err(mismatch());
                                 }
                             }
                         }
@@ -5260,7 +5586,7 @@ pub(crate) fn coerce_arg_strict(
             }
             // A primitive `Value` reached a reference parameter.
             // JDK-faithful "argument type mismatch" (see note above).
-            _ => Err(illegal_arg_exc("argument type mismatch".to_string())),
+            _ => Err(mismatch()),
         },
     }
 }
@@ -6644,6 +6970,9 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
+    // Read once, then threaded down every rank: what the refusal NAMES cannot
+    // drift between ranks if they all print the same struct.
+    let ident = field_ident(ctx, this, class_id, &descriptor, modifiers);
     // RANKS 1-2. `Field.get` has no RANK 3: the generic accessor reads every
     // descriptor, so the null receiver the override skips past is not noticed
     // until rank 4 either way, and both spellings answer
@@ -6657,10 +6986,11 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         class_id,
         receiver,
         &format!("Field.get({})", descriptor),
+        None,
     )?;
     // RANK 4.
-    null_receiver_on_instance_field(is_static, receiver, "Field.get")?;
-    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field.get")?;
+    null_receiver_on_instance_field(is_static, receiver, None)?;
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, &ident, "get", "on")?;
 
     // WP2.1-field вЂ” volatile-aware read fence: matches what the JDK does
     // internally via `Unsafe.getReferenceVolatile`/`getIntVolatile`. No-op
@@ -6685,7 +7015,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let recv =
             receiver.ok_or_else(
                 || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some("Field.get: null receiver for instance field".to_string()),
+                    message: None,
                 },
             )?;
         reject_array_field_receiver(ctx, recv, "Field.get")?;
@@ -6796,6 +7126,9 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
+    // Read once, then threaded down every rank: what the refusal NAMES cannot
+    // drift between ranks if they all print the same struct.
+    let ident = field_ident(ctx, this, class_id, &descriptor, modifiers);
     // RANKS 1-2.
     field_access_phase(
         ctx,
@@ -6806,14 +7139,17 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         class_id,
         receiver,
         &format!("Field.set({})", descriptor),
+        Some(ENSURE_OBJ_NPE),
     )?;
     // RANK 4. `set(Object,Object)` has no RANK 3 — it accepts every descriptor
     // and decides the value's type at rank 6 instead, which is exactly what
     // separates it from the typed setters:
     //   finalIntField.setLong(obj, 1L)                IllegalArgumentException
     //   finalIntField.set(obj, Integer.valueOf(1))    IllegalAccessException
-    null_receiver_on_instance_field(is_static, receiver, "Field.set")?;
-    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field.set")?;
+    null_receiver_on_instance_field(is_static, receiver, Some(ENSURE_OBJ_NPE))?;
+    // NOTE the `"to"`: see the quirk in the reflection-message block. Every
+    // other rank-4 caller passes `"on"`.
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, &ident, "set", "to")?;
     // RANK 5 вЂ” WP2.1-field final-field write check. It must run AFTER the
     // access checks so the more specific error message wins on a public-final
     // field, and BEFORE the coercion below: measured on Temurin 25.0.3,
@@ -6821,13 +7157,22 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // `finalStringField.set(obj, Integer.valueOf(1))` are both
     // `IllegalAccessException`, while the same two writes to the same fields
     // without `final` are `IllegalArgumentException`.
-    check_final_for_set(modifiers, accessible, &format!("Field.set({})", descriptor))?;
+    // The generic setter names the VALUE's class (or `null value`) -- not a
+    // `(type)value` rendering, which is the typed setters' spelling.
+    let attempted = attempted_value_name(ctx, new_value);
+    check_final_for_set(&ident, accessible, &attempted)?;
 
     // RANK 6 вЂ” strictly coerce the value if the field expects a primitive
     // (including widening); this raises IllegalArgumentException if the wrapper
     // type cannot be narrowed/widened to the target primitive per JLS В§5.1.2.
-    let coerced = match coerce_arg_strict(ctx, new_value, &descriptor, "Field.set", Some(class_id))
-    {
+    let coerced = match coerce_arg_strict_msg(
+        ctx,
+        new_value,
+        &descriptor,
+        "Field.set",
+        Some(class_id),
+        Some(&ident.set_to(&attempted)),
+    ) {
         Ok(v) => v,
         Err(e) => {
             // DIAG (`CRATONVM_DBG=coerce`): the refusal itself names the FIELD's
@@ -6874,7 +7219,7 @@ declaring={} (cid={class_id:?}, loader={})",
         let recv =
             receiver.ok_or_else(
                 || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some("Field.set: null receiver for instance field".to_string()),
+                    message: None,
                 },
             )?;
         reject_array_field_receiver(ctx, recv, "Field.set")?;
@@ -6901,9 +7246,10 @@ declaring={} (cid={class_id:?}, loader={})",
 /// Reference / array descriptors (descriptors starting with `L` or `[`) are
 /// always rejected вЂ” typed primitive getters can never read a reference.
 fn validate_field_descriptor(
+    ident: &FieldIdent,
     descriptor: &str,
     accepted: &[u8],
-    java_method: &str,
+    target: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     // Empty descriptor means the meta lookup failed; fall back to the value-
     // variant check downstream rather than throwing here.
@@ -6918,10 +7264,8 @@ fn validate_field_descriptor(
     // type conversion" вЂ” the JDK actually emits a slightly different phrasing
     // depending on the source/target pair, but every variant is an IAE and
     // mentions both the Field method and the underlying type. Match closely.
-    Err(illegal_arg_exc(format!(
-        "Attempt to get {} field on Field.{}: incompatible descriptor `{}`",
-        descriptor, java_method, descriptor
-    )))
+    // GRAMMAR 4 -- the one that quotes the field name and omits the modifiers.
+    Err(illegal_arg_exc(ident.get_conversion(target)))
 }
 
 /// The rank-3 gate for the typed SETTERS, the mirror of
@@ -6942,9 +7286,11 @@ fn validate_field_descriptor(
 /// run on HotSpot too, and every row it refuses is already an
 /// `IllegalArgumentException` there.
 fn validate_set_descriptor(
+    ident: &FieldIdent,
     descriptor: &str,
     accepted: &[u8],
-    java_method: &str,
+    target: &str,
+    value: Value,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     // Empty descriptor means the meta lookup failed; fall back to the
     // coercion check downstream rather than inventing a refusal here.
@@ -6955,10 +7301,11 @@ fn validate_set_descriptor(
     if accepted.contains(&first) {
         return Ok(());
     }
-    Err(illegal_arg_exc(format!(
-        "Can not set {} field using Field.{}: incompatible descriptor `{}`",
-        descriptor, java_method, descriptor
-    )))
+    // GRAMMAR 1, rendered at the SETTER's type: this rank refuses before any
+    // conversion happens, so `setLong(9L)` into an `int` field prints
+    // `(long)9`, not `(int)9`. The legal-widening case at rank 5 prints the
+    // field's type instead. Measured both ways.
+    Err(illegal_arg_exc(ident.set_to_prim(target, value)))
 }
 
 /// A typed accessor's rank-3 descriptor gate, threaded into
@@ -6973,8 +7320,10 @@ fn validate_set_descriptor(
 struct TypedAccessorGate {
     /// Field descriptor first bytes this accessor may widen from / narrow into.
     accepted: &'static [u8],
-    /// `getInt`, `setLong`, ... -- for the exception message only.
-    java_method: &'static str,
+    /// `int`, `long`, ... -- the accessor's own primitive type, as the message
+    /// spells it. This used to be the METHOD name (`getInt`), which is what the
+    /// old messages printed and what no JDK message mentions.
+    prim: &'static str,
 }
 
 /// Ranks 1 and 2 of the precedence lattice: `Field.checkAccess`, in full,
@@ -6998,11 +7347,12 @@ fn field_access_phase(
     class_id: ClassId,
     receiver: Option<ObjectRef>,
     operation: &str,
+    npe_message: Option<&str>,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if accessible {
         return Ok(());
     }
-    null_receiver_on_instance_field(is_static, receiver, operation)?;
+    null_receiver_on_instance_field(is_static, receiver, npe_message)?;
     // Bound before the call, not inline: `check_field_access` takes `ctx`
     // mutably and this takes it shared, and the two cannot be live at once.
     let target_cid = reflective_target_class_id(ctx, modifiers, receiver);
@@ -7039,6 +7389,9 @@ fn field_get_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
+    // Read once, then threaded down every rank: what the refusal NAMES cannot
+    // drift between ranks if they all print the same struct.
+    let ident = field_ident(ctx, this, class_id, &descriptor, modifiers);
 
     // RANKS 1-2. The whole typed family — getInt/getLong/getFloat/getDouble/
     // getBoolean/getByte/getShort/getChar — funnels through here, so the rule
@@ -7052,16 +7405,17 @@ fn field_get_raw(
         class_id,
         receiver,
         "Field typed getter",
+        None,
     )?;
     // RANK 3. Below the access refusal — `String.hash.getBoolean("q")` is denied
     // AND the wrong accessor, and HotSpot answers `IllegalAccessException` —
     // and above the receiver test, so with the override set a null receiver
     // still loses to it.
-    validate_field_descriptor(&descriptor, gate.accepted, gate.java_method)?;
+    validate_field_descriptor(&ident, &descriptor, gate.accepted, gate.prim)?;
     // RANK 4, in its two halves: the null receiver the override skipped past
     // above, then the receiver-type test.
-    null_receiver_on_instance_field(is_static, receiver, "Field typed getter")?;
-    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field typed getter")?;
+    null_receiver_on_instance_field(is_static, receiver, None)?;
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, &ident, "get", "on")?;
 
     // WP2.1-field вЂ” volatile-aware read fence (no-op for non-volatile).
     volatile_load_fence(modifiers);
@@ -7084,9 +7438,7 @@ fn field_get_raw(
         let recv =
             receiver.ok_or_else(
                 || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some(
-                        "Field typed getter: null receiver for instance field".to_string(),
-                    ),
+                    message: None,
                 },
             )?;
         reject_array_field_receiver(ctx, recv, "Field typed getter")?;
@@ -7112,7 +7464,7 @@ pub(crate) fn native_field_get_int(
         args,
         TypedAccessorGate {
             accepted: b"BSCI",
-            java_method: "getInt",
+            prim: "int",
         },
     )?;
     match val {
@@ -7133,7 +7485,7 @@ pub(crate) fn native_field_get_long(
         args,
         TypedAccessorGate {
             accepted: b"BSCIJ",
-            java_method: "getLong",
+            prim: "long",
         },
     )?;
     match val {
@@ -7155,7 +7507,7 @@ pub(crate) fn native_field_get_float(
         args,
         TypedAccessorGate {
             accepted: b"BSCIJF",
-            java_method: "getFloat",
+            prim: "float",
         },
     )?;
     match val {
@@ -7178,7 +7530,7 @@ pub(crate) fn native_field_get_double(
         args,
         TypedAccessorGate {
             accepted: b"BSCIJFD",
-            java_method: "getDouble",
+            prim: "double",
         },
     )?;
     match val {
@@ -7209,7 +7561,7 @@ pub(crate) fn native_field_get_boolean(
         args,
         TypedAccessorGate {
             accepted: b"Z",
-            java_method: "getBoolean",
+            prim: "boolean",
         },
     )?;
     match val {
@@ -7258,6 +7610,9 @@ fn field_set_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
+    // Read once, then threaded down every rank: what the refusal NAMES cannot
+    // drift between ranks if they all print the same struct.
+    let ident = field_ident(ctx, this, class_id, &descriptor, modifiers);
 
     // RANKS 1-2. setInt/setLong/setFloat/setDouble/setBoolean/setByte/setShort/
     // setChar all funnel through here, so the rule cannot drift between
@@ -7271,6 +7626,7 @@ fn field_set_raw(
         class_id,
         receiver,
         "Field typed setter",
+        None,
     )?;
     // RANK 3, and it is ABOVE the final-write refusal on this path — measured:
     // `Integer.MAX_VALUE.setInt(null, 1)` is `IllegalAccessException` but
@@ -7278,24 +7634,32 @@ fn field_set_raw(
     // on the same `public static final int`. `coerce_arg_strict` at rank 6
     // cannot stand in for this: a `boolean` is a `Value::Int(0|1)` here, so it
     // coerces cleanly into an `int` field and the row silently succeeds.
-    validate_set_descriptor(&descriptor, gate.accepted, gate.java_method)?;
+    validate_set_descriptor(&ident, &descriptor, gate.accepted, gate.prim, new_value)?;
     // RANK 4, in its two halves: the null receiver the override skipped past
     // above, then the receiver-type test.
-    null_receiver_on_instance_field(is_static, receiver, "Field typed setter")?;
-    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field typed setter")?;
+    null_receiver_on_instance_field(is_static, receiver, None)?;
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, &ident, "set", "on")?;
     // RANK 5 вЂ” WP2.1-field final-field write check (matches Field.set on the
     // generic `set(Object,Object)` path).
-    check_final_for_set(modifiers, accessible, "Field typed setter")?;
+    // Rank 5 is BELOW rank 3, so the widening is already known to be legal --
+    // which is why this renders at the FIELD's type and the value it prints is
+    // the widened one: `setChar('z')` into an `int` field says `(int)122`.
+    check_final_for_set(
+        &ident,
+        accessible,
+        &format!("({}){}", ident.ty(), render_prim_as(ident.ty(), new_value)),
+    )?;
 
     // RANK 6, and unreachable as a refusal now that rank 3 exists: whatever the
     // descriptor gate admitted always fits. Kept because it is what actually
     // performs the widening/narrowing conversion into the field's storage shape.
-    let coerced = coerce_arg_strict(
+    let coerced = coerce_arg_strict_msg(
         ctx,
         new_value,
         &descriptor,
         "Field typed setter",
         Some(class_id),
+        Some(&ident.set_to_prim(ident.ty(), new_value)),
     )?;
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
@@ -7307,9 +7671,7 @@ fn field_set_raw(
         let recv =
             receiver.ok_or_else(
                 || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some(
-                        "Field typed setter: null receiver for instance field".to_string(),
-                    ),
+                    message: None,
                 },
             )?;
         ctx.set_field(recv, slot, coerced);
@@ -7329,7 +7691,7 @@ pub(crate) fn native_field_set_int(
         val,
         TypedAccessorGate {
             accepted: b"IJFD",
-            java_method: "setInt",
+            prim: "int",
         },
     )?;
     Ok(None)
@@ -7346,7 +7708,7 @@ pub(crate) fn native_field_set_long(
         val,
         TypedAccessorGate {
             accepted: b"JFD",
-            java_method: "setLong",
+            prim: "long",
         },
     )?;
     Ok(None)
@@ -7363,7 +7725,7 @@ pub(crate) fn native_field_set_float(
         val,
         TypedAccessorGate {
             accepted: b"FD",
-            java_method: "setFloat",
+            prim: "float",
         },
     )?;
     Ok(None)
@@ -7380,7 +7742,7 @@ pub(crate) fn native_field_set_double(
         val,
         TypedAccessorGate {
             accepted: b"D",
-            java_method: "setDouble",
+            prim: "double",
         },
     )?;
     Ok(None)
@@ -7400,7 +7762,7 @@ pub(crate) fn native_field_set_boolean(
         val,
         TypedAccessorGate {
             accepted: b"Z",
-            java_method: "setBoolean",
+            prim: "boolean",
         },
     )?;
     Ok(None)
@@ -7418,7 +7780,7 @@ pub(crate) fn native_field_get_byte(
         args,
         TypedAccessorGate {
             accepted: b"B",
-            java_method: "getByte",
+            prim: "byte",
         },
     )?;
     match val {
@@ -7440,7 +7802,7 @@ pub(crate) fn native_field_get_short(
         args,
         TypedAccessorGate {
             accepted: b"BS",
-            java_method: "getShort",
+            prim: "short",
         },
     )?;
     match val {
@@ -7462,7 +7824,7 @@ pub(crate) fn native_field_get_char(
         args,
         TypedAccessorGate {
             accepted: b"C",
-            java_method: "getChar",
+            prim: "char",
         },
     )?;
     match val {
@@ -7493,7 +7855,7 @@ pub(crate) fn native_field_set_byte(
         val,
         TypedAccessorGate {
             accepted: b"BSIJFD",
-            java_method: "setByte",
+            prim: "byte",
         },
     )?;
     Ok(None)
@@ -7518,7 +7880,7 @@ pub(crate) fn native_field_set_short(
         val,
         TypedAccessorGate {
             accepted: b"SIJFD",
-            java_method: "setShort",
+            prim: "short",
         },
     )?;
     Ok(None)
@@ -7543,7 +7905,7 @@ pub(crate) fn native_field_set_char(
         val,
         TypedAccessorGate {
             accepted: b"CIJFD",
-            java_method: "setChar",
+            prim: "char",
         },
     )?;
     Ok(None)
@@ -24281,16 +24643,30 @@ mod tests {
     #[test]
     fn null_receiver_on_an_instance_field_outranks_the_access_refusal() {
         use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
-        let err = null_receiver_on_instance_field(false, None, "Field.get")
+        let err = null_receiver_on_instance_field(false, None, None)
             .expect_err("a null receiver on an instance field must fail");
-        assert!(matches!(
-            err,
-            MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::NullPointerException { .. }
-            ))
-        ));
+        // G69-1: the message is NULL, as HotSpot's is on four of the five entry
+        // points. It used to read "Field.get: null receiver for instance
+        // field", which no JDK ever emits.
+        assert!(
+            matches!(
+                &err,
+                MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NullPointerException { message: None }
+                ))
+            ),
+            "expected a NullPointerException with a null message, got: {err:?}"
+        );
+        // The generic `Field.set` is the exception, and carries HotSpot's own
+        // helpful NPE text.
+        let with_msg = null_receiver_on_instance_field(false, None, Some(ENSURE_OBJ_NPE))
+            .expect_err("a null receiver on an instance field must fail");
+        assert!(
+            format!("{with_msg:?}").contains("because \"o\" is null"),
+            "expected HotSpot's helpful NPE, got: {with_msg:?}"
+        );
         // ...and a STATIC field has no receiver to be null.
-        assert!(null_receiver_on_instance_field(true, None, "Field.get").is_ok());
+        assert!(null_receiver_on_instance_field(true, None, None).is_ok());
     }
 
     /// Fail CLOSED when there is no resolvable Java caller frame: the
@@ -26862,14 +27238,16 @@ Implementation-Title: opensaml-core-api\r\n\
     fn wp21_field_check_final_non_final_passes() {
         // Plain int field, public, no final bit set вЂ” should pass.
         let modifiers = ACC_PUBLIC; // 0x0001
-        assert!(check_final_for_set(modifiers, false, "x").is_ok());
-        assert!(check_final_for_set(modifiers, true, "x").is_ok());
+        let id = FieldIdent::for_test("P$H.f", "int", modifiers);
+        assert!(check_final_for_set(&id, false, "(int)9").is_ok());
+        assert!(check_final_for_set(&id, true, "(int)9").is_ok());
     }
 
     #[test]
     fn wp21_field_check_final_instance_final_no_access_throws() {
         let modifiers = ACC_PUBLIC | ACC_FINAL; // 0x0011
-        let r = check_final_for_set(modifiers, false, "Y");
+        let id = FieldIdent::for_test("P$H.fin", "int", modifiers);
+        let r = check_final_for_set(&id, false, "java.lang.Integer");
         assert!(
             r.is_err(),
             "instance final without setAccessible MUST throw IllegalAccessException"
@@ -26880,33 +27258,105 @@ Implementation-Title: opensaml-core-api\r\n\
             msg.contains("IllegalAccessException"),
             "expected IllegalAccessException, got: {msg}"
         );
+        // G69-1: and the sentence is HotSpot's, naming the field and the value.
+        // Note NO `static` in the modifier run -- this one is an instance final.
+        assert!(
+            msg.contains("Can not set final int field P$H.fin to java.lang.Integer"),
+            "expected the JDK grammar, got: {msg}"
+        );
     }
 
     #[test]
     fn wp21_field_check_final_instance_final_with_access_passes() {
         // Mirrors `ff.setAccessible(true); ff.setInt(o, 11);` вЂ” must succeed.
         let modifiers = ACC_PUBLIC | ACC_FINAL;
-        assert!(check_final_for_set(modifiers, true, "Y").is_ok());
+        let id = FieldIdent::for_test("P$H.fin", "int", modifiers);
+        assert!(check_final_for_set(&id, true, "java.lang.Integer").is_ok());
     }
 
     #[test]
     fn wp21_field_check_final_static_final_always_throws() {
         let modifiers = ACC_PUBLIC | ACC_STATIC | ACC_FINAL; // 0x0019
                                                              // Without setAccessible.
+        let id = FieldIdent::for_test("P$H.I", "int", modifiers);
         assert!(
-            check_final_for_set(modifiers, false, "K").is_err(),
+            check_final_for_set(&id, false, "(int)9").is_err(),
             "static final without setAccessible MUST throw"
         );
         // WITH setAccessible вЂ” must still throw.
-        let r = check_final_for_set(modifiers, true, "K");
+        let r = check_final_for_set(&id, true, "(int)9");
         assert!(
             r.is_err(),
             "static final WITH setAccessible MUST also throw вЂ” only Unsafe / VarHandle bypasses",
         );
         let msg = format!("{:?}", r.unwrap_err());
+        // G69-1: the whole sentence, not just the two words. The old message
+        // said "static final" too -- and named neither the field nor the value.
+        assert!(
+            msg.contains("Can not set static final int field P$H.I to (int)9"),
+            "expected the JDK grammar, got: {msg}"
+        );
         assert!(
             msg.contains("static final"),
             "static-final error should call out 'static final' specifically, got: {msg}",
+        );
+    }
+
+    /// G69-1 -- the field TYPE in a reflection message is `getName()`, not the
+    /// `int[]` speller. `G68-1` section 3a made exactly this mistake in
+    /// `NoSuchMethodException`, and the reachable-looking helper
+    /// (`array_descriptor_to_type_name`) is still one import away, so this test
+    /// exists to make the wrong one fail loudly.
+    #[test]
+    fn g69_descriptor_get_name_is_getname_not_the_array_speller() {
+        assert_eq!(descriptor_get_name("I"), "int");
+        assert_eq!(descriptor_get_name("Z"), "boolean");
+        assert_eq!(descriptor_get_name("Ljava/lang/String;"), "java.lang.String");
+        // The two that matter: arrays keep the descriptor shape, with dots.
+        assert_eq!(descriptor_get_name("[I"), "[I");
+        assert_eq!(
+            descriptor_get_name("[[Ljava/lang/String;"),
+            "[[Ljava.lang.String;"
+        );
+        // ...and the speller that is NOT wanted here still says otherwise, so
+        // the difference is a real fork and not a distinction without one.
+        assert_eq!(
+            array_descriptor_to_type_name("[I").as_deref(),
+            Some("int[]"),
+            "if this ever agrees with descriptor_get_name, one of them is wrong"
+        );
+    }
+
+    /// G69-1 -- the typed setters render `(type)value` at the type NAMED in the
+    /// message, and a `char` prints as a character while the same unit widened
+    /// into an `int` field prints as a number.
+    #[test]
+    fn g69_render_prim_as_follows_the_named_type_not_the_value_tag() {
+        assert_eq!(render_prim_as("char", Value::Int(122)), "z");
+        assert_eq!(render_prim_as("int", Value::Int(122)), "122");
+        assert_eq!(render_prim_as("boolean", Value::Int(1)), "true");
+        assert_eq!(render_prim_as("boolean", Value::Int(0)), "false");
+        assert_eq!(render_prim_as("long", Value::Long(9)), "9");
+        // Java's float/double spelling, not Rust's: `9`, not `9.0`, is wrong.
+        assert_eq!(render_prim_as("float", Value::Float(9.0)), "9.0");
+        assert_eq!(render_prim_as("double", Value::Double(9.0)), "9.0");
+    }
+
+    /// G69-1 -- grammar 4 is deliberately unlike grammars 1-3: it QUOTES the
+    /// field name and carries NO `static`/`final`. Measured on a
+    /// `public static final int`, which prints neither modifier.
+    #[test]
+    fn g69_get_conversion_grammar_quotes_the_name_and_drops_the_modifiers() {
+        let id = FieldIdent::for_test("PD$H.I", "int", ACC_PUBLIC | ACC_STATIC | ACC_FINAL);
+        assert_eq!(
+            id.get_conversion("byte"),
+            "Attempt to get int field \"PD$H.I\" with illegal data type conversion to byte"
+        );
+        // The same field through grammar 1 DOES carry both modifiers -- which is
+        // the asymmetry a uniform renderer would have flattened.
+        assert_eq!(
+            id.set_to("(int)9"),
+            "Can not set static final int field PD$H.I to (int)9"
         );
     }
 

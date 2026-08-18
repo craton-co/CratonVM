@@ -2983,7 +2983,253 @@ public class RJdkIntrinsics3 {
     static final String[] FAMILIES = {
         "objects", "boxid", "boxconv", "bitops", "strictd", "mathd", "bigdec", "bigint",
         "logrec", "tlocal", "fmtobj", "inet", "regex", "misc", "bufslice", "mathexact",
+        "refmsg",
     };
+
+    // 17. refmsg -- what a reflective FIELD refusal SAYS.
+    //
+    // The exception types and their precedence were already exact: 71 probe
+    // rows across `scratchpad/g71/{PD,PE,PF,PG}.java` agreed with HotSpot on
+    // every one, and disagreed on every message. So these rows assert TEXT, and
+    // they are here because the text is the whole diagnostic: a framework that
+    // fails to set a field prints this sentence and nothing else.
+    //
+    // Five grammars, and they are deliberately NOT uniform -- three of the rows
+    // below exist only to pin an asymmetry that a tidier renderer would erase:
+    //   * the bad-receiver rows carry `final`, the conversion rows do not;
+    //   * the conversion rows QUOTE the field name, nothing else does;
+    //   * the generic `set` names a bad RECEIVER after `to`, where every other
+    //     row in that position names the value.
+    // Each was measured after being got wrong or nearly guessed.
+    static class RefHolder {
+        static final int I = 3;
+        static final long J = 4L;
+        static final char C = 'a';
+        static final String L = "s";
+        static final int[] AR = new int[] {1};
+        public int nf = 1;
+        public String sref = "a";
+        public final int fin = 1;
+    }
+
+    static class RefOther {
+    }
+
+    static Field rf(String n) throws Exception {
+        Field x = RefHolder.class.getDeclaredField(n);
+        x.setAccessible(true);
+        return x;
+    }
+
+    /** The message of whatever {@code op} threw, or a marker naming what went wrong instead. */
+    static String msgOf(Throwable t) {
+        return t == null ? "no throw" : String.valueOf(t.getMessage());
+    }
+
+    static void refmsg() throws Exception {
+        Throwable t;
+        RefHolder h = new RefHolder();
+        final String D = "RJdkIntrinsics3$RefHolder";
+        final String O = "RJdkIntrinsics3$RefOther";
+
+        // -- GRAMMAR 1, typed setter: the value prints as (type)value ----------
+        // A LEGAL widening reports the FIELD's type and the WIDENED value, so a
+        // char written into an int field prints the number, not the character.
+        step("refmsg", "setInt on a static final int");
+        t = null;
+        try {
+            rf("I").setInt(null, 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:setInt on static final", t, "java.lang.IllegalAccessException");
+        ckS("refmsg:setInt on static final message", msgOf(t),
+                "Can not set static final int field " + D + ".I to (int)9");
+        t = null;
+        try {
+            rf("I").setChar(null, 'z');
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:setChar into an int field widens and prints the NUMBER", msgOf(t),
+                "Can not set static final int field " + D + ".I to (int)122");
+        t = null;
+        try {
+            rf("C").setChar(null, 'z');
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:setChar into a char field prints the CHARACTER", msgOf(t),
+                "Can not set static final char field " + D + ".C to (char)z");
+
+        // An ILLEGAL widening is refused a rank EARLIER, before any conversion,
+        // so it reports the SETTER's type -- and it is an IllegalArgumentException
+        // where the row above is an IllegalAccessException, on the same field.
+        t = null;
+        try {
+            rf("I").setLong(null, 9L);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:setLong into an int field", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:an ILLEGAL widening reports the SETTER's type", msgOf(t),
+                "Can not set static final int field " + D + ".I to (long)9");
+        t = null;
+        try {
+            rf("I").setFloat(null, 9f);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:setFloat prints Java's float spelling", msgOf(t),
+                "Can not set static final int field " + D + ".I to (float)9.0");
+
+        // -- GRAMMAR 1, generic setter: the value prints as its CLASS ----------
+        t = null;
+        try {
+            rf("I").set(null, 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:set(Object) names the argument's CLASS", msgOf(t),
+                "Can not set static final int field " + D + ".I to java.lang.Integer");
+        t = null;
+        try {
+            rf("L").set(null, null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:set(Object) with null says 'null value'", msgOf(t),
+                "Can not set static final java.lang.String field " + D + ".L to null value");
+        // An ARRAY field's type is getName() -- `[I`, not `int[]`. Reaching for
+        // the `int[]` speller is the mistake G68-1 made in NoSuchMethodException.
+        t = null;
+        try {
+            rf("AR").set(null, new int[] {2});
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:an array field and an array value both render as getName()", msgOf(t),
+                "Can not set static final [I field " + D + ".AR to [I");
+        t = null;
+        try {
+            rf("L").set(null, new String[][] {});
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:a nested array argument renders as [[L...;", msgOf(t),
+                "Can not set static final java.lang.String field " + D
+                        + ".L to [[Ljava.lang.String;");
+
+        // -- rank 6: the same grammar on a NON-final field ---------------------
+        // Not "argument type mismatch", which is Method.invoke's message and was
+        // being applied one caller too widely.
+        t = null;
+        try {
+            rf("nf").set(h, "x");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:set a String into an int field", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:a non-final refusal names the field too", msgOf(t),
+                "Can not set int field " + D + ".nf to java.lang.String");
+        t = null;
+        try {
+            rf("nf").set(h, null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:null into a primitive field", msgOf(t),
+                "Can not set int field " + D + ".nf to null value");
+
+        // -- GRAMMAR 2 and 3: a bad RECEIVER prints "on"... --------------------
+        // ...and DOES carry `final`, which the conversion grammar below does not.
+        t = null;
+        try {
+            rf("fin").setInt(new RefOther(), 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:typed set with a wrong receiver", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:a bad receiver prints 'on' AND carries final", msgOf(t),
+                "Can not set final int field " + D + ".fin on " + O);
+        t = null;
+        try {
+            rf("fin").getInt(new RefOther());
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:a bad receiver on a getter says 'get ... on'", msgOf(t),
+                "Can not get final int field " + D + ".fin on " + O);
+
+        // ...EXCEPT the generic setter, which prints the RECEIVER after "to" --
+        // in the sentence position every other rank-6 row fills with the value.
+        // The argument here is a distinctive String and is still not named.
+        t = null;
+        try {
+            rf("nf").set(new RefOther(), "ARG");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:generic set names a bad RECEIVER after 'to', not the value", msgOf(t),
+                "Can not set int field " + D + ".nf to " + O);
+
+        // -- GRAMMAR 4: quoted name, and NO modifiers --------------------------
+        // Measured on a static final field, which prints neither modifier --
+        // the one grammar of the five that drops them.
+        t = null;
+        try {
+            rf("I").getByte(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:getByte on an int field", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:the conversion grammar QUOTES the name and drops the modifiers", msgOf(t),
+                "Attempt to get int field \"" + D + ".I\" with illegal data type conversion to byte");
+        t = null;
+        try {
+            rf("sref").getLong(h);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:a reference field cannot be read by a typed getter", msgOf(t),
+                "Attempt to get java.lang.String field \"" + D
+                        + ".sref\" with illegal data type conversion to long");
+
+        // -- GRAMMAR 5: a null receiver is a NullPointerException with a NULL
+        // message -- on four of the five entry points.
+        t = null;
+        try {
+            rf("nf").getInt(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:typed get with a null receiver", t, "java.lang.NullPointerException");
+        ckS("refmsg:...and its message is null", msgOf(t), "null");
+        t = null;
+        try {
+            rf("nf").get(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:generic get with a null receiver is also null", msgOf(t), "null");
+        t = null;
+        try {
+            rf("nf").setInt(null, 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:typed set with a null receiver is also null", msgOf(t), "null");
+
+        // -- what must still SUCCEED -------------------------------------------
+        // A legal widening read, and an instance final that setAccessible really
+        // does unlock -- so these rows are not "reflection always throws".
+        ckI("refmsg:getLong widens an int field", (int) rf("nf").getLong(h), 1);
+        rf("fin").setInt(h, 41);
+        ckI("refmsg:an INSTANCE final is writable after setAccessible(true)",
+                rf("fin").getInt(h), 41);
+
+        sectionEnd("refmsg", 27);
+    }
 
     static void runFamily(String name) throws Exception {
         if ("objects".equals(name)) {
@@ -3018,6 +3264,8 @@ public class RJdkIntrinsics3 {
             bufslice();
         } else if ("mathexact".equals(name)) {
             mathexact();
+        } else if ("refmsg".equals(name)) {
+            refmsg();
         } else {
             throw new AssertionError("unknown family: " + name);
         }
