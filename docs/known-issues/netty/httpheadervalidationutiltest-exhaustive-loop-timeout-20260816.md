@@ -124,8 +124,13 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    against HotSpot's ~0, because HotSpot inlines all of them. Roughly ten call
    frames therefore cost 40-80 ns before any of them does any work, and the whole
    budget for the iteration is 21. No arrangement of real calls fits; not making
-   the calls is the only lever. The sibling page carries the sequenced blocker,
-   and its first two steps are VM work rather than compiler work: an artifact
+   the calls is the only lever. The sibling page carries the sequenced blocker.
+   Steps 1-3 of it landed 2026-08-18 (multi-frame deopt resume, a multi-frame
+   OSR-exit transfer with admission relaxed to match, and the single-pass scope
+   stack); step 4 — a real call inside a spliced body — is where the remaining
+   work is, and its substantive half is resolving the callee's own invoke
+   targets against the CALLEE's constant pool, since `InlineSite` has never
+   carried any. Its first two steps were VM work rather than compiler work: an artifact
    carrying an inlined caller scope cannot be OSR-entered at all
    (`osr_exit_policy` refuses `caller.is_some()`, because the in-place OSR-exit
    transfer is single-frame), and both these classes' hot methods are `@Test`

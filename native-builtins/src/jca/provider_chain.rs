@@ -3111,8 +3111,25 @@ fn provider_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let ihash = ctx.identity_hash_code(this) as i64;
-    let found = provider_instance_keys().lock().contains(&(ihash, key));
+    // Answers from the same rows `keySet`/`size`/`entrySet` project — see
+    // `provider_map_rows`, which is where the scoping rule is explained.
+    //
+    // Instance scope is LOAD-BEARING and not an accident. BouncyCastle's
+    // `BouncyCastleProvider.addAlgorithm` is:
+    //
+    // ```java
+    // if (containsKey(key)) {
+    //     throw new IllegalStateException("duplicate provider key (" + key + ") found");
+    // }
+    // ```
+    //
+    // so a process-global answer makes the SECOND `new BouncyCastleProvider()`
+    // throw on its first registration. On HotSpot each provider instance owns
+    // its own map and sees none of the first one's keys. Making this
+    // name-keyed to match `get` was tried and did exactly that:
+    // `cannot create instance of ...GOST3411$Mappings : duplicate provider key
+    // (MessageDigest.GOST3411) found`.
+    let found = provider_row_present(ctx, this, &key);
     Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
@@ -3281,6 +3298,371 @@ fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `getService(type, algorithm)`. The early bootstrap fallback returns an empty
 /// set; BouncyCastle JSSE needs the populated set while constructing the FIPS
 /// provider so it can discover TLS key/trust manager algorithms.
+/// Every `(key, value)` this provider's Map surface must show.
+///
+/// `java.security.Provider` is a `Properties`, and applications read it as one
+/// — `for (Object k : provider.keySet())` is an ordinary idiom, and
+/// BouncyCastle's own `BouncyCastleProviderTest.testRegisteredClasses` does
+/// exactly that. Before this, the Map surface had **three** disagreeing views:
+///
+/// | | HotSpot | CratonVM (before) |
+/// |---|---|---|
+/// | `keySet().size()` | 5153 | 4 |
+/// | `get("Provider.id name")` | `BC` | `null` |
+/// | `containsKey(k)` after `put(k, v)` | true | true |
+/// | `size()` after that `put` | 5 | **4** |
+///
+/// `put`, `parseLegacyPut` and `putService` all record into
+/// `provider_properties` (name-keyed, with the value) and
+/// `provider_instance_keys` (identity-keyed), and `get`/`containsKey` read
+/// those — but `size`/`keySet`/`entrySet`/`values` were never registered at
+/// all, so they fell through to the inherited `Properties` map, which only
+/// `putId`'s four `Provider.id *` rows had ever reached. Three stores, three
+/// answers, no error anywhere.
+///
+/// Everything now projects the two tables every writer maintains together:
+/// `provider_instance_keys` for WHICH keys this instance has, and
+/// `provider_properties` for their values.
+///
+/// Scoped to the INSTANCE, because that is what a real `Provider` is — its own
+/// `Properties` map — and because BouncyCastle depends on it: `addAlgorithm`
+/// refuses a key `containsKey` already reports, so a process-global answer
+/// makes the second `new BouncyCastleProvider()` throw. See
+/// `provider_contains_key`.
+///
+/// The fallback covers the VM's own stand-ins: `make_provider` mints a fresh
+/// synthetic `Provider` per call, which never ran a `put` and so owns no
+/// instance keys, but must still show the rows registered under its name.
+/// An instance that has put SOMETHING is authoritative about its own contents;
+/// only one that has put NOTHING defers to its name.
+///
+/// Sorted so `keySet`, `values` and `entrySet` agree with each other
+/// positionally and the order is stable between calls. HotSpot's is a hash
+/// order and is unspecified, so a defined order is not a divergence.
+fn provider_map_rows(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+    let name = provider_name_of(ctx, this);
+    let ihash = ctx.identity_hash_code(this) as i64;
+    let own: Vec<String> = provider_instance_keys()
+        .lock()
+        .iter()
+        .filter(|(instance, _)| *instance == ihash)
+        .map(|(_, key)| key.clone())
+        .collect();
+    let properties = provider_properties().lock();
+    let mut rows: Vec<(String, String)> = if own.is_empty() {
+        properties
+            .iter()
+            .filter(|((provider, _), _)| provider == &name)
+            .map(|((_, key), value)| (key.clone(), value.clone()))
+            .collect()
+    } else {
+        own.into_iter()
+            .map(|key| {
+                let value = properties
+                    .get(&(name.clone(), key.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                (key, value)
+            })
+            .collect()
+    };
+    drop(properties);
+    rows.sort_unstable();
+    rows
+}
+
+/// Is `key` one of this provider's rows, under the same scoping rule
+/// [`provider_map_rows`] projects? Answered without materialising every row.
+fn provider_row_present(ctx: &mut dyn NativeContext, this: ObjectRef, key: &str) -> bool {
+    let ihash = ctx.identity_hash_code(this) as i64;
+    let (has_own_key, has_any_own) = {
+        let instance_keys = provider_instance_keys().lock();
+        (
+            instance_keys.contains(&(ihash, key.to_string())),
+            instance_keys.iter().any(|(instance, _)| *instance == ihash),
+        )
+    };
+    if has_any_own {
+        return has_own_key;
+    }
+    let name = provider_name_of(ctx, this);
+    provider_properties()
+        .lock()
+        .contains_key(&(name, key.to_string()))
+}
+
+/// Build an unmodifiable `Set` of the strings produced by `pick`.
+///
+/// Each string is pinned across the `add` that follows it: the set, the string
+/// and every node allocated on the way can trigger a moving collection, and a
+/// raw `ObjectRef` held only in this Rust frame would be stale afterwards.
+/// This is the same discipline `provider_get_services_native` uses.
+fn provider_string_set(
+    ctx: &mut dyn NativeContext,
+    rows: &[(String, String)],
+    pick: fn(&(String, String)) -> &String,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
+    let set_pin = ctx.pin_native_root(set);
+    for row in rows {
+        let element = ctx.create_string(pick(row));
+        let element_pin = ctx.pin_native_root(element);
+        let set_now = ctx.read_native_pin(set_pin, set);
+        let element_now = ctx.read_native_pin(element_pin, element);
+        let added = ctx.invoke(
+            "java/util/HashSet",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[
+                Value::Object(Some(set_now)),
+                Value::Object(Some(element_now)),
+            ],
+        );
+        ctx.unpin_native_roots(element_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(set_pin);
+            return Err(e);
+        }
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    let view = wrap_unmodifiable(ctx, set);
+    ctx.unpin_native_roots(set_pin);
+    Ok(view)
+}
+
+/// `Provider.size()` — the number of registered rows, not the four the
+/// inherited map happened to hold.
+fn provider_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let n = provider_map_rows(ctx, this).len();
+    Ok(Some(Value::Int(n as i32)))
+}
+
+fn provider_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let empty = provider_map_rows(ctx, this).is_empty();
+    Ok(Some(Value::Int(i32::from(empty))))
+}
+
+/// `Provider.keySet()` — unmodifiable, as the real `Provider` returns.
+fn provider_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let rows = provider_map_rows(ctx, this);
+    let set = provider_string_set(ctx, &rows, |(key, _)| key)?;
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// `Properties.stringPropertyNames()` — every row here has a String key and a
+/// String value, so it is the same set as `keySet`.
+fn provider_string_property_names(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    provider_key_set(ctx, args)
+}
+
+/// `Provider.values()` — a `Collection`, and duplicates are meaningful here
+/// (many algorithms map to one implementation class), so this is a List and
+/// NOT a Set.
+fn provider_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let rows = provider_map_rows(ctx, this);
+    let list = ctx.new_object_initialized("java/util/ArrayList", "()V", &[])?;
+    let list = match list {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let list_pin = ctx.pin_native_root(list);
+    for (_, value) in &rows {
+        let element = ctx.create_string(value);
+        let element_pin = ctx.pin_native_root(element);
+        let list_now = ctx.read_native_pin(list_pin, list);
+        let element_now = ctx.read_native_pin(element_pin, element);
+        let added = ctx.invoke(
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[
+                Value::Object(Some(list_now)),
+                Value::Object(Some(element_now)),
+            ],
+        );
+        ctx.unpin_native_roots(element_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(list_pin);
+            return Err(e);
+        }
+    }
+    let list = ctx.read_native_pin(list_pin, list);
+    let view = match ctx.invoke(
+        "java/util/Collections",
+        "unmodifiableCollection",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        &[Value::Object(Some(list))],
+    ) {
+        Ok(Some(Value::Object(Some(v)))) => v,
+        _ => list,
+    };
+    ctx.unpin_native_roots(list_pin);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// `Provider.entrySet()` — unmodifiable, of real `Map.Entry` objects, so
+/// `entry.getKey()` / `entry.getValue()` work on the result.
+fn provider_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let rows = provider_map_rows(ctx, this);
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
+    let set_pin = ctx.pin_native_root(set);
+    for (key, value) in &rows {
+        let k = ctx.create_string(key);
+        let k_pin = ctx.pin_native_root(k);
+        let v = ctx.create_string(value);
+        let v_pin = ctx.pin_native_root(v);
+        let k_now = ctx.read_native_pin(k_pin, k);
+        let v_now = ctx.read_native_pin(v_pin, v);
+        let entry = ctx.new_object_initialized(
+            "java/util/AbstractMap$SimpleEntry",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[Value::Object(Some(k_now)), Value::Object(Some(v_now))],
+        );
+        ctx.unpin_native_roots(v_pin);
+        ctx.unpin_native_roots(k_pin);
+        let entry = match entry {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            Ok(_) => continue,
+            Err(e) => {
+                ctx.unpin_native_roots(set_pin);
+                return Err(e);
+            }
+        };
+        let entry_pin = ctx.pin_native_root(entry);
+        let set_now = ctx.read_native_pin(set_pin, set);
+        let entry_now = ctx.read_native_pin(entry_pin, entry);
+        let added = ctx.invoke(
+            "java/util/HashSet",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(set_now)), Value::Object(Some(entry_now))],
+        );
+        ctx.unpin_native_roots(entry_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(set_pin);
+            return Err(e);
+        }
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    let view = wrap_unmodifiable(ctx, set);
+    ctx.unpin_native_roots(set_pin);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// `Hashtable.keys()` / `Hashtable.elements()` — the Enumeration surface, built
+/// from a real `Vector` so the returned object is a genuine JDK Enumeration
+/// rather than a synthetic stand-in.
+fn provider_enumeration_of(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    values_not_keys: bool,
+) -> MethodCallResult {
+    let rows = provider_map_rows(ctx, this);
+    let vector = ctx.new_object_initialized("java/util/Vector", "()V", &[])?;
+    let vector = match vector {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let vector_pin = ctx.pin_native_root(vector);
+    for (key, value) in &rows {
+        let element = ctx.create_string(if values_not_keys { value } else { key });
+        let element_pin = ctx.pin_native_root(element);
+        let vector_now = ctx.read_native_pin(vector_pin, vector);
+        let element_now = ctx.read_native_pin(element_pin, element);
+        let added = ctx.invoke(
+            "java/util/Vector",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[
+                Value::Object(Some(vector_now)),
+                Value::Object(Some(element_now)),
+            ],
+        );
+        ctx.unpin_native_roots(element_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(vector_pin);
+            return Err(e);
+        }
+    }
+    let vector = ctx.read_native_pin(vector_pin, vector);
+    let out = ctx.invoke(
+        "java/util/Vector",
+        "elements",
+        "()Ljava/util/Enumeration;",
+        &[Value::Object(Some(vector))],
+    );
+    ctx.unpin_native_roots(vector_pin);
+    out
+}
+
+fn provider_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    provider_enumeration_of(ctx, this, false)
+}
+
+fn provider_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    provider_enumeration_of(ctx, this, true)
+}
+
+/// `Provider.putId()` — the four `Provider.id *` rows.
+///
+/// The real one writes them with `super.put`, which is an `invokespecial` on
+/// `Properties` and therefore bypasses the `Provider.put` native entirely. That
+/// is why those four rows were the ONLY thing the inherited map ever held, and
+/// why `get("Provider.id name")` answered null while `keySet().size()` was
+/// exactly 4. Recording them the way every other writer does puts them in the
+/// one store, so all the views above show them.
+///
+/// The real `super.put` calls are deliberately NOT reproduced. Routing them
+/// back through `Properties.put` threw inside `Provider.<init>` — the synthetic
+/// `Provider` layout this VM allocates does not carry a usable `Properties`
+/// backing map — and with every Map view registered above there is no longer a
+/// reader for the inherited map. One store, and it is this one.
+fn provider_put_id(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = provider_name_of(ctx, this);
+    let version = match ctx.get_field_by_name(this, "versionStr") {
+        Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let info = match ctx.get_field_by_name(this, "info") {
+        Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java.security.Provider".to_string())
+        .replace('/', ".");
+
+    let rows = [
+        ("Provider.id name", name.clone()),
+        ("Provider.id version", version),
+        ("Provider.id info", info),
+        ("Provider.id className", class_name),
+    ];
+    let ihash = ctx.identity_hash_code(this) as i64;
+    for (key, value) in &rows {
+        provider_properties()
+            .lock()
+            .insert((name.clone(), (*key).to_string()), value.clone());
+        provider_instance_keys()
+            .lock()
+            .insert((ihash, (*key).to_string()));
+    }
+
+    let _ = ihash;
+    Ok(None)
+}
+
 fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let prov_name = provider_name_of(ctx, this);
@@ -4813,6 +5195,24 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         provider_get_object,
     );
+    // The Map surface. `java.security.Provider` IS a `Properties`, and these
+    // were the methods nothing here registered — so they read the inherited
+    // map while `get`/`containsKey` read the side table, and the two never
+    // agreed. See `provider_map_rows`.
+    r.register(prov, "size", "()I", provider_size);
+    r.register(prov, "isEmpty", "()Z", provider_is_empty);
+    r.register(prov, "keySet", "()Ljava/util/Set;", provider_key_set);
+    r.register(prov, "entrySet", "()Ljava/util/Set;", provider_entry_set);
+    r.register(prov, "values", "()Ljava/util/Collection;", provider_values);
+    r.register(prov, "keys", "()Ljava/util/Enumeration;", provider_keys);
+    r.register(prov, "elements", "()Ljava/util/Enumeration;", provider_elements);
+    r.register(
+        prov,
+        "stringPropertyNames",
+        "()Ljava/util/Set;",
+        provider_string_property_names,
+    );
+    r.register(prov, "putId", "()V", provider_put_id);
 
     // Provider$Service accessors — `getClassName()` is consumed by both
     // `Cipher.getInstance` (to instantiate the SPI) and by callers

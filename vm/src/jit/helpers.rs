@@ -558,26 +558,61 @@ thread_local! {
     /// behaviour is unchanged.
     #[cfg(debug_assertions)]
     static JIT_THREAD_BORROWED: Cell<bool> = const { Cell::new(false) };
+
+    /// Debug-only: where the currently-live `jit_thread_mut` borrow was taken.
+    ///
+    /// The `debug_assert!` in `jit_thread_mut` says two borrows overlap; it
+    /// cannot say WHICH two, and with 58 call sites in this file that is the
+    /// whole difficulty. Populated only when
+    /// `CRATONVM_DBG_JIT_BORROW_SITES=1`, because capturing a backtrace on
+    /// every borrow costs far more than the borrow.
+    ///
+    /// `Cell<Option<Box<..>>>` rather than `RefCell`: the one place this is
+    /// read is the aliasing trip itself, which is by definition a reentrant
+    /// moment, and a `RefCell` double-borrow panic there would replace the
+    /// diagnosis with a different panic.
+    #[cfg(debug_assertions)]
+    static JIT_THREAD_BORROW_SITE: Cell<Option<Box<std::backtrace::Backtrace>>> =
+        const { Cell::new(None) };
+}
+
+/// Debug-only: is the borrow-site backtrace capture switched on?
+#[cfg(debug_assertions)]
+fn jit_borrow_site_capture_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_BORROW_SITES").is_some()
+    })
 }
 
 /// Debug-only: snapshot the borrow flag and clear it, so a nested JIT entry
 /// (the interpreter re-entering JIT from inside a bail) starts a fresh borrow
 /// level. Returns the previous value for [`restore_jit_borrow`]. No-op in
 /// release builds.
+///
+/// Carries the recorded borrow SITE along with the flag. Without that, the
+/// nested case leaves `flag = true` restored over `site = None` (the inner
+/// guard's drop cleared it), and a trip in the outer level then reports "no
+/// site recorded" while the capture is switched on — an instrument that goes
+/// quiet exactly where it is needed.
 #[cfg(debug_assertions)]
-fn suspend_jit_borrow() -> bool {
-    JIT_THREAD_BORROWED.with(|b| {
+fn suspend_jit_borrow() -> (bool, Option<Box<std::backtrace::Backtrace>>) {
+    let prev = JIT_THREAD_BORROWED.with(|b| {
         let prev = b.get();
         b.set(false);
         prev
-    })
+    });
+    let site = JIT_THREAD_BORROW_SITE.with(|s| s.take());
+    (prev, site)
 }
 
 /// Debug-only: restore the borrow flag suspended by [`suspend_jit_borrow`]
 /// once the nested JIT call has returned. No-op in release builds.
 #[cfg(debug_assertions)]
-fn restore_jit_borrow(prev: bool) {
-    JIT_THREAD_BORROWED.with(|b| b.set(prev));
+fn restore_jit_borrow(prev: (bool, Option<Box<std::backtrace::Backtrace>>)) {
+    let (flag, site) = prev;
+    JIT_THREAD_BORROWED.with(|b| b.set(flag));
+    JIT_THREAD_BORROW_SITE.with(|s| s.set(site));
 }
 
 /// Debug-only RAII guard that marks the `jit_thread_mut` borrow as released
@@ -591,6 +626,8 @@ impl Drop for JitThreadGuard {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
         JIT_THREAD_BORROWED.with(|b| b.set(false));
+        #[cfg(debug_assertions)]
+        JIT_THREAD_BORROW_SITE.with(|s| s.set(None));
     }
 }
 
@@ -610,7 +647,7 @@ pub struct JitThreadScope {
     /// no-op there.
     saved_shadow_top: Option<usize>,
     #[cfg(debug_assertions)]
-    prev_borrow: bool,
+    prev_borrow: (bool, Option<Box<std::backtrace::Backtrace>>),
 }
 
 /// DIAGNOSTIC: read the current dispatched JIT callee name.
@@ -1335,6 +1372,24 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
             // flag around that boundary so the legitimate nesting does NOT trip
             // here. (Empirically verified: DaCapo avrora drives ~1100 such
             // nested borrows and completes cleanly with no UB.)
+            if b.get() {
+                // Name BOTH sides before tripping. The assertion's own message
+                // asserts this is "a genuine sibling fabrication"; that claim
+                // is only checkable if the prior borrow's site is printed
+                // next to this one's.
+                let prior = JIT_THREAD_BORROW_SITE.with(|s| s.take());
+                match prior {
+                    Some(bt) => eprintln!(
+                        "[jit-borrow] PRIOR borrow was taken here:\n{bt}\n\
+                         [jit-borrow] SECOND borrow is being taken here:\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    ),
+                    None => eprintln!(
+                        "[jit-borrow] aliasing borrow detected; re-run with \
+                         CRATONVM_DBG_JIT_BORROW_SITES=1 to see both sites"
+                    ),
+                }
+            }
             debug_assert!(
                 !b.get(),
                 "jit_thread_mut: aliasing &mut JvmThread borrow detected \
@@ -1342,6 +1397,11 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
                  level — this is a genuine sibling fabrication, not a re-entry)"
             );
             b.set(true);
+            if jit_borrow_site_capture_enabled() {
+                JIT_THREAD_BORROW_SITE.with(|s| {
+                    s.set(Some(Box::new(std::backtrace::Backtrace::force_capture())))
+                });
+            }
         });
         Some((
             &mut *ptr,
@@ -6231,6 +6291,52 @@ pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
 /// [`JIT_GETFIELD_RECEIVER_SHAPE`]. Off by default: the classification re-reads
 /// the bounds table and the object header on a path taken tens of millions of
 /// times, so it must not be in the measured configuration.
+/// Is anything going to READ [`GETFIELD_HELPER_CALLS`] this run?
+///
+/// The increment is one relaxed atomic on the hottest helper in the VM, and
+/// its original comment claimed "this is not visible in it". That claim was
+/// never tested and was wrong: an ablation build measured it at ~2-3 ns of a
+/// 9 ns reference-field read, i.e. a quarter to a third of the post-fix cost.
+/// The counter is only ever printed under `CRATONVM_DBG=mic-prof` or
+/// `CRATONVM_DBG=jit-method-stats` (and it is the denominator the receiver
+/// census needs), so counting outside those buys nothing and costs the default
+/// configuration.
+///
+/// Cached, because a per-call `runtime_var_os` on this exact path is the 3.4x
+/// regression [`compact_inline_dbg`] documents.
+fn getfield_census_counting_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
+    })
+}
+
+/// Cached `CRATONVM_DBG_COMPACT_INLINE` gate for the `jit_getfield` guard-failure
+/// dump.
+///
+/// PERF (2026-08-18, the `BigDecimalBench` flag-read census): this gate was read
+/// through `runtime_var_os` on EVERY `jit_getfield` helper call, and that is not
+/// a cheap read — it hashes the name against the declared-flag set and then
+/// falls through to `std::env::var_os`. A per-key census of a 50k-iteration
+/// `BigDecimal` run counted **4,560,891 of 4,600,000 flag reads (99.1%) for this
+/// one name**, ~91 per benchmark iteration.
+///
+/// Worth noting where it sat: the comment on `GETFIELD_HELPER_CALLS` directly
+/// above the call site argues that one relaxed atomic increment is too cheap to
+/// show up in the measured 8.2 ns `receiverFieldTax` — and it is right. The
+/// uncached environment lookup on the very next line was the expensive one.
+///
+/// Same `OnceLock` idiom as [`getfield_receiver_census_enabled`] immediately
+/// below, which is the sibling gate on the same path and was always cached.
+fn compact_inline_dbg() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some()
+    })
+}
+
 fn getfield_receiver_census_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -6246,8 +6352,16 @@ fn getfield_receiver_census_enabled() -> bool {
 /// the helper stopped incrementing reading a confident `0` at shutdown, which
 /// on a page about instruments that measure the wrong thing would have been a
 /// poor way to go.
-pub fn jit_getfield_helper_calls() -> u64 {
-    GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+pub fn jit_getfield_helper_calls() -> Option<u64> {
+    if !getfield_census_counting_enabled() {
+        // NOT `Some(0)`. The counter is gated (see
+        // `getfield_census_counting_enabled`), and a gated counter reported as
+        // a number is indistinguishable from a fast path that never fell
+        // through — which is the precise misreading this whole counter exists
+        // to prevent.
+        return None;
+    }
+    Some(GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Why each helper call arrived: the receiver's own shape, counted at
@@ -6580,11 +6694,13 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // measured one. It costs one uncontended increment on a path that already
     // pays `note_jit_boundary`, `is_object_address` and a layout lookup — the
     // measured `receiverFieldTax` is 8.2 ns, and this is not visible in it.
-    GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if getfield_census_counting_enabled() {
+        GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if getfield_receiver_census_enabled() {
         note_getfield_receiver_shape(obj_ptr, field_index);
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+    if compact_inline_dbg() {
         dump_getfield_guard_failure(obj_ptr);
     }
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
@@ -10885,7 +11001,27 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // a call with nothing to compile and nothing to dispatch: a field read, an
     // atomic, or a constant. Everything after this point is per-call work that
     // such a site was paying for no reason. See `NativeSiteCache`.
-    if let Some(result) = try_jit_site_cached_native_dispatch(vm, info, info_key, args_slice) {
+    // Unlike the `jit_invoke_virtual_mic` call site, no borrow is live here —
+    // the nearest one above is scoped to an `if let` that has already closed —
+    // so this one acquires it, and the guard's scope is exactly the call.
+    //
+    // The borrow is passed as an `Option` rather than being required, so a run
+    // with no JIT thread installed still ENTERS the callee and still runs its
+    // counted pre-resolution bails; the `?` inside consumes the `None` at the
+    // same point the callee's own `jit_thread_mut()?` used to. Requiring it
+    // here instead would have skipped those `site_refusal::note_and_decline`
+    // counters, which the callee's own comment calls out as the thing that
+    // made its first cut unexplainable.
+    let mut thread_and_guard = jit_thread_mut();
+    let site_native = try_jit_site_cached_native_dispatch(
+        vm,
+        thread_and_guard.as_mut().map(|(t, _)| &mut **t),
+        info,
+        info_key,
+        args_slice,
+    );
+    drop(thread_and_guard);
+    if let Some(result) = site_native {
         disp_census::note(disp_census::OUT_SITE_NATIVE);
         return result;
     }
@@ -11735,6 +11871,29 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 /// by `forward_jit_reference_args` in the caller.
 unsafe fn try_jit_site_cached_native_dispatch(
     vm: &SharedVm,
+    // BORROWED FROM THE CALLER, never re-derived here.
+    //
+    // This used to do its own `jit_thread_mut()?` at the top of the leaf-native
+    // arm. That is sound from `jit_invoke_dispatch`, whose own borrow is scoped
+    // to an `if let` that closes before the call — and UNSOUND from
+    // `jit_invoke_virtual_mic`, which takes `(thread, _jit_thread_guard)` and
+    // holds the guard for the whole function. Two `&mut JvmThread` derived from
+    // the same raw pointer were live at once, with no `set_jit_thread` boundary
+    // between them to make the inner one a child reborrow — a genuine sibling,
+    // which is exactly what `jit_thread_mut`'s debug assertion says when it
+    // fires. And the outer reference is USED after the inner one is created
+    // (`safe_native_call`, `handle_jit_dispatch_error`, … all take it as
+    // `&mut`), so the invalidated borrow is not merely held but dereferenced.
+    //
+    // The `debug_assert!` is `#[cfg(debug_assertions)]`; the aliasing is not.
+    // Release built the same two derivations and simply did not look.
+    //
+    // `Option`, not `&mut`, and consumed at exactly the point the old
+    // `jit_thread_mut()?` stood — several counted bails
+    // (`site_refusal::note_and_decline`) run before it, and hoisting the
+    // thread requirement above them would silently stop counting a refusal
+    // whenever no JIT thread is installed.
+    thread: Option<&mut JvmThread>,
     info: &JitInvokeInfo,
     info_key: JitSiteKey,
     args_slice: &[i64],
@@ -11809,7 +11968,9 @@ unsafe fn try_jit_site_cached_native_dispatch(
         }
     }
 
-    let (thread, _guard) = jit_thread_mut()?;
+    // The old `let (thread, _guard) = jit_thread_mut()?;` stood here. Same
+    // position, same early-out, but the reference is the caller's.
+    let thread = thread?;
     if entry.kind == LeafNativeKind::ThreadCurrentThread {
         // The mirror is a per-thread GC root the collector remaps, and handing
         // it to the caller roots it again with no allocation in between. When
@@ -13887,22 +14048,33 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 /// holds the callee and the emitted cascade never re-enters Rust
 /// (`mic_calls=1` across 2 200 000 dispatches, `CRATONVM_DBG=mic-prof`). The
 /// only thing keeping a lambda out of that slot was an argument shuffle — the
-/// call site has `(proxy, samArgs…)` and a non-capturing lambda's impl wants
-/// `(samArgs…)` — so `lambda_adapter` emits a thunk that performs the shuffle
-/// and tail-jumps, and the slot holds THAT.
+/// call site has `(proxy, samArgs…)` and the impl wants `(captures…, samArgs…)`
+/// — so `lambda_adapter` emits a thunk that performs the shuffle, reads any
+/// captures out of the proxy, and tail-jumps; the slot holds THAT.
 ///
-/// Installed only for shapes the thunk can serve without touching memory:
+/// Two questions are asked here, and the rest belong to the emitter:
 ///
-/// * **no captures** — reading a captured field from a hand-emitted thunk would
-///   mean reproducing the compact/legacy body-layout branch (`GC_FLAG_COMPACT`)
-///   and every per-type width the `getfield` arms handle. A capturing lambda
-///   keeps the Rust arm.
 /// * **no `checkcast`** — a generic call site's cast is a class-hierarchy
 ///   question, not a register move.
-/// * **a static impl**, which "no captures" already implies for javac's output;
-///   asserted rather than assumed because the thunk drops the receiver outright.
-/// * **an arity the register ABI can carry**, receiver and context included —
-///   `lambda_adapter_entry` refuses the rest.
+/// * **a static impl**, asserted rather than assumed because the thunk drops the
+///   receiver outright and nothing downstream would notice if it mattered.
+///
+/// Whether the captures' types, the proxy's layout and the arity permit an
+/// emission is `lambda_adapter_entry`'s to decide — it is what would have to
+/// emit them. A `None` from it leaves this site on the Rust arm for good,
+/// because the install is claimed before the attempt rather than after it; and
+/// every refusal it can make is a property of the SITE rather than of the
+/// moment, so nothing is given up by asking once.
+///
+/// That last sentence was NOT true while a reference capture could also be
+/// refused for the collector's read-barrier state, which is a property of the
+/// instant: a site that happened to ask during an armed cycle lost its thunk
+/// permanently. That refusal is gone — it was both inert by default and
+/// unnecessary, see `lambda_adapter_entry` — so the "ask once" shape is now
+/// unqualified. Claiming after the attempt instead would trade it for
+/// re-asking (a lock and a layout lookup) on every dispatch a refused site ever
+/// serves, which is the shape of the 202 000 re-installs
+/// `LambdaJitSite::adapter_installed` exists to prevent.
 ///
 /// Both slots are written, because the emitted cascade prefers the PIC when the
 /// codegen allocated one and never consults the MIC in that case.
@@ -13924,16 +14096,23 @@ unsafe fn install_lambda_inline_cache(
     if !crate::runtime::env_cache::jit_lambda_adapter() {
         return;
     }
-    if site.num_captures() != 0 || site.has_checkcasts() || !site.is_static_impl() {
+    if site.num_captures() != 0 && !crate::runtime::env_cache::jit_lambda_capture_adapter() {
+        return;
+    }
+    if site.has_checkcasts() || !site.is_static_impl() {
         return;
     }
     if !site.claim_adapter_install() {
         return;
     }
+    // `total_args` is captures plus SAM arguments; the emitter wants them apart,
+    // because only the SAM arguments arrive in registers.
+    let sam_args = site.total_args() - site.num_captures();
     let Some(entry) = cratonvm_jit::lambda_adapter::lambda_adapter_entry(
         receiver_class_id.as_u32(),
         code.arc(),
-        site.total_args(),
+        site.capture_descs(),
+        sam_args,
     ) else {
         return;
     };
@@ -13953,12 +14132,12 @@ unsafe fn install_lambda_inline_cache(
         installed = true;
     }
     if installed {
-        crate::runtime::interpreter::lambda_site_bump_adapter();
+        crate::runtime::interpreter::lambda_site_bump_adapter(site.num_captures());
         if mic_prof::enabled() {
             eprintln!(
                 "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
-                 sam_args={} entry={entry:#x} impl={}",
-                site.total_args(),
+                 captures={} sam_args={sam_args} entry={entry:#x} impl={}",
+                site.num_captures(),
                 class_name,
             );
         }
@@ -14415,6 +14594,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
+        Some(thread),
         info,
         jit_site_key(vm.vm_identity, info_ptr as usize),
         args_slice,

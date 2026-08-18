@@ -21668,6 +21668,24 @@ mod g22_glob_translation_tests {
     /// Every expectation here is the regex the JDK's own `Globs
     /// .toWindowsRegexPattern` produces, cross-checked against the MEASURED
     /// match/no-match answers of HotSpot 25.0.3+9 on Windows (G22-1 §Glob).
+    ///
+    /// That claim was false for the first block until 2026-08-18: ten
+    /// expectations spelled the separator class with ONE backslash where the
+    /// JDK emits two — and one backslash is not even a legal Java character
+    /// class, because it escapes the closing bracket and the class never
+    /// closes. The rest of this function already had it right, which is what a
+    /// partial hand-edit looks like.
+    ///
+    /// Re-derived rather than reasoned about: `Globs.toWindowsRegexPattern`
+    /// called by reflection on JDK 25 under `--add-opens java.base/sun.nio.fs`,
+    /// against this VM's `p57_globs_to_regex` over the same inputs. They agree
+    /// on all 21 patterns, so the translator was right and only these strings
+    /// were wrong.
+    ///
+    /// A line asserting that the escaped form translates BOTH to `^suba'\'.txt$`
+    /// and to `^sub'\'a'\'.txt$`, two lines apart, is also gone: no
+    /// implementation can satisfy both, so this test could never have passed.
+    /// The JDK gives the first.
     #[test]
     fn windows_translation_matches_the_jdk() {
         // `*` and `?` stop at the separator; `**` crosses it.

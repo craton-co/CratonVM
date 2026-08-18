@@ -3223,7 +3223,7 @@ impl G1Collector {
         // previous pause could not evacuate, so it runs with a heap the
         // collector has already declined to reason about normally — exactly the
         // state in which a death certificate should not be issued.
-        let _census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let _census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
@@ -3419,6 +3419,16 @@ impl G1Collector {
             "G1 young CSet contains a pinned region"
         );
 
+        // G1AUD-11 — pre-evacuation `(region_type, cursor)` snapshot. A region
+        // whose either field differs afterwards is one this pause WROTE INTO,
+        // and those, plus the CSet's remembered-set sources, are the only
+        // regions the Phase-4 fix-up can have anything to do. Derived by
+        // observation rather than from the evacuator's bookkeeping, so a
+        // future allocation path cannot forget to register itself — see
+        // `phase4_regions_to_walk`. One pass over two words per region.
+        let pre_evac: Vec<(RegionType, usize)> =
+            regions.iter().map(|r| (r.region_type, r.cursor)).collect();
+
         // Phase 1: Scan roots and evacuate reachable objects from CSet
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
         let mut work_list: Vec<*mut u8> = Vec::new();
@@ -3548,6 +3558,9 @@ impl G1Collector {
         rset_sources.extend(jit_pinned_regions.iter().copied());
         let unique_sources = rset_sources;
         let rset_sources_scanned = unique_sources.len();
+        // G1AUD-11: the narrow Phase-4 set needs these after the walk below
+        // consumes them.
+        let narrow_sources = unique_sources.clone();
         if dbg_phases {
             eprintln!(
                 "[g1][PHASES] roots={} p1_forwards={p1_forwards} sources={:?}",
@@ -3613,7 +3626,17 @@ impl G1Collector {
         phase_mark = std::time::Instant::now();
 
         // Phase 4: Update forwarding pointers in non-CSet regions
-        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let narrow = self.phase4_regions_to_walk(
+            &regions,
+            Some(&pre_evac),
+            &narrow_sources,
+            gc_flags().g1_eager_humongous
+                && regions
+                    .iter()
+                    .any(|r| r.region_type == RegionType::HumongousStart),
+        );
+        let census =
+            self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, narrow.as_ref());
         phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
         phases.fixup_regions = census.walked_regions;
         phases.fixup_bytes = census.walked_bytes;
@@ -3642,6 +3665,7 @@ impl G1Collector {
         // the release/quiet path; aborts in debug.
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_rset_completeness(&regions, "young-serial");
         // Env-gated diagnostics (no-ops unless CRATONVM_G1_DBG_HEADERS /
         // CRATONVM_G1_DBG_ZERO are set) — same coverage the parallel path has,
         // so serial-path corruption is also caught at the collection that
@@ -4090,7 +4114,7 @@ impl G1Collector {
         );
 
         // Update references and free evacuated regions
-        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
 
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
@@ -4656,7 +4680,7 @@ impl G1Collector {
         };
 
         // Phase 4: update interior refs in non-CSet regions.
-        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
 
         // Phase 5: free evacuated regions.
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
@@ -4888,7 +4912,7 @@ impl G1Collector {
             )
         };
 
-        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
 
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
@@ -5958,11 +5982,88 @@ impl G1Collector {
     /// than walking the heap a second time is the whole reason eager reclaim is
     /// affordable per pause: this pass already visits every reference slot in
     /// every non-CSet region.
+    /// G1AUD-11 — the regions Phase 4 must walk, or `None` for "all of them".
+    ///
+    /// # Why the whole-heap walk can be narrowed at all
+    ///
+    /// A slot needing a forwarding rewrite points at an object that was
+    /// EVACUATED, i.e. one that lived in the collection set. Only three kinds
+    /// of place can hold such a slot:
+    ///
+    /// * a root — Phase 1 rewrites those directly;
+    /// * an object in the CSet — evacuated, and Phase 3 scans every to-space
+    ///   copy;
+    /// * an object in a non-CSet region — reachable to the collector ONLY
+    ///   through that region's membership in the CSet's remembered set, which
+    ///   is exactly what Phase 2 walks.
+    ///
+    /// So the rewrite half of Phase 4 is redundant with Phases 2 and 3 as soon
+    /// as the remembered set is complete. It is: every mutator reference store
+    /// reaches `post_write_barrier_rset` — the interpreter's and every
+    /// native's directly, and every JIT-compiled one through
+    /// `jit_putfield_object` since defect G1-2 was closed (under G1 the
+    /// `JIT_REGION_BOUNDS` table is never published, so `region_bounds_are_live`
+    /// is false and all four inline emitters take the helper).
+    ///
+    /// # Why the set is derived by observation
+    ///
+    /// The other half of Phase 4 is the GC-INTERNAL rset rebuild: edges the
+    /// collector itself creates by copying an object or by rewriting a slot.
+    /// Those live in whichever regions this pause WROTE INTO, and enumerating
+    /// them from the evacuator's bookkeeping would mean every present and
+    /// future allocation path (serial, parallel, finalizer resurrection, the
+    /// kept-region drain) remembering to register itself — a list that is one
+    /// forgotten call site away from a silent lost edge.
+    ///
+    /// Instead the caller snapshots `(region_type, cursor)` for every region
+    /// before evacuation, and a region is "changed" iff either differs
+    /// afterwards. That catches any write by any path, including paths added
+    /// later, and costs one O(regions) pass over two words.
+    ///
+    /// # What still forces the wide walk
+    ///
+    /// The humongous census. "Nothing in the heap references span H" is a
+    /// whole-heap claim, so when the heap holds a humongous span and eager
+    /// reclaim is on, this returns `None` and the walk is unchanged. A
+    /// coarsened remembered set needs no special case: `live_rset_sources`
+    /// already answers "every live region" for one, so the narrow set degrades
+    /// to the wide one on its own.
+    fn phase4_regions_to_walk(
+        &self,
+        regions: &[G1Region],
+        pre: Option<&[(RegionType, usize)]>,
+        rset_sources: &std::collections::HashSet<usize>,
+        want_census: bool,
+    ) -> Option<std::collections::HashSet<usize>> {
+        if !gc_flags().g1_narrow_fixup {
+            return None;
+        }
+        // The census is a whole-heap question; nothing narrower can answer it.
+        if want_census {
+            return None;
+        }
+        let pre = pre?;
+        if pre.len() != regions.len() {
+            // A snapshot that does not describe this region table cannot be
+            // used to decide what changed. Fail wide.
+            return None;
+        }
+        let mut set = rset_sources.clone();
+        for (i, r) in regions.iter().enumerate() {
+            let (was_type, was_cursor) = pre[i];
+            if r.region_type != was_type || r.cursor != was_cursor {
+                set.insert(i);
+            }
+        }
+        Some(set)
+    }
+
     fn update_references_in_regions(
         &self,
         regions: &mut Vec<G1Region>,
         cset: &std::collections::HashSet<usize>,
         pointer_map: &cratonvm_types::PointerMap,
+        narrow: Option<&std::collections::HashSet<usize>>,
     ) -> HumongousCensus {
         let mut census = HumongousCensus::default();
         let rewrite = !pointer_map.is_empty();
@@ -6035,6 +6136,13 @@ impl G1Collector {
 
         for i in 0..regions.len() {
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
+                continue;
+            }
+            // G1AUD-11: with a narrow set, a region outside it holds no slot
+            // into the CSet and had no edge created in it this pause — see
+            // `phase4_regions_to_walk` for the argument and for what forces
+            // the wide walk instead.
+            if narrow.is_some_and(|n| !n.contains(&i)) {
                 continue;
             }
 
@@ -6242,6 +6350,126 @@ impl G1Collector {
     /// overhead near-zero it is gated on `debug_assertions` OR the
     /// existing `gc_log_enabled` verify flag; the common (release, quiet)
     /// path skips it entirely.
+    /// G1AUD-11 — post-pause remembered-set COMPLETENESS check
+    /// (`CRATONVM_G1_DBG_RSET`).
+    ///
+    /// `verify_no_dangling_into_cset` answers "did this pause leave a stale
+    /// pointer?" — a question about the pause that just ran. This answers the
+    /// other half: "will the NEXT pause know where to look?" Every cross-region
+    /// reference from a live region `H` into a collectable region `T` must be
+    /// named in `T`'s remembered set, or the pause that collects `T` never
+    /// scans `H` and frees an object `H` still points at.
+    ///
+    /// That is the invariant the Phase-4 rebuild maintains, and it is the one
+    /// narrowing the walk could break. It is checked here rather than in a unit
+    /// test because the unit suite cannot discriminate: on every constructible
+    /// fixture the mutator barrier alone already records every edge, so a
+    /// Phase-4 walk that visits NOTHING still passes. The shape that needs the
+    /// rebuild — a pair stored while both ends shared one Eden region, so no
+    /// cross-region barrier fired, which promotion then splits across two Old
+    /// regions — is documented as observed on real workloads and resisted
+    /// construction in a test. So the check runs against real programs instead.
+    ///
+    /// Whole-heap and O(live bytes): a diagnostic, never a shipping default.
+    /// Reports and continues rather than aborting, so one violation does not
+    /// hide the rest.
+    fn dbg_verify_rset_completeness(&self, regions: &[G1Region], site: &'static str) {
+        if !gc_flags().g1_dbg_rset {
+            return;
+        }
+        let (examined, missing) = self.rset_completeness_counts(regions, site);
+        // Printed even when clean, and with the DENOMINATOR: "no violations"
+        // over zero examined edges is what a vacuous check looks like, and this
+        // check has already been vacuous once in a unit fixture.
+        eprintln!("[g1][RSET-CHECK] {site}: edges={examined} missing={missing}");
+    }
+
+    /// The walk itself, returning `(edges_examined, edges_missing)`.
+    ///
+    /// Split from the flag-gated, printing wrapper so a unit test can prove
+    /// this code CAN report a violation. `missing=0` from a checker that is
+    /// incapable of returning anything else is not evidence, and the whole
+    /// reason this exists is that the unit suite could not tell a correct
+    /// Phase-4 narrowing from one that walked nothing.
+    fn rset_completeness_counts(
+        &self,
+        regions: &[G1Region],
+        site: &str,
+    ) -> (usize, usize) {
+        let mut examined = 0usize;
+        let mut missing = 0usize;
+        for h in 0..regions.len() {
+            if regions[h].region_type == RegionType::Free {
+                continue;
+            }
+            let base = regions[h].data.as_ptr() as usize;
+            let cursor = regions[h].cursor;
+            let mut offset = 0usize;
+            while offset < cursor {
+                let obj_ptr = (base + offset) as *mut u8;
+                if let Some(gap) = gap_filler_len(obj_ptr) {
+                    offset += gap;
+                    continue;
+                }
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let size = object_total_size(header);
+                if size < HEADER_SIZE || offset + size > cursor {
+                    break;
+                }
+                let mut check = |raw: usize| {
+                    let Some(t) = self.lookup_region_for_addr(raw) else {
+                        return;
+                    };
+                    if t == h || !is_collectable_region_type(regions[t].region_type) {
+                        return;
+                    }
+                    examined += 1;
+                    if regions[t].rset.is_coarsened() {
+                        return; // means "every region", so it names `h`
+                    }
+                    if !regions[t]
+                        .rset
+                        .sources_with_generations()
+                        .into_iter()
+                        .any(|(src, _)| src == h)
+                    {
+                        missing += 1;
+                        if missing <= 8 {
+                            tracing::warn!(
+                                "[g1][RSET-INCOMPLETE] {site}: region {h} ({:?}) object \
+                                 0x{:x} references 0x{raw:x} in region {t} ({:?}), but \
+                                 region {t}'s remembered set does not name {h} — the next \
+                                 pause that collects {t} will not scan {h}",
+                                regions[h].region_type,
+                                obj_ptr as usize,
+                                regions[t].region_type,
+                            );
+                        }
+                    }
+                };
+                if header.kind() == ObjectKind::Array {
+                    if header.element_type() == ArrayElementType::Reference {
+                        let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+                        for k in 0..header.array_length() as usize {
+                            let raw: u64 =
+                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) };
+                            if raw != 0 {
+                                check(raw as usize);
+                            }
+                        }
+                    }
+                } else {
+                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| check(raw));
+                }
+                offset += size;
+            }
+        }
+        (examined, missing)
+    }
+
     fn verify_no_dangling_into_cset(
         &self,
         regions: &[G1Region],
@@ -15598,6 +15826,326 @@ mod tests {
             r.region_type = RegionType::Eden;
             r.cursor = full;
         }
+    }
+
+    /// G1AUD-11 — the post-pause remembered-set completeness invariant.
+    ///
+    /// For every live non-CSet region `H` and every cross-region reference it
+    /// holds into a COLLECTABLE region `T`, `T`'s remembered set must name `H`.
+    /// That is the whole contract the Phase-4 rebuild exists to maintain, and
+    /// it is what a wrong narrowing breaks — not this pause, but the NEXT one,
+    /// which then fails to scan `H` when `T` enters the collection set and
+    /// frees a still-referenced object.
+    ///
+    /// Checked as a universal invariant over the whole heap rather than by
+    /// engineering one specific layout: which regions the evacuator happens to
+    /// pack survivors into is not something a test should be pinning, and a
+    /// missed edge anywhere is equally fatal.
+    fn assert_rset_covers_every_cross_region_edge(gc: &G1Collector, when: &str) -> usize {
+        let regions = gc.regions.lock();
+        let mut missing: Vec<String> = Vec::new();
+        // How many cross-region edges this check actually EXAMINED. A checker
+        // that inspects nothing passes for free, which on a heap whose regions
+        // are big enough to hold the whole graph is exactly what happens — and
+        // is why the pre-existing suite could not see a broken narrowing.
+        let mut examined = 0usize;
+        for (h, region) in regions.iter().enumerate() {
+            if region.region_type == RegionType::Free {
+                continue;
+            }
+            let base = region.data.as_ptr() as usize;
+            let mut offset = 0usize;
+            while offset < region.cursor {
+                let obj_ptr = (base + offset) as *mut u8;
+                if let Some(gap) = gap_filler_len(obj_ptr) {
+                    offset += gap;
+                    continue;
+                }
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let size = object_total_size(header);
+                if size < HEADER_SIZE || offset + size > region.cursor {
+                    break;
+                }
+                let mut check = |raw: usize| {
+                    let Some(t) = gc.lookup_region_for_addr(raw) else {
+                        return;
+                    };
+                    if t == h || !is_collectable_region_type(regions[t].region_type) {
+                        return;
+                    }
+                    examined += 1;
+                    if regions[t].rset.is_coarsened() {
+                        return; // means "every region", so it names `h`
+                    }
+                    let named = regions[t]
+                        .rset
+                        .sources_with_generations()
+                        .into_iter()
+                        .any(|(src, _)| src == h);
+                    if !named {
+                        missing.push(format!(
+                            "region {h} ({:?}) holds 0x{raw:x} in region {t} ({:?}) \
+                             but region {t}'s rset does not name {h}",
+                            regions[h].region_type, regions[t].region_type
+                        ));
+                    }
+                };
+                if header.kind() == ObjectKind::Array {
+                    if header.element_type() == ArrayElementType::Reference {
+                        let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+                        for k in 0..header.array_length() as usize {
+                            let raw: u64 =
+                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) };
+                            if raw != 0 {
+                                check(raw as usize);
+                            }
+                        }
+                    }
+                } else {
+                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| check(raw));
+                }
+                offset += size;
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{when}: {} cross-region edge(s) missing from the remembered set — \
+             the NEXT pause will not scan their holders and will free a live \
+             object:\n  {}",
+            missing.len(),
+            missing.join("\n  ")
+        );
+        examined
+    }
+
+    /// Config with small regions, so an ordinary object graph is spread over
+    /// many regions and produces real cross-region edges. The default 1 MiB
+    /// region packs an entire unit-test heap into one or two regions, where
+    /// every edge is intra-region and the remembered set is trivially correct
+    /// no matter what the collector does — which is exactly why the existing
+    /// suite could not see a broken Phase-4 narrowing.
+    fn many_region_config() -> G1CollectorConfig {
+        G1CollectorConfig {
+            heap_size: 4 * 1024 * 1024,
+            region_size: 8 * 1024,
+            promotion_age: 0, // promote on the first pause, so edges go Old->young
+            ..small_config()
+        }
+    }
+
+    /// G1AUD-11 — the narrowed Phase-4 walk must still leave the remembered set
+    /// complete, across REPEATED pauses.
+    ///
+    /// One pause is not enough: the rewrite half of Phase 4 is redundant with
+    /// Phases 2 and 3, so a pause whose fix-up walked nothing at all still
+    /// produces a correct heap. What a wrong narrowing loses is the GC-INTERNAL
+    /// edge rebuild, whose absence is invisible until a LATER pause fails to
+    /// scan a holder. This drives several pauses over a retained graph and
+    /// checks the invariant after each.
+    #[test]
+    fn the_narrowed_fixup_keeps_the_remembered_set_complete_across_pauses() {
+        let gc = G1Collector::new(many_region_config());
+
+        // A retained linked structure, big enough to span many regions.
+        // Enough nodes to span many 8 KiB regions: a 2-slot legacy object is
+        // 48 bytes, so 64 of them fit in ONE region and produce no cross-region
+        // edge at all — which is exactly how the first version of this test
+        // managed to examine zero edges and pass regardless of what the
+        // collector did.
+        let mut nodes: Vec<ObjectRef> = Vec::new();
+        for i in 0..1500 {
+            let n = gc.alloc_object(ClassId::new(1), 2);
+            if let Some(prev) = nodes.last() {
+                gc.set_field(*prev, 0, Value::Object(Some(n)));
+            }
+            gc.set_field(n, 1, Value::Int(i));
+            nodes.push(n);
+            // INTERLEAVED garbage, and it is load-bearing for what this test
+            // discriminates. The remembered-set rebuild exists for a pair
+            // stored while BOTH ends sat in one Eden region — the post-write
+            // barrier records only CROSS-region edges, so that store leaves no
+            // entry at all — which a later promotion then splits across two Old
+            // regions. Allocating the chain contiguously makes Eden packing and
+            // Old packing agree, so the pairs that shared an Eden region also
+            // share an Old region and the case never arises: the first version
+            // of this test examined real edges, passed, and still could not
+            // tell a working narrowing from one that walked NOTHING. Garbage
+            // between the nodes makes the promotion compact them differently,
+            // so region boundaries move and the split pairs appear.
+            for _ in 0..3 {
+                let _ = gc.alloc_object(ClassId::new(9), 3);
+            }
+        }
+        let head = nodes[0];
+
+        let mut total_examined = 0usize;
+        for pass in 0..4 {
+            // Garbage between pauses, so each pause has something to reclaim
+            // and something to promote.
+            for _ in 0..400 {
+                let _ = gc.alloc_object(ClassId::new(2), 1);
+            }
+            let mut roots = vec![head];
+            let _ = gc.young_collection(&mut roots, &NoopMonitors);
+            total_examined +=
+                assert_rset_covers_every_cross_region_edge(&gc, &format!("after pause {pass}"));
+
+            // …and the graph is still walkable and intact, which is what the
+            // missing-edge failure would eventually destroy.
+            let mut cur = roots[0];
+            for i in 0..1500 {
+                assert_eq!(
+                    gc.get_field(cur, 1).as_int(),
+                    Some(i),
+                    "node {i} lost its payload after pause {pass}"
+                );
+                match gc.get_field(cur, 0) {
+                    Value::Object(Some(next)) => cur = next,
+                    _ => {
+                        assert_eq!(i, 1499, "chain broke early at node {i} after pause {pass}");
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            total_examined > 0,
+            "the remembered-set check examined ZERO cross-region edges across              every pause — the fixture is not producing the shape it guards, so              a green result here would mean nothing"
+        );
+    }
+
+    /// G1AUD-11 — the remembered-set completeness checker must be able to
+    /// REPORT a violation.
+    ///
+    /// `missing=0` from a checker incapable of returning anything else is not
+    /// evidence, and that is the whole reason this checker exists: the unit
+    /// suite could not distinguish a correct Phase-4 narrowing from one that
+    /// walked nothing, so the real-workload run under `CRATONVM_G1_DBG_RSET`
+    /// is what the change leans on. This proves that run could have failed.
+    ///
+    /// Builds a genuine cross-region edge, confirms the checker sees it and is
+    /// happy, then CLEARS the target's remembered set — exactly the state a
+    /// lost GC-internal edge produces — and requires the checker to notice.
+    #[test]
+    fn the_rset_completeness_checker_can_report_a_missing_edge() {
+        let gc = G1Collector::new(many_region_config());
+        // Enough nodes to guarantee the chain crosses region boundaries.
+        let mut nodes: Vec<ObjectRef> = Vec::new();
+        for _ in 0..1500 {
+            let n = gc.alloc_object(ClassId::new(1), 2);
+            if let Some(prev) = nodes.last() {
+                gc.set_field(*prev, 0, Value::Object(Some(n)));
+            }
+            nodes.push(n);
+        }
+
+        let (examined, missing) = {
+            let regions = gc.regions.lock();
+            gc.rset_completeness_counts(&regions, "test")
+        };
+        assert!(
+            examined > 0,
+            "the fixture must produce cross-region edges, or the checker has              nothing to be sensitive ABOUT"
+        );
+        assert_eq!(missing, 0, "the barrier should have recorded every edge");
+
+        // Now break it: drop every remembered set. Every one of those
+        // `examined` edges is now unaccounted for.
+        {
+            let regions = gc.regions.lock();
+            for r in regions.iter() {
+                r.rset.clear();
+            }
+        }
+        let (examined_after, missing_after) = {
+            let regions = gc.regions.lock();
+            gc.rset_completeness_counts(&regions, "test")
+        };
+        assert_eq!(
+            examined_after, examined,
+            "clearing the remembered sets must not change how many edges exist"
+        );
+        assert_eq!(
+            missing_after, examined,
+            "with every remembered set cleared, EVERY cross-region edge must be              reported missing — a checker that still says 0 is measuring nothing"
+        );
+    }
+
+    /// G1AUD-11 — the narrow set itself: it must contain every region the pause
+    /// WROTE INTO and every remembered-set source, and it must actually
+    /// EXCLUDE an untouched region (or it is not a narrowing at all).
+    #[test]
+    fn the_narrow_fixup_set_is_the_changed_regions_plus_the_rset_sources() {
+        let gc = G1Collector::new(many_region_config());
+        // Pre-existing state: region 7 is an Old region that this pause will
+        // NOT touch. It has to be Old in the snapshot too — a region that
+        // becomes Old during the pause is one the pause wrote into, which is
+        // precisely a region that DOES need walking.
+        {
+            let mut regions = gc.regions.lock();
+            regions[7].region_type = RegionType::Old;
+            regions[7].cursor = 128;
+        }
+        let pre: Vec<(RegionType, usize)> = {
+            let regions = gc.regions.lock();
+            regions.iter().map(|r| (r.region_type, r.cursor)).collect()
+        };
+        // What this pause did: region 3 is a remembered-set source, region 5
+        // was allocated into (Free -> Survivor, cursor grew).
+        {
+            let mut regions = gc.regions.lock();
+            regions[5].region_type = RegionType::Survivor;
+            regions[5].cursor = 64;
+        }
+        let sources: std::collections::HashSet<usize> = [3usize].into_iter().collect();
+        let regions = gc.regions.lock();
+        let narrow = gc
+            .phase4_regions_to_walk(&regions, Some(&pre), &sources, false)
+            .expect("narrowing is on and no census is wanted");
+
+        assert!(narrow.contains(&3), "a remembered-set source must be walked");
+        assert!(
+            narrow.contains(&5),
+            "a region this pause wrote into must be walked — it holds new \
+             GC-internal edges"
+        );
+        assert!(
+            !narrow.contains(&7),
+            "an untouched region must be EXCLUDED, or the walk was not narrowed"
+        );
+    }
+
+    /// …and the two things that must still force the WIDE walk.
+    #[test]
+    fn the_fixup_stays_wide_for_the_humongous_census_and_without_a_snapshot() {
+        let gc = G1Collector::new(many_region_config());
+        let pre: Vec<(RegionType, usize)> = {
+            let regions = gc.regions.lock();
+            regions.iter().map(|r| (r.region_type, r.cursor)).collect()
+        };
+        let sources = std::collections::HashSet::new();
+        let regions = gc.regions.lock();
+
+        assert!(
+            gc.phase4_regions_to_walk(&regions, Some(&pre), &sources, true)
+                .is_none(),
+            "\"nothing in the heap references this span\" is a whole-heap claim; \
+             the census must force the wide walk"
+        );
+        assert!(
+            gc.phase4_regions_to_walk(&regions, None, &sources, false)
+                .is_none(),
+            "no snapshot means no way to know what changed — fail wide"
+        );
+        let short = vec![(RegionType::Free, 0usize); 2];
+        assert!(
+            gc.phase4_regions_to_walk(&regions, Some(&short), &sources, false)
+                .is_none(),
+            "a snapshot that does not describe this region table must fail wide"
+        );
     }
 
     fn free_region_count(gc: &G1Collector) -> usize {

@@ -314,6 +314,163 @@ public final class LambdaJitTierUp {
         return sum;
     }
 
+    // The capturing fixtures below get their OWN hop methods, and that is not
+    // tidiness.
+    //
+    // `step` is shared by every checksum in this file, so ITS call site
+    // accumulates receiver classes across the whole run — three from
+    // `captureShapesChecksum`, one from `multiCaptureChecksum`, one from
+    // `warmCapturingChecksum`, on top of everything above. The polymorphic
+    // inline cache holds four (`JIT_PIC_ENTRIES`), and the fifth receiver
+    // evicts one. Past that the site thrashes and every dispatch falls back to
+    // the Rust arm, which is exactly what `site_direct` is asserted to be small.
+    //
+    // Measured as an intermittent failure of `lambda_capture_adapter_tests` —
+    // one run in eighteen — because whether the site goes megamorphic before or
+    // after the bulk of the calls depends on when each body finishes compiling.
+    // A dedicated hop per fixture keeps each site inside the cache's four ways,
+    // and is also what an ordinary call site looks like.
+
+    private static int capStep(IntUnaryOperator op, int v) {
+        return op.applyAsInt(v);
+    }
+
+    private static int shapeStep(IntUnaryOperator op, int v) {
+        return op.applyAsInt(v);
+    }
+
+    private static long shapeStepLong(LongUnaryOperator op, long v) {
+        return op.applyAsLong(v);
+    }
+
+    private static double shapeStepDouble(DoubleUnaryOperator op, double v) {
+        return op.applyAsDouble(v);
+    }
+
+    private static String shapeStepObj(IntFunction<String> op, int v) {
+        return op.apply(v);
+    }
+
+    private static int multiStep(IntUnaryOperator op, int v) {
+        return op.applyAsInt(v);
+    }
+
+    private static long multiStepLong(LongUnaryOperator op, long v) {
+        return op.applyAsLong(v);
+    }
+
+    private static double multiStepDouble(DoubleUnaryOperator op, double v) {
+        return op.applyAsDouble(v);
+    }
+
+    /**
+     * {@link #warmChecksum} for a CAPTURING lambda.
+     *
+     * The non-capturing thunk is a pure register shuffle; this one has to read
+     * the captured value out of the proxy object before it jumps. {@code
+     * warmChecksum} cannot prove that happened — its lambda captures nothing,
+     * so its site's thunk engages whatever the capture path does — which is why
+     * this is a separate method with a separate engagement counter behind it.
+     *
+     * {@code k} is deliberately NOT {@code final}. A final local with a constant
+     * initializer is a *constant variable* in the JLS sense, and javac replaces
+     * every reference to one with its value before desugaring the lambda: the
+     * body would capture nothing at all and this method would silently be a
+     * second copy of {@code warmChecksum}.
+     */
+    public static int warmCapturingChecksum() {
+        int k = 7;
+        IntUnaryOperator capAdd = v -> v + k;
+        int sum = 0;
+        for (int i = 0; i < 400_000; i++) {
+            sum += capStep(capAdd, i & 0xFF) + capAdd.applyAsInt(i & 0xFF);
+        }
+        return sum;
+    }
+
+    /**
+     * One hot loop per capture WIDTH, because the thunk emits a different load
+     * for each and they fail differently.
+     *
+     * A wide load covers a reference, a {@code long} and a {@code double}; a
+     * zero-extending narrow load covers a {@code float}'s bits; a
+     * sign-extending narrow load covers the whole int category. Each arm is
+     * chosen so a wrong load is a wrong NUMBER rather than a crash: the
+     * {@code byte} is negative (156 if read unsigned), the {@code char} is
+     * above {@code 0x7FFF} (negative if read signed), the {@code long} does not
+     * fit in 32 bits, and both floating-point constants are exact binary
+     * fractions, so scaling them back to integers loses nothing and the
+     * checksum stays exactly comparable.
+     */
+    public static int captureShapesChecksum() {
+        long bigCap = 4_000_000_029L;
+        double dCap = 0.25;
+        float fCap = 0.15625f;
+        byte bCap = (byte) -100;
+        char cCap = (char) 0xFFFF;
+        short sCap = (short) -30_000;
+        String rCap = "abcd";
+
+        LongUnaryOperator lop = v -> v + bigCap;
+        DoubleUnaryOperator dop = v -> v * dCap;
+        DoubleUnaryOperator fop = v -> v * fCap;
+        IntUnaryOperator bop = v -> v + bCap;
+        IntUnaryOperator cop = v -> v + cCap;
+        IntUnaryOperator sop = v -> v + sCap;
+        IntFunction<String> rop = v -> rCap + v;
+
+        long acc = 0;
+        for (int i = 0; i < N; i++) {
+            int x = i & 0xFF;
+            acc += shapeStepLong(lop, x);
+            acc += (long) (shapeStepDouble(dop, x) * 4.0);
+            acc += (long) (shapeStepDouble(fop, x) * 64.0);
+            acc += shapeStep(bop, x);
+            acc += shapeStep(cop, x);
+            acc += shapeStep(sop, x);
+            acc += shapeStepObj(rop, x).length();
+        }
+        return (int) (acc % 1_000_000_007L);
+    }
+
+    /**
+     * Lambdas with MORE THAN ONE capture, which is the only thing that can
+     * check the capture INDEX.
+     *
+     * {@link #captureShapesChecksum} covers one capture of each width, and
+     * every one of its lambdas captures exactly one value — so a thunk that
+     * ignored the capture index outright and read every capture from cell 0
+     * passed it, and the engagement assertions with it. Measured, not
+     * supposed: that break was applied and the suite stayed green.
+     *
+     * Each lambda here holds two captures and combines them
+     * NON-COMMUTATIVELY, so reading both from one cell, or reading them in the
+     * wrong order, changes the checksum. The first pair are the same width,
+     * which isolates the index from the load; the other two mix widths, where a
+     * collapsed index also picks the wrong load.
+     */
+    public static int multiCaptureChecksum() {
+        long cl1 = 1_000_000_007L;
+        long cl2 = 13L;
+        int ci = 3;
+        String cs = "wxyz";
+        double cd = 0.5;
+        int ck = 41;
+
+        LongUnaryOperator twoLongs = v -> cl1 - cl2 * v;
+        IntUnaryOperator intAndRef = v -> ci * 1000 + cs.length() + v;
+        DoubleUnaryOperator dblAndInt = v -> cd * v + ck;
+
+        long acc = 0;
+        for (int i = 0; i < N; i++) {
+            int x = i & 0xFF;
+            acc += multiStepLong(twoLongs, x);
+            acc += multiStep(intAndRef, x);
+            acc += (long) (multiStepDouble(dblAndInt, x) * 2.0);
+        }
+        return (int) (acc % 1_000_000_007L);
+    }
+
     private static int indirect(IntUnaryOperator op, int v) {
         return level2(op, v);
     }

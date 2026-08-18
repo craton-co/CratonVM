@@ -580,6 +580,82 @@ Partial, and named as such.
    the JIT's inline TLAB allocator; the interpreter/`jit_new_object` TLAB path
    still has none, and that is the path that matters most.
 
+## CORRECTION 2026-08-18: every ZGC number on this page was inflated 3.4x by a diagnostic added to this page
+
+`1794c8e81` ("dump the receiver beside the live bounds table on helper entry")
+gated its `#[cold]`, 8-line-bounded dump on a bare
+
+```rust
+if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+```
+
+**inline in `jit_getfield`** — an uncached, string-keyed flag lookup on the path
+this VM takes tens of millions of times a second. The line directly above it
+caches its flag in a `OnceLock`; this one did not. The dump was never the cost.
+The gate was.
+
+Two sessions found this independently within an hour, by different routes, and
+both are worth keeping: a per-key flag-read census on `BigDecimalBench` counted
+**4 560 891 of 4 600 000 flag reads (99.1%) for this one name**, ~91 per
+benchmark iteration; and the bisect below priced it. The census says how often,
+the bisect says how much.
+
+Bisected on an Azure host with `probes/AccessorDispatchProbe.java`, all arms
+interleaved in the same rounds so a shared host cannot bias one against another,
+`receiverFieldTax` (one reference-field read):
+
+| binary | ns |
+|---|---|
+| `bc01a0066` — before the diagnostics | 13.30 / 13.85 / 13.05 |
+| `9c74737a6` — after the four `diag` commits | 52.75 / 51.97 / 50.20 |
+| `dev` @ `36433bf5d` | 49.12 / 46.61 / 49.23 |
+| **the same, with the gate cached** | **14.11 / 13.46 / 14.49** |
+
+**3.5x, recovered by one line.** Re-verified after merging current `dev`, same
+interleaving: `bc01a0066` 13.02 / 13.48 / 14.09, `dev` 50.57 / 50.08 / 45.80,
+fixed 14.47 / 13.39 / 13.00 — back to baseline.
+
+The neighbouring `GETFIELD_HELPER_CALLS` atomic is a second, much smaller cost:
+an ablation build put it at ~2-3 ns of a then-9 ns read on a quiet host, and
+below the noise floor under load. It is now gated behind the flags that
+actually read it, and `jit_getfield_helper_calls()` returns `Option<u64>` so a
+gated counter cannot be printed as a confident `0` — which would look exactly
+like a fast path that never fell through.
+
+### What this invalidates
+
+Every ZGC/G1 timing on this page was taken between `1794c8e81` and this fix, so
+each carries ~33 ns of flag lookup on the helper path. **Only the paths that
+CALL the helper are affected** — a primitive field inlines and never enters it —
+so the corrections are one-sided and the reference-vs-primitive comparisons here
+overstate the gap:
+
+| | as published | re-measured with the gate cached |
+|---|---:|---:|
+| ZGC, reference field | 25.2 ns | **12.5 – 15.3** |
+| Generational, reference field | 0.95 ns | 2.1 – 3.4 |
+| ZGC, primitive field | 1.51 ns | 1.8 – 1.9 |
+| **ZGC-vs-Generational reference gap** | **26x** | **~5x** |
+
+The direction of every conclusion survives — reference reads under ZGC really do
+take the helper, really are the residual, and Generational really does inline
+them. The *magnitude* does not: it is 5x, not 26x, and the case for the
+read-side bounds table has to be argued at 5x.
+
+Counts are unaffected: `helper_calls` is a count, not a timing, and every
+engagement figure on this page still stands exactly as printed.
+
+### The methodological point, which this page is the right home for
+
+This page's own thesis is that an instrument can be the thing you end up
+measuring. It then measured itself for a day. The tell was available the whole
+time and was read as noise: the "before" number kept coming out at 13 while
+every later arm sat at 25-50, and that was attributed to host load — on a box
+that genuinely was loaded, which is what made the excuse plausible. What settled
+it was interleaving all arms inside one round so load could not favour one, and
+the discipline that catches this in general is: **when a diagnostic lands on a
+hot path, price it in the same run that uses it.**
+
 ## The transferable part
 
 **A fast path that is emitted is not a fast path that runs**, and it took a

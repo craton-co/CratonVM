@@ -950,6 +950,35 @@ pub fn jit_lambda_adapter() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER` — extend that inline-cache entry to a
+/// lambda that CAPTURES.
+///
+/// A capturing lambda's impl wants `(captures…, samArgs…)`, so its thunk has to
+/// read the captured values out of the proxy object before it jumps. That is the
+/// one part of the thunk that touches memory, and the only part whose
+/// preconditions are not purely about registers — the proxy's field layout, the
+/// capture types, and, for a reference capture, the collector's read-barrier
+/// state.
+///
+/// It gets its own switch for that reason, and because a same-binary A/B of
+/// "capturing lambdas too" against "non-capturing only" is otherwise impossible:
+/// [`jit_lambda_adapter`]`=0` turns off both at once and would measure the wrong
+/// difference.
+///
+/// Default ON. `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` leaves capturing sites on
+/// the Rust fast path (`try_lambda_site_direct_call`) while non-capturing ones
+/// keep their thunks.
+#[inline]
+pub fn jit_lambda_capture_adapter() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).

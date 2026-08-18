@@ -581,6 +581,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-match", on_key: Some("CRATONVM_DBG_NPE_MATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "a5-engagement", on_key: Some("CRATONVM_DBG_A5_ENGAGEMENT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "unreg-memo-audit", on_key: Some("CRATONVM_DBG_UNREG_MEMO_AUDIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "redefine-dump", on_key: Some("CRATONVM_DBG_REDEFINE_DUMP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-stack", on_key: Some("CRATONVM_DBG_NPE_STACK"), off_key: None, off_word: None },
@@ -1054,7 +1055,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "scan-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_SCAN_CACHE"), off_word: None },
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
-    E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "new-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-hiwater", on_key: Some("CRATONVM_JIT_UNREG_MEMO_HIWATER"), off_key: None, off_word: None },
@@ -1126,6 +1127,7 @@ pub const INVENTORY: &[E] = &[
     // Compatibility alias: `check_schedule` was split into the memory-chain and
     // arena-order lanes, and this token still seeds both when neither is set.
     E { group: Group::JIT, token: "lambda-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_ADAPTER"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-capture-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-site", on_key: Some("CRATONVM_JIT_LAMBDA_SITE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-tierup", on_key: Some("CRATONVM_JIT_LAMBDA_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },
@@ -1170,6 +1172,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-eager-humongous", on_key: Some("CRATONVM_G1_EAGER_HUMONGOUS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "g1-young-pause-target", on_key: Some("CRATONVM_G1_YOUNG_PAUSE_TARGET"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-scrub-free", on_key: Some("CRATONVM_G1_SCRUB_FREE"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-narrow-fixup", on_key: Some("CRATONVM_G1_NARROW_FIXUP"), off_key: None, off_word: Some("0") },
+    E { group: Group::DBG, token: "g1-dbg-rset", on_key: Some("CRATONVM_G1_DBG_RSET"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-rset-source-cap", on_key: Some("CRATONVM_G1_RSET_SOURCE_CAP"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-verify-budget", on_key: Some("CRATONVM_G1_VERIFY_BUDGET"), off_key: None, off_word: None },

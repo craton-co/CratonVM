@@ -353,6 +353,7 @@ export inherited from a parent shell.
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
 | `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
+| `a5-engagement` | `CRATONVM_DBG_A5_ENGAGEMENT` |
 | `unreg-memo-audit` | `CRATONVM_DBG_UNREG_MEMO_AUDIT` |
 | `redefine-dump` | `CRATONVM_DBG_REDEFINE_DUMP` |
 | `npe-stack` | `CRATONVM_DBG_NPE_STACK` |
@@ -522,10 +523,11 @@ export inherited from a parent shell.
 | `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
 | `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+| `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-190 tokens.
+191 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -711,6 +713,7 @@ export inherited from a parent shell.
 | `verify-ir` | `CRATONVM_JIT_VERIFY_IR` |
 | `verify-memory-chain` | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` |
 | `lambda-adapter` | `CRATONVM_JIT_LAMBDA_ADAPTER` |
+| `lambda-capture-adapter` | `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER` |
 | `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
 | `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
@@ -723,7 +726,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-58 tokens.
+59 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -743,6 +746,7 @@ export inherited from a parent shell.
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
 | `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
+| `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
