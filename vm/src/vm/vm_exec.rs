@@ -2780,6 +2780,63 @@ fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
     }
 }
 
+/// Forward every reference ARGUMENT a native hands to a callback.
+///
+/// The companion to [`forward_boundary_value`], and the gap it leaves. Every
+/// `NativeContext` entry point forwards its RECEIVER, and the write entry points
+/// were taught to forward their VALUE; the `invoke_*` family passed `args`
+/// straight through. So a native that read an object, called back into Java, and
+/// then passed that object to a second callback handed a **stale pointer into a
+/// Java frame** — from where it is stored, compared, or `checkcast`-ed with
+/// nothing on the path to repair it.
+///
+/// This is the generic form of a defect fixed one native at a time five times
+/// over (`h2_comparison_compare`, `h2_comparison_get_value`,
+/// `h2_parser_test_token_fast`, `h2_condition_and_or_get_value`,
+/// `h2_coalesce_function_get_value` — see
+/// `known-issues/h2/bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md`).
+/// A native may hold raw `ObjectRef`s across its own Rust code — the STW census
+/// waits for `NativeRunning` — but a callback into Java ends that protection,
+/// and this is the one boundary every such argument must cross.
+///
+/// **It does not make per-site pinning unnecessary.** It repairs the value ON
+/// THE WAY IN; the native's own Rust local stays stale, so anything that
+/// compares it by identity, reads a field off it, or passes it somewhere else
+/// still needs a pin and a re-read. What it removes is the worst outcome — the
+/// stale pointer escaping into the heap.
+///
+/// Allocates only when something actually moved: the common case walks the
+/// arguments, finds every one already current, and returns the caller's slice
+/// untouched.
+#[inline]
+fn forward_boundary_args<'a>(
+    heap: &crate::memory::VmHeap,
+    args: &'a [Value],
+    buf: &'a mut Vec<Value>,
+) -> &'a [Value] {
+    let mut forwarded = false;
+    for (index, value) in args.iter().enumerate() {
+        let Value::Object(Some(obj)) = value else {
+            continue;
+        };
+        let moved = heap.load_and_forward(*obj);
+        if moved == *obj {
+            continue;
+        }
+        if !forwarded {
+            buf.clear();
+            buf.extend_from_slice(args);
+            forwarded = true;
+        }
+        buf[index] = Value::Object(Some(moved));
+    }
+    if forwarded {
+        buf.as_slice()
+    } else {
+        args
+    }
+}
+
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -9876,6 +9933,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_shared(
             self.shared,
             self.thread,
@@ -9894,6 +9953,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_by_class_id_shared(
             self.shared,
             self.thread,
@@ -9915,6 +9976,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // `class_name` with no virtual dispatch and no iface/abstract retarget
         // to the receiver's concrete class. Required for `Lookup.findSpecial`
         // private-to-private calls and default-method super-call patterns.
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_shared(
             self.shared,
             self.thread,
@@ -9938,6 +10001,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // `Method.invoke` dispatch of private / cross-package package-private
         // instance methods, which has the identical loader-identity
         // requirement. See the trait method's doc comment.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_shared_on_class(
             self.shared,
             self.thread,
@@ -9956,6 +10021,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_bytecode_only_shared(
             self.shared,
             self.thread,
@@ -10078,6 +10145,11 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        // Arguments as well as the receiver: see `forward_boundary_args`. This
+        // is the entry point the H2 natives use, and the one whose unforwarded
+        // `session` argument is the MVStore-writer page's headline verdict.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         let mut receiver = self.shared.mem.heap.load_and_forward(receiver);
         let mut receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         if let Some(recovered) = recover_stale_lambda_receiver_from_native_pins(
@@ -10862,6 +10934,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // infinite recursion (confirmed via a depth-counter probe: `execute`
         // called itself on the same receiver until the native stack
         // overflowed) instead of actually reaching bytecode.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         let receiver = self.shared.mem.heap.load_and_forward(receiver);
         let class_id = self.shared.mem.heap.class_id_of(receiver);
         let declaring_class_id = {
