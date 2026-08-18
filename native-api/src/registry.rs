@@ -99,6 +99,20 @@ pub mod lookup_census {
     /// `resolve_id_with_descriptor_quirks` — the `#[cold]` rewrite arm.
     pub const QUIRKS: usize = 4;
     /// One bytecode-level invoke reaching `try_stackless_invoke`.
+    ///
+    /// **This is NOT a general per-invoke denominator, and `lookups_per_invoke`
+    /// must not be read as "registry probes per Java call".** Measured
+    /// 2026-08-18 on `probes/LambdaCompositionProbe.java` at four workload
+    /// sizes: `find` scaled perfectly linearly (151 254 / 231 254 / 391 254 /
+    /// 711 254) while this counter stayed pinned at **966 in all four runs**.
+    /// The lookups that workload generates do not come through this entry
+    /// point at all, so the printed ratio grew 162 -> 742 purely because the
+    /// numerator moved and the denominator could not.
+    ///
+    /// The reliable reading is the MARGINAL rate: run two sizes and divide the
+    /// difference in `find` by the difference in work. That gave exactly 4.0
+    /// lookups per composition stage, with a fixed ~71 k boot cost — a fact
+    /// the ratio line could not have produced at any single size.
     pub const INVOKE_STACKLESS: usize = 5;
     /// One call reaching `invoke_or_native`, the general resolver.
     pub const INVOKE_GENERAL: usize = 6;
@@ -166,8 +180,59 @@ pub mod lookup_census {
         }
     }
 
+    /// Tally of MISSED lookup triples — the question the ratio cannot answer:
+    /// not "how many", but "which".
+    ///
+    /// A miss is `find` returning `None` after both the exact probe and the
+    /// descriptor-quirk rewrite failed. Measured on `LambdaCompositionProbe`
+    /// those are ~100% of all `find` calls and exactly 4.0 per composition
+    /// stage, so the top rows here name the four — and a triple like
+    /// `java/util/concurrent/CompletableFuture.thenApply` identifies its caller
+    /// far more directly than a stack would. Which matters, because `perf`'s
+    /// dwarf unwinding through these frames yields bogus return addresses and
+    /// gives no callers at all.
+    ///
+    /// Behind the same `CRATONVM_DBG=native-lookups` gate, and allocating only
+    /// when it is on.
+    static MISSES: OnceLock<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
+        OnceLock::new();
+
+    /// Record one missed triple. Gated; a disabled run does not allocate.
+    #[inline]
+    pub fn note_miss(class_name: &str, method_name: &str, descriptor: &str) {
+        if !enabled() {
+            return;
+        }
+        record_miss(class_name, method_name, descriptor);
+    }
+
+    #[cold]
+    fn record_miss(class_name: &str, method_name: &str, descriptor: &str) {
+        let map = MISSES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let key = format!("{class_name}.{method_name}{descriptor}");
+        *map.lock().entry(key).or_insert(0) += 1;
+    }
+
+    /// The `n` most-missed triples, hottest first.
+    fn top_misses(n: usize) -> Vec<(String, u64)> {
+        let Some(map) = MISSES.get() else {
+            return Vec::new();
+        };
+        let mut v: Vec<(String, u64)> = map.lock().iter().map(|(k, c)| (k.clone(), *c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(n);
+        v
+    }
+
     /// Print the census and the ratio it exists to produce. Safe to call when
     /// disabled — it prints nothing.
+    ///
+    /// **Read `lookups_per_invoke` with the caveat on [`INVOKE_STACKLESS`].**
+    /// It is lookups over *stackless-entry invokes*, not over Java calls, and
+    /// on a workload whose lookups arrive by another path the denominator is
+    /// constant while the numerator scales — which makes the ratio grow with
+    /// the workload and mean nothing. Take two sizes and use the marginal
+    /// rate.
     pub fn report(tag: &str) {
         if !enabled() {
             return;
@@ -188,6 +253,9 @@ pub mod lookup_census {
             "[native-lookups {tag}] lookups={lookups} invokes={invokes} \
              lookups_per_invoke={per_invoke:.2}{parts}"
         );
+        for (triple, count) in top_misses(12) {
+            eprintln!("[native-lookups {tag}] miss {count:>10}  {triple}");
+        }
     }
 }
 
@@ -8432,7 +8500,11 @@ impl NativeMethodRegistry {
         // we short-circuit: only walk the variant logic when the
         // descriptor *actually* has a quirk worth rewriting. Clean
         // descriptors return `None` with zero allocation.
-        Self::find_with_descriptor_quirks(self, class_name, method_name, descriptor)
+        let quirked = Self::find_with_descriptor_quirks(self, class_name, method_name, descriptor);
+        if quirked.is_none() {
+            lookup_census::note_miss(class_name, method_name, descriptor);
+        }
+        quirked
     }
 
     /// Cold path of `find`: try compatibility-rewritten descriptor

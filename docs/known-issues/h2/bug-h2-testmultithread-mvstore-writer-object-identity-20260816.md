@@ -2,11 +2,12 @@
 
 ## Status
 
-**STILL OPEN 2026-08-17, but no longer unexplained.** **Six** real defects
-behind it were found and fixed on
-`fix/h2-mvstore-writer-object-identity-20260816` — three in the reference
-machinery (below) and three in the stale-reference family the second pass went
-after — one of which this page had filed as a separate curiosity. The failure
+**STILL OPEN 2026-08-18, but no longer unexplained.** **Nine** real defects
+behind it have been found and fixed — three in the reference machinery (below),
+three in the stale-reference family the second pass went after (one of which
+this page had filed as a separate curiosity), and **three more of that same
+family in the fifth pass, 2026-08-18** (see *Fifth pass*), including the one
+that matches this page's own headline verdict. The failure
 itself still reproduces, and the mechanism now has a measured name instead of
 four candidate explanations.
 
@@ -175,14 +176,96 @@ the barrier backtraces caught twice already (`apps_h2`,
 `properties_sidetable`), and the `load_and_forward` instrument from the second
 pass is the one that names them, one at a time, as each is fixed.
 
-**Next step:** the ledger has to survive re-issue to catch the USE. Keep the
-full vacated history and disambiguate with the identity hash minted into the
-object at slide time (`VmHeap::identity_hash_code` already provides one, and the
-reference processor's stamp shows the pattern): a holder whose address now
-carries a different identity than the one recorded for it at the move is stale,
-whether or not the space has been handed out again. That is the one instrument
-that can name the holder after re-issue, which is where every current one goes
-blind.
+### Fifth pass (2026-08-18): three more producers of that class, named and fixed
+
+The prediction above held. Pointing `CRATONVM_DBG_VACATED_FRAMES=1` at the
+`MvidRepro` loop again produced a barrier backtrace naming a **third** `apps_h2`
+native, and reading its neighbours found two more of exactly the same shape. All
+three are fixed:
+
+* **`h2_parser_test_token_fast`** — the one the instrument caught. `this` was
+  never pinned at all and is read (`identifiersToUpper`) after
+  `asIdentifier()`; `expected` and `token` *were* pinned, but re-read into
+  bindings declared **inside the match arm**, so the repaired values died with
+  the arm's scope and the stale outer `expected` was what reached
+  `native_string_equals`; and `identifier` was live across the read below it.
+* **`h2_condition_and_or_get_value`** — `this` read after the first `getValue`
+  callback, and **`session` passed as an argument to the second**. This is this
+  page's own headline verdict (`original_class=org/h2/engine/SessionLocal`,
+  `site="invoke dispatch"`): a `SessionLocal` reaching `getValue(SessionLocal)`
+  after a relocation. Both operands are also compared by identity against
+  `ValueNull.INSTANCE` after a callback.
+* **`h2_coalesce_function_get_value`** — the same, once per loop iteration, with
+  `args`, `type`, `session` **and** `ValueNull.INSTANCE` live across the
+  callback. A stale `INSTANCE` compares unequal to everything, so COALESCE would
+  return its first argument instead of skipping NULLs.
+
+**The rule these share, worth stating once:** the receiver of a `ctx` call is
+repaired by `load_and_forward`; an **argument** handed to `ctx.invoke_*` is not.
+A native may hold a raw `ObjectRef` across its own Rust code — the STW census
+waits for `NativeRunning` precisely so the collector cannot move under it — but
+**a callback into Java ends that protection**, and everything the native still
+holds must be pinned across it and re-read afterwards, into the OUTER binding.
+
+**A/B, ABBA-interleaved, 16 runs per arm, one binary per arm:** pre **3/16**,
+post **2/16**. Indistinguishable — which is what this page already predicts for
+removing one producer out of several. The fixes are justified by being provable
+memory-safety defects under the VM's own stated rule, not by this number.
+
+### Do not misread `interior_off` in the verdict
+
+Every verdict reproduced in this pass carried a **non-zero `interior_off`**
+(88 into a 176-byte `CacheLongKeyLIRS$Entry`, 72 into a 96-byte `BigDecimal`,
+48 into an 80-byte `SimpleRowValue`, 8 into a 128-byte `IndexCondition`). That
+reads like an interior-pointer defect and is not one. `zgc_corpse_lookup` maps
+the address into the *extent of a previously vacated object*, so a non-zero
+offset only says the vacated span was later re-issued at **sub-object
+granularity** — a `String` or a `byte[]` now legitimately starts partway into
+what used to be one bigger object. It is the re-served face this page already
+describes, restated by a different instrument. (Checked against
+`vm/src/memory/reclaim_guard.rs` before acting on it.)
+
+### The remaining worklist, made concrete
+
+`apps_h2.rs` alone has **15 more natives that call back into Java and pin
+nothing**. Not every one is a defect — a function that touches no reference
+after its callback is fine — but each has to be read, and all three fixed above
+came out of this list. Ordered by number of callbacks:
+
+| native | line | callbacks |
+|---|---:|---:|
+| `h2_cardinality_expression_get_value` | 1052 | 12 |
+| `table_filter_prepare_on` | 3181 | 11 |
+| `h2_constraint_run_existing_data_query` | 2346 | 8 |
+| `h2_constraint_check_existing_data` | 2246 | 3 |
+| `h2_constraint_check_column_types` | 2312 | 3 |
+| `h2_internal_error` | 605 | 2 |
+| `h2_invalid_array_value` | 1030 | 2 |
+| `h2_sql_fragment` | 2537 | 2 |
+| `h2_read_string_hash` · `h2_value_is_false` · `h2_default_row_get_value` · `h2_boxed_long_value` · `h2_parser_read` · `h2_syntax_error` · `h2_db_exception` | — | 1 each |
+
+Regenerate it by scanning for `fn`s that contain `ctx.invoke_*` and no
+`pin_native_root`. **And `apps_h2.rs` is one file** — the same audit is owed by
+every native that calls back into Java.
+
+**Next step, and a correction to the one this page used to carry.** The previous
+"next step" — keep the full vacated history and disambiguate with the identity
+hash — does not work as stated. For an address that has been re-issued, "the
+identity here differs from the one recorded at the move" is equally true of a
+**legitimate** holder of the new object, so the predicate over-reports instead of
+naming the stale holder. It becomes sound only when scoped by *when the holder
+obtained the reference* — e.g. stamping each native call with the collection
+count at entry and flagging only a reference to an address vacated since. The
+cheaper route is the one that worked twice more this pass: run the barrier
+instrument and work the table above.
+
+One instrument was added for the gap that is still genuinely blind — the window
+BEFORE re-issue, where a stale holder reads a zeroed corpse and
+`class_id_of`/`kind_of` swallow it into `ClassId(0)`/`ObjectKind::Object` with
+nothing thrown. `VmHeap::note_dead_base_deref` reports that swallow with a
+backtrace under the same flag. **It has not fired on any reproduced failure
+yet**, which says the stale reads seen here all land on re-issued memory rather
+than on the corpse. Recorded as an untriggered instrument, not as evidence.
 
 ## The three reference-machinery defects fixed on the way
 
