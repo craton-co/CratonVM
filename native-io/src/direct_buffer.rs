@@ -1432,7 +1432,15 @@ struct DbbElemFields {
     /// `ScopedMemoryAccess.getLongUnaligned`, so honouring it is not an
     /// embellishment: a native that assumed big-endian would silently return
     /// byte-swapped values for every `order(LITTLE_ENDIAN)` buffer.
-    big_endian: usize,
+    ///
+    /// `Option`, and deliberately NOT a `?` in the constructor below. The four
+    /// fields above are what the BYTE accessors need and have needed since
+    /// 2026-08-05; folding a fifth resolution into the same `?` would mean an
+    /// image without a `bigEndian` field — synthetic-JDK mode, where
+    /// `java/nio/ByteBuffer` is this VM's own class — silently sending the
+    /// byte accessors back to bytecode as well. A missing `bigEndian` bails
+    /// only the wide accessors, which is the blast radius it earns.
+    big_endian: Option<usize>,
 }
 
 /// `CRATONVM_DBG_DBB_ELEM` — per-accessor census for the element natives.
@@ -1546,7 +1554,7 @@ fn dbb_elem_fields(ctx: &mut dyn NativeContext) -> Option<DbbElemFields> {
             limit: ctx.resolve_field_index(CLASS, "limit")?,
             is_read_only: ctx.resolve_field_index(CLASS, "isReadOnly")?,
             position: ctx.resolve_field_index(CLASS, "position")?,
-            big_endian: ctx.resolve_field_index(CLASS, "bigEndian")?,
+            big_endian: ctx.resolve_field_index(CLASS, "bigEndian"),
         })
     })
 }
@@ -1698,6 +1706,7 @@ fn dbb_wide_addr(
     for_write: bool,
 ) -> Option<(i64, bool)> {
     let fields = dbb_elem_fields(ctx)?;
+    let big_endian_slot = fields.big_endian?;
     let mut vals = [Value::Int(0); 4];
     ctx.get_fields_typed(
         this,
@@ -1705,7 +1714,7 @@ fn dbb_wide_addr(
             (fields.limit, b'I'),
             (fields.address, b'J'),
             (fields.is_read_only, b'Z'),
-            (fields.big_endian, b'Z'),
+            (big_endian_slot, b'Z'),
         ],
         &mut vals,
     );
