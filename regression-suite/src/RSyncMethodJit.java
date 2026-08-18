@@ -32,13 +32,50 @@ import java.util.concurrent.CountDownLatch;
  * monitor is exact, and is the only thing that can detect a monitor that
  * stopped excluding.
  *
- * ⚠️ In the default CORE run the flag is OFF, so this exercises the ORDINARY
- * interpreted/synchronized path — a real check, but NOT the compiled one it was
- * written for. To cover that path it must be run explicitly:
+ * <h2>The default run DOES reach compiled code — the header used to deny it</h2>
  *
+ * This block used to say the flag being OFF meant the default CORE run
+ * exercised only the interpreted path, "NOT the compiled one it was written
+ * for". That was false, and believing it would have retired the vector's most
+ * valuable arm. {@code CRATONVM_JIT=sync-methods} gates ONE door — the
+ * invocation-counter upgrade in {@code try_jit_upgrade_with_gate}. The
+ * BACKGROUND TIERING door does not ask it at all: {@code bumpStatic} is
+ * enqueued at 500 invocations and compiled and published into {@code jit_cache}
+ * on every default run, which is exactly what
+ * {@code CRATONVM_DBG_JITC=1} shows:
+ *
+ * <pre>
+ *   [cratonvm-jitc] tiered-enqueue RSyncMethodJit.bumpStatic()V tier=C1 invoc_count=500 bg=true
+ *   [cratonvm-jitc] full-compile RSyncMethodJit.bumpStatic()V entry=0x... len=422
+ * </pre>
+ *
+ * That publication is legitimate — {@code execute_jit_call} wraps the body in
+ * the monitor guard. What made it a lost-update bug was an UNWRAPPED consumer
+ * serving the same body. So the default run is the real gate, and the flag adds
+ * a second door rather than the only one. Run it BOTH ways; both must pass:
+ *
+ * <pre>
+ *     ONLY=RSyncMethodJit bash regression-suite/run.sh
  *     CRATONVM_JIT=sync-methods ONLY=RSyncMethodJit bash regression-suite/run.sh
+ * </pre>
  *
- * Fold it into the default set only when that flag's default flips.
+ * <h2>What the static arm caught, 2026-08-18</h2>
+ *
+ * {@code staticCount} lost ~35 of 240 000 increments per run while the two
+ * instance counters stayed exact — the asymmetry is the whole clue.
+ * {@code jit_invoke_dispatch}'s statically-bound {@code DISPATCH_CACHE} CALLs a
+ * compiled callee's raw entry, and a compiled body carries no monitor
+ * prologue. The refusal existed, but only on the COMPILE path
+ * ({@code try_jit_compile_callee_slow}); the {@code jit_cache} fast path in
+ * front of it served an already-published body without re-asking. It surfaced
+ * only once the caller loop was OSR-compiled, which the RBC.6b lift
+ * (OSR a method with an exception table — this lambda has a {@code try}/
+ * {@code catch}) newly allowed. {@code CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY=0}
+ * is the one-command confirmation: it restores PASS on a broken binary.
+ *
+ * A loss of 0.015% is what an occasionally-unlocked counter looks like, NOT
+ * what a never-locked one looks like — do not dismiss a small delta here as
+ * noise. The counters are deliberately non-atomic precisely so this is visible.
  */
 public class RSyncMethodJit {
 

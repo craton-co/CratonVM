@@ -2115,6 +2115,10 @@ pub(crate) struct TlsEntry {
 
 pub(crate) enum TlsClientStream {
     Native(native_tls::TlsStream<TcpStream>),
+    /// A raw SChannel stream, the Windows counterpart of [`Self::Openssl`] and
+    /// for the same reason -- see [`s2_schannel_tls_connect_on`].
+    #[cfg(windows)]
+    Schannel(schannel::tls_stream::TlsStream<TcpStream>),
     /// A raw `openssl` stream. Two callers produce one: the legacy DSA bridge
     /// (`s2_legacy_dsa_tls_connect_on`) and — since
     /// `tls-client-captures-only-the-leaf` — the DEFAULT client path
@@ -2132,6 +2136,8 @@ impl TlsClientStream {
             Self::Native(stream) => stream.get_ref(),
             #[cfg(unix)]
             Self::Openssl(stream) => stream.get_ref(),
+            #[cfg(windows)]
+            Self::Schannel(stream) => stream.get_ref(),
         }
     }
 }
@@ -2663,6 +2669,323 @@ pub(crate) fn s2_openssl_tls_connect_on(
     Ok(id)
 }
 
+
+/// [`OpensslClientConfig`]'s Windows counterpart, minus one field.
+///
+/// There is no `replace_roots` here, and its absence is the design rather than
+/// an omission. On Unix `set_verify_cert_store` genuinely REPLACES the anchor
+/// set, so JSSE's "this store instead of cacerts" is expressible. SChannel has
+/// no such switch: the closest thing native-tls does for
+/// `disable_built_in_roots` is to run the platform's normal verification and
+/// then REJECT anything whose built chain does not touch a configured root.
+/// That is a narrowing, not a replacement -- it can only refuse chains the
+/// platform accepted, never accept one it did not. Applying it to the JDK's
+/// `cacerts` would therefore refuse any site whose root the Windows store
+/// lacks and cacerts has, which is a divergence from HotSpot in the direction
+/// of breaking working connections.
+///
+/// So this connector changes ONE thing about the Windows path: the chain it
+/// captures. Every trust decision is the decision native-tls was already
+/// making, including the two stand-downs. The anchor-set question (Windows
+/// root store vs `cacerts`) is real and is NOT answered here; it is a
+/// different measurement on a different page.
+#[cfg(windows)]
+pub(crate) struct SchannelClientConfig {
+    /// Anchors to ADD to the platform set, as native-tls has always done here.
+    pub(crate) roots: Vec<Vec<u8>>,
+    /// Stand SChannel's verifier and hostname check down: the caller is the
+    /// verifier and runs immediately after connect, fail-closed.
+    pub(crate) skip_verify: bool,
+    /// Pin the ceiling to TLS 1.2, for `SSLContext.getInstance("TLSv1.2")`.
+    pub(crate) max_tls12: bool,
+}
+
+/// [`order_chain_from_leaf`], against the input the live platform declines to
+/// produce.
+///
+/// MEASURED: with the walk skipped, SChannel returned leaf-first on all six
+/// hosts of `PeerChainOrderProbe` — so a probe against the real world cannot
+/// tell the walk from its absence, and the only honest way to exercise it is
+/// to hand it the shuffled set the store is permitted to hand back but
+/// currently does not.
+///
+/// The certificates are two-byte stand-ins and the `names` closure is a lookup
+/// table, deliberately: what is under test is the subject/issuer walk, not the
+/// DER parser, and a fixture built from real certificates would test both at
+/// once and be unbuildable on the platform this code runs on (no `openssl`
+/// crate on Windows).
+#[cfg(test)]
+mod chain_order_tests {
+    use super::order_chain_from_leaf;
+
+    /// leaf <- i1 <- i2 <- root(self-signed)
+    fn names(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (subject, issuer): (&[u8], &[u8]) = match der {
+            b"leaf" => (b"L", b"I1"),
+            b"i1__" => (b"I1", b"I2"),
+            b"i2__" => (b"I2", b"RT"),
+            b"root" => (b"RT", b"RT"),
+            b"xxxx" => (b"XX", b"YY"),
+            _ => return None,
+        };
+        Some((subject.to_vec(), issuer.to_vec()))
+    }
+
+    fn v(items: &[&[u8]]) -> Vec<Vec<u8>> {
+        items.iter().map(|b| b.to_vec()).collect()
+    }
+
+    #[test]
+    fn a_shuffled_pool_is_walked_back_into_a_path() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"i2__", b"root", b"i1__"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"i2__", b"root"]));
+    }
+
+    /// The order the live store happens to use today must survive unchanged —
+    /// a walk that only works on shuffled input would be worse than none.
+    #[test]
+    fn an_already_ordered_pool_is_left_alone() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"i1__", b"i2__", b"root"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"i2__", b"root"]));
+    }
+
+    /// A certificate that is not on the path is APPENDED. Dropping it would
+    /// take a cross-certificate away from `x509_manager::validate_chain`,
+    /// which builds its own path and may need exactly that one.
+    #[test]
+    fn a_certificate_off_the_path_is_kept_at_the_end() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"xxxx", b"i1__"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"xxxx"]));
+    }
+
+    /// A self-issued certificate ends the path. Following `subject == issuer`
+    /// one step further would append the root to itself forever.
+    #[test]
+    fn a_self_issued_root_terminates_the_walk() {
+        let out = order_chain_from_leaf(b"root".to_vec(), v(&[b"root"]), names);
+        assert_eq!(out, v(&[b"root", b"root"]));
+    }
+
+    /// An unparseable member cannot stall the walk or vanish.
+    #[test]
+    fn an_unparseable_member_is_kept_and_skipped() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"junk", b"i1__"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"junk"]));
+    }
+
+    /// An empty pool is the one-certificate chain, unchanged.
+    #[test]
+    fn an_empty_pool_yields_the_leaf_alone() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), Vec::new(), names);
+        assert_eq!(out, v(&[b"leaf"]));
+    }
+}
+
+/// Order a certificate SET into a path: `leaf` first, then whichever member of
+/// `pool` issued the one before it, and so on. `names` yields
+/// `(subject, issuer)` for a member.
+///
+/// Not `#[cfg(windows)]`, and not because it might be wanted elsewhere -- so
+/// that its TEST runs everywhere. The logic is about a subject/issuer graph
+/// and has nothing platform-specific in it; only its caller does.
+///
+/// Leftovers are APPENDED, never dropped. A peer may legitimately send a
+/// certificate that is not on the path to the anchor this VM will pick -- a
+/// cross-certificate is the usual case -- and `x509_manager::validate_chain`
+/// builds its own path from the whole set. A certificate it never sees is one
+/// it cannot build with.
+fn order_chain_from_leaf<F>(leaf: Vec<u8>, mut pool: Vec<Vec<u8>>, names: F) -> Vec<Vec<u8>>
+where
+    F: Fn(&[u8]) -> Option<(Vec<u8>, Vec<u8>)>,
+{
+    let mut out = vec![leaf];
+    loop {
+        let issuer_of_last = match names(out.last().expect("chain is never empty")) {
+            Some((_, issuer)) => issuer,
+            None => break,
+        };
+        // A self-issued certificate is the end of the path: continuing past it
+        // would loop on itself.
+        let next = pool.iter().position(|der| {
+            names(der)
+                .map(|(subject, issuer)| subject == issuer_of_last && subject != issuer)
+                .unwrap_or(false)
+        });
+        match next {
+            Some(i) => out.push(pool.remove(i)),
+            None => break,
+        }
+    }
+    out.extend(pool);
+    out
+}
+
+/// The peer's certificate chain as DER, leaf first, from an SChannel stream.
+///
+/// Two Windows facts do the work. `peer_certificate()` is the LEAF, and the
+/// `CertContext` it returns carries an attached store -- SChannel's own words
+/// for it are "a certificate store containing any intermediate certificates
+/// provided by the remote sender" -- reachable as `CertContext::cert_store()`.
+/// So the chain is there; `native_tls` simply never re-exports the stream that
+/// owns it, which is the whole reason this function exists.
+///
+/// WHY THE PATH IS WALKED. `SSLSession.getPeerCertificates()` is ordered --
+/// the peer's own certificate, then each issuer. On Unix that is free: OpenSSL
+/// hands back a LIST, in the order the peer sent it. Here the source is a
+/// `CertStore`, which is a SET; `certs()` enumerates it in whatever order the
+/// store holds, and Windows promises nothing about that order.
+///
+/// MEASURED, and worth stating plainly rather than dressing up: with the walk
+/// SKIPPED, live SChannel already returned leaf-first on all six hosts of
+/// `PeerChainOrderProbe`, output identical to the walk's. So this is not a
+/// repair of an observed defect -- it is the removal of a dependence on an
+/// order the platform does not contract. The unit tests above `order_chain_from_leaf`
+/// are what exercise it, since the live store declines to.
+#[cfg(windows)]
+fn schannel_peer_chain_der(
+    stream: &schannel::tls_stream::TlsStream<TcpStream>,
+) -> Vec<Vec<u8>> {
+    let leaf_ctx = match stream.peer_certificate() {
+        Ok(c) => c,
+        // No peer certificate (PSK / anonymous suite). An empty chain is the
+        // honest answer; `getPeerCertificates` throws
+        // SSLPeerUnverifiedException on it, which is JSSE's behaviour.
+        Err(_) => return Vec::new(),
+    };
+    let leaf = leaf_ctx.to_der().to_vec();
+    let mut pool: Vec<Vec<u8>> = Vec::new();
+    if let Some(store) = leaf_ctx.cert_store() {
+        for cert in store.certs() {
+            let der = cert.to_der().to_vec();
+            if der != leaf && !pool.contains(&der) {
+                pool.push(der);
+            }
+        }
+    }
+    order_chain_from_leaf(leaf, pool, |der| {
+        crate::x509_manager::parse_certificate(der)
+            .ok()
+            .map(|p| (p.subject_der, p.issuer_der))
+    })
+}
+
+/// [`s2_schannel_tls_connect_on`], opening the connection here.
+#[cfg(windows)]
+pub(crate) fn s2_schannel_tls_connect(
+    cfg: &SchannelClientConfig,
+    host: &str,
+    port: u16,
+) -> Result<i32, TlsConnectFailure> {
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_schannel_tls_connect_on(cfg, host, port, tcp)
+}
+
+/// The default `SSLSocket` client bridge on Windows, over the `schannel` crate
+/// directly instead of through `native_tls`.
+///
+/// The backend does not change -- native-tls IS SChannel here, and its
+/// `imp/schannel.rs` is a thin wrapper over exactly the calls below. What
+/// changes is that the stream stays in reach, so the peer's chain can be read
+/// off it (see [`schannel_peer_chain_der`]). Everything the wrapper configured
+/// is configured here: the protocol range, SNI, hostname verification, the
+/// caller-supplied roots, and the two stand-downs.
+///
+#[cfg(windows)]
+pub(crate) fn s2_schannel_tls_connect_on(
+    cfg: &SchannelClientConfig,
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
+    use schannel::cert_context::CertContext;
+    use schannel::cert_store::{CertAdd, Memory};
+    use schannel::schannel_cred::{Direction, Protocol, SchannelCred};
+    use schannel::tls_stream;
+
+    // Same 30 s floor the other two bridges set, for the same reason.
+    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+
+    let protocols: &[Protocol] = if cfg.max_tls12 {
+        &[Protocol::Tls12]
+    } else {
+        &[Protocol::Tls12, Protocol::Tls13]
+    };
+    let cred = SchannelCred::builder()
+        .enabled_protocols(protocols)
+        .acquire(Direction::Outbound)
+        .map_err(|e| TlsConnectFailure::Handshake(format!("SChannel credentials: {e}")))?;
+
+    let mut roots = Memory::new()
+        .map_err(|e| TlsConnectFailure::Handshake(format!("SChannel root store: {e}")))?
+        .into_store();
+    for der in &cfg.roots {
+        match CertContext::new(der) {
+            Ok(cert) => {
+                let _ = roots.add_cert(&cert, CertAdd::ReplaceExisting);
+            }
+            Err(e) => {
+                // One unparseable anchor must not sink the connector, which is
+                // what `new13_build_connector` does with the same input.
+                tracing::debug!(
+                    target: "servlet::tls",
+                    "schannel client: skipping unparseable trust anchor DER: {e}"
+                );
+            }
+        }
+    }
+
+    let mut builder = tls_stream::Builder::new();
+    builder
+        .cert_store(roots)
+        .domain(host)
+        .use_sni(true)
+        .accept_invalid_hostnames(cfg.skip_verify);
+    if cfg.skip_verify {
+        builder.verify_callback(|_| Ok(()));
+    }
+
+    // `HandshakeError`'s own Display is the generic "failed to perform
+    // handshake"; the certificate error a caller needs is in its source. JSSE
+    // callers read this message (it is the analogue of HotSpot's "PKIX path
+    // building failed: ..."), so unwrap it rather than reporting the wrapper.
+    let stream = builder.connect(cred, tcp).map_err(|e| {
+        TlsConnectFailure::Handshake(match e {
+            schannel::tls_stream::HandshakeError::Failure(io) => {
+                format!("TLS handshake failed: {io}")
+            }
+            other => format!("TLS handshake failed: {other}"),
+        })
+    })?;
+
+    let peer_cert_chain_der = schannel_peer_chain_der(&stream);
+    let negotiated_alpn = stream
+        .negotiated_application_protocol()
+        .ok()
+        .flatten()
+        .map(|p| String::from_utf8_lossy(&p).into_owned());
+    let raw = stream.get_ref().try_clone().ok();
+    let entry = TlsEntry {
+        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Schannel(stream))),
+        raw,
+        peer_host: host.to_string(),
+        peer_port: port,
+        // SChannel exposes no negotiated-version or ciphersuite accessor
+        // through this crate, so these keep the values the native-tls path
+        // reported -- unchanged, not newly approximate. The OpenSSL bridge
+        // reports the real ones because OpenSSL can be asked.
+        negotiated_protocol: String::from("TLSv1.3"),
+        negotiated_cipher: String::from("TLS_AES_128_GCM_SHA256"),
+        negotiated_alpn,
+        peer_cert_chain_der,
+    };
+    let mut reg = s2_registry().lock();
+    let id = s2_next_free_id(&mut reg);
+    reg.tls_streams.insert(id, entry);
+    Ok(id)
+}
+
 /// Client SSLSockets backed by the rustls client path (`t27_tls`) store their
 /// stream id offset by this base, so `s2_tls_read`/`write`/`close` can route to
 /// the rustls stream table instead of the native-tls one. Native-tls and rustls
@@ -2858,6 +3181,8 @@ fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
         TlsClientStream::Native(stream) => stream.read(buf),
         #[cfg(unix)]
         TlsClientStream::Openssl(stream) => stream.read(buf),
+        #[cfg(windows)]
+        TlsClientStream::Schannel(stream) => stream.read(buf),
     };
     drop(guard);
     s2_tls_classify_after_block(id, result)
@@ -2934,6 +3259,8 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
         TlsClientStream::Native(stream) => stream.write(data),
         #[cfg(unix)]
         TlsClientStream::Openssl(stream) => stream.write(data),
+        #[cfg(windows)]
+        TlsClientStream::Schannel(stream) => stream.write(data),
     };
     drop(guard);
     // Same after-the-fact classification as the read side, and safe for the
@@ -3007,6 +3334,10 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
                 }
                 #[cfg(unix)]
                 TlsClientStream::Openssl(stream) => {
+                    let _ = stream.shutdown();
+                }
+                #[cfg(windows)]
+                TlsClientStream::Schannel(stream) => {
                     let _ = stream.shutdown();
                 }
             }
