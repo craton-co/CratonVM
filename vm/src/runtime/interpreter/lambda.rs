@@ -1770,7 +1770,8 @@ pub(crate) mod lambda_site_prof {
 
     pub(crate) fn line() -> String {
         format!(
-            "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} site_arity={} site_adapters={}",
+            "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} \
+             site_arity={} site_adapters={} site_cap_adapters={}",
             SITE_CALLS.load(Ordering::Relaxed),
             SITE_DIRECT.load(Ordering::Relaxed),
             SITE_NO_CODE.load(Ordering::Relaxed),
@@ -1778,6 +1779,11 @@ pub(crate) mod lambda_site_prof {
             SITE_DEOPTED.load(Ordering::Relaxed),
             SITE_ARITY.load(Ordering::Relaxed),
             SITE_ADAPTERS.load(Ordering::Relaxed),
+            // Beside the total, never instead of it: a run full of
+            // non-capturing lambdas keeps `site_adapters` healthy while every
+            // capturing site falls back to Rust, and a probe reading only the
+            // total cannot tell those apart.
+            SITE_CAPTURE_ADAPTERS.load(Ordering::Relaxed),
         )
     }
 }
