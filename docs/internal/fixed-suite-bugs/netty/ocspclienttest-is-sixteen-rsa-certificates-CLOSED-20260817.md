@@ -71,7 +71,10 @@ rewrite and not what this page was about.
 2.09x — but the `SHA256withRSA` row above moved only 1.21x, and the attribution
 there shows why: the signature is bound by a full-width private exponentiation
 that ignores the CRT parameters already on the key, which is filed separately as
-`perf/rsa-private-key-op-ignores-the-crt-parameters-it-already-has-20260817.md`.
+`../../performance/rsa-private-key-op-crt-FIXED-20260817.md`, which is now FIXED
+too: the private op takes the CRT parameters and the `SHA256withRSA` row moved
+3.17x (RSA decrypt 7.08x). The §3 conclusion is still unchanged — a certificate
+is mostly X.509/ASN.1, not RSA.
 §3's conclusion is unchanged — keygen is a minority of a certificate, so none of
 this moves a certificate by anything like 2x.
 

@@ -2078,6 +2078,121 @@ fn rsa_private_modpow_blinded(base: &BigUint, d: &BigUint, e: &BigUint, n: &BigU
     base.modpow(d, n)
 }
 
+/// `base^d mod n` through the Chinese Remainder Theorem, using the
+/// `(p, q, dP, dQ, qInv)` the key already carries.
+///
+/// Two half-width exponentiations replace one full-width one. A modexp is
+/// `O(exponent_bits x limbs^2)`, so halving both is `2 * 1/2 * 1/4 = 1/4` — the
+/// ~4x that `internal/performance/rsa-private-key-op-crt-FIXED-20260817`
+/// named.
+///
+/// Returns `None` — sending the caller back to the full-width `d` — in every
+/// case where the CRT answer cannot be *trusted*, not merely where it cannot be
+/// computed:
+///
+/// * the key carries no CRT parameters (a bare `(n, d)` import), or they are
+///   structurally degenerate;
+/// * the public exponent cannot verify the result (see below);
+/// * **the fault check fails.**
+///
+/// ## The fault check is not optional
+///
+/// CRT-RSA that returns an unverified result is the Bellcore fault attack: if
+/// exactly one half computes wrongly — a bit flip, a malformed imported
+/// parameter, or a bug in this function — then `gcd(s - s_correct, n)` hands
+/// the attacker a factor of `n`, and a *single* faulty signature is enough.
+/// This matters here specifically because CRT parameters do not only come from
+/// `generate_keypair`: `parse_rsa_private_key_der` reads all five straight out
+/// of a PKCS#8 file with no consistency check, so `p` and `q` can be attacker-
+/// supplied and need not satisfy `n == p*q` at all.
+///
+/// So the result is verified with one public exponentiation before it is
+/// returned. `e` is small (65537 in practice, 17 bits), which makes the check
+/// ~3% of the operation it protects. A key whose `e` is too small to verify
+/// with gets no CRT at all rather than an unverified fast path — declining to
+/// go fast is always available, and going fast unverified is not.
+fn rsa_crt_exponentiate(key: &RsaPrivateKey, base: &BigUint) -> Option<BigUint> {
+    let (Some(p), Some(q), Some(dp), Some(dq), Some(qinv)) = (
+        key.p.as_ref(),
+        key.q.as_ref(),
+        key.dp.as_ref(),
+        key.dq.as_ref(),
+        key.qinv.as_ref(),
+    ) else {
+        return None; // bare (n, d) import — nothing to use
+    };
+    // A zero or one modulus has no residue ring worth the name, and `modulo`
+    // by zero is not a question this should be asking.
+    if p.is_zero() || q.is_zero() || p.is_one() || q.is_one() {
+        return None;
+    }
+    // No verifiable public exponent => no CRT. See the fault-check note above.
+    if key.e.cmp(&BigUint::from_u64(3)) == std::cmp::Ordering::Less {
+        return None;
+    }
+
+    // The two halves. Reducing the base first is what makes each exponentiation
+    // half-width in the *modulus* as well as the exponent.
+    let m1 = base.modulo(p).modpow(dp, p);
+    let m2 = base.modulo(q).modpow(dq, q);
+
+    // Garner recombination: h = qInv * (m1 - m2) mod p, m = m2 + q*h.
+    // `BigUint::sub` panics on underflow and `m1 < m2` is perfectly ordinary,
+    // so the difference is taken in [0, p) explicitly. `m2` is reduced mod `p`
+    // first because nothing here guarantees `q < p` — the JDK convention holds
+    // for generated keys, but an imported key may carry them either way round,
+    // and Garner does not actually care as long as `qInv*q == 1 (mod p)`.
+    let m2p = m2.modulo(p);
+    let diff = if m1.cmp(&m2p) == std::cmp::Ordering::Less {
+        m1.add(p).sub(&m2p)
+    } else {
+        m1.sub(&m2p)
+    };
+    let h = qinv.mul(&diff).modulo(p);
+    let m = m2.add(&q.mul(&h));
+
+    // Bellcore. Everything above is unverified arithmetic until this passes.
+    if m.modpow(&key.e, &key.n).cmp(&base.modulo(&key.n)) != std::cmp::Ordering::Equal {
+        return None;
+    }
+    Some(m)
+}
+
+/// `base^d mod n`, by CRT when the key can support a *verified* one and by the
+/// full-width exponent otherwise. The fallback is what makes every refusal in
+/// [`rsa_crt_exponentiate`] safe: declining CRT costs speed, never correctness.
+fn rsa_private_exponentiate(key: &RsaPrivateKey, base: &BigUint) -> BigUint {
+    match rsa_crt_exponentiate(key, base) {
+        Some(m) => m,
+        None => base.modpow(&key.d, &key.n),
+    }
+}
+
+/// The private-key operation every signing path should call: base blinding on
+/// the outside, CRT on the inside.
+///
+/// The composition order is the one OpenSSL uses and it is the only one that
+/// works: blind first, so the secret-exponent arithmetic — both CRT halves
+/// included — runs on a uniformly random, message-independent operand, then
+/// unblind the result. Blinding the *output* would leave the halves running on
+/// attacker-chosen data and defeat the point (VULN(2)).
+///
+/// The fault check inside runs against the blinded base, which is exactly
+/// right: it verifies the arithmetic that actually executed.
+fn rsa_private_op_blinded(key: &RsaPrivateKey, base: &BigUint) -> BigUint {
+    if let Some(r) = rsa_random_coprime(&key.n) {
+        if let Some(r_inv) = r.modinv(&key.n) {
+            let re = r.modpow(&key.e, &key.n);
+            let blinded = base.mul(&re).modulo(&key.n);
+            let s_blinded = rsa_private_exponentiate(key, &blinded);
+            return s_blinded.mul(&r_inv).modulo(&key.n);
+        }
+    }
+    // Blinding material unavailable (OS entropy down). Still CRT, still
+    // verified — just without the message-independence property.
+    rsa_private_exponentiate(key, base)
+}
+
 /// Compute `base^d mod n` with blinding when the public exponent `e` is NOT
 /// available (the `Cipher` decrypt path only carries `(n, d)`).
 ///
@@ -2336,7 +2451,7 @@ impl Rsa {
         // timing channel of the variable-time `modpow` (VULN(2)). The public
         // exponent `e` is available on `RsaPrivateKey`, so use the efficient
         // single-secret-modpow `r^e` blinding.
-        let s = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
+        let s = rsa_private_op_blinded(key, &m);
         s.to_bytes_be_padded(k)
     }
 
@@ -2471,7 +2586,7 @@ impl Rsa {
             return Vec::new();
         };
         let m = BigUint::from_bytes_be(&em);
-        rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n).to_bytes_be_padded(k)
+        rsa_private_op_blinded(key, &m).to_bytes_be_padded(k)
     }
 
     fn pkcs1v15_encode_digest(
@@ -2551,7 +2666,7 @@ impl Rsa {
         // Blinded, for the same VULN(2) reason `sign_sha256` is blinded: the
         // variable-time `modpow` otherwise leaks a message-dependent timing
         // signal, and `NONEwithRSA` payloads are frequently attacker-chosen.
-        let sig = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
+        let sig = rsa_private_op_blinded(key, &m);
         Some(sig.to_bytes_be_padded(k))
     }
 
@@ -3126,6 +3241,70 @@ pub fn rsa_cipher_decrypt(
 ) -> Result<Vec<u8>, RsaCipherError> {
     let n_big = BigUint::from_bytes_be(n);
     let d_big = BigUint::from_bytes_be(d);
+    // Blinded private exponentiation (VULN(2)): this entry point carries only
+    // `(n, d)` — no public exponent, no CRT parameters — so it takes the no-`e`
+    // two-modpow blinding and the full-width exponent. Callers that can name a
+    // key handle should prefer `rsa_cipher_decrypt_by_id`, which reaches the
+    // CRT parameters and is ~3x faster.
+    rsa_cipher_decrypt_with(&n_big, pad, ct, |c| {
+        rsa_private_modpow_blinded_no_e(c, &d_big, &n_big)
+    })
+}
+
+/// `rsa_cipher_decrypt` for a caller that holds a `crypto_impl` key handle.
+///
+/// The handle reaches the whole `RsaPrivateKey` — including the CRT parameters
+/// the byte-slice entry point above cannot see — so this takes the CRT private
+/// op. Returns `None` when the handle cannot be trusted to name this key, which
+/// the caller treats as "fall back to the `(n, d)` form", not as a decryption
+/// failure.
+///
+/// ## `expect_n` is a safety interlock, not a sanity check
+///
+/// A handle can be *wrong* rather than merely absent. The JCA layer resolves it
+/// from an identity side-table and, failing that, from a fixed field slot on the
+/// key object — and on a genuine JDK key that slot holds whatever that class
+/// puts there. Key ids are small consecutive integers, so an unrelated small
+/// `int` in that slot can easily collide with a live id and name **a different
+/// key**, which would decrypt to a wrong plaintext rather than to an error.
+///
+/// So the handle is only honoured when the key it names carries the modulus the
+/// caller actually initialised with. A collision then declines instead of
+/// decrypting, and the cost is one big-endian comparison.
+///
+/// Retires the `Cipher` decrypt half of
+/// `internal/performance/rsa-private-key-op-crt-FIXED-20260817`.
+pub fn rsa_cipher_decrypt_by_id(
+    id: u64,
+    expect_n: &[u8],
+    pad: RsaCipherPadding,
+    ct: &[u8],
+) -> Option<Result<Vec<u8>, RsaCipherError>> {
+    let guard = RSA_KEY_STORE.read();
+    let key = &guard.as_ref()?.get(&id)?.private_key;
+    // The interlock. `BigUint` round-trips through `to_bytes_be`, so comparing
+    // the parsed values rather than the raw slices tolerates leading-zero
+    // padding differences between the two sources.
+    if key.n.cmp(&BigUint::from_bytes_be(expect_n)) != std::cmp::Ordering::Equal {
+        return None;
+    }
+    let n_big = key.n.clone();
+    Some(rsa_cipher_decrypt_with(&n_big, pad, ct, |c| {
+        rsa_private_op_blinded(key, c)
+    }))
+}
+
+/// The shared body of both decrypt entry points. Everything about length
+/// refusal, representative range, and the collapsed padding-failure surface is
+/// identical; only the private-key operation differs, so only that is a
+/// parameter. Keeping one body is what stops the two paths from drifting into
+/// different exception classes for the same input.
+fn rsa_cipher_decrypt_with(
+    n_big: &BigUint,
+    pad: RsaCipherPadding,
+    ct: &[u8],
+    private_op: impl FnOnce(&BigUint) -> BigUint,
+) -> Result<Vec<u8>, RsaCipherError> {
     let k = (n_big.bit_length() + 7) / 8;
     if k == 0 {
         return Err(RsaCipherError::Key("RSA: invalid (zero) modulus".into()));
@@ -3147,16 +3326,15 @@ pub fn rsa_cipher_decrypt(
     // not a decryptable representative and SunJCE says so with a checked
     // `BadPaddingException("Message is larger than modulus")`. Reachable only
     // through `NoPadding`, where the caller supplies the integer directly.
-    if c.cmp(&n_big) != std::cmp::Ordering::Less {
+    if c.cmp(n_big) != std::cmp::Ordering::Less {
         return Err(RsaCipherError::Padding(
             "Message is larger than modulus".into(),
         ));
     }
-    // Blinded private exponentiation (VULN(2)): the `Cipher` decrypt path only
-    // carries `(n, d)` — the public exponent `e` is not threaded here — so use
-    // the no-`e` two-modpow blinding to remove the message-dependent (adaptive
-    // ciphertext) timing channel that an RSA decryption-timing attacker probes.
-    let m = rsa_private_modpow_blinded_no_e(&c, &d_big, &n_big);
+    // The blinded private exponentiation the caller chose (VULN(2)): blinding
+    // is what removes the message-dependent timing channel an adaptive
+    // ciphertext attacker probes, so both forms of `private_op` blind.
+    let m = private_op(&c);
     let em = m.to_bytes_be_padded(k);
     // Every padding failure — wrong key, flipped byte, short ciphertext — has
     // already been collapsed to the single opaque `RSA_PADDING_ERROR` string by
@@ -3307,7 +3485,7 @@ pub fn rsa_sign_pss_ex(
     em.extend_from_slice(&h);
     em.push(0xbc);
     let m = BigUint::from_bytes_be(&em);
-    rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n).to_bytes_be_padded(k)
+    rsa_private_op_blinded(key, &m).to_bytes_be_padded(k)
 }
 
 /// RSASSA-PSS verify with MGF1 over the same digest and salt length == hLen
@@ -7963,6 +8141,12 @@ mod tests {
         }
         let secret_modpow = t.elapsed();
 
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = rsa_crt_exponentiate(&sk, &m).expect("CRT");
+        }
+        let crt = t.elapsed();
+
         let r = rsa_random_coprime(&sk.n).expect("blinding factor");
         let t = Instant::now();
         for _ in 0..10 {
@@ -7984,7 +8168,8 @@ mod tests {
 
         println!("--- RSA-2048 sign_sha256, x10 ---");
         println!("  whole signature      {whole:>12.2?}");
-        println!("  secret-exponent modpow {secret_modpow:>10.2?}");
+        println!("  secret-exponent modpow {secret_modpow:>10.2?}   (full-width d)");
+        println!("  CRT + fault check    {crt:>12.2?}");
         println!("  r.modinv(n)          {modinv:>12.2?}");
         println!("  r^e mod n            {public_modpow:>12.2?}");
         println!("  draw blinding factor {draw:>12.2?}");
@@ -8080,6 +8265,298 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The CRT private op against the full-width one it replaced.
+    ///
+    /// `internal/performance/rsa-private-key-op-crt-FIXED-20260817`
+    /// set the bar: "a differential test against the non-CRT path across key
+    /// sizes, imported-key (`None` CRT params) fallback, and the fault-check
+    /// branch". All three are here, and the differential is against
+    /// `base.modpow(&d, &n)` — the exact expression the CRT path replaced — so
+    /// the new arm is never checked only against itself.
+    #[test]
+    fn crt_private_op_matches_the_full_width_exponentiation() {
+        for bits in [1024usize, 2048] {
+            let (_pk, sk) = Rsa::generate_keypair(bits);
+            assert!(sk.p.is_some(), "generated key must carry CRT parameters");
+
+            // A spread of bases, including the ones that exercise the
+            // `m1 < m2` borrow in Garner and the degenerate residues.
+            let mut bases = vec![
+                BigUint::zero(),
+                BigUint::one(),
+                BigUint::from_u64(2),
+                BigUint::from_u64(65537),
+                sk.n.sub(&BigUint::one()),
+            ];
+            let mut seed = 0x5eed_c27_0817u64;
+            for _ in 0..24 {
+                let mut bytes = vec![0u8; bits / 8];
+                for b in bytes.iter_mut() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    *b = seed as u8;
+                }
+                bases.push(BigUint::from_bytes_be(&bytes).modulo(&sk.n));
+            }
+
+            for base in &bases {
+                let want = base.modpow(&sk.d, &sk.n);
+                let crt = rsa_crt_exponentiate(&sk, base).expect("CRT must engage");
+                assert_eq!(
+                    crt.to_bytes_be(),
+                    want.to_bytes_be(),
+                    "{bits}-bit CRT disagrees with full-width d"
+                );
+                // The dispatcher must pick the same value either way.
+                assert_eq!(
+                    rsa_private_exponentiate(&sk, base).to_bytes_be(),
+                    want.to_bytes_be(),
+                    "{bits}-bit dispatcher"
+                );
+                // Blinded, the answer is still the answer — the blinding factor
+                // is random per call, so this also says the unblind is right.
+                assert_eq!(
+                    rsa_private_op_blinded(&sk, base).to_bytes_be(),
+                    want.to_bytes_be(),
+                    "{bits}-bit blinded CRT"
+                );
+            }
+        }
+    }
+
+    /// A key with no CRT parameters — every `(n, d)` import — must still sign,
+    /// via the full-width fallback. Losing the parameters may cost speed; it
+    /// may never change an answer.
+    #[test]
+    fn crt_absent_falls_back_and_still_signs() {
+        let (pk, sk) = Rsa::generate_keypair(1024);
+        let stripped = RsaPrivateKey {
+            n: sk.n.clone(),
+            d: sk.d.clone(),
+            e: sk.e.clone(),
+            p: None,
+            q: None,
+            dp: None,
+            dq: None,
+            qinv: None,
+        };
+        let base = BigUint::from_u64(0xdead_beef);
+        assert!(
+            rsa_crt_exponentiate(&stripped, &base).is_none(),
+            "no parameters => no CRT"
+        );
+        assert_eq!(
+            rsa_private_exponentiate(&stripped, &base).to_bytes_be(),
+            base.modpow(&sk.d, &sk.n).to_bytes_be(),
+            "fallback must equal the full-width answer"
+        );
+        let msg = b"imported key, no CRT tail";
+        let sig = Rsa::sign_sha256(&stripped, msg);
+        assert!(Rsa::verify_sha256(&pk, msg, &sig), "stripped key still signs");
+
+        // Partial parameters are not usable parameters: any missing member
+        // sends it back to the fallback rather than half-computing.
+        for drop_idx in 0..5 {
+            let mut k = clone_key(&sk);
+            match drop_idx {
+                0 => k.p = None,
+                1 => k.q = None,
+                2 => k.dp = None,
+                3 => k.dq = None,
+                _ => k.qinv = None,
+            }
+            assert!(
+                rsa_crt_exponentiate(&k, &base).is_none(),
+                "missing member {drop_idx} must decline CRT"
+            );
+            assert_eq!(
+                rsa_private_exponentiate(&k, &base).to_bytes_be(),
+                base.modpow(&sk.d, &sk.n).to_bytes_be(),
+                "missing member {drop_idx} still answers correctly"
+            );
+        }
+    }
+
+    /// The Bellcore branch: a key whose CRT parameters are WRONG must be caught
+    /// by the fault check and fall back, never return the faulty value.
+    ///
+    /// This is the whole reason the check exists. A faulty CRT signature lets
+    /// `gcd(s - s_correct, n)` recover a factor of `n` from a single sample,
+    /// and `parse_rsa_private_key_der` reads all five parameters out of a
+    /// PKCS#8 file without ever checking `n == p*q`, so a hostile key file
+    /// reaches this code directly.
+    #[test]
+    fn corrupt_crt_parameters_are_caught_and_do_not_leak_a_factor() {
+        let (_pk, sk) = Rsa::generate_keypair(1024);
+        let base = BigUint::from_u64(0x1234_5678_9abc);
+        let correct = base.modpow(&sk.d, &sk.n);
+
+        // Corrupt each parameter in turn. `dP`/`dQ` are the realistic fault
+        // (a flipped exponent bit); `p`/`q`/`qInv` cover a malformed import.
+        for name in ["dP", "dQ", "qInv", "p", "q"] {
+            let mut bad = clone_key(&sk);
+            let one = BigUint::one();
+            let two = BigUint::from_u64(2);
+            match name {
+                "dP" => bad.dp = Some(bad.dp.as_ref().unwrap().add(&one)),
+                "dQ" => bad.dq = Some(bad.dq.as_ref().unwrap().add(&one)),
+                "qInv" => bad.qinv = Some(bad.qinv.as_ref().unwrap().add(&one)),
+                "p" => bad.p = Some(bad.p.as_ref().unwrap().add(&two)),
+                _ => bad.q = Some(bad.q.as_ref().unwrap().add(&two)),
+            }
+            assert!(
+                rsa_crt_exponentiate(&bad, &base).is_none(),
+                "corrupt {name} must fail the fault check"
+            );
+            // And the caller-facing entry points still return the RIGHT answer,
+            // because declining CRT falls back rather than failing.
+            assert_eq!(
+                rsa_private_exponentiate(&bad, &base).to_bytes_be(),
+                correct.to_bytes_be(),
+                "corrupt {name}: fallback answer"
+            );
+            assert_eq!(
+                rsa_private_op_blinded(&bad, &base).to_bytes_be(),
+                correct.to_bytes_be(),
+                "corrupt {name}: blinded fallback answer"
+            );
+        }
+
+        // A degenerate p or q declines before any arithmetic runs.
+        for degenerate in [BigUint::zero(), BigUint::one()] {
+            let mut bad = clone_key(&sk);
+            bad.p = Some(degenerate.clone());
+            assert!(rsa_crt_exponentiate(&bad, &base).is_none(), "degenerate p");
+            let mut bad = clone_key(&sk);
+            bad.q = Some(degenerate.clone());
+            assert!(rsa_crt_exponentiate(&bad, &base).is_none(), "degenerate q");
+        }
+
+        // An unverifiable public exponent gets no CRT at all.
+        for tiny in [BigUint::zero(), BigUint::one(), BigUint::from_u64(2)] {
+            let mut bad = clone_key(&sk);
+            bad.e = tiny;
+            assert!(
+                rsa_crt_exponentiate(&bad, &base).is_none(),
+                "e too small to verify => no CRT"
+            );
+        }
+    }
+
+    fn clone_key(k: &RsaPrivateKey) -> RsaPrivateKey {
+        RsaPrivateKey {
+            n: k.n.clone(),
+            d: k.d.clone(),
+            e: k.e.clone(),
+            p: k.p.clone(),
+            q: k.q.clone(),
+            dp: k.dp.clone(),
+            dq: k.dq.clone(),
+            qinv: k.qinv.clone(),
+        }
+    }
+
+    /// The handle-based decrypt (CRT) must be indistinguishable from the
+    /// `(n, d)` decrypt it accelerates — same plaintexts AND same failure
+    /// classes. The two share a body precisely so they cannot drift, and this
+    /// is the test that says so.
+    #[test]
+    fn decrypt_by_id_matches_the_n_d_path_including_its_refusals() {
+        let (pk, sk) = Rsa::generate_keypair(2048);
+        let id = rsa_key_next_id();
+        rsa_key_store(
+            id,
+            RsaKeyPairData {
+                public_key: pk,
+                private_key: sk,
+            },
+        );
+        let (n, d) = rsa_key_get_priv(id).expect("private components");
+        let (_, e) = rsa_key_get_pub(id).expect("public components");
+
+        for pad in [
+            RsaCipherPadding::Pkcs1,
+            RsaCipherPadding::OaepSha1,
+            RsaCipherPadding::OaepSha256,
+        ] {
+            // A ciphertext with a leading zero byte makes the "short" row below
+            // hand decrypt the same integer; re-roll, as the sibling test does.
+            let ct = loop {
+                let c = rsa_cipher_encrypt(&n, &e, pad, b"crt payload").expect("encrypt");
+                if c[0] != 0 {
+                    break c;
+                }
+            };
+
+            let by_id = rsa_cipher_decrypt_by_id(id, &n, pad, &ct)
+                .expect("handle is in the store")
+                .expect("decrypt");
+            let by_nd = rsa_cipher_decrypt(&n, &d, pad, &ct).expect("decrypt");
+            assert_eq!(by_id, b"crt payload".to_vec(), "{pad:?}: plaintext");
+            assert_eq!(by_id, by_nd, "{pad:?}: the two paths must agree");
+
+            // Refusals must carry the same class from both entry points.
+            let mut corrupt = ct.clone();
+            corrupt[200] ^= 0x01;
+            let a = rsa_cipher_decrypt_by_id(id, &n, pad, &corrupt)
+                .expect("handle")
+                .expect_err("corrupt must not decrypt");
+            let b = rsa_cipher_decrypt(&n, &d, pad, &corrupt).expect_err("corrupt");
+            assert_eq!(a.jca_class(), b.jca_class(), "{pad:?}: corrupt class");
+            assert_eq!(a.message(), b.message(), "{pad:?}: corrupt message");
+
+            let mut long = ct.clone();
+            long.push(0);
+            let a = rsa_cipher_decrypt_by_id(id, &n, pad, &long)
+                .expect("handle")
+                .expect_err("over-long must be refused");
+            let b = rsa_cipher_decrypt(&n, &d, pad, &long).expect_err("over-long");
+            assert_eq!(a.jca_class(), b.jca_class(), "{pad:?}: over-long class");
+            assert_eq!(a.message(), b.message(), "{pad:?}: over-long message");
+
+            let a = rsa_cipher_decrypt_by_id(id, &n, pad, &ct[1..])
+                .expect("handle")
+                .expect_err("short must not decrypt");
+            let b = rsa_cipher_decrypt(&n, &d, pad, &ct[1..]).expect_err("short");
+            assert_eq!(a.jca_class(), b.jca_class(), "{pad:?}: short class");
+        }
+
+        // An unknown handle is "I cannot help", not a decryption failure — the
+        // caller falls back to (n, d) rather than reporting a bad ciphertext.
+        assert!(
+            rsa_cipher_decrypt_by_id(u64::MAX, &n, RsaCipherPadding::Pkcs1, b"x").is_none(),
+            "unknown handle must decline, not fail"
+        );
+
+        // THE INTERLOCK. A handle that names a real but DIFFERENT key must
+        // decline rather than decrypt with it. This is the collision the JCA
+        // layer's field-slot fallback can produce on a genuine JDK key, and
+        // without the modulus check it would silently return a wrong plaintext.
+        let (other_pk, other_sk) = Rsa::generate_keypair(2048);
+        let other_id = rsa_key_next_id();
+        rsa_key_store(
+            other_id,
+            RsaKeyPairData {
+                public_key: other_pk,
+                private_key: other_sk,
+            },
+        );
+        let ct = rsa_cipher_encrypt(&n, &e, RsaCipherPadding::Pkcs1, b"crt payload")
+            .expect("encrypt");
+        assert!(
+            rsa_cipher_decrypt_by_id(other_id, &n, RsaCipherPadding::Pkcs1, &ct).is_none(),
+            "a handle naming a different key must decline"
+        );
+        // ...while the right handle for that same modulus still works.
+        assert_eq!(
+            rsa_cipher_decrypt_by_id(id, &n, RsaCipherPadding::Pkcs1, &ct)
+                .expect("handle")
+                .expect("decrypt"),
+            b"crt payload".to_vec()
+        );
     }
 
     // RF.6: RSA key generation produces a functional sign/verify pair.

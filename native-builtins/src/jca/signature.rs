@@ -1467,13 +1467,35 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(k))) => Value::Object(Some(*k)),
             _ => Value::Object(None),
         };
-        user_spi_call(
-            ctx,
-            spi,
-            "engineInitSign",
-            "(Ljava/security/PrivateKey;)V",
-            &[key],
-        )?;
+        // `initSign(key, random)` and `initSign(key)` share this native, and the
+        // random is not decoration: `SignatureSpi.engineInitSign(key, random)`
+        // stores it as `appRandom`, and that is where a signer takes its
+        // per-signature nonce from. Dropping it left BouncyCastle's ECDSA
+        // drawing `k` from its own source, so a test that pins `k` with a
+        // deterministic random got a DIFFERENT `r` on every run —
+        // `DSATest.testECDSA239bitPrime`, "r component wrong", where HotSpot
+        // reproduces the published J.3.2 vector exactly.
+        match args.get(2) {
+            Some(Value::Object(Some(random))) => {
+                let random = Value::Object(Some(*random));
+                user_spi_call(
+                    ctx,
+                    spi,
+                    "engineInitSign",
+                    "(Ljava/security/PrivateKey;Ljava/security/SecureRandom;)V",
+                    &[key, random],
+                )?;
+            }
+            _ => {
+                user_spi_call(
+                    ctx,
+                    spi,
+                    "engineInitSign",
+                    "(Ljava/security/PrivateKey;)V",
+                    &[key],
+                )?;
+            }
+        }
         set_sig_state(ctx, this, STATE_SIGN);
         clear_data(ctx, this);
         return Ok(None);
