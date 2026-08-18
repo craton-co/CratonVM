@@ -6863,12 +6863,27 @@ impl ZgcRealHeap {
     /// the failure mode the one-shot guard exists to avoid.
     const ZGC_FRAG_REPORT_WALLS: usize = 32;
 
-    /// One-shot report of an arena allocation failure, with the occupancy that
-    /// says whether the heap was full or merely fragmented.
+    /// Report an arena allocation failure, with the occupancy that says
+    /// whether the heap was full or merely fragmented.
     ///
-    /// One-shot on purpose: the failure repeats for every subsequent request
-    /// once the arena is out, and a per-failure line would bury the run in
-    /// stderr exactly when it is least readable.
+    /// Emitted on a doubling schedule (failures 1, 2, 4, 8, ...) rather than
+    /// exactly once. One-shot was the original rule and half its reason still
+    /// holds -- once the arena is out the failure repeats for every subsequent
+    /// request, and a per-failure line buries the run in stderr at the moment
+    /// it is least readable. The other half was wrong. A single allocation does
+    /// not fail once: its callers run a LADDER -- `gc_alloc_array` and
+    /// `jit_newarray` both try, retire the TLAB and force a GC, try again, run
+    /// `last_ditch_reclaim`, and try a third time before throwing. One-shot
+    /// therefore reported the FIRST rung, whose free list is by construction the
+    /// PRE-collection one, and then fell silent for exactly the rungs that
+    /// decide whether the `OutOfMemoryError` is honest.
+    ///
+    /// Failure #2 is the post-GC retry, and that is the number separating "the
+    /// heap really has no hole this big" from "the collection freed most of the
+    /// heap and the retry still could not see it". Found while diagnosing H2
+    /// `TestBenchmark`: the one-shot line reported `used` at 99% of capacity,
+    /// while the collection that ran immediately afterwards left the heap 97%
+    /// free -- a state this report had no way to show.
     fn warn_alloc_failed_once(
         size: usize,
         used: usize,
@@ -6880,8 +6895,9 @@ impl ZgcRealHeap {
         // dozen holes or twenty thousand, and those want different fixes.
         span_shape: (usize, usize),
     ) {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if WARNED.swap(true, Ordering::Relaxed) {
+        static FAILURES: AtomicUsize = AtomicUsize::new(0);
+        let failure_seq = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        if !failure_seq.is_power_of_two() {
             return;
         }
         tracing::warn!(
@@ -6893,10 +6909,13 @@ impl ZgcRealHeap {
             largest_free_block,
             free_spans = span_shape.0,
             free_span_sizes = span_shape.1,
+            failure_seq,
             "zgc: arena allocation failed — this heap does not compact, so the \
              bump cursor never rewinds and reclaimed space returns only as \
              free-list holes. `largest_free_block < request` with a large \
-             `free_list_bytes` means fragmentation, not exhaustion.",
+             `free_list_bytes` means fragmentation, not exhaustion. \
+             `failure_seq` is the rung of the caller's try/GC/try/reclaim/try \
+             ladder: 1 is pre-collection, 2 is the post-GC retry.",
         );
     }
 
@@ -6912,15 +6931,22 @@ impl ZgcRealHeap {
     /// hostage (a targeted fix does). [`Arena::frag_profile`] separates those,
     /// and this walks the winning window's walls so the occupants can be named.
     ///
-    /// Returns `None` on every call after the first: the failure repeats for
+    /// Returns `None` on every call after the second: the failure repeats for
     /// every subsequent request once the arena is out, and this report is far
     /// too long to emit per failure.
+    ///
+    /// TWICE, not once, for the reason spelled out on
+    /// [`Self::warn_alloc_failed_once`]: the callers run a try/GC/try ladder, so
+    /// report #1 always profiles the PRE-collection arena and report #2 is the
+    /// only view of the post-GC one. Naming the walls that survive a collection
+    /// is the whole point of this report -- the ones that do not survive it were
+    /// never the problem.
     ///
     /// Bounded on purpose: at most [`Self::ZGC_FRAG_REPORT_WALLS`] walls are
     /// walked and that many class rows returned.
     fn frag_report_once(&self, request: usize, arena: &Arena) -> Option<ZFragReport> {
-        static REPORTED: AtomicBool = AtomicBool::new(false);
-        if REPORTED.swap(true, Ordering::Relaxed) {
+        static REPORTS: AtomicUsize = AtomicUsize::new(0);
+        if REPORTS.fetch_add(1, Ordering::Relaxed) >= 2 {
             return None;
         }
         let profile = arena.frag_profile(request);
