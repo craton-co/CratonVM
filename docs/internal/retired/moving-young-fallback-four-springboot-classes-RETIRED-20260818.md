@@ -52,7 +52,7 @@ Both successors are filed, and neither is this page's mechanism:
   scanned as a GC root but never remapped, so a moving cycle evacuated the
   cached `java.lang.reflect.Method` and left the cache pointing at from-space.
   Both classes are 73/73 and 34/34 under Generational post-fix.
-* **`docs/known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.md`**
+* **`docs/known-issues/perf/quartz-stackwalker-walk-is-38x-hotspot-20260818.md`**
   — Quartz now dies on **every** collector, growing ~350 MB/s of native memory
   to 22 GB with `--Xmx` having no effect and **zero** `[moving-young]` lines in
   the log. `--nojit` passes it. Three hypotheses tested and refuted there.

@@ -809,6 +809,38 @@ pub struct GcFlags {
     /// zeros" world back — a use-after-free read is the one thing the scrub was
     /// really buying — and it is what makes the change a single-binary A/B.
     pub g1_scrub_free: bool,
+    /// `CRATONVM_G1_NARROW_FIXUP` — restrict G1's Phase-4 reference fix-up to
+    /// the regions that can actually need it, instead of every non-CSet region
+    /// in the heap. Default **ON** ([`parse::on_unless_zero`]); `=0` restores
+    /// the whole-heap walk.
+    ///
+    /// The walk is what makes a young pause O(LIVE HEAP) rather than O(young
+    /// live set) — the property G1's region design exists to buy. It visits
+    /// every object of every surviving region to rewrite forwarding pointers
+    /// and rebuild GC-internal remembered-set edges. Neither job needs the
+    /// whole heap: the rewrite is redundant with Phases 2 and 3 once every
+    /// mutator store reaches `post_write_barrier_rset` (true since defect G1-2
+    /// closed), and the rebuild only concerns regions this pause WROTE INTO.
+    /// See `G1Collector::phase4_regions_to_walk`.
+    ///
+    /// `=0` is the bisection lever, and the FIRST thing to try for any
+    /// suspected G1 dangling-reference or lost-edge defect: under it the
+    /// collector re-walks the whole heap every pause, which is the behaviour
+    /// every G1 result before 2026-08-18 was produced under.
+    pub g1_narrow_fixup: bool,
+    /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
+    /// every cross-region reference into a COLLECTABLE region is named in that
+    /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
+    /// bytes), never a shipping default.
+    ///
+    /// The complement of `verify_no_dangling_into_cset`, which asks "did this
+    /// pause leave a stale pointer?". This asks "will the NEXT pause know where
+    /// to look?" — a missing edge means the pause that collects the target
+    /// never scans the holder and frees a live object. It exists because the
+    /// unit suite cannot discriminate a correct Phase-4 narrowing from one that
+    /// walks nothing: on every constructible fixture the mutator barrier alone
+    /// already records every edge.
+    pub g1_dbg_rset: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
@@ -1012,6 +1044,8 @@ impl GcFlags {
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
+            g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
+            g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),

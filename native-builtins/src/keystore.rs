@@ -2249,6 +2249,77 @@ fn hex_lower(b: &[u8]) -> String {
 // Native registration
 // ---------------------------------------------------------------------------
 
+/// Every class the provider table advertises as a `KeyStore` implementation,
+/// so the guard below and the registrations above cannot drift apart silently.
+#[cfg(test)]
+const ADVERTISED_KEYSTORE_CLASSES: &[&str] = &[
+    "sun/security/provider/JavaKeyStore$DualFormatJKS",
+    "sun/security/provider/JavaKeyStore$CaseExactJKS",
+    "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12",
+    "sun/security/provider/DomainKeyStore$DKS",
+    "sun/security/pkcs12/PKCS12KeyStore",
+];
+
+#[cfg(test)]
+mod advertised_keystore_registration_tests {
+    use super::ADVERTISED_KEYSTORE_CLASSES;
+
+    /// A `KeyStore` row the provider table advertises must resolve to a class
+    /// this module actually serves.
+    ///
+    /// The two are joined only by a string, and dispatch here is by CLASS NAME
+    /// with no inheritance walk — so correcting a row to the real JDK class
+    /// name, which is exactly the right thing to do, silently unregisters the
+    /// engine surface. That happened: SUN's `KeyStore.PKCS12` was corrected
+    /// from `PKCS12KeyStore` to `PKCS12KeyStore$DualFormatPKCS12`, the JKS
+    /// twin of the same change WAS registered, and the PKCS12 one was not.
+    /// `KeyStore.getInstance("PKCS12")` — the default — then loaded nothing,
+    /// and netty's `JdkSslEngineTest` went from 754 passing to 563.
+    ///
+    /// Nothing in the build said so. The provider table was right, the
+    /// registration list was right for what it listed, and the gap was between
+    /// them. This test is that gap.
+    #[test]
+    fn every_advertised_keystore_class_has_an_engine_surface() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        super::register_keystore_real(&mut registry);
+        let mut missing = Vec::new();
+        for fqn in ADVERTISED_KEYSTORE_CLASSES {
+            // `engineLoad` stands for the whole surface: `register_engine_surface`
+            // registers them together or not at all.
+            if registry
+                .find(fqn, "engineLoad", "(Ljava/io/InputStream;[C)V")
+                .is_none()
+            {
+                missing.push(*fqn);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the provider table advertises these KeyStore classes and this module \
+             registers no engine surface for them, so every engineLoad on one is a \
+             method with no body: {missing:?}"
+        );
+    }
+
+    /// …and the list the guard walks must be the list the provider table
+    /// actually publishes, or the guard checks a fiction. Compared against the
+    /// SOURCE of `provider_chain`'s SUN/SunJSSE rows rather than a copy.
+    #[test]
+    fn the_advertised_list_matches_the_provider_table() {
+        let src = include_str!("jca/provider_chain.rs");
+        for fqn in ADVERTISED_KEYSTORE_CLASSES {
+            let dotted = fqn.replace('/', ".");
+            assert!(
+                src.contains(&format!("\"{dotted}\"")),
+                "{dotted} is in ADVERTISED_KEYSTORE_CLASSES but no longer appears in \
+                 provider_chain.rs — drop it here, or the guard is checking a class \
+                 nothing advertises"
+            );
+        }
+    }
+}
+
 /// FQNs we register on. PKCS12 + JKS share the same `engine*` surface; we
 /// register on each FQN explicitly because dispatch is keyed by class name
 /// (no Java-inheritance walk on the native side — `java/security/KeyStore`
@@ -2258,6 +2329,35 @@ const PKCS12_FQN: &str = "sun/security/pkcs12/PKCS12KeyStore";
 const JKS_FQN: &str = "sun/security/provider/JavaKeyStore";
 const JKS_INNER_JKS_FQN: &str = "sun/security/provider/JavaKeyStore$JKS";
 const JKS_INNER_DUAL_FQN: &str = "sun/security/provider/JavaKeyStore$DualFormatJKS";
+/// `KeyStore.getInstance("PKCS12")` — the DEFAULT, and the one netty, Tomcat
+/// and every `SslContextBuilder` reach for.
+///
+/// Registered late, and the omission cost 191 tests. When the SUN provider's
+/// `KeyStore.PKCS12` row was corrected to name the real JDK class
+/// (`…$DualFormatPKCS12`, a `KeyStoreDelegator` that sniffs the stream), the
+/// row started naming a class this file does not register — and dispatch here
+/// is keyed by CLASS NAME with no inheritance walk, as the comment above says.
+/// So the engine surface silently went missing: every `engineLoad` on the
+/// platform-default PKCS#12 store did nothing, netty's key material came back
+/// empty, and `JdkSslEngineTest` went 754 ok / 1 failed to 563 / 192, with
+/// `IOException: setNeedClientAuth(true) requires javax.net.ssl.trustStore`
+/// among the wreckage — an engine falling back to `default_engine_server_config`
+/// because its `SSLContext` never got an identity.
+///
+/// The JKS half of that same change WAS registered (`JKS_INNER_DUAL_FQN`
+/// above). Only its twin was missed, which is why
+/// `every_advertised_keystore_class_has_an_engine_surface` now exists.
+const PKCS12_INNER_DUAL_FQN: &str = "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12";
+/// `KeyStore.getInstance("CaseExactJKS")` — advertised long before the row
+/// correction and never registered either, so this one is not a regression,
+/// just the same hole one door along.
+const JKS_INNER_CASE_EXACT_FQN: &str = "sun/security/provider/JavaKeyStore$CaseExactJKS";
+/// `KeyStore.getInstance("DKS")`. A domain keystore is a different FORMAT
+/// (a policy file naming other stores), so serving it through this engine
+/// surface is not right in the long run — but an unregistered class answers
+/// nothing at all, and answering a `KeyStoreException` from a real
+/// `engineLoad` is strictly closer to the JDK than a method with no body.
+const DKS_FQN: &str = "sun/security/provider/DomainKeyStore$DKS";
 
 const SUN_KEYSTORE_FQN: &str = "java/security/KeyStore";
 
@@ -2271,6 +2371,9 @@ pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
     register_engine_surface(r, JKS_FQN);
     register_engine_surface(r, JKS_INNER_JKS_FQN);
     register_engine_surface(r, JKS_INNER_DUAL_FQN);
+    register_engine_surface(r, PKCS12_INNER_DUAL_FQN);
+    register_engine_surface(r, JKS_INNER_CASE_EXACT_FQN);
+    register_engine_surface(r, DKS_FQN);
 
     // The `java.security.KeyStore` shim's `load`/`getKey`/`getCertificate`
     // engine surface is registered by `phases_early.rs` — we don't override

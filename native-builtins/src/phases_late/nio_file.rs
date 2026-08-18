@@ -21668,29 +21668,46 @@ mod g22_glob_translation_tests {
     /// Every expectation here is the regex the JDK's own `Globs
     /// .toWindowsRegexPattern` produces, cross-checked against the MEASURED
     /// match/no-match answers of HotSpot 25.0.3+9 on Windows (G22-1 §Glob).
+    ///
+    /// That claim was false for the first block until 2026-08-18: ten
+    /// expectations spelled the separator class with ONE backslash where the
+    /// JDK emits two — and one backslash is not even a legal Java character
+    /// class, because it escapes the closing bracket and the class never
+    /// closes. The rest of this function already had it right, which is what a
+    /// partial hand-edit looks like.
+    ///
+    /// Re-derived rather than reasoned about: `Globs.toWindowsRegexPattern`
+    /// called by reflection on JDK 25 under `--add-opens java.base/sun.nio.fs`,
+    /// against this VM's `p57_globs_to_regex` over the same inputs. They agree
+    /// on all 21 patterns, so the translator was right and only these strings
+    /// were wrong.
+    ///
+    /// A line asserting that the escaped form translates BOTH to `^suba'\'.txt$`
+    /// and to `^sub'\'a'\'.txt$`, two lines apart, is also gone: no
+    /// implementation can satisfy both, so this test could never have passed.
+    /// The JDK gives the first.
     #[test]
     fn windows_translation_matches_the_jdk() {
         // `*` and `?` stop at the separator; `**` crosses it.
-        assert_eq!(dos("*.txt"), r"^[^\]*\.txt$");
-        assert_eq!(dos("a?c"), r"^a[^\]c$");
+        assert_eq!(dos("*.txt"), r"^[^\\]*\.txt$");
+        assert_eq!(dos("a?c"), r"^a[^\\]c$");
         assert_eq!(dos("**.txt"), r"^.*\.txt$");
-        assert_eq!(dos("**/*.txt"), r"^.*\[^\]*\.txt$");
-        assert_eq!(dos("src/**"), r"^src\.*$");
+        assert_eq!(dos("**/*.txt"), r"^.*\\[^\\]*\.txt$");
+        assert_eq!(dos("src/**"), r"^src\\.*$");
         // A `/` in the PATTERN is the separator; a lone `\` is the ESCAPE, so
         // `sub\a.txt` is the file name `suba.txt` and matches no directory.
-        assert_eq!(dos("sub/a.txt"), r"^sub\a\.txt$");
+        assert_eq!(dos("sub/a.txt"), r"^sub\\a\.txt$");
         assert_eq!(dos(r"sub\a.txt"), r"^suba\.txt$");
-        assert_eq!(dos(r"sub\a.txt"), r"^sub\a\.txt$");
         // Alternation, and a stray `}` / `,` outside a group is a literal.
-        assert_eq!(dos("*.{java,class}"), r"^[^\]*\.(?:(?:java)|(?:class))$");
+        assert_eq!(dos("*.{java,class}"), r"^[^\\]*\.(?:(?:java)|(?:class))$");
         assert_eq!(dos("a}b"), "^a}b$");
         assert_eq!(dos("a,b"), "^a,b$");
         // Classes: `!` negates, `^` is a LITERAL, a leading `-` is literal.
-        assert_eq!(dos("[abc].txt"), r"^[[^\]&&[abc]]\.txt$");
-        assert_eq!(dos("[!a-z].txt"), r"^[[^\]&&[^a-z]]\.txt$");
-        assert_eq!(dos("[^abc].txt"), r"^[[^\]&&[\^abc]]\.txt$");
-        assert_eq!(dos("[a-]"), r"^[[^\]&&[a-]]$");
-        assert_eq!(dos("[-a]"), r"^[[^\]&&[-a]]$");
+        assert_eq!(dos("[abc].txt"), r"^[[^\\]&&[abc]]\.txt$");
+        assert_eq!(dos("[!a-z].txt"), r"^[[^\\]&&[^a-z]]\.txt$");
+        assert_eq!(dos("[^abc].txt"), r"^[[^\\]&&[\^abc]]\.txt$");
+        assert_eq!(dos("[a-]"), r"^[[^\\]&&[a-]]$");
+        assert_eq!(dos("[-a]"), r"^[[^\\]&&[-a]]$");
         // `regexMetaChars` is escaped, and nothing outside it is.
         assert_eq!(dos("a+b"), r"^a\+b$");
         assert_eq!(dos("a-b"), "^a-b$");
@@ -21761,7 +21778,7 @@ mod g22_glob_translation_tests {
     fn globs_defers_two_cases_to_the_regex_engine() {
         // `[]` translates; `Pattern.compile` then reports
         // "Unclosed character class near index 12" over THIS string.
-        assert_eq!(dos("[]"), r"^[[^\]&&[]]$");
+        assert_eq!(dos("[]"), r"^[[^\\]&&[]]$");
         // Sequential groups are legal; only NESTING is banned.
         assert_eq!(dos("{a}{b}"), "^(?:(?:a))(?:(?:b))$");
     }
