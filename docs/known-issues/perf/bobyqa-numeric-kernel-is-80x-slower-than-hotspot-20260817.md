@@ -1,9 +1,12 @@
 # `BOBYQAOptimizerTest` times out because compiled numeric code is ~80x slower than HotSpot — the JIT is on, everything hot is compiled, and it buys 15%
 
-**Status: OPEN, reproduced and measured 2026-08-17, not fixed.**
+**Status: OPEN, reproduced and measured 2026-08-17, not fixed. Re-verified
+2026-08-18 on `dev` `c6299ca2a`: still HANG at the 90 s per-class cap while
+HotSpot passes the class in 2 s, and it is now one of only two non-PASSing
+classes in the whole 310-class `commons-math-legacy` sweep.**
 
 Every `BOBYQAOptimizerTest` method that actually runs the optimizer times out
-under the 90 s per-class suite budget (`apps/commons-math/RESULTS-20260817.md`).
+under the 90 s per-class suite budget (the suite run recorded in retired/commons-math-suite-run-RETIRED-20260818.md).
 The process is not deadlocked and is not stuck in the interpreter — it is
 running compiled code, correctly, about eighty times too slowly.
 
@@ -102,7 +105,7 @@ operation, spread thin.
 
 ```bash
 # Driver: probes/BobyqaOne.java — one optimize() call, no JUnit.
-CP="<commons-math test classpath — see apps/commons-math/RESULTS-20260817.md>"
+CP="<commons-math test classpath — /data/cm-legacy-classpath.txt on the Azure Linux box>"
 javac -nowarn -cp "$CP" -d . probes/BobyqaOne.java
 java     -cp "<driver>;$CP" BobyqaOne 12 1          # 0.5 s
 cratonvm --java-home <jdk> --Xmx 1g -c "<driver>;$CP" BobyqaOne 12 1          # ~45 s
@@ -133,4 +136,4 @@ HotSpot finishes the same class in 1 806 ms (17 of 18 tests run, 1 skipped).
   hang, and the one that has an actual `perf` profile. Its conclusion — flat,
   ~2% arithmetic, the rest VM plumbing — is the independent corroboration this
   page's sampler can only gesture at.
-* `apps/commons-math/RESULTS-20260817.md` — the suite run both were found from.
+* retired/commons-math-suite-run-RETIRED-20260818.md — the suite run both were found from, now closed.

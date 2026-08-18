@@ -166,7 +166,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # addition this branch had never scheduled. Dropping either side would
 # silently unschedule working coverage, which is the defect several of the
 # guards further down exist to catch.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitMultiArrayClass RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitArraycopyRefDeopt RJitMultiArrayClass RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -335,6 +335,17 @@ prune_missing "$CORE_CLASSES";    # RJitMultiArrayClass landed 2026-08-17 with t
 # reading each shape once measures only the tier that was already right.
 # MEASURED: red on the pre-fix binary (`CCE` at s16, `[Ljava.lang.Object;`
 # at s00), green on the fixed one and green under --nojit on both.
+# RJitArraycopyRefDeopt landed 2026-08-18 with the arraycopy deopt-snapshot fix:
+# the x64 primitive-copy intrinsic pinned its five operands into scratch homes
+# allocated from `next_spill_offset`, which the five pops had just rewound back
+# over those operands' own frame slots, so the store of srcPos landed on dst's
+# home — and the deopt snapshot, which names the ORIGINAL homes, then resumed a
+# reference-array copy with srcPos where dst belonged. It is a CORE vector
+# because a reference array is ALWAYS a bail here, i.e. this is ordinary correct
+# code, not an error path. MEASURED: red on the pre-fix binary (NPE out of
+# System.arraycopy), green after, green under --nojit on both, and byte-identical
+# to HotSpot. Its witness() is layout-sensitive on purpose — see the class
+# comment; a tidied-up first draft passed on the broken binary.
 CORE_CLASSES="$PRUNED"
 prune_missing "$JDKONLY_CLASSES"; JDKONLY_CLASSES="$PRUNED"
 
