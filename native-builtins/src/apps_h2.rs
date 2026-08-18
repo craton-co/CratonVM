@@ -969,6 +969,23 @@ fn h2_coalesce_function_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
         h2_object_field(ctx, this, "type").ok_or_else(|| RuntimeError::NullPointerException {
             message: Some("CoalesceFunction.type".to_string()),
         })?;
+    // Everything below is live ACROSS a `getValue` callback — and across it once
+    // per loop iteration, so the window is entered as many times as the function
+    // has arguments. `session` and `value_type` are handed to `convertTo` as
+    // ARGUMENTS, which nothing repairs (only the receiver of a `ctx` call goes
+    // through `load_and_forward`), and `null` is compared by IDENTITY: a stale
+    // `ValueNull.INSTANCE` compares unequal to every value, so COALESCE would
+    // return its first argument instead of skipping NULLs. See the sibling fix
+    // in `h2_condition_and_or_get_value` for the mechanism and the verdict that
+    // named it.
+    let session_pin = ctx.pin_native_root(session);
+    let args_pin = ctx.pin_native_root(args_array);
+    let null_pin = null.map(|n| (ctx.pin_native_root(n), n));
+    let type_pin = ctx.pin_native_root(value_type);
+    let mut args_array = args_array;
+    let mut null = null;
+    let mut value_type = value_type;
+    let mut session = session;
     for index in 0..ctx.array_length(args_array) {
         let expression = match ctx.get_array_element(args_array, index) {
             Value::Object(Some(value)) => value,
@@ -983,6 +1000,10 @@ fn h2_coalesce_function_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
             )?,
             "CoalesceFunction expression.getValue",
         )?;
+        args_array = ctx.read_native_pin(args_pin, args_array);
+        value_type = ctx.read_native_pin(type_pin, value_type);
+        session = ctx.read_native_pin(session_pin, session);
+        null = null_pin.map(|(pin, n)| ctx.read_native_pin(pin, n));
         let value_ref = h2_object_arg(&[value.clone()], 0, "CoalesceFunction value is null")?;
         if null != Some(value_ref) {
             return Ok(Some(h2_value_result(
