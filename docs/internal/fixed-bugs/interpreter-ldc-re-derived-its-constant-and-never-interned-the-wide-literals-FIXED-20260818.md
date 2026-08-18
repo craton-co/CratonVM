@@ -131,10 +131,128 @@ loader-safe. The `MethodType`/`MethodHandle` arms have recorded on the same key
 through the same store all along. A **failed** resolution is not recorded — the
 error must be raised again on each attempt, and the seed checks that.
 
-## Measurements
-
-TO BE FILLED
-
 ## Verification
 
-TO BE FILLED
+### Engagement, before any number was believed
+
+```text
+default        ldc: hit=1327337 miss=2469 fill=2469
+kill switch    ldc: hit=0       miss=0    fill=0
+```
+
+The first build of this change reported `hit=0 miss=0 fill=1329806` under the
+kill switch — the cache not being read and still being written, so the OFF arm
+took a resolution-cache WRITE lock per `ldc` that the pre-change interpreter
+never took. That does not merely waste work: the OFF arm is supposed to BE the
+baseline, so making it slower than the real pre-change code inflates any
+speedup computed against it. The five new recording sites now go through
+`record_cp_constant_if_enabled`; `MethodType`/`MethodHandle` still record
+unconditionally, because they recorded before this change and the switched-off
+arm has to reproduce that.
+
+### Identity, against HotSpot
+
+`probes/LdcStringIdentityProbe.java`, 14 rows, every one an exact value.
+
+| binary | rows differing from HotSpot |
+|---|---|
+| pre-change dev `9d79b364f` | **5** |
+| this change, cache ON | 0 |
+| this change, cache OFF | 0 |
+| this change, JIT on | 0 |
+
+The five: `same-method lone-high`, `same-method lone-low`, `cross-method
+lone-high`, `repeat-stable lone-high`, `intern lone-high`. `pair` and `plain`
+pass on both binaries, so the probe discriminates rather than failing
+everything.
+
+### The probe was vacuous first, and the count is the reason it was caught
+
+Four of those fourteen rows originally tested **nothing**. Written the obvious
+way —
+
+```java
+System.out.println("same-method lone-high: " + ("\uD800" == "\uD800"));
+```
+
+— javac constant-folds the comparison and emits a single
+`ldc // String same-method lone-high: true`. The row prints `true` on a VM that
+never interned anything and never executed the opcode under test. Confirmed
+with `javap -c`.
+
+The same defect covered **6 of 10** identity rows in
+`difftest/seeds/LdcConstCache.java`, because `STATIC_FINAL == "literal"` folds
+exactly as `"a" == "a"` does.
+
+Two things worth carrying forward. The vacuous rows were the ones that read as
+the *most direct* test in the file; the rows that actually caught the defect
+were the indirect-looking ones going through `loneHigh()` and `.intern()`. And
+the cheap check that settles it is to count the opcode in the compiled probe —
+a probe for `ldc` that does not contain an `ldc` is the purest vacuous green
+there is. After the rewrite through non-final locals, `main` carries 23.
+
+De-vacuuming changed the verdict: the probe went from catching 3 divergences
+against the pre-change binary to catching 5.
+
+## Measurements
+
+One binary, one env var, `--nojit`, six rounds — **three with the OFF arm first
+and three with the ON arm first**. Compared **paired within each round**, since
+both arms of a round see the same host load; the host was building throughout,
+so unpaired medians would mostly measure drift. Marginal ns per `ldc`:
+
+| round | | `ldc` String | `ldc` Class | `iadd` control |
+|---|---|---|---|---|
+| 1 | OFF → ON | 220.8 → 69.2 | 554.2 → 70.3 | 35.0 / 22.6 |
+| 2 | OFF → ON | 133.3 → 84.4 | 305.0 → 80.7 | 19.9 / 25.8 |
+| 3 | OFF → ON | 134.8 → 65.5 | 305.6 → 169.9 | 20.0 / 33.3 |
+| 4 | ON → OFF | 148.5 ← 227.0 | 144.0 ← 543.1 | 39.6 / 30.4 |
+| 5 | ON → OFF | 151.2 ← 211.8 | 148.1 ← 497.7 | 34.3 / 37.1 |
+| 6 | ON → OFF | 147.0 ← 205.0 | 138.3 ← 516.9 | 34.6 / 30.7 |
+
+**`ldc` of a String ~1.6x** (per-round ratios 3.2 / 1.6 / 2.1 / 1.5 / 1.4 / 1.4)
+and **`ldc` of a Class ~3.8x** (7.9 / 3.8 / 1.8 / 3.8 / 3.4 / 3.7). All six
+rounds favour the cache in both metrics, and the direction survives reversing
+the arm order at round 4.
+
+The Class figure is the larger one because that arm was skipping the most: a
+`String` allocation plus a full `resolve_class_loader_aware` BY NAME plus a
+mirror lookup, against the String arm's allocation plus content hash.
+
+The control spans 19.9-39.6 ns across the whole matrix without tracking the arm
+(the ON arm holds both near-minimum and maximum control readings), which is what
+a loaded host looks like and why the analysis is paired rather than pooled.
+
+**The `ldc-string` sets do overlap** between arms — ON reaches 151.2 while OFF
+reaches 133.3, across different rounds — so 1.6x is the honest reading of the
+paired ratios, not a separation claim. The `ldc-class` sets do not overlap at
+all: ON peaks at 169.9 against an OFF floor of 305.0.
+
+## A withdrawn claim, recorded because the number was stated
+
+While measuring invocation cost on this binary, a first version of
+`probes/MethodCountDispatchProbe.java` reported `final` instance calls at 3.8x
+`virtual`. That claim is **withdrawn**.
+
+There is no finality branch anywhere in `runtime/interpreter/` or
+`runtime/resolve/` — nothing in the code can produce the effect. The probe ran
+its six arms sequentially with `final` measured after `virtual`, on a host whose
+load was ramping from a concurrent build: the run's `iadd` control read 61.6ns
+against 21.9ns minutes earlier. Rising load lands entirely on whichever arm is
+measured last, which is sufficient to manufacture the whole ratio.
+
+The probe now interleaves every arm within each of five rounds and prints a
+per-round control so a drifting run can be discarded rather than believed. What
+survives from the control-stable run is only this: against HotSpot's
+interpreter, CratonVM's invocations cost 12-29x while its `iadd` costs 5.9x, so
+invocation is disproportionately expensive rather than uniformly slow. The
+per-opcode attribution has not been earned.
+
+## Suite results
+
+* **difftest** — 0/6 diverged across `jit-on`, `nojit` and `interp-decoded`,
+  including the new `LdcConstCache` seed.
+* **regression-suite** — 63/64. `RImmutableFactoryTypes` fails, and fails
+  **identically with `CRATONVM_JIT_NO_LDC_CONST_CACHE=1`**, so it is pre-existing
+  rather than caused here. Checked on this binary rather than carried over from
+  an earlier note.
