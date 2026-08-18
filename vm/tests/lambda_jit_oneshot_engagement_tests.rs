@@ -52,22 +52,26 @@ fn test_lambda_one_shot_actually_engages() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
-    // Before the first dispatch: the counters' gate is a `OnceLock`.
-    // SAFETY: single-threaded, and the first statement of the only test in this
-    // binary — nothing else can be reading the environment concurrently.
-    std::env::set_var("CRATONVM_DBG_LAMBDA_JIT", "1");
+
+    // `with_process_overrides`, not `std::env::set_var`: a declared flag is
+    // served from a snapshot latched on FIRST read, so setting the variable
+    // only takes effect if the call wins the race to initialise it — and the
+    // VM reads these from threads this test never created, which rules out
+    // the thread-scoped variant.
+    //
     // NOT `CRATONVM_BG_COMPILE=0`. Inline compilation looks like the way to
     // make "the body is compiled by iteration N" deterministic, and it is —
-    // but measured across this fixture it compiles only ~6% of the dispatches
-    // the background worker does (`eligible=6 200 000` against
-    // `compiled_hits=398 209` on the sibling suite), because the inline
-    // `try_jit_upgrade_with_gate` route declines bodies the worker admits. A
-    // configuration that suppresses the thing under test is a worse trade than
-    // a race the counters below can see.
-    // ...and the JIT-side arm OFF, so the interpreted one-shot is what serves.
-    // SAFETY: as above.
-    std::env::set_var("CRATONVM_JIT_LAMBDA_SITE", "0");
+    // but measured across this fixture it compiles about 6% of what the
+    // background worker does, because the inline `try_jit_upgrade_with_gate`
+    // route declines bodies the worker admits. Determinism bought by
+    // suppressing the thing under test is not determinism.
+    cratonvm_types::flags::with_process_overrides(
+        &[("CRATONVM_DBG_LAMBDA_JIT", Some("1")), ("CRATONVM_JIT_LAMBDA_SITE", Some("0"))],
+        || run_fixture(),
+    );
+}
 
+fn run_fixture() {
     let Some(mut vm) = real_jdk_vm() else {
         eprintln!(
             "Skipping: needs a class library (CRATONVM_JAVA_HOME / JAVA_HOME / `java` on PATH)."
