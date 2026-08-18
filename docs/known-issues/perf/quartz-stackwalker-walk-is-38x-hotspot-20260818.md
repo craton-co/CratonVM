@@ -297,7 +297,39 @@ help" — which is exactly what an engagement counter is for, and why this
 codebase's own rule is to print one beside the number. Four attempts were
 judged without one.
 
-That leaves a specific, un-refuted hypothesis for the site that DOES run: its
+### And at the site that DOES run, the memo is 100% cold — by construction
+
+Same counter, moved to the detection scan inside the root-snapshot deposit:
+
+```
+depth  20:  calls= 37,976   memo_clean=0  memo_banded=0  full_rescan= 37,976   (100%)
+depth 120:  calls=188,115   memo_clean=0  memo_banded=0  full_rescan=188,115   (100%)
+```
+
+**Not one engagement in 188,115 calls.** `full_rescan` is the
+`code_ranges != self.verified_ranges` arm, and `verified_ranges` is only ever
+written by `mark_clean` — which is reached ONLY when the probe comes back with
+no hit. On a workload with compiled frames the probe hits (the retired
+moving-young page measured A5's false-positive rate at **87%**), so `mark_clean`
+never runs, `verified_ranges` keeps its initial value, and every observation
+falls through to a full rescan **forever**.
+
+That closes the whole memo route, and explains all four attempts at once:
+
+* attempt 1 memoized a call site that never runs (`calls=0`);
+* attempt 2 lifted the range-invalidation rule, but with `verified_lo` still at
+  its initial `usize::MAX` — `mark_clean` having never run — the `floor`
+  comparison still forces a full-width scan, so the lift was neutered by the
+  same cause;
+* attempts 3 and 4 were unrelated knobs on the same cold path.
+
+**The memo is not under-tuned, it is inapplicable.** It caches "this stack is
+free of return-addresses-into-JIT", and on this workload that is simply false
+most of the time. No amount of memo work fixes a cache whose predicate is
+usually false — which is why the profile never moved and why an engagement
+counter, not another profile, was the thing that settled it.
+
+The previously-suspected hypothesis for this site — its
 band is `[scanner_sp.max(cover_hi), stack_high)`, and with an empty JIT entry
 chain `cover_hi == scanner_sp`, so it scans the whole native stack above the
 scanner. `UnregMemo::mark_clean` sets `hiwater = search_lo` on every clean
