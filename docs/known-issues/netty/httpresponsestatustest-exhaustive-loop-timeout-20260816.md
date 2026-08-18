@@ -552,17 +552,79 @@ below is unconditional. It affects PGO-02's guarded-virtual path in the default
 build, not just this feature. codec-http, 93 classes: identical result sets with
 the branch's flags off and on, so no regression at either.
 
-### Still not closed, and the remaining gate is one function
+### The devirt chain, end to end — and the wall it actually ends at
 
-`nested-splice-guarded` is still 0. The evidence is found and the native-shadow
-gate no longer refuses, but resolving the receiver's `equals` body still returns
-`None` through one of `resolve_inline_site_from`'s remaining UNINSTRUMENTED
-early returns — the `?` operators around `find_method_recursive` /
-`method.code()` / `store.get`, or `receiver_resolution_is_dispatch_faithful`.
-Every *named* gate in that function now prints its reason under
-`CRATONVM_DBG_JITC` (`inline-resolve REFUSED <method> depth=N: <why>`), which is
-what turned three separate guesses into three answers today; the `?` sites are
-what is left to name.
+Five distinct causes stood between "the emitter is written and tested" and "the
+guarded splice fires". Four are fixed. The fifth is the real one, it is
+pre-existing, and it is now a fact rather than an inference.
+
+| # | cause | status |
+|---|---|---|
+| 1 | receiver profile EMPTY at these sites (eager-callee-chain compiles before the method runs its virtual calls interpreted) | worked around — read the compiled callee's MIC instead |
+| 2 | profiling default-OFF behind `CRATONVM_TIER_PGO` | identified |
+| 3 | the MIC's pc mapping DISCARDED at publication | fixed (`JitMICSlot::bci`, `JitPICSlot::bci`) |
+| 4 | the dominance bar built on counters the hot path never touches | fixed (structural rule) |
+| 5 | the native-shadow gate refusing every OVERRIDE of a shadowed method | fixed — and it affects PGO-02's guarded-virtual path in the DEFAULT build |
+| 6 | **the inline emitter cannot splice a body with a value-producing branch merge** | **the wall** |
+
+With 1-5 addressed the chain resolves and the planner admits it:
+
+```
+nest-virtual java/lang/Object.equals at callee_pc=16 -> guard on class 1167 (from mic)
+nest-static  AssertionUtils.objectsAreEqual at callee_pc=2 depth=1 -> SPLICED
+inline-plan  AssertionUtils.objectsAreEqual: DirectBind (cost=Some(43) budget_left=750)
+inline-planned AssertionUtils.objectsAreEqual @pc=2
+```
+
+and then the emitter throws it away:
+
+```
+inline call arms: spliced-call-direct=10 spliced-call-dispatch=0
+                  nested-splice=0 nested-splice-guarded=0
+                  nested-splice-guarded-refused=0 nested-splice-refused=0
+                  outer-splice-rolled-back=2
+```
+
+`outer-splice-rolled-back=2` with every nested arm at zero says the invoke arm
+was never reached — `try_emit_inline_body` bails before it. `javap` says why:
+
+```
+static boolean objectsAreEqual(Object, Object);
+   0: aload_0
+   1: ifnonnull 14
+   4: aload_1
+   5: ifnonnull 12
+   8: iconst_1
+   9: goto 13
+  12: iconst_0
+  13: ireturn        <-- merge point, one value live
+  14: aload_0
+  15: aload_1
+  16: invokevirtual java/lang/Object.equals
+  19: ireturn
+```
+
+pc 13 is reached from `goto 13` with `iconst_1` on the stack and by fall-through
+from `iconst_0`. `prev_was_terminator` is false and the callee operand stack is
+not empty, so the merge-point rule bails — and pc 16, the call this whole line of
+work is about, is never emitted at all. This is the literal
+`iconst_1; goto L; iconst_0; L: ireturn` diamond that `try_emit_inline_body`'s own
+comment cites as the reason for commit 419a6f5's blanket branch bail. It is not
+a regression and nothing here introduced it.
+
+**So the next lever is not more evidence, more binding, or more devirtualisation
+— it is operand-stack MERGING in the inline emitter.** Every one of the five
+causes above had to be cleared to see that, and each was named by a counter or a
+trace rather than guessed: the arm census (`spliced-call-*`, `nested-splice-*`,
+`outer-splice-rolled-back`), the resolver's per-gate refusal line
+(`inline-resolve REFUSED <method> depth=N: <why>`), and the planner's per-site
+verdict (`inline-plan <method>: <verdict> (cost=.. budget_left=..)`). Three
+separate hypotheses died to those three lines in one session; two more died to
+guesses before they existed.
+
+Until a spliced body can carry a value across a branch merge, the assertion
+chain cannot collapse, because its very first rung past `assertEquals` is
+this shape.
 
 ### A correction to the direct-bind result
 
