@@ -125,12 +125,33 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    frames therefore cost 40-80 ns before any of them does any work, and the whole
    budget for the iteration is 21. No arrangement of real calls fits; not making
    the calls is the only lever. The sibling page carries the sequenced blocker.
-   Steps 1-3 of it landed 2026-08-18 (multi-frame deopt resume, a multi-frame
-   OSR-exit transfer with admission relaxed to match, and the single-pass scope
-   stack); step 4 — a real call inside a spliced body — is where the remaining
-   work is, and its substantive half is resolving the callee's own invoke
-   targets against the CALLEE's constant pool, since `InlineSite` has never
-   carried any. Its first two steps were VM work rather than compiler work: an artifact
+   **All five steps landed 2026-08-18** — multi-frame deopt resume, a
+   multi-frame OSR-exit transfer with admission relaxed to match, the
+   single-pass scope stack, a real call inside a spliced body, and nesting — and
+   the inliner can now nest. **What that did NOT buy is speed, and the
+   measurement says why.**
+
+   Step 4's emitted call goes through the blind `jit_invoke_dispatch` helper,
+   because a spliced call has no `direct_calls` equivalent and no inline-cache
+   slot (both are keyed by CALLER pc). On `probes/AssertChainProbe`, one binary,
+   three interleaved rounds, that made the assertion chain **47 -> 163-266
+   ns/iter**, with `CRATONVM_DBG=mic-prof` showing `disp_calls` going
+   **3 870 -> 2 003 361** over 2 000 000 iterations. The premise was inverted:
+   the chain is already direct-bound, so splicing a body removes one frame worth
+   ~4 ns and downgrades the call inside it to a ~175 ns name resolution.
+
+   The dispatch fallback is therefore opt-in and off
+   (`CRATONVM_JIT_INLINE_CALL_DISPATCH`), so a call-carrying body is admitted
+   only when every call in it is itself spliced. Nesting then recovers the
+   baseline but does not beat it, because the chain's terminal
+   `UNKNOWN.equals(k)` is an `invokevirtual` and cannot nest.
+
+   **So the lever for this class's 21 ns has moved once more, and it is now
+   named precisely: direct-bind a spliced call**, and devirtualise inside a
+   splice. Both are on the sibling page. Neither is a correctness risk of the
+   kind steps 1-4 were — they are refusals that cost reach, not wrong stacks.
+
+   The chain's first two steps were VM work rather than compiler work: an artifact
    carrying an inlined caller scope cannot be OSR-entered at all
    (`osr_exit_policy` refuses `caller.is_some()`, because the in-place OSR-exit
    transfer is single-frame), and both these classes' hot methods are `@Test`
