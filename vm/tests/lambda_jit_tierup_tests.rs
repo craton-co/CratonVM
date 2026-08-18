@@ -75,31 +75,7 @@ macro_rules! require_class_files {
     };
 }
 
-/// Compile the fixture's lambda bodies SYNCHRONOUSLY.
-///
-/// Under the default background compiler, whether a given fixture method's impl
-/// is compiled before its loop ends is a race against a worker thread — and
-/// with twelve tests running in parallel on a loaded box, a race these mostly
-/// LOSE. Measured: with the JIT-side direct arm deliberately returning `rc + 1`,
-/// eleven of these twelve still passed, because eleven of them never entered a
-/// compiled body at all. A suite that green-lights a path it did not take is
-/// not a suite.
-///
-/// `CRATONVM_BG_COMPILE=0` is the VM's documented opt-out that compiles inline
-/// on the mutator at the invocation threshold instead. That makes "the body is
-/// compiled by iteration ~501" a fact rather than a hope, and it is the same
-/// switch the invokestatic/invokevirtual twins honour.
-fn compile_inline() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: set before this binary has created any VM; every test here
-        // goes through this function first.
-        std::env::set_var("CRATONVM_BG_COMPILE", "0");
-    });
-}
-
 fn checksum(method: &str) -> i32 {
-    compile_inline();
     let mut vm = real_jdk_vm().expect("guarded by require_class_library!");
     match vm.invoke("cratonvm/LambdaJitTierUp", method, "()I", &[]) {
         Ok(Some(Value::Int(v))) => v,

@@ -56,10 +56,14 @@ fn test_lambda_one_shot_actually_engages() {
     // SAFETY: single-threaded, and the first statement of the only test in this
     // binary — nothing else can be reading the environment concurrently.
     std::env::set_var("CRATONVM_DBG_LAMBDA_JIT", "1");
-    // Compile on the mutator at the threshold rather than racing a worker, so
-    // "the body is compiled well before 800 000 dispatches are done" is a fact.
-    // SAFETY: as above.
-    std::env::set_var("CRATONVM_BG_COMPILE", "0");
+    // NOT `CRATONVM_BG_COMPILE=0`. Inline compilation looks like the way to
+    // make "the body is compiled by iteration N" deterministic, and it is —
+    // but measured across this fixture it compiles only ~6% of the dispatches
+    // the background worker does (`eligible=6 200 000` against
+    // `compiled_hits=398 209` on the sibling suite), because the inline
+    // `try_jit_upgrade_with_gate` route declines bodies the worker admits. A
+    // configuration that suppresses the thing under test is a worse trade than
+    // a race the counters below can see.
     // ...and the JIT-side arm OFF, so the interpreted one-shot is what serves.
     // SAFETY: as above.
     std::env::set_var("CRATONVM_JIT_LAMBDA_SITE", "0");
