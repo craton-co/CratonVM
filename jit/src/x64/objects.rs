@@ -398,6 +398,30 @@ impl Compiler {
         true
     }
 
+    /// Null / alignment / three-region containment on the receiver in RAX,
+    /// returning the patch sites the caller must route to its slow path.
+    ///
+    /// **Which table `bounds_addr` names is the caller's decision, and the two
+    /// kinds of caller decide differently.** The six-word
+    /// `[b0, e0, b1, e1, b2, e2]` layout is shared, so the emitted bytes are
+    /// identical and only the baked immediate differs -- but the two tables
+    /// answer different questions:
+    ///
+    /// * READ callers (the `getfield` arms, and `ir_lower`'s copy of this
+    ///   sequence) pass `helpers.read_bounds_addr` -- `JIT_READ_BOUNDS`, the
+    ///   "is this address mapped, so a raw load cannot fault" table, which
+    ///   Generational and G1 both fill and ZGC deliberately does not;
+    /// * STORE callers (the inline reference-`putfield` arms) pass
+    ///   `helpers.region_bounds_addr` -- `JIT_REGION_BOUNDS`, whose EMPTINESS
+    ///   under G1/ZGC is load-bearing: it is what stops an inline store from
+    ///   skipping `post_write_barrier_rset` and losing the remembered-set edge
+    ///   a JNI-pinned, CSet-excluded region is reachable only through
+    ///   (`audits/g1-audit.md` 8.1). Those callers additionally gate on
+    ///   [`region_bounds_are_live`], which reads that table's CONTENT.
+    ///
+    /// Handing the read table to a store caller would silently unblock exactly
+    /// the fast path G1-2 exists to block. Two tables rather than one is what
+    /// makes that mistake something you have to type out rather than inherit.
     pub(super) fn emit_guarded_getfield_receiver_check(&mut self, bounds_addr: usize) -> Vec<usize> {
         let mut slow: Vec<usize> = Vec::new();
         // 1. null → slow (helper throws the NPE).
@@ -407,8 +431,9 @@ impl Compiler {
         self.emit_mov_r64_r64(RCX, RAX);
         self.emit_and_r64_imm8(RCX, 7);
         slow.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
-                                                    // 3. region containment. RDX = &JIT_REGION_BOUNDS (six usize words:
-                                                    //    [b0, e0, b1, e1, b2, e2]).
+                                                    // 3. region containment. RDX = the caller's bounds table (six
+                                                    //    usize words: [b0, e0, b1, e1, b2, e2]) -- READ callers pass
+                                                    //    JIT_READ_BOUNDS, STORE callers JIT_REGION_BOUNDS; see above.
         self.emit_mov_imm64(RDX, bounds_addr as i64);
         // region 0: RAX >= b0 && RAX < e0 → ok
         self.emit_cmp_r64_mem_disp32(RAX, RDX, 0);

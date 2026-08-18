@@ -13,7 +13,7 @@
  * interpreted.
  *
  * <p>Both arms are compiled into every run on purpose: the refusal recorded in
- * {@code osr-refused-for-a-loop-inline-in-main-20260810.md} came from a deopt
+ * {@code osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md} came from a deopt
  * point inside the {@code method} arm — code the {@code main} arm never
  * executes — so deleting the unused arm would delete the trigger.
  *

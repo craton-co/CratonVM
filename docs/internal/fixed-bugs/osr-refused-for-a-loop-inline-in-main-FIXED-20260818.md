@@ -1,6 +1,16 @@
 # A hot loop inline in `main` never leaves the interpreter — OSR entry refused by a deopt point the entry cannot reach
 
-**Status: OPEN, reproduced and diagnosed 2026-08-10, not fixed.** The identical
+**Status: FIXED, verified 2026-08-18 by differential measurement.** The
+refusal is gone: `main` now enters OSR and runs at **1 ns/iter**, the same as
+the called-method arm. See [Verification](#verification-2026-08-18) for the
+before/after, both measured on one host with one probe.
+
+The text below is the original OPEN page, kept as written because its
+methodology section is the useful part. Read it as history: the numbers in it
+are the doc-era numbers, reproduced exactly at the commit it was written
+against.
+
+*Original status, 2026-08-10:* The identical
 loop runs at **1 ns/iter in any called method and 180 ns/iter inline in `main`**
 — 180x — because OSR entry is refused with a named reason. HotSpot runs both at
 ~0 ns/iter.
@@ -155,3 +165,72 @@ counters at zero and one OSR compile recorded, what happened there is that the
 compile was requested, produced, and the back edge never came round often enough
 to enter it — i.e. that workload has no loop hot enough to matter, which is
 consistent with everything else measured about it.
+
+
+## Verification 2026-08-18
+
+Differential, because "does not reproduce today" and "never reproduced on this
+host" are the same observation until you run the old binary. Both arms of
+`probes/OsrProbe.java`, one Azure Linux host, one pre-compiled `OsrProbe.class`,
+`CRATONVM_DBG=jit-method-stats` for the counters:
+
+| binary | arm | ns/iter | ms | `osr_entered` | `osr_refused_entry` |
+|---|---|---:|---:|---:|---:|
+| `150863d12` (2026-08-10, the page's own date) | method | 1 | 41 | — | — |
+| `150863d12` | **main** | **131** | **5 246** | **0** | **5** |
+| `dev` @ `021acb800` | method | 1 | 45 | 2 | 0 |
+| `dev` @ `021acb800` | **main** | **1** | **50** | **1** | **0** |
+
+`osr_refused_entry=5` on the old binary is the page's own count, to the
+refusal. The `main` arm is stable at 1 ns/iter across three repeats
+(50/48/51 ms). 131 rather than the page's 180 ns/iter is host difference; the
+refusal count, which is what the page is about, matches exactly.
+
+**The trigger shape is intact**, so this is the fix and not the probe drifting.
+`javap` on the same class still shows the page's own bcis:
+
+```
+23: getstatic     #17   // Field sink:J     <- the long on the operand stack
+26: ldc           #23   // int 40000000
+28: invokestatic  #24   // Method theLoop:(I)J
+```
+
+The deopt point that vetoed entry sat at bci 28. That bci, that `getstatic`, and
+that operand stack are all still there — the artifact-wide veto simply no longer
+fires on them.
+
+### What fixed it is NOT pinned, and is recorded that way on purpose
+
+This page cost four wrong hypotheses by inferring mechanism instead of measuring
+it, so: the lifting commit was not bisected. What is measured is the endpoints.
+The window is `150863d12..021acb800`, and the candidates, in the order they look
+plausible:
+
+* `c1935d2c8` — wires the `java/lang/String` intrinsics into the OSR door. This
+  is the leading guess because it would DELETE the deopt point rather than make
+  it resumable: the probe's veto came from the guard on `args[0].equals("method")`,
+  and an intrinsified `String.equals` emits no receiver-type guard to record.
+* `ac67dafe8` — lifts RBC.6b, OSR for a method with an exception table, "on
+  precise reason-9 frames". More precise frame states are exactly what would stop
+  a stack slot being recorded `FrameValue::Unsupported`.
+* `5ceb5da9a` — the multi-frame OSR-exit transfer, which lifted the inlined-caller
+  refusal outright (and already made this page's Mechanism section stale, since
+  that section describes the chain refusal as unconditional).
+
+One `git bisect` over that window with this probe settles it in a few builds.
+It was not run because the page's actionable claim — that a hot loop inline in
+`main` never leaves the interpreter — is now false, and that is what retires it.
+
+### Still true, and still worth keeping
+
+The **Who this actually hurts** section stands on its own evidence and is not
+retired by this fix: it is about probe methodology, not about the veto. A
+CratonVM probe arm should still live in its own small method called many times,
+with the control in the same shape — that was good practice before this defect
+and remains good practice after it, and the `FloorProbe` / `ReflProbe` numbers
+that motivated it were real.
+
+The diagnostics this page added (`osr_published_but_unenterable`,
+`osr_method_denied`) are still **zero in every run measured**, including both
+runs above. Its warning stands: do not read a future zero from them as evidence
+until one has been seen non-zero at least once.

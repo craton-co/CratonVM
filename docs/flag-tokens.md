@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-459 tokens.
+462 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -207,6 +207,7 @@ export inherited from a parent shell.
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
 | `gcphase` | `CRATONVM_DBG_GCPHASE` |
 | `gcwrite` | `CRATONVM_DBG_GCWRITE` |
+| `getfield-receivers` | `CRATONVM_DBG_GETFIELD_RECEIVERS` |
 | `getresources` | `CRATONVM_DBG_GETRESOURCES` |
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
@@ -264,6 +265,7 @@ export inherited from a parent shell.
 | `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
 | `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
+| `jit-borrow-sites` | `CRATONVM_DBG_JIT_BORROW_SITES` |
 | `jit-gen` | `CRATONVM_DBG_JIT_GEN` |
 | `jit-ldc` | `CRATONVM_DBG_JIT_LDC` |
 | `loop-work` | `CRATONVM_DBG_LOOP_WORK` |
@@ -526,7 +528,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-191 tokens.
+192 tokens.
 
 | Token | Expands to |
 | --- | --- |
