@@ -2341,20 +2341,25 @@ fn reloc_emit_enabled() -> bool {
         slot: i32,
     ) -> bool {
         if self.getfield == 0 {
+            crate::metrics::note_ir_getfield_decline(0);
             return false;
         }
         let Some(pc) = node_pc else {
+            crate::metrics::note_ir_getfield_decline(1);
             return false;
         };
         let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+            crate::metrics::note_ir_getfield_decline(2);
             return false;
         };
         if crate::x64::narrow_oops_block_inline_fields() {
+            crate::metrics::note_ir_getfield_decline(3);
             return false;
         }
         let raw_mode = crate::x64::inline_getfield_enabled();
         let guarded = crate::x64::guarded_inline_getfield_enabled() && self.region_bounds_addr != 0;
         if !raw_mode && !guarded {
+            crate::metrics::note_ir_getfield_decline(4);
             return false;
         }
         // The node type and the resolved descriptor must agree. They can only
@@ -2364,9 +2369,29 @@ fn reloc_emit_enabled() -> bool {
         let ref_node = node_ty == IrType::Ref;
         let ref_tag = matches!(type_tag, b'L' | b'[');
         if ref_node != ref_tag || ref_tag != c_is_ref {
+            crate::metrics::note_ir_getfield_decline(5);
             return false;
         }
-        if !ref_node && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+        // Width agreement, per descriptor. `J`/`D`/`F` were refused outright
+        // until 2026-08-17; measurement showed that refusal was ~88% of every
+        // `jit_getfield` call in a field-dense run — four sites falling back to
+        // an UNGUARDED helper CALL, which is why the count was identical on
+        // ZGC, Generational and G1. A `long` field on a hot path
+        // (BouncyCastle's `GeneralDigest.byteCount`) is not an exotic shape.
+        //
+        // Each is admitted only when the IR node's own type agrees with the
+        // resolved descriptor — the same defence the ref/non-ref check above
+        // applies, and for the same reason: a resolver that fabricated a
+        // compact slot must not steer a load width.
+        let width_ok = match type_tag {
+            b'I' | b'Z' | b'B' | b'C' | b'S' => node_ty == IrType::Int,
+            b'J' => node_ty == IrType::Long,
+            b'D' => node_ty == IrType::Double,
+            b'F' => node_ty == IrType::Float,
+            _ => false,
+        };
+        if !ref_node && !width_ok {
+            crate::metrics::note_ir_getfield_decline(6);
             return false;
         }
 
@@ -2425,7 +2450,18 @@ fn reloc_emit_enabled() -> bool {
                 b'B' => self.buf.emit(&[0x48, 0x0F, 0xBE, 0x80]), // MOVSX RAX, byte
                 b'C' => self.buf.emit(&[0x48, 0x0F, 0xB7, 0x80]), // MOVZX RAX, word
                 b'S' => self.buf.emit(&[0x48, 0x0F, 0xBF, 0x80]), // MOVSX RAX, word
-                _ => self.buf.emit(&[0x48, 0x63, 0x80]),          // MOVSXD RAX, dword
+                // `long` and `double` are 8-byte compact cells; both leave the
+                // raw 64 bits in RAX, which is exactly what the helper returns
+                // (`Value::Long(l) => l`, `Value::Double(d) => d.to_bits()`),
+                // so the shared tail below stores and (for FP) republishes them
+                // identically.
+                b'J' | b'D' => self.buf.emit(&[0x48, 0x8B, 0x80]), // MOV RAX, qword
+                // `float` is a 4-byte cell and the helper ZERO-extends it
+                // (`f.to_bits() as i64` widens a u32). A 32-bit MOV zeroes the
+                // upper half; MOVSXD would sign-extend and corrupt every
+                // negative-signed bit pattern.
+                b'F' => self.buf.emit(&[0x8B, 0x80]), // MOV EAX, dword (zero-extends)
+                _ => self.buf.emit(&[0x48, 0x63, 0x80]), // MOVSXD RAX, dword
             }
             self.buf.emit(&cell_off.to_le_bytes());
         }
@@ -4536,6 +4572,7 @@ fn reloc_emit_enabled() -> bool {
                     return;
                 }
                 if self.getfield != 0 {
+                    crate::metrics::note_getfield_arm(5);
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
