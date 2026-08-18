@@ -4401,9 +4401,37 @@ impl Compiler {
                         if !raw_mode {
                             self.flush_scratch_registers();
                         }
-                        let receiver_is_trusted_oop = !self.method_key.is_empty()
-                            && self.stack_oop_marks_exact
-                            && self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let trusted_have_key = !self.method_key.is_empty();
+                        let trusted_marks_exact = self.stack_oop_marks_exact;
+                        let trusted_top_is_oop =
+                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let receiver_is_trusted_oop =
+                            trusted_have_key && trusted_marks_exact && trusted_top_is_oop;
+                        // WHICH of the three clauses refused, at EMISSION time.
+                        //
+                        // The trusted-oop shortcut is the difference between a
+                        // bare null test and the six-compare containment check
+                        // that no non-publishing collector can ever pass — i.e.
+                        // between an inline load and a helper call, on the
+                        // hottest path in the VM. The getfield page's open item
+                        // 1 is "why is `stack_oop_marks_exact` false at these
+                        // sites", and until now the only way to ask was to read
+                        // the disassembly and infer. A bare "not trusted" would
+                        // repeat this page's own founding mistake: it names a
+                        // verdict, not a cause, and the three clauses want
+                        // completely different fixes.
+                        if !receiver_is_trusted_oop
+                            && cratonvm_types::flags::runtime_var_os(
+                                "CRATONVM_DBG_COMPACT_INLINE",
+                            )
+                            .is_some()
+                        {
+                            eprintln!(
+                                "[compact-inline] getfield pc={pc} NOT-trusted-oop                                  have_key={trusted_have_key} marks_exact={trusted_marks_exact}                                  top_is_oop={trusted_top_is_oop} depth={} method={}",
+                                self.stack.len(),
+                                self.method_key,
+                            );
+                        }
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(RAX, obj_slot);
                         let (slow_patches, null_patch) = if raw_mode {

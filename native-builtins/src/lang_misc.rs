@@ -505,10 +505,43 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
 pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let hash = ctx.identity_hash_code(this);
     if crate::nbflags().dbg_sttrace {
+        // The throwable's CLASS, not just its identity. Counting captures tells
+        // you a workload throws a lot; only the class tells you what. Naming it
+        // here is what separated "Quartz leaks memory" from "Quartz throws the
+        // same exception 25,000 times" — see
+        // known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.
         eprintln!("STTRACE_DBG_CTOR_CAP this={:?} hash={hash}", this.as_ptr());
     }
     let trace = ctx.capture_throwable_stack_trace(this);
     let depth = trace.len() as i32;
+    if crate::nbflags().dbg_sttrace {
+        // The top frames of THIS throwable's own trace, in order, on one line.
+        // Printing frames from a separate site and pairing them up afterwards
+        // is not sound — captures from several threads interleave in the log,
+        // and reading "the deepest frame" out of a merged group names a throw
+        // site that never existed. One line per throwable cannot be mispaired.
+        // Captured traces are OUTERMOST-first, so the throw site is the LAST
+        // entry, not the first. Print both ends labelled — an unlabelled
+        // "top=" that is really the thread entry point reads as a perfectly
+        // plausible answer, which is how the first version of this line sent
+        // the investigation at `TaskThread.run`.
+        let fmt = |f: &cratonvm_native_api::registry::StackTraceEntry| {
+            format!("{}.{}:{}", f.class_name, f.method_name, f.line_number)
+        };
+        let innermost: Vec<String> = trace.iter().rev().take(5).map(&fmt).collect();
+        // Class AND frames on ONE line. They were two `eprintln!`s, and
+        // `eprintln!` from several threads interleaves, so pairing "the last
+        // class line" with "the next frame line" attributes frames to the
+        // wrong throwable — the same unsound pairing this file already fixed
+        // once, reintroduced by splitting the print. One line, one throwable.
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_else(|| "?".to_string());
+        eprintln!(
+            "STTRACE_DBG_TOP hash={hash} class={cls} depth={depth} innermost={}",
+            innermost.join(" <- ")
+        );
+    }
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
     // park a self-reference as the non-null marker (the real frame data lives
     // in the identity-hash-keyed trace store).

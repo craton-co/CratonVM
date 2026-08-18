@@ -558,26 +558,61 @@ thread_local! {
     /// behaviour is unchanged.
     #[cfg(debug_assertions)]
     static JIT_THREAD_BORROWED: Cell<bool> = const { Cell::new(false) };
+
+    /// Debug-only: where the currently-live `jit_thread_mut` borrow was taken.
+    ///
+    /// The `debug_assert!` in `jit_thread_mut` says two borrows overlap; it
+    /// cannot say WHICH two, and with 58 call sites in this file that is the
+    /// whole difficulty. Populated only when
+    /// `CRATONVM_DBG_JIT_BORROW_SITES=1`, because capturing a backtrace on
+    /// every borrow costs far more than the borrow.
+    ///
+    /// `Cell<Option<Box<..>>>` rather than `RefCell`: the one place this is
+    /// read is the aliasing trip itself, which is by definition a reentrant
+    /// moment, and a `RefCell` double-borrow panic there would replace the
+    /// diagnosis with a different panic.
+    #[cfg(debug_assertions)]
+    static JIT_THREAD_BORROW_SITE: Cell<Option<Box<std::backtrace::Backtrace>>> =
+        const { Cell::new(None) };
+}
+
+/// Debug-only: is the borrow-site backtrace capture switched on?
+#[cfg(debug_assertions)]
+fn jit_borrow_site_capture_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_BORROW_SITES").is_some()
+    })
 }
 
 /// Debug-only: snapshot the borrow flag and clear it, so a nested JIT entry
 /// (the interpreter re-entering JIT from inside a bail) starts a fresh borrow
 /// level. Returns the previous value for [`restore_jit_borrow`]. No-op in
 /// release builds.
+///
+/// Carries the recorded borrow SITE along with the flag. Without that, the
+/// nested case leaves `flag = true` restored over `site = None` (the inner
+/// guard's drop cleared it), and a trip in the outer level then reports "no
+/// site recorded" while the capture is switched on — an instrument that goes
+/// quiet exactly where it is needed.
 #[cfg(debug_assertions)]
-fn suspend_jit_borrow() -> bool {
-    JIT_THREAD_BORROWED.with(|b| {
+fn suspend_jit_borrow() -> (bool, Option<Box<std::backtrace::Backtrace>>) {
+    let prev = JIT_THREAD_BORROWED.with(|b| {
         let prev = b.get();
         b.set(false);
         prev
-    })
+    });
+    let site = JIT_THREAD_BORROW_SITE.with(|s| s.take());
+    (prev, site)
 }
 
 /// Debug-only: restore the borrow flag suspended by [`suspend_jit_borrow`]
 /// once the nested JIT call has returned. No-op in release builds.
 #[cfg(debug_assertions)]
-fn restore_jit_borrow(prev: bool) {
-    JIT_THREAD_BORROWED.with(|b| b.set(prev));
+fn restore_jit_borrow(prev: (bool, Option<Box<std::backtrace::Backtrace>>)) {
+    let (flag, site) = prev;
+    JIT_THREAD_BORROWED.with(|b| b.set(flag));
+    JIT_THREAD_BORROW_SITE.with(|s| s.set(site));
 }
 
 /// Debug-only RAII guard that marks the `jit_thread_mut` borrow as released
@@ -591,6 +626,8 @@ impl Drop for JitThreadGuard {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
         JIT_THREAD_BORROWED.with(|b| b.set(false));
+        #[cfg(debug_assertions)]
+        JIT_THREAD_BORROW_SITE.with(|s| s.set(None));
     }
 }
 
@@ -610,7 +647,7 @@ pub struct JitThreadScope {
     /// no-op there.
     saved_shadow_top: Option<usize>,
     #[cfg(debug_assertions)]
-    prev_borrow: bool,
+    prev_borrow: (bool, Option<Box<std::backtrace::Backtrace>>),
 }
 
 /// DIAGNOSTIC: read the current dispatched JIT callee name.
@@ -1335,6 +1372,24 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
             // flag around that boundary so the legitimate nesting does NOT trip
             // here. (Empirically verified: DaCapo avrora drives ~1100 such
             // nested borrows and completes cleanly with no UB.)
+            if b.get() {
+                // Name BOTH sides before tripping. The assertion's own message
+                // asserts this is "a genuine sibling fabrication"; that claim
+                // is only checkable if the prior borrow's site is printed
+                // next to this one's.
+                let prior = JIT_THREAD_BORROW_SITE.with(|s| s.take());
+                match prior {
+                    Some(bt) => eprintln!(
+                        "[jit-borrow] PRIOR borrow was taken here:\n{bt}\n\
+                         [jit-borrow] SECOND borrow is being taken here:\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    ),
+                    None => eprintln!(
+                        "[jit-borrow] aliasing borrow detected; re-run with \
+                         CRATONVM_DBG_JIT_BORROW_SITES=1 to see both sites"
+                    ),
+                }
+            }
             debug_assert!(
                 !b.get(),
                 "jit_thread_mut: aliasing &mut JvmThread borrow detected \
@@ -1342,6 +1397,11 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
                  level — this is a genuine sibling fabrication, not a re-entry)"
             );
             b.set(true);
+            if jit_borrow_site_capture_enabled() {
+                JIT_THREAD_BORROW_SITE.with(|s| {
+                    s.set(Some(Box::new(std::backtrace::Backtrace::force_capture())))
+                });
+            }
         });
         Some((
             &mut *ptr,
@@ -6301,6 +6361,72 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
         .collect()
 }
 
+/// Among the calls that failed the CONTAINMENT clause, how many read a
+/// REFERENCE field and how many a primitive. Index 0 = primitive, 1 = reference.
+///
+/// This is the fork that decides whether anything further is reachable on ZGC
+/// and G1. Those two collectors publish no region bounds by design — the empty
+/// `JIT_REGION_BOUNDS` is the interlock that keeps inline reference STORES
+/// unreachable there (`audits/g1-audit.md` §8.1) — so containment can only be
+/// bypassed by a receiver check that does not need it. The IR tier now has one
+/// (`emit_trusted_oop_receiver_check`, primitives only), and the single-pass
+/// arm has always had one.
+///
+///   * a REFERENCE-heavy remainder means the rest is blocked on the ZGC JIT
+///     load barrier (`feature-designs/zgc-jit-load-barrier.md`), because a
+///     compact reference slot there may hold `Z_COLORED_TAG | colour | offset`
+///     and inlining its load is the use-after-free that design exists to stop.
+///     Nothing to fix in the getfield arms.
+///   * a PRIMITIVE-heavy remainder means some arm is failing to take a shortcut
+///     it is already entitled to, and that is an ordinary bug.
+pub static JIT_GETFIELD_OOB_FIELD_KIND: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// `(name, count)` for [`JIT_GETFIELD_OOB_FIELD_KIND`].
+pub fn jit_getfield_oob_field_kinds() -> Vec<(&'static str, u64)> {
+    use std::sync::atomic::Ordering;
+    vec![
+        (
+            "primitive",
+            JIT_GETFIELD_OOB_FIELD_KIND[0].load(Ordering::Relaxed),
+        ),
+        (
+            "reference",
+            JIT_GETFIELD_OOB_FIELD_KIND[1].load(Ordering::Relaxed),
+        ),
+    ]
+}
+
+/// Is the field at `field_index` of the object at `addr` a reference?
+///
+/// Asks the object's OWN layout, the same way the helper's read does: a compact
+/// object through the registered layout's storage kind, a legacy one through
+/// the 16-byte `Value` cell's tag byte. Anything it cannot resolve counts as a
+/// primitive, which is the conservative direction here — it under-reports the
+/// reference bucket rather than inventing one.
+///
+/// SAFETY: `addr` must have passed `plausible_heap_pointer` and point at a live
+/// object header whose body covers `field_index`.
+unsafe fn getfield_field_is_reference(addr: usize, field_index: i64) -> bool {
+    let Ok(idx) = usize::try_from(field_index) else {
+        return false;
+    };
+    let header = &*(addr as *const cratonvm_types::ObjectHeader);
+    if idx >= header.num_slots() as usize {
+        return false;
+    }
+    if let Some((_, storage)) = jit_compact_field_slot(addr as i64, field_index) {
+        return storage == cratonvm_types::FieldStorageKind::Reference;
+    }
+    let tag = *((addr
+        + cratonvm_types::HEADER_SIZE
+        + idx * cratonvm_types::SLOT_SIZE
+        + cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u8);
+    tag == cratonvm_types::VTAG_OBJECT || tag == cratonvm_types::VTAG_NULL
+}
+
 /// Classify the receiver of one helper call into
 /// [`JIT_GETFIELD_RECEIVER_SHAPE`].
 ///
@@ -6314,7 +6440,7 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
 /// precondition the emitted inline code satisfies before its own header read.
 #[inline(never)]
 #[cold]
-unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
+unsafe fn note_getfield_receiver_shape(obj_ptr: i64, field_index: i64) {
     use std::sync::atomic::Ordering;
     let bump = |i: usize| {
         JIT_GETFIELD_RECEIVER_SHAPE[i].fetch_add(1, Ordering::Relaxed);
@@ -6340,6 +6466,13 @@ unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
     });
     if !contained {
         bump(1);
+        // Split the containment failures by field kind — see
+        // `JIT_GETFIELD_OOB_FIELD_KIND`. The receiver is plausible and its
+        // header is readable, which is all this needs; it is NOT inside a
+        // published region, but on ZGC/G1 no region is ever published, so that
+        // says nothing about whether the memory is mapped.
+        let is_ref = getfield_field_is_reference(addr, field_index);
+        JIT_GETFIELD_OOB_FIELD_KIND[usize::from(is_ref)].fetch_add(1, Ordering::Relaxed);
         return;
     }
     let flags = *((addr + cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8);
@@ -6509,7 +6642,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // measured `receiverFieldTax` is 8.2 ns, and this is not visible in it.
     GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if getfield_receiver_census_enabled() {
-        note_getfield_receiver_shape(obj_ptr);
+        note_getfield_receiver_shape(obj_ptr, field_index);
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
         dump_getfield_guard_failure(obj_ptr);
@@ -10812,7 +10945,27 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // a call with nothing to compile and nothing to dispatch: a field read, an
     // atomic, or a constant. Everything after this point is per-call work that
     // such a site was paying for no reason. See `NativeSiteCache`.
-    if let Some(result) = try_jit_site_cached_native_dispatch(vm, info, info_key, args_slice) {
+    // Unlike the `jit_invoke_virtual_mic` call site, no borrow is live here —
+    // the nearest one above is scoped to an `if let` that has already closed —
+    // so this one acquires it, and the guard's scope is exactly the call.
+    //
+    // The borrow is passed as an `Option` rather than being required, so a run
+    // with no JIT thread installed still ENTERS the callee and still runs its
+    // counted pre-resolution bails; the `?` inside consumes the `None` at the
+    // same point the callee's own `jit_thread_mut()?` used to. Requiring it
+    // here instead would have skipped those `site_refusal::note_and_decline`
+    // counters, which the callee's own comment calls out as the thing that
+    // made its first cut unexplainable.
+    let mut thread_and_guard = jit_thread_mut();
+    let site_native = try_jit_site_cached_native_dispatch(
+        vm,
+        thread_and_guard.as_mut().map(|(t, _)| &mut **t),
+        info,
+        info_key,
+        args_slice,
+    );
+    drop(thread_and_guard);
+    if let Some(result) = site_native {
         disp_census::note(disp_census::OUT_SITE_NATIVE);
         return result;
     }
@@ -11331,6 +11484,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     info,
                     args_slice,
                     vm_ptr,
+                    // This door has no inline-cache slot to install into: it is
+                    // reached from a call site the codegen did not give one.
+                    None,
                 ) {
                     return result;
                 }
@@ -11659,6 +11815,29 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 /// by `forward_jit_reference_args` in the caller.
 unsafe fn try_jit_site_cached_native_dispatch(
     vm: &SharedVm,
+    // BORROWED FROM THE CALLER, never re-derived here.
+    //
+    // This used to do its own `jit_thread_mut()?` at the top of the leaf-native
+    // arm. That is sound from `jit_invoke_dispatch`, whose own borrow is scoped
+    // to an `if let` that closes before the call — and UNSOUND from
+    // `jit_invoke_virtual_mic`, which takes `(thread, _jit_thread_guard)` and
+    // holds the guard for the whole function. Two `&mut JvmThread` derived from
+    // the same raw pointer were live at once, with no `set_jit_thread` boundary
+    // between them to make the inner one a child reborrow — a genuine sibling,
+    // which is exactly what `jit_thread_mut`'s debug assertion says when it
+    // fires. And the outer reference is USED after the inner one is created
+    // (`safe_native_call`, `handle_jit_dispatch_error`, … all take it as
+    // `&mut`), so the invalidated borrow is not merely held but dereferenced.
+    //
+    // The `debug_assert!` is `#[cfg(debug_assertions)]`; the aliasing is not.
+    // Release built the same two derivations and simply did not look.
+    //
+    // `Option`, not `&mut`, and consumed at exactly the point the old
+    // `jit_thread_mut()?` stood — several counted bails
+    // (`site_refusal::note_and_decline`) run before it, and hoisting the
+    // thread requirement above them would silently stop counting a refusal
+    // whenever no JIT thread is installed.
+    thread: Option<&mut JvmThread>,
     info: &JitInvokeInfo,
     info_key: JitSiteKey,
     args_slice: &[i64],
@@ -11733,7 +11912,9 @@ unsafe fn try_jit_site_cached_native_dispatch(
         }
     }
 
-    let (thread, _guard) = jit_thread_mut()?;
+    // The old `let (thread, _guard) = jit_thread_mut()?;` stood here. Same
+    // position, same early-out, but the reference is the caller's.
+    let thread = thread?;
     if entry.kind == LeafNativeKind::ThreadCurrentThread {
         // The mirror is a per-thread GC root the collector remaps, and handing
         // it to the caller roots it again with no allocation in between. When
@@ -13804,6 +13985,91 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     }
 }
 
+/// Give this SAM call site an inline-cache entry of its own.
+///
+/// The Rust arm below answers a lambda dispatch in ~190 ns; a named class's
+/// call site answers one in ~12, because after its first miss the inline cache
+/// holds the callee and the emitted cascade never re-enters Rust
+/// (`mic_calls=1` across 2 200 000 dispatches, `CRATONVM_DBG=mic-prof`). The
+/// only thing keeping a lambda out of that slot was an argument shuffle — the
+/// call site has `(proxy, samArgs…)` and a non-capturing lambda's impl wants
+/// `(samArgs…)` — so `lambda_adapter` emits a thunk that performs the shuffle
+/// and tail-jumps, and the slot holds THAT.
+///
+/// Installed only for shapes the thunk can serve without touching memory:
+///
+/// * **no captures** — reading a captured field from a hand-emitted thunk would
+///   mean reproducing the compact/legacy body-layout branch (`GC_FLAG_COMPACT`)
+///   and every per-type width the `getfield` arms handle. A capturing lambda
+///   keeps the Rust arm.
+/// * **no `checkcast`** — a generic call site's cast is a class-hierarchy
+///   question, not a register move.
+/// * **a static impl**, which "no captures" already implies for javac's output;
+///   asserted rather than assumed because the thunk drops the receiver outright.
+/// * **an arity the register ABI can carry**, receiver and context included —
+///   `lambda_adapter_entry` refuses the rest.
+///
+/// Both slots are written, because the emitted cascade prefers the PIC when the
+/// codegen allocated one and never consults the MIC in that case.
+///
+/// Everything after installation is the ordinary cached-call path: the
+/// cascade's own null and `ObjectKind::Object` guards run before the call, its
+/// `i64::MIN` callee-deopt check after it, and an escaping exception is left in
+/// `jit_pending_exception` for the caller's post-invoke check. This arm
+/// participates in none of it any more, which is the point.
+#[allow(clippy::too_many_arguments)]
+unsafe fn install_lambda_inline_cache(
+    vm: &SharedVm,
+    site: &crate::runtime::interpreter::LambdaJitSite,
+    receiver_class_id: ClassId,
+    code: &cratonvm_jit::RetainedCode,
+    mic_ptr: i64,
+    pic_ptr: i64,
+) {
+    if !crate::runtime::env_cache::jit_lambda_adapter() {
+        return;
+    }
+    if site.num_captures() != 0 || site.has_checkcasts() || !site.is_static_impl() {
+        return;
+    }
+    if !site.claim_adapter_install() {
+        return;
+    }
+    let Some(entry) = cratonvm_jit::lambda_adapter::lambda_adapter_entry(
+        receiver_class_id.as_u32(),
+        code.arc(),
+        site.total_args(),
+    ) else {
+        return;
+    };
+    let class_id = receiver_class_id.as_u32();
+    let class_name = site.impl_class_name();
+    let needs_ctx = code.needs_context();
+    let jdk_only = crate::vm::dispatch_policy(vm).is_jdk_only();
+    let mut installed = false;
+    if mic_ptr != 0 {
+        let mic = &*(mic_ptr as *const JitMICSlot);
+        mic.update(class_id, class_name, entry as u64, needs_ctx, jdk_only);
+        installed = true;
+    }
+    if pic_ptr != 0 {
+        let pic = &*(pic_ptr as *const JitPICSlot);
+        pic.install(class_id, class_name, entry as u64, needs_ctx, jdk_only);
+        installed = true;
+    }
+    if installed {
+        crate::runtime::interpreter::lambda_site_bump_adapter();
+        if mic_prof::enabled() {
+            eprintln!(
+                "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
+                 sam_args={} entry={entry:#x} impl={}",
+                site.total_args(),
+                class_name,
+            );
+        }
+    }
+}
+
 /// A compiled caller's SAM call, served straight from the lambda call site's
 /// own cached target.
 ///
@@ -13840,6 +14106,7 @@ unsafe fn try_lambda_site_direct_call(
     info: &JitInvokeInfo,
     args_slice: &[i64],
     vm_ptr: i64,
+    ic_slots: Option<(i64, i64)>,
 ) -> Option<i64> {
     const MAX_DIRECT_ARGS: usize = 8;
     let site = crate::runtime::interpreter::lambda_jit_site(
@@ -13877,6 +14144,9 @@ unsafe fn try_lambda_site_direct_call(
         // `ClassCastException` it has always raised, message and all.
         crate::runtime::interpreter::lambda_site_bump_refused();
         return None;
+    }
+    if let Some((mic_ptr, pic_ptr)) = ic_slots {
+        install_lambda_inline_cache(vm, &site, receiver_class_id, &code, mic_ptr, pic_ptr);
     }
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
     crate::runtime::interpreter::lambda_jit_site_capture_args(
@@ -14250,6 +14520,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
+        Some(thread),
         info,
         jit_site_key(vm.vm_identity, info_ptr as usize),
         args_slice,
@@ -14512,6 +14783,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             info,
             args_slice,
             vm_ptr,
+            Some((mic_ptr, pic_ptr)),
         ) {
             return result;
         }
