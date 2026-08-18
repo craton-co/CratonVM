@@ -50,7 +50,7 @@ Both successors are filed, and neither is this page's mechanism:
   (`Method.getName()` returning null, a local NPEing as its own receiver). Both
   pass under ZGC on the same binary. The fallback was refusing compaction
   whenever the root set could not be verified; it was load-bearing.
-* **`docs/known-issues/springboot/quartz-endpoint-web-native-memory-runaway-20260818.md`**
+* **`docs/known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.md`**
   — Quartz now dies on **every** collector, growing ~350 MB/s of native memory
   to 22 GB with `--Xmx` having no effect and **zero** `[moving-young]` lines in
   the log. `--nojit` passes it. Three hypotheses tested and refuted there.
