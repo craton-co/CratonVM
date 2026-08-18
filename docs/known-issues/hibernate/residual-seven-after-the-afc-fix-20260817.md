@@ -426,3 +426,53 @@ Unchanged from §5: any candidate fix must be A/B'd on
 run — the hibernate-reactive suite is not on the Azure host. The numbers above
 are `LambdaCompositionProbe` only, and the page's own history is that probe
 wins do not always convert.
+
+## 7. The registry cluster, measured — 4 lookups per stage and every one of them misses
+
+§6.5 pointed at the ~12.5% native-registry cluster. `CRATONVM_DBG=native-lookups`
+(the census built for exactly this question) over
+`probes/LambdaCompositionProbe.java`, four workload sizes:
+
+| chains | stages | `find` | `quirks` | `invokes(stackless)` |
+|---:|---:|---:|---:|---:|
+| 2 500 | 20 000 | 151 254 | 147 753 | 966 |
+| 5 000 | 40 000 | 231 254 | 227 756 | 966 |
+| 10 000 | 80 000 | 391 254 | 387 756 | 966 |
+| 20 000 | 160 000 | 711 254 | 707 756 | 966 |
+
+**Exactly 4.0 `find` calls per composition stage**, at every size — the deltas
+are 80 000 / 160 000 / 320 000 against 20 000 / 40 000 / 80 000 added stages,
+linear to three digits, over a fixed ~71 k boot cost.
+
+**And essentially every one of them misses.** `quirks` tracks `find` to within
+0.5%, and `resolve_id_with_descriptor_quirks` is only reached *after* the exact
+lookup has already failed. So each of those four does: a class prefilter hash,
+a slot hash, a miss, then a full byte pass over the descriptor in an arm marked
+`#[cold]` `#[inline(never)]` — which on this workload is taken ~100% of the
+time. The arm is correct to bail (it returns `None` before allocating), but
+`#[cold]` is a branch-layout hint that is simply wrong here.
+
+That is the shape behind the 2.71% `__memcmp_evex_movbe` and a good part of the
+`find` / `slot_for_exact` / `quirks` lines: not one expensive lookup, but four
+cheap ones per stage that were never going to hit.
+
+**The instrument's own headline number is misleading, and this is the trap.**
+`lookups_per_invoke` printed 162 -> 245 -> 411 -> 742 across those four rows,
+which reads like a per-call cost that worsens with load. It is not:
+`invokes(stackless)` is **constant at 966** in all four runs, so the ratio grew
+only because its denominator could not move. The lookups this workload
+generates do not arrive through `try_stackless_invoke` at all, though that
+counter's doc comment calls itself "the every-invoke entry point". Corrected at
+the source in this change; the reliable reading is the marginal rate between
+two sizes, which is what the 4.0 above is.
+
+**Not fixed here, and deliberately.** The obvious moves — a negative cache, or
+dropping `#[cold]` — are each a one-line change with an obvious story, and this
+page's history (§3, and §6.4 in this session) is that such changes do not
+convert. Whoever takes it should start from the fact above: the target is
+*four misses per stage*, so the question is which call site issues them and
+whether it can ask once, not whether each miss can be made cheaper.
+
+`perf` could not answer that here: dwarf unwinding through these frames yields
+bogus return addresses (`0x1ffffffffff`, `0x3`), so `--call-graph` gives no
+callers for `find`. A counter at the call sites will be needed instead.
