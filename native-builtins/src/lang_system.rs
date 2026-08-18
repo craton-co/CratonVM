@@ -1210,7 +1210,7 @@ pub(crate) fn native_thread_sleep_millis_nanos(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.sleep: timeout value is negative".to_string(),
+                message: "timeout value is negative".to_string(),
             }
             .into(),
         );
@@ -1218,7 +1218,7 @@ pub(crate) fn native_thread_sleep_millis_nanos(
     if !(0..=999_999).contains(&nanos) {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.sleep: nanosecond timeout value out of range".to_string(),
+                message: "nanosecond timeout value out of range".to_string(),
             }
             .into(),
         );
@@ -1249,6 +1249,18 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Int(i)) => *i as i64,
         _ => 0,
     };
+    // G72-1: same missing check as `Object.wait(long)` had, and the same
+    // sibling-knew-better shape -- `native_thread_sleep_millis_nanos` above has
+    // it. A negative sleep silently succeeded here because the whole body is
+    // guarded by `millis > 0` and nothing else looked at the value.
+    if millis < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "timeout value is negative".to_string(),
+            }
+            .into(),
+        );
+    }
     if millis > 0 {
         // Keycloak Gap 9 localization (CRATONVM_DBG_SLEEP_TRACE): a worker is
         // stuck in a Thread.sleep poll-loop; sample the Java caller chain so we
@@ -1678,7 +1690,7 @@ pub(crate) fn native_thread_join_timed(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.join: timeout value is negative".to_string(),
+                message: "timeout value is negative".to_string(),
             }
             .into(),
         );
@@ -1752,7 +1764,7 @@ pub(crate) fn native_thread_join_millis_nanos(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.join: timeout value is negative".to_string(),
+                message: "timeout value is negative".to_string(),
             }
             .into(),
         );
@@ -1760,7 +1772,7 @@ pub(crate) fn native_thread_join_millis_nanos(
     if !(0..=999_999).contains(&nanos) {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.join: nanosecond timeout value out of range".to_string(),
+                message: "nanosecond timeout value out of range".to_string(),
             }
             .into(),
         );

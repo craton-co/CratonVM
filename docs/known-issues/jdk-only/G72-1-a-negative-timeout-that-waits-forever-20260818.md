@@ -1,6 +1,28 @@
 # G72-1 — a negative timeout that waits forever
 
-**Status:** MEASURED, **NOT FIXED**. The sweep is INCOMPLETE and cannot be
+> **UPDATE 2026-08-18 — a fix is WRITTEN and is UNVERIFIED. Do not trust it
+> until it has been run.** The toolchain on this host began crashing
+> (`STATUS_STACK_BUFFER_OVERRUN` inside rustc) partway through the session:
+> first only under `-C lto=fat`, then on plain library compiles that had
+> succeeded twenty minutes earlier, at `-j 1` as well as `-j 16`, with 40 GB
+> RAM free. It reproduces on unmodified `HEAD`, so it is not this change. No
+> binary could be produced, so **§1's hang has not been observed to stop
+> hanging**, no vector rows were added, and no suite arm was run.
+>
+> Two corrections to what is written below, both learned while fixing it:
+>
+> * §2 says `Thread.join(-1)` is "correct", implying a correctly-written
+>   sibling. **`Thread.join` is not registered as a native at all** — the
+>   registry dump shows no row for it, so it runs real JDK bytecode and gets
+>   the contract for free. The asymmetry was never two implementations, it
+>   was one implementation and one absence.
+> * The two overloads do NOT share a message. Measured:
+>   `wait(-5)` is `"timeout value is negative"`, `wait(-5, 0)` is
+>   `"timeoutMillis value is negative"`. Ours said
+>   `"Object.wait: timeout value is negative"` for the second — wrong prefix
+>   AND wrong noun.
+
+**Status:** MEASURED, fix WRITTEN and UNVERIFIED (see the banner). The sweep is INCOMPLETE and cannot be
 completed until §1 is fixed — the VM blocks partway through it.
 **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS; CratonVM
 `C:/craton/target-nolto` (non-LTO release, see `G71-1`), `--jdk-only`.

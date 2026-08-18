@@ -27177,16 +27177,36 @@ fn native_object_wait_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let timeout_ms = match args.get(1) {
-        Some(Value::Long(ms)) => {
-            if *ms > 0 {
-                Some(*ms as u64)
-            } else {
-                None
-            }
-        }
-        _ => None,
+    let millis = match args.get(1) {
+        Some(Value::Long(ms)) => *ms,
+        // WP4.5 tag erasure, as in `native_thread_sleep`: a long popped
+        // generically comes back tagged Double with the bits intact.
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(i)) => *i as i64,
+        _ => 0,
     };
+    // G72-1: a NEGATIVE timeout is an error, not a long wait.
+    //
+    // This arm used to fold `ms <= 0` into `None`, and `monitor_wait` reads
+    // `None` as "wait forever" -- so `o.wait(-5)` on a held monitor parked the
+    // thread with nobody to notify it and the VM never exited. A hang is worse
+    // than a wrong value: it presents as "the application stopped", far from
+    // the call, and the ordinary way to reach it is `deadline - now()` on a
+    // deadline that has already passed.
+    //
+    // ZERO still means forever (JLS 17.2), which is why the test is `< 0` and
+    // not `<= 0`. The rule was already written down in the doc comment of
+    // `native_object_wait_timeout_nanos` directly below -- stated correctly and
+    // implemented in that function only.
+    if millis < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "timeout value is negative".to_string(),
+            }
+            .into(),
+        );
+    }
+    let timeout_ms = if millis > 0 { Some(millis as u64) } else { None };
     ctx.monitor_wait(this, timeout_ms)
 }
 
@@ -27220,7 +27240,10 @@ fn native_object_wait_timeout_nanos(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Object.wait: timeout value is negative".to_string(),
+                // NOT "timeout value is negative" -- that is `wait(long)`'s
+                // wording. The two-arg overload says `timeoutMillis`.
+                // Measured on Temurin 25.0.3; the pair is in `scratchpad/g74/Z.java`.
+                message: "timeoutMillis value is negative".to_string(),
             }
             .into(),
         );
@@ -27228,7 +27251,7 @@ fn native_object_wait_timeout_nanos(
     if !(0..=999_999).contains(&nanos) {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Object.wait: nanosecond timeout value out of range".to_string(),
+                message: "nanosecond timeout value out of range".to_string(),
             }
             .into(),
         );
