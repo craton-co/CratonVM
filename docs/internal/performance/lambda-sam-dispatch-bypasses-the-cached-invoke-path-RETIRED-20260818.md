@@ -167,27 +167,53 @@ and it should not be filed as a lambda problem.
 ## 5. What pins it
 
 `vm/tests/lambda_jit_tierup_tests.rs` and `lambda_jit_oneshot_tests.rs` — the
-same twelve golden checksums from a real JDK, run against each half — plus
-`lambda_jit_engagement_tests.rs` and its `_oneshot_` mirror, which assert the
-half under test actually served the calls.
+same twelve golden checksums from a real JDK, run against each half (the second
+sets `CRATONVM_JIT_LAMBDA_SITE=0`, which sends a compiled caller's SAM call back
+down the generic path and therefore through the interpreted one-shot) — plus
+`lambda_jit_engagement_tests.rs` and its `_oneshot_` mirror, which assert that
+the half under test actually served the calls.
 
-That last pair exists because the first version of this suite was worthless and
-said nothing about it. Twelve tests, all green, at 4 000 iterations an arm —
-and with a deliberate off-by-one planted in the one-shot's return conversion and
-its implicit-NPE drain deleted outright, **eleven of the twelve still passed**.
-They had computed their answers in the interpreter and agreed with HotSpot about
-a path they never took. Three things fixed that, and all three were needed:
+**That last pair exists because the first version of this suite was worthless
+and said nothing about it.** Twelve tests, all green, at 4 000 iterations an arm
+— and with a deliberate off-by-one planted in the one-shot's return conversion
+and its implicit-NPE drain deleted outright, **eleven of the twelve still
+passed**. They had computed their answers in the interpreter and agreed with
+HotSpot about a path they never took. Three separate things were wrong and all
+three had to be fixed:
 
-1. **200 000 iterations**, not 4 000, so an asynchronous compile cannot outlast
-   the loop.
-2. **`CRATONVM_BG_COMPILE=0`**, so the body compiles on the mutator at the
-   threshold and "compiled by iteration ~501" is a fact rather than a race.
-3. **A one-line static `step` hop** that every SAM call goes through, because
-   which half serves a call is decided by whether the CALLING frame is compiled
-   — and a loop sitting directly in a test method leaves that to an OSR race the
-   test cannot see.
+1. **4 000 iterations** cannot outlast an asynchronous compile. Now 200 000.
+2. **Which half serves a call is decided by whether the CALLING frame is
+   compiled**, and a loop sitting directly in a test method leaves that to an
+   OSR race the test cannot see. Every SAM call now also goes through a one-line
+   static `step` hop, which compiles on its own invocation count, so both call
+   shapes are exercised by every arm.
+3. The suite had no way to say whether any of it happened. The engagement tests
+   read the counters and assert a floor.
 
-Then each break fails its own suite, and the engagement tests report
-`site_direct=399 500` of 400 000 for the compiled-caller half and the mirror
-figure for the interpreted one. A count beside the number, in the tests as well
-as in the measurements.
+A fourth attempt was made and REVERTED, and it is the useful one to record:
+`CRATONVM_BG_COMPILE=0` looks like the way to make "the body is compiled by
+iteration ~501" deterministic — compilation moves onto the mutator at the
+threshold instead of racing a worker. Measured across this fixture it compiles
+about **6%** of what the background worker does (`eligible=6 200 000` against
+`compiled_hits=398 209`), because the inline `try_jit_upgrade_with_gate` route
+declines bodies the worker admits. Determinism bought by suppressing the thing
+under test is not determinism.
+
+What the suite proves now, on the default configuration:
+
+* Both engagement tests pass, and the census they print separates the halves
+  cleanly. Default configuration: `site_direct=398 907` of the 400 000 SAM calls
+  that come through the compiled `step` hop, with the other 400 000 (called
+  straight from the interpreted loop) served by the one-shot,
+  `fast_returns=399 116`. With `CRATONVM_JIT_LAMBDA_SITE=0`: `site_calls=0` and
+  `fast_returns=599 109` — every dispatch through the interpreted half, which is
+  what that configuration is for.
+* Breaking the JIT-side arm (`Some(rc)` → `Some(rc + 1)`) turns
+  `lambda_jit_tierup_tests` red; breaking the one-shot's return conversion turns
+  `lambda_jit_oneshot_tests` red. Both were re-run after every change to the
+  fixture, and both are red for the current one.
+
+One honest limitation: under the default asynchronous compiler, a given run
+turns exactly the arm that won the compile race red — one test of the twelve,
+and a different one each time. The suites catch a break; the engagement tests,
+not the checksums, are what carry the "and the path really ran" burden.
