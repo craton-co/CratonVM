@@ -1,8 +1,25 @@
 # G75-1 — URI components, measured properly and costed
 
-**Status:** MEASURED. **N2 FIXED** (`URL.toString`/`toExternalForm`); **N1 NOT
-started** — §3 says why and what it would take. 13 rows diverged, 2 are fixed,
-11 remain and all 11 are N1. **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS;
+> **N1 DONE 2026-08-18. 12 of the 13 rows are fixed; one remains (§5).**
+> The conversion took a shape §2 and its correction both missed, and the shape
+> is the point: **the getters re-parse, so ONE splitter in units serves them
+> all, and the `&str` helpers become wrappers over it.** No second spelling was
+> created, and `url_parse` was never converted — it did not need to be.
+>
+> Three things had to be right together, and each was invisible until the one
+> before it was fixed:
+>
+> 1. the ACCESSORS, converted to units through one splitter and one decoder;
+> 2. the component FIELDS, which the accessors PREFER over their own parse —
+>    so a lossy field silently won over an exact parse, and the multi-argument
+>    constructor looked fixed while the single-string one did not;
+> 3. `URL.toURI()`, which re-encoded the string it already held as an object.
+>
+> Each step revealed the next only after it landed. That is the argument for
+> converting a chain end to end rather than at its most obvious point.
+
+**Status:** N1 **DONE** (12 of 13 rows); N2 **DONE**. One row remains —
+`URI.relativize`, §5. **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS;
 CratonVM `C:/craton/target-rel13` (fat-LTO release), `--jdk-only`. Probe:
 `regression-suite/probes/Sweep12UriComponents.java`, 26 rows, every row printed
 as UTF-16 unit values.
@@ -124,12 +141,29 @@ coincidence of the replacement function's arity, on a security-relevant path.
 Recorded so the next person does not have to re-derive that it is possible, and
 does not mistake possible for advisable.
 
+## 5. The one row left: `URI.relativize`
+
+`relativize` is not an accessor. It runs `uri_remove_dot_segments` and
+`uri_recompose` over `&str` — a genuine ALGORITHM on path segments, not a
+range selection — and then builds a new URI from the recomposed text. It is
+the only row of the 26 still wrong.
+
+Converting it means those two helpers in units. Both split on ASCII `/`, so
+neither needs Unicode reasoning; it is a bounded piece of work and simply a
+different one from the chain above. Left because it is a distinct algorithm
+and the evidence for it is one row.
+
 ## 4. NOMINATIONS
 
-**N1 — the conversion, whole, as costed in §2.** Ten callers, one 195-line
-slicer, ASCII delimiters throughout. Lift the rows from
-`probes/Sweep12UriComponents.java`, which is checked in and already has the
-oracle column.
+**N1 — DONE, and the costing in §2 was wrong in an instructive direction.**
+It said the work was `url_parse` plus ten callers, then corrected itself to
+add every getter. The real answer was neither: `url_parse` was never touched.
+Because the getters re-parse from the raw text, converting THEM plus the
+fields they prefer was sufficient — one splitter, one decoder, and the `&str`
+helpers reduced to wrappers. Two cost estimates in a row were wrong because
+both assumed the parse was on the critical path and neither checked.
+
+**N3 — `URI.relativize`, §5.** The last row, a distinct algorithm.
 
 **N2 — CLOSED. It WAS the second, narrower defect.** `URL.toString()` and
 `toExternalForm()` share one native that reconstructs the external form; it

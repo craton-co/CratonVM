@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.io.StringReader;
 import java.math.BigInteger;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -2138,7 +2139,53 @@ public class RJdkBridge1 {
         check("http://h.example/ok".equals(plain.toString()),
                 "an ordinary URL must round-trip unchanged");
 
-        sectionEnd("surrog", 68);
+        // -- every URI ACCESSOR re-parses the raw text ------------------------
+        // G75-1 N1. The loss was never in url_parse: each getter reads the raw
+        // string and re-parses it, so a read_string in the getter re-lost the
+        // unit whatever the parse had done. Converted to units end to end, with
+        // ONE splitter — the &str spellings are wrappers over it now.
+        step("surrog", "URI accessors with a lone surrogate");
+        URI lu;
+        URI lu2;
+        try {
+            lu = new URI("http", "h.example", "/" + LONE_HI, LONE_HI, LONE_HI);
+            lu2 = new URI("http://h.example/" + LONE_HI);
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+        ckCarries("URI.getPath()", lu.getPath(), 2);
+        ckCarries("URI.getRawPath()", lu.getRawPath(), 2);
+        ckCarries("URI.getQuery()", lu.getQuery(), 1);
+        ckCarries("URI.getRawQuery()", lu.getRawQuery(), 1);
+        ckCarries("URI.getFragment()", lu.getFragment(), 1);
+        ckCarries("URI.getSchemeSpecificPart()", lu.getSchemeSpecificPart(), 100);
+        ckCarries("URI.getRawSchemeSpecificPart()", lu.getRawSchemeSpecificPart(), 100);
+        // The SINGLE-string constructor took a different route: its component
+        // FIELDS won over the parse, so fixing the getters alone left it wrong.
+        ckCarries("URI(String).getPath()", lu2.getPath(), 2);
+        ckCarries("URI(String).getRawPath()", lu2.getRawPath(), 2);
+        // ...and URL.toURI() re-encoded the string it already held.
+        try {
+            ckCarries("URL.toURI().getPath()",
+                    new java.net.URL("http://h.example/" + LONE_HI).toURI().getPath(), 2);
+        } catch (Exception e) {
+            throw new AssertionError("URL.toURI must succeed: " + e);
+        }
+        // Controls: the ASCII-constrained components, and ordinary text.
+        check("http".equals(lu.getScheme()), "the scheme must be unchanged");
+        check("h.example".equals(lu.getHost()), "the host must be unchanged");
+        try {
+            URI plainUri = new URI("http://h.example/ok?q=1#f");
+            check("/ok".equals(plainUri.getPath()) && "q=1".equals(plainUri.getQuery())
+                            && "f".equals(plainUri.getFragment()),
+                    "an ordinary URI must parse unchanged");
+            check("/a b".equals(new URI("http://h/a%20b").getPath()),
+                    "percent-decoding must still work");
+        } catch (URISyntaxException e) {
+            throw new AssertionError("control URI construction must succeed: " + e);
+        }
+
+        sectionEnd("surrog", 82);
     }
 
     static final int SFF = 15;
