@@ -2326,12 +2326,26 @@ fn reloc_emit_enabled() -> bool {
     /// The shape mirrors `x64.rs`'s arm exactly, and deliberately keeps the
     /// property that stops the stale-receiver SIGSEGV: never dereference a
     /// receiver that is not null-free, 8-aligned and inside a published GC
-    /// region. Everything else — null, unaligned, out-of-heap, a legacy
-    /// (non-compact) instance of a compact class, or a width this arm does not
-    /// emit — branches to the helper, whose NPE / `i64::MIN` semantics are
-    /// unchanged. The one simplification against the single-pass version: the
-    /// legacy-layout receiver takes the helper rather than a second inline
-    /// path.
+    /// region. Everything else — null, unaligned, out-of-heap, or a width this
+    /// arm does not emit — branches to the helper, whose NPE / `i64::MIN`
+    /// semantics are unchanged.
+    ///
+    /// **The legacy-layout receiver reads inline too, since 2026-08-18.** It
+    /// used to take the helper — "the one simplification against the
+    /// single-pass version" — and that simplification turned out to be 100% of
+    /// this helper's calls on the Generational collector. `init_object_header`,
+    /// the TLAB fast path that serves ~99% of allocations for both the
+    /// interpreter and `jit_new_object`, writes `array_length = 0` and no
+    /// `GC_FLAG_COMPACT` unconditionally: it never consults
+    /// `plan_object_alloc`, so a class with a perfectly good registered compact
+    /// layout is still allocated legacy. An arm that inlines only compact
+    /// receivers therefore inlines almost nothing. See
+    /// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+    ///
+    /// The legacy read is the uniform 16-byte `Value` cell at
+    /// `HEADER_SIZE + field_index * SLOT_SIZE`, transcribed from the
+    /// single-pass arm's own legacy branch so the two cannot disagree about
+    /// payload offsets or sign-extension.
     fn emit_inline_compact_getfield(
         &mut self,
         node_pc: Option<usize>,
@@ -2428,15 +2442,17 @@ fn reloc_emit_enabled() -> bool {
             self.patch_rel32_to_here(ok1);
         }
         // 4. per-OBJECT compactness. A class with a registered compact layout
-        //    can still have legacy 16-byte-cell instances (an allocation whose
-        //    `num_fields` disagrees with the layout falls back to the uniform
-        //    plan), and reading one at the packed offset yields a mangled
-        //    {tag, half-pointer} word.
+        //    can still have legacy 16-byte-cell instances — and in practice
+        //    almost all of them are, because the TLAB fast path writes a legacy
+        //    header unconditionally (see this function's doc comment). Reading
+        //    one at the packed offset yields a mangled {tag, half-pointer}
+        //    word, so the two layouts get two reads, exactly as the single-pass
+        //    arm does.
         self.buf.emit(&[0xF6, 0x80]); // TEST byte [RAX + disp32], imm8
         self.buf
             .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
         self.buf.emit_byte(cratonvm_types::GC_FLAG_COMPACT);
-        slow.push(self.emit_jcc_rel32(0x84)); // JZ → slow (legacy instance)
+        let legacy_patch = self.emit_jcc_rel32(0x84); // JZ → legacy inline read
 
         // 5. the read itself. A compact reference field is the bare 8-byte
         //    pointer at the cell base; a primitive is its tagless descriptor
@@ -2469,6 +2485,47 @@ fn reloc_emit_enabled() -> bool {
         let done_patch = self.buf.pos();
         self.buf.emit(&[0; 4]);
 
+        // --- legacy path: the uniform 16-byte `Value` cell. Transcribed from
+        //     the single-pass arm's legacy branch; the payload sub-offsets and
+        //     the sign-extension choice are that arm's, not a re-derivation. ---
+        self.patch_rel32_to_here(legacy_patch);
+        let legacy_cell_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
+        if ref_node {
+            // A reference descriptor always reads the cell's 64-bit pointer
+            // payload — never the 32-bit MOVSXD below, which would
+            // sign-extend half a pointer into a bogus non-null receiver.
+            self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+            self.buf
+                .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
+        } else {
+            match type_tag {
+                b'J' | b'D' => {
+                    self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, qword
+                    self.buf
+                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
+                }
+                // `float` is stored as a 32-bit payload and the helper
+                // ZERO-extends it (`f.to_bits() as i64`), so a 32-bit MOV;
+                // MOVSXD would corrupt every float with bit 31 set.
+                b'F' => {
+                    self.buf.emit(&[0x8B, 0x80]); // MOV EAX, dword (zero-extends)
+                    self.buf
+                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes());
+                }
+                // Every int-category descriptor: the cell holds a `Value::Int`
+                // payload already narrowed on store, so sign-extending it is
+                // what the helper returns.
+                _ => {
+                    self.buf.emit(&[0x48, 0x63, 0x80]); // MOVSXD RAX, dword
+                    self.buf
+                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes());
+                }
+            }
+        }
+        self.buf.emit_byte(0xE9); // JMP rel32 → done
+        let done_legacy_patch = self.buf.pos();
+        self.buf.emit(&[0; 4]);
+
         // --- slow path: the checked helper, byte-identical to the arm this
         //     replaces, including the sentinel bail. ---
         for p in slow {
@@ -2487,6 +2544,7 @@ fn reloc_emit_enabled() -> bool {
         self.push_call_exc_patch(exc_patch);
 
         self.patch_rel32_to_here(done_patch);
+        self.patch_rel32_to_here(done_legacy_patch);
         self.store_rax(slot);
         true
     }

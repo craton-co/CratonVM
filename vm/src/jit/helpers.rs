@@ -6353,12 +6353,23 @@ unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
 /// Sixteen slots, linear scan, first-come. Small and fixed on purpose: this
 /// runs under the same off-by-default flag as its caller and must not allocate
 /// or lock on a path taken tens of millions of times.
-static LEGACY_RECEIVER_CLASSES: [(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU64);
-    16] = [
+///
+/// The NAME is captured on first sight, not at print time. `resolve_class_info`
+/// answers through `live_hook_vms()` and returns `None` "after every registered
+/// VM has been dropped" — which is exactly the state a shutdown diagnostic runs
+/// in, and it is why the first version of this tally printed
+/// `<unresolved>(id=440)` for a class the allocation-side census had no trouble
+/// naming.
+static LEGACY_RECEIVER_CLASSES: [(
+    std::sync::atomic::AtomicU32,
+    std::sync::atomic::AtomicU64,
+    std::sync::OnceLock<String>,
+); 16] = [
     const {
         (
             std::sync::atomic::AtomicU32::new(u32::MAX),
             std::sync::atomic::AtomicU64::new(0),
+            std::sync::OnceLock::new(),
         )
     };
     16
@@ -6370,7 +6381,8 @@ unsafe fn note_legacy_receiver_class(addr: usize) {
     use std::sync::atomic::Ordering;
     let header = &*(addr as *const cratonvm_types::ObjectHeader);
     let cid = header.class_id.as_u32();
-    for (slot_cid, count) in LEGACY_RECEIVER_CLASSES.iter() {
+    let slots = header.num_slots();
+    for (slot_cid, count, name) in LEGACY_RECEIVER_CLASSES.iter() {
         let cur = slot_cid.load(Ordering::Relaxed);
         if cur == cid {
             count.fetch_add(1, Ordering::Relaxed);
@@ -6381,6 +6393,32 @@ unsafe fn note_legacy_receiver_class(addr: usize) {
                 .compare_exchange(u32::MAX, cid, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            // Does a compact layout EXIST for this (class, field-count)? That
+            // separates the two stories a legacy receiver can tell: "no layout
+            // was ever registered for this shape" (an allocation-side gap) from
+            // "a matching layout exists and this object was still allocated
+            // legacy" (an allocation that bypassed or predated it). Neither
+            // legacy census fires for `SHA256Digest`, so this is the question
+            // left standing.
+            let registered = cratonvm_types::class_layout(cid).map(|l| l.field_count());
+            // `array_length` and the raw flags nibble separate the last two
+            // stories. `plan_object_alloc` writes `(body_size, GC_FLAG_COMPACT)`
+            // for a compact object and `(0, 0)` for a legacy one, so:
+            //   array_length != 0 with the COMPACT bit clear  => allocated
+            //     compact and the bit was CLEARED afterwards;
+            //   array_length == 0                             => allocated
+            //     legacy, and the allocation-side census should have said so.
+            // The whole nibble is printed because a promoted or marked object
+            // carries other bits, and an all-zero nibble on a live object is
+            // itself a signal.
+            let arr_len = header.array_length();
+            let raw_flags = header.gc_flags();
+            let _ = name.set(format!(
+                "{} num_slots={slots} registered_layout_fields={registered:?}                  array_length={arr_len} gc_flags={raw_flags:#04x}",
+                cratonvm_gc::gc::resolve_class_info(cid)
+                    .map(|(n, declared)| format!("{n} declared_fields={declared}"))
+                    .unwrap_or_else(|| "<unresolved>".to_string())
+            ));
             count.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -6392,15 +6430,13 @@ pub fn jit_getfield_legacy_receiver_classes() -> Vec<(String, u32, u64)> {
     use std::sync::atomic::Ordering;
     LEGACY_RECEIVER_CLASSES
         .iter()
-        .filter_map(|(cid, count)| {
+        .filter_map(|(cid, count, name)| {
             let cid = cid.load(Ordering::Relaxed);
             if cid == u32::MAX {
                 return None;
             }
             let n = count.load(Ordering::Relaxed);
-            let name = cratonvm_gc::gc::resolve_class_info(cid)
-                .map(|(n, _)| n)
-                .unwrap_or_else(|| "<unresolved>".to_string());
+            let name = name.get().cloned().unwrap_or_else(|| "<unnamed>".to_string());
             Some((name, cid, n))
         })
         .collect()
