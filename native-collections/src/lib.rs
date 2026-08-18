@@ -4484,7 +4484,9 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// of `iterator()` / `hasNext()` / `next()` to "no more elements". Measured
 /// 2026-08-11 on the pre-built binary against Temurin 25.0.3.9:
 ///
-///     new ArrayList<>(List.of("a","b","c")).equals(linkedList)
+/// ```text
+/// new ArrayList<>(List.of("a","b","c")).equals(linkedList)
+/// ```
 ///
 /// answered `true` on HotSpot and in `Compatible`, and **`false`** under
 /// `--jdk-only` — silently, no exception — because the `NoClassDefFoundError:
