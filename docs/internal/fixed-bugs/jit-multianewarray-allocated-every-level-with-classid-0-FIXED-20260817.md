@@ -258,9 +258,11 @@ source witnesses were each verified to fail when the defect is reintroduced.
 
 ## Related
 
-* `docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md`
-  and the other `docs/known-issues/jit/` siblings from the same Commons Math
-  sweep — different mechanisms, still open.
+* `docs/known-issues/jit/bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-20260817.md`
+  — the other still-open JIT page from the same Commons Math sweep, a
+  different mechanism. The sweep's two sibling pages (the OSR exception-table
+  refusal and the inline trap inside a protected range) were retired
+  independently on dev the same day.
 * `apps/commons-math/RESULTS-20260817.md` — the suite run this was found from.
   Its verdict table lists four of this doc's witness classes under the retired
   root-map reading.

@@ -4668,6 +4668,12 @@ pub(crate) enum OsrBackoffOutcome {
     /// OSR didn't fire (either backoff not yet, or `try_osr` rejected and
     /// the rejection has been recorded). Caller falls through to its
     /// post-back-edge work (typically `safepoint_check` then `continue`).
+    ///
+    /// Since the RBC.6b lift this also covers a case where OSR very much DID
+    /// fire: the OSR'd body raised an exception this method catches, and the
+    /// live frame has been left parked at the handler. The caller's action is
+    /// identical — resume interpreting this frame — but no rejection is
+    /// recorded, because nothing was rejected. See `try_osr`'s `committed_out`.
     Skip,
     /// OSR completed and we're back at the root frame of this
     /// `execute_frame` invocation — bubble the return value up to the
@@ -4681,10 +4687,14 @@ pub(crate) enum OsrBackoffOutcome {
     /// `frame_idx` out-parameter (which the helper mutates).
     ContinueDispatch,
     /// The OSR'd code exited with a Java exception in flight that this frame
-    /// cannot catch (an OSR'd method provably declares no exception table —
-    /// see RBC.6b in `compile_osr_artifact`). The caller must hand the
-    /// throwable to the dispatch loop's `pending_java_exception` channel so it
-    /// unwinds from THIS frame, instead of resuming the loop.
+    /// cannot catch. Until the RBC.6b lift that was a property of the whole
+    /// population — an OSR'd method provably declared no exception table — and
+    /// now it is a per-throw verdict reached by
+    /// `route_osr_exception_out_of_artifact`: either no handler covers the
+    /// precise throw bci, or the throw site lies outside every protected range.
+    /// The caller must hand the throwable to the dispatch loop's
+    /// `pending_java_exception` channel so it unwinds from THIS frame, instead
+    /// of resuming the loop.
     ///
     /// The old behaviour here was `Skip` + a re-stashed exception, i.e.
     /// "keep interpreting this frame from where it was". That is correct only
@@ -4910,6 +4920,10 @@ pub(crate) fn try_osr_with_backoff(
     // function; a single out-parameter written on exactly one path is the
     // minimal honest channel.
     let mut osr_throw: Option<ObjectRef> = None;
+    // Sibling out-channel: the OSR'd body ran and advanced this frame, but
+    // returned no value and threw nothing out — the RBC.6b lift's handler
+    // entry. See `try_osr`'s parameter doc.
+    let mut osr_committed = false;
     let osr_result = try_osr(
         shared,
         thread,
@@ -4917,12 +4931,23 @@ pub(crate) fn try_osr_with_backoff(
         osr_class_id,
         entry_pc,
         &mut osr_throw,
+        &mut osr_committed,
     );
     // Checked BEFORE the rejection bookkeeping below: the OSR'd body RAN (and
     // committed loop iterations), so this is not a rejected attempt and must
     // not consume the per-pc rejection budget.
     if let Some(exc) = osr_throw {
         return OsrBackoffOutcome::ThrowJava(exc);
+    }
+    // Same rule, same reason, for the path that ran and CAUGHT. `Skip`'s "fall
+    // through to your post-back-edge work" is the right action here — the frame
+    // is parked at a handler with the throwable on its stack, so the dispatch
+    // loop resumes there (after its safepoint check) and re-enters the cached
+    // artifact at the next hot back-edge. What must NOT happen is the rejection
+    // bookkeeping below: charging a caught exception against the per-pc budget
+    // retires OSR after five of them.
+    if osr_committed {
+        return OsrBackoffOutcome::Skip;
     }
     match osr_result {
         Some(osr_val) => {
