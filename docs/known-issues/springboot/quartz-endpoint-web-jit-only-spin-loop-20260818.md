@@ -61,6 +61,47 @@ Collector-independent, so not a GC bug. `--nojit` clears it, so it is the JIT �
 which is the same thesis the retired page reached for these classes by a
 different route.
 
+## 2026-08-18, later: the exception traffic is NOT the signal, and a warning about the instrument
+
+An earlier pass on this page reported "18,069 `NullPointerException`s, 18,066 of
+them thrown at `TomcatEmbeddedWebappClassLoader.loadClass`". **That number is an
+artefact and both halves of it are wrong.** It came from pairing a debug line
+that printed the throwable's class with a *separate* debug line that printed
+frames. Several threads capture concurrently, `eprintln!` interleaves, and
+pairing "the last class line" with "the next frame line" attributes frames to
+the wrong throwable. The same defect in the opposite direction made the frame
+list read outermost-first, so "the deepest frame" was the thread entry point.
+
+With class and frames emitted on ONE line (`STTRACE_DBG_TOP`, three commits on
+this branch), the real distribution over 25 s is:
+
+| throwable | count | where |
+|---|---:|---|
+| `NoSuchMethodException` | 1,324 | Jersey `AnnotatedMethod.findAnnotatedMethod`, Spring `DisposableBeanAdapter.inferDestroyMethodsIfNecessary` |
+| `ClassNotFoundException` | 85 | ordinary optional-dependency probing |
+| `NoSuchBeanDefinitionException` | 70 | ordinary Spring wiring |
+| `NullPointerException` | **2** | `ModuleDescriptor.modsHashCode` during a `<clinit>` |
+
+Every one of those is **ordinary framework reflection** that HotSpot also
+performs. There is no exception storm and nothing is failing in a loop. The
+stack-trace capture cost is real (it is what turns the spin into 22 GB of RSS)
+but it is a consequence of the iteration count, not a cause.
+
+**A correct-looking number from a wrongly-paired log is worse than no number.**
+Both mis-pairings produced plausible, confident, specific answers — a named
+class and a named throw site — and sent the investigation at
+`getClassLoadingLock`, which a 20-line probe then cleared on all three arms
+(`ClassLoadingLockProbe`: 400,000 iterations, zero null locks on HotSpot,
+CratonVM+JIT and CratonVM `--nojit`).
+
+### What the watchdog dump adds
+
+`--stack-dump-on-timeout 20` while spinning: all four `reactor-http-nio-N`
+threads — the `WebTestClient`'s own Netty event loops — are `blocked=true` in
+`NioIoHandler.select`, i.e. **the client is idle, waiting for I/O**, while the
+server side keeps executing. Whatever is iterating is on the server, not a
+client retry loop.
+
 ## The shape to look for
 
 A spin/poll loop whose condition is written by one thread and read by another:
@@ -72,9 +113,18 @@ here — JIT-only, collector-independent, no exception, unbounded iterations —
 but it is **not confirmed**, and the loop that spins has not been identified in
 the Java source yet.
 
-The first thing the next pass should do is find the loop: run under `--nojit`
-with a request counter, diff the two arms' iteration counts per test method to
-name which of the 45 tests spins, then read that test.
+Finding which of the 45 tests spins is harder than it looks and one route is
+already closed: `@WebEndpointTest` is a parameterized *template* (15 methods x 3
+web-server variants = 45 tests), and `DiscoverySelectors.selectMethod(fqcn,
+name)` does not address a template — `SbRunnerMethod` returns
+`tests=0 containersFailed=1` for every one of them. The next pass needs either
+a `MethodSource`-aware selector (the parameter type must be in the selector) or
+a JUnit `TestExecutionListener` that prints each test's start and finish, so the
+last one to start can be named.
+
+With the test named, the remaining question is what its server-side handler
+iterates on — and the client being idle in `select` says the answer is on the
+server.
 
 ## Refuted — do not re-run these
 
