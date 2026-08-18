@@ -7548,6 +7548,29 @@ fn resolve_inline_site_from(
         }
     }
 
+    // A spliced call must not be WORSE than the call it replaced.
+    //
+    // Measured 2026-08-18 (see `jit_inline_call_dispatch`): the chain this
+    // whole line of work targets is already direct-bound, so emitting an
+    // admitted call through the blind dispatch helper traded a ~4 ns raw CALL
+    // for a ~175 ns name resolution — `assertFull` 47 -> 163-266 ns/iter, with
+    // `disp_calls` going from 3 870 to 2 003 361 over 2 000 000 iterations.
+    // Splicing away one frame does not pay for downgrading the call inside it.
+    //
+    // So unless the fallback is explicitly re-enabled, refuse any site with a
+    // call that is not itself spliced, and then CLEAR `invoke_targets` — which
+    // removes the emitter's fallback as well, so a nested splice that bails
+    // during emission bails the enclosing splice instead of quietly becoming a
+    // dispatch. Refusing costs the site its inline; admitting it costs 3.5x.
+    let mut invoke_targets = invoke_targets;
+    if !invoke_targets.is_empty() && !crate::runtime::env_cache::jit_inline_call_dispatch() {
+        let nested_pcs: Vec<usize> = nested_sites.iter().map(|(pc, _)| *pc).collect();
+        if invoke_targets.iter().any(|(pc, _)| !nested_pcs.contains(pc)) {
+            return None;
+        }
+        invoke_targets.clear();
+    }
+
     Some(cratonvm_jit::InlineSite {
         callee_code: padded.to_vec(),
         callee_code_len: code_len,
