@@ -166,6 +166,21 @@ const ALLOWED: &[(&str, &str)] = &[
          names by `the_whole_surface_is_fifteen_variables`.",
     ),
     (
+        "CRATONVM_NO_MISPLACED_FLAG_WARNING",
+        "kind 4: `vm-cli/src/main.rs` - silences the warning that a launcher \
+         option was passed AFTER the main class and therefore ignored. \
+         `warn_about_misplaced_launcher_flags` is called from `main` about \
+         thirty-seven lines BEFORE `install_flags` latches the snapshot, \
+         because the warning is about argv and has to be reachable whatever \
+         the configuration turns out to be. Reading it through \
+         `flags::runtime_var_os` therefore latches the snapshot early and \
+         `install_flags` fails with `runtime flags were read before launcher \
+         configuration` - every run then exits 1, which is how this row was \
+         arrived at rather than by argument. The two lines that establish the \
+         ordering are the `warn_about_misplaced_launcher_flags(&early_argv)` \
+         call and the `install_flags(runtime_flags)` check below it.",
+    ),
+    (
         "CRATONVM_TEST_JAVA_HOME",
         "kind 3: `vm/tests/*` — a JDK for the test harness to shell out to, \
          checked ahead of `JAVA_HOME`",

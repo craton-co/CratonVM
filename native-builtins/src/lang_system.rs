@@ -320,13 +320,20 @@ pub(crate) fn flush_console_streams(ctx: &dyn NativeContext) {
 /// visible divergence rather than a silent hang.
 ///
 /// `CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS=0` restores HotSpot's unbounded wait;
-/// any other value sets the bound in milliseconds. Read with `std::env::var`
-/// rather than through `nbflags()` because that struct lives in `lib.rs`, which
-/// this lane does not own; a follow-up should move it (see W7-92 §7).
+/// any other value sets the bound in milliseconds.
+///
+/// Read through `flags::runtime_var`. It used to use `std::env::var`, with a
+/// note saying `nbflags()` lives in `lib.rs` which that lane did not own — but
+/// the boundary this needs is `cratonvm_types::flags`, not `nbflags`, and this
+/// crate already depends on it. Raw was wrong twice over: the name was declared
+/// nowhere (so `CRATONVM_THREADS=shutdown-hook-timeout-ms=…` could not reach
+/// it), and a raw read of a declared name is served by a live `getenv` instead
+/// of the latched snapshot, which check 4 of `tools/flag-census/check-surface.sh`
+/// flags for every core crate.
 fn shutdown_hook_join_bound() -> Option<std::time::Duration> {
     static BOUND: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *BOUND.get_or_init(|| {
-        let ms = std::env::var("CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS")
+        let ms = cratonvm_types::flags::runtime_var("CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(30_000);

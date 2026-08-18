@@ -58,7 +58,7 @@ parser on the nine edited files — that proves they parse, and nothing else.
 > the warning's own advice (§8.2), makes §6's population table incomplete in its
 > largest row, and falsifies §4.2's "a process that never boxes" premise (§8.3).
 > **Record stays OPEN**; the repair is in `vm/`, is already prescribed by
-> `docs/internal/audits/jdk-only-object-layout-audit.md`, and its own
+> `internal/audits/jdk-only-object-layout-audit.md`, and its own
 > precondition is already discharged (§8.4).
 
 Branch `fix/primitive-in-reference-slot-store-disagreement-20260812`.
@@ -517,7 +517,7 @@ the loop by themselves.
 Slot 0 of a real `java.lang.Class` on JDK 25 is
 `private volatile transient Constructor<T> cachedConstructor` — a reference.
 This is **not a new discovery**; it is
-`docs/internal/audits/jdk-only-object-layout-audit.md` rank 6, an *overlay*
+`internal/audits/jdk-only-object-layout-audit.md` rank 6, an *overlay*
 whose verdict was moved from `unknown` to `safe` on 2026-08-10, and the two
 `JDK-ONLY-LAYOUT: safe` markers at `vm_object.rs:1103-1180` and `:1364-1379`
 record that adjudication in place. What is new is that the W7-84 convergence

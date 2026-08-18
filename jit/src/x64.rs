@@ -1581,6 +1581,59 @@ mod deopt_snapshot_tests {
         assert_eq!(kinds[7], LocalKind::Unknown);
     }
 
+    /// A method with MORE THAN 64 LOCALS gets NO oop mask at all — and
+    /// `classify_local_kinds` is what covers for it.
+    ///
+    /// `compute_local_oop_masks` returns empty vectors for `max_locals > 64`, so
+    /// `build_and_record_deopt_point`'s `is_oop` reads false for EVERY local in
+    /// such a method (slot 0 included, not just the ones above 63). The only
+    /// thing that then publishes a reference local as a reference rather than as
+    /// a truncating `StackSlot` is the `LocalKind::Ref` arm — and that is sound
+    /// exactly because this classifier is a per-slot `Vec`, with no bitset and
+    /// no cap.
+    ///
+    /// Both halves are asserted together on purpose. Either one alone reads as a
+    /// property of a helper; together they are the invariant a reader of that
+    /// call site needs, and the pairing is what fails if someone "optimises"
+    /// `classify_local_kinds` into a `u64` to match its neighbours.
+    ///
+    /// Witnessed end-to-end by `probes/HighLocalOopProbe.java` (84 locals,
+    /// references at slots 74/75/76, OSR-entered, 100 forced collections):
+    /// `oop_reached=false oop_mask=0x0` while those three slots published
+    /// `StackSlotRef`. Its `probes/LowLocalOopProbe.java` twin, identical but
+    /// under 64 locals, reports `oop_reached=true oop_mask=0x700000e`.
+    #[test]
+    fn classify_local_kinds_types_a_reference_above_slot_63() {
+        // wide astore 74; wide aload 74; wide istore 70; return
+        let code = [
+            0xc4, 0x3a, 0x00, 0x4a, // wide astore 74 -> Ref@74
+            0xc4, 0x19, 0x00, 0x4a, // wide aload  74 -> Ref@74
+            0xc4, 0x36, 0x00, 0x46, // wide istore 70 -> Int@70
+            0xb1, // return
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 84);
+        assert_eq!(
+            kinds[74],
+            LocalKind::Ref,
+            "a reference local above slot 63 must still be classified Ref — it is the              ONLY thing that publishes it as a reference in a >64-local method, because              `compute_local_oop_masks` gives that method no mask at all"
+        );
+        assert_eq!(kinds[70], LocalKind::Int);
+        assert_eq!(kinds[83], LocalKind::Unknown);
+
+        // The other half of the invariant: the mask really is absent, so there
+        // is no second opinion to fall back on.
+        let (masks, reached) = crate::x64::licm::compute_local_oop_masks(&code, code.len(), 84, 0);
+        assert!(
+            masks.is_empty() && reached.is_empty(),
+            "compute_local_oop_masks must answer NOTHING above 64 locals; if it ever              starts answering, the deopt snapshot's `is_oop` gains a second source and              this test's premise needs rewriting rather than deleting"
+        );
+
+        // And the same method one local smaller DOES get a mask, so the cliff is
+        // the local count and not something about `wide` encodings.
+        let (masks64, reached64) = crate::x64::licm::compute_local_oop_masks(&code, code.len(), 64, 0);
+        assert!(!masks64.is_empty() && !reached64.is_empty());
+    }
+
     /// The `RowDataType.read` shape: slot 1 is an `int` in one arm of a branch
     /// and a `ref` in the other, so the whole-method classifier must call it
     /// `Ambiguous` — but at a pc only the `istore` arm reaches, the refinement

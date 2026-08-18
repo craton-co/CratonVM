@@ -133,7 +133,7 @@ pub(crate) fn needs_reference_box(value: Value) -> bool {
 /// `get_or_create_primitive_mirror` writes `Value::Int(-1)` into slot 0 of an
 /// object stamped `java/lang/Class`, whose real JDK 25 slot 0 is
 /// `Constructor<T> cachedConstructor`, a reference. That is a VM-internal
-/// overlay (`docs/internal/audits/jdk-only-object-layout-audit.md` rank 6), it
+/// overlay (`internal/audits/jdk-only-object-layout-audit.md` rank 6), it
 /// goes through `shared.mem.heap.set_field` rather than through any
 /// `NativeContext`, and so **no native-side census can ever name it**. Pointing
 /// a reader at the read-side alias census for it — as this message used to —

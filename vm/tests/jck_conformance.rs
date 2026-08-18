@@ -8,7 +8,7 @@
 //! Net, Security, Reflect, Loading, ClassFile, Instructions, Jdbc). Produces a
 //! machine-checkable summary and a regression gate.
 //!
-//! The baseline report lives at `docs/internal/gaps/jdk-regression-baseline.md`.
+//! The baseline report lives at `internal/gaps/jdk-regression-baseline.md`.
 //! Each category has a floor — CI fails if the pass count drops below the
 //! committed floor.
 //!
@@ -702,7 +702,7 @@ fn skip_or_fail_without_corpus(test_name: &str) -> bool {
         panic!(
             "{test_name}: the Tck corpus is not compiled ({dir}/cratonvm/TckClassFile.class \
              is missing) and CRATONVM_REQUIRE_E2E is set. This gate enforces the committed \
-             baseline in docs/internal/gaps/jdk-regression-baseline.md; with no corpus it \
+             baseline in internal/gaps/jdk-regression-baseline.md; with no corpus it \
              enforces nothing, and would have reported `ok` in 0.00s."
         );
     }
@@ -757,7 +757,7 @@ fn run_corpus() -> std::collections::BTreeMap<&'static str, Tally> {
 }
 
 // ---------------------------------------------------------------------------
-// Baseline report (committed under docs/internal/gaps/jdk-regression-baseline.md)
+// Baseline report (committed under internal/gaps/jdk-regression-baseline.md)
 // ---------------------------------------------------------------------------
 
 /// Per-category `(name, pass floor, corpus population)`.
@@ -770,7 +770,7 @@ fn run_corpus() -> std::collections::BTreeMap<&'static str, Tally> {
 /// not the 109 and 43 the committed baseline document still records.
 ///
 /// The floors themselves must match the Floor column of
-/// `docs/internal/gaps/jdk-regression-baseline.md`; that is asserted, against
+/// `internal/gaps/jdk-regression-baseline.md`; that is asserted, against
 /// the file, by `the_committed_baseline_document_and_this_table_agree`.
 const BASELINE_FLOORS: &[(&str, u32, u32)] = &[
     // Floors updated 2026-04-16 after T4.2-T4.6 corpus expansion.
@@ -804,7 +804,7 @@ const BASELINE_FLOORS: &[(&str, u32, u32)] = &[
 /// The committed baseline document, and where it was found.
 ///
 /// Two candidates because the harness doc comment said `gaps/…` for a long time
-/// while the file has lived under `docs/internal/gaps/…`, and `docs/internal` is
+/// while the file has lived under `internal/gaps/…`, and `docs/internal` is
 /// being removed from history by a separate effort. A gate whose committed
 /// baseline cannot be located enforces nothing, so this panics rather than
 /// skipping — the whole subject of this file's 2026-08-13 rewrite.
@@ -1091,7 +1091,7 @@ fn jck_regression_gate() {
         failures.is_empty(),
         "NEW-16 regression gate tripped:\n  {}\n\n\
          The regression gate enforces the committed baseline in \
-         docs/internal/gaps/jdk-regression-baseline.md. If a regression is \
+         internal/gaps/jdk-regression-baseline.md. If a regression is \
          intentional (e.g. a test was removed), update BASELINE_FLOORS and the \
          baseline doc together in the same commit — \
          `the_committed_baseline_document_and_this_table_agree` will tell you \
