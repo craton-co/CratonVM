@@ -296,19 +296,59 @@ The order is therefore:
    naming an inlined scope is malformed rather than deep. Those were two rules
    wearing one tag, and 08-17's pinning test caught its own drift by continuing
    to pass for the wrong reason after the relaxation.
-3. **Inline scopes in deopt metadata** — give `FrameState::caller` a producer.
-   The IR-side representation is already built and tested
-   (`docs/jit/deopt-inline-scopes.md`: `InlineScopeTable`, `caller_chain_for`,
-   `lower_inner_with_scopes`, chain-aware `frame_state_is_resumable`); what is
-   missing for THIS backend is the single-pass scope stack, "pushed at the splice
-   and popped at the callee's return", replacing
-   `build_and_record_deopt_point`'s hard-coded `caller: None`.
-4. **A real call inside a spliced body.** With scopes recorded and resumable,
-   `try_emit_inline_body` can emit the ordinary dispatch/direct-call sequence for
-   `0xb6`/`0xb8`/`0xb9` instead of bailing, and the postcondition above relaxes
-   from "published any metadata" to "published metadata with no caller scope".
-   Note this needs BOTH gates opened: `resolve_inline_site_from` rejects those
-   opcodes outright too, so a site is never even planned.
+3. ~~Inline scopes in deopt metadata.~~ **DONE 2026-08-18.** The single-pass
+   backend has a scope stack: `push_inline_scope` captures the enclosing frame
+   at the invoke (dropping `callee_num_args` stack slots, because a caller scope
+   is parked mid-`invoke`), and `build_and_record_deopt_point` fills
+   `FrameState::caller` from it instead of hard-coding `None`.
+   `try_emit_inline_site`'s postcondition now asks whether a published point
+   *says* it came from inside a splice, rather than whether anything was
+   published at all.
+4. **A real call inside a spliced body** — and the blocker here is NOT what
+   this page said it was. Measured 2026-08-18 with the per-splice trace step 3
+   added: **no splice publishes a deopt point at all, and that is structural.**
+   Precise exception frames and inlining are mutually exclusive
+   (`try_compile_inner`'s unconditional `inline_sites.clear()`, mirrored by
+   `InlineRefusal::PreciseExceptionFrames`), which rules out both precise-frame
+   producers; array ops and `invokedynamic` are rejected at the site resolver,
+   which rules out the bounds-check guard and the indy trap; and OSR exit maps
+   are emitted at the enclosing method's loop headers, not inside a splice.
+
+   So the deopt-metadata postcondition was a *guard*, not the reason invokes are
+   not spliced. The real work is:
+
+   * **write the arm.** `try_emit_inline_body` has no `0xb6`/`0xb8`/`0xb9` case
+     — they hit its catch-all bail — and `resolve_inline_site_from` rejects
+     those opcodes before a site is ever planned. Both gates have to open.
+   * **resolve the callee's own invoke targets.** This is the substantive half.
+     `InlineSite` carries `field_info`, `static_field_info`, `ldc_info` and
+     `elided_invoke_pcs`, all keyed by CALLEE pc and resolved against the
+     CALLEE's constant pool — but nothing for invokes, because none were ever
+     admitted. The emitter has nothing to call until `resolve_inline_site_from`
+     resolves them the same way, and the top-level `invoke_info` cannot be
+     reused: it is keyed by CALLER pc, which is a different bytecode space.
+   * **callee handlers.** `resolve_inline_site_from` already refuses a callee
+     whose own `exception_table` is non-empty; splicing one would need the
+     caller to carry its ranges. Leave that refusal in place for the first cut.
+
+   **Two things previously listed here as blockers are not blockers**, both
+   checked in the code rather than inferred from the comment that suggested
+   them:
+
+   * *The deopt-metadata postcondition.* Measured at step 3: no splice publishes
+     a deopt point, structurally (see above). It is a guard, not a gate.
+   * *The exception-check stub's throw pc.* `dbg_last_pc` is assigned in exactly
+     one place — the outer bytecode walk (`bytecode_walk.rs`, `self.dbg_last_pc
+     = pc`) — and `try_emit_inline_body` never touches it, so throughout a
+     splice it still holds the CALLER's invoke pc. That is not a hazard, it is
+     the correct answer: an exception from an inlined body is attributed to the
+     call site in the caller, whose exception table is the one that should be
+     searched. The inline emitter already relies on this — it calls
+     `emit_post_invoke_exception_check` today for `getfield`, `getstatic`'s
+     `<clinit>` and the arraycopy dispatch, all inside spliced bodies. So a
+     call-carrying splice needs no special admission rule about protected
+     ranges, and there is no reason to restrict the first cut to methods with no
+     exception table.
 5. **Nesting.** `InlineSite` grows a `nested_sites: HashMap<callee_pc,
    InlineSite>`, `resolve_inline_site_from` fills it recursively under a depth
    budget, and the emitter recurses. Statically bound callees are the tractable

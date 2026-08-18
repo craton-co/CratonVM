@@ -66,6 +66,24 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+/// FxHash-backed aliases for the two collections on the flag *read* path.
+///
+/// PERF (2026-08-18, commons-math `BigDecimalBench` profile): `runtime_var_os`
+/// consults `declared_flag_names()` on EVERY call, and with the default
+/// `RandomState` that is a SipHash of the key plus a `memcmp`. On a
+/// `BigDecimal` benchmark that showed up as `hash_one::<&str>` 1.70% +
+/// `sip::Hasher::write` 1.41% of the whole process — for looking up string
+/// constants in a set that never changes after startup.
+///
+/// This is the same trade this crate already made for `StringPool` (see the
+/// `rustc-hash` dependency note in Cargo.toml): FxHash is ~3-5x faster than
+/// SipHash on the short ASCII keys these hold, and neither collection is
+/// exposed to untrusted input — the flag-name set is built from a compile-time
+/// inventory, and `MapSource` from the process environment — so the HashDoS
+/// resistance SipHash buys is not load-bearing here.
+type FxHashSetStr = rustc_hash::FxHashSet<&'static str>;
+type FxHashMapStr = rustc_hash::FxHashMap<String, OsString>;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -97,7 +115,7 @@ impl FlagSource for EnvSource {
 /// An explicit map, for tests and for launchers that layer `-XX:` flags over
 /// the environment.
 #[derive(Debug, Clone, Default)]
-pub struct MapSource(HashMap<String, OsString>);
+pub struct MapSource(FxHashMapStr);
 
 impl MapSource {
     /// Build from `(name, value)` pairs.
@@ -131,7 +149,7 @@ impl MapSource {
     /// not valid UTF-8 are dropped, which is not observable — every lookup is
     /// by `&str`, so such a name could never be matched anyway.
     pub fn from_process_env() -> Self {
-        let mut map: HashMap<String, OsString> = HashMap::new();
+        let mut map: FxHashMapStr = FxHashMapStr::default();
         for (name, value) in std::env::vars_os() {
             if let Ok(name) = name.into_string() {
                 map.entry(name).or_insert(value);
@@ -141,7 +159,7 @@ impl MapSource {
     }
 
     fn declared_snapshot(src: &dyn FlagSource) -> Self {
-        let mut map = HashMap::new();
+        let mut map = FxHashMapStr::default();
         for &name in declared_flag_names() {
             if let Some(value) = src.get(name) {
                 map.insert(name.to_string(), value);
@@ -2252,10 +2270,10 @@ impl VmFlags {
 
 static FLAGS: OnceLock<VmFlags> = OnceLock::new();
 
-fn declared_flag_names() -> &'static HashSet<&'static str> {
-    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+fn declared_flag_names() -> &'static FxHashSetStr {
+    static NAMES: OnceLock<FxHashSetStr> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let mut names = HashSet::new();
+        let mut names = FxHashSetStr::default();
         for entry in crate::flag_groups::INVENTORY {
             if let Some(name) = entry.on_key {
                 names.insert(name);
@@ -2620,12 +2638,61 @@ pub fn runtime_var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError
 #[inline]
 pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     let key = key.as_ref();
+    // Per-name read census (`CRATONVM_DBG_FLAGREADS=1`). Kept because it is the
+    // instrument that found the `CRATONVM_DBG_COMPACT_INLINE` read in
+    // `jit_getfield` — `perf` put `runtime_var_os` at 1.21% of a `BigDecimal`
+    // benchmark, but inlining defeated stack attribution and a dwarf capture
+    // pointed at the callee side of the JIT->heap boundary. The KEY names the
+    // caller directly, and did so in one run. Off, it is one relaxed atomic load.
+    flag_read_census(key);
     if let Some(name) = key.to_str() {
         if declared_flag_names().contains(name) {
             return flags().legacy_var_os(name);
         }
     }
     std::env::var_os(key)
+}
+
+/// Per-flag-name read census — see the call in [`runtime_var_os`].
+///
+/// `CRATONVM_DBG_FLAGREADS=1` prints the top offenders every 200k reads. A flag
+/// read is supposed to be rare (every gate is expected to cache its answer), so
+/// a name appearing here in the millions IS the bug — which is exactly how
+/// `CRATONVM_DBG_COMPACT_INLINE` was found at 4,560,891 of 4,600,000 reads
+/// (99.1%) on a 50k-iteration `BigDecimal` run, uncached inside `jit_getfield`.
+/// After that fix the same run does not reach the first 200k report at all.
+fn flag_read_census(key: &OsStr) {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
+    let gate = match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            // std::env directly: reading through this module would recurse.
+            let on = std::env::var_os("CRATONVM_DBG_FLAGREADS").is_some();
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    };
+    if !gate {
+        return;
+    }
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static COUNTS: OnceLock<std::sync::Mutex<HashMap<String, u64>>> = OnceLock::new();
+    let map = COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let name = key.to_string_lossy().into_owned();
+    let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut g) = map.lock() {
+        *g.entry(name).or_insert(0) += 1;
+        if n % 200_000 == 0 {
+            let mut v: Vec<(String, u64)> = g.iter().map(|(k, c)| (k.clone(), *c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("[flagreads] total={n}");
+            for (k, c) in v.iter().take(8) {
+                eprintln!("[flagreads]   {c:>10}  {k}");
+            }
+        }
+    }
 }
 
 /// Publish an explicitly-built configuration.

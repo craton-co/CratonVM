@@ -162,6 +162,87 @@ over many. `--dump-native-registry`'s invocation census plus a per-call probe
 (`probes/BignumNativeCostProbe.java`) separate those two; a flat profile alone
 cannot.
 
+### A fourth item, found by re-profiling AFTER the three above (2026-08-18)
+
+The three fixes above changed the shape of the profile, and a second
+`perf record` on `c8c7545af` surfaced something the first one had buried:
+**~4.3% of the run was hashing flag names with SipHash.**
+
+`cratonvm_types::flags::runtime_var_os` consults `declared_flag_names()` on
+**every** call, and with the default `RandomState` that is a SipHash of the key
+plus a `memcmp` — to look up compile-time string constants in a set that never
+changes after startup.
+
+| symbol | before | after |
+|---|---:|---:|
+| `hash_one::<&str>` (SipHash) | 1.70% | 0.24% (and now a `TypeId` caller, not this path) |
+| `sip::Hasher::write` | 1.41% | 0.19% |
+| `runtime_var_os::<&str>` | 1.21% | absent |
+| `FxHasher::hash_one` | — | 0.05% |
+
+The fix is the trade this crate had already made once: `types/Cargo.toml`
+records `StringPool` moving off SipHash because "FxHash is ~3-5x faster than
+SipHash for the short ASCII strings", and the same reasoning applies verbatim to
+`declared_flag_names()` and `MapSource`. Neither takes untrusted input — one is
+built from a compile-time inventory, the other from the process environment — so
+SipHash's HashDoS resistance is not load-bearing.
+
+**Wall clock: 7,993 -> 7,752 ms median over 9 interleaved rounds (+3.0%), which
+matches the profile share removed but is INSIDE this benchmark's noise** (the
+same binary ranges 7,064-21,012 ms across those rounds). Stated as "consistent
+with, not demonstrated by" the wall clock on purpose. One Azure run read
+1,311 ms against an earlier 2,233 ms — 1.7x — and that is **noise, not the
+effect**: the patched binary alone ranges 1,311-2,154 ms over five runs.
+Recorded because a 1.7x that cannot be true is exactly the figure somebody
+quotes later.
+
+Order-safety was the one real risk of swapping a hasher and was checked:
+`declared_flag_names()` is iterated in exactly one place, which inserts distinct
+names into a map (order cannot change the result), and `from_process_env`
+iterates `env::vars_os()` — the source, not the map — so its documented
+first-wins duplicate semantics are untouched.
+
+**Found (2026-08-18):** the uncached caller was
+`cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")` inside
+**`jit_getfield`** (`vm/src/jit/helpers.rs`), read on every JIT getfield helper
+call purely to decide whether to print a debug dump. Now `OnceLock`-cached,
+which is the idiom the sibling gate ten lines above it
+(`getfield_receiver_census_enabled`) already used.
+
+How it was found matters more than the fix. `perf` could not name it: the flat
+profile showed `runtime_var_os` at 1.21% with no caller, and a `dwarf` capture
+attributed it to `alloc_raw_tlab` / `is_object_address` / `get_field` — the
+*callee* side of the JIT->heap boundary, which sent the first search into
+`zgc.rs` where every call site is properly cached. A **per-name census** of flag
+reads (`CRATONVM_DBG_FLAGREADS=1`, kept in `flags.rs`) named it in one run:
+
+```
+total=4,600,000
+   4,560,891  CRATONVM_DBG_COMPACT_INLINE     <- 99.1%, ~91 per iteration
+      23,086  CRATONVM_DBG_SHADOW
+       6,734  CRATONVM_DBG_EXCFRAME
+```
+
+After the fix the same run never reaches the first 200k report. **A flag read is
+supposed to be rare — every gate is expected to cache its answer — so a name in
+the millions IS the bug**, which is why counting by key beat counting by stack.
+
+Worth recording where it sat: the comment on `GETFIELD_HELPER_CALLS` directly
+above the call site argues carefully that one relaxed atomic increment is too
+cheap to appear in the measured 8.2 ns `receiverFieldTax`. That is correct. The
+uncached environment lookup on the very next line was the expensive one, and it
+had been reasoned right past.
+
+**Wall clock: not resolved, and not claimed.** Nine interleaved rounds put the
+median at 6,836 -> 6,421 ms (+6.1%) but the mean at 6,792 -> 6,831 (~0%) and the
+min at 6,155 -> 6,135 (~0%), with the fixed arm ahead in 6 of 9 paired rounds.
+Median and mean disagreeing means the distribution moved, not the centre. The
+arithmetic agrees it should be small: after the FxHash change above, each read is
+~2 Fx hashes, so 4.56M x ~25 ns is ~1-2% — inside this benchmark's noise. What is
+demonstrated is the removal of 4.6M redundant reads per 50k iterations; the
+timing benefit is not, and these two fixes overlap (this one removes the calls,
+the FxHash one made whatever remains cheap).
+
 ## What is left, and why it is not on this page
 
 The post-fix profile of the witness class is flat and no longer bignum-shaped:

@@ -228,182 +228,67 @@ back through `Properties.put` threw inside `Provider.<init>` — the synthetic
 `Provider` layout carries no usable `Properties` backing map — and with every
 Map view registered there is no longer a reader for the inherited one.
 
-### `Serialisation` — `readClassDescriptor()` returns a stub and reads nothing
+### `Serialisation` — order-dependent, and NOT the `readClassDescriptor` stub
 
-Fails `NullPointerException` at `ObjectInputStream.readNonProxyDesc:1927`, and
-**fails identically on pristine `origin/dev`**, so it is not from this lane's
-work. The cause is nevertheless identified, because the stack says it plainly:
+**Correction.** An earlier revision of this page named
+`ObjectInputStream.readClassDescriptor()` as the cause: `serialization.rs`
+registers it to return a constant `java/lang/Object` stub that consumes no
+stream, which would explain the doubled `readNonProxyDesc → readClassDesc →
+readNonProxyDesc` in the trace. That reading was wrong, and the reason it was
+wrong is worth keeping:
 
-```text
-readNonProxyDesc(ObjectInputStream.java:1927)   <- NPE
-readClassDesc(ObjectInputStream.java:1785)
-readNonProxyDesc(ObjectInputStream.java:1927)
-readClassDesc(ObjectInputStream.java:1785)
-readOrdinaryObject(ObjectInputStream.java:2101)
-```
+**`register_serialization_natives` is synthetic-JDK ONLY.** It is called from
+`register_synthetic_overrides` in `lib.rs`, so on the real-JDK path — which is
+the only path the bc-java suite runs on — none of those natives are registered
+at all. The stub is real, and it is inert here. Reading a registration and
+concluding it is in the path skipped the step of asking whether the registrar
+runs in this mode.
 
-Line 1927 is `desc.initNonProxy(readDesc, cl, resolveEx, readClassDesc(false))`
-and `desc` cannot be null — it is `new ObjectStreamClass()` twenty lines up. The
-recursion is the tell: `readNonProxyDesc` is reading the SAME class descriptor
-twice.
+What is actually true, measured:
 
-`serialization.rs` registers `ObjectInputStream.readClassDescriptor()` as:
+* **Ordinary serialization matches HotSpot exactly.** `SerProbe` round-trips a
+  String, an Integer, a BigInteger, an `ArrayList`, a custom `Serializable` and
+  a nested one: same classes back, same byte counts, on both VMs.
+* **BouncyCastle keys round-trip too**, including the cross-VM direction —
+  bytes written by HotSpot and read on CratonVM give back a
+  `BCRSAPublicKey` with the right modulus (`SerBC`).
+* **`SerialisationTest` PASSES standalone**: `Serialisation: Okay`. It fails
+  only inside the full `RegressionTest` run.
 
-```rust
-let desc = alloc_stream_class_stub(ctx, "java/lang/Object")?;
-Ok(Some(Value::Object(Some(desc))))
-```
+So this is an ORDER-DEPENDENT failure — something earlier in the run leaves
+state that breaks it — not a defect in deserialization as such. It fails the
+same way on pristine `origin/dev`, so it is not from this lane's work.
 
-It ignores the stream entirely — always `java/lang/Object`, and **consumes no
-bytes**. So the stream position never advances, the next read sees the same
-`TC_CLASSDESC` byte and recurses, and `initNonProxy` is handed a descriptor
-describing a class the stream never mentioned.
-
-The JDK's own `readClassDescriptor` is a documented extension point whose
-default reads the descriptor from the stream; a constant is not a
-simplification of that, it is a different function. Fixing it means parsing the
-serialized class descriptor properly, which is why it is recorded here rather
-than patched alongside the JCA work.
-
-### CLOSED: the `dev` defect — `Mac.getInstance(name, Provider)`
-
-`Mac.getInstance(algorithm, providerObject)` refused EVERY BouncyCastle name
-while `Mac.getInstance(algorithm, "BC")` served the same names, and HotSpot
-serves both forms.
-
-**It was not from this lane's work, and it was still unfixed on `dev`.** The
-goal for this pass was to check that before doing anything else, so it was
-checked twice: by building the `origin/dev` merge point itself, and by building
-current `origin/dev` (`9279bf108`, 44 commits later) and running the probe.
-Broken on both; no commit in between touched the JCA surface. The strengthened
-probe (`MacProvObj2`) also found what the original missed:
+**It is not a neighbouring test either.** `SerPair` runs the immediate
+predecessors from `RegressionTest`'s list and then `SerialisationTest` in one
+JVM:
 
 ```text
-                          before (pristine dev)         after
-HmacSHA256      byName    BC len=32 58019f4c…           BC len=32 58019f4c…
-                byObject  SunJCE len=32 58019f4c…       BC len=32 58019f4c…
-1.3.14.3.2.26   byObject  EX no such algorithm … BC     BC len=20 2376178e…
+after [none]    Serialisation: Okay
+after [rsa]     Serialisation: Okay
+after [sealed]  Serialisation: Okay      <- SealedTest is itself serialization-heavy
+after [seed]    Serialisation: Okay
+after [all]     Serialisation: Okay
 ```
 
-`HmacSHA256` SUCCEEDED and reported the wrong provider — a silent
-misattribution that an exception-only probe scores as a pass. Print the MAC and
-the provider, not "no exception".
+So no single predecessor carries the state. It takes the whole ~90-test run,
+which points at CUMULATIVE process state — heap pressure and collection count,
+class loading, or an address-keyed side table outliving its object — rather
+than at any one interaction. That is the same family as the `CipherStreamTest2`
+flake documented above, which also only appears under a long run and also
+presents as a null where an object is expected.
 
-**Cause.** The overload checked that the named provider OWNS the algorithm and
-then put the name to this engine's own `mac_algorithm_supported` gate, with
-neither the provider's alias rows (`canonical_if_unrecognised`) nor its own SPI
-(`build_real_mac`). The `(String, String)` overload had both steps; this one had
-neither. So a provider was told it does not implement what the same table had
-confirmed it owns, one line earlier.
+The NPE is at `ObjectInputStream.readNonProxyDesc:1927`,
+`desc.initNonProxy(readDesc, cl, resolveEx, readClassDesc(false))`, with no
+callee frame — and `desc` is `new ObjectStreamClass()` twenty lines earlier, so
+it cannot be null on any reading of the Java. A null receiver at a line whose
+receiver was just allocated is a VM-level fact, not a library one.
 
-Closed `BCFKS` and `PKCS12SecretKey`, restored `cert.test` to `OK (33 tests)`,
-and unblocked the `Security.getProperty` work below.
-
-### CLOSED: `Security.getProperty` now reads `java.security`
-
-It answered four hardcoded keys and `null` for every other one, though the
-configured JDK's own `conf/security/java.security` was right there. The reader
-was written in the first pass and committed UNWIRED, because turning it on sets
-`keystore.type.compat=true`, which sends BouncyCastle's `AdaptingKeyStoreSpi`
-down exactly the path that hit the Mac defect above — enabling it first took
-`cert.test` from PASS to FAIL. With the overload fixed the gate opens onto a
-path that works, and the `#[allow(dead_code)]` is gone.
-
-### CLOSED: the `KeyStore` service rows were transcribed from memory
-
-All five rows were wrong, and each wrong in a way that stays invisible until
-something asks the exact question. Measured on jdk-25 (`KsOwner` probe) against
-what this VM answered:
-
-| | JDK 25 | CratonVM (before) |
-|---|---|---|
-| SUN `PKCS12` | `PKCS12KeyStore$DualFormatPKCS12` | `PKCS12KeyStore` |
-| SUN `JKS` | `JavaKeyStore$DualFormatJKS` | `JavaKeyStore$JKS` |
-| SUN `DKS` | `DomainKeyStore$DKS` | missing |
-| SunJSSE `PKCS12` | `PKCS12KeyStore` | **missing** |
-| `getInstance("PKCS#12")` | `KeyStoreException` | invented alias, succeeded |
-
-The `DualFormat*` classes are the point of the SUN rows: they are the
-delegators that sniff the stream and accept either format, which is what makes
-`keystore.type.compat` mean anything at all. The missing SunJSSE row is what
-`PKCS12StoreTest.checkNoDuplicateOracleTrustedCertAttribute` asks for by name —
-it writes with BouncyCastle and reads back with the platform's own store, which
-is an interop check and not an implementation detail.
-
-### CLOSED: `X500Principal` did not keep the encoding it was built from
-
-`getEncoded()` re-derived the DER from the canonical RFC-4514 string, under a
-comment asserting *"the canonical `Name` form is byte-stable, so this
-round-trips exactly"*. It is not. The canonical string does not carry each
-value's ASN.1 STRING TYPE, so re-encoding picks PrintableString where
-BouncyCastle wrote UTF8String, and RFC 5280 name matching is byte equality over
-the DER:
-
-```text
-certGn  ...06035504030c04526f6f74...   from the certificate     (0c = UTF8String)
-expGn   ...0603550403 1304526f6f74...  rebuilt via X500Principal (13 = Printable)
-equals=false        -- and both print `CN=Root,O=BC,OU=Test+O=Bouncy`
-```
-
-That is `IDPRelativeNameTest.testMultiValuedRelativeNameRoundTrip`. The
-multi-valued RDN was a red herring: it survived every hop intact (parse,
-encode, decode, GeneralName, the certificate extension — all byte-identical to
-HotSpot). What differed was the CRL issuer name rebuilt through
-`getIssuerX500Principal()`.
-
-**Two things hid it.** First, the reported failure named a DIFFERENT
-distribution point than the one that actually failed: `checkCRLs` tries the
-certificate's real DPs, keeps only the LAST exception, then retries with a DP
-synthesised from the issuer — so the message on screen was the second failure
-and the first was discarded. Calling
-`PKIXCRLValidator.checkDistributionPointName` directly with the real DP is what
-surfaced it. Second, both names PRINT identically, so every `toString`
-comparison agreed; only the encodings disagreed.
-
-`--nojit` reproduced it, which took the JIT off the table in one run.
-
-### CLOSED: PKCS#12 is a BER format and the parser accepted only DER
-
-BouncyCastle writes indefinite lengths and segmented OCTET STRINGs, so every
-PKCS#12 file written by the most widely deployed third-party JCA provider was
-unreadable here — `IOException: PKCS#12 parse failed: ASN1Error { kind:
-Invalid }`, which is a Rust error surfacing through a Java API. `openssl
-asn1parse` on the two files, same certificate and password, shows it at a
-glance:
-
-```text
-BouncyCastle            JDK
-  0:d=0 hl=2 l=inf        0:d=0 hl=4 l= 786   SEQUENCE
- 20:d=3 hl=2 l=inf       26:d=3 hl=4 l= 681   OCTET STRING  (BC's is CONSTRUCTED)
-669:d=4 hl=2 l=  0                            EOC
-```
-
-`ber_to_definite_length` rewrites indefinite lengths to definite ones and joins
-segmented OCTET STRINGs into primitive ones. It runs only after a DER parse
-fails, so the conforming path is untouched, and a DER file comes back
-byte-identical. Six unit tests cover the rewrite, including that a truncated
-input is an error rather than a short read.
-
-Deliberately NOT a general BER-to-DER canonicaliser: SET OF ordering and
-primitive-value canonicalisation are left alone, because the parser does not
-depend on them and rewriting them would change the bytes the PKCS#12 MAC is
-taken over.
-
-### The other three `jce.provider.test` rows
-
-* `SlotTwo` — CLOSED. `Cipher.getProvider()` reports this engine's own identity
-  unless told otherwise, and the anonymous chain walk never recorded which
-  provider actually answered: a working cipher that named the wrong provider.
-  The named overloads had always recorded it.
-* `RSATest` — CLOSED. OAEP used ONE digest for both the label hash and MGF1.
-  `OAEPWith<md>AndMGF1Padding` names only `<md>`; SunJCE takes MGF1 from
-  `OAEPParameterSpec`'s default, which is SHA-1 whatever `<md>` is. Measured:
-  SunJCE's `OAEPWithSHA-256AndMGF1Padding` ciphertext decrypts under
-  BouncyCastle only with `MGF1ParameterSpec.SHA1`. This engine answers as
-  SunJCE, so it makes SunJCE's choice.
-* `PKCS12Store` — its first wall (`IOException: stream does not represent a
-  PKCS12 key store`) is the `Security.getProperty` gap above; behind it sits the
-  `dev` regression above.
+Next step: run `RegressionTest` under the `gc::guard` diagnostics that named
+the `CipherStreamTest2` gap (`in_published_snapshot`, root-collection events)
+and check whether one fires around `SerialisationTest`, rather than bisecting
+the test list further — the bisect has already been shown not to converge on a
+predecessor.
 
 ## Instruments that earned their keep
 

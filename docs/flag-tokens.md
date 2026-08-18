@@ -352,6 +352,7 @@ export inherited from a parent shell.
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
 | `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
+| `a5-engagement` | `CRATONVM_DBG_A5_ENGAGEMENT` |
 | `unreg-memo-audit` | `CRATONVM_DBG_UNREG_MEMO_AUDIT` |
 | `redefine-dump` | `CRATONVM_DBG_REDEFINE_DUMP` |
 | `npe-stack` | `CRATONVM_DBG_NPE_STACK` |
@@ -711,6 +712,7 @@ export inherited from a parent shell.
 | `verify-ir` | `CRATONVM_JIT_VERIFY_IR` |
 | `verify-memory-chain` | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` |
 | `lambda-adapter` | `CRATONVM_JIT_LAMBDA_ADAPTER` |
+| `lambda-capture-adapter` | `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER` |
 | `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
 | `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
