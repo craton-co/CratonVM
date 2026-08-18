@@ -56,6 +56,7 @@ public final class OsrExcTableProbe {
     static long handlerLocalSum;
     static long sideEffects;
     static long escaped;
+    static long caught;
     static long bodyRuns;
 
     /** Throws on every 4096th value — a callee, so the throw crosses a real invoke. */
@@ -151,6 +152,41 @@ public final class OsrExcTableProbe {
         } while (i != n);
     }
 
+    /**
+     * A protected range containing a site that does NOT publish a precise
+     * frame — here an `ldc` of a String constant, whose lowering allocates
+     * through `helpers.ldc_string` and branches to the SHARED sentinel stub
+     * rather than recording a reason-9 point at the bci.
+     *
+     * The lift's admission rule must refuse this method
+     * (`osr-DENY (osr-exc-site-unpublished pc=… opcode=0x12)`), because the
+     * alternative is an exception arriving with no throw bci and the live
+     * frame's stale pre-OSR locals. Refused, it runs interpreted and must still
+     * produce the same answer — which is what makes this an arm rather than a
+     * comment.
+     */
+    static void loopUnpublishableSite(int n) {
+        int i = 0;
+        do {
+            try {
+                if (mayThrow(i, "guard")) {
+                    caught++;
+                }
+            } catch (IllegalStateException e) {
+                catchCount++;
+                handlerLocalSum += i;
+            }
+            i++;
+        } while (i != n);
+    }
+
+    static boolean mayThrow(int i, String tag) {
+        if ((i & 0xFFF) == 0) {
+            throw ISE;
+        }
+        return tag.length() == 0;
+    }
+
     public static void main(String[] args) {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 300_000;
 
@@ -176,6 +212,11 @@ public final class OsrExcTableProbe {
         }
         System.out.println("loopEscapes    catchCount=" + catchCount
                 + " escaped=" + escaped);
+
+        catchCount = 0; handlerLocalSum = 0; caught = 0;
+        loopUnpublishableSite(n);
+        System.out.println("loopUnpublish  catchCount=" + catchCount
+                + " handlerLocalSum=" + handlerLocalSum);
         // `otherThrow` is used by `loopTwoRanges` only; referenced here so a
         // future edit cannot quietly orphan it.
         if (args.length > 99) { otherThrow(0); }
