@@ -90,7 +90,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Zero slack, matching `stub_ratchet`'s contract: this is the observed count,
 /// not a rounded-up allowance.
-const BASELINE_OFFENDERS: usize = 322;
+const BASELINE_OFFENDERS: usize = 319;
 
 /// Minimum number of declarations the scan must find before its result means
 /// anything.
