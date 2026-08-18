@@ -156,6 +156,52 @@ the percentage does: the inline branch works for a few thousand reads during
 startup and then never again for the rest of the process. In steady state the
 fast path is taken **zero** times.
 
+## Follow-up 2026-08-18: what is left is ONE reference-field read under ZGC
+
+Two fixes landed on `dev` while this page was being written
+(`a6f0ecf75`, `8787edbbe`, both on the getfield page's own branch). Re-measured
+on Azure Linux, quiet host (load 1.3), same probe, 3 ZGC reps + 2 Generational:
+
+| term | ZGC (default) | Generational |
+|---|---:|---:|
+| `callTax` | 2.85 | 2.46 |
+| `virtualTax` | 0.31 | 0.71 |
+| `argsAndLoadTax` | 0.6 | 0.9 |
+| **`receiverFieldTax` — a REFERENCE field** | **25.2** | **0.95** |
+| `primFieldTax` — a PRIMITIVE field | 1.51 | 1.51 |
+| **`totalGetterTax`** | **28.7** | **4.3** |
+
+Three things follow, and they finish this page's line of enquiry:
+
+* **Primitive field reads are fixed**, on both collectors: 13.19 → **1.51** ns,
+  an 8.7x improvement, and `[GETFIELD_CENSUS] helper_calls` drops from 4 arms'
+  worth of reads to 3 — `primFieldGet` no longer calls the helper **at all**.
+* **A reference field costs 25.2 ns on ZGC and 0.95 ns on Generational — 26x.**
+  The whole residual accessor tax is that one operation, and one collector
+  already does it in a nanosecond.
+* **The single-pass arm was never the problem.** The getfield page's open item 1
+  asks why `stack_oop_marks_exact` is false at these sites. It is not false:
+  with a per-clause emission diagnostic on
+  `receiver_is_trusted_oop`'s three conjuncts, **zero** sites report a refusal,
+  and the blocking site prints `getfield pc=1 off=0 ref=true`. The single-pass
+  arm takes its shortcut; the misses are all the **IR/C2** arm, whose own
+  shortcut is primitives-only *by design*, because an inline load of a
+  reference field under ZGC hands on a `Z_COLORED_TAG | colour | offset` word
+  that has had no load barrier.
+
+So the remaining lever is not a guard bug and not an admission gap. It is the
+ZGC JIT load barrier (`feature-designs/zgc-jit-load-barrier.md`), or the
+read-side bounds table the getfield page proposes as its own item 2. Until one
+of those exists, **`BOBYQAOptimizer`'s accessors — `ArrayRealVector.data` and
+`Array2DRowRealMatrix.data` are both reference fields — cannot inline on the
+default collector**, and that is the whole of what is left of this page.
+
+One observation offered with its caveat: the same probe on the same host read
+`receiverFieldTax=13.23` before those two commits and 25.2 after, i.e. the
+reference-field path appears to have got *slower* even as the primitive path
+got 8.7x faster. That is one before/after pair on one host, not a bisect, so it
+is a thing to check rather than a claim.
+
 ## What would fix it
 
 The lever is a single field read costing ~9 ns where HotSpot pays a load, taken

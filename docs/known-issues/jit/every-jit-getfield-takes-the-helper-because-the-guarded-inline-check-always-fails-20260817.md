@@ -414,11 +414,31 @@ Partial, and named as such.
 
 ## What is still open
 
-1. **The remaining ZGC/G1 misses are the SINGLE-PASS arm's containment check.**
-   That arm has its own trusted-oop shortcut and is not getting it here, because
-   it requires `stack_oop_marks_exact`. Why that is false at these sites is the
-   next question, and it is a third sub-problem, not a restatement of the first
-   two.
+1. ~~**The remaining ZGC/G1 misses are the SINGLE-PASS arm's containment
+   check**, which is not getting its trusted-oop shortcut because it requires
+   `stack_oop_marks_exact`.~~ **Answered 2026-08-18, and the premise was wrong.**
+   `stack_oop_marks_exact` is not false at these sites. A per-clause diagnostic
+   on `receiver_is_trusted_oop`'s three conjuncts (under
+   `CRATONVM_DBG_COMPACT_INLINE`, emission-time only) prints **zero** refusals
+   across `probes/AccessorDispatchProbe.java` — the single-pass arm takes its
+   shortcut everywhere.
+
+   The residual misses are the **IR/C2** arm, and they are not a bug: its
+   trusted-oop shortcut is primitives-only *by design*, and the blocking site
+   prints `getfield pc=1 off=0 ref=true`. Measured on Azure Linux, quiet host,
+   after `a6f0ecf75` + `8787edbbe`:
+
+   | field kind | ZGC | Generational |
+   |---|---:|---:|
+   | primitive `int` | **1.51 ns** | **1.51 ns** |
+   | reference `double[]` | **25.2 ns** | **0.95 ns** |
+
+   Primitive reads are fixed on both collectors and call the helper zero times.
+   A reference read is **26x** more expensive on ZGC than on Generational,
+   which is exactly the colored-pointer constraint this page's item 3 already
+   names — so what is left is not a guard to repair but the load barrier to
+   build. That makes item 2 below (a read-side bounds table) the real successor
+   to this page, not a fourth sub-problem here.
 2. **The proper fix for containment under a non-publishing collector is a
    separate READ-SIDE bounds table.** `JIT_REGION_BOUNDS` cannot be filled (see
    above), but nothing stops a second table carrying each collector's mapped
