@@ -163,10 +163,15 @@ Thirteen bytes for a one-argument SAM. Three properties keep it that small:
   cascade loads each operand-stack slot into `ARG_REGS[i]` without consulting
   its type — so no type information is needed. `LambdaAdapterProbe`'s
   double-argument arm is the check that this stays true.
-* **It touches no memory**, which is what confines it to NON-CAPTURING lambdas:
-  reading a captured field from a hand-emitted thunk would mean reproducing the
-  compact/legacy body-layout branch and every per-type width the `getfield` arms
-  handle. A capturing lambda keeps the Rust arm at ~200 ns.
+* **It touches no memory**, which is what confined it to NON-CAPTURING lambdas
+  *when this was written*: reading a captured field from a hand-emitted thunk
+  looked like it would mean reproducing the compact/legacy body-layout branch
+  and every per-type width the `getfield` arms handle. A capturing lambda kept
+  the Rust arm at ~200 ns.
+
+  **Superseded 2026-08-18.** The first half of that is not true of a lambda
+  proxy. See §4's "the one that is still open", which is now closed, and which
+  says what the obstacle actually was.
 
 Invalidation is the same commitment a JIT'd caller's baked direct call makes,
 and is registered the same way: the thunk's `_direct_callee_entries` names the
@@ -224,14 +229,62 @@ starting from a profile of `LambdaCompositionProbe` (flat: the interpreter loop
 at 7%, the native registry's three lookup functions at ~5.8%, allocation ~3%),
 and it should not be filed as a lambda problem.
 
-### The one that is still open
+### The one that was still open — closed 2026-08-18
 
-A CAPTURING lambda keeps the Rust arm and its ~200 ns, because the thunk may not
+A CAPTURING lambda kept the Rust arm and its ~200 ns, because the thunk may not
 read a captured field without reproducing the compact/legacy body-layout branch.
-That is the honest successor to this page, and unlike the residual it replaces
-it is a bounded piece of work with a known shape: emit the `GC_FLAG_COMPACT`
-test and the per-type loads the `getfield` arms already emit, or give the proxy
-a real body the ordinary compiler can handle.
+
+**Most of that premise was wrong, and it was wrong in a way worth recording,
+because it is the same mistake this page's §3 memo made: reasoning about a
+general obstacle instead of asking what the specific object looks like.**
+
+A lambda proxy's class id comes from `alloc_lambda_proxy_id`, which counts up
+from `0x8000_0000` — disjoint from every id class definition hands out. Nothing
+registers a `CompactLayout` for one, and `plan_object_alloc` sets
+`GC_FLAG_COMPACT` only when a registered layout matches the allocation's field
+count. So every lambda proxy in this VM is a uniform 16-byte-cell object, its
+capture offsets are the compile-time constants
+`HEADER_SIZE + i * SLOT_SIZE + payload`, and **the branch that was the stated
+blocker never needed emitting at all.** What remained was the small half: three
+loads cover every Java type, the same three the `getfield` legacy arm emits.
+
+That is a fact about this VM rather than a property of thunks, so
+`lambda_adapter_entry` asks `class_layout_for_fields` at build time and refuses
+if it ever answers otherwise — the feature disables itself rather than reading
+captures at the wrong offsets.
+
+The thunk therefore grew a prologue rather than a branch: save the receiver to
+`r11`, slide the SAM arguments to sit *after* the captures, load the captures
+into the registers the slide vacated, tail-jump. The arguments now move by
+`captures - 1` registers — down one for none, not at all for one, up for more —
+and the slide runs in whichever direction reads each register before the step
+that writes it.
+
+One genuine restriction survives, and it is about the collector rather than the
+layout: a REFERENCE capture is refused while `narrow_oops_block_inline_fields()`
+holds — compressed oops on, or ZGC's read barrier armed — which is the same gate
+and the same moment the inline `getfield` codegen makes its own commitment. A
+primitive capture is unaffected by either.
+
+`CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` is the kill switch, kept separate from
+`CRATONVM_JIT_LAMBDA_ADAPTER` so a same-binary A/B can hold the non-capturing
+thunk fixed while moving only this.
+
+#### What the fixture had to learn
+
+`captureShapesChecksum` covers one capture of each width, and every lambda in it
+captures exactly ONE value. A deliberate break that ignored the capture index
+and read every capture from cell 0 therefore passed the whole suite, engagement
+assertions included — the offsets were all zero anyway. `multiCaptureChecksum`
+exists for that: three lambdas holding two captures each, combined
+non-commutatively, one pair of equal width so the index is isolated from the
+load. With it, the same break fails with an access violation.
+
+A second break — emitting the int-category load zero-extending instead of
+sign-extending — passed, and that one is *correct*: an int-category parameter is
+stored to a frame local and read back 32 bits at a time, so the upper half is
+don't-care. `MOVSXD` is emitted because it is what the neighbouring code emits,
+not because anything can see it. The comment on `CaptureLoad::Int` says so.
 
 ## 5. What pins it
 

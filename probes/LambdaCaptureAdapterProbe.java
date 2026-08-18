@@ -154,7 +154,7 @@ public class LambdaCaptureAdapterProbe {
         // integer register, so the thunk's wide load is exactly right — and
         // this is the arm that says so rather than assuming it.
         final double d = f64(1.0 / 3.0);
-        System.out.printf("5 double_capture=%.9f%n", loopDouble(n -> d * n));
+        System.out.println("5 double_capture=" + loopDouble(n -> d * n));
 
         // 6 — a `float` capture. Its bits are the cell's NARROW payload,
         // zero-extended; sign-extending them yields a different float.
