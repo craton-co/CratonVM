@@ -8263,79 +8263,26 @@ pub fn register_essential_natives_with_shims(
     register_xerces_cmstateset_intrinsics(registry);
     register_xerces_xml_parser_intrinsics(registry);
     register_liquibase_checksum_intrinsics(registry);
-    registry.register("java/lang/String", "indexOf", "(I)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        for (i, c) in s.chars().enumerate() {
-            if c == needle {
-                return Ok(Some(Value::Int(i as i32)));
-            }
-        }
-        Ok(Some(Value::Int(-1)))
-    });
-    registry.register("java/lang/String", "lastIndexOf", "(I)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        let mut last = -1i32;
-        for (i, c) in s.chars().enumerate() {
-            if c == needle {
-                last = i as i32;
-            }
-        }
-        Ok(Some(Value::Int(last)))
-    });
-    registry.register("java/lang/String", "lastIndexOf", "(II)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let from = match args.get(2) {
-            Some(Value::Int(v)) => *v as i32,
-            _ => 0,
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        let mut last = -1i32;
-        for (i, c) in s.chars().enumerate() {
-            let ii = i as i32;
-            if ii > from {
-                break;
-            }
-            if c == needle {
-                last = ii;
-            }
-        }
-        Ok(Some(Value::Int(last)))
-    });
+    // E27-1 N2c: these four were hand-rolled closures over
+    // `s.chars().enumerate()`, which yields a CODE POINT index, not a UTF-16
+    // one — `"x\u{10437}yz".indexOf('z')` answered 3 where HotSpot answers 4,
+    // off by one for every supplementary character before the hit, and `-1`
+    // for every lone surrogate (`char::from_u32` rejects them). They were
+    // copies six through NINE of a rule E18-1 had already put in exactly one
+    // place, `lang_string.rs`'s `code_point_needle`.
+    //
+    // Rewired rather than deleted. Deleting needs them to be unreachable in
+    // EVERY configuration, and they are only provably dead in two of the
+    // three: real-JDK mode drops them (they are `Bridge`-kind on
+    // `java/lang/String`, and `registry.rs`'s adjudication drops all but
+    // `intern`), and a `synthetic-jdk` build has
+    // `register_synthetic_overrides` re-register the same four later and win.
+    // The third — feature off, drop-real-layout off — has neither mechanism.
+    // Pointing them at the canonical natives is correct in all three and
+    // needs no such proof.
+    registry.register("java/lang/String", "indexOf", "(I)I", native_string_index_of);
+    registry.register("java/lang/String", "lastIndexOf", "(I)I", native_string_last_index_of_char);
+    registry.register("java/lang/String", "lastIndexOf", "(II)I", lang_string::native_string_last_index_of_from);
     registry.register(
         "java/lang/String",
         "lastIndexOf",
@@ -8357,35 +8304,7 @@ pub fn register_essential_natives_with_shims(
             }
         },
     );
-    registry.register("java/lang/String", "indexOf", "(II)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let from = match args.get(2) {
-            Some(Value::Int(v)) => *v as i32,
-            _ => 0,
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        for (i, c) in s.chars().enumerate() {
-            let ii = i as i32;
-            if ii < from {
-                continue;
-            }
-            if c == needle {
-                return Ok(Some(Value::Int(ii)));
-            }
-        }
-        Ok(Some(Value::Int(-1)))
-    });
+    registry.register("java/lang/String", "indexOf", "(II)I", lang_string::native_string_index_of_from);
 
     // KEEP (W3), with the risk bounded rather than hand-waved.
     // RKC16N.9: org/jboss/modules/Module.<clinit> PC 154 invokes
