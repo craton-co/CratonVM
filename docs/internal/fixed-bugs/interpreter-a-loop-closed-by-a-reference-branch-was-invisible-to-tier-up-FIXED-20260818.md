@@ -63,6 +63,11 @@ back-edge site was believed to go through.
 
 ## Measurements
 
+Both tables below are `cratonvm` release binaries built from `9279bf108`
+(**base**, this branch's merge point) and from `a7117ffcd` (**fixed**), run
+alternately on one host. The merge point rather than current `dev` is the
+comparison because that is what this branch changed.
+
 `probes/BackEdgeShapeProbe.java` builds ONE 200 000-node chain and walks it
 twice per rep. The two walks read the same fields, do the same arithmetic and
 touch the same memory in the same order. The only difference between them is the
