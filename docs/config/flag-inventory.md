@@ -1234,6 +1234,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` | JIT | `CRATONVM_JIT=unreg-accept-residue` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_UNREG_MEMO_GC_RESET` | JIT | `CRATONVM_JIT=unreg-memo-gc-reset` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_UNREG_MEMO_HIWATER` | JIT | `CRATONVM_JIT=unreg-memo-hiwater` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_UNREG_MEMO_RANGE_INVALIDATE` | JIT | `CRATONVM_JIT=unreg-memo-range-invalidate` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_UNROLL` | JIT | `CRATONVM_JIT=unroll` | both | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_VECTORIZE` | JIT | `CRATONVM_JIT=vectorize` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_VERIFY_ARENA_ORDER` | JIT | `CRATONVM_JIT=verify-arena-order` | opt-in | off | behaviour | snapshot | jit, types |
