@@ -2,14 +2,16 @@
 
 **Status: OPEN (reduced). Profiled 2026-08-18 on `dev` `64c02b7ac`, which
 REFUTED the original per-call-overhead hypothesis in the form it was written.
-The three contained items that profile named have since been fixed
+The three contained items that profile named are fixed
 (`perf/bigdecimal-native-overhead-20260818`, measured below): the benchmark
-moved 31x -> 21x against HotSpot and `LegendreHighPrecisionTest` ~47x -> ~38x.
-The class still does not finish inside the 90 s suite budget. What is left is
-not bignum-specific and is tracked on the two pages under "Related".**
+moved 31x -> 21x against HotSpot, and the witness class
+`LegendreHighPrecisionTest` went from 110-119 s to 85-89 s and now finishes
+INSIDE the 90 s per-class suite budget it used to blow — by 2-6%, which is thin
+enough that a busier host will still time it out. The remaining ~32x is not
+bignum-specific and is tracked on the two pages under "Related".**
 
 Found triaging the Apache Commons Math test suite
-(`apps/commons-math/RESULTS-20260817.md`): `LegendreHighPrecisionTest` (2 JUnit
+(the suite run recorded in retired/commons-math-suite-run-RETIRED-20260818.md): `LegendreHighPrecisionTest` (2 JUnit
 methods, computing 60-digit-precision Gauss-Legendre quadrature rules via
 `java.math.BigDecimal` Newton-Raphson root-finding) never finishes — still
 making genuine forward progress after 90s+, a legitimate bounded ~119-frame
@@ -109,7 +111,7 @@ two release binaries from the same `dev` base, arms INTERLEAVED, six rounds:
 | | dev base | fixed | HotSpot 25 | change |
 |---|---:|---:|---:|---:|
 | `BigDecimalBench` 50k (median of 6) | 1,955 ms | **1,299 ms** | 63 ms | **-33%**, 31x -> 21x |
-| `LegendreHighPrecisionTest` (the witness class) | 146-169 s | **117-131 s** | 3.1 s | -20%, ~47x -> ~38x |
+| `LegendreHighPrecisionTest`, suite conditions (`--Xmx 1g`), 3 rounds | 110-119 s | **86-89 s** | 2.7 s | **-24%; HANG -> PASS** at the 90 s budget |
 | `BigDecimal.signum()` per call | 1,232 ns | **140 ns** | 4 ns | -89% |
 | `BigInteger.signum()` per call | 288 ns | **101 ns** | 2 ns | -65% |
 | `BigDecimal.scale()` per call | 379 ns | **98 ns** | 2 ns | -74% |
@@ -179,6 +181,15 @@ So the residual is the general "make native->heap interaction cheap" problem —
 the same verdict `bobyqa-numeric-kernel-is-80x-slower-than-hotspot` reaches from
 a workload with no bignum in it at all. Further work belongs there, not here.
 
+The suite consequence, measured on all 310 `commons-math-legacy` test classes
+(one class per process, 90 s cap, real-JDK backend, JIT on, default GC):
+**303 PASS, 2 HANG, 5 FAIL**, with every one of the 5 FAILs reproduced on
+HotSpot in the same session or proven to be an unseeded-RNG flake that flips on
+both VMs. The 2 HANGs are `BOBYQAOptimizerTest` and `PSquarePercentileTest`,
+both already filed as throughput, both of them optimizer/statistic inner loops
+rather than bignum. `CMAESOptimizerTest` is the same shape a third time — it
+passes, at 68-118 s against HotSpot's 2.5 s.
+
 ## Reproduction
 
 ```bash
@@ -197,7 +208,7 @@ java -cp <dir> BigDecimalBench 200000                       # HotSpot
 ```
 
 The witness class itself, against HotSpot in the same shell (needs the
-commons-math test classpath — see `apps/commons-math/`):
+commons-math test classpath — /data/cm-legacy-classpath.txt on the Azure Linux box):
 
 ```bash
 <cratonvm> --java-home <jdk-25> --Xmx 1g -c "<runner>:$CP" CratonRunner \
@@ -219,7 +230,7 @@ breakdown is needed.
 
 ## Related
 
-* `apps/commons-math/RESULTS-20260817.md` — the suite run this was found from.
+* retired/commons-math-suite-run-RETIRED-20260818.md — the suite run this was found from, now closed.
 * [`bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`](bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md)
   — the other CratonVM-only "hang" found in the same run. It was first filed as
   an OSR refusal; that gate was real and is now fixed, and the wall time did not
