@@ -2739,6 +2739,17 @@ fn openssl_client_enabled() -> bool {
     crate::nbflags().tls_openssl_client
 }
 
+/// The Windows half of the same switch, over `servlet::s2_schannel_tls_connect_on`.
+///
+/// One flag for both, because it selects the same THING on both: whether the
+/// default client path runs on a backend that can hand out the peer's chain.
+/// The backend differs (OpenSSL / SChannel) because the platform's does; the
+/// question does not, and two flags would let a reader think it did.
+#[cfg(windows)]
+fn schannel_client_enabled() -> bool {
+    crate::nbflags().tls_openssl_client
+}
+
 /// [`new13_connect_and_handshake`], optionally over a connection the caller
 /// already established (`SSLSocket.connect`'s deferred-handshake path — see
 /// [`PendingConnectSocket::tcp`]). `None` connects here, as before.
@@ -2886,7 +2897,29 @@ pub(crate) fn new13_connect_and_handshake_on(
         };
     #[cfg(unix)]
     let use_openssl = openssl_cfg.is_some();
-    #[cfg(not(unix))]
+    // The Windows counterpart. Deliberately NARROWER than the Unix one above:
+    // it carries the same roots native-tls was already given and makes the
+    // same trust decisions, and the only thing that changes is that the peer's
+    // chain comes back. `cacerts` is NOT resolved here — see
+    // `servlet::SchannelClientConfig` for why "replace the platform roots" is
+    // not expressible on SChannel and why faking it would break working
+    // connections rather than fix a divergence.
+    #[cfg(windows)]
+    let schannel_cfg: Option<crate::servlet::SchannelClientConfig> = if schannel_client_enabled() {
+        Some(crate::servlet::SchannelClientConfig {
+            roots: match jsse_default_roots {
+                Some(roots) => roots.to_vec(),
+                None => extra_root_ders.to_vec(),
+            },
+            skip_verify: java_tm_key.is_some() || verify_against_default_roots,
+            max_tls12: matches!(max_protocol, Some(native_tls::Protocol::Tlsv12)),
+        })
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let use_openssl = schannel_cfg.is_some();
+    #[cfg(not(any(unix, windows)))]
     let use_openssl = false;
     // Not built at all when the raw connector is in charge: building one reads
     // the OS root store, which is exactly the set this path is moving off.
@@ -2947,7 +2980,20 @@ pub(crate) fn new13_connect_and_handshake_on(
             None => Err(no_connector()),
         },
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let connect_result = match (schannel_cfg.as_ref(), established) {
+        (Some(cfg), Some(tcp)) => crate::servlet::s2_schannel_tls_connect_on(cfg, host, port, tcp),
+        (Some(cfg), None) => crate::servlet::s2_schannel_tls_connect(cfg, host, port),
+        (None, Some(tcp)) => match connector.as_ref() {
+            Some(c) => crate::servlet::s2_tls_connect_on(c, host, port, tcp),
+            None => Err(no_connector()),
+        },
+        (None, None) => match connector.as_ref() {
+            Some(c) => crate::servlet::s2_tls_connect(c, host, port),
+            None => Err(no_connector()),
+        },
+    };
+    #[cfg(not(any(unix, windows)))]
     let connect_result = match (connector.as_ref(), established) {
         (Some(c), Some(tcp)) => crate::servlet::s2_tls_connect_on(c, host, port, tcp),
         (Some(c), None) => crate::servlet::s2_tls_connect(c, host, port),

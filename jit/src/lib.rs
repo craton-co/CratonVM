@@ -15135,7 +15135,62 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if matches!(op, 0xb2 | 0xc0) {
         return precise_getstatic_checkcast_enabled();
     }
+    if matches!(op, 0xbb | 0xbf) {
+        return precise_alloc_athrow_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Whether a protected `new` (0xbb) / `athrow` (0xbf) may be treated as
+/// publishing a precise exceptional frame.
+///
+/// **Unlike `getfield`/`getstatic`, this admission is NOT bookkeeping.** Both
+/// lowerings grew a publishing exit in the same change that added them here,
+/// which is the condition
+/// `fixed-bugs/rbc6-protected-field-ops-FIXED-20260802.md` states and the
+/// netty adaptive-allocator page insisted on: admitting `new` without giving
+/// its lowering a precise frame is a miscompile, not a speedup.
+///
+/// `new` (0xbb) — every non-scalar-replaced lowering funnels through
+/// `emit_post_alloc_oom_check`: the resolved inline-TLAB arm (whose slow edge
+/// falls into `jit_new_object`), the resolved helper arm
+/// (`emit_new_object_stub`) and the DEFERRED CP arm
+/// (`emit_new_object_cp_stub`, for a class not yet loaded at compile time).
+/// That guard now records a reason-9 frame at the allocating bci whenever the
+/// pc is protected. All three ways this site can raise — a `<clinit>` failure,
+/// a class-resolution failure on the deferred arm, and heap exhaustion — are
+/// reported by the same `0`/null sentinel the guard already tested for, so one
+/// publishing exit covers the lot.
+///
+/// The scalar-replaced arm (`self.scalar_replaced`) emits no call at all: it
+/// zero-fills frame slots and pushes a dummy. It raises nothing, and a site
+/// that raises nothing cannot hand a handler an unpublished frame. (That arm
+/// also skips `<clinit>`, which is a pre-existing residual recorded on
+/// `jit_new_object`, not something this admission introduces or depends on.)
+///
+/// `athrow` (0xbf) — its lowering calls `jit_throw_exception`, which stashes
+/// the exception together with this athrow's own bci, and then returned the
+/// sentinel straight through the epilogue. Inside a protected range it now
+/// jumps to the reason-9 stub instead, which spills the trapping registers,
+/// materializes the frame and runs the same epilogue. It is admitted alongside
+/// `new` rather than after it because `throw new X(...)` compiles to
+/// `new`/`dup`/`invokespecial`/`athrow`: netty's
+/// `AdaptivePoolingAllocator$Magazine.allocate` carries exactly that sequence
+/// at pc 338-345, so admitting `new` on its own would only have moved the bail
+/// seven bytes — the trap the page warned about in the same paragraph that
+/// named the refusal.
+///
+/// `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW=1` withdraws the admission so one
+/// binary can be A/B'd against its own pre-change behaviour; comparing against
+/// a separately built branch would confound this with everything else that
+/// landed. It withdraws only the ADMISSION — the publishing exits stay emitted,
+/// because they are correct for the opcodes already admitted around them.
+fn precise_alloc_athrow_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW").is_none()
+    })
 }
 
 /// Whether a protected `getstatic` / `checkcast` may be treated as publishing a
@@ -15203,6 +15258,19 @@ fn precise_getstatic_checkcast_enabled() -> bool {
 ///   never built. Not cached here: `inline_getfield_enabled` does its own
 ///   `OnceLock`, and this runs per protected opcode at COMPILE time, never on
 ///   any hot path.
+/// `CRATONVM_DBG_RBC6_EMIT=1` — trace which exit each protected throwing site
+/// is given at EMIT time.
+///
+/// The `[rbc6-dbg]` family traces the RUNTIME sinks. A frame that never reaches
+/// them can be missing for two different reasons and only this says which: the
+/// site chose the shared sentinel stub (no frame was ever built), or it chose
+/// the reason-9 stub and the frame was lost between the stub and the sink.
+pub(crate) fn rbc6_emit_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6_EMIT").is_some())
+}
+
 fn precise_field_ops_enabled() -> bool {
     if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_FIELD_OPS").is_some() {
         return false;
@@ -15437,11 +15505,23 @@ pub fn first_unsupported_precise_frame_site(
     // `may_throw_without_precise_frame` set below — that set is the CANDIDATE
     // set, and `precise_frame_publishing_opcode` is what exempts them.
     //
+    // 2026-08-17: `new` (0xbb) and `athrow` (0xbf) have left it as well, and
+    // unlike every departure above them this one is NOT bookkeeping — both
+    // lowerings grew a publishing exit in the same change. See
+    // `precise_alloc_athrow_enabled` for the per-path argument, and note the
+    // two had to leave TOGETHER: `throw new X(...)` is one four-bytecode
+    // sequence, so admitting either alone only moves the bail to the other.
+    //
     // Still genuinely blocking, because their lowerings really do not publish:
-    // `new` (0xbb), `ldc` (0x12), `athrow` (0xbf), and `arraylength` (0xbe) —
-    // the last routes its NPE through the SHARED null-check stub, which records
-    // no frame at the bci. It was the one site blocking Tomcat's
-    // `IntrospectionUtils.setProperty` in the WebSocket-latency run.
+    // `ldc` (0x12) and `arraylength` (0xbe) — the last routes its NPE through
+    // the SHARED null-check stub, which records no frame at the bci. It was the
+    // one site blocking Tomcat's `IntrospectionUtils.setProperty` in the
+    // WebSocket-latency run. The array opcodes, the integer divides and
+    // `multianewarray` are still out too; `newarray`/`anewarray`/
+    // `multianewarray` reach the same publishing `emit_post_alloc_oom_check`
+    // that `new` does, so they are the cheapest next candidates — but each
+    // needs its own audit of the NegativeArraySizeException edge before it can
+    // be claimed, and none of them was blocking a measured method.
     let may_throw_without_precise_frame = |op: u8| {
         matches!(
             op,
@@ -21170,6 +21250,10 @@ mod tests {
             0xb7, // invokespecial
             0xb8, // invokestatic
             0xb9, // invokeinterface
+            0xbb, // new         — every non-scalar-replaced arm funnels through
+            //           `emit_post_alloc_oom_check`, which publishes; the
+            //           scalar-replaced arm emits no call and cannot throw
+            0xbf, // athrow      — protected sites jump to the reason-9 stub
             0xc0, // checkcast   — single arm, always publishes
             0xc2, // monitorenter
             0xc3, // monitorexit
@@ -21182,15 +21266,14 @@ mod tests {
 
         // Do NOT publish. `arraylength` routes its NPE through the shared
         // `null_check_store_stubs` stub (`jit_npe_with_action` + sentinel +
-        // epilogue), which records nothing at the bci; `new`, `ldc` and
-        // `athrow` are the other three named on
-        // `first_unsupported_precise_frame_site`.
+        // epilogue), which records nothing at the bci; `ldc` reaches
+        // `helpers.ldc_string` / `helpers.ldc_class_cp` through the shared
+        // sentinel stub. They are the two left on
+        // `first_unsupported_precise_frame_site`'s named list.
         for op in [
             0x12u8, // ldc
             0x13,   // ldc_w
-            0xbb,   // new
             0xbe,   // arraylength
-            0xbf,   // athrow
         ] {
             assert!(
                 !super::precise_frame_publishing_opcode(op),
@@ -21237,6 +21320,59 @@ mod tests {
             super::first_unsupported_precise_frame_site(&arraylength, arraylength.len(), &table),
             Some((1, 0xbe)),
             "a protected arraylength must still refuse, at its own pc"
+        );
+    }
+
+    /// The exact bytecode shape RBC.6 was refusing on netty's
+    /// `AdaptivePoolingAllocator$Magazine.allocate`, both ways round.
+    ///
+    /// `throw new IllegalStateException()` inside a `try` is
+    /// `new`/`dup`/`invokespecial`/`athrow` — four bytecodes, two of which were
+    /// unadmitted. The method was reported refused at the `new` (pc=338,
+    /// op=0xbb); admitting only that opcode would have moved the refusal to the
+    /// `athrow` seven bytes later and measured nothing, which is why the two
+    /// landed together.
+    ///
+    /// The negative half is what makes this test non-vacuous: with the
+    /// admission withdrawn the same bytes MUST refuse, and refuse at the `new`.
+    /// Without it a gate that had quietly become unconditional would read green.
+    #[test]
+    fn rbc6_admits_a_protected_throw_new_and_refuses_it_when_withdrawn() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+        // pc 0: new #0        (3 bytes)
+        // pc 3: dup           (1)
+        // pc 4: invokespecial (3)
+        // pc 7: athrow        (1)
+        let code = [0xbbu8, 0x00, 0x00, 0x59, 0xb7, 0x00, 0x00, 0xbf];
+        let table = [ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 8,
+            handler_pc: 8,
+            catch_type: 0,
+        }];
+        assert_eq!(
+            super::first_unsupported_precise_frame_site(&code, code.len(), &table),
+            None,
+            "a protected `throw new X()` must compile — this is the netty              AdaptivePoolingAllocator$Magazine.allocate shape"
+        );
+
+        // Prove the RED. `precise_alloc_athrow_enabled` caches in a `OnceLock`,
+        // so this asks the predicate the same question the walk does rather
+        // than setting the env var (which a sibling test in this process may
+        // already have latched).
+        let withdrawn = |op: u8| -> bool {
+            if matches!(op, 0xbb | 0xbf) {
+                return false;
+            }
+            super::precise_frame_publishing_opcode(op)
+        };
+        assert!(
+            !withdrawn(0xbb) && !withdrawn(0xbf),
+            "the withdrawal must take both opcodes out — withdrawing one leaves              the other holding the same method down"
+        );
+        assert!(
+            withdrawn(0xb7),
+            "the withdrawal must not disturb invokespecial, which sits between              them in this very sequence"
         );
     }
 
@@ -25195,6 +25331,79 @@ mod tests {
         assert_eq!(
             osr_t_tag(&plan.resume_after_exit(&cm, &stray).unwrap_err()),
             Some(OSR_REFUSE_EXIT_REPLAY)
+        );
+    }
+
+    /// **An OSR artifact may not contain an inlined body that publishes a deopt
+    /// point.** This is the constraint that gates the whole nesting-inliner
+    /// programme, and until now it existed only as prose.
+    ///
+    /// `osr_exit_policy` refuses any deopt point whose `frame_state.caller` is
+    /// set, because the VM's in-place OSR-exit transfer is single-frame
+    /// (`transfer_osr_exit_into_live_frame` bails on "inlined caller chain", as
+    /// do `resume_from_ir_deopt` and `build_deopt_frame_inner`). Nothing in this
+    /// crate sets `caller` today — `build_and_record_deopt_point` hard-codes
+    /// `None` and the IR-side `InlineScopeTable` has no producer — so this arm
+    /// had no test, and a future producer could have landed against it without
+    /// anything failing.
+    ///
+    /// Why it matters beyond tidiness, from
+    /// `netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`: the
+    /// method that needs inlining there is a `@Test` body, i.e. invoked ONCE, so
+    /// OSR is its only door out of the interpreter. An inliner that records
+    /// caller scopes would therefore make exactly the artifact that needs it
+    /// un-enterable, and the loop would run interpreted — strictly worse than
+    /// not inlining. The VM's multi-frame resume has to come first; this test is
+    /// what says so in code rather than in a design note.
+    ///
+    /// Both spellings are asserted, because they are two different gates and a
+    /// producer could satisfy one while tripping the other:
+    ///  * a point carrying a caller scope refuses at ADMISSION here;
+    ///  * a reconstructed frame carrying caller frames refuses at the EXIT
+    ///    (`resume_after_exit`, covered by
+    ///    `only_reexecute_semantics_yield_an_exact_resume_point`).
+    #[test]
+    fn a_deopt_point_with_an_inlined_caller_scope_refuses_the_osr_entry() {
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        // Sanity: the SAME artifact without the caller scope is admitted. Without
+        // this the test could pass because the fixture is malformed some other
+        // way, which is the shape of a guard that cannot fail.
+        let mut flat = osr_t_artifact(3);
+        flat.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        )];
+        flat.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("the same artifact without a caller scope must be admitted");
+
+        // The caller scope is fully DESCRIBABLE — every slot resolvable, no
+        // monitors, no virtuals. The refusal is not about describability; it is
+        // that the resume path has nowhere to put a second frame.
+        let mut inlined = osr_t_artifact(3);
+        let mut point = osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        );
+        point.frame_state.caller = Some(Box::new(deopt::FrameState {
+            method_key: "craton/probe/OsrEntry.caller:()V".to_string(),
+            bci: 12,
+            locals: vec![deopt::FrameValue::Int(7)],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        }));
+        inlined.deopt_points = vec![point];
+
+        let err = inlined
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a deopt point under an inlined caller scope must refuse the entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_INLINED_SCOPE));
+        assert!(
+            osr_refusal_is_permanent(&err),
+            "the point list is a pure function of the artifact, so the refusal is memoable"
         );
     }
 

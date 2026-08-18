@@ -459,6 +459,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-ldc", on_key: Some("CRATONVM_DBG_JIT_LDC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loop-work", on_key: Some("CRATONVM_DBG_LOOP_WORK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-site", on_key: Some("CRATONVM_DBG_FIELD_SITE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "g1-live-memo", on_key: Some("CRATONVM_DBG_G1_LIVE_MEMO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-method-stats", on_key: Some("CRATONVM_DBG_JIT_METHOD_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
@@ -648,6 +649,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "raf-getfd", on_key: Some("CRATONVM_DBG_RAF_GETFD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "raf-init", on_key: Some("CRATONVM_DBG_RAF_INIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rbc6", on_key: Some("CRATONVM_DBG_RBC6"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "rbc6-emit", on_key: Some("CRATONVM_DBG_RBC6_EMIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "re5", on_key: Some("CRATONVM_DBG_RE5"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "refersto", on_key: Some("CRATONVM_DBG_REFERSTO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "reflection-factory", on_key: Some("CRATONVM_DBG_REFLECTION_FACTORY"), off_key: None, off_word: None },
@@ -831,6 +833,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "string-intrinsic-pin", on_key: None, off_key: Some("CRATONVM_JIT_NO_STRING_INTRINSIC_PIN"), off_word: None },
     E { group: Group::JIT, token: "dup-x1", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X1"), off_word: None },
     E { group: Group::JIT, token: "dup-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X2"), off_word: None },
+    E { group: Group::JIT, token: "dup2-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP2_X2"), off_word: None },
     E { group: Group::JIT, token: "dupx", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUPX"), off_word: None },
     E { group: Group::JIT, token: "dupx-eager-canon", on_key: Some("CRATONVM_JIT_DUPX_EAGER_CANON"), off_key: None, off_word: None },
     // Transitive eager callee compilation, so a body compiled bottom-up binds its
@@ -914,6 +917,7 @@ pub const INVENTORY: &[E] = &[
     // and only falls through to a live `getenv` for an undeclared one — so
     // this row is the whole fix.
     E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None },
+    E { group: Group::JIT, token: "precise-alloc-athrow", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW"), off_word: None },
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
@@ -971,6 +975,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "never-free-code", on_key: Some("CRATONVM_JIT_NEVER_FREE_CODE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "old-sweep-jit", on_key: Some("CRATONVM_OLD_SWEEP_JIT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr", on_key: Some("CRATONVM_JIT_OSR"), off_key: None, off_word: None },
+    // Default-ON (RBC.6 lift): `env_cache::osr_athrow_allowed` answers `true`
+    // for `Err(_)` and reads `0`/`false` as the kill switch.
+    E { group: Group::JIT, token: "osr-athrow", on_key: Some("CRATONVM_JIT_OSR_ATHROW"), off_key: None, off_word: Some("0") },
     // Default-ON: `jit::osr_dead_local_entry_allowed` answers `true` for
     // `Err(_)` and reads `0`/`off`/`false`/`no` as the kill switch.
     E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
@@ -1037,6 +1044,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "new-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-hiwater", on_key: Some("CRATONVM_JIT_UNREG_MEMO_HIWATER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "field-site-cache-loader", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE_LOADER"), off_key: None, off_word: None },
@@ -1143,6 +1151,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "exact-refproc-survival", on_key: None, off_key: Some("CRATONVM_NO_EXACT_REFPROC_SURVIVAL"), off_word: None },
     E { group: Group::GC, token: "g1-coverage-pin", on_key: Some("CRATONVM_G1_COVERAGE_PIN"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None },
+    E { group: Group::GC, token: "g1-live-region-memo", on_key: None, off_key: Some("CRATONVM_G1_NO_LIVE_REGION_MEMO"), off_word: None },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "g1-eager-humongous", on_key: Some("CRATONVM_G1_EAGER_HUMONGOUS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },

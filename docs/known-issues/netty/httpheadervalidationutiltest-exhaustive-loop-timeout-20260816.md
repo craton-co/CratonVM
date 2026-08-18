@@ -124,9 +124,14 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    against HotSpot's ~0, because HotSpot inlines all of them. Roughly ten call
    frames therefore cost 40-80 ns before any of them does any work, and the whole
    budget for the iteration is 21. No arrangement of real calls fits; not making
-   the calls is the only lever. The sibling page carries the sequenced blocker
-   (inline scopes in deopt metadata, then a real call inside a spliced body, then
-   nesting) — it is the same work for both classes.
+   the calls is the only lever. The sibling page carries the sequenced blocker,
+   and its first two steps are VM work rather than compiler work: an artifact
+   carrying an inlined caller scope cannot be OSR-entered at all
+   (`osr_exit_policy` refuses `caller.is_some()`, because the in-place OSR-exit
+   transfer is single-frame), and both these classes' hot methods are `@Test`
+   bodies for which OSR is the only door. So multi-frame resume and a multi-frame
+   OSR transfer come before inline scopes, calls inside spliced bodies, and
+   nesting — same work for both classes.
 
 An honest reading is that this class remains the furthest from reach of the three
 `codec-http` walls — which is what the 2026-08-17 revision concluded — but the

@@ -108,11 +108,15 @@ times, and it is **not** reachable by one more compile:
   across `AdaptiveByteBuf.init`, `readInitInto`, `chooseFirstFreeBuddy`,
   `nextAvailableSegmentOffset`.
 
-Characterised separately as `perf-netty-adaptive-allocator-throughput-20260817`
-in `docs/known-issues/`, with the microbenchmark. Until that closes, this class
-is 24/25 with one test over budget — a throughput row, which is where the
-2026-08-13 page had already filed it (its §4, "correct, slow, and re-filed where
-it belongs").
+Characterised separately, with the microbenchmark, and **closed 2026-08-17** —
+see `performance/netty-adaptive-allocator-throughput-FIXED-20260817`. The
+refusal above is gone: `new` and `athrow` both publish a precise exceptional
+frame now and both are admitted, so `Magazine.allocate` compiles and
+`hot_but_stuck_in_interpreter` reads 0. Note what that page found about the
+0xbb refusal reported here — the `athrow` seven bytes later was unadmitted too,
+so clearing 0xbb alone would only have moved the bail. This class remains a
+throughput row, which is where the 2026-08-13 page had already filed it (its
+§4, "correct, slow, and re-filed where it belongs").
 
 ## Repro
 
