@@ -1441,6 +1441,14 @@ fn misplaced_launcher_flags(argv: &[String]) -> Vec<&'static str> {
 /// "check your argument order" leaves the reader doing the work this function
 /// already did.
 fn warn_about_misplaced_launcher_flags(argv: &[String]) {
+    // `std::env::var_os`, deliberately, and this one may NOT be converted.
+    // This function runs from `main` BEFORE `install_flags` latches the
+    // snapshot (the call is ~37 lines earlier), so reading through
+    // `flags::runtime_var_os` here latches it early and `install_flags` then
+    // fails with "runtime flags were read before launcher configuration" —
+    // every run exits 1. Measured, not reasoned: converting it broke `java
+    // Hello`. The name is exempt in `flag_declaration_guard`'s `ALLOWED` as
+    // kind 4 for exactly this reason.
     if std::env::var_os(MISPLACED_FLAG_WARNING_OFF).is_some() {
         return;
     }

@@ -15317,7 +15317,7 @@ fn precise_virtual_invokes_enabled() -> bool {
 ///
 /// ## Why it is this narrow
 ///
-/// `docs/internal/fixed-bugs/unresumable-unconditional-trap-mvmap-FIXED-20260802.md`
+/// `internal/fixed-bugs/unresumable-unconditional-trap-mvmap-FIXED-20260802.md`
 /// warns in as many words: *"Do not apply the publish-side rule blind... the
 /// naive form would refuse every trap-carrying artifact, including the many
 /// whose re-run-from-entry fallback works fine."* Two narrowing terms keep that
