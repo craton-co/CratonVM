@@ -14003,17 +14003,22 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 /// * **a static impl**, asserted rather than assumed because the thunk drops the
 ///   receiver outright and nothing downstream would notice if it mattered.
 ///
-/// Whether the captures' types, the proxy's layout, the arity, and the
-/// collector's read-barrier state permit an emission is `lambda_adapter_entry`'s
-/// to decide — it is what would have to emit them. A `None` from it leaves this
-/// site on the Rust arm for good, because the install is claimed before the
-/// attempt rather than after it. Every refusal but one is a property of the
-/// site, so that costs nothing; the exception is a reference capture refused
-/// because ZGC's read barrier happened to be armed at this instant, which gives
-/// up a thunk that a later attempt could have had. Claiming after the attempt
-/// would trade that for re-asking — a lock and a layout lookup — on every
-/// dispatch a refused site ever serves, which is the shape of the 202 000
-/// re-installs `LambdaJitSite::adapter_installed` exists to prevent.
+/// Whether the captures' types, the proxy's layout and the arity permit an
+/// emission is `lambda_adapter_entry`'s to decide — it is what would have to
+/// emit them. A `None` from it leaves this site on the Rust arm for good,
+/// because the install is claimed before the attempt rather than after it; and
+/// every refusal it can make is a property of the SITE rather than of the
+/// moment, so nothing is given up by asking once.
+///
+/// That last sentence was NOT true while a reference capture could also be
+/// refused for the collector's read-barrier state, which is a property of the
+/// instant: a site that happened to ask during an armed cycle lost its thunk
+/// permanently. That refusal is gone — it was both inert by default and
+/// unnecessary, see `lambda_adapter_entry` — so the "ask once" shape is now
+/// unqualified. Claiming after the attempt instead would trade it for
+/// re-asking (a lock and a layout lookup) on every dispatch a refused site ever
+/// serves, which is the shape of the 202 000 re-installs
+/// `LambdaJitSite::adapter_installed` exists to prevent.
 ///
 /// Both slots are written, because the emitted cascade prefers the PIC when the
 /// codegen allocated one and never consults the MIC in that case.
