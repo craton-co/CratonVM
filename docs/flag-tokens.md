@@ -865,7 +865,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_SECURITY`
 
-13 tokens.
+14 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -881,6 +881,7 @@ export inherited from a parent shell.
 | `reflect-export-gate` | `CRATONVM_REFLECT_NO_EXPORT_GATE` |
 | `require-policy` | `CRATONVM_REQUIRE_POLICY` |
 | `trust-pem` | `CRATONVM_TRUST_PEM` |
+| `tls-openssl-client` | `CRATONVM_TLS_OPENSSL_CLIENT` |
 | `untrusted-code` | `CRATONVM_UNTRUSTED_CODE` |
 
 ## `CRATONVM_COMPAT`

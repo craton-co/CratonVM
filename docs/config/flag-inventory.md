@@ -1392,6 +1392,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_TIER_OSR_THRESHOLD` | JIT | `CRATONVM_JIT=tier-osr-threshold` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_TIER_PGO` | JIT | `CRATONVM_JIT=tier-pgo` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_TLAB_GC_TRIGGER` | GC | `CRATONVM_GC=tlab-gc-trigger` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_TLS_OPENSSL_CLIENT` | SECURITY | `CRATONVM_SECURITY=tls-openssl-client` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_TOMCAT_MAPPER_NATIVES` | COMPAT | `CRATONVM_COMPAT=tomcat-mapper-natives` | default-on | on | behaviour | snapshot | native-builtins |
 | `CRATONVM_TRACE_ARRAYS_HASHCODE` | DBG | `CRATONVM_DBG=trace-arrays-hashcode` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_TRACE_CLASSVALUE` | DBG | `CRATONVM_DBG=trace-classvalue` | opt-in | off | diag | snapshot | types, vm |

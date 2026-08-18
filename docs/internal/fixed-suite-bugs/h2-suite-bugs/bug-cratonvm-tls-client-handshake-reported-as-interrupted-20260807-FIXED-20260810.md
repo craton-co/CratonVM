@@ -142,7 +142,7 @@ certificate at the same point.
 >    completes the handshake (197 ms) and CratonVM still refuses it
 >    ("EE certificate key too weak", 50 ms): the client applies OpenSSL's
 >    SECLEVEL where HotSpot applies the JDK's trust-anchor rules. Filed as
->    `docs/known-issues/tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816.md`.
+>    `fixed-suite-bugs/tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816-FIXED-20260817.md`.
 
 ## Reproducer
 
