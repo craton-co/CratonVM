@@ -2453,6 +2453,11 @@ impl VmHeap {
     pub fn print_gc_summary(&self) {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
+            // Independent of GC stats being requested: this census answers
+            // "how many accessor calls still take the global regions lock?",
+            // which is a question about the MUTATOR, not about collections.
+            // Gated by its own flag (`CRATONVM_DBG_G1ACCESSOR`).
+            g1.dbg_report_accessor_census();
         }
         // ZGC: the same unconditional-counts treatment the generational branch
         // below gets, and for the same reason — without it a `--verbose:gc` run
@@ -2598,6 +2603,32 @@ impl VmHeap {
             // already met and silently worked around, one warning per process.
             // A run that ends with a nonzero here has corrupt headers whatever
             // else it reports.
+            // A NOTIFICATION THAT IS MISSING IS A SLOWDOWN, NOT A FAILURE.
+            // The mark driver's fixed-point wait is a `wait_for`, so a lost
+            // notification costs a poll interval and is otherwise
+            // indistinguishable from a working one -- which is how the driver
+            // came to poll a never-notified condvar on a 5 ms grid for months.
+            // Nonzero here means it is back. A count, so it reads the same on a
+            // loaded host as on a quiet one.
+            // THE OVERLAY GATE, asked of the provider rather than measured here
+            // -- see `ExternalRootProvider::gate_stats`. `roots_for_owner` runs
+            // once per marked object and was 20-29% of mark samples on both the
+            // serial and the parallel arm (2026-08-17 `perf record`). A gate that
+            // works and a gate that is inert return the same empty `Vec`, and the
+            // previous attempt at this optimisation WAS inert, so `hits` is the
+            // only thing that separates them. `disabled=true` means an owner was
+            // registered with no class id and the gate has failed safe.
+            for (name, hits, misses, disabled) in
+                crate::external_roots::provider_gate_stats()
+            {
+                eprintln!(
+                    "[GC] zgc-overlay-gate: provider={name} hits={hits}                      misses={misses} disabled={disabled}",
+                );
+            }
+            eprintln!(
+                "[GC] zgc-mark-wait: park_timeouts={}",
+                h.mark_park_timeouts(),
+            );
             eprintln!(
                 "[GC] zgc-integrity: unsizable_registered_objects={}",
                 crate::zgc::ZGC_UNSIZABLE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed),
@@ -2637,7 +2668,7 @@ impl VmHeap {
         // `par_accepts` far below `par_attempts` means the parallel sweep
         // prefix is being discarded and the entire arena is re-swept
         // sequentially. Until 2026-08-12 that was the state on EVERY JIT-warm
-        // workload — `attempts=5 accepts=0` on the hibernate-reactive repro,
+        // workload — `attempts=5 accepts=0` on the hibernate repro,
         // every abort the benign empty-object zero run — and these counters
         // said so the whole time with nobody to read them.
         //

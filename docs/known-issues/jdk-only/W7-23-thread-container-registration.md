@@ -580,6 +580,97 @@ opens at all. It covers W7-27, not this record — but a red there means the
 decrement's *driver* is not running, which is the first thing to rule out before
 reading any hang here as a container defect.
 
+## 11. Verification pass 2026-08-12 (lane A16) — the flip is live and still unmeasured
+
+**Nothing was built or run in this pass.** Source read against today's
+worktree. The headline is unchanged: **this record is a flip awaiting a
+measurement, and the measurement has not happened.**
+
+### 11.1 The flip and its pair are where this record says they are
+
+| claim | today | verdict |
+|---|---|---|
+| `VM_REMOVES_THREADS_FROM_CONTAINERS` is `true` | `shared_secrets_bridge.rs:765` | present |
+| the runtime lever, read through `flags::runtime_var` (not `std::env::var`) | `:777`–`:786` | present — and the reason is written in place: a raw `getenv` is invisible to `flags::with_thread_overrides`, so an A/B through the supported hook would have measured the ambient environment |
+| the bridge invokes the container-taking start | `:842`–`:847`, `"start"`, `"(Ljdk/internal/vm/ThreadContainer;)V"` | present |
+| the WARN-once on the dropped path | `:860`–`:870` | present |
+| `run_thread_exit_shared` | `vm/src/vm/vm_exec.rs:4998` | present |
+| both worker-death call sites | `vm_exec.rs:4630` and `:13356` | present — the pairing this record was blocked on |
+
+### 11.2 One hazard this record did NOT name, already answered by a later lane
+
+The flip routes thread starts around `Thread.start()V` — the triple
+`native_thread_start0` shadows — and onto a different triple. So the obvious
+question is what happens to the **second-start** refusal, which was broken and
+recently fixed (`Thread.start` must raise `IllegalThreadStateException`; a
+second `start()` had been re-running the body and spawning a second OS thread
+for a retired `Runnable`).
+
+It is handled, and by argument rather than by accident.
+`native-builtins/src/lang_system.rs:1048`–`:1058` carries the guard, and its
+doc comment at `:1039`–`:1047` says explicitly that this native *"is the
+convergence point of all four registrations **and of the container route**,
+including the `--jdk-only` case where the real `start()` bytecode runs; a
+refusal here does not leak a container registration, because that bytecode's
+`finally` calls `container.onExit(this)`."* — i.e. `Thread.start(ThreadContainer)`
+reaches `start0()`, which is still CratonVM's, so the guard still fires, and the
+JDK's own `finally { container.remove(this); }` covers the failed-to-start case
+§1 quotes. Note also that the JDK body's *own* two checks are not the guard
+here: `holder.threadStatus` is inert on this VM (measured NEW=0 / terminated=0),
+so only `this.container != null` fires from the bytecode side.
+
+**Source argument, unrun.** It is the right argument and it is not a
+measurement.
+
+### 11.3 The flag surface is complete — recorded so nobody re-files it
+
+This record introduced `CRATONVM_THREAD_CONTAINERS` and did not say what a new
+`CRATONVM_*` name obliges. It is now declared in all four surface files:
+`types/src/flag_groups.rs:1217` (`THREADS`/`thread-containers`),
+`types/tests/flag-surface.txt:741`, `docs/flag-tokens.md:822`,
+`docs/config/flag-inventory.md:1354` (`default-on`). W7-27 §10A landed it
+(`78a0428ef`). `flag_declaration_guard.rs` will not fire.
+
+### 11.4 §10's scheduling need is still unmet
+
+`regression-suite/run.sh` contains **no** `--add-opens` anywhere — no
+`jdk.internal.misc`, no `jdk.internal.vm`, for any class. So the reflection-only
+vector §10 asks for still cannot be written, `ExitPairingProbe`'s two
+load-bearing lines are still a hand-run, and `probes/` is still never run by
+`run.sh` at any `SUITE=` value. **There is no scheduled assertion that can go
+red or green on this flip.** The one adjacent scheduled thing is unchanged:
+`regression-suite/src/RJdkExecutors.java::threadExitCleanup()` (`:373`, invoked
+at `:480`), which covers W7-27's `clearReferences()` and is the first thing to
+rule out before reading any hang here as a container defect.
+
+### 11.5 A residual this record does not carry: the synthetic-mode arm
+
+The enabled branch is **not** gated on JDK mode. `jla_start_in_container`
+invokes `Thread.start(Ljdk/internal/vm/ThreadContainer;)V` with `?` on any
+non-null container, in every mode, and `register_wp1_4_shared_secrets` (its
+registrar, `native-builtins/src/lib.rs:10050`) is unconditional. The in-file
+comment at `shared_secrets_bridge.rs:838`–`:841` argues synthetic mode never
+presents a non-null container — fabricated `java/lang/Thread`, and the synthetic
+`StructuredTaskScope` forks on the forking thread (W7-18 §6). **That is an
+argument, not a guard.** If a non-null container ever does arrive there, the
+`?` on an unresolvable method turns a working thread start into a failure, where
+the pre-flip path fell through to `start()V`. Unmeasured, and the fix is a
+`MethodCallFailed::InternalError`-only fallback — the same
+`ExceptionThrown`-vs-`InternalError` discrimination
+docs/known-issues/jdk-only/W7-26-getannotation-swallowed-exception.md's
+`ladder_rung` makes — not a mode `#[cfg]`. Named here so the next reader of a
+synthetic-mode thread failure does not start from scratch.
+
+### 11.6 Today's probe screen says nothing about this record, and §10 predicts that
+
+A 33-probe reachability screen was run on the current binary (`--jdk-only`
+28/33). `ThreadMXBean` and `MXBean` **pass**. Per §5's last row and §10's *"What
+is NOT evidence either way"*, that is expected and is not evidence: no probe in
+the screen opens a `ThreadFlock` or reaches a `ThreadContainer`, and
+`getAllStackTraces`-shaped consumers are backed by the VM thread registry, not
+by a `ThreadContainers` walk. **No claim in this record is contradicted by the
+screen; none is corroborated by it either.**
+
 ## What is not claimed
 
 Nothing was rebuilt. The JDK contract, the two baselines, the eight-run HotSpot

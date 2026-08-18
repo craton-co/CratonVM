@@ -108,13 +108,27 @@ pub fn lookup(class: &str, name: &str, desc: &str) -> Option<InterpIntrinsic> {
     })
 }
 
-/// Conservative class-agnostic prefilter for hot virtual-dispatch paths.
+/// Conservative class-agnostic prefilter for hot **virtual**-dispatch paths.
 ///
-/// A `false` result is definitive: no intrinsic entry has this
-/// `(method_name, descriptor)` pair on any class, so callers can skip the
-/// declaring-class lookup they would otherwise need before calling [`lookup`].
-/// A `true` result only means "maybe"; callers must still resolve the actual
-/// declaring class and use [`lookup`] for the final, sound decision.
+/// A `false` result is definitive **for an instance method**: no intrinsic
+/// entry with that shape has this `(method_name, descriptor)` pair on any
+/// class, so callers can skip the declaring-class lookup they would otherwise
+/// need before calling [`lookup`]. A `true` result only means "maybe"; callers
+/// must still resolve the actual declaring class and use [`lookup`] for the
+/// final, sound decision.
+///
+/// **It is not a prefilter for STATIC call sites and must never be used as
+/// one.** `Thread.onSpinWait ()V` and `Thread.currentThread
+/// ()Ljava/lang/Thread;` both resolve through [`lookup`] and are deliberately
+/// absent from the list below, so this function answers `false` for two live
+/// intrinsics. That is sound today because the only caller is
+/// `vm/src/runtime/interpreter/dispatch_virtual.rs`, and a static method never
+/// reaches it — but the earlier wording ("no intrinsic entry has this pair on
+/// any class") was simply false, and a future caller on the `invokestatic`
+/// path would have lost both fast paths silently, with a green build. G9-1.
+///
+/// The invariant that IS true is pinned by `every_instance_entry_is_admitted`:
+/// every non-static member of [`lookup`]'s table must be admitted here.
 #[inline]
 pub fn might_have_method_descriptor(name: &str, desc: &str) -> bool {
     matches!(
@@ -378,5 +392,166 @@ mod tests {
             "(Ljava/lang/String;)Ljava/lang/String;"
         ));
         assert!(!might_have_method_descriptor("length", "()J"));
+    }
+
+    /// Every `(class, name, descriptor)` [`lookup`] resolves, with the
+    /// staticness the interpreter has to agree with.
+    ///
+    /// This table is the second copy of `lookup`'s arms on purpose: the tests
+    /// below cross-check the three functions that must agree about it, and a
+    /// single table cannot disagree with itself. Adding an arm to `lookup`
+    /// without adding it here fails `the_table_is_complete`.
+    const TABLE: &[(&str, &str, &str, bool)] = &[
+        ("java/lang/Object", "getClass", "()Ljava/lang/Class;", false),
+        ("java/lang/Object", "hashCode", "()I", false),
+        ("java/lang/String", "length", "()I", false),
+        ("java/lang/String", "charAt", "(I)C", false),
+        ("java/lang/String", "isEmpty", "()Z", false),
+        (
+            "java/lang/System",
+            "arraycopy",
+            "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+            true,
+        ),
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            false,
+        ),
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(I)Ljava/lang/StringBuilder;",
+            false,
+        ),
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(C)Ljava/lang/StringBuilder;",
+            false,
+        ),
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(J)Ljava/lang/StringBuilder;",
+            false,
+        ),
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(Z)Ljava/lang/StringBuilder;",
+            false,
+        ),
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+            false,
+        ),
+        (
+            "java/lang/StringBuilder",
+            "toString",
+            "()Ljava/lang/String;",
+            false,
+        ),
+        ("java/lang/StringBuilder", "length", "()I", false),
+        (
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            true,
+        ),
+        ("java/lang/Integer", "intValue", "()I", false),
+        (
+            "java/lang/Integer",
+            "parseInt",
+            "(Ljava/lang/String;)I",
+            true,
+        ),
+        ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;", true),
+        ("java/lang/Long", "longValue", "()J", false),
+        ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J", true),
+        ("java/lang/Thread", "onSpinWait", "()V", true),
+        (
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            true,
+        ),
+        ("java/lang/Math", "abs", "(I)I", true),
+        ("java/lang/Math", "abs", "(J)J", true),
+        ("java/lang/Math", "abs", "(D)D", true),
+        ("java/lang/Math", "min", "(II)I", true),
+        ("java/lang/Math", "max", "(II)I", true),
+        ("java/lang/Math", "min", "(JJ)J", true),
+        ("java/lang/Math", "max", "(JJ)J", true),
+        ("java/lang/Math", "sqrt", "(D)D", true),
+    ];
+
+    /// `is_static` and [`lookup`] must agree for every entry: the interpreter
+    /// picks its argument-pop helper from `is_static`, so a wrong answer reads
+    /// the receiver as `param0` or drops it.
+    #[test]
+    fn staticness_agrees_with_the_table() {
+        for &(class, name, desc, expect_static) in TABLE {
+            let kind = lookup(class, name, desc)
+                .unwrap_or_else(|| panic!("{class} {name} {desc} must resolve"));
+            assert_eq!(
+                is_static(kind),
+                expect_static,
+                "{class} {name} {desc} staticness"
+            );
+        }
+    }
+
+    /// The prefilter's real invariant, G9-1: it may drop a STATIC entry (see
+    /// its doc), but it must never drop an INSTANCE one — the virtual dispatch
+    /// path consults it before `lookup` and a `false` there is final.
+    #[test]
+    fn every_instance_entry_is_admitted() {
+        for &(class, name, desc, is_stat) in TABLE {
+            if is_stat {
+                continue;
+            }
+            assert!(
+                might_have_method_descriptor(name, desc),
+                "{class} {name} {desc} resolves through lookup() but the virtual \
+                 prefilter rejects it, so the fast path is unreachable"
+            );
+        }
+    }
+
+    /// The two Thread entries really are the whole of the prefilter's blind
+    /// spot. If this starts failing, a new static intrinsic was added and the
+    /// doc on `might_have_method_descriptor` needs re-reading, not deleting.
+    #[test]
+    fn the_prefilter_blind_spot_is_exactly_the_two_thread_statics() {
+        let blind: Vec<&str> = TABLE
+            .iter()
+            .filter(|(_, name, desc, _)| !might_have_method_descriptor(name, desc))
+            .map(|(_, name, _, _)| *name)
+            .collect();
+        assert_eq!(blind, vec!["onSpinWait", "currentThread"]);
+    }
+
+    /// Guards the table above against drifting behind `lookup`.
+    ///
+    /// `dispatch` has one arm per `InterpIntrinsic`; the two record kinds are
+    /// not in `lookup` at all (they are produced per-class by
+    /// `vm::runtime::interpreter::dispatch_static::record_object_intrinsic`),
+    /// so the expected count is the enum's size minus those two.
+    #[test]
+    fn the_table_is_complete() {
+        assert_eq!(TABLE.len(), 30, "lookup() arm count");
+        assert_eq!(
+            lookup("java/lang/Thread", "onSpinWait", "()V"),
+            Some(InterpIntrinsic::ThreadOnSpinWait)
+        );
+        assert_eq!(lookup("java/lang/Record", "hashCode", "()I"), None);
+        assert_eq!(
+            lookup("java/lang/Object", "equals", "(Ljava/lang/Object;)Z"),
+            None
+        );
     }
 }

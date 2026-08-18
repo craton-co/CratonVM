@@ -23,6 +23,128 @@
 > * **Cannot adjudicate without a run:** `cargo build --release -p cratonvm-cli`
 >   then `cratonvm --real-jdk ... ShadowDifferentialProbe`; the
 >   `IntStream.rangeClosed(1,5).summaryStatistics()` row must stop dying.
+>
+> ## ADJUDICATED BY A RUN, 2026-08-12 — headline CONFIRMED closed; §5's NaN/`-0.0` claim is FALSE, and its cause is one level below this record
+>
+> The run this record has asked for since it was written. Binary: a
+> default-feature release build dated 2026-08-12 15:27; oracle HotSpot 25.0.3+9;
+> host default locale `ru_RU`.
+>
+> **Headline: CLOSED and VERIFIED.**
+> `probes/ShadowDifferentialProbe.java` prints
+> `stream.summaryStats=IntSummaryStatistics{count=5, sum=15, min=1, average=3.000000, max=5}`
+> where it used to print `SECTION-DIED.streamsSurface`. §7.1's wiring is live.
+> `regression-suite/src/RJdkViews.java` — the §9.4 cover, scheduled in
+> `CORE_CLASSES` — passes **107/107 in all three arms** (HotSpot, `--real-jdk`,
+> `--jdk-only`). So §9.1's landed rows and §9.5's boxing fix are verified too.
+>
+> **§5's second bullet is contradicted by measurement.** It states that
+> `Math.min`/`Math.max` semantics were applied so NaN poisons the fold. Measured,
+> both modes, on a directly constructed real `java.util.DoubleSummaryStatistics`:
+>
+> | observable | HotSpot 25 | CratonVM `--real-jdk` | `--jdk-only` |
+> |---|---|---|---|
+> | `d.accept(1.0); d.accept(NaN); d.accept(3.0)` → `getMin`/`getMax`/`getSum` | `NaN`/`NaN`/`NaN` | **`1.0`/`3.0`/`NaN`** | same |
+> | `z.accept(-0.0); z.accept(0.0)` → `getMin` | `-0.0` | **`0.0`** | same |
+> | `DoubleStream.of(1.0,NaN,3.0).summaryStatistics().getMin()` | `NaN` | **`1.0`** | same |
+>
+> `sum=NaN` beside `min=1.0, max=3.0` is, in this record's own words, "three
+> fields that cannot all have come from the same data" — the exact wrong answer
+> `p56_java_math_min`'s doc comment was written to prevent, still being produced.
+>
+> **The cause is NOT in this file, and that is the finding.** `p56_java_math_min`
+> is correct and is used correctly at every site in
+> `native-builtins/src/phases_late/streams.rs`. But the fold that actually runs
+> here is the **real JDK bytecode** of `DoubleSummaryStatistics.accept`, because
+> `register_phase56_summary_stats` is reachable only from
+> `register_phase56_stream_extras` (`streams.rs:29`) — the synthetic-only
+> registrar. §7.1 wired the *terminals* into the real path and deliberately left
+> the `*SummaryStatistics` surface behind. So the real `accept` runs, and it
+> calls `java.lang.Math.min(double,double)` — **which this VM answers wrongly**:
+>
+> ```text
+>                        HotSpot 25    CratonVM (both modes)
+> Math.min(1.0, NaN)     NaN           1.0
+> Math.max(1.0, NaN)     NaN           1.0
+> Math.min(-0.0, 0.0)    -0.0          0.0
+> Math.min(1.0f, NaNf)   NaN           1.0
+> StrictMath.min(1.0,NaN) NaN          1.0
+> StrictMath.min(-0.0,0.0) -0.0        0.0
+> ```
+>
+> `native_math_min_double`/`_max_double`/`_min_float`/`_max_float`
+> (`native-builtins/src/lang_math.rs:1410`–`:1482`) use Rust's `f64::min`/`max`,
+> which is IEEE `minNum` — the operand-returning form this record's own
+> `p56_java_math_min` doc comment names as the trap. `register_math_natives` is
+> called for **both** `java/lang/Math` and `java/lang/StrictMath`
+> (`native-builtins/src/lib.rs:14627`–`:14628`), so those four bodies are eight
+> wrong triples. **The correct helper already exists in this repo and exactly one
+> caller uses it** — see NOMINATION 1.
+>
+> Counted rather than assumed, because a family this shape is where a count goes
+> wrong: **ten wrong triples, reached by three different routes.**
+>
+> * eight from `lang_math.rs`'s four bodies x `Math`/`StrictMath`;
+> * **two more with their own bodies** — `java/lang/Double.min/max(DD)D`,
+>   registered separately at `native-builtins/src/phases_early.rs:2701`–`:2710`,
+>   also spelled `a.min(b)`/`a.max(b)`. Measured: `Double.min(1.0, NaN)` → `1.0`,
+>   `Double.min(-0.0, 0.0)` → `0.0`. These are **not** fixed by NOMINATION 1 and
+>   need their own edit;
+> * `java/lang/Float.min/max(FF)F` is **not registered anywhere** (grepped) — it
+>   is real bytecode delegating to `Math.min`, and measures wrong
+>   (`Float.min(1.0f, NaN)` → `1.0`) purely by inheritance. It needs no edit of
+>   its own, and it is the cheapest witness that this reaches ordinary callers
+>   rather than only the stream fold.
+>
+> **Why nothing flagged it.** `register_math_natives` opens with
+> `registry.set_category(NativeKind::Intrinsic)` (`lang_math.rs:20`–`:21`),
+> ambient over the whole function. `Intrinsic` is exempt from the shadow
+> retirement *and* from the census's `native-shadows-bytecode` kind: a
+> `--jdk-only --jdk-only-report` run of a program that calls `Math.min` four
+> times contains **zero** `java/lang/Math` rows of any kind (13
+> `compatibility-class-requested`, 2 `native-shadows-bytecode`, 1324
+> `synthetic-native-registered`; `grep -c java/lang/Math` → 0). This is
+> W7-25 §1's species exactly — a native that gives an answer the bytecode would
+> not, wearing a category that makes it invisible — and it is the reason a
+> reader of `phases_late/streams.rs` alone concludes the defect is fixed.
+>
+> **§5's first bullet — the `%f` locale gap — is now MEASURED, not predicted.**
+> It is the single surviving divergence in the whole 864-line
+> `ShadowDifferentialProbe` transcript (W7-1's closing block): HotSpot renders
+> `average=3,000000` under this host's `ru_RU` default, `p56_format_java_f`
+> renders `3.000000` unconditionally.
+>
+> **Provenance matters for exactly this row, so it is stated rather than
+> glossed.** The binary measured here (15:27) PREDATES commit `67146db71`
+> (17:49), which is where the locale lane's no-`Locale` `String.format` fix and
+> its vector `RJdkFormatLocale` landed. On the binary measured,
+> `String.format("%f", 3.0)` also answered `3.000000` — i.e. the pre-fix
+> behaviour, not evidence against that lane. **What is verified at HEAD by
+> reading rather than running** is that `p56_format_java_f`
+> (`native-builtins/src/phases_late/streams.rs:1698`) is untouched by that
+> commit and still ends in `format!("{:.6}", d)`, a Rust-side renderer that
+> never calls `String.format`. So the prediction — not the measurement — is that
+> at HEAD the two now DISAGREE inside CratonVM about which locale they follow:
+> `String.format("%f", 3.0)` follows `Locale.getDefault(FORMAT)` and
+> `IntSummaryStatistics.toString()` still does not. First run of a post-`67146db71`
+> binary settles it in one line. NOMINATION 2.
+>
+> The same caveat applies to nothing else in this block: the `Math.min`/`Math.max`
+> bodies were last touched at 03:34 on 2026-08-12 and are byte-for-byte at HEAD
+> what the 15:27 binary contains — checked, not assumed.
+>
+> **Coverage gap in §9.4's own vector, named because it is why 107/107 is not a
+> discharge of the two rows above.** `RJdkViews.primitiveStreamSurface` asserts
+> `emptyStats=2147483647,-2147483648,0.0` — `getMin`/`getMax`/`getSum` **values**.
+> It never asserts a `*SummaryStatistics.toString()`, which is the only thing
+> `p56_format_java_f` produces, and it never feeds a NaN to `accept`. Both
+> defects above are invisible to a green run of it. NOMINATION 3.
+>
+> **Unchanged and re-confirmed by the same run:** §9.1's third bullet —
+> `DoubleStream.min()`/`max()` are still wrong for NaN. Measured:
+> `DoubleStream.of(1.0,NaN,3.0).min()` → HotSpot `OptionalDouble[NaN]`,
+> CratonVM `OptionalDouble[1.0]`. §9.3's `spliterator()` refusal stands; nothing
+> here re-opens it.
 
 Status: **fix written (unbuilt, unmeasured, and PARTLY UNWIRED)**. Wave 7, lane
 W7-2. Takes the fourth family of
@@ -573,3 +695,79 @@ lines; every one of them fails on the old behaviour (an `AbstractMethodError`
 that kills the run, or the `-0.0` rows above). `RJdkViews` is deliberately not
 also in `JDKONLY_CLASSES` — under `CRATONVM_ARGS=--jdk-only` the CORE list runs
 with those args too, so the one file covers both modes.
+
+---
+
+## Adjudicated in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+The reconciliation block at the head of this record says the §7.2 residual is
+"Source only — nothing built, nothing run", and that adjudicating it needs a
+build. A `--features synthetic-jdk` binary was built from clean HEAD and
+launched with `--synthetic-jdk` — the mode `register_phase56_stream_extras` and
+`register_phase56_primitive_stream_terminals` are actually reachable in.
+
+**Headline: the wiring works, and §7.2's named holes are RETIRED.** The bug this
+record came from — `IntStream.summaryStatistics()` killing whole probe runs with
+`AbstractMethodError: … has no Code attribute` — does not reproduce:
+
+```
+--synthetic-jdk (HotSpot 25 identical on every row):
+  R intStream.summaryStatistics = count=5 sum=15 min=1 max=5 avg=3.0
+  R intStream.range.distinct    = [0, 1]
+  R intStream.range.anyMatch    = true
+  R intStream.range.findFirst   = 2
+  R intStream.range.reduce      = 6
+  R intStream.range.sorted      = [0, 1, 2]
+  R intStream.range.iterator    = 0,1
+  R intStream.concat            = [0, 1, 5]
+  R intStream.asDouble.stats    = 6.0
+  R longStream.range.reduce     = 6
+```
+
+That is every §7.2 member the reconciliation block lists as WRITTEN —
+`anyMatch`, both `reduce` overloads, `findFirst`/`findAny`, `sorted`,
+`distinct`, and the `iterator()` boxing bridge — answering correctly in the only
+mode they are compiled into. **Retired.** (`summaryStatistics` was already green
+in `--real-jdk`; this closes the other half.)
+
+### Two residuals survive, and one of them is exactly what §9 refused
+
+1. **`spliterator()` — CONFIRMED ABSENT, with the missing triple named.** §9
+   refuses it as "REFUSED, not deferred". The refusal is still in force and now
+   has a transcript:
+
+   ```
+   --synthetic-jdk: R intStream.range.spliterator ! java.lang.NoSuchMethodError:
+       java.util.Spliterators.spliterator([IIII)Ljava/util/Spliterator$OfInt;
+   HotSpot / --jdk-only: est=3
+   ```
+
+   The gap is not in `IntStream` at all — `IntStream.spliterator()` runs and
+   reaches `java.util.Spliterators.spliterator([IIII)Ljava/util/Spliterator$OfInt;`,
+   which the synthetic image does not declare. Anyone reopening §9 should target
+   that one `Spliterators` triple, not the six `spliterator()` overloads §3
+   assumed.
+
+2. **The static `of(...)` factories are ABSENT — not previously recorded here.**
+
+   ```
+   --synthetic-jdk:
+     R intStream.distinct    ! NoSuchMethodError: java.util.stream.IntStream.of([I)Ljava/util/stream/IntStream;
+     R longStream.reduce     ! NoSuchMethodError: java.util.stream.LongStream.of([J)Ljava/util/stream/LongStream;
+     R doubleStream.sorted.distinct ! NoSuchMethodError: java.util.stream.DoubleStream.of([D)Ljava/util/stream/DoubleStream;
+   HotSpot / --jdk-only: [1, 3] / 6 / [1.0, 2.0, 3.0]
+   ```
+
+   §9's "static `concat`" exception is half right: `IntStream.concat` **works**
+   (`[0, 1, 5]`), and it is `of(...)` — all three primitive flavours, varargs
+   form — that is missing. This matters for the falsifier design: **a probe
+   written with `IntStream.of(...)` measures the absence of `of`, not the
+   terminal it was aimed at.** Every green row above uses `IntStream.range` /
+   `LongStream.range` for exactly that reason. Redo any earlier
+   `of`-based measurement before trusting it.
+
+Method note: none of this is visible from `--real-jdk` or `--jdk-only`, where
+real JDK bytecode serves all of it and the whole file is out of the picture. The
+falsifier the head of this record asks for (`cratonvm --real-jdk …
+ShadowDifferentialProbe`) tests a different question from the one §7.2's
+registrations answer.

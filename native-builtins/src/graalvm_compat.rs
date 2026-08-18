@@ -1498,9 +1498,12 @@ pub(crate) fn register_graalvm_compat_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // Serialize tests that mutate GraalVM global state
     // (GRAALVM_CONFIG, GRAALVM_SUBSTITUTIONS, GRAALVM_FEATURES).
@@ -2125,13 +2128,297 @@ mod tests {
             .is_some());
     }
 
+    /// What the real GraalVM SDK has where CratonVM registered something.
+    ///
+    /// Measured, not recalled — see [`GRAALVM_COMPAT_REGISTRATIONS`] for the
+    /// exact `javap` provenance.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Sdk {
+        /// `javap` shows this exact class, method name and descriptor.
+        Exact,
+        /// The SDK has no such `(class, method, descriptor)`. The payload is
+        /// what the SDK really declares, or `None` when the SDK has no method
+        /// of that name on any related class at all.
+        ///
+        /// A `Divergent` row is an EXEMPTION, and it expires: if the
+        /// registration is ever corrected to match the payload, the row stops
+        /// being divergent and
+        /// `the_graalvm_sdk_divergences_are_the_five_that_were_measured` fails
+        /// telling you to reclassify it.
+        Divergent(Option<(&'static str, &'static str, &'static str)>),
+        /// A CratonVM extension with no GraalVM counterpart, on purpose.
+        CratonExtension,
+    }
+
+    /// Every triple `register_graalvm_compat_natives` installs, frozen, with
+    /// each row's verdict against the real GraalVM SDK.
+    ///
+    /// Two-sided on purpose: a row missing from the registry is a LOST
+    /// registration, and a registration missing from this table is an
+    /// UNDECLARED one. A changed descriptor trips both halves at once, which is
+    /// why the descriptor is part of the row rather than a separate assertion.
+    ///
+    /// Transcribed from `register_graalvm_compat_natives` on 2026-08-13 and
+    /// verified by counting `r.register(` in that function: 5 `ImageInfo` +
+    /// 2 `RuntimeReflection` + 1 `RuntimeSerialization` + 1 `RuntimeJNIAccess`
+    /// + 1 `Platform` + 1 `hosted/Feature` + 3 `ImageSingletons` + 1 CratonVM
+    /// `MetadataAgent` extension = **15**, not the 10 the old comment claimed.
+    ///
+    /// EXTERNAL ORACLE. The `Sdk` column was measured on this host on
+    /// 2026-08-13 with
+    ///
+    /// ```text
+    /// javap -public -s -cp nativeimage-25.0.2.jar org.graalvm.nativeimage.<Class>
+    /// ```
+    ///
+    /// against the GraalVM SDK **25.0.2** shipped in
+    /// `tornadovm-4.0.1-jdk25-ptx/share/java/tornado/nativeimage-25.0.2.jar`,
+    /// using `javap` from `openjdk 25.0.3 2026-04-21 LTS, Microsoft-13877124,
+    /// build 25.0.3+9-LTS`. Nine rows matched the SDK exactly. Five did not,
+    /// and they are recorded below rather than quietly asserted away:
+    /// `RuntimeReflection`, `RuntimeSerialization` and `RuntimeJNIAccess` live
+    /// in `org.graalvm.nativeimage.**hosted**`, not in
+    /// `org.graalvm.nativeimage`, and every one of their `register` methods is
+    /// **varargs** (`([Ljava/lang/Class;)V`), while
+    /// `org.graalvm.nativeimage.hosted.Feature` declares no `register` method
+    /// of any shape. See NOM E33-1 —
+    /// `docs/known-issues/jdk-only/E33-R11-FOUR-UNFALSIFIABLE-GUARDS-20260813.md`.
+    ///
+    /// RESIDUAL: the jar is a host path, not a checked-in fixture, so nothing
+    /// re-measures this column at test time. NOM E33-1 asks for the frozen
+    /// `javap` output to be committed next to this table.
+    #[rustfmt::skip]
+    const GRAALVM_COMPAT_REGISTRATIONS: &[(&str, &str, &str, Sdk)] = &[
+        ("org/graalvm/nativeimage/ImageInfo",             "inImageCode",                        "()Z",                                   Sdk::Exact),
+        ("org/graalvm/nativeimage/ImageInfo",             "inImageBuildtimeCode",               "()Z",                                   Sdk::Exact),
+        ("org/graalvm/nativeimage/ImageInfo",             "inImageRuntimeCode",                 "()Z",                                   Sdk::Exact),
+        ("org/graalvm/nativeimage/ImageInfo",             "isExecutable",                       "()Z",                                   Sdk::Exact),
+        ("org/graalvm/nativeimage/ImageInfo",             "isSharedLibrary",                    "()Z",                                   Sdk::Exact),
+        ("org/graalvm/nativeimage/RuntimeReflection",     "register",                           "(Ljava/lang/Class;)V",                  Sdk::Divergent(Some(("org/graalvm/nativeimage/hosted/RuntimeReflection",    "register",                           "([Ljava/lang/Class;)V")))),
+        ("org/graalvm/nativeimage/RuntimeReflection",     "registerForReflectiveInstantiation", "(Ljava/lang/Class;)V",                  Sdk::Divergent(Some(("org/graalvm/nativeimage/hosted/RuntimeReflection",    "registerForReflectiveInstantiation", "([Ljava/lang/Class;)V")))),
+        ("org/graalvm/nativeimage/RuntimeSerialization",  "register",                           "(Ljava/lang/Class;)V",                  Sdk::Divergent(Some(("org/graalvm/nativeimage/hosted/RuntimeSerialization", "register",                           "([Ljava/lang/Class;)V")))),
+        ("org/graalvm/nativeimage/RuntimeJNIAccess",      "register",                           "(Ljava/lang/Class;)V",                  Sdk::Divergent(Some(("org/graalvm/nativeimage/hosted/RuntimeJNIAccess",     "register",                           "([Ljava/lang/Class;)V")))),
+        ("org/graalvm/nativeimage/Platform",              "includedIn",                         "(Ljava/lang/Class;)Z",                  Sdk::Exact),
+        ("org/graalvm/nativeimage/hosted/Feature",        "register",                           "(Ljava/lang/Class;)V",                  Sdk::Divergent(None)),
+        ("org/graalvm/nativeimage/ImageSingletons",       "contains",                           "(Ljava/lang/Class;)Z",                  Sdk::Exact),
+        ("org/graalvm/nativeimage/ImageSingletons",       "lookup",                             "(Ljava/lang/Class;)Ljava/lang/Object;", Sdk::Exact),
+        ("org/graalvm/nativeimage/ImageSingletons",       "add",                                "(Ljava/lang/Class;Ljava/lang/Object;)V", Sdk::Exact),
+        ("cratonvm/graalvm/MetadataAgent",                "dumpConfigs",                        "(Ljava/lang/String;)I",                 Sdk::CratonExtension),
+    ];
+
+    /// The five GraalVM-SDK divergences measured on 2026-08-13, named.
+    ///
+    /// This is the ratcheted, EXPIRING half of the exemption. It fails three
+    /// ways, and every one of them is a thing somebody would otherwise do
+    /// silently:
+    ///
+    ///  * a sixth divergence appears — a new registration that does not match
+    ///    the SDK, or an `Exact` row edited into a wrong shape;
+    ///  * a divergence disappears — good news, but the row must be reclassified
+    ///    `Sdk::Exact` in the same edit or the exemption outlives the exception
+    ///    (E20's decay mode, and E25's `already_triaged` rows, again);
+    ///  * a `Divergent(Some(..))` row whose registration now equals what the
+    ///    SDK declares. That row is fixed and is lying about itself.
+    #[rustfmt::skip]
+    const MEASURED_SDK_DIVERGENCES: &[&str] = &[
+        "org/graalvm/nativeimage/RuntimeReflection::register(Ljava/lang/Class;)V",
+        "org/graalvm/nativeimage/RuntimeReflection::registerForReflectiveInstantiation(Ljava/lang/Class;)V",
+        "org/graalvm/nativeimage/RuntimeSerialization::register(Ljava/lang/Class;)V",
+        "org/graalvm/nativeimage/RuntimeJNIAccess::register(Ljava/lang/Class;)V",
+        "org/graalvm/nativeimage/hosted/Feature::register(Ljava/lang/Class;)V",
+    ];
+
+    #[test]
+    fn the_graalvm_sdk_divergences_are_the_five_that_were_measured() {
+        let mut divergent: Vec<String> = Vec::new();
+        let mut stale: Vec<String> = Vec::new();
+        for (class, method, descriptor, sdk) in GRAALVM_COMPAT_REGISTRATIONS.iter().copied() {
+            if let Sdk::Divergent(what_the_sdk_has) = sdk {
+                divergent.push(format!("{class}::{method}{descriptor}"));
+                if what_the_sdk_has == Some((class, method, descriptor)) {
+                    stale.push(format!("{class}::{method}{descriptor}"));
+                }
+            }
+        }
+        divergent.sort();
+        let mut measured: Vec<String> = MEASURED_SDK_DIVERGENCES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        measured.sort();
+
+        assert!(
+            stale.is_empty(),
+            "these rows are marked Sdk::Divergent but now register exactly what \
+             the GraalVM SDK declares:\n    {}\n\n\
+             The registration was fixed and the row was not. Change it to \
+             Sdk::Exact and drop it from MEASURED_SDK_DIVERGENCES.",
+            stale.join("\n    ")
+        );
+        assert_eq!(
+            divergent, measured,
+            "the set of registrations that disagree with GraalVM SDK 25.0.2 \
+             changed. If a divergence was FIXED, delete its row from \
+             MEASURED_SDK_DIVERGENCES and mark it Sdk::Exact. If a NEW one \
+             appeared, re-measure with `javap -public -s -cp \
+             nativeimage-25.0.2.jar <class>` before adding it — an exemption \
+             added without a measurement is how this whole class of guard rots."
+        );
+        assert_eq!(
+            GRAALVM_COMPAT_REGISTRATIONS
+                .iter()
+                .filter(|(_, _, _, s)| *s == Sdk::CratonExtension)
+                .count(),
+            1,
+            "exactly one row is a CratonVM extension with no GraalVM \
+             counterpart (`cratonvm/graalvm/MetadataAgent`). A second one is \
+             either a real extension that needs saying so, or an \
+             `org.graalvm.*` row misfiled to dodge the SDK check."
+        );
+    }
+
+    /// WHY THIS TEST WAS REWRITTEN ON 2026-08-13.
+    ///
+    /// Its name says "total method count" and the comment inside it did the
+    /// arithmetic `= 10 methods`, but the entire body was one line:
+    /// `assert!(r.find(IMAGE_INFO, "nonExistent", "()V").is_none());`. That
+    /// asserts the absence of a method **nothing has ever registered**, so no
+    /// registration change of any kind could turn this test red — deleting
+    /// every single `r.register(...)` call in `register_graalvm_compat_natives`
+    /// left it green. It was counted as coverage for a claim it never made.
+    /// (E25 sweep, `docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md`
+    /// §3 row 1.) The arithmetic was wrong too: the registrar makes 15
+    /// registrations, and the tally omitted `ImageSingletons` entirely.
+    ///
+    /// The replacement is the shape this tree already blesses for exactly this
+    /// failure — `vm/tests/wp8_10_9_string_contains_native.rs:266`
+    /// `the_surviving_string_registration_set_is_exactly_this`, written because
+    /// "both passed while the drop was silently deleting four registrations
+    /// nobody had thought to name". A two-sided frozen set, plus the
+    /// over-registration probe the old body did carry.
+    ///
+    /// The GraalVM-SDK conformance of each row is a separate, measured column —
+    /// see [`GRAALVM_COMPAT_REGISTRATIONS`] and
+    /// `the_graalvm_sdk_divergences_are_the_five_that_were_measured`. This test
+    /// asserts only that the registrar registers what it says it registers.
     #[test]
     fn test_register_total_method_count() {
         let r = make_registry();
-        // 5 ImageInfo + 2 RuntimeReflection + 1 RuntimeSerialization
-        // + 1 RuntimeJNIAccess + 1 Platform = 10 methods
-        // Verify a few are not present to confirm no over-registration
+
+        let mut expected: Vec<(&str, &str, &str)> = GRAALVM_COMPAT_REGISTRATIONS
+            .iter()
+            .map(|(c, m, d, _sdk)| (*c, *m, *d))
+            .collect();
+        expected.sort_unstable();
+        let declared = expected.len();
+        expected.dedup();
+        assert_eq!(
+            expected.len(),
+            declared,
+            "GRAALVM_COMPAT_REGISTRATIONS lists the same triple twice; a duplicated row \
+             would hide a lost registration behind its own copy"
+        );
+
+        let mut actual: Vec<(&str, &str, &str)> = r
+            .dump_registrations()
+            .into_iter()
+            .map(|(c, m, d, _kind)| (c, m, d))
+            .collect();
+        actual.sort_unstable();
+        actual.dedup();
+
+        let lost: Vec<String> = expected
+            .iter()
+            .copied()
+            .filter(|row| !actual.contains(row))
+            .map(|(c, m, d)| format!("{c}::{m}{d}"))
+            .collect();
+        let undeclared: Vec<String> = actual
+            .iter()
+            .copied()
+            .filter(|row| !expected.contains(row))
+            .map(|(c, m, d)| format!("{c}::{m}{d}"))
+            .collect();
+
+        assert!(
+            lost.is_empty() && undeclared.is_empty(),
+            "register_graalvm_compat_natives no longer matches its frozen set.\n  \
+             REGISTRATION LOST (declared here, not registered):\n    {}\n  \
+             UNDECLARED REGISTRATION (registered, not declared here):\n    {}\n\n\
+             If you ADDED a native, add its row above in the same edit. If a row \
+             disappeared, a registration was dropped — that is the failure this \
+             test exists for, and until 2026-08-13 it could not report it.",
+            if lost.is_empty() {
+                "(none)".to_string()
+            } else {
+                lost.join("\n    ")
+            },
+            if undeclared.is_empty() {
+                "(none)".to_string()
+            } else {
+                undeclared.join("\n    ")
+            },
+        );
+
+        // The count the name promises, now backed by the set above rather than
+        // by a comment.
+        assert_eq!(
+            r.len(),
+            GRAALVM_COMPAT_REGISTRATIONS.len(),
+            "registry slot count disagrees with the frozen set even though every \
+             triple matched — two rows must have collapsed onto one slot"
+        );
+
+        // Retained from the old body: a name nothing registers must stay
+        // unregistered. This is the only half the old test had.
         assert!(r.find(IMAGE_INFO, "nonExistent", "()V").is_none());
+    }
+
+    /// The anchor OUTSIDE this module: a registry this module does not build.
+    ///
+    /// `register_graalvm_compat_natives` is reached from exactly one call site
+    /// (`lib.rs`, inside `register_synthetic_overrides`), so every triple above
+    /// is a Substrate-VM stand-in that must never be visible on the real-JDK
+    /// path. `ImageInfo.inImageCode()` answering on a real JDK would tell an
+    /// application it is running inside a native image when it is not; the
+    /// `register_p68_xml` precedent (a synthetic surface pulled onto the
+    /// real-JDK path, which pre-empted Tomcat's real SAX parser and broke
+    /// `server.xml`) is the same mistake with a different class name.
+    ///
+    /// Unlike the frozen set above, the expectation here is not transcribed
+    /// from the code under test: it is read off a registry built by
+    /// `register_essential_natives`.
+    #[test]
+    fn no_graalvm_substrate_stub_reaches_the_essential_path() {
+        let mut essential = NativeMethodRegistry::new();
+        crate::register_essential_natives(&mut essential);
+
+        // Anti-vacuity: an empty registry would make the check below pass for
+        // the wrong reason.
+        assert!(
+            essential.len() > 100,
+            "register_essential_natives produced only {} registrations — this \
+             check would have passed vacuously",
+            essential.len()
+        );
+
+        let leaked: Vec<String> = GRAALVM_COMPAT_REGISTRATIONS
+            .iter()
+            .copied()
+            // `kind_of` is the EXACT-triple lookup. `find` would also match
+            // through the registry's descriptor-compatibility rewriting, which
+            // could report a leak that is really a different registration.
+            .filter(|(c, m, d, _sdk)| essential.kind_of(c, m, d).is_some())
+            .map(|(c, m, d, _sdk)| format!("{c}::{m}{d}"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "GraalVM Substrate stubs reached the real-JDK path:\n    {}\n\n\
+             These are synthetic stand-ins for `org.graalvm.nativeimage.*`. On a \
+             real JDK the application is not a native image, and these would \
+             answer for it anyway.",
+            leaked.join("\n    ")
+        );
     }
 
     // -----------------------------------------------------------------------

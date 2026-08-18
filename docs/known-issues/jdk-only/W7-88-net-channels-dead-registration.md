@@ -8,6 +8,17 @@ record named.
 
 Branch `fix/net-channels-losing-registration-20260812`.
 
+> **READ §10 BEFORE APPLYING ANYTHING IN THIS RECORD TO THE FILE AS A WHOLE.**
+> Everything below is scoped to `register_p58_nio_channels`, which registers
+> nothing in any runnable configuration. The **next function down**,
+> `register_p67_async_channels`, is reached from
+> `register_essential_natives_with_shims` and is **live in both shipping
+> modes** — §2's own census says so and the sentence reads the other way at a
+> glance. Four of its triples survive `native-io`'s later registrations, and two
+> of those are broken: `AsynchronousFileChannel.force(Z)V` is a **silent no-op**
+> and `AsynchronousFileChannel.lock()` / `AsynchronousServerSocketChannel.accept()`
+> hand back a `FutureTask` whose `get()` **never returns**.
+
 **This lane did not build.** Every CratonVM claim is either (a) a transcript of
 the **prebuilt dev binary** `C:/craton/CratonVM/target/release/cratonvm.exe`,
 built 2026-08-12 07:33 — the same commit this branch is cut from, and later than
@@ -458,3 +469,143 @@ skip:
   NO-CHANGE by construction and is still not scheduled (`run.sh` reads a word
   list, not `probes/`). This is a record that closes on a census diff, not on a
   vector.
+
+---
+
+## 10. The OTHER registrar in this file is LIVE, 2026-08-12 — and its two live AFC triples are both broken
+
+Source read on this tree; **no build, no binary, no `cargo`**. Ordering
+re-measured from `vm/src/vm/vm_init.rs`; JDK layouts are `javap -p` against
+Adoptium 25.0.3.9 on this host, the same oracle and convention as §3.
+
+This record's title, its §2 census and its §8 residual list all say
+`net_channels.rs` in the voice of a file that does not run. That is true of
+`register_p58_nio_channels` and **false of the file.** §2's own census says so
+and the sentence was read the wrong way round: *"in all four censuses every
+`net_channels.rs` row is at line >= 1252, i.e. contributed by
+`register_p67_async_channels` (line 1247) and later."* Those rows are **present
+in all four configurations**, including `--jdk-only`. `register_p58_nio_channels`
+registers nothing; `register_p67_async_channels` registers into every shipping
+binary, and it is the next function down.
+
+The call chain is different, and that is the whole reason:
+
+| | `register_p58_nio_channels` (§2) | `register_p67_async_channels` (this section) |
+|---|---|---|
+| declared at | `net_channels.rs:70` | `net_channels.rs:1307` |
+| reached from | `phases_late.rs` → `register_phase58_natives` → `native-builtins/src/lib.rs`, inside `#[cfg(feature = "synthetic-jdk")] register_synthetic_overrides` — **one** call site | `native-builtins/src/lib.rs:7943`, inside **`register_essential_natives_with_shims`** (`lib.rs:7103`) — *and* a second time in the synthetic arm via `register_phase67_natives` (`lib.rs:24073`) |
+| `vm_init` reaches it | only the `synthetic-jdk` feature build in `--synthetic-jdk` mode | `:2028` (feature build, real-JDK arm) and **`:2566`** (`#[cfg(not(feature = "synthetic-jdk"))]` at `:2540` — the shipping `cratonvm-cli`) |
+| in the census | zero rows | all rows at `>= 1252` |
+
+So a reader who takes "this file is dead" from §1–§9 and applies it below line
+1247 reaches the wrong conclusion — which is this campaign's own
+`chk dev`/losing-registration failure mode, committed by a record *about* that
+failure mode. The correction is filed here rather than in the title because the
+title's claim, scoped to the function it names, is still exactly right.
+
+### 10.1 What survives, per triple
+
+`register_io_natives` runs **after** `register_essential_natives_with_shims` in
+all three `vm_init` arms (`:1908`, `:2225`, `:2761`), so everything `native-io`
+re-registers overwrites this registrar. Diffed triple by triple against
+`native-io/src/lib.rs::register_async_file_channel`,
+`native-io/src/nio_native.rs::register_t16_channel_overrides` and
+`native-io/src/async_socket.rs::register_async_socket_real`:
+
+| this file | triple | later owner | live here? |
+|---:|---|---|:-:|
+| `:1312` | `AFC.open(Path,[OpenOption])` | `native_afc_open` → `t16_afc_open` | no |
+| `:1325` | `AFC.read(ByteBuffer,J)Future` | `native_afc_read` | no |
+| `:1389` | `AFC.write(ByteBuffer,J)Future` | `native_afc_write` | no |
+| `:1470` | `AFC.size()J` | `native_afc_size` → `t16_afc_size` | no |
+| `:1481` | `AFC.truncate(J)` | `native_afc_truncate` | no |
+| **`:1487`** | **`AFC.force(Z)V`** | **nobody** | **YES** |
+| **`:1506`** | **`AFC.lock()Future`** | **nobody** | **YES** |
+| `:1517` | `AFC.close()V` | `native_afc_close` → `t16_afc_close` | no |
+| `:1522` | `AFC.isOpen()Z` | `native_afc_is_open` → `t16_afc_is_open` | no |
+| `:1565`/`:1579` | `ASC.open()` ×2 | `aio_asc_open` / `aio_asc_open_group` | no |
+| **`:1593`** | **`ASC.connect(SocketAddress)Future`** | **nobody** (`native-io` registers only the `(SocketAddress,Object,CompletionHandler)V` form) | **YES** |
+| `:1624`/`:1693` | `ASC.read/write(ByteBuffer)Future` | `aio_asc_read_future` / `aio_asc_write_future` | no |
+| `:1765`/`:1775`/`:1779` | `ASC.close`/`isOpen`/`getRemoteAddress` | `aio_asc_close` / `aio_asc_is_open` / `aio_asc_remote_address` | no |
+| `:1791`/`:1805` | `ASSC.open()` / `bind(SocketAddress)` | `aio_assc_open` / `aio_assc_bind` | no |
+| **`:1811`** | **`ASSC.accept()Future`** | **nobody** (`async_socket.rs:3516` registers only `accept(Object,CompletionHandler)V`) | **YES** |
+| `:1822` | `ASSC.close()V` | `aio_assc_close` | no |
+
+**One row this corrects in another record.** The comment at `:1539-1541` says
+*"The one survivor is `connect(SocketAddress)Future` — native-io registers only
+the `(SocketAddress, Object, CompletionHandler)V` form"*, and W7-49 records the
+same. That was true of `connect` and has since become **false as a statement
+about the block**: `native-io` now registers `asc.read`/`asc.write` in both
+forms, so those two joined the dead, while `ASSC.accept()Future` — which the
+comment does not mention — was a survivor all along. Four survivors, not one.
+
+### 10.2 The two AFC survivors are both fabricated success
+
+Both are adjudicated in full in
+[W7-8-fabricated-success-io-sweep.md](W7-8-fabricated-success-io-sweep.md) §9,
+which is the fabricated-success anchor and carries the patches as out-of-file
+items 7–9. In one line each, because this is the file they live in:
+
+* **`force(Z)V` (`:1487`) reads slot 0 as a path `String`.** Every
+  `AsynchronousFileChannel` in this VM is allocated by `native-io`'s
+  `alloc_afc_channel` with `Int(fd)` in slot 0, so the `match` takes `_ =>` and
+  **returns `Ok(None)` before touching its first argument.** `force(true)` — the
+  durability barrier H2's async file store calls — does nothing, reports nothing,
+  and its scheduled fixture (`RJdkAsyncChannel.java:143-144`, in
+  `JDKONLY_CLASSES`) asserts only `isOpen()` afterwards, which the no-op
+  satisfies. Three further defects are stacked behind the slot error: the
+  `sync_all`/`sync_data` polarity is inverted, the fsync is issued on a
+  *second* descriptor opened by path (so none of the channel's buffered writes
+  are flushed, and the open fails outright on a read-only channel), and there is
+  no closed-channel refusal.
+* **`lock()Future` (`:1506`) mints `java/util/concurrent/FutureTask` with two
+  field-index writes.** That is a real `java.base` class: slot 0 is `state` and
+  slot 1 is `callable`. `Object(None)` into the `int` slot coerces to `Int(0)` =
+  `NEW` (`gc/src/heap.rs:1657`) and the `Int(1)` meant as "done" lands on
+  `callable` and degrades to null (`:1674`). Real `FutureTask.get()` sees
+  `state <= COMPLETING`, enters an untimed `awaitDone`, and **parks forever**;
+  `isDone()` is `false` for the life of the process. `ASSC.accept()` at `:1811`
+  is the identical mint and the identical hang.
+
+This is the same species §3 records — *"an in-bounds write of the wrong field …
+invisible to the allocation-width instrument because slot 0 exists"* — with two
+aggravations §3's row does not have. The receiver class is one the JDK's own
+hot-path bytecode reads (`AbstractInterruptibleChannel.end()` was §3.1's
+argument; `FutureTask.awaitDone` is a stronger one, because it does not merely
+misbehave, it does not return). And unlike §3's row, **these are live**:
+`--dump-native-registry` will show `owns_slot = true`, `overwrote = null` for
+`java/nio/channels/AsynchronousFileChannel.force (Z)V` and
+`.lock ()Ljava/util/concurrent/Future;` in all four configurations of §2.
+
+### 10.3 The fix is already in this file, applied to one caller
+
+`aio_completed_future` (`native-builtins/src/phases_late/concurrent.rs:1369`) is
+four lines over `CompletableFuture.completedFuture`, and its own doc comment at
+`:1366-1368` states this exact diagnosis:
+
+> *"A synthetic `FutureTask` does NOT work here: in real-JDK mode
+> `FutureTask.get()` runs the real bytecode (reads the real `state` field, stuck
+> NEW) → the websocket client's `fConnect.get(timeout)` TimeoutException."*
+
+It was applied to `asc.connect` (`:1621`) and to `asc.read`/`asc.write`
+(`:1690`, `:1762`) — and to none of the four `FutureTask` mints in the same
+function. The diagnosis was written down and then applied at the call site whose
+test was failing, not to the shape. **Grep the shape, not the failing test:**
+`try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)`
+returns four hits, all in this file (`:1383`, `:1464`, `:1511`, `:1816`), and a
+ratchet on that string is worth more than any of the four individual repairs.
+
+### 10.4 What this does and does not change about §8
+
+§8 residual 2 says the `sc` / `sel` / `sk` blocks in
+`register_p58_nio_channels` were not examined, and that *"the liveness half is
+already answered for them"*. That still holds — they are inside the dead
+registrar. What did not hold is the unstated extension of it to the rest of the
+file. Restated as a residual: **`register_p67_async_channels` (`:1307`–`:1830`)
+is live in both shipping modes and has now been audited for liveness per triple
+(§10.1) but not for layout.** `AsynchronousSocketChannel`'s two-maps-on-one-class
+condition, quoted at `:1544-1548` and measured by W7-49, is still unrepaired and
+is now known to sit under a **surviving** `connect` — so slots 0 and 2 of a
+`native-io`-allocated channel are being written under a map whose slot 0 means
+the opposite. That is `:1550`'s own sentence, and it needs the cross-crate lane
+it names.

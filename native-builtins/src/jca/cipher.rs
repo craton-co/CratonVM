@@ -145,6 +145,19 @@ struct CipherState {
     /// public exponent for ENCRYPT/WRAP, the private exponent for DECRYPT/UNWRAP.
     /// Empty for non-RSA ciphers.
     rsa_exp: Vec<u8>,
+    /// The `crypto_impl` key handle behind this cipher's private key, when the
+    /// key has one. `(n, d)` above is everything the decrypt path needs to be
+    /// *correct*, but it cannot reach the CRT parameters, which live on the
+    /// whole `RsaPrivateKey` in `crypto_impl`'s store; the handle can, and CRT
+    /// is ~3x on the private op. `None` for a key with no handle (a real JDK
+    /// key object this VM did not mint), which simply keeps the `(n, d)` path.
+    /// A handle, not a key ref, for the same GC-safety reason as `key_bytes`.
+    ///
+    /// The handle is NOT trusted on its own: `rsa_cipher_decrypt_by_id` only
+    /// honours it when the key it names carries `rsa_n` above, because the
+    /// field-slot fallback in `rsa_private_key_handle` can read an unrelated
+    /// small integer off a genuine JDK key and collide with a live id.
+    rsa_key_id: Option<u64>,
     /// PBES2 (`PBEWithHmacSHA*AndAES_*`) salt, captured at `init` time from the
     /// `AlgorithmParameters` argument. Empty for non-PBES2 ciphers. Plain bytes
     /// (not an `ObjectRef`) for the same GC-safety reason as `key_bytes` — and
@@ -523,6 +536,23 @@ fn rsa_key_components(
     }
 }
 
+/// The `crypto_impl` key handle behind an RSA private key object, if it has one.
+///
+/// Same resolution the synthetic-key branch of [`rsa_key_components`] uses — the
+/// real-key side table first, then the handle field — but run unconditionally,
+/// because a key can expose real `getModulus()`/`getPrivateExponent()` AND still
+/// have a handle. `rsa_key_components` stops at the first, so it never learns
+/// the second; the decrypt path wants both.
+fn rsa_private_key_handle(ctx: &mut dyn NativeContext, key: ObjectRef) -> Option<u64> {
+    crate::crypto_impl::rsa_realkey_map_get(ctx.vm_identity(), ctx.identity_hash_code(key))
+        .or_else(|| match ctx.get_field(key, 3) {
+            Value::Long(i) => Some(i as u64),
+            Value::Int(i) => Some(i as u64),
+            _ => None,
+        })
+        .filter(|&i| i != 0)
+}
+
 /// Shared `Cipher.init` recorder: snapshot mode + key bytes + IV, and (for RSA
 /// transformations) the key's modulus/exponent components, into the side-table.
 /// This Cipher's transformation string, as recorded by `getInstance`.
@@ -757,6 +787,11 @@ fn cipher_init_record_with_counter(
         ));
     }
 
+    let rsa_key_id = if is_rsa_transformation(&algo) && (mode == 2 || mode == 4) {
+        rsa_private_key_handle(ctx, key)
+    } else {
+        None
+    };
     let (rsa_n, rsa_exp) = if is_rsa_transformation(&algo) {
         match rsa_key_components(ctx, key, mode) {
             Some(pair) if !pair.0.is_empty() && !pair.1.is_empty() => pair,
@@ -803,6 +838,7 @@ fn cipher_init_record_with_counter(
         s.chacha_last_encrypt = last_encrypt;
         s.rsa_n = rsa_n;
         s.rsa_exp = rsa_exp;
+        s.rsa_key_id = rsa_key_id;
         s.accumulated.clear();
         s.aad.clear();
     });
@@ -962,6 +998,7 @@ fn cipher_init_record_pbes2(
                 s.iv_bytes = iv;
                 s.rsa_n = Vec::new();
                 s.rsa_exp = Vec::new();
+                s.rsa_key_id = None;
                 s.pbe_salt = salt;
                 s.pbe_iterations = iters;
                 s.accumulated.clear();
@@ -3500,6 +3537,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     let state_counter = state.chacha_counter;
     let rsa_n = state.rsa_n.clone();
     let rsa_exp = state.rsa_exp.clone();
+    let rsa_key_id = state.rsa_key_id;
 
     // RSA cipher (`RSA/ECB/{PKCS1Padding, OAEPWith…}`). The symmetric AES path
     // below would misread the RSA key encoding as an AES key (the historic
@@ -3534,7 +3572,17 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         let result = if encrypt {
             crate::crypto_impl::rsa_cipher_encrypt(&rsa_n, &rsa_exp, pad, &data)
         } else {
-            crate::crypto_impl::rsa_cipher_decrypt(&rsa_n, &rsa_exp, pad, &data)
+            // Prefer the key handle: it reaches the CRT parameters, which the
+            // `(n, d)` form cannot see. A handle that is not in the store
+            // returns `None` and falls through to the identical `(n, d)`
+            // path — same body, same exception classes, just slower.
+            rsa_key_id
+                .and_then(|id| {
+                    crate::crypto_impl::rsa_cipher_decrypt_by_id(id, &rsa_n, pad, &data)
+                })
+                .unwrap_or_else(|| {
+                    crate::crypto_impl::rsa_cipher_decrypt(&rsa_n, &rsa_exp, pad, &data)
+                })
         };
         return match result {
             Ok(bytes) => finish_cipher_bytes(ctx, key, &bytes),

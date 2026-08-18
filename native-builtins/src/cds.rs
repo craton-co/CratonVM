@@ -3,19 +3,27 @@
 
 //! Class Data Sharing (CDS / AppCDS) native method implementations.
 //!
-//! Provides archive infrastructure, metrics reporting, and all native stubs
-//! required by `jdk/internal/misc/CDS`, `sun/misc/VM`, `java/lang/ClassLoader`,
-//! and `sun/management/ManagementFactoryHelper` for CDS-related queries.
+//! Provides archive infrastructure and the native stubs required by
+//! `jdk/internal/misc/CDS` and `sun/management/ManagementFactoryHelper`.
 //!
 //! The JVM boots with CDS **disabled** by default (sharing = 0).  The archive
 //! types below are present so that a future dump/load path can be wired in
 //! without changing the public registration surface.
+//!
+//! F17-1 (2026-08-13): this header used to also claim `sun/misc/VM` and
+//! `java/lang/ClassLoader`. It no longer does, because the registrations behind
+//! that claim were fabrications — `javap` cannot find `sun.misc.VM` in the JDK
+//! 25 image at all, and `java.lang.ClassLoader` has no `getCdsArchivePath`. See
+//! the tombstone above the native handler functions for the transcripts.
+//! `sun/management/CDSMetrics` went the same way, which is why "metrics
+//! reporting" has left this sentence: the Rust `CdsMetrics` type stayed, the
+//! Java class it was projected into never existed.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
-use crate::{try_alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::native_noop_with_this;
 
 // ---------------------------------------------------------------------------
 // Archive format constants
@@ -588,128 +596,90 @@ pub fn format_class_list(classes: &[String]) -> String {
 // Synthetic object allocation helpers
 // ---------------------------------------------------------------------------
 
-/// Allocate a CDS metrics synthetic object.
-///
-/// Field layout (5 fields):
-/// ```text
-///  0  total_classes_in_archive   (Int)
-///  1  classes_loaded_from_archive (Int)
-///  2  archive_size_bytes         (Long)
-///  3  archive_load_time_ms       (Long)
-///  4  archive_path               (Object / String)
-/// ```
-fn alloc_cds_metrics_obj(
-    ctx: &mut dyn NativeContext,
-    metrics: &CdsMetrics,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/CDSMetrics", 5)?;
-    ctx.set_field(obj, 0, Value::Int(metrics.total_classes_in_archive as i32));
-    ctx.set_field(
-        obj,
-        1,
-        Value::Int(metrics.classes_loaded_from_archive as i32),
-    );
-    ctx.set_field(obj, 2, Value::Long(metrics.archive_size_bytes as i64));
-    ctx.set_field(obj, 3, Value::Long(metrics.archive_load_time_ms as i64));
-    let path_obj = ctx.create_string(&metrics.archive_path);
-    ctx.set_field(obj, 4, Value::Object(Some(path_obj)));
-    Ok(obj)
-}
-
-/// Allocate a synthetic `java.util.Properties` object (2 fields: backing
-/// array + size).  The object is empty; callers may add entries via
-/// `ctx.set_field` if needed.
-fn alloc_properties_obj(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    use cratonvm_types::ClassId;
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 2)?;
-    let backing = ctx.new_ref_array(ClassId::new(0), 0);
-    ctx.set_field(obj, 0, Value::Object(Some(backing)));
-    ctx.set_field(obj, 1, Value::Int(0));
-    Ok(obj)
-}
+// F17-1 (2026-08-13) — TWO ALLOCATION HELPERS USED TO LIVE HERE. Both are gone
+// because the only natives that called them are gone; see the tombstone at the
+// head of the handler section below for the `javap` evidence.
+//
+//   * `alloc_cds_metrics_obj` built a 5-slot `sun/management/CDSMetrics`. That
+//     class is not in the JDK 25 runtime image.
+//   * `alloc_properties_obj` built a 2-slot `java/util/Properties` for
+//     `sun/misc/VM.savedProps()`. That class is not in the JDK 25 runtime image
+//     either, and the 2-slot shape it minted is not `Properties`' real layout —
+//     it was only ever safe because nothing but the deleted native read it.
 
 // ---------------------------------------------------------------------------
 // Individual native handler functions (named, non-capturing)
 // ---------------------------------------------------------------------------
 
-// --- sun/management/ManagementFactoryHelper ---
-
-fn native_get_cds_metrics(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let metrics = CdsMetrics::disabled();
-    let obj = alloc_cds_metrics_obj(ctx, &metrics)?;
-    Ok(Some(Value::Object(Some(obj))))
-}
-
-// --- sun/management/CDSMetrics ---
-
-/// `sun/management/CDSMetrics.<init>()V`.
-///
-/// This is NOT one of the trivial constructors: the five accessor natives
-/// registered next to it read the synthetic slots directly
-/// (`getTotalClassesInArchive` → 0, `getClassesLoadedFromArchive` → 1,
-/// `getArchiveSizeBytes` → 2, `getArchiveLoadTimeMs` → 3, `getArchivePath`
-/// → 4). The previous no-op left every slot at its default, so an instance
-/// built with `new` reported `getArchivePath() == null` instead of the
-/// documented "no archive" value, while one obtained from
-/// `ManagementFactoryHelper.getCDSMetrics()` (which goes through
-/// `alloc_cds_metrics_obj`) reported `""`. Seed the same disabled-CDS state
-/// here so the two construction paths are indistinguishable.
-fn native_cds_metrics_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if ctx.object_num_fields(this) < 5 {
-        // Not the 5-slot synthetic layout the accessors above assume — leave a
-        // foreign-shaped receiver alone rather than scribbling on its slots.
-        return Ok(None);
-    }
-    let metrics = CdsMetrics::disabled();
-    // `create_string` allocates, which can relocate `this`: pin first, read the
-    // forwarded reference back afterwards (the discipline documented on
-    // `NativeHeapAccess::pin_native_root`).
-    let pin = ctx.pin_native_root(this);
-    let path_obj = ctx.create_string(&metrics.archive_path);
-    let this = ctx.read_native_pin(pin, this);
-    ctx.set_field(this, 0, Value::Int(metrics.total_classes_in_archive as i32));
-    ctx.set_field(
-        this,
-        1,
-        Value::Int(metrics.classes_loaded_from_archive as i32),
-    );
-    ctx.set_field(this, 2, Value::Long(metrics.archive_size_bytes as i64));
-    ctx.set_field(this, 3, Value::Long(metrics.archive_load_time_ms as i64));
-    ctx.set_field(this, 4, Value::Object(Some(path_obj)));
-    ctx.unpin_native_roots(pin);
-    Ok(None)
-}
-
-// --- java/lang/ClassLoader ---
-
-fn native_get_cds_archive_path(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let path = ctx
-        .get_system_property("jdk.internal.vm.cds.archive")
-        .unwrap_or_default();
-    let s = ctx.create_string(&path);
-    Ok(Some(Value::Object(Some(s))))
-}
-
-// --- sun/misc/VM ---
-
-fn native_vm_is_booted(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(1)))
-}
-
-fn native_vm_saved_props(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let props = alloc_properties_obj(ctx)?;
-    Ok(Some(Value::Object(Some(props))))
-}
+// ===========================================================================
+// F17-1 TOMBSTONE (2026-08-13) — WHAT USED TO BE HERE AND WHY IT IS NOT.
+//
+// Eleven natives were deleted from this file, across three groups. All of them
+// named a class or a member that the JDK 25 runtime image does not contain, so
+// none of them could ever be dispatched to by real JDK bytecode; the fact that
+// `sun.misc.VM` and `sun.management.CDSMetrics` were real *once* is exactly what
+// made them plausible enough to survive this long. Measured on Microsoft
+// 25.0.3+9-LTS (`java -version`: `OpenJDK Runtime Environment
+// Microsoft-13877124 (build 25.0.3+9-LTS)`), not inferred:
+//
+//   1. `sun/management/CDSMetrics` — SIX registrations (`<init>` plus five
+//      accessors), and its factory `sun/management/ManagementFactoryHelper
+//      .getCDSMetrics()Lsun/management/CDSMetrics;`.
+//
+//          $ javap sun.management.CDSMetrics
+//          Error: class not found: sun.management.CDSMetrics
+//          $ javap -p sun.management.ManagementFactoryHelper | grep -c CDS
+//          0
+//
+//      The second command is the one that matters: `ManagementFactoryHelper`
+//      IS in the image and DOES load, so the failure mode was not "class
+//      missing" but a real class carrying a method it does not declare. `javap
+//      -p` shows all 22 of its methods and none mentions CDS. Baseline:
+//      scripts/baselines/jdk25-sun.management.ManagementFactoryHelper.tsv.
+//
+//   2. `sun/misc/VM` — THREE registrations (`<init>`, `isBooted()Z`,
+//      `savedProps()Ljava/util/Properties;`).
+//
+//          $ javap -p sun.misc.VM
+//          Error: class not found: sun.misc.VM
+//
+//      The JDK-true home of this functionality is `jdk.internal.misc.VM`, and
+//      NOTHING WAS ADDED HERE FOR IT — that class is already owned in full by
+//      `lib.rs` (`isBooted()Z` at lib.rs:14894, alongside `initLevel`,
+//      `getSavedProperty` and friends). `register()` is last-write-wins, so
+//      minting a second body for those triples in this file would silently
+//      decide which one runs based on registrar call order. Note also that the
+//      shapes do not transfer: JDK 25 declares `getSavedProperties()Ljava/util/
+//      Map;` and `getSavedProperty(Ljava/lang/String;)Ljava/lang/String;`, with
+//      `savedProps` surviving only as a private *field*, so `savedProps()` had
+//      no descriptor-compatible successor to be corrected into.
+//
+//   3. `java/lang/ClassLoader.getCdsArchivePath()Ljava/lang/String;` — ONE
+//      registration on a class that very much exists.
+//
+//          $ javap -p java.lang.ClassLoader | grep -i -e archive -e cds
+//            private void resetArchivedStates();
+//
+//      That single hit is the whole CDS-adjacent surface of `ClassLoader` in
+//      JDK 25; there is no `getCdsArchivePath` at any access level. This is the
+//      most dangerous of the three shapes, because a registration on a real,
+//      always-loaded class reads as legitimate at a glance.
+//
+// DISPATCH CHECK, done before deleting rather than after (`call_native` panics
+// on an unregistered triple, and a Rust panic kills the VM instead of raising
+// something Java can catch): a tree-wide grep for `sun/misc/VM`, `CDSMetrics`
+// and `getCdsArchivePath` finds no caller outside this file and its tests — the
+// only surviving mention is a prose comment at lib.rs:14892. And this registrar
+// is doubly out of reach of both shipping modes anyway: `register_cds_natives`
+// is called only from `register_synthetic_overrides` (`#[cfg(feature =
+// "synthetic-jdk")]`) and only under `#[cfg(feature = "experimental-aot")]`.
+//
+// `CdsMetrics` (the Rust struct) is deliberately still here. It is the archive
+// generator's own bookkeeping type and has tests of its own; only the *Java*
+// class it used to be projected into was fabricated.
+// ===========================================================================
 
 // --- jdk/internal/misc/CDS ---
-
-fn native_cds_is_dumping_class_list(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
-}
 
 fn native_cds_is_dumping_archive(
     _ctx: &mut dyn NativeContext,
@@ -718,11 +688,85 @@ fn native_cds_is_dumping_archive(
     Ok(Some(Value::Int(0)))
 }
 
-fn native_cds_is_sharing_enabled(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `jdk/internal/misc/CDS.isUsingArchive()Z`.
+///
+/// F17-1 (2026-08-13): RENAMED from `isSharingEnabled`, which JDK 25 does not
+/// declare at any access level. `javap -p jdk.internal.misc.CDS` lists 23
+/// members; the predicate for "is the VM using at least one CDS archive?" is
+/// spelled `isUsingArchive`, and the JDK's own javadoc on it is that sentence
+/// verbatim. Same descriptor, same meaning, different name — so this is a
+/// spelling repair, not a deletion, and the body is unchanged.
+///
+/// A sibling fabrication, `isDumpingClassList()Z`, was deleted outright in the
+/// same pass rather than renamed: there is no JDK 25 predicate it corresponds
+/// to. `isDumpingArchive()Z` (already registered below, real spelling) and
+/// `isDumpingStaticArchive()Z` are the two that exist, and neither means "is a
+/// class list being written" — `dumpClassList(String)` is the action, and
+/// HotSpot gates it on the same `configStatus` word rather than on a predicate
+/// of its own.
+fn native_cds_is_using_archive(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let enabled = ctx
         .get_system_property("jdk.internal.vm.cds.enabled")
         .map_or(false, |v| v == "true");
     Ok(Some(Value::Int(if enabled { 1 } else { 0 })))
+}
+
+/// `jdk/internal/misc/CDS.getCDSConfigStatus()I` — ADDED by F17-1 (2026-08-13).
+///
+/// This is a real `private static native` on JDK 25's `CDS`, and it was the
+/// most load-bearing member of the class that this registrar did not cover:
+///
+///     $ javap -p jdk.internal.misc.CDS | grep getCDSConfigStatus
+///       private static native int getCDSConfigStatus();
+///
+/// It is called from `CDS.<clinit>` — `private static final int configStatus =
+/// getCDSConfigStatus();` (jdk25src java.base/jdk/internal/misc/CDS.java:55) —
+/// which means every one of the class's five public predicates
+/// (`isLoggingLambdaFormInvokers`, `isDumpingArchive`, `isUsingArchive`,
+/// `isDumpingStaticArchive`, `isSingleThreadVM`) reads a field that only this
+/// native can fill, and merely *initialising* `CDS` requires it.
+///
+/// WHY IT WAS INVISIBLE. `scripts/baselines/jdk25-jdk.internal.misc.CDS.tsv`
+/// does not list it. That is not staleness — `generate.py:175` keeps only rows
+/// whose flags contain `public`, so a baseline structurally cannot see a
+/// `private static native`, which is the exact access level most JDK natives
+/// live at. Auditing a native registrar against a public-only surface therefore
+/// produces false positives AND false negatives at once, and this class shows
+/// both: it reported the real `logLambdaFormInvoker(String)V` as off-surface
+/// (see its registration below) while staying silent about two genuinely
+/// missing natives.
+///
+/// Zero is the whole-truth answer, not a stub: the bits are
+/// `IS_DUMPING_ARCHIVE|IS_DUMPING_METHOD_HANDLES|IS_DUMPING_STATIC_ARCHIVE|
+/// IS_LOGGING_LAMBDA_FORM_INVOKERS|IS_USING_ARCHIVE` (CDS.java:50-54), and
+/// CratonVM is doing none of those five things.
+fn native_cds_get_config_status(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+/// `jdk/internal/misc/CDS.needsClassInitBarrier0(Ljava/lang/Class;)Z` — ADDED by
+/// F17-1 (2026-08-13). The second real native the public-only baseline could not
+/// see:
+///
+///     $ javap -p jdk.internal.misc.CDS | grep needsClassInitBarrier
+///       public static boolean needsClassInitBarrier(java.lang.Class<?>);
+///       private static native boolean needsClassInitBarrier0(java.lang.Class<?>);
+///
+/// Note the pair: the *public* half is on the baseline and the native half is
+/// not, so a name-keyed audit sees `needsClassInitBarrier` as covered while the
+/// method that actually needs a body is the one ending in `0`. Registering the
+/// public half instead would have been wrong twice over — it has real bytecode,
+/// so under `--jdk-only` §7 step 3 answers `Bytecode` for it and the native
+/// would never run.
+///
+/// `false` is correct here for the same reason `getCDSConfigStatus` returns 0:
+/// the barrier exists to serialise archived-heap class initialisation, and this
+/// VM maps no archived heap.
+fn native_cds_needs_class_init_barrier0(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
 }
 
 fn native_cds_initialize_from_archive(
@@ -797,79 +841,17 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
     {
         let cls = "sun/management/ManagementFactoryHelper";
         // Pure static-holder: in the JDK this class is `final` with a private
-        // constructor and only static factory/accessor members, and the single
-        // native we register on it (`getCDSMetrics`) is static too. There is no
+        // constructor and only static factory/accessor members. There is no
         // instance state for a no-arg constructor to establish, so an empty
         // body is the real implementation, not a stub. KEEP.
+        //
+        // F17-1 (2026-08-13): the `getCDSMetrics()Lsun/management/CDSMetrics;`
+        // that used to sit here is gone, and so is the entire
+        // `sun/management/CDSMetrics` block that followed it. So are the
+        // `java/lang/ClassLoader.getCdsArchivePath()` and `sun/misc/VM`
+        // registrations. Do not re-add any of them — the `javap` transcripts are
+        // in the tombstone above the handler functions.
         r.register(cls, "<init>", "()V", native_noop_with_this);
-        r.register(
-            cls,
-            "getCDSMetrics",
-            "()Lsun/management/CDSMetrics;",
-            native_get_cds_metrics,
-        );
-    }
-
-    // -- sun/management/CDSMetrics (accessor stubs) --
-    {
-        let cls = "sun/management/CDSMetrics";
-        // Real constructor — the accessors below read slots 0..4, so the
-        // instance must start in the disabled-CDS state. See
-        // `native_cds_metrics_init`.
-        r.register(cls, "<init>", "()V", native_cds_metrics_init);
-        r.register(cls, "getTotalClassesInArchive", "()I", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        });
-        r.register(cls, "getClassesLoadedFromArchive", "()I", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
-        });
-        r.register(cls, "getArchiveSizeBytes", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        });
-        r.register(cls, "getArchiveLoadTimeMs", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 3)))
-        });
-        r.register(
-            cls,
-            "getArchivePath",
-            "()Ljava/lang/String;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                Ok(Some(ctx.get_field(this, 4)))
-            },
-        );
-    }
-
-    // -- java/lang/ClassLoader --
-    {
-        let cls = "java/lang/ClassLoader";
-        r.register(
-            cls,
-            "getCdsArchivePath",
-            "()Ljava/lang/String;",
-            native_get_cds_archive_path,
-        );
-    }
-
-    // -- sun/misc/VM --
-    {
-        let cls = "sun/misc/VM";
-        // Pure static-holder: `sun.misc.VM` exposes only static members (the
-        // two natives registered below, `isBooted` and `savedProps`, are both
-        // static and read process-wide state, never instance slots). A no-arg
-        // constructor genuinely has nothing to do. KEEP.
-        r.register(cls, "<init>", "()V", native_noop_with_this);
-        r.register(cls, "isBooted", "()Z", native_vm_is_booted);
-        r.register(
-            cls,
-            "savedProps",
-            "()Ljava/util/Properties;",
-            native_vm_saved_props,
-        );
     }
 
     // -- jdk/internal/misc/CDS --
@@ -879,23 +861,37 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
         // native registered on it below — is static, and the class carries no
         // instance fields for a constructor to initialize. KEEP.
         r.register(cls, "<init>", "()V", native_noop_with_this);
-        r.register(
-            cls,
-            "isDumpingClassList",
-            "()Z",
-            native_cds_is_dumping_class_list,
-        );
+        // F17-1 (2026-08-13): `isDumpingClassList()Z` USED TO BE THE SECOND
+        // REGISTRATION HERE AND IS GONE. `javap -p jdk.internal.misc.CDS` on
+        // Microsoft 25.0.3+9-LTS lists 23 members and none is named
+        // `isDumpingClassList` at any access level. It has no differently-spelled
+        // equivalent to be corrected into either — see
+        // `native_cds_is_using_archive`'s doc comment for why
+        // `isDumpingArchive`/`isDumpingStaticArchive` are not it.
         r.register(
             cls,
             "isDumpingArchive",
             "()Z",
             native_cds_is_dumping_archive,
         );
+        // F17-1: was `isSharingEnabled`, a name JDK 25 does not declare.
+        // `isUsingArchive()Z` is the JDK-true spelling of the same predicate.
+        r.register(cls, "isUsingArchive", "()Z", native_cds_is_using_archive);
+        // F17-1: both ADDED. Real `private static native` members of JDK 25's
+        // `CDS` that no registrar covered, and that a public-only baseline
+        // cannot report as missing. `getCDSConfigStatus` is the one `<clinit>`
+        // calls. See their doc comments.
         r.register(
             cls,
-            "isSharingEnabled",
-            "()Z",
-            native_cds_is_sharing_enabled,
+            "getCDSConfigStatus",
+            "()I",
+            native_cds_get_config_status,
+        );
+        r.register(
+            cls,
+            "needsClassInitBarrier0",
+            "(Ljava/lang/Class;)Z",
+            native_cds_needs_class_init_barrier0,
         );
         r.register(
             cls,
@@ -909,6 +905,22 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
             "()J",
             native_cds_get_random_seed_for_dumping,
         );
+        // F17-1: KEPT, against a report that called it off-surface. The
+        // ONE-parameter `logLambdaFormInvoker` is the real native:
+        //
+        //     $ javap -p jdk.internal.misc.CDS | grep logLambdaFormInvoker
+        //       private static native void logLambdaFormInvoker(java.lang.String);
+        //       public static void logLambdaFormInvoker(String, String, String, String);
+        //
+        // JDK 25 declares BOTH. The four-String overload is ordinary Java
+        // (CDS.java:142) whose whole body concatenates its arguments and calls
+        // the one-String native (CDS.java:144), so registering a native for the
+        // 4-arg form would shadow real bytecode with a body that drops three
+        // arguments, and dropping the 1-arg form would take out the only one
+        // that has no bytecode to fall back to. The audit that flagged this read
+        // a public-only baseline, which by construction lists the public
+        // overload and hides the private native — the descriptor difference
+        // then looks like a divergence rather than an overload pair.
         r.register(
             cls,
             "logLambdaFormInvoker",
@@ -1222,49 +1234,66 @@ mod cds_tests {
         register_cds_natives(&mut r);
         let cls = "sun/management/ManagementFactoryHelper";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r
-            .find(cls, "getCDSMetrics", "()Lsun/management/CDSMetrics;")
-            .is_some());
     }
 
+    /// F17-1 (2026-08-13) — REPLACES four tests that asserted the presence of
+    /// registrations for classes and members JDK 25 does not have
+    /// (`test_cds_metrics_accessors_registered`,
+    /// `test_classloader_cds_archive_path_registered`,
+    /// `test_sun_misc_vm_registered`, and the `getCDSMetrics` half of
+    /// `test_management_factory_helper_registration`).
+    ///
+    /// Those tests were not neutral about the fabrication — they PINNED it.
+    /// Each one asserted `is_some()` on a triple whose defect was that it
+    /// existed at all, so the only way to fail them was to fix the bug. Flipping
+    /// them to `is_none()` is what turns roughly a hundred lines of deletion
+    /// into something a reader can check without re-running `javap`.
     #[test]
-    fn test_cds_metrics_accessors_registered() {
+    fn f17_1_registrar_mints_nothing_absent_from_the_jdk25_image() {
         let mut r = NativeMethodRegistry::new();
         register_cds_natives(&mut r);
-        let cls = "sun/management/CDSMetrics";
-        assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getTotalClassesInArchive", "()I").is_some());
-        assert!(r.find(cls, "getClassesLoadedFromArchive", "()I").is_some());
-        assert!(r.find(cls, "getArchiveSizeBytes", "()J").is_some());
-        assert!(r.find(cls, "getArchiveLoadTimeMs", "()J").is_some());
-        assert!(r
-            .find(cls, "getArchivePath", "()Ljava/lang/String;")
-            .is_some());
-    }
-
-    #[test]
-    fn test_classloader_cds_archive_path_registered() {
-        let mut r = NativeMethodRegistry::new();
-        register_cds_natives(&mut r);
-        assert!(r
-            .find(
+        // `javap` on Microsoft 25.0.3+9-LTS answers "class not found" for each of
+        // these three classes, so every triple on them was unreachable.
+        let absent_classes = ["sun/management/CDSMetrics", "sun/misc/VM"];
+        let registered: Vec<(&str, &str, &str)> = r
+            .dump_registrations()
+            .into_iter()
+            .map(|(c, m, d, _)| (c, m, d))
+            .collect();
+        for cls in absent_classes {
+            let minted: Vec<_> = registered
+                .iter()
+                .filter(|(c, _, _)| *c == cls)
+                .map(|(_, m, d)| format!("{m}{d}"))
+                .collect();
+            assert!(
+                minted.is_empty(),
+                "{cls} is not in the JDK 25 runtime image, but the CDS registrar \
+                 still mints natives for it: {minted:?}"
+            );
+        }
+        // These two classes DO exist; the members did not.
+        let absent_members: &[(&str, &str, &str)] = &[
+            (
+                "sun/management/ManagementFactoryHelper",
+                "getCDSMetrics",
+                "()Lsun/management/CDSMetrics;",
+            ),
+            (
                 "java/lang/ClassLoader",
                 "getCdsArchivePath",
-                "()Ljava/lang/String;"
-            )
-            .is_some());
-    }
-
-    #[test]
-    fn test_sun_misc_vm_registered() {
-        let mut r = NativeMethodRegistry::new();
-        register_cds_natives(&mut r);
-        let cls = "sun/misc/VM";
-        assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "isBooted", "()Z").is_some());
-        assert!(r
-            .find(cls, "savedProps", "()Ljava/util/Properties;")
-            .is_some());
+                "()Ljava/lang/String;",
+            ),
+            ("jdk/internal/misc/CDS", "isDumpingClassList", "()Z"),
+            ("jdk/internal/misc/CDS", "isSharingEnabled", "()Z"),
+        ];
+        for (cls, name, desc) in absent_members {
+            assert!(
+                r.find(cls, name, desc).is_none(),
+                "{cls}.{name}{desc} is not declared by JDK 25 — re-registering it \
+                 re-introduces the fabrication F17-1 removed"
+            );
+        }
     }
 
     #[test]
@@ -1272,11 +1301,19 @@ mod cds_tests {
         let mut r = NativeMethodRegistry::new();
         register_cds_natives(&mut r);
         let cls = "jdk/internal/misc/CDS";
+        // F17-1 (2026-08-13): every entry below is checked against `javap -p
+        // jdk.internal.misc.CDS`, i.e. ALL access levels — not against
+        // `scripts/baselines/jdk25-jdk.internal.misc.CDS.tsv`, which
+        // `generate.py:175` filters to `public` and which therefore lists none
+        // of the natives this registrar exists to supply. `isDumpingClassList`
+        // and `isSharingEnabled` were removed from this list; `isUsingArchive`,
+        // `getCDSConfigStatus` and `needsClassInitBarrier0` were added.
         let methods: &[(&str, &str)] = &[
             ("<init>", "()V"),
-            ("isDumpingClassList", "()Z"),
             ("isDumpingArchive", "()Z"),
-            ("isSharingEnabled", "()Z"),
+            ("isUsingArchive", "()Z"),
+            ("getCDSConfigStatus", "()I"),
+            ("needsClassInitBarrier0", "(Ljava/lang/Class;)Z"),
             ("initializeFromArchive", "(Ljava/lang/Class;)V"),
             ("getRandomSeedForDumping", "()J"),
             ("logLambdaFormInvoker", "(Ljava/lang/String;)V"),
@@ -1295,14 +1332,25 @@ mod cds_tests {
         }
     }
 
+    /// F17-1 (2026-08-13): was `test_registration_count_at_least_20`. The
+    /// registrar now mints 12, so a floor of 20 would be red — but the floor was
+    /// never the point, and raising or lowering a `>=` is not either. What
+    /// matters is that the count is EXACT and moves only when someone means it
+    /// to: a one-sided `>=` cannot notice a fabricated class being added back,
+    /// which is the regression this file has already had once.
     #[test]
-    fn test_registration_count_at_least_20() {
+    fn f17_1_registration_count_is_exact() {
         let mut r = NativeMethodRegistry::new();
         register_cds_natives(&mut r);
-        assert!(
-            r.len() >= 20,
-            "Expected at least 20 registrations, got {}",
-            r.len()
+        assert_eq!(
+            r.len(),
+            12,
+            "CDS registrar count changed. Expected 12: \
+             ManagementFactoryHelper.<init> (1) + jdk/internal/misc/CDS (11). \
+             If you added a registration, check it against `javap -p` on the \
+             real JDK 25 image FIRST — `javap` with no flag, and the frozen \
+             baselines, are public-only and cannot see a `private static \
+             native`."
         );
     }
 
@@ -1322,43 +1370,26 @@ mod cds_tests {
         let mut r = NativeMethodRegistry::new();
         register_cds_natives(&mut r);
 
+        // F17-1 (2026-08-13): eleven rows removed here — the whole
+        // `sun/management/CDSMetrics` and `sun/misc/VM` blocks,
+        // `ManagementFactoryHelper.getCDSMetrics`,
+        // `ClassLoader.getCdsArchivePath`, and `CDS.{isDumpingClassList,
+        // isSharingEnabled}` — and three added. The removals are classes and
+        // members `javap` cannot find on Microsoft 25.0.3+9-LTS; the transcripts
+        // are in the tombstone above the handler functions. This list is now the
+        // registrar's full contents, which is what
+        // `f17_1_registration_count_is_exact` cross-checks it against.
         let expected: &[(&str, &str, &str)] = &[
             ("sun/management/ManagementFactoryHelper", "<init>", "()V"),
-            (
-                "sun/management/ManagementFactoryHelper",
-                "getCDSMetrics",
-                "()Lsun/management/CDSMetrics;",
-            ),
-            ("sun/management/CDSMetrics", "<init>", "()V"),
-            (
-                "sun/management/CDSMetrics",
-                "getTotalClassesInArchive",
-                "()I",
-            ),
-            (
-                "sun/management/CDSMetrics",
-                "getClassesLoadedFromArchive",
-                "()I",
-            ),
-            ("sun/management/CDSMetrics", "getArchiveSizeBytes", "()J"),
-            ("sun/management/CDSMetrics", "getArchiveLoadTimeMs", "()J"),
-            (
-                "sun/management/CDSMetrics",
-                "getArchivePath",
-                "()Ljava/lang/String;",
-            ),
-            (
-                "java/lang/ClassLoader",
-                "getCdsArchivePath",
-                "()Ljava/lang/String;",
-            ),
-            ("sun/misc/VM", "<init>", "()V"),
-            ("sun/misc/VM", "isBooted", "()Z"),
-            ("sun/misc/VM", "savedProps", "()Ljava/util/Properties;"),
             ("jdk/internal/misc/CDS", "<init>", "()V"),
-            ("jdk/internal/misc/CDS", "isDumpingClassList", "()Z"),
             ("jdk/internal/misc/CDS", "isDumpingArchive", "()Z"),
-            ("jdk/internal/misc/CDS", "isSharingEnabled", "()Z"),
+            ("jdk/internal/misc/CDS", "isUsingArchive", "()Z"),
+            ("jdk/internal/misc/CDS", "getCDSConfigStatus", "()I"),
+            (
+                "jdk/internal/misc/CDS",
+                "needsClassInitBarrier0",
+                "(Ljava/lang/Class;)Z",
+            ),
             (
                 "jdk/internal/misc/CDS",
                 "initializeFromArchive",
@@ -1393,6 +1424,21 @@ mod cds_tests {
                 "Missing registration for {cls}.{name}{desc}"
             );
         }
+        // F17-1: make the check two-sided. `is_some()` over a hand-written list
+        // only ever proves the list is a SUBSET of what is registered — it is
+        // structurally incapable of noticing an extra registration, which is
+        // precisely how the eleven fabricated triples removed above sat here
+        // being asserted-present rather than being questioned.
+        assert_eq!(
+            expected.len(),
+            r.len(),
+            "the registrar holds registrations this list does not name: {:?}",
+            r.dump_registrations()
+                .into_iter()
+                .map(|(c, m, d, _)| (c, m, d))
+                .filter(|t| !expected.contains(t))
+                .collect::<Vec<_>>()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1956,11 +2002,14 @@ mod cds_tests {
 
 
 
-    #[test]
-    fn test_is_dumping_class_list_returns_zero() {
-        let result = native_cds_is_dumping_class_list(&mut PanicContext, &[]);
-        assert_eq!(result.unwrap(), Some(Value::Int(0)));
-    }
+    // F17-1 (2026-08-13): `test_is_dumping_class_list_returns_zero` was deleted
+    // with the native it exercised. It is worth naming what that test was
+    // actually measuring: `isDumpingClassList` is not a member of JDK 25's
+    // `jdk.internal.misc.CDS` at any access level, so a green assertion here
+    // reported only that a Rust function returned the constant it was written to
+    // return — the invented Java method it was reachable through never appeared
+    // in the test at all. A unit test on a native's BODY cannot see that the
+    // native's TRIPLE is fabricated; only the registration list can.
 
     #[test]
     fn test_is_dumping_archive_returns_zero() {
@@ -1968,9 +2017,36 @@ mod cds_tests {
         assert_eq!(result.unwrap(), Some(Value::Int(0)));
     }
 
+    /// F17-1: was `test_is_sharing_enabled_returns_zero`. Same body, JDK-true
+    /// name — `isUsingArchive` is what JDK 25 calls this predicate.
     #[test]
-    fn test_is_sharing_enabled_returns_zero() {
-        let result = native_cds_is_sharing_enabled(&mut PanicContext, &[]);
+    fn test_is_using_archive_returns_zero() {
+        let result = native_cds_is_using_archive(&mut PanicContext, &[]);
+        assert_eq!(result.unwrap(), Some(Value::Int(0)));
+    }
+
+    /// F17-1: `getCDSConfigStatus()I` must answer 0 — every bit in the word
+    /// (`IS_DUMPING_ARCHIVE`, `IS_DUMPING_METHOD_HANDLES`,
+    /// `IS_DUMPING_STATIC_ARCHIVE`, `IS_LOGGING_LAMBDA_FORM_INVOKERS`,
+    /// `IS_USING_ARCHIVE`) describes something CratonVM does not do.
+    ///
+    /// This one is not cosmetic: JDK 25's `CDS.<clinit>` is
+    /// `configStatus = getCDSConfigStatus()`, so any non-zero answer here would
+    /// silently switch on a code path — e.g. `isLoggingLambdaFormInvokers()`
+    /// going true routes `logSpeciesType` and the 4-arg `logLambdaFormInvoker`
+    /// into a native that discards its input.
+    #[test]
+    fn f17_1_cds_config_status_is_zero() {
+        let result = native_cds_get_config_status(&mut PanicContext, &[]);
+        assert_eq!(result.unwrap(), Some(Value::Int(0)));
+    }
+
+    /// F17-1: `needsClassInitBarrier0(Class)Z` must answer false — the barrier
+    /// orders initialisation of classes reached through an archived heap
+    /// subgraph, and CratonVM maps none.
+    #[test]
+    fn f17_1_needs_class_init_barrier_is_false() {
+        let result = native_cds_needs_class_init_barrier0(&mut PanicContext, &[]);
         assert_eq!(result.unwrap(), Some(Value::Int(0)));
     }
 
@@ -1993,11 +2069,12 @@ mod cds_tests {
         assert_eq!(result.unwrap(), Some(Value::Long(0)));
     }
 
-    #[test]
-    fn test_vm_is_booted_returns_one() {
-        let result = native_vm_is_booted(&mut PanicContext, &[]);
-        assert_eq!(result.unwrap(), Some(Value::Int(1)));
-    }
+    // F17-1 (2026-08-13): `test_vm_is_booted_returns_one` was deleted with
+    // `native_vm_is_booted`. `sun.misc.VM` is not in the JDK 25 image
+    // (`javap -p sun.misc.VM` → class not found). The equivalent that DOES exist,
+    // `jdk/internal/misc/VM.isBooted()Z`, is registered and tested by `lib.rs`
+    // (registration at lib.rs:14894) — a second copy here would have been a
+    // last-write-wins coin flip decided by registrar call order.
 
     #[test]
     fn test_log_lambda_form_invoker_is_noop() {

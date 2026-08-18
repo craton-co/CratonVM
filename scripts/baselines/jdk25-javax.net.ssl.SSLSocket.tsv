@@ -1,0 +1,52 @@
+# jdk-baseline	2
+# kind	class
+# name	javax.net.ssl.SSLSocket
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/javax/net/ssl/SSLSocket.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	25
+# protected-methods	0
+# declared-methods	30
+# declared-fields	0
+# rows	36
+# columns	kind	name	descriptor	flags
+CLASS	javax.net.ssl.SSLSocket		public,abstract
+EXTENDS	java.net.Socket		
+SUPERTYPE	java.io.Closeable		
+SUPERTYPE	java.lang.AutoCloseable		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.net.Socket		
+METHOD	<init>	()V	protected
+METHOD	<init>	(Ljava/lang/String;I)V	protected
+METHOD	<init>	(Ljava/lang/String;ILjava/net/InetAddress;I)V	protected
+METHOD	<init>	(Ljava/net/InetAddress;I)V	protected
+METHOD	<init>	(Ljava/net/InetAddress;ILjava/net/InetAddress;I)V	protected
+METHOD	addHandshakeCompletedListener	(Ljavax/net/ssl/HandshakeCompletedListener;)V	public,abstract
+METHOD	getApplicationProtocol	()Ljava/lang/String;	public
+METHOD	getEnableSessionCreation	()Z	public,abstract
+METHOD	getEnabledCipherSuites	()[Ljava/lang/String;	public,abstract
+METHOD	getEnabledProtocols	()[Ljava/lang/String;	public,abstract
+METHOD	getHandshakeApplicationProtocol	()Ljava/lang/String;	public
+METHOD	getHandshakeApplicationProtocolSelector	()Ljava/util/function/BiFunction;	public
+METHOD	getHandshakeSession	()Ljavax/net/ssl/SSLSession;	public
+METHOD	getNeedClientAuth	()Z	public,abstract
+METHOD	getSSLParameters	()Ljavax/net/ssl/SSLParameters;	public
+METHOD	getSession	()Ljavax/net/ssl/SSLSession;	public,abstract
+METHOD	getSupportedCipherSuites	()[Ljava/lang/String;	public,abstract
+METHOD	getSupportedProtocols	()[Ljava/lang/String;	public,abstract
+METHOD	getUseClientMode	()Z	public,abstract
+METHOD	getWantClientAuth	()Z	public,abstract
+METHOD	removeHandshakeCompletedListener	(Ljavax/net/ssl/HandshakeCompletedListener;)V	public,abstract
+METHOD	setEnableSessionCreation	(Z)V	public,abstract
+METHOD	setEnabledCipherSuites	([Ljava/lang/String;)V	public,abstract
+METHOD	setEnabledProtocols	([Ljava/lang/String;)V	public,abstract
+METHOD	setHandshakeApplicationProtocolSelector	(Ljava/util/function/BiFunction;)V	public
+METHOD	setNeedClientAuth	(Z)V	public,abstract
+METHOD	setSSLParameters	(Ljavax/net/ssl/SSLParameters;)V	public
+METHOD	setUseClientMode	(Z)V	public,abstract
+METHOD	setWantClientAuth	(Z)V	public,abstract
+METHOD	startHandshake	()V	public,abstract

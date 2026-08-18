@@ -1,5 +1,99 @@
 # W7-16 — `ArrayDeque` streamed empty, and the two gates on `LinkedListSnapshotListItr`
 
+> # A34 2026-08-12 — RUN, in three arms. ALL THREE DEFECTS ARE CLOSED BY
+> # MEASUREMENT. Every claim below this banner was source-only until now.
+>
+> This record, and the reconciliations stacked on top of it, closed three
+> defects "in source, NOT REBUILT". A binary that carries all three exists —
+> `scratchpad/bin/cratonvm-merged-dev.exe`, built 2026-08-12 15:27 — and the
+> whole file has now been re-measured on it against Microsoft JDK 25.0.3.9,
+> `--java-home` passed on every CratonVM row, one binary per arm with only the
+> mode flag differing. HotSpot 25.0.3.9 is the oracle. **This banner is
+> observation. Everything below it about source remains a claim.**
+>
+> **Part 1, `ArrayDeque` — CLOSED, measured.** Every row of the three-arm table
+> further down now reads HotSpot's answer in BOTH CratonVM modes, including the
+> four that were the whole defect:
+>
+> | member (`C1` = `new ArrayDeque<>(List.of("a","b"))`) | HotSpot | `--real-jdk` | `--jdk-only` |
+> |---|---|---|---|
+> | `LAYOUT` | `len=3 head=0 tail=2` | `len=3 head=0 tail=2` | `len=3 head=0 tail=2` |
+> | `toArray(T[])` | `[a, b]` | `[a, b]` | `[a, b]` |
+> | `spliterator().estimateSize()` | `2` | `2` | `2` |
+> | `stream().count()` | `2` | `2` | `2` |
+> | `parallelStream().count()` | `2` | `2` | `2` |
+> | `iterator()` / `String.join` | `ab` / `a\|b` | `ab` / `a\|b` | `ab` / `a\|b` |
+>
+> `C5` (sixteen `addLast` on a default deque — the shape with no collection
+> constructor in it) reads `len=17 head=0 tail=16`, `stream().count()=16` and a
+> full `toArray(T[])` on all three arms. The spare slot is the mechanism, as
+> Part 1 argued, and the falsifying observation it wrote did NOT fire.
+>
+> **The quieter finding is closed too, and it was worth printing.** After one
+> `poll()` the `elements` array reads
+> `[null, y, null, …]` on all three arms, and after `clear()` it is all-`null`
+> on all three — byte-identical to HotSpot. The dropped references are no
+> longer strongly reachable from the buffer.
+>
+> **Part 2, `LinkedListSnapshotListItr` — CLOSED, measured, both halves live.**
+> Under `--jdk-only`: `listIterator()` forward is `abc`, `subList(0,2)` is
+> `[a, b]`, and — the row Part 2 called the most important in its table —
+> `arrayList.equals(linkedList)` is **`true`**, where it answered a laundered
+> `false` with no exception before. The `UnsatisfiedLinkError`-at-`hasNext()`
+> failure mode that "land both hunks or neither" was written to prevent did not
+> occur: the retag and the mint are both in, and the nine natives dispatch.
+>
+> **Part 3, the `jdk_interfaces` arm — CLOSED, measured, and this is the first
+> time `probes/ListItrInterfaceProbe.java` has ever been executed on CratonVM.**
+> `SUMMARY pass=16 fail=0` in **both** modes, matching
+> `ListItrInterfaceProbe.expected.txt`'s stated AFTER state exactly:
+>
+> ```text
+> ROW ll.interfaces [java.util.Iterator, java.util.ListIterator]
+> ROW ll.instanceofListIterator true  want=true  PASS
+> ROW ll.instanceofIterator     true  want=true  PASS
+> ROW ll.castListIterator       ok:true          PASS
+> ROW ll.castIterator           ok:true          PASS
+> ROW ll.idx.castListIterator   ok:true          PASS
+> SUMMARY pass=16 fail=0
+> ```
+>
+> The instrument's own calibrations held on the CratonVM arms, which is what
+> makes the greens mean anything: `selfTestNoCheckcast` passed, all three
+> `selfTestRed*` rows produced their expected `ClassCastException`/`false`, and
+> the entire `al.*` control family passed. The expected transcript's single
+> falsifying observation — `castIterator` passing while `castListIterator`
+> raises — did not fire, so assignability IS walking super-interfaces
+> transitively.
+>
+> The two unscored INFO rows behave as designed and are worth reading as
+> provenance: `ll.getClass` is `cratonvm.internal.LinkedListSnapshotListItr` in
+> both modes, and `ll.iterator.getClass` splits by mode —
+> `java.util.LinkedList$Itr` under `--real-jdk`, `java.util.Arrays$ArrayItr`
+> under `--jdk-only`. That second row is W2-1's strict iterator fallback
+> observed working, and it dates this binary as post-`6ae3ca634`.
+>
+> **Scheduling — unchanged, and still the real gap.** `regression-suite/run.sh`
+> names no path under `probes/` at any `SUITE=` value (re-grepped: the string
+> `probes` does not appear in it). The three closures above are therefore
+> **discharged but unscheduled** — nothing in CI re-runs them, and the two
+> fixtures that touch `listIterator` still assign through the declared return
+> type, so javac emits no `checkcast` and they cannot see Part 3 even in
+> principle. The nomination for an erased-type vector below stands unchanged;
+> what has changed is that it would now be pinning a green rather than chasing
+> a red.
+>
+> **NEW, and not previously probed by anyone: `--synthetic-jdk` RUNTIME MODE.**
+> A `--features synthetic-jdk` binary now exists
+> (`C:/craton/synjdk-target/release/cratonvm.exe`), so the mode this record's
+> two families were never measured in is reachable for the first time. Three
+> findings, all measured, none of them this record's fault and all of them in
+> its subject matter — see *"A34 2026-08-12 — the `--synthetic-jdk` arm"* at
+> the end of this file. The one that matters is not a refusal:
+> **`linkedList.equals(arrayList)` answers `false` while
+> `arrayList.equals(linkedList)` answers `true`** on the same pair, which is a
+> silent wrong answer and an asymmetric `List.equals`.
+
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — THE
 > `LinkedListSnapshotListItr` HALF WAS TAKEN.** Both hunks of the "not applied"
 > patch are in the tree, landed together as this record required ("one commit
@@ -655,3 +749,93 @@ per-member so one refusal does not truncate the table. Both take a reflective
 `LAYOUT` row under `--add-opens java.base/java.util=ALL-UNNAMED`, which is what
 made the `elements.len` / `tail` comparison possible at all and is the single
 step that separated "unwritten field" from "wrapped index".
+
+---
+
+## A34 2026-08-12 — the `--synthetic-jdk` arm, measured for the first time
+
+Both families in this record were only ever measured on `--real-jdk` and
+`--jdk-only`. The third mode had no binary. It has one now
+(`C:/craton/synjdk-target/release/cratonvm.exe`, a `--features synthetic-jdk`
+build, run as `--synthetic-jdk`), and the memory-note distinction applies
+exactly as written: **the Cargo feature is the build, `--synthetic-jdk` is the
+runtime mode**, and a shipping binary refuses the flag, so nothing before now
+could have taken these rows.
+
+Same `ADProbe2` source as the three-arm table above, same host, same day.
+
+| row | HotSpot / `--real-jdk` / `--jdk-only` | `--synthetic-jdk` |
+|---|---|---|
+| `new ArrayDeque<>(List.of("a","b"))` | constructs | **`NoSuchMethodError: java.util.ArrayDeque.<init>(Ljava/util/Collection;)V`** |
+| `ll.subList(0, 2)` | `[a, b]` | **`NoSuchMethodError: java.util.LinkedList.subList(II)Ljava/util/List;`** |
+| `ll.equals(arrayList)` | `true` | **`false`** |
+| `arrayList.equals(ll)` | `true` | `true` |
+| `ll.listIterator()` forward | `abc` | `abc` |
+| `ll.iterator()` | `abc` | `abc` |
+| `ad.stream().count()` (`C5`, 16 elements) | `16` | `16` |
+
+Three findings, in ascending order of how much they should worry a reader.
+
+1. **`ArrayDeque.<init>(Collection)` is absent.** This is the exact constructor
+   Part 1 identifies as the one that hits the full-buffer state every time
+   (*"its real body is `this(c.size()); copyElements(c)`"*). In synthetic mode
+   it does not exist at all, so Part 1's headline shape is unreachable there —
+   the defect cannot occur because the constructor cannot be called. A missing
+   method is a loud, diagnosable gap and is the least bad of the three.
+
+2. **`LinkedList.subList(int,int)` is absent.** Same shape, same loudness.
+
+3. **`LinkedList.equals` is IDENTITY comparison.** The row that surfaced it was
+   the asymmetry — `ll.equals(al)` `false` against `al.equals(ll)` `true` — but
+   the asymmetry is a symptom and the falsifier this section originally wrote
+   was run rather than left standing. It fired the first way, and then a second
+   probe discriminated the mechanism completely:
+
+   | expression | HotSpot | `--synthetic-jdk` |
+   |---|---|---|
+   | `ll.equals(ll)` (same object) | `true` | `true` |
+   | `ll.equals(ll2)` (equal `LinkedList`) | `true` | **`false`** |
+   | `emptyLL1.equals(emptyLL2)` | `true` | **`false`** |
+   | `ll.equals(arrayList)` | `true` | **`false`** |
+   | `ll.equals(vector)` | `true` | **`false`** |
+   | `ll.hashCode() == al.hashCode()` | `true` | **`false`** |
+   | `ll.equals("a")` | `false` | `false` |
+   | **`al.equals(al2)` (the CONTROL)** | `true` | `true` |
+
+   Only the same-object row is true, including for two *empty* lists — that is
+   `Object.equals`, not a broken element walk and not argument-type
+   discrimination. `LinkedList` has no `equals` in the synthetic arm and falls
+   through to identity; `ArrayList` in the same run is correct, which is the
+   control that makes this a `LinkedList` finding rather than a mode-wide one.
+   `hashCode` diverges with it, so a synthetic-mode `LinkedList` is also broken
+   as a `HashMap` key. `indexOf(Object)` raises `NoSuchMethodError` beside them.
+
+   This is not a refusal and not a gap — it is a **silent wrong answer**, and
+   it is the same species this record already documents in strict mode
+   (*"a refusal that reaches a caller with nowhere to put it stops being a
+   refusal"*) arriving from the other side: nothing was refused, so nothing was
+   recorded, and **the census cannot see it at all**.
+
+**The mechanism, answered by the instrument rather than left as a falsifier.**
+`--dump-native-registry` on the feature binary settles it: `java/util/LinkedList`
+carries **36 registrations and `equals` is not one of them**. Nor is `hashCode`,
+nor `indexOf`. Its sibling has all three:
+
+| triple | `java/util/ArrayList` | `java/util/LinkedList` |
+|---|---|---|
+| `equals(Ljava/lang/Object;)Z` | `native-collections/src/lib.rs:4307` `[bridge]` | **absent** |
+| `hashCode()I` | `native-collections/src/lib.rs:4306` `[bridge]` | **absent** |
+| `indexOf(Ljava/lang/Object;)I` | `native-collections/src/lib.rs:4222` `[bridge]` | **absent** |
+| `contains(Ljava/lang/Object;)Z` | present | present, `lib.rs:31733` `[bridge]` |
+
+So this is **not** a last-write-wins loser and **not** a `NativeKind` drop — it
+is an unimplemented family, and the two modes hide it for the same reason from
+opposite directions: `--real-jdk` and `--jdk-only` both have real
+`AbstractList.equals`/`hashCode` bytecode to inherit, and `--synthetic-jdk` has
+none, so the call lands on `Object`. `contains` being present next to `equals`
+being absent is the tell that this was an omission rather than a decision.
+
+The generalisation, which is this campaign's twin-drift shape in a new place:
+**`ArrayList` and `LinkedList` are twins and the `equals`/`hashCode`/`indexOf`
+family was given to exactly one of them.** Diff the two receivers' registration
+sets rather than checking that the one you are looking at "has natives".

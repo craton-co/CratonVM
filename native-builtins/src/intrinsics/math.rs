@@ -285,6 +285,42 @@ mod tests {
         assert!(compute_abs_double(f64::NAN).is_nan());
     }
 
+    /// Bit-exact agreement with HotSpot, including the NaN PAYLOAD.
+    ///
+    /// G9-1 swept `Math.sqrt` and `Math.abs(double)` over 200,000 pseudorandom
+    /// `double` bit patterns plus 14 hand-picked specials on OpenJDK 25.0.3+9
+    /// and on this toolchain's `f64::sqrt`/`f64::abs`: **200,158 rows,
+    /// identical, zero divergences**. `is_nan()` is too weak an assertion to
+    /// notice if that ever stops being true — a NaN whose payload moved is
+    /// still a NaN — so these rows compare raw bits.
+    ///
+    /// `abs` clears the sign bit and touches nothing else, so a NEGATIVE
+    /// signalling NaN must come back as the same payload with bit 63 cleared.
+    /// `sqrt` of a NaN is specified only as "NaN"; the measured HotSpot answer
+    /// is the quieted input, which is what the hardware instruction produces.
+    #[test]
+    fn nan_payloads_survive_abs_and_sqrt_bit_for_bit() {
+        let signalling = f64::from_bits(0xFFF0_0000_0000_0001);
+        assert!(signalling.is_nan());
+        assert_eq!(
+            compute_abs_double(signalling).to_bits(),
+            0x7FF0_0000_0000_0001
+        );
+        assert_eq!(
+            compute_sqrt(f64::from_bits(0x7FF0_0000_0000_0001)).to_bits(),
+            0x7FF8_0000_0000_0001
+        );
+        // Signed zeros and infinities, which `is_nan`-style assertions also
+        // cannot separate.
+        assert_eq!(compute_sqrt(-0.0f64).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(compute_abs_double(-0.0f64).to_bits(), 0.0f64.to_bits());
+        assert!(compute_sqrt(f64::NEG_INFINITY).is_nan());
+        assert_eq!(
+            compute_abs_double(f64::NEG_INFINITY).to_bits(),
+            f64::INFINITY.to_bits()
+        );
+    }
+
     #[test]
     fn abs_double_infinity() {
         assert_eq!(compute_abs_double(f64::NEG_INFINITY), f64::INFINITY);

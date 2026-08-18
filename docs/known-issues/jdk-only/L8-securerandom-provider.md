@@ -517,3 +517,70 @@ change Compatible-mode or `--jdk-only` behaviour by any amount, because the
 registrar is not reachable in either. For the same reason it cannot move
 `scripts/baselines/jdk-only-bridge-ratchet.json`, which is taken in Compatible
 mode — see `docs/architecture/natives-over-real-jdk-classes.md` §7.
+
+---
+
+## Adjudicated in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+"Verdict 1 — the registration is live, and it is synthetic-jdk ONLY" and the
+closing "**Mode: synthetic-jdk only, in both directions**" were both derived from
+the call graph, correctly, and neither had ever been run: `--synthetic-jdk` had
+never been launched on a `--features synthetic-jdk` binary. It has now.
+
+**The scoping claim holds. The repair's intended effect does not appear.**
+
+The stated purpose of deleting `native_secure_random_set_seed_long` /
+`_set_seed_bytes` / `_init_seed_bytes` from `crypto_impl.rs` was that their
+no-op bodies "silently undid two fixes in `securerandom.rs`: SHA1PRNG reseeding,
+which HotSpot makes reproducible and which is the one replay guarantee the JDK
+gives a `SecureRandom`; and the `algorithm` / `provider` stamping this record
+exists for." Both are still missing in the mode where `securerandom.rs` is
+supposed to be the survivor:
+
+```
+                                        HotSpot 25    --jdk-only     --synthetic-jdk
+R secureRandom.sha1prng.reproducible    equal=true    equal=true     equal=false
+   (two SHA1PRNG instances, setSeed(42L), 8 bytes each)
+R secureRandom.setSeedBytes.reproducible equal=true   equal=true     equal=false
+   (same, setSeed(new byte[]{1,2,3}))
+R secureRandom.nextInt.deterministic    equal=true    equal=true     equal=false
+   (same, setSeed(1234L), one nextInt())
+R secureRandom.default.algo             algo=DRBG     algo=OS-CSPRNG NoSuchMethodError:
+                                        provider=SUN  provider=SUN   java.security.SecureRandom
+                                                                     .getAlgorithm()Ljava/lang/String;
+R secureRandom.sha1prng.algo            SHA1PRNG      SHA1PRNG       (same NoSuchMethodError)
+R security.getProviders                 count=13      count=13       count=5
+                                        first=SUN     first=SUN      first=SUN
+```
+
+Two separate findings, and they should not be merged:
+
+1. **`SecureRandom.getAlgorithm()` is not registered at all in `--synthetic-jdk`.**
+   The `algorithm` stamping this record exists for cannot be read by any Java
+   caller in that mode — the accessor is absent, so the field's value is
+   unobservable whatever `securerandom.rs` writes. The same applies to
+   `getProvider()` (the probe dies on `getAlgorithm()` first).
+   `--jdk-only` answers `SHA1PRNG` correctly, so the stamping half is genuinely
+   working in the shipping modes and only there.
+
+2. **SHA1PRNG reseeding is still not reproducible in `--synthetic-jdk`.** Three
+   independent formulations — `setSeed(long)`, `setSeed(byte[])`, and
+   `nextInt()` after `setSeed(long)` — all disagree between two identically
+   seeded instances. That is precisely the replay guarantee the deletion was
+   made to restore, in the only mode the deleted registrations were ever live
+   in. Either the deletion did not take effect on this build, or
+   `securerandom.rs`'s SHA1PRNG path is itself not seeded-deterministic in
+   synthetic mode. **This lane did not distinguish those two** — it writes no
+   Rust and did not build a second binary — and that is the open question.
+
+Green in `--synthetic-jdk`, so the surface is not wholesale broken:
+`generateSeed(8)` returns 8 non-zero bytes; `MessageDigest.getInstance("SHA-256")`
+digests `"abc"` to `ba7816bf8f01cfea…`, byte-identical to HotSpot;
+`SecureRandom.getInstance("SHA1PRNG")` returns a `java.security.SecureRandom`
+without throwing.
+
+**Verdict: the residual is CONFIRMED LIVE in `--synthetic-jdk`, and the record's
+"in both directions" scoping is confirmed** — every `--jdk-only` cell matches
+HotSpot, so nothing here can move a Compatible-mode baseline or
+`scripts/baselines/jdk-only-bridge-ratchet.json`, exactly as the record says. It
+is **not retired**: the fix's own falsifier fails. See lane A31's NOMINATION A31-7.

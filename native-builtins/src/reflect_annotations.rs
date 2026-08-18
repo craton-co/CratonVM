@@ -216,6 +216,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "addHandler",
         "(Ljava/util/logging/Handler;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
@@ -287,6 +294,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "setFormatter",
         "(Ljava/util/logging/Formatter;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             if let Some(Value::Object(Some(this))) = args.first() {
                 ctx.set_field_by_name(
                     *this,
@@ -358,6 +372,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "setLevel",
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             ctx.set_field_by_name(
                 obj_arg(args, 0)?,
                 "logLevel",
@@ -424,6 +445,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "setFormatter",
         "(Ljava/util/logging/Formatter;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             ctx.set_field_by_name(
                 obj_arg(args, 0)?,
                 "formatter",
@@ -2978,8 +3006,14 @@ fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // (which extends `Proxy$Instance`). The generated classes carry their own
     // name (`com/sun/proxy/$ProxyN` etc.), so a name-only check would wrongly
     // report `false`; walk the superclass chain instead.
+    // G18-1: `Proxy.isProxyClass(null)` is `Objects.requireNonNull(cl)` in the
+    // JDK — a NullPointerException with NO message, not `false`. Measured; the
+    // previous `_ => Ok(0)` arm answered `false` for null.
     let class_mirror = match args.first() {
         Some(Value::Object(Some(m))) => *m,
+        Some(Value::Object(None)) | None => {
+            return Err(RuntimeError::NullPointerException { message: None }.into());
+        }
         _ => return Ok(Some(Value::Int(0))),
     };
     let is_proxy = match crate::lang_class::mirror_class_id(ctx, class_mirror) {
@@ -3054,8 +3088,13 @@ fn native_proxy_get_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let proxy = match args.first() {
         Some(Value::Object(Some(p))) => *p,
         Some(Value::Object(None)) | None => {
+            // G18-1: HotSpot reaches `proxy.getClass()` inside
+            // `Proxy.getInvocationHandler`, so the NPE carries the helpful
+            // message that call site produces. Transcribed, not derived.
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("proxy is null".to_string()),
+                message: Some(
+                    "Cannot invoke \"Object.getClass()\" because \"proxy\" is null".to_string(),
+                ),
             }
             .into());
         }
@@ -3100,6 +3139,534 @@ pub(crate) fn proxy_loader_namespace(ctx: &mut dyn NativeContext, loader_obj: Ob
     }
 }
 
+// ---------------------------------------------------------------------------
+// G18-1 — `java.lang.reflect.Proxy`'s refusal contract.
+//
+// MEASURED against HotSpot 25.0.3+9-LTS on 2026-08-17 (record
+// `docs/known-issues/jdk-only/G18-1-the-proxy-invocation-contract-and-two-vectors-20260817.md`).
+// Before this, `newProxyInstance` applied exactly ONE of the JDK's refusals
+// ("<X> is not an interface") and silently built a working proxy for the other
+// ten; `getProxyClass` applied none at all.
+//
+// The ORDER below is HotSpot's, pinned by probe rows that put two violations in
+// the same call rather than derived from reading:
+//
+//   1. `Objects.requireNonNull(h)`  -> NPE, message **null**
+//   2. `interfaces.length`          -> NPE `Cannot read the array length
+//                                      because "interfaces" is null`
+//   3. `ProxyBuilder.referencedTypes` calls `intf.getMethods()` on EVERY
+//      element before any per-element validation, so a null element ANYWHERE
+//      beats a bad element earlier in the array
+//                                   -> NPE `Cannot invoke
+//                                      "java.lang.Class.getMethods()" because
+//                                      "intf" is null`
+//   4. `ProxyBuilder.validateProxyInterfaces`, per element in argument order:
+//        a. `!intf.isInterface()` -> IAE `<name> is not an interface`
+//        b. `ensureVisible`       -> IAE `<name> referenced from a method is
+//                                    not visible from class loader: null`
+//        c. duplicate             -> IAE `repeated interface: <name>`
+//   5. `ProxyGenerator.checkReturnTypes` -> IAE `methods with same signature
+//      <sig> but incompatible return types: ...`
+//
+// (4a) running before (4b) is not a guess: `newProxyInstance(null, {POrder})`
+// — an application CLASS — answers "POrder is not an interface", while
+// `newProxyInstance(null, {POrder$A, POrder$A})` — an application INTERFACE,
+// twice — answers "not visible" rather than "repeated interface".
+// ---------------------------------------------------------------------------
+
+/// The eight primitive descriptors plus `void`, spelled as `Class.getName()`
+/// spells them. Used only to recognise a `Class` mirror that carries no
+/// `ClassId` (`int.class`) so it can be refused by name; every other
+/// unresolvable mirror FAILS OPEN.
+const PROXY_PRIMITIVE_NAMES: [&str; 9] = [
+    "int", "long", "short", "byte", "char", "float", "double", "boolean", "void",
+];
+
+/// `Class.getName()` for a field/return descriptor: `I` -> `int`,
+/// `Ljava/lang/String;` -> `java.lang.String`, `[Ljava/lang/String;` ->
+/// `[Ljava.lang.String;` (arrays keep their descriptor spelling, as
+/// `Class.getName()` does).
+fn proxy_desc_class_name(desc: &str) -> String {
+    if desc.starts_with('[') {
+        return desc.replace('/', ".");
+    }
+    if let Some(inner) = desc.strip_prefix('L') {
+        return inner.trim_end_matches(';').replace('/', ".");
+    }
+    match desc {
+        "B" => "byte".to_string(),
+        "C" => "char".to_string(),
+        "D" => "double".to_string(),
+        "F" => "float".to_string(),
+        "I" => "int".to_string(),
+        "J" => "long".to_string(),
+        "S" => "short".to_string(),
+        "Z" => "boolean".to_string(),
+        "V" => "void".to_string(),
+        _ => desc.replace('/', "."),
+    }
+}
+
+/// `Class.getTypeName()` for a descriptor — the *source* spelling, which is
+/// what `Method.toShortSignature()` prints for parameters: `[J` -> `long[]`,
+/// `[Ljava/lang/String;` -> `java.lang.String[]`.
+fn proxy_desc_type_name(desc: &str) -> String {
+    let mut dims = 0usize;
+    let mut rest = desc;
+    while let Some(stripped) = rest.strip_prefix('[') {
+        dims += 1;
+        rest = stripped;
+    }
+    let mut out = proxy_desc_class_name(rest);
+    for _ in 0..dims {
+        out.push_str("[]");
+    }
+    out
+}
+
+/// `Class.toString()` for a descriptor: `"interface "`, `"class "` or (for a
+/// primitive) no prefix, then `Class.getName()`. This is the exact text the
+/// JDK's incompatible-return-types message embeds, because it formats a
+/// `List<Class<?>>`.
+fn proxy_desc_class_to_string(ctx: &dyn NativeContext, desc: &str) -> String {
+    let name = proxy_desc_class_name(desc);
+    if desc.starts_with('[') {
+        return format!("class {name}");
+    }
+    let Some(inner) = desc.strip_prefix('L') else {
+        return name; // primitive / void: no prefix
+    };
+    let internal = inner.trim_end_matches(';');
+    let is_iface = ctx
+        .class_id_by_name(internal)
+        .map(|cid| ctx.class_access_flags(cid) & cratonvm_types::access_flags::ACC_INTERFACE != 0)
+        .unwrap_or(false);
+    if is_iface {
+        format!("interface {name}")
+    } else {
+        format!("class {name}")
+    }
+}
+
+/// Transitive `to.isAssignableFrom(from)` over `ClassId`s — superclass chain
+/// plus every (transitive) super-interface.
+///
+/// Deliberately self-contained rather than `NativeContext::is_subclass`: a
+/// wrong `false` here REFUSES a proxy HotSpot builds, so the walk that decides
+/// it has to be one this file can unit-test. Bounded so a malformed hierarchy
+/// cannot spin.
+fn proxy_cid_assignable(
+    ctx: &dyn NativeContext,
+    to: cratonvm_types::ClassId,
+    from: cratonvm_types::ClassId,
+) -> bool {
+    let mut seen: Vec<cratonvm_types::ClassId> = Vec::new();
+    let mut stack: Vec<cratonvm_types::ClassId> = vec![from];
+    let mut guard = 0usize;
+    while let Some(cid) = stack.pop() {
+        guard += 1;
+        if guard > 4096 {
+            return false;
+        }
+        if cid == to {
+            return true;
+        }
+        if seen.contains(&cid) {
+            continue;
+        }
+        seen.push(cid);
+        if let Some(sup) = ctx.superclass_of(cid) {
+            stack.push(sup);
+        }
+        stack.extend(ctx.class_interfaces(cid));
+    }
+    false
+}
+
+/// `to.isAssignableFrom(from)` over DESCRIPTORS. `None` means "could not be
+/// decided" (a reference type this VM cannot resolve) — every caller FAILS
+/// OPEN on `None` rather than refusing a proxy it cannot justify refusing.
+fn proxy_desc_assignable(ctx: &dyn NativeContext, to: &str, from: &str) -> Option<bool> {
+    proxy_desc_assignable_opt(Some(ctx), to, from)
+}
+
+/// The body of [`proxy_desc_assignable`], with the context made optional so the
+/// arms that need no class resolution — array covariance and primitives, which
+/// between them decide the two measured array rows — are unit-testable without
+/// a live VM. Passing `None` makes every arm that WOULD resolve a class answer
+/// `None` instead.
+fn proxy_desc_assignable_opt(
+    ctx: Option<&dyn NativeContext>,
+    to: &str,
+    from: &str,
+) -> Option<bool> {
+    if to == from {
+        return Some(true);
+    }
+    let to_arr = to.starts_with('[');
+    let from_arr = from.starts_with('[');
+    if to_arr || from_arr {
+        // Array covariance: `Object[].isAssignableFrom(String[])` is true, and
+        // `String[].isAssignableFrom(Integer[])` is false. That distinction is
+        // the difference between the measured `Object[] vs String[]` row (which
+        // HotSpot ACCEPTS) and the `String[] vs Integer[]` row (which it
+        // refuses), so it cannot be collapsed to "arrays differ -> conflict".
+        if to == "Ljava/lang/Object;" {
+            return Some(true);
+        }
+        if to_arr && from_arr {
+            return proxy_desc_assignable_opt(ctx, &to[1..], &from[1..]);
+        }
+        if to == "Ljava/lang/Cloneable;" || to == "Ljava/io/Serializable;" {
+            return Some(from_arr);
+        }
+        return Some(false);
+    }
+    let (Some(to_inner), Some(from_inner)) = (to.strip_prefix('L'), from.strip_prefix('L')) else {
+        // At least one side is a primitive (or `void`) and they are not equal.
+        return Some(false);
+    };
+    let ctx = ctx?;
+    let to_cid = ctx.class_id_by_name(to_inner.trim_end_matches(';'))?;
+    let from_cid = ctx.class_id_by_name(from_inner.trim_end_matches(';'))?;
+    Some(proxy_cid_assignable(ctx, to_cid, from_cid))
+}
+
+/// `Method.toShortSignature()` — `name(type,type,...)` with each parameter in
+/// `Class.getTypeName()` spelling and no spaces. This is the text the JDK's
+/// incompatible-return-types message names the clashing methods by; measured as
+/// `m(int,java.lang.String,long[])` and `q(java.util.List)` (erased — the
+/// generic argument does not appear).
+fn proxy_short_signature(name: &str, params: &str) -> String {
+    let joined = proxy_iter_param_descs(params)
+        .iter()
+        .map(|d| proxy_desc_type_name(d))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}({joined})")
+}
+
+/// Split a method descriptor into `(params-without-parens, return)`.
+fn proxy_split_method_desc(desc: &str) -> Option<(&str, &str)> {
+    let open = desc.find('(')?;
+    let close = desc.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    Some((&desc[open + 1..close], &desc[close + 1..]))
+}
+
+/// Iterate the field descriptors packed inside a parameter list.
+///
+/// Byte-indexed, and every slice is rebuilt with `from_utf8_lossy`, so a
+/// descriptor naming a class with a non-ASCII identifier (which Java permits)
+/// cannot land a slice on a non-char boundary and panic the VM. A truncated
+/// descriptor yields its remainder and terminates.
+fn proxy_iter_param_descs(params: &str) -> Vec<String> {
+    let bytes = params.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'L' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b';' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // consume the ';'
+            }
+        } else {
+            i += 1;
+        }
+        out.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+    }
+    out
+}
+
+/// Every method a generated proxy would have to implement for `iface`:
+/// its own public, non-static methods plus those of every super-interface.
+/// Appends `(name, descriptor)` pairs in first-seen order; repeats are left in,
+/// because the grouping in [`proxy_check_return_types`] collapses them the same
+/// way `ProxyGenerator.addProxyMethod` does.
+fn proxy_collect_iface_methods(
+    ctx: &dyn NativeContext,
+    iface: cratonvm_types::ClassId,
+    out: &mut Vec<(String, String)>,
+) {
+    let mut seen: Vec<cratonvm_types::ClassId> = Vec::new();
+    let mut stack: Vec<cratonvm_types::ClassId> = vec![iface];
+    let mut guard = 0usize;
+    while let Some(cid) = stack.pop() {
+        guard += 1;
+        if guard > 1024 {
+            return;
+        }
+        if seen.contains(&cid) {
+            continue;
+        }
+        seen.push(cid);
+        for m in ctx.declared_methods(cid) {
+            let flags = m.access_flags;
+            if flags & cratonvm_types::access_flags::ACC_STATIC != 0
+                || flags & cratonvm_types::access_flags::ACC_PRIVATE != 0
+                || flags & cratonvm_types::access_flags::ACC_PUBLIC == 0
+                || m.name.starts_with('<')
+            {
+                continue;
+            }
+            // No de-duplication here: the grouping below already collapses
+            // repeats of the same (signature, return type), which is exactly
+            // what `ProxyGenerator.addProxyMethod` does.
+            out.push((m.name.clone(), m.descriptor.clone()));
+        }
+        stack.extend(ctx.class_interfaces(cid));
+    }
+}
+
+/// `ProxyGenerator.checkReturnTypes`: two interfaces may declare the same
+/// name+parameters only if one declared return type is assignable from every
+/// other. A primitive return in a group of two or more is always a conflict.
+///
+/// Fails OPEN: a signature whose return types this VM cannot resolve is
+/// skipped, because refusing a proxy HotSpot builds is strictly worse than
+/// accepting one it refuses.
+fn proxy_check_return_types(
+    ctx: &dyn NativeContext,
+    ifaces: &[cratonvm_types::ClassId],
+) -> Result<(), MethodCallFailed> {
+    // Deliberately narrowed to the multi-interface case. A conflict needs two
+    // methods with the same name and parameters but return types neither of
+    // which is assignable from the other; inside ONE interface hierarchy javac
+    // rejects that at compile time (the covariant-override rule), and all five
+    // measured conflict rows pass two interfaces. Skipping the single-interface
+    // case therefore costs no measured row and keeps `declared_methods` — which
+    // allocates a `Vec<MethodMetadata>` per class — off the common
+    // `newProxyInstance(loader, new Class[]{ Iface.class }, h)` path.
+    if ifaces.len() < 2 {
+        return Ok(());
+    }
+    let mut methods: Vec<(String, String)> = Vec::new();
+    for &cid in ifaces {
+        proxy_collect_iface_methods(ctx, cid, &mut methods);
+    }
+    // Group by short signature, preserving argument order — the JDK's message
+    // lists the return types in the order the methods were added, and the two
+    // measured orderings (`{A,B}` -> `[String, Integer]`, `{B,A}` ->
+    // `[Integer, String]`) show that order is the caller's.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (name, desc) in &methods {
+        let Some((params, ret)) = proxy_split_method_desc(desc) else {
+            continue;
+        };
+        let key = format!("{name}({params})");
+        let slot = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Vec::new()
+        });
+        // `ProxyGenerator.addProxyMethod` MERGES a repeat with an identical
+        // return type instead of adding it, so `methods.size() < 2` counts
+        // DISTINCT return types. Mirror that by de-duplicating here.
+        if !slot.iter().any(|r| r == ret) {
+            slot.push(ret.to_string());
+        }
+    }
+    for key in order {
+        let rets = match groups.get(&key) {
+            Some(r) if r.len() >= 2 => r,
+            _ => continue,
+        };
+        let display = {
+            let (name, params) = key.split_once('(').unwrap_or((key.as_str(), ""));
+            proxy_short_signature(name, params.trim_end_matches(')'))
+        };
+        if let Some(prim) = rets
+            .iter()
+            .find(|r| !r.starts_with('L') && !r.starts_with('['))
+        {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "methods with same signature {display} but incompatible return types: {} and others",
+                    proxy_desc_class_name(prim)
+                ),
+            }
+            .into());
+        }
+        // The JDK's `uncoveredReturnTypes` fold, transcribed.
+        let mut uncovered: Vec<String> = Vec::new();
+        let mut undecidable = false;
+        'next_ret: for new_ret in rets {
+            let mut added = false;
+            for slot in uncovered.iter_mut() {
+                match proxy_desc_assignable(ctx, new_ret, slot.as_str()) {
+                    Some(true) => continue 'next_ret,
+                    None => {
+                        undecidable = true;
+                        break 'next_ret;
+                    }
+                    Some(false) => {}
+                }
+                match proxy_desc_assignable(ctx, slot.as_str(), new_ret) {
+                    Some(true) => {
+                        *slot = new_ret.clone();
+                        added = true;
+                    }
+                    None => {
+                        undecidable = true;
+                        break 'next_ret;
+                    }
+                    Some(false) => {}
+                }
+            }
+            if !added {
+                uncovered.push(new_ret.clone());
+            }
+        }
+        if undecidable || uncovered.len() < 2 {
+            continue;
+        }
+        let listed = uncovered
+            .iter()
+            .map(|d| proxy_desc_class_to_string(ctx, d))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "methods with same signature {display} but incompatible return types: [{listed}]"
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `ProxyBuilder.ensureVisible(loader, intf)` — but only for the arm this VM
+/// can answer with certainty: a **null** (bootstrap) loader argument cannot see
+/// an interface that the bootstrap loader did not define.
+///
+/// Two independent signals must agree before refusing, because
+/// `NativeContext::loader_id_of_class` reports `Application` both for a genuine
+/// application class AND for a class it has no record of — exactly the
+/// conflation that would turn a legitimate
+/// `newProxyInstance(jdkIface.getClassLoader(), …)` (whose loader argument IS
+/// null) into a spurious `IllegalArgumentException`. The second signal is the
+/// module: every class in the JDK image carries a module name, a classpath
+/// class does not.
+fn proxy_iface_hidden_from_bootstrap(
+    ctx: &dyn NativeContext,
+    cid: cratonvm_types::ClassId,
+) -> bool {
+    let non_bootstrap =
+        ctx.loader_id_of_class(cid) != cratonvm_types::ClassLoaderId::NATIVE_BOOTSTRAP as i32;
+    let unnamed_module = match ctx.module_name_of_class(cid) {
+        None => true,
+        Some(m) => m.is_empty() || m == "unnamed",
+    };
+    non_bootstrap && unnamed_module
+}
+
+/// Walk the `Class[] interfaces` argument of `Proxy.newProxyInstance` /
+/// `Proxy.getProxyClass` into `ClassId`s, applying steps 2-4 of the contract
+/// documented above. `loader_is_null` is whether the caller passed a null
+/// `ClassLoader`.
+fn proxy_validate_interfaces(
+    ctx: &mut dyn NativeContext,
+    loader_is_null: bool,
+    interfaces: Value,
+) -> Result<Vec<cratonvm_types::ClassId>, MethodCallFailed> {
+    let Value::Object(Some(arr)) = interfaces else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot read the array length because \"interfaces\" is null".to_string(),
+            ),
+        }
+        .into());
+    };
+    let n = ctx.array_length(arr);
+    // Step 3 — the referenced-types pass touches every element first.
+    for i in 0..n {
+        if !matches!(ctx.get_array_element(arr, i), Value::Object(Some(_))) {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"java.lang.Class.getMethods()\" because \"intf\" is null"
+                        .to_string(),
+                ),
+            }
+            .into());
+        }
+    }
+    // Step 4 — per element, in argument order.
+    let mut out: Vec<cratonvm_types::ClassId> = Vec::with_capacity(n);
+    for i in 0..n {
+        let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) else {
+            continue;
+        };
+        // `class_id_from_mirror` ONLY — deliberately not `lang_class::
+        // mirror_class_id`, whose second step reads the VM's `Int` overlay at
+        // mirror slot 0 and would hand a primitive mirror back some other
+        // class's id, turning "int is not an interface" into a message naming
+        // whatever that id happens to be. This is the same resolver the loop
+        // used before G18-1.
+        let Some(cid) = ctx.class_id_from_mirror(mirror) else {
+            // A mirror with no `ClassId`. The only such shape the JDK refuses
+            // that can be named with certainty is a PRIMITIVE mirror
+            // (`int.class`), which carries its name in slot 1 and no class id
+            // at all. Anything else is a mirror this VM failed to resolve —
+            // skip it, exactly as this loop did before G18-1, rather than
+            // inventing a refusal from a name.
+            let name = crate::lang_class::mirror_class_name(ctx, mirror).unwrap_or_default();
+            if PROXY_PRIMITIVE_NAMES.contains(&name.as_str()) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("{name} is not an interface"),
+                }
+                .into());
+            }
+            continue;
+        };
+        let dotted = ctx
+            .class_name_of_id(cid)
+            .unwrap_or_default()
+            .replace('/', ".");
+        if ctx.class_access_flags(cid) & cratonvm_types::access_flags::ACC_INTERFACE == 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("{dotted} is not an interface"),
+            }
+            .into());
+        }
+        if loader_is_null && proxy_iface_hidden_from_bootstrap(ctx, cid) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "{dotted} referenced from a method is not visible from class loader: null"
+                ),
+            }
+            .into());
+        }
+        if out.contains(&cid) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("repeated interface: {dotted}"),
+            }
+            .into());
+        }
+        out.push(cid);
+    }
+    // Step 5.
+    proxy_check_return_types(ctx, &out)?;
+    Ok(out)
+}
+
+/// Whether the `ClassLoader` argument at `args[0]` is a Java `null`.
+fn proxy_loader_arg_is_null(args: &[Value]) -> bool {
+    !matches!(args.first(), Some(Value::Object(Some(_))))
+}
+
 fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // WP2.5-B — strategy A path: emit a real `$ProxyN` class that
     // extends `java/lang/reflect/Proxy$Instance` and implements the
@@ -3122,36 +3689,20 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let interfaces = args.get(1).cloned().unwrap_or(Value::Object(None));
     let handler = args.get(2).cloned().unwrap_or(Value::Object(None));
 
-    // Walk the Class[] arg into a list of iface ClassIds for cache keying.
-    //
-    // Real `Proxy.newProxyInstance` → `ProxyBuilder` validates every supplied
-    // `Class` is actually an interface, throwing
-    // `IllegalArgumentException("<fqcn> is not an interface")` otherwise
-    // (ServiceLocatorFactoryBeanTests.whenServiceLocatorInterfaceIsNotAnInterfaceType,
-    // which passes a plain class). Mirror that check here before generating the
-    // proxy class.
-    let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::new();
-    if let Value::Object(Some(arr)) = interfaces {
-        let n = ctx.array_length(arr);
-        for i in 0..n {
-            if let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) {
-                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
-                    let flags = ctx.class_access_flags(cid);
-                    if flags & cratonvm_types::access_flags::ACC_INTERFACE == 0 {
-                        let dotted = ctx
-                            .class_name_of_id(cid)
-                            .unwrap_or_default()
-                            .replace('/', ".");
-                        return Err(RuntimeError::IllegalArgumentException {
-                            message: format!("{dotted} is not an interface"),
-                        }
-                        .into());
-                    }
-                    iface_cids.push(cid);
-                }
-            }
-        }
+    // G18-1 step 1 — `Objects.requireNonNull(h)` is the FIRST line of
+    // `Proxy.newProxyInstance` and beats every argument check that follows,
+    // including a null `interfaces` array. Its NPE carries NO message.
+    if !matches!(handler, Value::Object(Some(_))) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
     }
+
+    // G18-1 steps 2-5 — the rest of the refusal contract, shared with
+    // `getProxyClass`. Before this, the only refusal applied here was
+    // "<fqcn> is not an interface"
+    // (ServiceLocatorFactoryBeanTests.whenServiceLocatorInterfaceIsNotAnInterfaceType,
+    // which passes a plain class); the other ten measured refusals silently
+    // produced a working proxy.
+    let iface_cids = proxy_validate_interfaces(ctx, proxy_loader_arg_is_null(args), interfaces)?;
 
     // Try to generate a `$ProxyN` class. On any failure, fall back to
     // the legacy synthetic `Proxy$Instance` allocation — the existing
@@ -3266,18 +3817,14 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 ///
 /// Args (static method): `[0]` ClassLoader, `[1]` `Class[]` interfaces.
 fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Walk the Class[] into iface ClassIds (same as `native_proxy_new_instance`).
-    let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::new();
-    if let Some(Value::Object(Some(arr))) = args.get(1).cloned() {
-        let n = ctx.array_length(arr);
-        for i in 0..n {
-            if let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) {
-                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
-                    iface_cids.push(cid);
-                }
-            }
-        }
-    }
+    // G18-1 — `getProxyClass` shares `ProxyBuilder` with `newProxyInstance`, so
+    // it shares steps 2-5 of the refusal contract VERBATIM (measured: identical
+    // exception classes and identical messages for null array, null element,
+    // non-interface, duplicate and invisible interface). It has no handler
+    // argument, so step 1 does not apply. Before this it applied NO refusals at
+    // all and answered a `Class` for every one of them.
+    let interfaces = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let iface_cids = proxy_validate_interfaces(ctx, proxy_loader_arg_is_null(args), interfaces)?;
     // Per-loader namespace = the loader instance's identity hash (bootstrap/null
     // → 0), matching `native_proxy_new_instance` so both share the cache entry.
     let loader_namespace: u32 = match args.first() {
@@ -3560,6 +4107,15 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 let flag = Value::Int(if eq { 1 } else { 0 });
                 return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
             }
+            // `Annotation.toString()` is rendered TWICE in this repository:
+            // here, via `ctx_annotation_proxy_to_string`, and in the
+            // interpreter's primary dispatch hook,
+            // `vm/src/vm/vm_exec.rs::annotation_proxy_to_string`. Which one
+            // answers a given call is not under the caller's control — the
+            // first `toString()` on a fresh proxy can take the vm_exec hook and
+            // every later one this route — so any divergence between them shows
+            // up as ONE run printing TWO different strings for ONE annotation
+            // (measured 2026-08-12). Change neither alone.
             "toString" => {
                 let s = crate::lang_class::ctx_annotation_proxy_to_string(ctx, handler)?;
                 let result = ctx.create_string(&s);
@@ -3809,6 +4365,164 @@ mod proxy_strict_gate_tests {
             assert!(super::real_proxy_super());
             assert_eq!(super::proxy_super_class_name(), "java/lang/reflect/Proxy");
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_refusal_contract_tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
+    /// `Class.getName()` spelling. Arrays keep their DESCRIPTOR form
+    /// (`[Ljava.lang.String;`), which is what makes the measured
+    /// `class [Ljava.lang.String;` entry in the incompatible-return-types list
+    /// reproducible. Getting this wrong would have printed
+    /// `java.lang.String[]` there.
+    #[test]
+    fn desc_class_name_matches_class_get_name() {
+        assert_eq!(proxy_desc_class_name("I"), "int");
+        assert_eq!(proxy_desc_class_name("J"), "long");
+        assert_eq!(proxy_desc_class_name("Z"), "boolean");
+        assert_eq!(proxy_desc_class_name("V"), "void");
+        assert_eq!(
+            proxy_desc_class_name("Ljava/lang/String;"),
+            "java.lang.String"
+        );
+        assert_eq!(
+            proxy_desc_class_name("[Ljava/lang/String;"),
+            "[Ljava.lang.String;"
+        );
+        assert_eq!(proxy_desc_class_name("[I"), "[I");
+        assert_eq!(proxy_desc_class_name("[[J"), "[[J");
+    }
+
+    /// `Class.getTypeName()` spelling — the one `toShortSignature` uses for
+    /// parameters, where arrays DO become `long[]`.
+    #[test]
+    fn desc_type_name_matches_class_get_type_name() {
+        assert_eq!(proxy_desc_type_name("[J"), "long[]");
+        assert_eq!(
+            proxy_desc_type_name("[Ljava/lang/String;"),
+            "java.lang.String[]"
+        );
+        assert_eq!(proxy_desc_type_name("[[I"), "int[][]");
+        assert_eq!(proxy_desc_type_name("Ljava/util/List;"), "java.util.List");
+        assert_eq!(proxy_desc_type_name("S"), "short");
+    }
+
+    /// Transcribed from HotSpot 25.0.3+9-LTS:
+    ///   `methods with same signature m(int,java.lang.String,long[]) but ...`
+    ///   `methods with same signature q(java.util.List) but ...`
+    ///   `methods with same signature r() but ...`
+    #[test]
+    fn short_signature_matches_the_measured_text() {
+        assert_eq!(
+            proxy_short_signature("m", "ILjava/lang/String;[J"),
+            "m(int,java.lang.String,long[])"
+        );
+        assert_eq!(
+            proxy_short_signature("q", "Ljava/util/List;"),
+            "q(java.util.List)"
+        );
+        assert_eq!(proxy_short_signature("r", ""), "r()");
+    }
+
+    #[test]
+    fn param_descriptors_split_on_the_right_boundaries() {
+        assert_eq!(proxy_iter_param_descs(""), Vec::<String>::new());
+        assert_eq!(
+            proxy_iter_param_descs("ILjava/lang/String;[J"),
+            vec!["I", "Ljava/lang/String;", "[J"]
+        );
+        assert_eq!(
+            proxy_iter_param_descs("[[Ljava/lang/Object;Z"),
+            vec!["[[Ljava/lang/Object;", "Z"]
+        );
+        // A truncated descriptor must terminate, not spin.
+        assert_eq!(
+            proxy_iter_param_descs("Ljava/lang/String"),
+            vec!["Ljava/lang/String"]
+        );
+    }
+
+    #[test]
+    fn method_descriptor_splits_into_params_and_return() {
+        assert_eq!(
+            proxy_split_method_desc("(ILjava/lang/String;)Ljava/lang/Integer;"),
+            Some(("ILjava/lang/String;", "Ljava/lang/Integer;"))
+        );
+        assert_eq!(proxy_split_method_desc("()V"), Some(("", "V")));
+        assert_eq!(proxy_split_method_desc("no-parens"), None);
+    }
+
+    /// Array covariance is the difference between two MEASURED rows that must
+    /// NOT be collapsed: HotSpot accepts `{Object[] u(), String[] u()}` and
+    /// refuses `{String[] t(), Integer[] t()}`. Both are decided without any
+    /// class resolution, so this is testable without a VM.
+    #[test]
+    fn array_assignability_separates_the_two_measured_array_rows() {
+        let probe = |to: &str, from: &str| proxy_desc_assignable_opt(None, to, from);
+        assert_eq!(
+            probe("[Ljava/lang/Object;", "[Ljava/lang/String;"),
+            Some(true)
+        );
+        assert_eq!(
+            probe("[Ljava/lang/String;", "[Ljava/lang/Integer;"),
+            None,
+            "element assignability needs the VM; the caller must FAIL OPEN"
+        );
+        assert_eq!(probe("[I", "[I"), Some(true));
+        assert_eq!(probe("[I", "[J"), Some(false));
+        assert_eq!(probe("Ljava/lang/Object;", "[I"), Some(true));
+        assert_eq!(probe("I", "J"), Some(false));
+        assert_eq!(probe("V", "Ljava/lang/String;"), Some(false));
+        assert_eq!(probe("Ljava/io/Serializable;", "[I"), Some(true));
+    }
+
+    /// The primitive-return arm of the message, transcribed:
+    /// `... but incompatible return types: int and others` — note it names the
+    /// PRIMITIVE regardless of which interface was listed first, and that
+    /// `void` counts as one (`void and others`).
+    #[test]
+    fn primitive_return_is_recognised_by_descriptor_shape() {
+        for d in ["I", "J", "S", "B", "C", "F", "D", "Z", "V"] {
+            assert!(
+                !d.starts_with('L') && !d.starts_with('['),
+                "{d} must take the primitive arm"
+            );
+        }
+        for d in ["Ljava/lang/String;", "[I", "[Ljava/lang/String;"] {
+            assert!(
+                d.starts_with('L') || d.starts_with('['),
+                "{d} must NOT take the primitive arm"
+            );
+        }
+    }
+
+    /// The nine names that may be refused from a `Class` mirror carrying no
+    /// `ClassId`. Anything else must fail OPEN — inventing "X is not an
+    /// interface" from an unresolvable mirror is how a working path breaks.
+    #[test]
+    fn only_primitives_are_refused_by_name() {
+        assert!(PROXY_PRIMITIVE_NAMES.contains(&"int"));
+        assert!(PROXY_PRIMITIVE_NAMES.contains(&"void"));
+        assert_eq!(PROXY_PRIMITIVE_NAMES.len(), 9);
+        assert!(!PROXY_PRIMITIVE_NAMES.contains(&"java.lang.String"));
+        assert!(!PROXY_PRIMITIVE_NAMES.contains(&""));
+    }
+
+    /// A null `ClassLoader` argument is what arrives as anything other than
+    /// `Object(Some(_))` at slot 0 — including a MISSING slot 0, which is how
+    /// a malformed call would otherwise slip past the visibility arm.
+    #[test]
+    fn loader_arg_null_detection() {
+        assert!(proxy_loader_arg_is_null(&[]));
+        assert!(proxy_loader_arg_is_null(&[Value::Object(None)]));
+        assert!(proxy_loader_arg_is_null(&[Value::Int(0)]));
     }
 }
 

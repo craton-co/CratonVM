@@ -947,6 +947,38 @@ fn resolve_native_for_dispatch(
     }
 }
 
+/// The concrete class whose registered natives `execute`'s "Path B" borrows
+/// when an interface method resolved to an abstract declaration and the
+/// receiver matched no class in the store — or `""` when this interface has no
+/// such stand-in.
+///
+/// Extracted from the `match` that used to sit inline at the Path B call site
+/// (JDK-ONLY-WAVE2 §8) for one reason: the array refusal immediately after it
+/// has to ask "is this one of the substituted interfaces?", and a second
+/// hard-coded copy of these six names would be a list that can drift from the
+/// list it is supposed to mirror. There is now exactly one copy, and
+/// `g13_array_receiver_tests` pins it.
+///
+/// **Deliberately absent: `java/lang/Cloneable` and `java/io/Serializable`.**
+/// They are the only two interfaces an array type actually implements
+/// (JLS 4.10.3), they declare no methods, and nothing may map them here — that
+/// absence is what makes "canonical is non-empty AND the receiver is an array"
+/// a sound proof of `IncompatibleClassChangeError` rather than a heuristic.
+fn canonical_concrete_for_interface(iface: &str) -> &'static str {
+    match iface {
+        "java/util/Set" | "java/util/Collection" => "java/util/HashSet",
+        // Iterable has no collection shape of its own. Keep synthetic
+        // List-style receivers on the established ArrayList bridge after
+        // lambda proxies have already had a chance to dispatch their SAM
+        // implementation.
+        "java/lang/Iterable" => "java/util/ArrayList",
+        "java/util/List" => "java/util/ArrayList",
+        "java/util/Map" => "java/util/HashMap",
+        "java/util/Iterator" => "java/util/HashMap$KeyItr",
+        _ => "",
+    }
+}
+
 /// Execute a method on the given class.
 ///
 /// This is called by `invoke_on_class_shared` for non-native methods.
@@ -1555,18 +1587,80 @@ pub fn execute(
                         // unreachable rather than conditional. NOT deleted this
                         // wave — removing shim mappings has regressed real-JDK
                         // boot before.
-                        let canonical: &'static str = match &*class_name_owned {
-                            "java/util/Set" | "java/util/Collection" => "java/util/HashSet",
-                            // Iterable has no collection shape of its own. Keep
-                            // synthetic List-style receivers on the established
-                            // ArrayList bridge after lambda proxies have already
-                            // had a chance to dispatch their SAM implementation.
-                            "java/lang/Iterable" => "java/util/ArrayList",
-                            "java/util/List" => "java/util/ArrayList",
-                            "java/util/Map" => "java/util/HashMap",
-                            "java/util/Iterator" => "java/util/HashMap$KeyItr",
-                            _ => "",
-                        };
+                        let canonical: &'static str =
+                            canonical_concrete_for_interface(&class_name_owned);
+                        // G13-1, 2026-08-17. An ARRAY receiver cannot be an
+                        // instance of ANY interface this map covers: JLS 4.10.3
+                        // gives an array type exactly two superinterfaces,
+                        // `java.lang.Cloneable` and `java.io.Serializable`, and
+                        // neither is in the list. So for an array the
+                        // substitution is not "a shim that is probably right" —
+                        // it is provably wrong, and it is the shape that hides
+                        // the wrongness best, because every one of the canonical
+                        // natives reads its receiver through an `elementData`/
+                        // bucket layout an array does not have and reports
+                        // **empty** rather than refusing.
+                        //
+                        // MEASURED, 2026-08-17, on the `d87dff06a`+2 binary:
+                        // `LinkedHashMap.values()` mints a real
+                        // `LinkedHashMap$LinkedValues` carrier, whose
+                        // `elementData` slot (absolute 1, from the real
+                        // `java/util/ArrayList` layout) collides with the ONE
+                        // member of that carrier family that declares two
+                        // fields — `LinkedValues` has `reversed` at 0 and
+                        // `this$0` at 1. The view's source-map read then hands
+                        // native-collections the `Object[]` element buffer as
+                        // though it were the backing `Map`, and it arrives here
+                        // as `ctx.invoke("java/util/Map", "isEmpty", "()Z",
+                        // [Object[11]])`. Proven by reflection on both VMs
+                        // (`--add-opens java.base/java.util=ALL-UNNAMED`):
+                        // HotSpot reports `this$0 -> java.util.LinkedHashMap`,
+                        // CratonVM `this$0 -> [Ljava.lang.Object;[len=11]`.
+                        // Under `Compatible` that substitution answered
+                        // `isEmpty() == true` for a three-entry map and the
+                        // whole `values()` view silently came back EMPTY; under
+                        // `--jdk-only` the §8 refusal below turned it into an
+                        // `AbstractMethodError` naming `java/util/Map` — which
+                        // reads as an interface-door defect and is not one.
+                        //
+                        // Refusing here is what makes the two modes agree and
+                        // what puts the receiver's real shape in the message.
+                        // The blast radius is MEASURED, not argued: across all
+                        // 105 corpus main classes, in `--jdk-only` and in
+                        // `Compatible`, `[CANONICAL_CENSUS]` reports this map
+                        // firing exactly ONCE — `java/util/Map -> java/util/
+                        // HashMap isEmpty 1`, in `RJdkMapViews`, the vector this
+                        // record is about. No currently-green vector reaches it.
+                        //
+                        // The root cause is the slot collision, and it lives in
+                        // `native-collections/src/lib.rs` (nominated in
+                        // `G13-1-…-20260817.md`). This site cannot fix it; it
+                        // can stop laundering it into a wrong answer.
+                        if !canonical.is_empty() && recv_kind == cratonvm_types::ObjectKind::Array {
+                            let msg = format!(
+                                "array receiver does not implement the requested interface \
+                                 {class_name_owned} (dispatching \
+                                 {class_name_owned}.{method_name}{method_descriptor})"
+                            );
+                            match super::exceptions::create_exception_object(
+                                shared,
+                                thread,
+                                "java/lang/IncompatibleClassChangeError",
+                                Some(&msg),
+                            ) {
+                                Ok(exc) => {
+                                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                                }
+                                // Same fallback the AbstractMethodError path
+                                // below takes: never lose the diagnostic to a
+                                // heap exhaustion during exception construction.
+                                Err(_) => {
+                                    return Err(MethodCallFailed::InternalError(
+                                        VmError::Internal { message: msg },
+                                    ));
+                                }
+                            }
+                        }
                         // JDK-ONLY-WAVE2 §8, 2026-08-06. The record says: "Under
                         // `JdkOnly` real class bytes make every one of these
                         // interfaces resolvable, so the map should become
@@ -1685,7 +1779,41 @@ pub fn execute(
                             .get_class(rc)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| format!("<cid {rc}>"));
-                        format!("recv_cid={rc} recv_class={rn}")
+                        // G13-1: the KIND matters as much as the class here,
+                        // and it was the missing half. `class_id_of` reports
+                        // `ClassId(0)` for an array as well as for an
+                        // unstamped synthetic object, and `get_class(0)`
+                        // resolves to `java/lang/Object` — so the two shapes
+                        // printed identically ("recv_cid=0
+                        // recv_class=java/lang/Object") and a lane reading
+                        // this line could not tell an `Object[]` receiver
+                        // from a class-less allocation. That is exactly the
+                        // distinction that separates "the interface door is
+                        // missing a row" from "a native handed us the wrong
+                        // object", and this record's whole first hypothesis
+                        // was the wrong one of those two.
+                        //
+                        // `recv_is_declaring` is the second discriminator, and
+                        // it separates the two mechanisms G13-1 measured behind
+                        // one message. `true` means the receiver's runtime
+                        // class IS the abstract/interface class the call
+                        // resolved to — i.e. a native minted an instance of an
+                        // abstract type and the method invoked on it has no
+                        // native either (`HttpRequest.version()`,
+                        // `PathMatcher.matches()`). `false` with
+                        // `recv_kind=Array`, or with a class unrelated to the
+                        // message, means something handed dispatch an object
+                        // that is not an instance of the resolved type at all
+                        // (`Map.isEmpty()` on an `Object[]`). The first needs a
+                        // registration; the second needs the caller fixed. They
+                        // are not the same bug and they print the same
+                        // sentence.
+                        let rk = shared.mem.heap.kind_of(r);
+                        let recv_is_declaring = rc == class_id;
+                        format!(
+                            "recv_cid={rc} recv_class={rn} recv_kind={rk:?} \
+                             recv_is_declaring={recv_is_declaring}"
+                        )
                     }
                     other => format!("recv={other:?}"),
                 };
@@ -4550,6 +4678,12 @@ pub(crate) enum OsrBackoffOutcome {
     /// OSR didn't fire (either backoff not yet, or `try_osr` rejected and
     /// the rejection has been recorded). Caller falls through to its
     /// post-back-edge work (typically `safepoint_check` then `continue`).
+    ///
+    /// Since the RBC.6b lift this also covers a case where OSR very much DID
+    /// fire: the OSR'd body raised an exception this method catches, and the
+    /// live frame has been left parked at the handler. The caller's action is
+    /// identical — resume interpreting this frame — but no rejection is
+    /// recorded, because nothing was rejected. See `try_osr`'s `committed_out`.
     Skip,
     /// OSR completed and we're back at the root frame of this
     /// `execute_frame` invocation — bubble the return value up to the
@@ -4563,10 +4697,14 @@ pub(crate) enum OsrBackoffOutcome {
     /// `frame_idx` out-parameter (which the helper mutates).
     ContinueDispatch,
     /// The OSR'd code exited with a Java exception in flight that this frame
-    /// cannot catch (an OSR'd method provably declares no exception table —
-    /// see RBC.6b in `compile_osr_artifact`). The caller must hand the
-    /// throwable to the dispatch loop's `pending_java_exception` channel so it
-    /// unwinds from THIS frame, instead of resuming the loop.
+    /// cannot catch. Until the RBC.6b lift that was a property of the whole
+    /// population — an OSR'd method provably declared no exception table — and
+    /// now it is a per-throw verdict reached by
+    /// `route_osr_exception_out_of_artifact`: either no handler covers the
+    /// precise throw bci, or the throw site lies outside every protected range.
+    /// The caller must hand the throwable to the dispatch loop's
+    /// `pending_java_exception` channel so it unwinds from THIS frame, instead
+    /// of resuming the loop.
     ///
     /// The old behaviour here was `Skip` + a re-stashed exception, i.e.
     /// "keep interpreting this frame from where it was". That is correct only
@@ -4792,6 +4930,10 @@ pub(crate) fn try_osr_with_backoff(
     // function; a single out-parameter written on exactly one path is the
     // minimal honest channel.
     let mut osr_throw: Option<ObjectRef> = None;
+    // Sibling out-channel: the OSR'd body ran and advanced this frame, but
+    // returned no value and threw nothing out — the RBC.6b lift's handler
+    // entry. See `try_osr`'s parameter doc.
+    let mut osr_committed = false;
     let osr_result = try_osr(
         shared,
         thread,
@@ -4799,12 +4941,23 @@ pub(crate) fn try_osr_with_backoff(
         osr_class_id,
         entry_pc,
         &mut osr_throw,
+        &mut osr_committed,
     );
     // Checked BEFORE the rejection bookkeeping below: the OSR'd body RAN (and
     // committed loop iterations), so this is not a rejected attempt and must
     // not consume the per-pc rejection budget.
     if let Some(exc) = osr_throw {
         return OsrBackoffOutcome::ThrowJava(exc);
+    }
+    // Same rule, same reason, for the path that ran and CAUGHT. `Skip`'s "fall
+    // through to your post-back-edge work" is the right action here — the frame
+    // is parked at a handler with the throwable on its stack, so the dispatch
+    // loop resumes there (after its safepoint check) and re-enters the cached
+    // artifact at the next hot back-edge. What must NOT happen is the rejection
+    // bookkeeping below: charging a caught exception against the per-pc budget
+    // retires OSR after five of them.
+    if osr_committed {
+        return OsrBackoffOutcome::Skip;
     }
     match osr_result {
         Some(osr_val) => {
@@ -7129,12 +7282,26 @@ fn execute_frame_from_index(
                     let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
                     if let Value::Object(Some(arr_ref)) = arr_val {
-                        if index < 0 {
+                        // JVMS 6.5 fixes the order NPE -> AIOOBE -> ASE, and the
+                        // bounds test is TWO-SIDED. This arm checked only
+                        // `index < 0`, so an index PAST THE END fell through to
+                        // the covariance check below and reported
+                        // ArrayStoreException where HotSpot reports
+                        // ArrayIndexOutOfBoundsException (measured:
+                        // RArrayStoreTiers s15, String[] as Object[], index 5
+                        // into length 1).
+                        //
+                        // The slow-path `Instruction::Aastore` arm in opcodes.rs
+                        // received the full two-sided check first. This fast-path
+                        // twin is the one the interpreter actually dispatches, so
+                        // fixing only the other one changed nothing observable --
+                        // the same two-handlers-for-one-opcode drift as the JIT
+                        // emitter that never called `jit_aastore`.
+                        let arr_len = shared.mem.heap.array_length(arr_ref) as i32;
+                        if index < 0 || index >= arr_len {
                             let _ = frame;
-                            pending_runtime_error = Some((
-                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
-                                saved_pc,
-                            ));
+                            pending_runtime_error =
+                                Some((RuntimeError::aioobe(index, arr_len), saved_pc));
                             continue;
                         }
                         // JVMS §aastore covariance check (mirrors the slow-path
@@ -7150,13 +7317,26 @@ fn execute_frame_from_index(
                                 && !aastore_element_assignable(shared, arr_ref, elem_ref)
                             {
                                 let _ = frame;
-                                let elem_cls = shared
+                                // Name the VALUE'S OWN class, HotSpot-style. On
+                                // a reference array the header class id is the
+                                // COMPONENT's, so the raw lookup answers
+                                // `java.lang.Integer` for an `Integer[]` where
+                                // HotSpot answers `[Ljava.lang.Integer;`
+                                // (`RArrayStoreTiers` s04). `cce_display_class_
+                                // name` is the existing repair for exactly that
+                                // — see the long note on the slow-path
+                                // `Instruction::Aastore` twin in opcodes.rs.
+                                // Separate statements: the helper takes the
+                                // class-manager read lock itself.
+                                let raw_elem_name = shared
                                     .classes
                                     .class_manager
                                     .read()
                                     .get_class(shared.mem.heap.class_id_of(elem_ref))
                                     .map(|c| c.name.to_string())
                                     .unwrap_or_else(|| "?".to_string());
+                                let elem_cls =
+                                    cce_display_class_name(shared, elem_ref, &raw_elem_name);
                                 pending_runtime_error = Some((
                                     RuntimeError::ArrayStoreException { message: elem_cls },
                                     saved_pc,
@@ -8873,6 +9053,95 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
             "[imse]   readHolds={:p}: NO ThreadLocalMap entry in current thread's table (len={len}) — the entry is GONE",
             read_holds.as_ptr(),
         );
+    }
+}
+
+/// G13-1 (2026-08-17) — the Path B interface-substitution table, and the
+/// property that makes an ARRAY receiver a refusal rather than a guess.
+///
+/// These live inline rather than in `interpreter/tests.rs` because this lane
+/// owns exactly one file. They are pure-function tests: nothing here builds a
+/// VM, so they run in milliseconds and cannot flake.
+#[cfg(test)]
+mod g13_array_receiver_tests {
+    use super::canonical_concrete_for_interface;
+
+    /// The six names Path B substitutes for, pinned. If a lane adds a seventh,
+    /// this test is where it has to say so — and the array refusal at the call
+    /// site picks it up automatically, because it reads the same function.
+    #[test]
+    fn the_substituted_interfaces_are_exactly_these_six() {
+        let mapped: Vec<(&str, &str)> = [
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/List",
+            "java/util/Map",
+            "java/util/Iterator",
+        ]
+        .into_iter()
+        .map(|i| (i, canonical_concrete_for_interface(i)))
+        .collect();
+        assert_eq!(
+            mapped,
+            vec![
+                ("java/util/Set", "java/util/HashSet"),
+                ("java/util/Collection", "java/util/HashSet"),
+                ("java/lang/Iterable", "java/util/ArrayList"),
+                ("java/util/List", "java/util/ArrayList"),
+                ("java/util/Map", "java/util/HashMap"),
+                ("java/util/Iterator", "java/util/HashMap$KeyItr"),
+            ]
+        );
+    }
+
+    /// The load-bearing absence. An array type implements `Cloneable` and
+    /// `java.io.Serializable` and nothing else (JLS 4.10.3). If either ever
+    /// gained a canonical mapping, "canonical is non-empty AND receiver is an
+    /// array" would stop being a proof of `IncompatibleClassChangeError` — so
+    /// the refusal's soundness is asserted here, not just commented.
+    #[test]
+    fn the_two_interfaces_an_array_really_implements_are_never_substituted() {
+        assert_eq!(canonical_concrete_for_interface("java/lang/Cloneable"), "");
+        assert_eq!(canonical_concrete_for_interface("java/io/Serializable"), "");
+    }
+
+    /// The refusal must not swallow ordinary `Object` methods on an array.
+    /// `clone`/`hashCode`/`getClass` on an `Object[]` are legal and reach the
+    /// no-`Code` arm through `java/lang/Object`, which maps to nothing — so
+    /// the array check cannot fire for them.
+    #[test]
+    fn object_and_unrelated_types_are_not_substituted() {
+        for name in [
+            "java/lang/Object",
+            "java/util/Map$Entry",
+            "java/util/SequencedCollection",
+            "java/net/http/HttpRequest",
+            "java/util/stream/Stream",
+            "",
+        ] {
+            assert_eq!(
+                canonical_concrete_for_interface(name),
+                "",
+                "{name} must not be substituted"
+            );
+        }
+    }
+
+    /// The exact triple this record was written about:
+    /// `java/util/Map.isEmpty()Z` on an `Object[]` receiver. `java/util/Map`
+    /// is substituted, so an array receiver at that site is refused.
+    ///
+    /// MEASURED counterpart: `[CANONICAL] java/util/Map java/util/HashMap
+    /// isEmpty 1` — the only row the whole 105-class corpus produces, in
+    /// either policy mode.
+    #[test]
+    fn the_map_is_empty_triple_is_the_substituted_one() {
+        assert_eq!(
+            canonical_concrete_for_interface("java/util/Map"),
+            "java/util/HashMap"
+        );
+        assert!(!canonical_concrete_for_interface("java/util/Map").is_empty());
     }
 }
 

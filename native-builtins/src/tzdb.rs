@@ -20,7 +20,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use cratonvm_native_api::registry::NativeMethodRegistry;
 use cratonvm_native_api::NativeContext;
+use cratonvm_types::error::RuntimeError;
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Binary cursor over tzdb.dat / per-zone rule byte blobs.
@@ -719,15 +722,28 @@ pub const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T0
 /// answer WITHOUT paying for a Java dispatch plus a native-funnel entry per
 /// format — and two copies of this rule would be two things to keep in step.
 pub fn legacy_offsets_ms(ctx: &mut dyn NativeContext, zone_id: &str, date_millis: i64) -> (i32, i32) {
+    match get_zone_rules(ctx, zone_id) {
+        Some(rules) => legacy_offsets_ms_of(&rules, date_millis),
+        // An id this catalog cannot resolve keeps the answer it always had:
+        // UTC, with no daylight saving. Unchanged from the pre-G28-1 spelling,
+        // whose two `unwrap_or(0)`s reduced to exactly this.
+        None => (0, 0),
+    }
+}
+
+/// [`legacy_offsets_ms`] with the rules already in hand — the pure half, split
+/// out by G28-1 so the whole legacy rule is unit-testable without a
+/// `NativeContext`. Behaviour is unchanged.
+pub fn legacy_offsets_ms_of(rules: &ZoneRulesData, date_millis: i64) -> (i32, i32) {
     let epoch_sec = date_millis.div_euclid(1000);
     let (total_sec, standard_sec) = if epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
-        let raw = raw_offset_seconds(ctx, zone_id).unwrap_or(0);
+        let raw = raw_offset(rules);
         (raw, raw)
     } else {
-        let total = offset_seconds_at_instant(ctx, zone_id, epoch_sec).unwrap_or(0);
-        let standard =
-            standard_offset_seconds_at_instant(ctx, zone_id, epoch_sec).unwrap_or(total);
-        (total, standard)
+        (
+            offset_at_instant(rules, epoch_sec),
+            standard_offset_at_instant(rules, epoch_sec),
+        )
     };
     (
         total_sec.saturating_mul(1000),
@@ -745,6 +761,403 @@ pub fn standard_offset_seconds_at_instant(
     epoch_sec: i64,
 ) -> Option<i32> {
     get_zone_rules(ctx, zone_id).map(|r| standard_offset_at_instant(&r, epoch_sec))
+}
+
+// ---------------------------------------------------------------------------
+// G28-1 — the DAYLIGHT-SAVING rule layer, and the five natives that publish it.
+// ---------------------------------------------------------------------------
+//
+// Everything above answers "what is the offset". Everything below answers the
+// other five questions `java.util.TimeZone` asks about a zone —
+// `getDSTSavings()`, `useDaylightTime()`, `observesDaylightTime()`,
+// `inDaylightTime(Date)` and the six-argument `getOffset(era, y, m, d, dow,
+// ms)` — which were answered by real `sun.util.calendar.ZoneInfo` bytecode
+// against a FABRICATED receiver whose `transitions` array is null and whose
+// `simpleTimeZoneParams` is null. That receiver says "no zone on earth has ever
+// observed daylight saving": MEASURED wrong on 542 of the 632 ids
+// `TimeZone.getAvailableIDs()` returns. See
+// `docs/known-issues/jdk-only/G17-1-the-dst-family-and-the-fixture-that-compared-two-empty-strings-20260817.md`
+// (the measurement and the design) and `G28-1-the-dst-rule-layer-rebuilt-20260817.md`
+// (this implementation).
+//
+// The rules below are not invented. Each is a transcription of the arithmetic
+// real `sun.util.calendar.ZoneInfoFile.getZoneInfo(...)` performs on THESE SAME
+// five arrays when it builds a `ZoneInfo`, plus the accessor `ZoneInfo` then
+// runs against the result — read out of `$JAVA_HOME/lib/src.zip` and validated,
+// as a rule, on 632 zones x 15 accessors = 9,480 oracle rows with 0 mismatches
+// (`scratchpad/g28/G28Model.java`, which computes every quantity here from
+// `java.time.zone.ZoneRules` alone and compares against `java.util.TimeZone`).
+
+/// `sun.util.calendar.ZoneInfoFile.UTC2100` — the last instant its generated
+/// transition table can describe. A rule beyond it is not written into the
+/// table at all, which is why the scan in [`observes_daylight_time_of`] stops
+/// there and why `last_savings_transition_year` pins to `LASTYEAR`.
+pub const ZONEINFO_UTC2100_EPOCH_SEC: i64 = 4_133_980_799;
+
+/// `sun.util.calendar.ZoneInfoFile.LASTYEAR`.
+pub const ZONEINFO_LASTYEAR: i32 = 2100;
+
+/// `ZoneInfoFile`'s `lastyear`: the proleptic-Gregorian year of the FINAL
+/// savings transition, read at the offset in force BEFORE it (`wallOffsets[n-1]`
+/// — that index is `ZoneInfoFile`'s, and it is the before-offset, not the
+/// after-offset); or `LASTYEAR` outright as soon as any transition lies beyond
+/// `UTC2100`, because that is where `ZoneInfoFile`'s own loop breaks out.
+///
+/// Returns `None` for a zone with no savings transitions at all, where
+/// `ZoneInfoFile` never enters the block that computes it.
+fn last_savings_transition_year(rules: &ZoneRulesData) -> Option<i32> {
+    let n = rules.savings_instant_transitions.len();
+    if n == 0 {
+        return None;
+    }
+    if rules
+        .savings_instant_transitions
+        .iter()
+        .any(|&t| t > ZONEINFO_UTC2100_EPOCH_SEC)
+    {
+        return Some(ZONEINFO_LASTYEAR);
+    }
+    Some(find_year(
+        rules.savings_instant_transitions[n - 1],
+        rules.wall_offsets[n - 1],
+    ))
+}
+
+/// The RECURRING daylight saving, in seconds — the quantity real
+/// `ZoneInfoFile` stores in `ZoneInfo.dstSavings` and `getDSTSavings()`
+/// returns.
+///
+/// It is a property of the zone's LAST RULES, never of its transition history:
+/// `America/Sao_Paulo` has a dense DST past and answers `0`, because Brazil
+/// abolished daylight saving in 2019. The three branches are `ZoneInfoFile`'s
+/// three, in its order:
+///
+///   * no savings transitions at all -> `ZoneInfo.transitions` is null, nothing
+///     is computed, `0`;
+///   * two or more `lastRules` -> the saving of the START rule, where "start"
+///     is `lastRules[n-2]` and `lastRules[n-1]` SWAPPED when the first of the
+///     pair steps the clock back and the second steps it forward. That swap is
+///     what makes the southern hemisphere answer `+1800000` for
+///     `Australia/Lord_Howe` rather than `-1800000`;
+///   * otherwise `ZoneInfoFile`'s "Israel/Iran workaround": a zone with no
+///     recurring rule but an explicit table running all the way to `LASTYEAR`
+///     gets a saving synthesised from its final pair of transitions.
+///
+/// **The third branch is UNEXERCISED by the tzdb this JDK ships** — measured:
+/// deleting it from `G28Model` leaves the 9,480-row comparison at 0 mismatches,
+/// because every zone whose table reaches 2100 also has `lastRules`. It is
+/// transcribed anyway because it is `ZoneInfoFile`'s own arithmetic and a later
+/// tzdb can reach it; it is NOT a guess, and the record says plainly that it is
+/// unmeasured.
+pub fn dst_savings_seconds(rules: &ZoneRulesData) -> i32 {
+    if rules.savings_instant_transitions.is_empty() {
+        return 0;
+    }
+    let n = rules.last_rules.len();
+    if n > 1 {
+        let first = &rules.last_rules[n - 2];
+        let second = &rules.last_rules[n - 1];
+        let start = if first.offset_after - first.offset_before < 0
+            && second.offset_after - second.offset_before > 0
+        {
+            second
+        } else {
+            first
+        };
+        return start.offset_after - start.offset_before;
+    }
+    if rules.savings_instant_transitions.len() > 2
+        && last_savings_transition_year(rules).unwrap_or(i32::MIN) >= ZONEINFO_LASTYEAR
+    {
+        let m = rules.savings_instant_transitions.len();
+        let start_trans = rules.savings_instant_transitions[m - 2];
+        let start_offset = rules.wall_offsets[m - 1];
+        let start_standard = standard_offset_at_instant(rules, start_trans);
+        let end_trans = rules.savings_instant_transitions[m - 1];
+        let end_offset = rules.wall_offsets[m];
+        let end_standard = standard_offset_at_instant(rules, end_trans);
+        if start_offset > start_standard && end_offset == end_standard {
+            return start_offset - start_standard;
+        }
+    }
+    0
+}
+
+/// `ZoneInfo.useDaylightTime()`, whose whole body is
+/// `return (simpleTimeZoneParams != null);`.
+///
+/// `simpleTimeZoneParams` and `dstSavings` are written by the SAME two branches
+/// of `ZoneInfoFile` — neither is ever set without the other — so
+/// "`dstSavings != 0`" is that field test, expressed in the only state this
+/// module keeps. Validated on all 632 ids.
+pub fn uses_daylight_time(rules: &ZoneRulesData) -> bool {
+    dst_savings_seconds(rules) != 0
+}
+
+/// `ZoneInfo.inDaylightTime(Date)`: is the offset in force at this instant
+/// something other than the zone's STANDARD offset?
+///
+/// `ZoneInfo` reads a DST bit that `ZoneInfoFile.addTrans` sets to exactly
+/// `offset - standardOffset` per table entry, and answers `false` outright for
+/// any instant before the table starts — which is the 1900 floor
+/// [`ZONEINFO_LEGACY_FLOOR_EPOCH_SEC`] already models. So the whole method is
+/// the DST component of [`legacy_offsets_ms_of`], which is not a coincidence
+/// but the same rule reached twice.
+pub fn in_daylight_time_of(rules: &ZoneRulesData, date_millis: i64) -> bool {
+    legacy_offsets_ms_of(rules, date_millis).1 != 0
+}
+
+/// `ZoneInfo.observesDaylightTime()` — the one member of this family whose
+/// answer legitimately depends on WHEN YOU ASK.
+///
+/// `ZoneInfo`'s body is: `simpleTimeZoneParams != null` short-circuits to
+/// `true`; otherwise walk the transition table from the entry containing NOW to
+/// its end and answer `true` if any of them carries daylight saving. The walk
+/// starts AT the current entry, so "in daylight time right now" counts, and the
+/// table stops at `UTC2100`.
+///
+/// That distinction is not academic: `Africa/Casablanca`, `Africa/El_Aaiun` and
+/// `Africa/Windhoek` model a standing daylight offset with no recurring rule
+/// and are the three ids for which `useDaylightTime()` is `false` while
+/// `observesDaylightTime()` is `true`. A rule keyed only on `lastRules` gets
+/// them wrong.
+pub fn observes_daylight_time_of(rules: &ZoneRulesData, now_millis: i64) -> bool {
+    if uses_daylight_time(rules) {
+        return true;
+    }
+    if in_daylight_time_of(rules, now_millis) {
+        return true;
+    }
+    let now_sec = now_millis.div_euclid(1000);
+    for (i, &trans) in rules.savings_instant_transitions.iter().enumerate() {
+        if trans <= now_sec || trans > ZONEINFO_UTC2100_EPOCH_SEC {
+            continue;
+        }
+        if rules.wall_offsets[i + 1] != standard_offset_at_instant(rules, trans) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The six-argument `ZoneInfo.getOffset(era, year, month, day, dayOfWeek,
+/// milliseconds)`, whose `milliseconds` argument is **standard local time** and
+/// whose return is the TOTAL offset.
+///
+/// `ZoneInfo` converts by subtracting the zone's fixed `rawOffset` — its
+/// modern standard offset, not the standard offset in force at the resulting
+/// instant — and then reads the total offset off that instant. Subtracting the
+/// modern raw offset is wrong for a pre-modern date whose standard offset
+/// differed, and it is reproduced here deliberately: the 1900 floor swallows
+/// almost every such case, and where it does not, HotSpot is the oracle.
+///
+/// The `dayOfWeek` argument is range-checked and then IGNORED, exactly as the
+/// real method ignores it.
+pub fn offset_ms_at_local_standard_of(rules: &ZoneRulesData, local_standard_ms: i64) -> i32 {
+    let raw_ms = (raw_offset(rules) as i64).saturating_mul(1000);
+    legacy_offsets_ms_of(rules, local_standard_ms.saturating_sub(raw_ms)).0
+}
+
+/// `sun.util.calendar.Gregorian.validate` for the three fields the six-arg
+/// `getOffset` actually sets — the time-of-day fields are left at zero by
+/// `newCalendarDate(null)` and cannot fail. `month` is 1-based here.
+fn gregorian_date_is_valid(year: i32, month: i32, day: i32) -> bool {
+    (1..=12).contains(&month) && day >= 1 && day <= length_of_month(year, month)
+}
+
+/// The RECURRING daylight saving in milliseconds for a zone id — the value
+/// `ZoneInfo.dstSavings` is supposed to hold.
+///
+/// Exists so `alloc_synth_timezone` can seed that field from the same producer
+/// the accessors read. It could not before: the value lives in
+/// `ZoneRulesData.last_rules`, which is private to this module, and a sampler
+/// built outside it was MEASURED wrong on `Africa/Casablanca`,
+/// `Africa/El_Aaiun` and `Africa/Windhoek` (601/604). Exposing it from in here
+/// is the fix for that; see N-TZ-1 in
+/// `docs/known-issues/jdk-only/G23-1-the-nominations-that-needed-lib-rs-20260817.md`.
+pub fn dst_savings_ms(ctx: &mut dyn NativeContext, zone_id: &str) -> Option<i32> {
+    get_zone_rules(ctx, zone_id).map(|r| dst_savings_seconds(&r).saturating_mul(1000))
+}
+
+/// The receiver's `ID` field, read exactly as the neighbouring tzdb offset
+/// natives in `lib.rs` read it.
+fn zone_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    match ctx.get_field_by_name(this, "ID") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Registers the five daylight-saving members on `sun/util/calendar/ZoneInfo`
+/// **and on nothing else**.
+///
+/// WHY NOT ALSO ON `java/util/TimeZone`, when its sibling offset family in
+/// `lib.rs` IS registered on the base. `TimeZone.getDSTSavings()` and
+/// `TimeZone.observesDaylightTime()` are CONCRETE on the base class. An
+/// application's own `extends TimeZone` that does not override them has no
+/// bytecode of its own for the superclass climb to stop at, so a base
+/// registration would answer that subclass from a tzdb lookup of its `ID` —
+/// which is precisely the `C6-2` defect (an id treated as a zone when it is an
+/// opaque label) recreated in a new place. MEASURED: the base class's rows for
+/// the already-registered offset family read `invocations=0` under `--jdk-only`,
+/// so the narrow registration gives up nothing that runs.
+///
+/// `java.util.SimpleTimeZone` declares all five itself and could not have been
+/// captured through the base in any case.
+pub fn register_zoneinfo_dst_natives(registry: &mut NativeMethodRegistry) {
+    const ZONE_INFO: &str = "sun/util/calendar/ZoneInfo";
+
+    registry.register(ZONE_INFO, "getDSTSavings", "()I", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let id = zone_id_of(ctx, this);
+        Ok(Some(Value::Int(dst_savings_ms(ctx, &id).unwrap_or(0))))
+    });
+
+    registry.register(ZONE_INFO, "useDaylightTime", "()Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let id = zone_id_of(ctx, this);
+        let uses = get_zone_rules(ctx, &id)
+            .map(|r| uses_daylight_time(&r))
+            .unwrap_or(false);
+        Ok(Some(Value::Int(i32::from(uses))))
+    });
+
+    registry.register(ZONE_INFO, "observesDaylightTime", "()Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let id = zone_id_of(ctx, this);
+        // The real method reads `System.currentTimeMillis()`. So does this;
+        // it is the one member of the family that is not a pure function of
+        // (zone, instant), and a fixture that asks it of a zone currently
+        // abolishing daylight saving will flake for that reason and not
+        // because of this VM.
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let observes = get_zone_rules(ctx, &id)
+            .map(|r| observes_daylight_time_of(&r, now_millis))
+            .unwrap_or(false);
+        Ok(Some(Value::Int(i32::from(observes))))
+    });
+
+    registry.register(
+        ZONE_INFO,
+        "inDaylightTime",
+        "(Ljava/util/Date;)Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let date = match args.get(1) {
+                Some(Value::Object(Some(d))) => *d,
+                // `ZoneInfo.inDaylightTime(null)` is a bare
+                // `throw new NullPointerException()` -- getMessage() is NULL,
+                // unlike `SimpleTimeZone`'s helpful helper-generated one. A
+                // `Some(String::new())` here would build a non-null empty
+                // message and diverge; `None` is the only spelling that
+                // reproduces it.
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+            };
+            // `Date.getTime()` is a real virtual call that can allocate and
+            // safepoint -- a deprecated `Date` setter leaves `cdate` dirty and
+            // forces a normalise -- so both references are pinned across it.
+            // Same reason `ssl_security.rs` does it this way for
+            // `checkValidity(Date)`.
+            let this_pin = ctx.pin_native_root(this);
+            let date_pin = ctx.pin_native_root(date);
+            let called = ctx.invoke_virtual(date, "getTime", "()J", &[]);
+            let this = ctx.read_native_pin(this_pin, this);
+            let date = ctx.read_native_pin(date_pin, date);
+            ctx.unpin_native_roots(this_pin);
+            let millis = match called? {
+                Some(Value::Long(ms)) => ms,
+                // A synthetic `Date` with no bytecode keeps its instant in
+                // slot 0.
+                _ => match ctx.get_field(date, 0) {
+                    Value::Long(ms) => ms,
+                    _ => return Ok(Some(Value::Int(0))),
+                },
+            };
+            let id = zone_id_of(ctx, this);
+            let in_dst = get_zone_rules(ctx, &id)
+                .map(|r| in_daylight_time_of(&r, millis))
+                .unwrap_or(false);
+            Ok(Some(Value::Int(i32::from(in_dst))))
+        },
+    );
+
+    registry.register(ZONE_INFO, "getOffset", "(IIIIII)I", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let int_at = |i: usize| args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
+        let era = int_at(1);
+        let year_arg = int_at(2);
+        let month0 = int_at(3);
+        let day = int_at(4);
+        let day_of_week = int_at(5);
+        let millis_in_day = int_at(6);
+
+        // The four argument checks, in the real method's order. Every one of
+        // them is `throw new IllegalArgumentException()` with NO argument, so
+        // `getMessage()` is null; `String::new()` is the spelling this VM
+        // converts to a null message (types/src/error.rs), and any non-empty
+        // string would produce a message HotSpot does not have.
+        const DAY_IN_MILLIS: i32 = 86_400_000;
+        if !(0..DAY_IN_MILLIS).contains(&millis_in_day) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: String::new(),
+            }
+            .into());
+        }
+        // java.util.GregorianCalendar.BC = 0, AD = 1. `1 - year` in Java wraps
+        // on overflow and must not panic a debug build here.
+        let year = match era {
+            0 => 1i32.wrapping_sub(year_arg),
+            1 => year_arg,
+            _ => {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: String::new(),
+                }
+                .into())
+            }
+        };
+        if !gregorian_date_is_valid(year, month0.saturating_add(1), day) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: String::new(),
+            }
+            .into());
+        }
+        // Calendar.SUNDAY = 1 .. Calendar.SATURDAY = 7. Checked and then
+        // ignored -- "bug-for-bug compatible argument checking", in the real
+        // method's own words.
+        if !(1..=7).contains(&day_of_week) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: String::new(),
+            }
+            .into());
+        }
+
+        let local_standard_ms = to_epoch_day(year, month0.saturating_add(1), day)
+            .saturating_mul(86_400_000)
+            .saturating_add(millis_in_day as i64);
+        let id = zone_id_of(ctx, this);
+        let total = get_zone_rules(ctx, &id)
+            .map(|r| offset_ms_at_local_standard_of(&r, local_standard_ms))
+            .unwrap_or(0);
+        Ok(Some(Value::Int(total)))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1532,436 @@ mod tests {
             assert_eq!(standard_offset_at_instant(&rules, epoch_sec), 3600);
         }
         assert_eq!(raw_offset(&rules), 3600);
+    }
+
+    // ---------------------------------------------------------------------
+    // G28-1 — the daylight-saving rule layer.
+    //
+    // Every expectation below is TRANSCRIBED from HotSpot 25.0.3+9-LTS
+    // (`scratchpad/g28/G28Values.java`), never derived from this module. The
+    // rule as a whole is separately validated on 632 zones x 15 accessors
+    // (`scratchpad/g28/G28Model.java`, 9,480 rows, 0 mismatches); these tests
+    // pin the rows a future edit is most likely to break.
+    // ---------------------------------------------------------------------
+
+    /// `2026-08-17T04:21:54Z`, the instant `G28Values` ran. `observesDaylight
+    /// Time` is the one member of this family that reads the wall clock, so the
+    /// only way to assert it deterministically is to fix the "now" the rule is
+    /// asked about. The three `use=false obs=true` zones below hold that status
+    /// for the whole of 2026 in this JDK's tzdb.
+    const G28_NOW_MS: i64 = 1_786_942_914_079;
+
+    #[test]
+    fn dst_savings_matches_hotspot_get_dst_savings() {
+        let cat = test_catalog();
+        // (zone, HotSpot getDSTSavings() in ms)
+        let cases: &[(&str, i32)] = &[
+            ("America/New_York", 3_600_000),
+            ("Europe/London", 3_600_000),
+            // Thirty minutes: the row a hard-coded hour gets wrong.
+            ("Australia/Lord_Howe", 1_800_000),
+            // Two hours, on a zone whose standard offset is 0.
+            ("Antarctica/Troll", 7_200_000),
+            ("Pacific/Chatham", 3_600_000),
+            // Never observed daylight saving at all.
+            ("Asia/Kolkata", 0),
+            // A dense DST HISTORY and no current rule -- abolished 2019/2022.
+            ("America/Sao_Paulo", 0),
+            ("America/Mexico_City", 0),
+            ("Asia/Tehran", 0),
+            // A STANDING daylight offset with no recurring rule: 0 savings,
+            // even though the zone is in daylight time at almost every instant.
+            ("Africa/Casablanca", 0),
+            ("Africa/Windhoek", 0),
+            // The southern-hemisphere pair, where `lastRules` runs fall-then-
+            // spring and `ZoneInfoFile` swaps them. Without the swap these
+            // answer -3600000.
+            ("Pacific/Auckland", 3_600_000),
+            ("America/Santiago", 3_600_000),
+        ];
+        for (zone, expected) in cases {
+            let rules = rules_for(&cat, zone);
+            assert_eq!(
+                dst_savings_seconds(&rules).saturating_mul(1000),
+                *expected,
+                "getDSTSavings zone={zone}"
+            );
+        }
+    }
+
+    #[test]
+    fn uses_daylight_time_matches_hotspot() {
+        let cat = test_catalog();
+        let cases: &[(&str, bool)] = &[
+            ("America/New_York", true),
+            ("Europe/London", true),
+            ("Australia/Lord_Howe", true),
+            ("Pacific/Chatham", true),
+            ("Antarctica/Troll", true),
+            ("Asia/Jerusalem", true),
+            ("Africa/Cairo", true),
+            ("Asia/Kolkata", false),
+            ("Asia/Tokyo", false),
+            ("America/Sao_Paulo", false),
+            ("Asia/Tehran", false),
+            ("America/Mexico_City", false),
+            // The three ids that separate `use` from `obs`.
+            ("Africa/Casablanca", false),
+            ("Africa/El_Aaiun", false),
+            ("Africa/Windhoek", false),
+            ("UTC", false),
+        ];
+        for (zone, expected) in cases {
+            let rules = rules_for(&cat, zone);
+            assert_eq!(
+                uses_daylight_time(&rules),
+                *expected,
+                "useDaylightTime zone={zone}"
+            );
+        }
+    }
+
+    #[test]
+    fn observes_daylight_time_separates_itself_from_uses() {
+        let cat = test_catalog();
+        // The whole point of this member: three zones answer `false` to
+        // `useDaylightTime()` and `true` to `observesDaylightTime()`, because
+        // tzdb models their permanent shift as a standing daylight offset with
+        // no recurring rule.
+        for zone in ["Africa/Casablanca", "Africa/El_Aaiun", "Africa/Windhoek"] {
+            let rules = rules_for(&cat, zone);
+            assert!(!uses_daylight_time(&rules), "useDaylightTime zone={zone}");
+            assert!(
+                observes_daylight_time_of(&rules, G28_NOW_MS),
+                "observesDaylightTime zone={zone}"
+            );
+        }
+        for zone in ["America/New_York", "Pacific/Chatham", "Antarctica/Troll"] {
+            let rules = rules_for(&cat, zone);
+            assert!(
+                observes_daylight_time_of(&rules, G28_NOW_MS),
+                "observesDaylightTime zone={zone}"
+            );
+        }
+        for zone in [
+            "Asia/Kolkata",
+            "Asia/Tokyo",
+            "America/Sao_Paulo",
+            "America/Mexico_City",
+            "Asia/Tehran",
+            "UTC",
+        ] {
+            let rules = rules_for(&cat, zone);
+            assert!(
+                !observes_daylight_time_of(&rules, G28_NOW_MS),
+                "observesDaylightTime zone={zone}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_daylight_time_matches_hotspot_at_the_fixture_instants() {
+        let cat = test_catalog();
+        // 2021-01-15T12:00Z and 2021-07-15T12:00Z, the two instants
+        // `RSimpleTimeZoneRaw` pins.
+        const JAN: i64 = 1_610_712_000_000;
+        const JUL: i64 = 1_626_350_400_000;
+        // 1850-01-15T00:00Z -- below the 1900 floor, where `ZoneInfo`'s table
+        // does not start and the answer is `false` for every zone.
+        const OLD: i64 = -3_786_825_600_000;
+        // 2045-03-15T00:00Z -- past the end of every stored transition table,
+        // answered by the recurring rules.
+        const FAR: i64 = 2_373_062_400_000;
+        // (zone, inJan, inJul, inOld, inFar)
+        let cases: &[(&str, bool, bool, bool, bool)] = &[
+            ("America/New_York", false, true, false, true),
+            ("Europe/London", false, true, false, false),
+            // Southern hemisphere: the seasons invert.
+            ("Australia/Lord_Howe", true, false, false, true),
+            ("Pacific/Chatham", true, false, false, true),
+            ("Pacific/Auckland", true, false, false, true),
+            ("America/Santiago", true, false, false, true),
+            ("Asia/Kolkata", false, false, false, false),
+            ("America/Sao_Paulo", false, false, false, false),
+            // No RULE, so `getDSTSavings` is 0 -- but IN daylight time in July
+            // 2021, because the explicit table still carried one.
+            ("Asia/Tehran", false, true, false, false),
+            ("America/Mexico_City", false, true, false, false),
+            // Standing daylight offset: in daylight time at both instants.
+            ("Africa/Casablanca", true, true, false, true),
+            ("Africa/Windhoek", true, true, false, true),
+            // A recurring rule whose 2021 dates put both probes in standard
+            // time -- the row that catches "assume July means daylight".
+            ("Africa/Cairo", false, false, false, false),
+            ("UTC", false, false, false, false),
+        ];
+        for (zone, in_jan, in_jul, in_old, in_far) in cases {
+            let rules = rules_for(&cat, zone);
+            assert_eq!(
+                in_daylight_time_of(&rules, JAN),
+                *in_jan,
+                "inDaylightTime(JAN) zone={zone}"
+            );
+            assert_eq!(
+                in_daylight_time_of(&rules, JUL),
+                *in_jul,
+                "inDaylightTime(JUL) zone={zone}"
+            );
+            assert_eq!(
+                in_daylight_time_of(&rules, OLD),
+                *in_old,
+                "inDaylightTime(1850) zone={zone}"
+            );
+            assert_eq!(
+                in_daylight_time_of(&rules, FAR),
+                *in_far,
+                "inDaylightTime(2045) zone={zone}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_daylight_time_is_exact_at_a_transition_boundary() {
+        let cat = test_catalog();
+        // (zone, transition ms, offset before, offset at, in-dst before, in-dst at)
+        let edge = |zone: &str, t: i64, before: i32, at: i32, in_before: bool, in_at: bool| {
+            let rules = rules_for(&cat, zone);
+            assert_eq!(
+                legacy_offsets_ms_of(&rules, t - 1).0,
+                before,
+                "getOffset(t-1) zone={zone} t={t}"
+            );
+            assert_eq!(
+                legacy_offsets_ms_of(&rules, t).0,
+                at,
+                "getOffset(t) zone={zone} t={t}"
+            );
+            assert_eq!(
+                in_daylight_time_of(&rules, t - 1),
+                in_before,
+                "inDaylightTime(t-1) zone={zone} t={t}"
+            );
+            assert_eq!(
+                in_daylight_time_of(&rules, t),
+                in_at,
+                "inDaylightTime(t) zone={zone} t={t}"
+            );
+            assert_eq!(
+                in_daylight_time_of(&rules, t + 1),
+                in_at,
+                "inDaylightTime(t+1) zone={zone} t={t}"
+            );
+        };
+        let ny = "America/New_York";
+        edge(ny, 1_615_705_200_000, -18_000_000, -14_400_000, false, true);
+        edge(ny, 1_636_264_800_000, -14_400_000, -18_000_000, true, false);
+        let ldn = "Europe/London";
+        edge(ldn, 1_616_893_200_000, 0, 3_600_000, false, true);
+        edge(ldn, 1_635_642_000_000, 3_600_000, 0, true, false);
+        // Southern hemisphere, half-hour step.
+        let lhi = "Australia/Lord_Howe";
+        edge(lhi, 1_617_462_000_000, 39_600_000, 37_800_000, true, false);
+        edge(lhi, 1_633_188_600_000, 37_800_000, 39_600_000, false, true);
+        let cha = "Pacific/Chatham";
+        edge(cha, 1_617_458_400_000, 49_500_000, 45_900_000, true, false);
+        edge(cha, 1_632_578_400_000, 45_900_000, 49_500_000, false, true);
+    }
+
+    /// The local-standard-time millis the six-arg native builds from
+    /// `(year, month0, day, millisInDay)`.
+    fn local_standard_ms(year: i32, month0: i32, day: i32, millis: i32) -> i64 {
+        to_epoch_day(year, month0 + 1, day) * 86_400_000 + millis as i64
+    }
+
+    #[test]
+    fn six_arg_offset_reads_local_standard_time() {
+        let cat = test_catalog();
+        // 2021-01-15 12:00 and 2021-07-15 12:00 STANDARD local, the arguments
+        // `RSimpleTimeZoneRaw` passes.
+        let jan = local_standard_ms(2021, 0, 15, 43_200_000);
+        let jul = local_standard_ms(2021, 6, 15, 43_200_000);
+        let cases: &[(&str, i32, i32)] = &[
+            ("America/New_York", -18_000_000, -14_400_000),
+            ("Europe/London", 0, 3_600_000),
+            // Both half-hour zones: a rule that reads a whole-hour field
+            // passes every other row here and fails these two.
+            ("Australia/Lord_Howe", 39_600_000, 37_800_000),
+            ("Pacific/Chatham", 49_500_000, 45_900_000),
+            ("Asia/Kolkata", 19_800_000, 19_800_000),
+            ("America/Sao_Paulo", -10_800_000, -10_800_000),
+            ("Asia/Tehran", 12_600_000, 16_200_000),
+            ("America/St_Johns", -12_600_000, -9_000_000),
+            ("Africa/Windhoek", 7_200_000, 7_200_000),
+            ("UTC", 0, 0),
+        ];
+        for (zone, expect_jan, expect_jul) in cases {
+            let rules = rules_for(&cat, zone);
+            assert_eq!(
+                offset_ms_at_local_standard_of(&rules, jan),
+                *expect_jan,
+                "six-arg JAN zone={zone}"
+            );
+            assert_eq!(
+                offset_ms_at_local_standard_of(&rules, jul),
+                *expect_jul,
+                "six-arg JUL zone={zone}"
+            );
+        }
+
+        // Inside the spring-forward gap and the fall-back overlap, both
+        // expressed in STANDARD local time, where the conversion must not fold
+        // daylight saving into the wall reading.
+        let ny = rules_for(&cat, "America/New_York");
+        assert_eq!(
+            offset_ms_at_local_standard_of(&ny, local_standard_ms(2021, 2, 14, 7_200_000)),
+            -14_400_000
+        );
+        assert_eq!(
+            offset_ms_at_local_standard_of(&ny, local_standard_ms(2021, 10, 7, 3_600_000)),
+            -18_000_000
+        );
+        // The half-hour zone across its own transitions.
+        let lhi = rules_for(&cat, "Australia/Lord_Howe");
+        assert_eq!(
+            offset_ms_at_local_standard_of(&lhi, local_standard_ms(2021, 9, 15, 43_200_000)),
+            39_600_000
+        );
+        assert_eq!(
+            offset_ms_at_local_standard_of(&lhi, local_standard_ms(2021, 3, 15, 43_200_000)),
+            37_800_000
+        );
+    }
+
+    #[test]
+    fn six_arg_offset_honours_the_1900_floor() {
+        let cat = test_catalog();
+        // 1850 is below `ZoneInfo`'s transition table, so every zone answers
+        // its MODERN raw offset -- including the two whose modern offset is a
+        // standing daylight one.
+        let old = local_standard_ms(1850, 6, 15, 43_200_000);
+        let cases: &[(&str, i32)] = &[
+            ("America/New_York", -18_000_000),
+            ("Europe/London", 0),
+            ("Australia/Lord_Howe", 37_800_000),
+            ("Pacific/Chatham", 45_900_000),
+            ("Africa/Casablanca", 0),
+            ("Africa/Windhoek", 3_600_000),
+        ];
+        for (zone, expected) in cases {
+            let rules = rules_for(&cat, zone);
+            assert_eq!(
+                offset_ms_at_local_standard_of(&rules, old),
+                *expected,
+                "six-arg 1850 zone={zone}"
+            );
+            assert!(!in_daylight_time_of(&rules, -3_786_825_600_000));
+        }
+        // era = BC, year = 100 -> proleptic year -99, still below the floor.
+        let bc = local_standard_ms(1 - 100, 6, 15, 43_200_000);
+        let ny = rules_for(&cat, "America/New_York");
+        assert_eq!(offset_ms_at_local_standard_of(&ny, bc), -18_000_000);
+    }
+
+    #[test]
+    fn gregorian_epoch_day_anchors_and_the_six_arg_date_validation() {
+        assert_eq!(to_epoch_day(1970, 1, 1), 0);
+        assert_eq!(to_epoch_day(1969, 12, 31), -1);
+        assert_eq!(to_epoch_day(2000, 3, 1), 11017);
+        assert_eq!(to_epoch_day(2021, 7, 15), 18823);
+
+        // The four rows `ZoneInfo`'s six-arg rejects with a message-less
+        // IllegalArgumentException, and the ones it accepts.
+        assert!(gregorian_date_is_valid(2021, 7, 15));
+        assert!(gregorian_date_is_valid(2020, 2, 29));
+        assert!(gregorian_date_is_valid(2021, 12, 31));
+        assert!(!gregorian_date_is_valid(2021, 2, 29));
+        assert!(!gregorian_date_is_valid(2021, 2, 30));
+        assert!(!gregorian_date_is_valid(2021, 13, 15));
+        assert!(!gregorian_date_is_valid(2021, 0, 15));
+        assert!(!gregorian_date_is_valid(2021, 7, 0));
+        assert!(!gregorian_date_is_valid(2021, 7, 32));
+    }
+
+    #[test]
+    fn last_savings_transition_year_pins_to_lastyear_beyond_utc2100() {
+        // 1_000_000_000 is 2001-09-09T01:46:40Z; `ZoneInfoFile` reads the year
+        // at `wallOffsets[n-1]`, the offset in force BEFORE that transition.
+        let below = ZoneRulesData {
+            standard_transitions: Vec::new(),
+            standard_offsets: vec![0],
+            savings_instant_transitions: vec![0, 1_000_000_000],
+            wall_offsets: vec![0, 3600, 0],
+            last_rules: Vec::new(),
+        };
+        assert_eq!(last_savings_transition_year(&below), Some(2001));
+
+        let beyond = ZoneRulesData {
+            standard_transitions: Vec::new(),
+            standard_offsets: vec![0],
+            savings_instant_transitions: vec![0, ZONEINFO_UTC2100_EPOCH_SEC + 1],
+            wall_offsets: vec![0, 3600, 0],
+            last_rules: Vec::new(),
+        };
+        assert_eq!(
+            last_savings_transition_year(&beyond),
+            Some(ZONEINFO_LASTYEAR)
+        );
+
+        // A zone with no savings transitions never reaches the block that
+        // computes it.
+        assert_eq!(
+            last_savings_transition_year(&fixed_offset_rules(3600)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fixed_offset_zone_never_observes_daylight_saving() {
+        // The `GMT+HH:MM` fallback and, by the same arms, any id the catalog
+        // cannot resolve: no savings transitions, so every member of the family
+        // answers "no rule" without touching `last_rules`.
+        let rules = fixed_offset_rules(5 * 3600 + 1800);
+        assert_eq!(dst_savings_seconds(&rules), 0);
+        assert!(!uses_daylight_time(&rules));
+        assert!(!observes_daylight_time_of(&rules, G28_NOW_MS));
+        assert!(!in_daylight_time_of(&rules, 1_626_350_400_000));
+        assert_eq!(
+            offset_ms_at_local_standard_of(&rules, local_standard_ms(2021, 6, 15, 43_200_000)),
+            19_800_000
+        );
+        // ...and the pre-1900 arm answers the same constant rather than 0.
+        assert_eq!(
+            offset_ms_at_local_standard_of(&rules, local_standard_ms(1850, 6, 15, 43_200_000)),
+            19_800_000
+        );
+    }
+
+    #[test]
+    fn legacy_offsets_split_total_from_saving() {
+        let cat = test_catalog();
+        let ny = rules_for(&cat, "America/New_York");
+        // In daylight time: total -04:00 = raw -05:00 plus one hour of saving.
+        assert_eq!(
+            legacy_offsets_ms_of(&ny, 1_626_350_400_000),
+            (-14_400_000, 3_600_000)
+        );
+        // Standard time: no saving.
+        assert_eq!(
+            legacy_offsets_ms_of(&ny, 1_610_712_000_000),
+            (-18_000_000, 0)
+        );
+        // Below the 1900 floor the legacy rule reports the modern raw offset
+        // with a zero saving, bug-for-bug with `ZoneInfoFile`.
+        assert_eq!(
+            legacy_offsets_ms_of(&ny, -3_786_825_600_000),
+            (-18_000_000, 0)
+        );
+        // A half-hour saving must survive the split.
+        let lhi = rules_for(&cat, "Australia/Lord_Howe");
+        assert_eq!(
+            legacy_offsets_ms_of(&lhi, 1_610_712_000_000),
+            (39_600_000, 1_800_000)
+        );
     }
 
     #[test]

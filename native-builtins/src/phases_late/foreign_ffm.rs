@@ -697,9 +697,41 @@ fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Res
     // allocated it, and the answer is that arena's session — this is what makes
     // `arena.scope() == segment.scope()` hold.
     if ctx.object_num_fields(receiver) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(arena)) = ctx.get_field(receiver, P67_SEGMENT_ARENA) {
-            if let Some(session) = p67_arena_session(ctx, arena) {
+        if let Value::Object(Some(owner)) = ctx.get_field(receiver, P67_SEGMENT_ARENA) {
+            if let Some(session) = p67_arena_session(ctx, owner) {
                 return Ok(Value::Object(Some(session)));
+            }
+            // G19-1: OR THE SLOT HOLDS THE SESSION ITSELF.
+            //
+            // `panama::pe_segment_slice` has stamped a slice's slot 2 with the
+            // PARENT'S SESSION — not with an arena — since W7-89, and
+            // `panama::pe_segment_session` has had a "tolerate a segment
+            // stamped with the session directly" arm for exactly that shape
+            // the whole time. This reader never grew the matching arm, so the
+            // two files disagreed about what slot 2 can hold and every
+            // `slice.scope()` fell through to the fresh mint below.
+            //
+            // MEASURED before this arm (`--jdk-only`, 25.0.3+9-LTS oracle):
+            //
+            //     conf.allocate(16).asSlice(4,4).scope() == seg.scope()
+            //        CratonVM false   HotSpot true
+            //     MemorySegment.ofArray(new byte[16]).scope() == ... .scope()
+            //        CratonVM false   HotSpot true
+            //
+            // A fresh session is always open, so this was not only an identity
+            // divergence: a slice of a CLOSED arena reported a live scope.
+            //
+            // `panama::pe_session_modelled` and NOT the local
+            // `p67_session_modelled`: the local one is width-and-state-word
+            // only, and slot 2's OTHER tenant on an `ofArray` mirror carrier is
+            // the Java backing ARRAY. `object_num_fields`/`get_field` on an
+            // array are not the two-int shape the local predicate assumes, so
+            // recognising a session by shape alone here would risk reading an
+            // `int[]`'s element 0 as a session state word — the class-name test
+            // in panama's copy is exactly the guard that rules that out, and
+            // it is memoised so the extra precision is an integer compare.
+            if crate::panama::pe_session_modelled(ctx, owner) {
+                return Ok(Value::Object(Some(owner)));
             }
         }
     }
@@ -836,7 +868,7 @@ fn p67_session_delegate(
 /// answer into a use-after-FREE. Real segments carry their session in the named
 /// `scope` field (`AbstractMemorySegmentImpl.scope`); synthetic ones have no
 /// such field and are unaffected.
-fn p67_segment_check_scope(
+pub(crate) fn p67_segment_check_scope(
     ctx: &mut dyn NativeContext,
     segment: ObjectRef,
 ) -> Result<(), MethodCallFailed> {
@@ -869,9 +901,22 @@ fn p67_segment_check_scope(
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
     // finds nothing — that would make every check trivially pass.
     if ctx.object_num_fields(segment) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(arena)) = ctx.get_field(segment, P67_SEGMENT_ARENA) {
-            if let Some(session) = p67_arena_session(ctx, arena) {
+        if let Value::Object(Some(owner)) = ctx.get_field(segment, P67_SEGMENT_ARENA) {
+            if let Some(session) = p67_arena_session(ctx, owner) {
                 p67_session_check_valid(ctx, session)?;
+            } else if crate::panama::pe_session_modelled(ctx, owner) {
+                // G19-1: the slot's third tenant — the session ITSELF, which is
+                // what `panama::pe_segment_slice` stamps onto a slice and what
+                // `pe_of_array_alias` now stamps onto a heap carrier. Without
+                // this arm the one shape whose scope IS resolvable was the one
+                // shape that skipped the check, which is the same fail-open
+                // W7-89 closed one branch up.
+                //
+                // The class-name-checked predicate, for the reason spelled out
+                // in `p67_receiver_session`: the local `p67_session_modelled`
+                // would accept slot 2's OTHER tenant, an `ofArray` mirror's
+                // backing array, and read an element as a state word.
+                p67_session_check_valid(ctx, owner)?;
             }
         }
     }
@@ -1196,31 +1241,561 @@ pub(crate) fn p67_layout_named_member(
     None
 }
 
-pub(crate) fn p67_memory_layout_path_target(
+// `p67_memory_layout_path_target` lived here until 2026-08-12: a path walk
+// that followed GROUP-BY-NAME elements only, silently `break`ing on anything
+// else (so `sequenceElement()` addressed the sequence itself) and discarding
+// the offset it walked past (so it could not serve `byteOffset` at all). It is
+// replaced by `p67_layout_path_walk` below, which is the single walk both
+// `byteOffset` and `varHandle` use — two consumers of one path cannot disagree
+// about where the path lands if there is only one walker.
+
+// ---------------------------------------------------------------------------
+// Layout paths — `byteOffset(PathElement...)` and the var-handle path walk
+// ---------------------------------------------------------------------------
+//
+// `MemoryLayout.byteOffset` and `MemoryLayout.varHandle` are the two consumers
+// of a layout PATH, and until 2026-08-12 only the second existed here (and it
+// followed group elements by NAME only, discarding the offset it walked past).
+// `byteOffset` was registered nowhere that reaches a shipping binary —
+// `panama.rs` has one, but its registrar is `register_pe_panama`, reached only
+// from `register_synthetic_overrides`, i.e. the synthetic-JDK arm — so a real
+// `struct.byteOffset(groupElement("c"))` resolved to the ABSTRACT interface
+// declaration and raised `AbstractMethodError: ... has no Code attribute`
+// (regression-suite `RJdkForeign.layouts`). Both now share one walk.
+
+/// A layout's byte size in either model: this file's `(byteSize, …)` carriers
+/// hold it as a `Long` in slot 0; `panama.rs`'s `(kind, byteSize, …)` carriers
+/// hold a kind tag there and the size in slot 1. A real
+/// `jdk.internal.foreign.layout.AbstractLayout` declares `byteSize` first, so
+/// the slot-0 `Long` read covers it too.
+pub(crate) fn p67_layout_size_of(ctx: &dyn NativeContext, layout: ObjectRef) -> i64 {
+    match ctx.get_field(layout, 0) {
+        Value::Long(v) => v,
+        _ => match ctx.get_field(layout, 1) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        },
+    }
+}
+
+/// A layout's byte alignment, defaulting to its size (which is what every
+/// value layout uses) when the carrier does not record one separately.
+pub(crate) fn p67_layout_align_of(ctx: &dyn NativeContext, layout: ObjectRef) -> i64 {
+    let by_slot = match ctx.get_field(layout, 1) {
+        Value::Long(v) if v > 0 => v,
+        _ => 0,
+    };
+    if by_slot > 0 {
+        return by_slot;
+    }
+    p67_layout_size_of(ctx, layout).max(1)
+}
+
+// ---------------------------------------------------------------------------
+// THE ONE LAYOUT CARRIER ENCODING (F16, 2026-08-13)
+// ---------------------------------------------------------------------------
+//
+// Every `java.lang.foreign` layout this VM mints has the SAME head:
+//
+//     [0] Long  byteSize
+//     [1] Long  byteAlignment
+//     [2]       payload — endian flag (value), member ARRAY (group),
+//               ELEMENT layout (sequence), null (padding)
+//     [3]       name (Optional's value, or null)
+//
+// Slots 0 and 1 are not an invention: a real
+// `jdk.internal.foreign.layout.AbstractLayout` declares
+//
+//     $ sed -n '52,54p' jdk25src/java.base/jdk/internal/foreign/layout/AbstractLayout.java
+//       private final long byteSize;
+//       private final long byteAlignment;
+//       private final Optional<String> name;
+//
+// in exactly that order, so the same two reads serve a CratonVM carrier and a
+// real JDK layout object alike. That is why this encoding — not `panama.rs`'s
+// `[0]=Int(kind)` one — is the authoritative one, and `panama.rs` no longer
+// mints a layout at all outside its own unit tests. See the banner above
+// `register_pe_value_layout` there.
+//
+// A member whose slot 0 is NOT a `Long` is a carrier this VM does not
+// understand. It must NOT be defaulted to a plausible number: that is the
+// defect this consolidation removes (`panama.rs` read slot 0 as `Int(kind)`
+// and fell through to `_ => 0`, which is `LAYOUT_BYTE`, so a 4-byte layout
+// silently became a 1-byte one). `p67_member_size_align` answers `None` and
+// every caller turns that into a named refusal.
+
+/// `(byteSize, byteAlignment)` of a member layout, or `None` if the object is
+/// not a layout carrier this VM minted.
+///
+/// Deliberately has no default arm. See the banner above.
+fn p67_member_size_align(ctx: &dyn NativeContext, member: ObjectRef) -> Option<(i64, i64)> {
+    let size = match ctx.get_field(member, 0) {
+        Value::Long(v) => v,
+        _ => return None,
+    };
+    let align = match ctx.get_field(member, 1) {
+        Value::Long(v) if v > 0 => v,
+        // A carrier with a size but no recorded alignment is a value layout
+        // whose alignment equals its size — the JDK's own rule for every
+        // `ValueLayout` constant except the `_UNALIGNED` ones, which DO record
+        // a separate 1 (measured: `JAVA_INT_UNALIGNED` byteSize=4 align=1).
+        _ => size.max(1),
+    };
+    Some((size, align))
+}
+
+/// Render a layout the way the JDK's `MemoryLayout::toString` does, because
+/// the one exception message that quotes a layout quotes it in this form.
+///
+/// Measured on the oracle (Microsoft build 25.0.3+9-LTS):
+///
+/// ```text
+/// JAVA_BYTE b1   JAVA_BOOLEAN z1   JAVA_CHAR c2    JAVA_SHORT  s2
+/// JAVA_INT  i4   JAVA_LONG    j8   JAVA_FLOAT f4   JAVA_DOUBLE d8
+/// ADDRESS   a8   paddingLayout(3)  x3
+/// sequenceLayout(2, JAVA_INT)        [2:i4]
+/// structLayout(JAVA_INT, JAVA_INT)   [i4i4]
+/// unionLayout(JAVA_BYTE, JAVA_INT)   [b1|i4]
+/// JAVA_INT.withName("x")             i4(x)
+/// JAVA_INT_UNALIGNED                 1%i4
+/// ```
+///
+/// Value layouts, padding and named layouts are reproduced EXACTLY; a group or
+/// sequence renders its bracket form from the carrier's payload slot. The
+/// message is a diagnostic, not a contract — what a caller can `catch` is the
+/// KIND, `IllegalArgumentException`, which is exact.
+pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> String {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(layout))
+        .unwrap_or_default();
+    let (size, align) = p67_member_size_align(ctx, layout).unwrap_or((0, 1));
+
+    let base = if class_name.contains("PaddingLayout") {
+        format!("x{size}")
+    } else if class_name.contains("SequenceLayout") {
+        let elem = match ctx.get_field(layout, 2) {
+            Value::Object(Some(e)) => p67_layout_render(ctx, e),
+            _ => String::new(),
+        };
+        // The STORED count (slot 4) first — see the `elementCount()`
+        // registration. Division is the fallback for a four-slot carrier and
+        // is wrong whenever the element's byteSize is 0: the oracle renders
+        // `sequenceLayout(3, structLayout())` as `[3:[]]`, and the division
+        // would print `[0:[]]`.
+        let stored = if ctx.object_num_fields(layout) > 4 {
+            // Read slot 4 only AFTER the width check — a four-slot carrier has
+            // no slot 4 to read, and asking for one is the out-of-bounds field
+            // access this file's carrier notes keep warning about.
+            match ctx.get_field(layout, 4) {
+                Value::Long(count) => Some(count),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let count = match stored {
+            Some(count) => count,
+            None => match ctx.get_field(layout, 2) {
+                Value::Object(Some(e)) => {
+                    let es = p67_layout_size_of(ctx, e);
+                    if es > 0 {
+                        size / es
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            },
+        };
+        format!("[{count}:{elem}]")
+    } else if class_name.contains("StructLayout")
+        || class_name.contains("UnionLayout")
+        || class_name.contains("GroupLayout")
+    {
+        let sep = if class_name.contains("UnionLayout") {
+            "|"
+        } else {
+            ""
+        };
+        let parts = match ctx.get_field(layout, 2) {
+            Value::Object(Some(arr)) => (0..ctx.array_length(arr))
+                .map(|i| match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(m)) => p67_layout_render(ctx, m),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        format!("[{}]", parts.join(sep))
+    } else {
+        // A value layout. The JDK's code letter is its CARRIER, and
+        // `p67_layout_carrier_name` already maps every `$Of*` spelling — real
+        // and synthetic — onto that carrier, so the two cannot drift.
+        let letter = match p67_layout_carrier_name(&class_name) {
+            "boolean" => "z",
+            "byte" => "b",
+            "char" => "c",
+            "short" => "s",
+            "int" => "i",
+            "long" => "j",
+            "float" => "f",
+            "double" => "d",
+            "java/lang/foreign/MemorySegment" => "a",
+            _ => "?",
+        };
+        format!("{letter}{size}")
+    };
+
+    // A VALUE layout whose alignment is not its size prints an `<align>%`
+    // prefix (`JAVA_INT_UNALIGNED` -> `1%i4`). Padding, groups and sequences
+    // never do: measured, `paddingLayout(3)` is `x3` (align 1, size 3) and
+    // `structLayout(JAVA_INT, JAVA_INT)` is `[i4i4]` (align 4, size 8).
+    let is_value = !(class_name.contains("PaddingLayout")
+        || class_name.contains("SequenceLayout")
+        || class_name.contains("StructLayout")
+        || class_name.contains("UnionLayout")
+        || class_name.contains("GroupLayout"));
+    let with_align = if is_value && align != size.max(1) {
+        format!("{align}%{base}")
+    } else {
+        base
+    };
+    match p67_layout_name_value(ctx, layout) {
+        Value::Object(Some(s)) => match ctx.read_string(s) {
+            Some(n) => format!("{with_align}({n})"),
+            None => with_align,
+        },
+        _ => with_align,
+    }
+}
+
+/// One element of a layout path, decoded from whichever carrier produced it.
+///
+/// `MemoryLayout.PathElement.groupElement(...)` / `sequenceElement(...)` run
+/// REAL JDK bytecode here (measured: `groupElement("c")` yields a
+/// `jdk.internal.foreign.LayoutPath$GroupElementByName`), so the decoding is
+/// primarily by the real record classes' own field names; the synthetic
+/// 2-field `MemoryLayout$PathElement` carrier is still accepted.
+pub(crate) enum P67PathElement {
+    /// `groupElement(String)` — a member of a struct/union, by name.
+    GroupByName(String),
+    /// `groupElement(long)` — a member by position.
+    GroupByIndex(i64),
+    /// `sequenceElement()` — an OPEN index: contributes no fixed offset and
+    /// adds a `long` coordinate to a var handle.
+    SequenceOpen,
+    /// `sequenceElement(long)` — a fixed index.
+    SequenceAt(i64),
+    /// Anything this VM cannot decode. Carries the element's class name so the
+    /// refusal can name it rather than answering a plausible zero.
+    Unsupported(String),
+}
+
+pub(crate) fn p67_classify_path_element(
+    ctx: &dyn NativeContext,
+    elem: ObjectRef,
+) -> P67PathElement {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(elem))
+        .unwrap_or_default();
+    if class_name.contains("SequenceElementByIndex") {
+        return match ctx.get_field_by_name(elem, "index") {
+            Value::Long(v) => P67PathElement::SequenceAt(v),
+            Value::Int(v) => P67PathElement::SequenceAt(v as i64),
+            _ => P67PathElement::SequenceOpen,
+        };
+    }
+    if class_name.contains("SequenceElementByRange") {
+        // A range element addresses a SLICE, not one element; refusing is the
+        // honest answer rather than reporting the range's start.
+        return P67PathElement::Unsupported(class_name);
+    }
+    if class_name.contains("SequenceElement") {
+        return P67PathElement::SequenceOpen;
+    }
+    if class_name.contains("GroupElementByIndex") {
+        return match ctx.get_field_by_name(elem, "index") {
+            Value::Long(v) => P67PathElement::GroupByIndex(v),
+            Value::Int(v) => P67PathElement::GroupByIndex(v as i64),
+            _ => P67PathElement::Unsupported(class_name),
+        };
+    }
+    if let Some(name) = p67_path_element_group_name(ctx, elem) {
+        return P67PathElement::GroupByName(name);
+    }
+    P67PathElement::Unsupported(class_name)
+}
+
+/// The member layouts of a group layout (slot 2), if it has any.
+fn p67_group_members(ctx: &dyn NativeContext, layout: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field(layout, 2) {
+        Value::Object(Some(arr)) if ctx.array_length(arr) > 0 => Some(arr),
+        _ => None,
+    }
+}
+
+/// Offset of a group member, computed with the SAME alignment rule
+/// `structLayout` used to size the group — one algorithm, so a member's offset
+/// and the group's size can never disagree.
+///
+/// `select` receives each member's index and name; the first member it accepts
+/// stops the walk. Returns `(offset, member layout)`.
+fn p67_group_member_offset(
+    ctx: &dyn NativeContext,
+    group: ObjectRef,
+    mut select: impl FnMut(usize, Option<&str>) -> bool,
+) -> Option<(i64, ObjectRef)> {
+    let members = p67_group_members(ctx, group)?;
+
+    // A UNION PUTS EVERY MEMBER AT OFFSET 0 (F16, 2026-08-13). This loop used
+    // to accumulate for any group, which was invisible while `unionLayout`
+    // discarded its members — `p67_group_members` answered `None` and this
+    // function never ran on a union. Now that a union carries its members, the
+    // path is reachable and has to be right. Measured on 25.0.3+9-LTS:
+    //
+    //     u = unionLayout(JAVA_BYTE.withName("b"), JAVA_INT.withName("i"),
+    //                     JAVA_LONG.withName("l"))
+    //     u.byteOffset(groupElement("b")) = 0
+    //     u.byteOffset(groupElement("i")) = 0
+    //     u.byteOffset(groupElement("l")) = 0
+    let is_union = ctx
+        .class_name_of_id(ctx.class_id_of_object(group))
+        .is_some_and(|n| n.contains("UnionLayout"));
+
+    let mut offset = 0_i64;
+    for i in 0..ctx.array_length(members) {
+        let member = match ctx.get_array_element(members, i) {
+            Value::Object(Some(m)) => m,
+            _ => continue,
+        };
+        // NO `align_up` HERE. A member's offset in a struct is the PLAIN
+        // RUNNING SUM of the preceding members' sizes — the JDK does not
+        // insert padding, it rejects a layout that needs some (see the
+        // `structLayout` registration). Measured:
+        //
+        //     s  = struct(b1, x3, i4, j8)  -> b=0, i=4, l=8
+        //     s2 = struct(j8, i4)          -> l=0, i=8   (size 12, NOT 16)
+        //
+        // The `offset = align_up(offset, align)` that used to be here was the
+        // SECOND copy of the offset rule, and it disagreed with the first as
+        // soon as the first stopped padding. It happened to be a no-op for
+        // every layout `structLayout` will now build — the alignment check
+        // guarantees the running offset is already a multiple of each member's
+        // alignment — but a rule written twice is a rule that drifts, and this
+        // copy silently rounded `struct(j8, i4)`'s second member to 8 for the
+        // right reason and would have kept doing it for the wrong one.
+        let name = p67_string_value(ctx, p67_layout_name_value(ctx, member));
+        if select(i, name.as_deref()) {
+            return Some((if is_union { 0 } else { offset }, member));
+        }
+        offset = offset.saturating_add(p67_layout_size_of(ctx, member).max(0));
+    }
+    None
+}
+
+/// The element layout of a sequence layout — slot 2 of the carrier
+/// `MemoryLayout.sequenceLayout` mints. A GROUP layout's slot 2 is its member
+/// ARRAY, so this is only ever asked of a receiver whose class says sequence.
+fn p67_sequence_element_layout(ctx: &dyn NativeContext, layout: ObjectRef) -> Option<ObjectRef> {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(layout))
+        .unwrap_or_default();
+    if !class_name.contains("SequenceLayout") {
+        return None;
+    }
+    match ctx.get_field(layout, 2) {
+        Value::Object(Some(e)) => Some(e),
+        _ => None,
+    }
+}
+
+/// [`p67_sequence_element_layout`] as a hard requirement: a sequence path
+/// element applied to something that is not a sequence is the caller's error,
+/// and the JDK reports it as `IllegalArgumentException`.
+fn p67_sequence_element(
     ctx: &dyn NativeContext,
     layout: ObjectRef,
-    path_arr: ObjectRef,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
+    p67_sequence_element_layout(ctx, layout).ok_or_else(|| {
+        RuntimeError::IllegalArgumentException {
+            message: "cannot resolve layout path element: the layout is not a sequence".to_string(),
+        }
+        .into()
+    })
+}
+
+/// Where a layout path lands: the byte offset of the addressed element, the
+/// element's own layout, and the STRIDE of each open (`sequenceElement()`)
+/// index the path left behind.
+///
+/// The strides are what makes a var handle's extra `long` coordinates mean
+/// something: `seq.varHandle(sequenceElement())` addresses
+/// `base + index * elementSize`.
+pub(crate) struct P67PathTarget {
+    pub offset: i64,
+    pub layout: ObjectRef,
+    pub open_strides: Vec<i64>,
+}
+
+pub(crate) fn p67_layout_path_walk(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    path_arr: Option<ObjectRef>,
+) -> Result<P67PathTarget, MethodCallFailed> {
     let mut current = layout;
+    let mut offset = 0_i64;
+    let mut open_strides: Vec<i64> = Vec::new();
+    let Some(path_arr) = path_arr else {
+        return Ok(P67PathTarget {
+            offset,
+            layout: current,
+            open_strides,
+        });
+    };
     for i in 0..ctx.array_length(path_arr) {
         let elem = match ctx.get_array_element(path_arr, i) {
-            Value::Object(Some(elem)) => elem,
-            _ => break,
+            Value::Object(Some(e)) => e,
+            _ => continue,
         };
-        let Some(name) = p67_path_element_group_name(ctx, elem) else {
-            break;
-        };
-        let Some(member) = p67_layout_named_member(ctx, current, &name) else {
-            break;
-        };
-        current = member;
+        match p67_classify_path_element(ctx, elem) {
+            P67PathElement::GroupByName(name) => {
+                let found = p67_group_member_offset(ctx, current, |_, member_name| {
+                    member_name == Some(name.as_str())
+                });
+                match found {
+                    Some((member_offset, member)) => {
+                        offset = offset.saturating_add(member_offset);
+                        current = member;
+                    }
+                    None => {
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: format!("cannot resolve layout path element: no member named `{name}`"),
+                        }
+                        .into());
+                    }
+                }
+            }
+            P67PathElement::GroupByIndex(idx) => {
+                let found =
+                    p67_group_member_offset(ctx, current, |member_index, _| {
+                        member_index as i64 == idx
+                    });
+                match found {
+                    Some((member_offset, member)) => {
+                        offset = offset.saturating_add(member_offset);
+                        current = member;
+                    }
+                    None => {
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: format!("cannot resolve layout path element: no member at index {idx}"),
+                        }
+                        .into());
+                    }
+                }
+            }
+            P67PathElement::SequenceOpen => {
+                let element = p67_sequence_element(ctx, current)?;
+                open_strides.push(p67_layout_size_of(ctx, element).max(0));
+                current = element;
+            }
+            P67PathElement::SequenceAt(idx) => {
+                let element = p67_sequence_element(ctx, current)?;
+                let stride = p67_layout_size_of(ctx, element).max(0);
+                offset = offset.saturating_add(stride.saturating_mul(idx));
+                current = element;
+            }
+            P67PathElement::Unsupported(class_name) => {
+                // Never a fabricated 0: a wrong offset is a silent wrong
+                // read/write into somebody's off-heap memory.
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!(
+                        "MemoryLayout path element `{class_name}` is not modelled by CratonVM; \
+                         the offset is unknown rather than zero"
+                    ),
+                }
+                .into());
+            }
+        }
     }
-    current
+    Ok(P67PathTarget {
+        offset,
+        layout: current,
+        open_strides,
+    })
+}
+
+/// `MemoryLayout.byteOffset(PathElement...)`.
+pub(crate) fn p67_layout_byte_offset(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let path = match args.get(1) {
+        Some(Value::Object(p)) => *p,
+        _ => None,
+    };
+    let target = p67_layout_path_walk(ctx, this, path)?;
+    if !target.open_strides.is_empty() {
+        // `byteOffset` has no coordinates to supply an open index with; the JDK
+        // rejects such a path outright.
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "byteOffset does not accept an open sequence-element path".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(Value::Long(target.offset)))
 }
 
 pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Result<Value, MethodCallFailed> {
-    let width = p67_layout_width_obj(ctx, layout);
+    p67_var_handle_for_path(ctx, layout, 0, &[])
+}
+
+/// Mint the FFM layout VarHandle for `layout`, addressing `base_offset` bytes
+/// past its segment coordinate plus one `long` coordinate per entry in
+/// `open_strides`.
+///
+/// The shape is recorded in `lang_invoke`'s side table, which is the ONLY place
+/// this handle's meaning lives: the receiver is a synthetic
+/// `java/lang/invoke/VarHandle` whose slots the real class declares as
+/// `vform`/`… `, so slot reads are not a description. Before this recorded a
+/// carrier, `varType()`/`coordinateTypes()` refused (kind 0 — they were reading
+/// slot 0, this file's endianness flag, as a kind tag) and `get`/`set` fell
+/// through to the instance-field path and silently no-opped: measured on the
+/// shipping binary, `vhInt.set(seg, 0L, 11); vhInt.get(seg, 0L)` answered `0`
+/// where HotSpot answers `11`.
+pub(crate) fn p67_var_handle_for_path(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    base_offset: i64,
+    open_strides: &[i64],
+) -> Result<Value, MethodCallFailed> {
+    if open_strides.len() > 1 {
+        // A nested `sequenceElement(), sequenceElement()` path needs one index
+        // coordinate per level, and the shape carries one. Refusing names the
+        // gap; addressing with only the outer stride would read the wrong slot
+        // and look like a working handle.
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!(
+                "CratonVM models one open sequence index per layout var handle; this path has {}",
+                open_strides.len()
+            ),
+        }
+        .into());
+    }
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(layout))
+        .unwrap_or_default();
+    let carrier = p67_layout_carrier_name(&class_name);
     let little_endian = p67_layout_is_little(ctx, layout);
+    let width = p67_layout_width_obj(ctx, layout);
+    let shape = crate::lang_invoke::SegmentVhShape {
+        width,
+        carrier: p67_carrier_descriptor_byte(carrier, width),
+        little_endian,
+        base_offset,
+        stride: open_strides.first().copied().unwrap_or(0),
+    };
     let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS)?;
     ctx.set_field(
         vh,
@@ -1229,8 +1804,31 @@ pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: Obj
     );
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(width));
     ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
-    crate::lang_invoke::register_p67_memory_segment_var_handle(ctx, vh, width);
+    crate::lang_invoke::register_p67_memory_segment_var_handle(ctx, vh, shape);
     Ok(Value::Object(Some(vh)))
+}
+
+/// The JVM descriptor byte for a layout carrier name, falling back to the
+/// width when the carrier is not one of the eight primitives (`ADDRESS`, whose
+/// carrier is `MemorySegment`, is addressed as a pointer-sized integer).
+pub(crate) fn p67_carrier_descriptor_byte(carrier: &str, width: i32) -> u8 {
+    match carrier {
+        "boolean" => b'Z',
+        "byte" => b'B',
+        "char" => b'C',
+        "short" => b'S',
+        "int" => b'I',
+        "long" => b'J',
+        "float" => b'F',
+        "double" => b'D',
+        _ => {
+            if width == 8 {
+                b'J'
+            } else {
+                b'I'
+            }
+        }
+    }
 }
 
 pub(crate) fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
@@ -1251,11 +1849,17 @@ pub(crate) fn p67_memory_layout_var_handle(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let target_layout = match args.get(1) {
-        Some(Value::Object(Some(path_arr))) => p67_memory_layout_path_target(ctx, this, *path_arr),
-        _ => this,
+    let path = match args.get(1) {
+        Some(Value::Object(p)) => *p,
+        _ => None,
     };
-    Ok(Some(p67_var_handle_for_layout(ctx, target_layout)?))
+    let target = p67_layout_path_walk(ctx, this, path)?;
+    Ok(Some(p67_var_handle_for_path(
+        ctx,
+        target.layout,
+        target.offset,
+        &target.open_strides,
+    )?))
 }
 
 pub(crate) fn p67_segment_parts(
@@ -1421,6 +2025,79 @@ fn p67_segment_impl_is_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(Some(Value::Int(i32::from(
         name == "jdk/internal/foreign/MappedMemorySegmentImpl",
     ))))
+}
+
+/// Upper bound on a `getString` scan, so a segment whose recorded size is
+/// implausible cannot turn into an unbounded read.
+const P67_MAX_CSTR_LEN: usize = 1 << 20;
+
+/// `MemorySegment.getString(long)` — the UTF-8, NUL-terminated read.
+///
+/// `MemorySegment` is an interface whose every method is abstract, and the
+/// carriers this VM hands out are instances of that interface, so an
+/// unregistered method is an `AbstractMethodError: … has no Code attribute`
+/// rather than a missing implementation class. `getString` was one:
+/// `panama.rs` implements only the JDK-21-preview spelling `getUtf8String`,
+/// and that registrar (`register_pe2_string_marshaling`, via
+/// `register_pe_panama`) is on the synthetic-JDK arm, so nothing answered
+/// `getString` in a shipping binary (regression-suite
+/// `RJdkForeign.segmentRoundTrip`).
+///
+/// Bounds are read from the segment itself through the canonical pair
+/// `panama_libffi::segment_address`/`segment_byte_size`, which accept BOTH
+/// segment models (`min`/`length` on a real `NativeMemorySegmentImpl`, the
+/// `[base@0, size@1, …, offset@5]` synthetic one) — the scan can never run past
+/// what the segment claims to own. An offset outside the segment, or a region
+/// with no terminator in it, raises `IndexOutOfBoundsException`, which is what
+/// the JDK raises; neither is answered with a truncated or empty string.
+pub(crate) fn p67_segment_get_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let seg = obj_arg(args, 0)?;
+    let offset = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    // GC-safety: `checkValidState()` is Java bytecode and can relocate `seg`.
+    let seg_pin = ctx.pin_native_root(seg);
+    let checked = p67_segment_check_scope(ctx, seg);
+    let seg = ctx.read_native_pin(seg_pin, seg);
+    ctx.unpin_native_roots(seg_pin);
+    checked?;
+    let base = crate::panama_libffi::segment_address(ctx, seg);
+    let size = crate::panama_libffi::segment_byte_size(ctx, seg);
+    if offset < 0 || size <= 0 || offset >= size {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "getString offset {offset} is out of bounds for a segment of {size} bytes"
+            )),
+        }
+        .into());
+    }
+    let Some(addr) = (base as u64).checked_add(offset as u64).filter(|a| *a != 0) else {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some("getString on a segment with no address".to_string()),
+        }
+        .into());
+    };
+    let len = ((size - offset) as usize).min(P67_MAX_CSTR_LEN);
+    // SAFETY: `addr` is non-null and `len` is clamped to the bytes the segment
+    // itself reports past `offset`, so the scan stays inside the block the
+    // arena allocated (and the scope check above proved it is still live).
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+    let Some(nul) = bytes.iter().position(|b| *b == 0) else {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "getString found no NUL terminator in the {len} bytes at offset {offset}"
+            )),
+        }
+        .into());
+    };
+    let text = String::from_utf8_lossy(&bytes[..nul]).into_owned();
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
 }
 
 pub(crate) fn p67_segment_get_width(
@@ -2268,6 +2945,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // constant the moment a mapped carrier is minted.
     r.register(ms, "isMapped", "()Z", p67_segment_impl_is_mapped);
     r.register(ms, "isReadOnly", "()Z", p67_segment_is_read_only);
+    // The JDK 22+ spelling of the C-string read. See `p67_segment_get_string`
+    // for why nothing answered it before. The `(long, Charset)` overload is
+    // deliberately NOT registered: this implementation decodes UTF-8, and
+    // answering a caller that asked for another charset with UTF-8 bytes would
+    // be a wrong value where the AbstractMethodError is at least a refusal.
+    r.register(ms, "getString", "(J)Ljava/lang/String;", p67_segment_get_string);
     // `MemorySegment` does not override `equals` in the JDK — segment equality
     // IS reference identity. The constant `false` this used to return broke
     // even reflexivity (`seg.equals(seg)` was false), so a segment could not be
@@ -2336,6 +3019,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         // HEAP impls too, so a blanket TRUE there reported every heap segment
         // as both native and mapped. Answer from the receiver's own runtime
         // class instead (see `p67_segment_impl_is_native`).
+        r.register(
+            ms_impl,
+            "getString",
+            "(J)Ljava/lang/String;",
+            p67_segment_get_string,
+        );
         r.register(ms_impl, "isNative", "()Z", p67_segment_impl_is_native);
         r.register(ms_impl, "isMapped", "()Z", p67_segment_impl_is_mapped);
         // Was a constant `false`, which shadowed the real, concrete
@@ -2718,42 +3407,113 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "structLayout",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
         |ctx, args| {
+            // THE JDK DOES NOT AUTO-PAD A STRUCT, AND DOES NOT ROUND THE TOTAL
+            // UP TO THE ALIGNMENT (F16, 2026-08-13). Both are measured, and
+            // this VM used to do both. Verbatim from the oracle's own source,
+            // jdk25src/java.base/jdk/internal/foreign/layout/StructLayoutImpl.java:
+            //
+            //     public static StructLayout of(List<MemoryLayout> elements) {
+            //         long size = 0;
+            //         long align = 1;
+            //         for (MemoryLayout elem : elements) {
+            //             if (size % elem.byteAlignment() != 0) {
+            //                 throw new IllegalArgumentException(
+            //                     "Invalid alignment constraint for member layout: " + elem);
+            //             }
+            //             size = Math.addExact(size, elem.byteSize());
+            //             align = Math.max(align, elem.byteAlignment());
+            //         }
+            //         ...
+            //     }
+            //
+            // and confirmed by running it (Microsoft build 25.0.3+9-LTS):
+            //
+            //     structLayout(JAVA_BYTE, JAVA_INT)  -> IAE: Invalid alignment
+            //                                    constraint for member layout: i4
+            //     structLayout(JAVA_INT, JAVA_LONG)  -> IAE: ... : j8
+            //     structLayout(JAVA_BYTE, paddingLayout(3), JAVA_INT) -> 8  align 4
+            //     structLayout(JAVA_LONG, JAVA_INT)                   -> 12 align 8
+            //     structLayout(JAVA_INT,  JAVA_BYTE)                  -> 5  align 4
+            //     structLayout()                                      -> 0  align 1
+            //
+            // `structLayout(JAVA_LONG, JAVA_INT) == 12` is the one that the
+            // old `total_size = align_up(offset, max_align)` got wrong even
+            // for a call the JDK ACCEPTS: it answered 16. The padding is the
+            // caller's job in both directions.
             let members = match args.first() {
                 Some(Value::Object(Some(arr))) => *arr,
                 _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
             };
             let count = ctx.array_length(members);
-            let mut offset = 0_i64;
+            let mut size = 0_i64;
             let mut max_align = 1_i64;
             for i in 0..count {
-                let Some(member) = (match ctx.get_array_element(members, i) {
-                    Value::Object(Some(obj)) => Some(obj),
-                    _ => None,
-                }) else {
-                    continue;
+                // A NULL member is a `NullPointerException`, not a member to
+                // skip. MEASURED 2026-08-16: `structLayout((MemoryLayout) null)`
+                // and `structLayout(JAVA_INT, null)` are both
+                // `NullPointerException` with a null message
+                // (`Objects.requireNonNull` inside `MemoryLayout.structLayout`).
+                // The `continue` this replaces answered a layout that was one
+                // member short — `structLayout(JAVA_LONG, null)` was `j8`,
+                // byteSize 8, with nothing to say a member had gone missing.
+                let member = match ctx.get_array_element(members, i) {
+                    Value::Object(Some(obj)) => obj,
+                    _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
                 };
-                let size = match ctx.get_field(member, 0) {
-                    Value::Long(v) => v,
-                    _ => match ctx.get_field(member, 1) {
-                        Value::Int(v) => v as i64,
-                        Value::Long(v) => v,
-                        _ => 0,
-                    },
+                let Some((member_size, member_align)) = p67_member_size_align(ctx, member) else {
+                    // Not a layout carrier. Name it rather than defaulting to
+                    // a plausible zero — see the banner at
+                    // `p67_member_size_align`.
+                    let cls = ctx
+                        .class_name_of_id(ctx.class_id_of_object(member))
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "MemoryLayout.structLayout: member {i} is not a memory layout \
+                             (class {cls}, slot 0 = {:?})",
+                            ctx.get_field(member, 0)
+                        ),
+                    }
+                    .into());
                 };
-                let align = match ctx.get_field(member, 1) {
-                    Value::Long(v) if v > 0 => v,
-                    Value::Int(v) if v > 0 => v as i64,
-                    _ => size.max(1),
+                if member_align <= 0 || size % member_align != 0 {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "Invalid alignment constraint for member layout: {}",
+                            p67_layout_render(ctx, member)
+                        ),
+                    }
+                    .into());
+                }
+                let Some(next) = size.checked_add(member_size.max(0)) else {
+                    // MEASURED 2026-08-16, and NOT what this said before.
+                    //
+                    // The JDK does use `Math.addExact` here, but it does not
+                    // let the `ArithmeticException` out: `AbstractLayout`
+                    // catches it and rethrows. Oracle, with
+                    // `big = sequenceLayout(Long.MAX_VALUE, JAVA_BYTE)`:
+                    //
+                    //     structLayout(big, JAVA_BYTE) -> IllegalArgumentException:
+                    //                          Layout size exceeds Long.MAX_VALUE
+                    //     structLayout(big, big)       -> the same
+                    //
+                    // "an overflow there is an ArithmeticException" was a
+                    // PREDICTION read off the `Math.addExact` call, and it is
+                    // the wrong exception CLASS — a caller catching
+                    // `IllegalArgumentException`, which is what every other
+                    // refusal in this factory throws, would not have caught it.
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "Layout size exceeds Long.MAX_VALUE".to_string(),
+                    }
+                    .into());
                 };
-                offset = ((offset + align - 1) / align) * align;
-                offset = offset.saturating_add(size.max(0));
-                max_align = max_align.max(align);
+                size = next;
+                max_align = max_align.max(member_align);
             }
-            let total_size = ((offset + max_align - 1) / max_align) * max_align;
             let members_pin = ctx.pin_native_root(members);
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 4)?;
             let members = ctx.read_native_pin(members_pin, members);
-            ctx.set_field(obj, 0, Value::Long(total_size));
+            ctx.set_field(obj, 0, Value::Long(size));
             ctx.set_field(obj, 1, Value::Long(max_align));
             ctx.set_field(obj, 2, Value::Object(Some(members)));
             ctx.set_field(obj, 3, Value::Object(None));
@@ -2774,35 +3534,123 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "sequenceLayout",
         "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;",
         |ctx, args| {
+            // The carrier used to be ONE slot holding the element COUNT, which
+            // no reader in this file understands: `byteSize()` reads slot 0 as
+            // a size, so `sequenceLayout(4, JAVA_INT).byteSize()` would have
+            // answered 4 instead of 16 — and did not even get that far,
+            // because `byteSize` was registered on no sequence class at all
+            // (`AbstractMethodError: MemoryLayout.byteSize()J has no Code
+            // attribute`, which is what `arena.allocate(seq)` hit through the
+            // real `SegmentAllocator.allocate(MemoryLayout)` default method).
+            //
+            // It now carries the same 4-slot shape as `structLayout`:
+            // `[0] byteSize, [1] byteAlignment, [2] ELEMENT layout, [3] name`.
+            // Slot 2 differs in meaning from a group layout's member ARRAY,
+            // and the two are told apart by the receiver's class — see
+            // `p67_sequence_element_layout`.
             let count = match args.first() {
                 Some(Value::Long(v)) => *v,
+                Some(Value::Int(v)) => *v as i64,
                 _ => 0,
             };
+            // Measured on the oracle:
+            //   sequenceLayout(10, JAVA_INT) -> byteSize=40 align=4   (agrees)
+            //   sequenceLayout(0,  JAVA_INT) -> byteSize=0  align=4   (agrees)
+            //   sequenceLayout(-1, JAVA_INT) -> IllegalArgumentException:
+            //                        The provided elementCount is negative: -1
+            // The negative case was accepted here and answered a negative
+            // byteSize.
+            if count < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("The provided elementCount is negative: {count}"),
+                }
+                .into());
+            }
+            // The remaining three refusals, in the ORDER the oracle applies
+            // them. MEASURED 2026-08-16 (`FfmProbe4`, `P5`):
+            //
+            // | call | oracle |
+            // |---|---|
+            // | `sequenceLayout(-1, null)` | IAE `The provided elementCount is negative: -1` |
+            // | `sequenceLayout(4, null)` | `NullPointerException` |
+            // | `sequenceLayout(0, structLayout(JAVA_INT, JAVA_BYTE))` | IAE `Element layout size is not multiple of alignment` |
+            // | `sequenceLayout(2, JAVA_INT.withByteAlignment(8))` | IAE, same message |
+            // | `sequenceLayout(Long.MAX_VALUE, JAVA_INT)` | IAE `Layout size exceeds Long.MAX_VALUE` |
+            // | `sequenceLayout(Long.MAX_VALUE, JAVA_BYTE)` | 9223372036854775807 |
+            //
+            // The negative-count check above wins even over a null element
+            // (`sequenceLayout(-1, null)` is the count message, not an NPE),
+            // which is why it stays first.
             let element = match args.get(1) {
-                Some(Value::Object(Some(obj))) => Some(*obj),
-                _ => None,
+                Some(Value::Object(Some(e))) => *e,
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
             };
-            let (elem_size, elem_align) = element.map_or((0, 1), |e| p67_layout_size_align(ctx, e));
-            let element_pin = element.map(|e| (ctx.pin_native_root(e), e));
-            // Six slots: the standard four plus the element layout and count,
-            // so `elementLayout()`/`elementCount()` have somewhere to read from
-            // when they are implemented.
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 6)?;
-            let element = element_pin.map(|(pin, e)| {
-                let e = ctx.read_native_pin(pin, e);
-                ctx.unpin_native_roots(pin);
-                e
-            });
-            ctx.set_field(obj, 0, Value::Long(count.max(0).saturating_mul(elem_size)));
-            ctx.set_field(obj, 1, Value::Long(elem_align));
-            ctx.set_field(
-                obj,
-                2,
-                Value::Int(i32::from(cfg!(target_endian = "little"))),
-            );
+            let (elem_size, elem_align) = p67_layout_size_align(ctx, element);
+            // An element whose own size is not a whole number of its own
+            // alignment cannot tile, and the JDK refuses it AT THE FACTORY —
+            // before the count is even multiplied in, which is why count 0
+            // refuses too. Without this,
+            // `sequenceLayout(2, structLayout(JAVA_INT, JAVA_BYTE))` answered a
+            // 10-byte layout with alignment 4, whose second element starts at
+            // byte 5. `pe_segment_spliterator` already carries this exact check
+            // and this exact message for a segment's element layout; the
+            // factory is where the oracle puts it.
+            if elem_align > 0 && elem_size % elem_align != 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Element layout size is not multiple of alignment".to_string(),
+                }
+                .into());
+            }
+            // `SequenceLayoutImpl`'s constructor is
+            // `Math.multiplyExact(elemCount, elementLayout.byteSize())`, but
+            // the `ArithmeticException` does not escape — the JDK rethrows it.
+            // MEASURED: `sequenceLayout(Long.MAX_VALUE, JAVA_INT)` is
+            // `IllegalArgumentException: Layout size exceeds Long.MAX_VALUE`.
+            // "an overflow is an ArithmeticException" was a PREDICTION read
+            // off the `multiplyExact` call and is the wrong exception class.
+            let Some(total) = count.checked_mul(elem_size) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Layout size exceeds Long.MAX_VALUE".to_string(),
+                }
+                .into());
+            };
+            // FOUR slots, not six. A six-slot carrier that parked the element
+            // layout at slot 4 and the count at slot 5 (and the endian flag at
+            // slot 2) is the OTHER encoding this file spent F16 collapsing:
+            // slot 2 is the payload for every layout here, and
+            // `p67_sequence_element_layout` — the single reader both the
+            // `byteOffset` and the `varHandle` path walks go through — reads a
+            // sequence's element from slot 2. Six slots would have left the
+            // walk reading `Int(littleEndian)` as a layout.
+            //
+            // THE COUNT IS STORED, AT SLOT 4, AND IT IS NOT DERIVABLE.
+            //
+            // This carrier used to be exactly four slots on the reasoning that
+            // `elementCount()` could divide `byteSize` by the element size. The
+            // oracle falsifies it: an element layout may have byteSize ZERO,
+            // and then the total is 0 for every count. MEASURED —
+            // `sequenceLayout(3, structLayout()).byteSize()` is 0 and its
+            // `elementCount()` is **3**; `sequenceLayout(2, sequenceLayout(0,
+            // JAVA_INT)).elementCount()` is 2. The division answered 0 for all
+            // of them (it is guarded against a divide-by-zero, so it was a
+            // quiet wrong number rather than a crash).
+            //
+            // Slot 4 is a SEQUENCE-ONLY EXTENSION and changes nothing about the
+            // shared prefix: `[0]=byteSize, [1]=byteAlignment, [2]=payload,
+            // [3]=name` is still what `p67_layout_size_align`,
+            // `p67_layout_name` and `p67_sequence_element_layout` read, and
+            // slot 4 is read by `elementCount()` alone. It is NOT the six-slot
+            // carrier F16 removed: that one put the ELEMENT at slot 4, where
+            // the walk expects it at slot 2.
+            let element_pin = ctx.pin_native_root(element);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 5)?;
+            ctx.set_field(obj, 0, Value::Long(total));
+            ctx.set_field(obj, 1, Value::Long(elem_align.max(1)));
+            let element = ctx.read_native_pin(element_pin, element);
+            ctx.set_field(obj, 2, Value::Object(Some(element)));
             ctx.set_field(obj, 3, Value::Object(None));
-            ctx.set_field(obj, 4, Value::Object(element));
-            ctx.set_field(obj, 5, Value::Long(count));
+            ctx.set_field(obj, 4, Value::Long(count));
+            ctx.unpin_native_roots(element_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2811,25 +3659,70 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "unionLayout",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
         |ctx, args| {
-            // A union is as large as its largest member, rounded up to the
-            // strictest member alignment — not zero, which is what this
-            // returned for every union regardless of its members.
+            // This used to DISCARD its members and answer a one-slot carrier
+            // holding `Long(0)` — `unionLayout(JAVA_INT, JAVA_LONG).byteSize()`
+            // was 0, and `UnionLayout` had no `byteSize` registration to read
+            // it with anyway. Measured on the oracle, and matching
+            // `UnionLayoutImpl.of` (size = max, align = max, and NO alignment
+            // constraint, because every union member sits at offset 0):
+            //
+            //     unionLayout(JAVA_INT, JAVA_LONG) -> byteSize=8 align=8
+            //     unionLayout(JAVA_BYTE, JAVA_INT) -> byteSize=4 align=4
+            //
+            // The size is NOT rounded up to the alignment. `UnionLayoutImpl.of`
+            // is `size = Math.max(size, elem.byteSize())` and nothing else, so
+            // `unionLayout(structLayout(JAVA_INT, JAVA_BYTE))` is 5 — the same
+            // "the JDK never pads for you" rule `structLayout` above is built
+            // on (F16). Rounding agrees with the oracle only on the two rows
+            // above, where every member is already a power-of-two value layout.
             let members = match args.first() {
-                Some(Value::Object(Some(arr))) => Some(*arr),
-                _ => None,
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
             };
-            let (mut size, mut align) = (0_i64, 1_i64);
-            if let Some(members) = members {
-                for i in 0..ctx.array_length(members) {
-                    if let Value::Object(Some(member)) = ctx.get_array_element(members, i) {
-                        let (m_size, m_align) = p67_layout_size_align(ctx, member);
-                        size = size.max(m_size);
-                        align = align.max(m_align);
+            let count = ctx.array_length(members);
+            let mut size = 0_i64;
+            let mut max_align = 1_i64;
+            for i in 0..count {
+                let Some(member) = (match ctx.get_array_element(members, i) {
+                    Value::Object(Some(obj)) => Some(obj),
+                    _ => None,
+                }) else {
+                    // MEASURED: `unionLayout(JAVA_INT, null)` is a
+                    // `NullPointerException`, the same rule `structLayout`
+                    // above now follows. Skipping the member answered a union
+                    // sized by the members that happened to be non-null.
+                    return Err(RuntimeError::NullPointerException { message: None }.into());
+                };
+                let Some((member_size, member_align)) = p67_member_size_align(ctx, member) else {
+                    let cls = ctx
+                        .class_name_of_id(ctx.class_id_of_object(member))
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "MemoryLayout.unionLayout: member {i} is not a memory layout \
+                             (class {cls}, slot 0 = {:?})",
+                            ctx.get_field(member, 0)
+                        ),
                     }
-                }
+                    .into());
+                };
+                size = size.max(member_size);
+                max_align = max_align.max(member_align);
             }
-            let size = ((size + align - 1) / align).saturating_mul(align);
-            let obj = p67_layout_object(ctx, "java/lang/foreign/UnionLayout", size, align)?;
+            // Four slots with the MEMBERS at slot 2, not `p67_layout_object`'s
+            // value-layout shape (whose slot 2 is the endian flag): a union is
+            // a group layout, `p67_layout_named_member` resolves
+            // `groupElement(name)` against slot 2, and `memberLayouts()` reads
+            // it. Minting one through `p67_layout_object` answers the right
+            // byteSize and then loses every member.
+            let members_pin = ctx.pin_native_root(members);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/UnionLayout", 4)?;
+            let members = ctx.read_native_pin(members_pin, members);
+            ctx.set_field(obj, 0, Value::Long(size));
+            ctx.set_field(obj, 1, Value::Long(max_align));
+            ctx.set_field(obj, 2, Value::Object(Some(members)));
+            ctx.set_field(obj, 3, Value::Object(None));
+            ctx.unpin_native_roots(members_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2838,8 +3731,21 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "paddingLayout",
         "(J)Ljava/lang/foreign/PaddingLayout;",
         |ctx, args| {
+            // A PADDING LAYOUT'S ALIGNMENT IS ALWAYS 1, and its carrier must
+            // have the same four-slot head as every other layout here. The
+            // one-slot carrier this used to mint was the reason `structLayout`
+            // got the CORRECT JDK idiom wrong: with no slot 1 to read, the old
+            // member decode fell back to "alignment = size", so a
+            // `paddingLayout(3)` claimed alignment 3 and
+            //
+            //     structLayout(JAVA_BYTE, paddingLayout(3), JAVA_INT)
+            //
+            // — the padded form the JDK REQUIRES here — answered 12 where the
+            // oracle answers 8. Measured: `paddingLayout(3)` is byteSize=3,
+            // byteAlignment=1, and prints as `x3`.
             let size = match args.first() {
                 Some(Value::Long(v)) => *v,
+                Some(Value::Int(v)) => *v as i64,
                 _ => 0,
             };
             // `MemoryLayout.paddingLayout` rejects a non-positive size at the
@@ -2853,9 +3759,22 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // Built here rather than through `p67_layout_object` for the same
+            // reason the group layouts are: slot 2 is the PAYLOAD slot in the
+            // one carrier encoding (member array / element layout / null), and
+            // `p67_layout_object` stamps the VALUE-layout endian flag there.
+            // Padding has no payload, so the slot is explicitly null rather
+            // than an `Int` that a payload reader could mistake for one.
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/PaddingLayout", 4)?;
+            ctx.set_field(obj, 0, Value::Long(size));
             // Padding has no alignment constraint of its own — the JDK's
-            // `PaddingLayoutImpl` is byte-aligned.
-            let obj = p67_layout_object(ctx, "java/lang/foreign/PaddingLayout", size, 1)?;
+            // `PaddingLayoutImpl` is byte-aligned. This is the slot whose
+            // absence made `structLayout(JAVA_BYTE, paddingLayout(3), JAVA_INT)`
+            // answer 12 where the oracle answers 8: with no slot 1 to read, the
+            // member decode fell back to "alignment = size".
+            ctx.set_field(obj, 1, Value::Long(1));
+            ctx.set_field(obj, 2, Value::Object(None));
+            ctx.set_field(obj, 3, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2872,6 +3791,126 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         p67_memory_layout_var_handle,
     );
     r.register(ml, "name", "()Ljava/util/Optional;", p67_layout_name);
+    // The interface-level fallback for a receiver whose concrete layout class
+    // is not one of the ones registered below. `panama.rs` used to supply this
+    // row, decoding slot 0 as `Int(kind)` and slot 1 as the size; it is
+    // deleted, and this is its replacement in the one encoding (F16,
+    // 2026-08-13). Registrations here are keyed by RECEIVER class, so the
+    // per-class rows are what normally answer — this is the safety net, not
+    // the main path.
+    r.register(ml, "byteSize", "()J", p67_layout_byte_size);
+    r.register(ml, "byteAlignment", "()J", p67_layout_byte_alignment);
+
+    // `byteOffset(PathElement...)` on every layout carrier this file mints.
+    //
+    // Registered per RECEIVER class, not only on the `MemoryLayout` interface,
+    // because that is how a registration reaches one of these objects: the
+    // carriers are instances of the interface the factory names
+    // (`java/lang/foreign/StructLayout`, `…$OfInt`, …), and the interface
+    // method the call site resolved is only what the AbstractMethodError gets
+    // NAMED after. `MemorySegment.get`/`byteSize` above are registered exactly
+    // this way, and the value layouts are included so a zero-length path on a
+    // value layout answers 0 instead of raising.
+    const BYTE_OFFSET_DESC: &str = "([Ljava/lang/foreign/MemoryLayout$PathElement;)J";
+    for layout_class in [
+        ml,
+        "java/lang/foreign/StructLayout",
+        "java/lang/foreign/GroupLayout",
+        "java/lang/foreign/UnionLayout",
+        "java/lang/foreign/SequenceLayout",
+        "java/lang/foreign/PaddingLayout",
+        "java/lang/foreign/AddressLayout",
+        "java/lang/foreign/ValueLayout",
+        "java/lang/foreign/ValueLayout$OfByte",
+        "java/lang/foreign/ValueLayout$OfBoolean",
+        "java/lang/foreign/ValueLayout$OfChar",
+        "java/lang/foreign/ValueLayout$OfShort",
+        "java/lang/foreign/ValueLayout$OfInt",
+        "java/lang/foreign/ValueLayout$OfLong",
+        "java/lang/foreign/ValueLayout$OfFloat",
+        "java/lang/foreign/ValueLayout$OfDouble",
+    ] {
+        r.register(
+            layout_class,
+            "byteOffset",
+            BYTE_OFFSET_DESC,
+            p67_layout_byte_offset,
+        );
+    }
+
+    // The sequence layout's own accessors. Its carrier now has the same
+    // `[byteSize, byteAlignment, …, name]` head as every other layout here, so
+    // it can share the same four readers, and `varHandle` reaches the shared
+    // path walk (which is what turns `sequenceElement()` into an index
+    // coordinate instead of addressing the sequence itself).
+    let seq_layout = "java/lang/foreign/SequenceLayout";
+    r.register(seq_layout, "byteSize", "()J", p67_layout_byte_size);
+    r.register(
+        seq_layout,
+        "byteAlignment",
+        "()J",
+        p67_layout_byte_alignment,
+    );
+    r.register(seq_layout, "name", "()Ljava/util/Optional;", p67_layout_name);
+    r.register(
+        seq_layout,
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+        p67_layout_with_name,
+    );
+    r.register(
+        seq_layout,
+        "varHandle",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+        p67_memory_layout_var_handle,
+    );
+    r.register(
+        seq_layout,
+        "elementLayout",
+        "()Ljava/lang/foreign/MemoryLayout;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        },
+    );
+    // `elementCount()` reads the STORED count (slot 4), falling back to the
+    // division only for a carrier minted before slot 4 existed.
+    //
+    // The division is not equivalent, and the oracle says so: an element with
+    // byteSize 0 makes every total 0, and `sequenceLayout(3, structLayout())
+    // .elementCount()` is **3** on HotSpot where the division answers 0
+    // (MEASURED, `FfmProbe4` N7/N10/N12). The fallback is kept — and only the
+    // fallback divides — so a four-slot sequence carrier from any other mint
+    // still answers what it used to instead of reading past its own end.
+    r.register(seq_layout, "elementCount", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 4 {
+            if let Value::Long(count) = ctx.get_field(this, 4) {
+                return Ok(Some(Value::Long(count)));
+            }
+        }
+        let total = p67_layout_size_of(ctx, this);
+        let elem = match ctx.get_field(this, 2) {
+            Value::Object(Some(e)) => p67_layout_size_of(ctx, e),
+            _ => 0,
+        };
+        Ok(Some(Value::Long(if elem > 0 { total / elem } else { 0 })))
+    });
+    // The struct/group carriers reach the path walk through the same
+    // registration; without it a `struct.varHandle(groupElement("c"))` would
+    // have resolved to the abstract interface declaration.
+    for group_class in [
+        "java/lang/foreign/StructLayout",
+        "java/lang/foreign/GroupLayout",
+        "java/lang/foreign/UnionLayout",
+    ] {
+        r.register(
+            group_class,
+            "varHandle",
+            "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+            p67_memory_layout_var_handle,
+        );
+    }
 
     // `byteSize()`/`byteAlignment()` on the INTERFACE, not only on the
     // concrete layout classes.
@@ -2891,8 +3930,9 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // whose class IS the interface, i.e. exactly these carriers. The uniform
     // `[0]=byteSize, [1]=byteAlignment` prefix is what makes one registration
     // serve all of them.
-    r.register(ml, "byteSize", "()J", p67_layout_byte_size);
-    r.register(ml, "byteAlignment", "()J", p67_layout_byte_alignment);
+    // (The two `ml` rows themselves are registered once, further up, with the
+    // "interface-level fallback" note — same function, so a second identical
+    // row would only be noise.)
     for layout_class in [
         "java/lang/foreign/SequenceLayout",
         "java/lang/foreign/PaddingLayout",
@@ -2907,31 +3947,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         );
     }
 
-    // `SequenceLayout`'s own two accessors. The factory above already keeps the
-    // element layout at slot 4 and the count at slot 5 "so `elementLayout()`/
-    // `elementCount()` have somewhere to read from when they are implemented" —
-    // this is that.
-    r.register(
-        "java/lang/foreign/SequenceLayout",
-        "elementLayout",
-        "()Ljava/lang/foreign/MemoryLayout;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 4)))
-        },
-    );
-    r.register(
-        "java/lang/foreign/SequenceLayout",
-        "elementCount",
-        "()J",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(match ctx.get_field(this, 5) {
-                v @ Value::Long(_) => v,
-                _ => Value::Long(0),
-            }))
-        },
-    );
+    // `SequenceLayout.elementLayout()`/`elementCount()` are registered ONCE,
+    // with the `seq_layout` block above, and they read slot 2 and the byteSize
+    // ratio. A second pair reading slot 4 and slot 5 stood here — the accessors
+    // for the six-slot sequence carrier that F16 replaced. Registration is
+    // last-write-wins, so the later pair silently took the rows away from the
+    // encoding the rest of this file walks: on a four-slot carrier slot 4 and
+    // slot 5 are past the end of the object, and `elementLayout()` would have
+    // answered nothing for every sequence. One encoding, one pair of readers.
 
     // Linker
     let gl = "java/lang/foreign/GroupLayout";
@@ -2989,6 +4012,45 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         );
     }
 
+    // `UnionLayout` and `PaddingLayout` had NO size/alignment accessors at all
+    // (F16, 2026-08-13). The group loop above covers `GroupLayout` and
+    // `StructLayout` only, so `unionLayout(...).byteSize()` and
+    // `paddingLayout(3).byteSize()` resolved to the abstract interface
+    // declaration — `AbstractMethodError: ... has no Code attribute` — which is
+    // how the union stub's fabricated `Long(0)` stayed invisible: nothing could
+    // read it. Both carriers now have the shared four-slot head, so both share
+    // the same two readers.
+    //
+    // Plain `java/lang/foreign/ValueLayout` is here for the same reason: the
+    // `$Of*` loop above registers the accessors on each concrete spelling but
+    // never on the interface itself, and `panama.rs` used to supply that row
+    // from the OTHER encoding (reading slot 1 as `Int`). With panama's minter
+    // gone the row has to exist here, in the encoding that is now the only one.
+    for layout_class in [
+        "java/lang/foreign/UnionLayout",
+        "java/lang/foreign/PaddingLayout",
+        "java/lang/foreign/ValueLayout",
+    ] {
+        r.register(layout_class, "byteSize", "()J", p67_layout_byte_size);
+        r.register(
+            layout_class,
+            "byteAlignment",
+            "()J",
+            p67_layout_byte_alignment,
+        );
+        r.register(
+            layout_class,
+            "name",
+            "()Ljava/util/Optional;",
+            p67_layout_name,
+        );
+        r.register(
+            layout_class,
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+            p67_layout_with_name,
+        );
+    }
     let linker = "java/lang/foreign/Linker";
 
     // Real JDK Arena.ofAuto returns ArenaImpl; its concrete allocate(long,
@@ -3153,12 +4215,31 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     args.get(3).is_some()
                 );
             }
-            let dh = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
-            ctx.set_field(dh, 0, Value::Long(fn_addr));
-            ctx.set_field(dh, 1, Value::Object(Some(descriptor)));
-            ctx.set_field(dh, 2, Value::Long(variadic_fixed));
-            ctx.set_field(dh, 3, Value::Long(0)); // cif cache not yet built
-            ctx.set_field(dh, 4, Value::Int(capture_call_state as i32));
+            // P1-E: this WAS the live `--jdk-only` mint of
+            // `java/lang/foreign/DowncallHandle`, a class no real JDK image
+            // declares, so strict mode correctly refused it and every FFM
+            // downcall died as
+            // `NoClassDefFoundError: java/lang/foreign/DowncallHandle` at the
+            // application's call site. The refusal was right; the survival of
+            // this caller was the defect.
+            //
+            // The carrier is now a real `java/lang/invoke/MethodHandle` — which
+            // is what the caller actually holds it as, casts it to, and calls
+            // `invokeExact` on. See `panama::alloc_downcall_handle`.
+            //
+            // Note the panama.rs mints of the same class are NOT this one:
+            // `register_pe_panama` is reached only from
+            // `register_synthetic_overrides`, which is
+            // `#[cfg(feature = "synthetic-jdk")]`, so it is in neither shipping
+            // binary. This site, reached from
+            // `register_essential_natives_with_shims`, is the one that ran.
+            let dh = crate::panama::alloc_downcall_handle(
+                ctx,
+                fn_addr,
+                descriptor,
+                variadic_fixed,
+                capture_call_state,
+            )?;
             Ok(Some(Value::Object(Some(dh))))
         }
     );
@@ -3221,6 +4302,93 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // G19-1: THE TWO READERS OF THE CARRIER THE TWO FACTORIES ABOVE MINT.
+    //
+    // MEASURED, `--jdk-only` against 25.0.3+9-LTS, before this registration:
+    //
+    //     FunctionDescriptor.of(JAVA_LONG, ADDRESS).returnLayout()
+    //       -> AbstractMethodError: method java/lang/foreign/FunctionDescriptor
+    //          .returnLayout()Ljava/util/Optional; has no Code attribute
+    //     ... .argumentLayouts()
+    //       -> AbstractMethodError: ... .argumentLayouts()Ljava/util/List;
+    //
+    // That is the whole of `RJdkForeign`'s `[layouts]` step failure: the two
+    // factories are registered HERE — `register_pe_function_descriptor` in
+    // `panama.rs`, which does carry a `returnLayout`, is reached only from
+    // `register_pe_panama`/`register_synthetic_overrides` and does not run in
+    // `--jdk-only` (registry dump: the only two `FunctionDescriptor` rows are
+    // `of` and `ofVoid`, both `foreign_ffm.rs`, `owns_slot=true`). So the
+    // carrier was mintable and unreadable.
+    //
+    // Both are declared ABSTRACT on the sealed interface and have no `Object`
+    // fallback, which is why a registration here wins where one for
+    // `toString`/`equals` would not — see the record's NOM-2.
+    //
+    // `argumentLayouts()` is `java.util.List`, NOT `ValueLayout[]`. The array
+    // spelling is the pre-JDK-22 preview signature and it is what
+    // `panama.rs`'s dead copy still registers; a caller writing `.size()` on
+    // the JDK 22+ API would have got the same `AbstractMethodError` even after
+    // that registrar was reached.
+    r.register(fd, "returnLayout", "()Ljava/util/Optional;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // MEASURED: `of(JAVA_LONG, ADDRESS).returnLayout()` is `Optional[j8]`
+        // and `ofVoid(JAVA_INT).returnLayout()` is `Optional.empty` — so the
+        // void carrier's null slot 0 must become an EMPTY Optional and not a
+        // present one holding null. `p67_optional` is the local helper the
+        // `name()`/`targetLayout()` readers already use, and it is measured
+        // working on a real `java.util.Optional` in `--jdk-only`
+        // (`JAVA_LONG.name()` prints `Optional.empty` today).
+        let value = ctx.get_field(this, 0);
+        let opt = p67_optional(ctx, value)?;
+        Ok(Some(Value::Object(Some(opt))))
+    });
+    r.register(fd, "argumentLayouts", "()Ljava/util/List;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Read the slot into a local FIRST: a `match` whose scrutinee is a
+        // `&self` call keeps that borrow alive for the whole match, and the
+        // fallback arm needs `&mut ctx` to mint the empty array.
+        let stored = ctx.get_field(this, 1);
+        let array = match stored {
+            Value::Object(Some(arr)) => arr,
+            _ => ctx.new_array(ArrayElementType::Reference, 0),
+        };
+        // `List.of` with an `Arrays.asList` fallback is this tree's idiom for
+        // handing back an immutable list (`lang_invoke::vh_coordinate_types`),
+        // and it is measured working in this binary: `RJdkForeign`'s
+        // `layoutVarHandles` step asserts
+        // `coordinateTypes().equals(List.of(MemorySegment.class, long.class))`
+        // and is green. The fallback matters for a descriptor built with a
+        // null member, which `List.of` refuses and `Arrays.asList` accepts —
+        // the oracle refuses that descriptor at the FACTORY (NPE), which this
+        // lane did not change, so the fallback keeps a carrier that already
+        // exists readable rather than turning a read into a second refusal.
+        let array_pin = ctx.pin_native_root(array);
+        let list = ctx
+            .invoke(
+                "java/util/List",
+                "of",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(array))],
+            )
+            .ok()
+            .flatten();
+        let list = match list {
+            Some(Value::Object(Some(_))) => list,
+            _ => {
+                let array = ctx.read_native_pin(array_pin, array);
+                ctx.invoke(
+                    "java/util/Arrays",
+                    "asList",
+                    "([Ljava/lang/Object;)Ljava/util/List;",
+                    &[Value::Object(Some(array))],
+                )
+                .ok()
+                .flatten()
+            }
+        };
+        ctx.unpin_native_roots(array_pin);
+        Ok(Some(list.unwrap_or(Value::Object(None))))
+    });
 
     // SymbolLookup — `loaderLookup`/`libraryLookup`/`find` are registered by
     // `panama::register_pe_symbol_lookup` (promoted to `Bridge` category
@@ -3250,4 +4418,109 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // clean unavailable signal.
     r.set_category(__prev_cat);
     ()
+}
+
+#[cfg(test)]
+mod g19_scope_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+
+    /// Build the synthetic segment shape `panama::pe_of_array_alias` and
+    /// `panama::pe_segment_slice` mint: eight slots, `[1]=byteSize`, and
+    /// `[2]` = the segment's own session.
+    fn stamped_segment(ctx: &mut dyn NativeContext, session: Value, byte_size: i64) -> ObjectRef {
+        let seg =
+            try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 8).unwrap();
+        ctx.set_field(seg, 0, Value::Long(0));
+        ctx.set_field(seg, 1, Value::Long(byte_size));
+        ctx.set_field(seg, P67_SEGMENT_ARENA, session);
+        ctx.set_field(seg, 3, Value::Int(0));
+        ctx.set_field(seg, 4, Value::Int(1));
+        ctx.set_field(seg, 5, Value::Long(0));
+        seg
+    }
+
+    /// G19-1: `scope()` on a carrier stamped with its session must hand back
+    /// THAT session, not a fresh one.
+    ///
+    /// MEASURED on 25.0.3+9-LTS: `heap.scope() == heap.scope()` and
+    /// `seg.asSlice(4,4).scope() == seg.scope()` are both true; CratonVM
+    /// answered false for both because this reader only ever looked for an
+    /// ARENA in slot 2, while `panama::pe_segment_slice` had been stamping the
+    /// SESSION there since W7-89. The `RForeignLayoutJdkInterfaces` assertion
+    /// "a heap segment's scope is stable" is this row.
+    #[test]
+    fn a_stamped_session_is_the_scope_and_it_is_the_same_object_every_time() {
+        let mut ctx = mock_ctx();
+        let session = p67_memory_session(&mut ctx).unwrap();
+        let seg = stamped_segment(&mut ctx, session, 16);
+
+        let first = p67_receiver_session(&mut ctx, seg).unwrap();
+        let second = p67_receiver_session(&mut ctx, seg).unwrap();
+        assert_eq!(first, session, "scope() must answer the stamped session");
+        assert_eq!(
+            first, second,
+            "scope() must answer the SAME object on every call"
+        );
+    }
+
+    /// The negative half, and it is not optional: slot 2's other tenant on an
+    /// `ofArray` MIRROR carrier is the Java backing array, and a reader that
+    /// accepted it as a session would read an array element as a state word.
+    ///
+    /// A carrier with nothing in slot 2 keeps the historical behaviour (a fresh
+    /// session), which is a separate, still-open divergence — see the record's
+    /// §"what this lane did NOT do".
+    #[test]
+    fn an_array_in_slot_two_is_not_a_scope() {
+        let mut ctx = mock_ctx();
+        let array = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let seg = stamped_segment(&mut ctx, Value::Object(Some(array)), 16);
+        let scope = p67_receiver_session(&mut ctx, seg).unwrap();
+        assert_ne!(
+            scope,
+            Value::Object(Some(array)),
+            "the backing array must never be handed out as a scope"
+        );
+        assert_eq!(
+            ctx.class_name_of_id(ctx.class_id_of_object(match scope {
+                Value::Object(Some(obj)) => obj,
+                other => panic!("scope() answered {other:?}"),
+            }))
+            .as_deref(),
+            Some("jdk/internal/foreign/MemorySessionImpl"),
+            "the fallback is still a session"
+        );
+    }
+
+    /// G19-1: and the stamped session is CHECKED, not merely reported.
+    ///
+    /// The arm added to `p67_receiver_session` without the matching arm here
+    /// would be the W7-89 fail-open one branch over: the one shape whose scope
+    /// resolves would be the one shape that skips the validity check. Oracle:
+    /// a closed arena's segment answers `IllegalStateException: Already closed`
+    /// on every access.
+    #[test]
+    fn a_stamped_session_that_has_closed_refuses_the_access() {
+        let mut ctx = mock_ctx();
+        let session = p67_memory_session(&mut ctx).unwrap();
+        let seg = stamped_segment(&mut ctx, session, 16);
+        assert!(
+            p67_segment_check_scope(&mut ctx, seg).is_ok(),
+            "an open session must let the access through"
+        );
+
+        let session_obj = match session {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("p67_memory_session answered {other:?}"),
+        };
+        let slots = p67_session_slots(&ctx, session_obj);
+        ctx.set_field(session_obj, slots.state, Value::Int(0));
+        let err = p67_segment_check_scope(&mut ctx, seg).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Already closed"),
+            "a closed stamped session must refuse; got {err:?}"
+        );
+    }
 }

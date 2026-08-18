@@ -3605,12 +3605,30 @@ impl OsrEntryPlan {
         let point = match osr_exit::resume_image(&artifact.deopt_points, rframe.bci) {
             osr_exit::ResumeImage::Unique { index, .. } => &artifact.deopt_points[index],
             osr_exit::ResumeImage::None => {
+                // Two different states share this arm, and saying so matters:
+                // `resume_image` skips `rethrow_exception` points (they are not
+                // resume images — see its doc), so a bci whose ONLY point is a
+                // reason-9 exceptional frame answers `None` here. That is not a
+                // mis-routed stash, it is a frame arriving at the wrong sink:
+                // its bci names a THROWING instruction and it belongs to
+                // `take_exceptional_frame`, not to a resume.
+                let rethrow_here = artifact
+                    .deopt_points
+                    .iter()
+                    .any(|p| p.bci == rframe.bci && p.semantics.rethrow_exception);
                 return Err(osr_refusal(
                     OSR_REFUSE_EXIT_REPLAY,
-                    format!(
-                        "exit bci {} is not a recorded deopt point of this artifact",
-                        rframe.bci
-                    ),
+                    if rethrow_here {
+                        format!(
+                            "exit bci {} names only a RETHROW point, which is not a resume                              point at all — it must be routed through the exception table                              (REEXECUTE semantics are required here)",
+                            rframe.bci
+                        )
+                    } else {
+                        format!(
+                            "exit bci {} is not a recorded deopt point of this artifact",
+                            rframe.bci
+                        )
+                    },
                 ));
             }
             osr_exit::ResumeImage::Ambiguous { first, second } => {
@@ -7761,18 +7779,26 @@ pub enum JitIntrinsic {
     // inlined as a coder+length-guarded raw byte compare (deopts to native
     // on a coder mismatch or a non-String argument).
     //
-    // Phase 3b follow-up: `compareTo` and both `indexOf` overloads are now
-    // ALSO inlined. Unlike `equals` (which can byte-compare only when the
-    // coders match), these three decode each receiver/argument character
+    // Phase 3b follow-up: `compareTo` and `indexOf(String)` are now ALSO
+    // inlined. Unlike `equals` (which can byte-compare only when the
+    // coders match), these decode each receiver/argument character
     // through a per-string `coder` branch (0 LATIN1 = 1 byte/char, 1 UTF16
     // = 2 LE bytes/char), so EVERY coder combination — including mixed —
     // is handled inline with no coder-mismatch deopt. The deopt stub is
     // still used for the genuinely uncertain cases (null receiver, null
     // String argument, null backing `value` array). Variant ordering here
     // is local and not externally observed.
-    StringEquals,      // equals(Ljava/lang/Object;)Z
-    StringCompareTo,   // compareTo(Ljava/lang/String;)I
-    StringIndexOfChar, // indexOf(I)I
+    StringEquals,    // equals(Ljava/lang/Object;)Z
+    StringCompareTo, // compareTo(Ljava/lang/String;)I
+    // `indexOf(I)I` — the codegen for this variant still exists in
+    // `x64/bytecode_walk.rs`, but `try_resolve_string_intrinsic` no longer
+    // hands the entry out, so nothing reaches it. Its inline body masks the
+    // needle to `ch & 0xFFFF`, which is not what the JDK does — the gate is
+    // `Character.isValidCodePoint`, applied BEFORE any narrowing, and a
+    // supplementary `ch` is matched as a surrogate PAIR. See the retirement
+    // note in `try_resolve_string_intrinsic` for the measured rows and for
+    // what restoring the fast path would take.
+    StringIndexOfChar, // indexOf(I)I — NOT handed out; see above
     StringIndexOfStr,  // indexOf(Ljava/lang/String;)I
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
@@ -8406,6 +8432,32 @@ pub static STATIC_SITES_SEEN_IR: std::sync::atomic::AtomicU64 =
 pub static THREAD_CURRENT_THREAD_SITES_OSR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Statically bound call sites at which a ladder ASKED `callee_compiler` for a
+/// direct target, split by whether it got one.
+///
+/// The question these answer is the one netty's census raised and no other
+/// instrument could: `AdaptiveByteBufAllocatorTest` runs 259 M
+/// `jit_invoke_dispatch` calls of which **98.4% are `DISPATCH_CACHE` hits** —
+/// a compiled callee, reached through a Rust helper, on every call. The callee
+/// is compiled; the caller simply could not bind it, because at the caller's
+/// compile time it was not compiled YET, and a call site's binding is decided
+/// once and never revisited. A miss here is that event, counted.
+///
+/// Compile-time only — one relaxed `fetch_add` per statically bound site per
+/// compile, never on a runtime path.
+pub static DIRECT_CALLEE_BIND_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(bound, unbound)` — see [`DIRECT_CALLEE_BIND_HITS`].
+pub fn direct_callee_bind_counts() -> (u64, u64) {
+    (
+        DIRECT_CALLEE_BIND_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        DIRECT_CALLEE_BIND_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `(single-pass, IR)` counts of `invokestatic` sites each direct-call ladder
 /// examined since process start.
 pub fn static_sites_seen() -> (u64, u64) {
@@ -9006,29 +9058,83 @@ pub fn try_resolve_string_intrinsic(
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-    // `equals`, `compareTo` and both `indexOf` overloads are inlined. The
-    // codegen ladder decodes every character through the receiver's /
-    // argument's own `coder` byte, so all LATIN1/UTF16 combinations are
-    // handled inline; only null receiver / null argument / null backing
-    // array route to the deopt stub. These signatures are declared on
-    // `java/lang/String` (not CharSequence), so they never reach a guarded
-    // (CharSequence) call site.
+    // `equals`, `compareTo` and `indexOf(String)` are inlined. The codegen
+    // ladder decodes every character through the receiver's / argument's own
+    // `coder` byte, so all LATIN1/UTF16 combinations are handled inline. These
+    // signatures are declared on `java/lang/String` (not CharSequence), so they
+    // never reach a guarded (CharSequence) call site.
     //
+    //   * equals(Object)      — the argument is NOT assumed to be a String.
+    //     The emitted body (`x64/bytecode_walk.rs`) tests the argument's
+    //     ObjectHeader class id against the receiver's and routes a mismatch
+    //     to the deopt stub, which is what makes it agree with
+    //     `String.equals`'s `anObject instanceof String` guard: String is
+    //     final, so equal class ids IS the instanceof. That test is
+    //     load-bearing, not an optimisation — everything below it reaches the
+    //     argument's `value` array by SLOT INDEX, and CratonVM's synthetic
+    //     `StringBuilder` also has `char[] value` at slot 0. Measured on
+    //     OpenJDK 25.0.3+9: `"abc".equals(new StringBuilder(3).append("abc"))`
+    //     is `false` (the builder really does have capacity 3, so even the
+    //     length matches) while `contentEquals` is `true`. See E18-1 §3, which
+    //     fixed the same hole on the native side; this door already had the
+    //     class-id compare, so both tiers now answer `false`.
     //   * compareTo(String)   — lexicographic decoded-char compare; the
     //     unsigned-char difference at the first mismatch, else len1-len2.
-    //   * indexOf(I)          — scan for `(ch & 0xFFFF)` from index 0,
-    //     bit-identical to native `String.indexOf(int)` (which likewise
-    //     masks to a single code unit — supplementary code points match
-    //     their masked low half, no surrogate special-casing).
     //   * indexOf(String)     — naive O(n*m) substring search from 0; an
     //     empty needle returns 0.
+    //
+    // `indexOf(I)` is deliberately NOT recognised — see the block below.
     if is_string {
         let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
             ("compareTo", "(Ljava/lang/String;)I") => {
                 Some((JitIntrinsic::StringCompareTo, 1, b'I'))
             }
-            ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
+            // `indexOf(I)` — RETIRED, deliberately not intrinsified here.
+            //
+            // The inline body masks the needle to `ch & 0xFFFF` and the comment
+            // that used to stand here called that "bit-identical to native
+            // `String.indexOf(int)`". Both halves were false. The JDK does not
+            // narrow `ch`: it gates on `Character.isValidCodePoint` FIRST, then
+            // scans for one code unit if `ch <= 0xFFFF` and for the SURROGATE
+            // PAIR if `ch >= 0x10000`. Measured on OpenJDK 25.0.3+9 (this
+            // lane's `scratchpad/e27/E27Probe.java`):
+            //
+            //     "abc".indexOf(0x10061)   -1     masking finds 'a' at 0
+            //     "￿q".indexOf(-1)    -1     masking finds U+FFFF at 0
+            //     mixed.indexOf(0x10437)    3     the pair, not its low half at 1
+            //
+            // The `indexOf(-1)` row is the one that rejects the plausible wrong
+            // fix: `(char) -1` IS `0xFFFF` and the receiver DOES hold `0xFFFF`,
+            // yet HotSpot answers -1 — so the rule is the validity gate, not a
+            // narrowing cast.
+            //
+            // E18-1 rewrote the native side onto ONE `code_point_needle`
+            // predicate plus two shared scanners, replacing four divergent
+            // copies of this single JVMS rule. Re-implementing the gate here
+            // would make a fifth. Dropping the recognition sends the call site
+            // through ordinary dispatch to that one predicate instead, which is
+            // the only way this door can carry the rule without owning a copy
+            // of it — `jit/src/lib.rs` is below `native-builtins` in the crate
+            // graph and cannot call `code_point_needle` directly.
+            //
+            // Verified before landing: ordinary dispatch reaches a CORRECT
+            // implementation in both modes. In real-JDK mode a `Bridge`-kind
+            // `java/lang/String` native is dropped at registration
+            // (`native-api/src/registry.rs`, `drop_real_layout_synthetic`), so
+            // nothing shadows the real JDK's own `String.indexOf(int)`
+            // bytecode; in synthetic-jdk mode `register_synthetic_overrides`
+            // last-write-wins with `native_string_index_of`, which is the
+            // `code_point_needle` body.
+            //
+            // This costs the inline scan on a hot method. Restoring it is a
+            // codegen change, not a recognition change: emit the fast path
+            // under a runtime screen (`ch < 0 || ch > 0xFFFF` -> deopt), which
+            // admits exactly the range where a single-code-unit scan already IS
+            // the whole answer and defers every other case to the predicate.
+            // That belongs in `x64/bytecode_walk.rs` and is nominated as N2b in
+            // `docs/known-issues/jdk-only/`
+            // `E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md`.
             ("indexOf", "(Ljava/lang/String;)I") => Some((JitIntrinsic::StringIndexOfStr, 1, b'I')),
             _ => None,
         };
@@ -12851,6 +12957,32 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
     jit_bail_list().write().insert(h);
 }
 
+/// Bail-list a method AND record the refusal site the compile that just ran left
+/// behind, so `CRATONVM_DBG=jit-method-stats` can name it.
+///
+/// [`mark_jit_bail_listed`] alone leaves the reason unrecorded. That is fine for a
+/// caller that has already recorded one, and wrong for the OSR door in
+/// `vm/src/runtime/interpreter/jit_bridge.rs`, which reaches the backend directly:
+/// its bails arrived in the report as `reason=unrecorded`, which is exactly the
+/// shape that sends a reader looking for a compiler bug somewhere else. An OSR bail
+/// is also the one that matters most — that door compiles a `@Test` method's hot
+/// loop, and a method denied there runs its whole life interpreted with no other
+/// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
+/// exhaustive loops (fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md).
+///
+/// Consumes the thread-local site, like `try_compile`'s own recorder.
+pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
+    mark_jit_bail_listed(class_name, method_name, descriptor);
+    let site = take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0));
+    record_jit_bail_reason(class_name, method_name, descriptor, site);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] OSR-bail site={} pc={} opcode={:#04x} {class_name}.{method_name}{descriptor}",
+            site.0, site.1, site.2,
+        );
+    }
+}
+
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
@@ -13443,6 +13575,44 @@ impl Drop for JitCompileStackGuard {
             debug_assert_eq!(popped.as_ref(), Some(&self.key));
         });
     }
+}
+
+/// Depth of the nested-compile stack on this thread.
+///
+/// `0` outside any compile; `1` inside a top-level `try_compile`; deeper while a
+/// `callee_compiler` compiles a callee inside its caller's compilation.
+///
+/// # Why a VM-side caller needs this
+///
+/// Binding a statically bound call site to a raw `CALL` requires the callee to be
+/// COMPILED ALREADY, and `vm/.../jit_bridge.rs`'s callee resolver
+/// (`direct_callee_lookup`) may compile one transitively to get there. Without a
+/// depth bound, a deep call chain compiled bottom-up on one thread would nest one
+/// compile per level; with one, the chain stops binding directly past the bound
+/// and falls back to the dispatch helper, which is always correct.
+pub fn jit_active_compile_depth() -> usize {
+    JIT_COMPILE_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Whether `(class_name, method_name, descriptor)` is already being compiled
+/// somewhere on this thread's nested-compile stack.
+///
+/// A VM-side transitive callee compile must ask this before recursing:
+/// re-entering a compile that is already open would recurse until the depth bound
+/// (or the native stack) ran out. Same question [`note_jit_recursive_compile_cycle`]
+/// answers for this crate's own `callee_compiler`, minus the cycle bookkeeping —
+/// the VM caller only needs to decline.
+pub fn jit_active_compile_contains(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    JIT_COMPILE_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .any(|k| k.matches(class_name, method_name, descriptor))
+    })
 }
 
 fn mark_jit_recursive_cycle_method(key: JitCompileMethodKey) {
@@ -14849,6 +15019,124 @@ fn precise_virtual_invokes_enabled() -> bool {
     })
 }
 
+/// Does this method contain an **inline trapping bytecode inside a protected
+/// range** that the optimizing tier lowers to a *deopt it cannot resume*, with
+/// a side effect in the same range that a whole-method replay would repeat?
+///
+/// Returns the offending `(pc, opcode)`, or `None` when the optimizing tier may
+/// take the method.
+///
+/// ## What goes wrong without this
+///
+/// The IR tier lowers an array access, an `arraylength`, a field access and a
+/// division to **deopt guards** (`emit_array_null_bounds_guards`,
+/// `emit_deopt_if_zero`), on the stated promise that "the interpreter
+/// re-executes the opcode and throws the exact NPE / AIOOBE with full
+/// semantics (including any in-method handler)". Re-executing needs a precise
+/// resume — and `can_deopt_resume` is only ever set on the IR path in the
+/// narrow scalar-replacement case (`ir_lower.rs`, guarded by
+/// `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`), so on a production
+/// artifact it is **false**. The interpreter then has to fall back to replaying
+/// the whole method, refuses because that would re-run the side effects already
+/// committed, and raises a hard `InternalError`.
+///
+/// The single-pass backend has no such problem: its bounds check calls
+/// `jit_throw_aioobe` and returns the sentinel through the epilogue, and the
+/// interpreter routes the exception through the method's own exception table
+/// without resuming anything. So declining here is not "stay interpreted" — it
+/// is "use the backend that handles this shape", at single-pass code quality.
+///
+/// ## Why it is this narrow
+///
+/// `docs/internal/fixed-bugs/unresumable-unconditional-trap-mvmap-FIXED-20260802.md`
+/// warns in as many words: *"Do not apply the publish-side rule blind... the
+/// naive form would refuse every trap-carrying artifact, including the many
+/// whose re-run-from-entry fallback works fine."* Two narrowing terms keep that
+/// from happening:
+///
+/// 1. **only the deopt-guarded opcodes.** Invokes, `new`, `ldc`, `checkcast`
+///    and the monitor ops all leave through the `i64::MIN` sentinel and the
+///    exception-routing path, which needs no resume. They are not listed.
+/// 2. **only when the range also commits a side effect.** A read-only
+///    `try { return a[i]; } catch (...)` replays harmlessly, so the refusal
+///    would buy nothing and cost the compile. `advance()` — the reported
+///    witness — stores two fields on every iteration *before* the trapping
+///    `baload`, which is exactly what makes its replay observably wrong.
+///
+/// The side-effect scan is deliberately whole-range rather than
+/// "before the trap in pc order": the witness is a **loop**, where a store at a
+/// lower pc executes on the iteration *after* the one that traps. Pc order is
+/// not execution order, and the cheap conservative answer is the correct one.
+fn ir_unresumable_protected_trap(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> Option<(usize, u8)> {
+    if exception_table.is_empty() {
+        return None;
+    }
+    let covered = |pc: usize| {
+        exception_table
+            .iter()
+            .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
+    };
+    // The opcodes whose IR lowering is a deopt guard. Kept in step with
+    // `ir_lower.rs`: array element access and `arraylength` go through
+    // `emit_array_null_bounds_guards` / `emit_deopt_if_zero`, `getfield` /
+    // `putfield` through the inline null check, and the integer divisions
+    // through the div-by-zero guard.
+    let deopt_guarded = |op: u8| {
+        matches!(
+            op,
+            0x2e..=0x35 // array loads
+                | 0x4f..=0x56 // array stores
+                | 0x6c | 0x6d | 0x70 | 0x71 // idiv / irem / ldiv / lrem
+                | 0xb4 | 0xb5 // getfield / putfield
+                | 0xbe // arraylength
+        )
+    };
+    // What makes a replay observably wrong. Stores and calls only — a pure
+    // computation can be re-run.
+    let side_effecting = |op: u8| {
+        matches!(
+            op,
+            0x4f..=0x56 // array stores
+                | 0xb3 | 0xb5 // putstatic / putfield
+                | 0xb6..=0xba // the invokes
+                | 0xc2 | 0xc3 // monitorenter / monitorexit
+        )
+    };
+
+    let mut trap: Option<(usize, u8)> = None;
+    let mut has_side_effect = false;
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        if covered(pc) {
+            if trap.is_none() && deopt_guarded(op) {
+                trap = Some((pc, op));
+            }
+            if side_effecting(op) {
+                has_side_effect = true;
+            }
+        }
+        // Same walk `first_unsupported_precise_frame_site` uses; a length of 0
+        // or one that runs off the end means the scan lost sync, and the
+        // conservative answer to "I can no longer read this code" is to
+        // decline the tier rather than guess.
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return trap.or(Some((pc, op)));
+        }
+        pc += len;
+    }
+    if has_side_effect {
+        trap
+    } else {
+        None
+    }
+}
+
 /// Thin `bool` wrapper over [`first_unsupported_precise_frame_site`], kept for
 /// the call sites that only need the verdict.
 #[cfg(target_arch = "x86_64")]
@@ -14876,8 +15164,19 @@ fn precise_exception_frame_sites_supported(
 /// A malformed instruction stream also answers `Some` (at the offending pc,
 /// with the opcode that could not be measured): a walk that cannot find the
 /// next boundary has not proved anything about the rest of the method.
+///
+/// **Public because the OSR door asks the same question.** RBC.6b refused any
+/// OSR compile of a method with a non-empty exception table outright, on the
+/// grounds that an OSR artifact carries no handler ranges. Staging the same
+/// three requests the method-entry path stages (`set_precise_exception_frame_
+/// request` / `set_protected_ranges_request` / `set_pending_exception_ranges`)
+/// gives the OSR body reason-9 frames at its protected-range invokes — but only
+/// where every throwing site in those ranges publishes one. That is exactly
+/// this predicate, so `compile_osr_artifact` calls it rather than growing a
+/// second, drifting copy of the opcode table. See
+/// `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`.
 #[cfg(target_arch = "x86_64")]
-fn first_unsupported_precise_frame_site(
+pub fn first_unsupported_precise_frame_site(
     code: &[u8],
     code_len: usize,
     exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
@@ -15474,6 +15773,14 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
+        } else if let Some((pc, op)) =
+            ir_unresumable_protected_trap(code, code_len, &cached.exception_table)
+        {
+            format!(
+                "an inline trap this tier deopts on (pc={pc}, opcode={op:#04x}) sits in a \
+                 protected range that also commits a side effect; the deopt could not be \
+                 resumed, so the single-pass backend takes it"
+            )
         } else if let Some(k) = single_pass_only_lowering_for(code, code_len, cached) {
             format!(
                 "the single-pass backend has {} here and the IR tier has no equivalent",
@@ -15632,6 +15939,11 @@ fn try_compile_inner(
         // that landed — and as an escape hatch if a workload ever regresses.
         && !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
         && !precise_exception_frames
+        // An inline trap inside a protected range that this tier lowers to an
+        // unresumable deopt — see `ir_unresumable_protected_trap`. Falls
+        // through to the single-pass backend, which throws and routes through
+        // the exception table instead of deopting.
+        && ir_unresumable_protected_trap(code, code_len, &cached.exception_table).is_none()
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it
@@ -16611,9 +16923,20 @@ fn try_compile_inner(
                                             )
                                         {
                                             direct_target = Some((entry, callee_needs_ctx));
+                                            DIRECT_CALLEE_BIND_HITS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         } else {
                                             mark_current_jit_compile_method_recursive_cycle();
+                                            DIRECT_CALLEE_BIND_MISSES
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                    } else {
+                                        // The one that matters: the compiler had
+                                        // nothing to give, so this site is bound
+                                        // to the dispatch helper for the life of
+                                        // this body. See `DIRECT_CALLEE_BIND_HITS`.
+                                        DIRECT_CALLEE_BIND_MISSES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -18399,9 +18722,17 @@ fn try_compile_inner(
                     // are why this only bites a small overridable method.
                     if direct_jit_callee_calls_enabled && matches!(invoke_kind, 1 | 3) {
                         if let Some(compiler) = callee_compiler.as_ref() {
-                            if let Some((entry, callee_needs_ctx)) =
-                                compiler(&class_name, &method_name, &descriptor)
-                            {
+                            let probed = compiler(&class_name, &method_name, &descriptor);
+                            if probed.is_none() {
+                                // See `DIRECT_CALLEE_BIND_HITS`: this site is now
+                                // bound to `jit_invoke_dispatch` permanently, and
+                                // the callee is very often compiled moments later.
+                                DIRECT_CALLEE_BIND_MISSES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some((entry, callee_needs_ctx)) = probed {
+                                DIRECT_CALLEE_BIND_HITS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if jit_direct_call_requires_dispatch(
                                     &class_name,
                                     &method_name,
@@ -20280,6 +20611,111 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The optimizing tier must decline exactly the shape that crashed
+    /// `SparseRealVectorTest`, and nothing broader.
+    ///
+    /// Both directions matter and they fail differently. Refusing too much is
+    /// silent — the method drops to single-pass and only a benchmark notices,
+    /// which is why the measured reach is pinned here as well as the witness.
+    /// Refusing too little is a hard `InternalError` on the first trap.
+    #[test]
+    fn ir_declines_an_unresumable_protected_trap_and_only_that() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        fn range(start: u16, end: u16) -> Vec<ExceptionTableEntry> {
+            vec![ExceptionTableEntry {
+                start_pc: start,
+                end_pc: end,
+                handler_pc: end,
+                catch_type: 1,
+            }]
+        }
+
+        // `OpenIntToDoubleHashMap$Iterator.advance()` in miniature: a putfield
+        // (side effect) and a baload (deopt-guarded trap) inside one range.
+        //   0: aload_0        (0x2a)
+        //   1: aload_0        (0x2a)
+        //   2: getfield  #1   (0xb4 0x00 0x01)
+        //   5: putfield  #2   (0xb5 0x00 0x02)
+        //   8: aload_0        (0x2a)
+        //   9: iconst_0       (0x03)
+        //  10: baload         (0x33)
+        //  11: return         (0xb1)
+        let advance_like = [
+            0x2a, 0x2a, 0xb4, 0x00, 0x01, 0xb5, 0x00, 0x02, 0x2a, 0x03, 0x33, 0xb1,
+        ];
+        let site = ir_unresumable_protected_trap(&advance_like, advance_like.len(), &range(0, 11));
+        assert!(site.is_some(), "the witness shape must be declined");
+
+        // No exception table at all: the trap propagates out, nothing to route.
+        assert_eq!(
+            ir_unresumable_protected_trap(&advance_like, advance_like.len(), &[]),
+            None,
+            "an unprotected trap is not this gate's business"
+        );
+
+        // The trap is OUTSIDE the protected range.
+        assert_eq!(
+            ir_unresumable_protected_trap(&advance_like, advance_like.len(), &range(0, 2)),
+            None,
+            "a range that does not cover the trap must not be declined"
+        );
+
+        // Read-only range: a baload with nothing committed before it. Replaying
+        // from entry is harmless here, so declining would cost a compile and
+        // buy nothing — the narrowing term the H2 precedent asks for.
+        //   0: aload_0, 1: iconst_0, 2: baload, 3: ireturn
+        let read_only = [0x2a, 0x03, 0x33, 0xac];
+        assert_eq!(
+            ir_unresumable_protected_trap(&read_only, read_only.len(), &range(0, 3)),
+            None,
+            "a side-effect-free protected trap must still compile"
+        );
+
+        // A protected range whose only throwing site is an invoke: those exit
+        // through the sentinel + exception routing, which needs no resume.
+        //   0: aload_0, 1: invokevirtual #3, 4: return
+        let invoke_only = [0x2a, 0xb6, 0x00, 0x03, 0xb1];
+        assert_eq!(
+            ir_unresumable_protected_trap(&invoke_only, invoke_only.len(), &range(0, 4)),
+            None,
+            "an invoke is not a deopt-guarded inline trap"
+        );
+
+        // Side effect present but no deopt-guarded trap: putstatic only.
+        //   0: iconst_0, 1: putstatic #4, 4: return
+        let store_only = [0x03, 0xb3, 0x00, 0x04, 0xb1];
+        assert_eq!(
+            ir_unresumable_protected_trap(&store_only, store_only.len(), &range(0, 4)),
+            None,
+            "a side effect with no trap has nothing to deopt on"
+        );
+
+        // Every opcode family the IR tier lowers to a deopt guard must be
+        // recognised — this is the list that has to stay in step with
+        // `ir_lower.rs`, and the one that silently rots if nobody pins it.
+        for (op, label) in [
+            (0x2eu8, "iaload"),
+            (0x33u8, "baload"),
+            (0x4fu8, "iastore"),
+            (0x54u8, "bastore"),
+            (0x6cu8, "idiv"),
+            (0x70u8, "irem"),
+            (0xb4u8, "getfield"),
+            (0xbeu8, "arraylength"),
+        ] {
+            // `putstatic` supplies the side effect so the trap is the variable
+            // under test; two-byte operands for the field ops.
+            let code = [0x03, 0xb3, 0x00, 0x04, op, 0x00, 0x01, 0xb1];
+            let len = if matches!(op, 0xb4 | 0xb5) { 8 } else { 6 };
+            assert!(
+                ir_unresumable_protected_trap(&code[..len], len, &range(0, (len - 1) as u16))
+                    .is_some(),
+                "{label} must be recognised as a deopt-guarded trap"
+            );
+        }
+    }
 
     /// RBC.6's admission list must match what the lowerings actually publish.
     ///
@@ -24353,20 +24789,30 @@ mod tests {
 
         // Two images of the loop header that disagree on the SEMANTICS.
         //
-        // `RETHROW`, not `RESUME`, and the choice is the whole point: a
-        // `RESUME` point anywhere in an artifact is already refused by the
-        // per-point rule above (`osr-entry-unresumable-exit`), so it could
-        // never reach this check. A `RETHROW` point is explicitly ALLOWED to
-        // exist — such points are stashed separately and never routed to a
-        // resume — which is exactly what makes it the reachable disagreement:
-        // `for_reason` answers `RETHROW` for `PendingException` and `REEXECUTE`
-        // for everything else.
+        // This used to be spelled `REEXECUTE` vs `RETHROW`, on the reasoning
+        // that a `RESUME` point is refused by the per-point rule before this
+        // check sees it while a `RETHROW` point is explicitly allowed to exist.
+        // Both halves of that were true and the conclusion was wrong: a
+        // `RETHROW` point is not a competing resume IMAGE — the same sentence
+        // that admits it says such points are "stashed separately and never
+        // routed to a resume" — so a bci carrying one plus one `REEXECUTE`
+        // point has exactly one image and no ambiguity.
+        //
+        // Refusing it was not academic. After the RBC.6b lift (2026-08-17) a
+        // `try { foo(x); } catch (...)` loop puts a speculative-dispatch guard
+        // and a `PendingException` frame on the same invoke bci, which is the
+        // ORDINARY shape of the population that lift admits;
+        // `probes/OsrExcTableProbe.java` reported `osr_entered=0
+        // osr_entry_refused_ambiguous_image=15` with every correctness arm
+        // green. `osr_exit::resume_image` now skips rethrow points, and
+        // `a_rethrow_point_is_not_a_competing_resume_image` is that case.
+        //
+        // What remains here is the genuine disagreement between two things that
+        // both claim to be resume points, which is the wrong-code half.
         let mut cm = osr_t_artifact(3);
         let mut other = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
         other.native_offset = 0x90;
-        other.reason = deopt::DeoptReason::PendingException;
-        other.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
-        assert_eq!(other.semantics, deopt::ResumeSemantics::RETHROW);
+        other.semantics = deopt::ResumeSemantics::RESUME;
         cm.deopt_points = vec![
             osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
             other,
@@ -24374,11 +24820,35 @@ mod tests {
         let err = cm
             .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
             .unwrap_err();
-        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE));
+        // The per-point `RESUME` rule fires first (it walks the list before the
+        // ambiguity scan), so THAT is what this pair reports. Assert the
+        // ambiguity scan itself directly, where nothing else can shadow it.
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
         assert!(
             osr_refusal_is_permanent(&err),
             "the point list is a pure function of the artifact, so the refusal is memoable"
         );
+        assert!(
+            osr_exit::first_ambiguous_resume_bci(&cm.deopt_points).is_some(),
+            "two points that both claim to be resume points and disagree are ambiguous"
+        );
+
+        // And the rethrow pairing, which must NOT be ambiguous — the correction
+        // above, asserted at the same level as the refusal it replaced.
+        let mut rethrow_pair = osr_t_artifact(3);
+        let mut exc = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        exc.native_offset = 0x90;
+        exc.reason = deopt::DeoptReason::PendingException;
+        exc.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
+        assert_eq!(exc.semantics, deopt::ResumeSemantics::RETHROW);
+        rethrow_pair.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            exc,
+        ];
+        let plan = rethrow_pair
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("a RETHROW point sharing a bci must not refuse the entry");
+        assert_eq!(plan.exit_policy, OsrExitPolicy::ExactTransfer);
 
         // Over-refusal guard 1: several native images of ONE bytecode is
         // exactly what a loop transform produces, and they agree on everything
@@ -24533,6 +25003,12 @@ mod tests {
         let err = plan.resume_after_exit(&cm, &rframe).unwrap_err();
         assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
         assert!(err.to_string().contains("REEXECUTE"), "{err}");
+        // …and it says WHY, rather than "not a recorded deopt point": since
+        // `resume_image` stopped counting rethrow points as resume images, a
+        // bci whose only point is one answers `None` there, and the generic
+        // "not recorded" wording would send the reader looking for a
+        // mis-routed stash that does not exist.
+        assert!(err.to_string().contains("RETHROW"), "{err}");
     }
 
     /// A crash handler must be able to tell "no compiled body covers this

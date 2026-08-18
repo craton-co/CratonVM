@@ -17,6 +17,86 @@ swap-simulation both ran on `java` and their transcripts are in §6.
 
 Branch `fix/month-stringjoiner-method-slot-maps-20260812`.
 
+> **SOURCE-VERIFICATION BANNER — 2026-08-12, triage pass (A28). §5.3's
+> disposition stands and BOTH of its stated reasons are false. Do not quote
+> either of them.**
+>
+> §5.3 declines to renumber `METHOD_LEGACY_SLOT_*` on two grounds: (a) *"the
+> guard means these indices are only ever applied to the fabricated mirror, where
+> they ARE the layout"*, and (b) a renumber *"would break `test_utils.rs`'s
+> `MockNativeContext`, which maps field names onto exactly these slots and is the
+> oracle for the synthetic-mode tests"*. Read against the tree, neither holds.
+>
+> **(a) The fabricated mirror's layout is not the legacy map — it is the REAL
+> map.** `ClassManager::synthetic_stub_fields`' `"java/lang/reflect/Method"` arm
+> (`classloading/src/class_manager.rs:13231`) is `pad_to(vec![…], 15)` over
+> eleven **named** fields, and its own comment (`:13222`–`:13230`) records that
+> they were deliberately aligned to the image — `Executable`'s two on top of
+> `AccessibleObject`'s two, *"so their own fields start at index 4, not index 1"*.
+> The result reproduces §1's `javap` table exactly for 0..10:
+>
+> | | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+> |---|---|---|---|---|---|---|---|---|---|---|---|
+> | real JDK 25 **and** the fabricated stub | `override` | `accessCheckCache` | `parameterData` | `declaredAnnotations` | `clazz` | `slot` | `name` | `returnType` | `parameterTypes` | `exceptionTypes` | `modifiers` |
+> | `METHOD_LEGACY_SLOT_*` | `clazz` | `name` | `returnType` | `modifiers` | `slot` | — | `override` | `parameterTypes` | `callerSensitive` | `exceptionTypes` | `annotations` |
+>
+> The two agree on `exceptionTypes`(9) and on nothing else — which is §3's
+> *"11 of 12 disagree"* verdict, correct as stated, but the class it disagrees
+> with is **both** classes, not just the real one.
+>
+> **And the guard does not select the legacy map for the fabricated mirror.**
+> `method_class_has_named_layout` (`native-builtins/src/lang_class.rs:8363`) is
+> `resolve_field_index_by_class_id(class_id, "clazz").is_some()`. The fabricated
+> stub **declares `clazz`**, at index 4. So the predicate answers `true` for the
+> fabricated mirror exactly as it does for a real one, and the fabricated mirror
+> takes the **named** path. The legacy indices are reached only by a receiver
+> whose class declares no `clazz` at all — which is neither shipping mode's
+> `java.lang.reflect.Method`. That is the foreign-receiver case W7-49 §8 says no
+> width-derived helper can make safe, and it is why the disposition is still
+> right: **not because the map is correct for someone, but because it is correct
+> for nobody and reached by nobody.** A future lane should be told that the
+> honest change here is a deletion behind a gate, not a renumber and not a
+> defence.
+>
+> **(b) The mock is not an oracle for this; it is a third copy of the legacy
+> map.** `mock_jdk_field_slot` (`native-builtins/src/test_utils.rs:197`) is
+> `clazz`→0, `name`→1, `returnType`→2, `modifiers`→3, `slot`→4, `override`→6,
+> `parameterTypes`→7, `callerSensitive`→8, `exceptionTypes`→9, `annotations`→10,
+> `parameterAnnotations`→11, `annotationDefault`→12 — **byte-for-byte
+> `METHOD_LEGACY_SLOT_*`**. And `MockNativeContext::resolve_field_index_by_class_id`
+> (`:2112`) falls through to `mock_field_slot` for any field a test did not
+> declare with `set_declared_fields`, where the doc at `:228` records that
+> `mock_jdk_field_slot` is made to **outrank** the fabricated model for exactly
+> this family. So under the mock a `Method` mirror's `clazz` is at 0; under the
+> VM, in both modes, it is at 4. The mock and the legacy map agree with each
+> other and with nothing the VM produces.
+>
+> Consequence beyond this row, and it is the reason to write it down: **any test
+> that asserts a slot INDEX on a `Method`/`Field`/`Constructor` mirror is
+> measuring `mock_jdk_field_slot`, not CratonVM's layout.** That is the
+> mock-name-to-slot-table trap this project already keeps a record of, met here
+> in the one family the mock is deliberately allowed to shadow. The gates §6.1
+> lists for this row are text scans over source and are unaffected; it is the
+> behavioural tests around the mirror that inherit the mock's numbers.
+>
+> **Verified true and not to be re-derived:** `declare_slot_map(` has **eight**
+> production call sites — `native-io/src/lib.rs:5691`,
+> `native-collections/src/lib.rs:30409`, `jdk25_concurrency.rs:2058`,
+> `lang_reflect.rs:2021`, `phases_early.rs:11523`,
+> `phases_late/concurrent.rs:8376` and `:8656`,
+> `phases_late/net_channels.rs:78` — so §7 item 2's corrected denominator holds.
+> `verify_declared_slot_maps` **has callers** (`vm-cli/src/main.rs`,
+> `vm/src/vm/vm_init.rs`), so §7 item 2's CLOSED note holds. There really are
+> **two** `MONTH_FIELD_VALUE` maps (`util_time.rs:5523`, `phases_early.rs:11423`),
+> so §2.1 holds. `SJ_SYNTHETIC_SLOT_*` are renamed and span 0..4, and
+> `class_manager.rs:12367` fabricates `java/util/StringJoiner` at **5** — the one
+> row of this record where allocation width, fabricated width and slot map all
+> agree, which is why §5.2's "the map is for a different class" reading is right.
+> §3.1's `Thread` table also holds, but see W7-73's triage banner: the fabricated
+> `java/lang/Thread` declares **eight** fields, not the five that record's sources
+> still claim, and this record's `THREAD_SYNTHETIC_NUM_FIELDS` = 6 is a third
+> value again.
+
 ## 1. The oracle, and what it says
 
 Four layouts, re-derived before anything was touched. The task's instruction to

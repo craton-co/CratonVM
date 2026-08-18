@@ -82,12 +82,27 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
          `aastore` and `Array.set` now accept every reference store",
     );
 
-    // Documented lenience 1: an INTERFACE component. Proving a value implements
-    // an interface is unreliable here (dynamic/annotation proxies, synthetic
-    // classes implement them at runtime), so the predicate declines to throw.
+    // NO LONGER a documented lenience. An interface component used to `return
+    // true` unconditionally, which made this the assertion that pinned the
+    // blanket in place; HotSpot 25.0.3 throws `ArrayStoreException` for
+    // `Runnable[] <- String` and `Comparable[] <- Object`, and the predicate
+    // permitted both. An unrelated concrete value must now be REFUSED against
+    // an interface component exactly as against a concrete one.
+    // docs/known-issues/jdk-only/W7-101-aastore-interface-component-blanket.md
     assert!(
-        aastore_element_assignable(&shared, iface_arr, beta_obj),
-        "an interface component must fail open",
+        !aastore_element_assignable(&shared, iface_arr, beta_obj),
+        "AastoreBeta implements nothing, so storing it into an AastoreIface[] \
+         must be refused — an interface component is not a reason to fail open",
+    );
+
+    // …and the fail-open population the blanket was WRITTEN for is still served,
+    // now by the arm that can actually tell a proxy from an `Object`: the
+    // `$Proxy` name test below `is_subclass_of`. Without this assertion the one
+    // above would also pass against a predicate that had started refusing
+    // everything with an interface component.
+    assert!(
+        aastore_element_assignable(&shared, iface_arr, proxy_obj),
+        "a $Proxy-named value must still fail open against an interface component",
     );
 
     // Documented lenience 2: a `$Proxy`-named value. This is the arm that

@@ -1,0 +1,65 @@
+# jdk-baseline	2
+# kind	class
+# name	javax.net.ssl.SSLParameters
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/javax/net/ssl/SSLParameters.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	28
+# protected-methods	0
+# declared-methods	32
+# declared-fields	14
+# rows	49
+# columns	kind	name	descriptor	flags
+CLASS	javax.net.ssl.SSLParameters		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<init>	()V	public
+METHOD	<init>	([Ljava/lang/String;)V	public
+METHOD	<init>	([Ljava/lang/String;[Ljava/lang/String;)V	public
+METHOD	clone	([Ljava/lang/String;)[Ljava/lang/String;	private,static
+METHOD	getAlgorithmConstraints	()Ljava/security/AlgorithmConstraints;	public
+METHOD	getApplicationProtocols	()[Ljava/lang/String;	public
+METHOD	getCipherSuites	()[Ljava/lang/String;	public
+METHOD	getEnableRetransmissions	()Z	public
+METHOD	getEndpointIdentificationAlgorithm	()Ljava/lang/String;	public
+METHOD	getMaximumPacketSize	()I	public
+METHOD	getNamedGroups	()[Ljava/lang/String;	public
+METHOD	getNeedClientAuth	()Z	public
+METHOD	getProtocols	()[Ljava/lang/String;	public
+METHOD	getSNIMatchers	()Ljava/util/Collection;	public,final
+METHOD	getServerNames	()Ljava/util/List;	public,final
+METHOD	getSignatureSchemes	()[Ljava/lang/String;	public
+METHOD	getUseCipherSuitesOrder	()Z	public,final
+METHOD	getWantClientAuth	()Z	public
+METHOD	setAlgorithmConstraints	(Ljava/security/AlgorithmConstraints;)V	public
+METHOD	setApplicationProtocols	([Ljava/lang/String;)V	public
+METHOD	setCipherSuites	([Ljava/lang/String;)V	public
+METHOD	setEnableRetransmissions	(Z)V	public
+METHOD	setEndpointIdentificationAlgorithm	(Ljava/lang/String;)V	public
+METHOD	setMaximumPacketSize	(I)V	public
+METHOD	setNamedGroups	([Ljava/lang/String;)V	public
+METHOD	setNeedClientAuth	(Z)V	public
+METHOD	setProtocols	([Ljava/lang/String;)V	public
+METHOD	setSNIMatchers	(Ljava/util/Collection;)V	public,final
+METHOD	setServerNames	(Ljava/util/List;)V	public,final
+METHOD	setSignatureSchemes	([Ljava/lang/String;)V	public
+METHOD	setUseCipherSuitesOrder	(Z)V	public,final
+METHOD	setWantClientAuth	(Z)V	public
+FIELD	algorithmConstraints	Ljava/security/AlgorithmConstraints;	private
+FIELD	applicationProtocols	[Ljava/lang/String;	private
+FIELD	cipherSuites	[Ljava/lang/String;	private
+FIELD	enableRetransmissions	Z	private
+FIELD	identificationAlgorithm	Ljava/lang/String;	private
+FIELD	maximumPacketSize	I	private
+FIELD	namedGroups	[Ljava/lang/String;	private
+FIELD	needClientAuth	Z	private
+FIELD	preferLocalCipherSuites	Z	private
+FIELD	protocols	[Ljava/lang/String;	private
+FIELD	signatureSchemes	[Ljava/lang/String;	private
+FIELD	sniMatchers	Ljava/util/Collection;	private
+FIELD	sniNames	Ljava/util/List;	private
+FIELD	wantClientAuth	Z	private

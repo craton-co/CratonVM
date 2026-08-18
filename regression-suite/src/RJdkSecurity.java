@@ -4,6 +4,7 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
 import java.security.SecureRandom;
 import java.security.Security;
 import java.security.Signature;
@@ -35,10 +36,17 @@ import javax.net.ssl.SSLParameters;
  * failure modes for absent algorithms, key encoding round-trips and the
  * TLS/SSLEngine surface.
  *
- * TLS: a real loopback HANDSHAKE needs a key store, which cannot be generated
- * portably without internal APIs, so this vector goes as far as
- * {@code SSLContext} + {@code SSLEngine} construction and parameter shape --
- * see regression-suite/jdk-only-coverage.txt for that limitation.
+ * TLS: this vector goes as far as {@code SSLContext} + {@code SSLEngine}
+ * construction and parameter shape, and stops there because that is its subject
+ * -- NOT because a handshake is impossible here. This paragraph used to say that
+ * a real loopback handshake "needs a key store, which cannot be generated
+ * portably without internal APIs", and that is MEASURED FALSE (lane F36,
+ * 2026-08-13): a self-signed CN=localhost certificate can be assembled as DER and
+ * signed with java.security.Signature, all public API, and loaded into an
+ * in-memory KeyStore that never touches the disk. RSslLiveSession does exactly
+ * that and runs a loopback TLS 1.3 handshake with no resource file, no keytool
+ * step and no expiry date. regression-suite/jdk-only-coverage.txt SS3 still
+ * carries the old claim and is not this vector's file -- see F36-1 NOMINATION 3.
  *
  * Determinism: SecureRandom output is asserted only through invariants (length,
  * "two draws differ"), NEVER printed. Signatures over RSA use randomised PKCS#1
@@ -52,6 +60,25 @@ public class RJdkSecurity {
         if (!c) {
             throw new AssertionError(m);
         }
+    }
+
+    /** The class of the throwable {@code op} produced, or {@code "none"}. */
+    static String nameOf(Throwable t) {
+        return t == null ? "none" : t.getClass().getName();
+    }
+
+    /** The throwable {@code op} produced, or {@code null} — never a swallowed failure. */
+    static Throwable raised(Op op) {
+        try {
+            op.run();
+            return null;
+        } catch (Throwable t) {
+            return t;
+        }
+    }
+
+    interface Op {
+        void run() throws Exception;
     }
 
     static String hex(byte[] b) {
@@ -164,6 +191,352 @@ public class RJdkSecurity {
         }
         check(threw, "an unknown PRNG must raise NoSuchAlgorithmException");
         System.out.println("CK RJdkSecurity prng=" + named + " distinct=true");
+    }
+
+    /**
+     * {@code SecureRandom} by ARGUMENT KIND — the axis {@code secureRandoms()} above never
+     * drives, because every call it makes passes a valid argument.
+     *
+     * <p>NOM F12-1. Lane F12 fixed seven divergences in
+     * {@code native-builtins/src/securerandom.rs} and found that <b>five of the seven have
+     * no regression check anywhere in the tree</b>: the {@code java.util.Random} half of
+     * the identical null-argument defect had a check (RJdkIntrinsics2 {@code --only=random}
+     * check 41) and was therefore caught, and the {@code SecureRandom} half had none and
+     * was found only by reading the file beside it. A green {@code --only=random} is not
+     * evidence for any of this — that family drives {@code java.util.Random} only.
+     *
+     * <p>Every expected value below was measured on Microsoft OpenJDK 25.0.3+9-LTS
+     * (scratchpad/f25) and cross-checked against the JDK 25 line that produces it. The
+     * arms are ordered by argument kind rather than by method, which is what turned up
+     * {@link #getInstanceArgumentOrder} — a divergence that exists only when TWO arguments
+     * are bad at once and that no per-method review can reach.
+     *
+     * <p><b>Messages are asserted only where the string is the finding.</b>
+     * {@code generateSeed}'s wording was the whole of one defect (the class was already
+     * right), and {@code "null algorithm name"} is the string the pre-fix
+     * {@code IllegalArgumentException} <i>also</i> carried, so there the class row is the
+     * discriminator and the message row pins that the correct message survived the class
+     * change. Where only HotSpot's message is known and CratonVM's was never measured, the
+     * class alone is asserted and the message is recorded in this lane's record instead.
+     */
+    static void secureRandomArgumentKinds() throws Exception {
+        int mark = checks;
+        SecureRandom sr = new SecureRandom();
+
+        // (1) NULLABLE REFERENCES. F12 §3.1: five sites, and all five swallowed the null
+        // and carried on. A swallowed null is worse than a loud one here — nextBytes(null)
+        // returning normally tells the caller its buffer was filled.
+        //
+        // The message is genuinely null on all three: the JDK calls the ONE-ARGUMENT
+        // Objects.requireNonNull (SecureRandom.java:774/724/266), so `message: None` is
+        // the faithful answer and not a shortcut. Only java.util.Random.nextBytes(null)
+        // carries text, and it carries it because HotSpot's helpful-NPE synthesises one
+        // from the bytecode -- there is no requireNonNull there at all.
+        Throwable t = raised(() -> sr.nextBytes(null));
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "SecureRandom.nextBytes(null) must throw NullPointerException — a body that"
+                        + " matches only the Object(Some(array)) arm and falls through on"
+                        + " Object(None) returns normally and the caller believes its buffer"
+                        + " was filled with entropy; got " + nameOf(t));
+        check(t.getMessage() == null,
+                "and its message is NULL — Objects.requireNonNull(bytes) with no message"
+                        + " argument (SecureRandom.java:774); got " + t.getMessage());
+        t = raised(() -> sr.setSeed((byte[]) null));
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "SecureRandom.setSeed((byte[]) null) must throw NullPointerException, and"
+                        + " BEFORE the receiver is examined (SecureRandom.java:724); got "
+                        + nameOf(t));
+        check(t.getMessage() == null, "and its message is NULL; got " + t.getMessage());
+        t = raised(() -> new SecureRandom((byte[]) null));
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "new SecureRandom((byte[]) null) must throw NullPointerException — the"
+                        + " CONSTRUCTOR is a third site with its own arity gate"
+                        + " (SecureRandom.java:266); got " + nameOf(t));
+        check(t.getMessage() == null, "and its message is NULL; got " + t.getMessage());
+
+        // The negative half, without which every row above passes an implementation that
+        // rejects EVERY array. An empty array is not a null one and must be accepted.
+        check(nameOf(raised(() -> sr.nextBytes(new byte[0]))).equals("none"),
+                "nextBytes(new byte[0]) must return normally — empty is not null");
+        check(nameOf(raised(() -> sr.setSeed(new byte[0]))).equals("none"),
+                "setSeed(new byte[0]) must return normally");
+        check(nameOf(raised(() -> new SecureRandom(new byte[0]))).equals("none"),
+                "new SecureRandom(new byte[0]) must return normally");
+
+        // (2) RANGED INTEGERS. F12 §3.2 cleared this axis for the TYPE and found one
+        // wrong WORDING. Integer.MIN_VALUE is the load-bearing column: a `<= 0` test
+        // rejects it, an `abs(n) > ...` or a `n == -1` test does not.
+        t = raised(() -> sr.generateSeed(-1));
+        check("java.lang.IllegalArgumentException".equals(nameOf(t)),
+                "generateSeed(-1) must throw IllegalArgumentException; got " + nameOf(t));
+        check("numBytes cannot be negative".equals(t.getMessage()),
+                "and the message is HotSpot's verbatim (SecureRandom.java:878) — this VM"
+                        + " said \"numBytes must be non-negative\", which is the same"
+                        + " sentence and a different string, and only a message row can see"
+                        + " the difference; got " + t.getMessage());
+        check("java.lang.IllegalArgumentException"
+                        .equals(nameOf(raised(() -> sr.generateSeed(Integer.MIN_VALUE)))),
+                "generateSeed(Integer.MIN_VALUE) must throw too — the column that separates"
+                        + " a `<= 0` guard from one written around -1");
+        check(sr.generateSeed(0).length == 0,
+                "generateSeed(0) is the ACCEPTING boundary: an empty array, not a throw");
+        // The STATIC twin. A separate registration, and the two have drifted before.
+        t = raised(() -> SecureRandom.getSeed(-1));
+        check("java.lang.IllegalArgumentException".equals(nameOf(t)),
+                "the static SecureRandom.getSeed(-1) must throw IllegalArgumentException —"
+                        + " a separate registration from the instance method above; got "
+                        + nameOf(t));
+        check("numBytes cannot be negative".equals(t.getMessage()),
+                "with the same message as its instance twin; got " + t.getMessage());
+        check(SecureRandom.getSeed(0).length == 0, "and getSeed(0) is an empty array");
+        check("java.lang.IllegalArgumentException".equals(nameOf(raised(() -> sr.nextInt(0)))),
+                "SecureRandom.nextInt(0) must throw IllegalArgumentException");
+        check("java.lang.IllegalArgumentException"
+                        .equals(nameOf(raised(() -> sr.nextInt(Integer.MIN_VALUE)))),
+                "and nextInt(Integer.MIN_VALUE) too");
+
+        // (3) THE SELECTOR STRING. Both of these used to be IllegalArgumentException, and
+        // the first of them carried the RIGHT message under the WRONG class — which is
+        // exactly the shape a message-only assertion cannot see.
+        t = raised(() -> SecureRandom.getInstance(null));
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "SecureRandom.getInstance(null) must throw NullPointerException, not"
+                        + " IllegalArgumentException: SecureRandom.java:391 opens with"
+                        + " Objects.requireNonNull(algorithm, ...). This VM threw IAE with"
+                        + " the SAME message, so the class is the whole assertion; got "
+                        + nameOf(t));
+        check("null algorithm name".equals(t.getMessage()),
+                "and it keeps HotSpot's message across the class change; got "
+                        + t.getMessage());
+        t = raised(() -> SecureRandom.getInstance(""));
+        check("java.security.NoSuchAlgorithmException".equals(nameOf(t)),
+                "getInstance(\"\") must be NoSuchAlgorithmException — the empty name is not"
+                        + " a null name, it is a name that no provider serves, and it must"
+                        + " reach the ordinary dead end rather than an early-return guard;"
+                        + " got " + nameOf(t));
+        check(" SecureRandom not available".equals(t.getMessage()),
+                "and the message is the ordinary template applied to the empty string, with"
+                        + " its LEADING SPACE intact — the row that proves the empty name"
+                        + " travelled the normal path instead of a special-cased one; got "
+                        + t.getMessage());
+        t = raised(() -> SecureRandom.getInstance("NO-SUCH-PRNG"));
+        check("java.security.NoSuchAlgorithmException".equals(nameOf(t))
+                        && "NO-SUCH-PRNG SecureRandom not available".equals(t.getMessage()),
+                "getInstance(\"NO-SUCH-PRNG\") must refuse with that same template; got "
+                        + nameOf(t) + " / " + t.getMessage());
+        check(nameOf(raised(() -> SecureRandom.getInstance("sha1prng"))).equals("none"),
+                "JCA lookup is CASE-INSENSITIVE: getInstance(\"sha1prng\") must resolve. A"
+                        + " case-sensitive table passes every refusal row above and fails"
+                        + " only here");
+
+        // (3a) AND THE NAME IS CARRIED THROUGH VERBATIM. F25 §6.4 measured this and
+        // deliberately did not assert it, because F12 §3.5 records that
+        // secure_random_static_provider normalises to upper-case alphanumeric for the
+        // LOOKUP and says nothing about what getAlgorithm() then reports. This lane was
+        // assigned the row anyway: a red row here is a finding for
+        // native-builtins/src/securerandom.rs, not a reason to drop it.
+        //
+        // The row is only half a discriminator on its own. Its other half is
+        // getInstanceArgumentOrder()'s `"SHA1PRNG".equals(viaProvider.getAlgorithm())`,
+        // which asks the SAME question of an upper-case request: together they say the
+        // answer TRACKS the request, where either alone also passes an implementation
+        // that hard-cases every answer in one direction.
+        check("sha1prng".equals(SecureRandom.getInstance("sha1prng").getAlgorithm()),
+                "getAlgorithm() reports the spelling that was ASKED FOR, not a"
+                        + " normalised one — JCA lookup is case-insensitive and the name"
+                        + " is carried through verbatim; measured \"sha1prng\" on"
+                        + " jdk-25.0.3+9");
+        // The two-argument overloads are SEPARATE registrations — that is this family's
+        // founding lesson (§the getInstance argument order below) and this tree has a
+        // recorded defect where exactly the Provider-object form behaved differently from
+        // its String-named twin. A fix that threads the asked-for spelling through the
+        // one-argument body only is invisible without these two.
+        check("sha1prng".equals(
+                        SecureRandom.getInstance("sha1prng", "SUN").getAlgorithm()),
+                "getInstance(\"sha1prng\", \"SUN\").getAlgorithm() carries the asked-for"
+                        + " spelling too — a separate registration from the one-argument"
+                        + " form");
+        check("sha1prng".equals(
+                        SecureRandom.getInstance("sha1prng", Security.getProvider("SUN"))
+                                .getAlgorithm()),
+                "and so does the Provider-object overload — the third registration, and"
+                        + " the one the recorded \"provider ignored\" defect was found on");
+
+        getInstanceArgumentOrder();
+        // The only family in this file that publishes its own size. It is a tripwire in
+        // the sense sectionEnd() is elsewhere in the suite: a block that silently loses
+        // rows to an edit still prints a CK line, and this one prints a DIFFERENT number.
+        // The value is MEASURED on jdk-25.0.3+9, not counted on paper.
+        int n = checks - mark;
+        if (n != 52) {
+            throw new AssertionError("srArgKinds ran " + n + " checks, header says 52");
+        }
+        System.out.println("CK RJdkSecurity srArgKinds=" + n);
+    }
+
+    /**
+     * The argument ORDER of the three two-argument {@code getInstance} overloads.
+     *
+     * <p>F12 §2. This is the divergence no per-method audit reaches, because the method
+     * rejects both of its arguments correctly — in the wrong order. All three overloads
+     * open with {@code Objects.requireNonNull(algorithm, "null algorithm name")}
+     * ({@code SecureRandom.java:439} for the {@code String} provider, {@code :481} for the
+     * {@code Provider}), and the provider is examined only afterwards.
+     * {@code native_secure_random_get_instance_with_provider} ran its provider check
+     * first, so a null algorithm plus a bad provider answered the provider's complaint.
+     *
+     * <p>Fixing the one-argument form does not fix this: the one-argument body is reached
+     * only after both provider checks have already had their chance to throw, so the null
+     * check has to be hoisted into the two-argument body itself.
+     *
+     * <p>The wrong order came from a comment that is TRUE — "the provider is resolved
+     * BEFORE the algorithm is looked up" ({@code jca/provider_chain.rs:2612-2614}) — read
+     * one clause too far. The provider does precede the algorithm's LOOKUP. It does not
+     * precede the algorithm's NULL CHECK, and only these rows can tell the two apart.
+     */
+    static void getInstanceArgumentOrder() throws Exception {
+        java.security.Provider sun = Security.getProvider("SUN");
+        check(sun != null, "the SUN provider is the premise of the rows below");
+
+        // A null algorithm wins over EVERY provider argument, good or bad. Each row names
+        // the answer a provider-first implementation gives instead.
+        check("java.lang.NullPointerException"
+                        .equals(nameOf(raised(() -> SecureRandom.getInstance(null, "SUN")))),
+                "getInstance(null, \"SUN\") — a VALID provider — must still be NPE. This is"
+                        + " the row that shows the null check is not merely reached, but"
+                        + " reached FIRST: a correct provider costs two lookups before the"
+                        + " null is noticed if the order is wrong");
+        Throwable t = raised(() -> SecureRandom.getInstance(null, "NOPE"));
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "getInstance(null, \"NOPE\") — BOTH arguments bad — must be NPE. A"
+                        + " provider-first body answers NoSuchProviderException here, and"
+                        + " this cell exists in no single-argument probe; got " + nameOf(t));
+        check("null algorithm name".equals(t.getMessage()),
+                "and the message names the ALGORITHM, not the provider — a body that"
+                        + " reported \"no such provider: NOPE\" through an NPE would pass"
+                        + " the row above and fail this one; got " + t.getMessage());
+        check("java.lang.NullPointerException".equals(
+                        nameOf(raised(() -> SecureRandom.getInstance(null, (String) null)))),
+                "getInstance(null, (String) null) must be NPE — a provider-first body"
+                        + " answers IllegalArgumentException \"missing provider\"");
+        check("java.lang.NullPointerException"
+                        .equals(nameOf(raised(() -> SecureRandom.getInstance(null, "")))),
+                "getInstance(null, \"\") must be NPE — the EMPTY provider name takes the"
+                        + " same IllegalArgumentException arm as the null one, so this is a"
+                        + " second, independently-reachable way to lose the ordering");
+        check("java.lang.NullPointerException".equals(
+                        nameOf(raised(() -> SecureRandom.getInstance(null, (Provider) null)))),
+                "getInstance(null, (Provider) null) must be NPE — the THIRD overload is a"
+                        + " SEPARATE registration and can be fixed independently of the two"
+                        + " String-provider ones");
+        check("java.lang.NullPointerException"
+                        .equals(nameOf(raised(() -> SecureRandom.getInstance(null, sun)))),
+                "getInstance(null, sunProvider) must be NPE too");
+
+        // The CONTROL. Without these, every row above also passes an implementation that
+        // answers NPE for anything it does not like: the provider complaints must still
+        // be the provider's, with a GOOD algorithm.
+        check("java.lang.IllegalArgumentException".equals(
+                        nameOf(raised(() -> SecureRandom.getInstance("SHA1PRNG", (String) null)))),
+                "getInstance(\"SHA1PRNG\", (String) null) must be IllegalArgumentException,"
+                        + " NOT NullPointerException — the null PROVIDER is not the null"
+                        + " ALGORITHM, and this row is what stops the fix from becoming"
+                        + " \"throw NPE on any null\"");
+        check("java.lang.IllegalArgumentException"
+                        .equals(nameOf(raised(() -> SecureRandom.getInstance("SHA1PRNG", "")))),
+                "getInstance(\"SHA1PRNG\", \"\") must be IllegalArgumentException");
+        check("java.security.NoSuchProviderException"
+                        .equals(nameOf(raised(() -> SecureRandom.getInstance("SHA1PRNG", "NOPE")))),
+                "getInstance(\"SHA1PRNG\", \"NOPE\") must be NoSuchProviderException — an"
+                        + " ABSENT provider is a third answer again, distinct from both"
+                        + " nulls above");
+        check("java.lang.IllegalArgumentException".equals(
+                        nameOf(raised(() -> SecureRandom.getInstance("SHA1PRNG", (Provider) null)))),
+                "getInstance(\"SHA1PRNG\", (Provider) null) must be IllegalArgumentException");
+        check("java.security.NoSuchAlgorithmException"
+                        .equals(nameOf(raised(() -> SecureRandom.getInstance("NOPE", "SUN")))),
+                "getInstance(\"NOPE\", \"SUN\") must be NoSuchAlgorithmException — the"
+                        + " algorithm is LOOKED UP after the provider is resolved, which is"
+                        + " the true half of the comment that produced the defect");
+        check(nameOf(raised(() -> SecureRandom.getInstance("SHA1PRNG", "SUN"))).equals("none"),
+                "and the all-good combination must simply work");
+
+        // The MESSAGES for the six provider-argument rows above. F25 §3.3 left every one
+        // of them class-only, on the stated ground that CratonVM's strings had never been
+        // measured; this lane was assigned them, so a red row here is a finding for
+        // native-builtins/src/securerandom.rs and not a reason to drop the row.
+        //
+        // Measured on jdk-25.0.3+9. THREE distinct strings across SIX call sites, and the
+        // split is the point: "missing provider" is raised by the ARGUMENT check before
+        // any lookup happens, and the other two are raised BY the lookup. A body that
+        // produced one apology for every provider complaint passes any single row here.
+        t = raised(() -> SecureRandom.getInstance("SHA1PRNG", (String) null));
+        check(t != null && "missing provider".equals(t.getMessage()),
+                "getInstance(\"SHA1PRNG\", (String) null) says \"missing provider\" — the"
+                        + " ARGUMENT check's string, raised before any provider is looked"
+                        + " up; got " + t);
+        t = raised(() -> SecureRandom.getInstance("SHA1PRNG", ""));
+        check(t != null && "missing provider".equals(t.getMessage()),
+                "and the EMPTY provider name takes the identical arm, string included —"
+                        + " an implementation that special-cased \"\" would answer here and"
+                        + " not above; got " + t);
+        t = raised(() -> SecureRandom.getInstance("SHA1PRNG", (Provider) null));
+        check(t != null && "missing provider".equals(t.getMessage()),
+                "and the Provider-object overload's null arm carries the same string; got "
+                        + t);
+        t = raised(() -> SecureRandom.getInstance("SHA1PRNG", "NOPE"));
+        check(t != null && "no such provider: NOPE".equals(t.getMessage()),
+                "an ABSENT provider names ITSELF and not the algorithm — the string is how"
+                        + " a caller tells a mistyped provider from a mistyped algorithm,"
+                        + " and both refusals are otherwise a bare exception; got " + t);
+        t = raised(() -> SecureRandom.getInstance("NOPE", "SUN"));
+        check(t != null && "no such algorithm: NOPE for provider SUN".equals(t.getMessage()),
+                "a present provider that does not serve the algorithm names BOTH, in that"
+                        + " order — this is the lookup's own string, so it is the row that"
+                        + " proves the refusal came from the lookup rather than from an"
+                        + " earlier guard; got " + t);
+        t = raised(() -> SecureRandom.getInstance("SHA1PRNG", "SunJCE"));
+        check(t != null
+                        && "no such algorithm: SHA1PRNG for provider SunJCE".equals(t.getMessage()),
+                "and the SunJCE row — the one that catches a discarded provider argument —"
+                        + " names the real algorithm and the real provider, so a body that"
+                        + " refused with a canned string would pass its class row and fail"
+                        + " this one; got " + t);
+
+        // The provider must actually be HONOURED, not merely accepted. Elsewhere in this
+        // tree a getInstance(alg, Provider) DISCARDED its provider argument and silently
+        // served the default one; no refusal row above can see that, because SUN is
+        // ALSO the default provider for SHA1PRNG, so "asked for SUN, got SUN" is true
+        // either way. The discriminator is a provider that is INSTALLED and does NOT
+        // serve the algorithm: SunJCE ships in every OpenJDK and publishes no
+        // SecureRandom service at all, so a body that drops the argument answers with
+        // SUN's SHA1PRNG here instead of refusing.
+        check("java.security.NoSuchAlgorithmException"
+                        .equals(nameOf(raised(() -> SecureRandom.getInstance("SHA1PRNG", "SunJCE")))),
+                "getInstance(\"SHA1PRNG\", \"SunJCE\") must be NoSuchAlgorithmException —"
+                        + " the algorithm exists and that provider does not serve it. A"
+                        + " body that resolves the algorithm and ignores the provider"
+                        + " returns an object here and passes every other row in this arm");
+        check("java.security.NoSuchAlgorithmException".equals(nameOf(
+                        raised(() -> SecureRandom.getInstance("SHA1PRNG",
+                                Security.getProvider("SunJCE"))))),
+                "and the Provider-object overload refuses identically — a SEPARATE"
+                        + " registration, and the one the JCA \"provider ignored\" defect"
+                        + " was found on");
+        SecureRandom viaProvider = SecureRandom.getInstance("SHA1PRNG", sun);
+        check(viaProvider.getProvider() != null
+                        && "SUN".equals(viaProvider.getProvider().getName()),
+                "getInstance(\"SHA1PRNG\", sunProvider).getProvider() must be non-null and"
+                        + " named SUN. The recorded defect this row catches is not the"
+                        + " ignored provider (the two SunJCE rows above are that) but the"
+                        + " construction route that stamped `algorithm` and never"
+                        + " `provider`, so getProvider() came back null");
+        check("SHA1PRNG".equals(viaProvider.getAlgorithm()),
+                "and its getAlgorithm() is the name that was asked for");
+        SecureRandom viaName = SecureRandom.getInstance("SHA1PRNG", "SUN");
+        check("SUN".equals(viaName.getProvider().getName()),
+                "and the String-named overload resolves to the same provider; got "
+                        + viaName.getProvider().getName());
     }
 
     static void signatures() throws Exception {
@@ -293,6 +666,79 @@ public class RJdkSecurity {
             threw = true;
         }
         check(threw, "an unknown SSL protocol must raise NoSuchAlgorithmException");
+
+        // THE SSLSession ATTRIBUTE MAP, BY ARGUMENT KIND. F25 §6.6 measured this and left
+        // it unwritten because CratonVM's answers had never been measured; NOMINATION 4 of
+        // that record is this block. It is asked of the ENGINE's pre-handshake session,
+        // which is the session this vector already holds — the same contract on a
+        // NEGOTIATED session is RSslLiveSession's `attrs` family, and the two are not
+        // duplicates: this directory's recorded defect (E31-1 §2) is a slot whose meaning
+        // depends on the session's WIDTH, so the null-session door and the live door can
+        // and do diverge.
+        //
+        // The pair worth having is rows 2 and 7: putValue says "arguments can not be null"
+        // and getValue says "argument can not be null". Two methods, two strings, ONE
+        // LETTER apart. A shared constant is wrong in one of the two places and only a
+        // message row can see it — this is the same shape as generateSeed's wording above,
+        // where the class was already right and the string was the whole defect.
+        javax.net.ssl.SSLSession sess = engine.getSession();
+        Throwable at = raised(() -> sess.putValue(null, "v"));
+        check("java.lang.IllegalArgumentException".equals(nameOf(at)),
+                "SSLSession.putValue(null, \"v\") must throw IllegalArgumentException, NOT"
+                        + " NullPointerException — JSSE validates rather than dereferences"
+                        + " here; got " + nameOf(at));
+        check("arguments can not be null".equals(at.getMessage()),
+                "and the message is PLURAL — SSLSessionImpl.putValue guards both arguments"
+                        + " with one string; got " + at.getMessage());
+        at = raised(() -> sess.putValue("k", null));
+        check("java.lang.IllegalArgumentException".equals(nameOf(at)),
+                "a null VALUE is refused by the same guard as a null NAME — an"
+                        + " implementation that checked only the name accepts this and"
+                        + " stores a null; got " + nameOf(at));
+        check("arguments can not be null".equals(at.getMessage()),
+                "with the same plural message; got " + at.getMessage());
+        at = raised(() -> sess.putValue(null, null));
+        check("arguments can not be null".equals(at.getMessage()),
+                "and both-null is not a third case; got " + at.getMessage());
+        at = raised(() -> sess.getValue(null));
+        check("java.lang.IllegalArgumentException".equals(nameOf(at)),
+                "SSLSession.getValue(null) must throw IllegalArgumentException too — a"
+                        + " lookup that simply missed would return null and tell the caller"
+                        + " the attribute was absent; got " + nameOf(at));
+        check("argument can not be null".equals(at.getMessage()),
+                "and its message is SINGULAR — one argument, one noun. This is the row that"
+                        + " a single shared constant fails; got " + at.getMessage());
+        at = raised(() -> sess.removeValue(null));
+        check("java.lang.IllegalArgumentException".equals(nameOf(at)),
+                "and removeValue(null) is the third site with the same contract; got "
+                        + nameOf(at));
+        check("argument can not be null".equals(at.getMessage()),
+                "carrying the SINGULAR string, like getValue and unlike putValue; got "
+                        + at.getMessage());
+
+        // The controls. Without them every row above also passes a map whose putValue
+        // silently does nothing and whose getValue always answers null.
+        check(nameOf(raised(() -> sess.putValue("cratonvm.f36", "v"))).equals("none"),
+                "a well-formed putValue must return normally");
+        check("v".equals(sess.getValue("cratonvm.f36")),
+                "and the attribute must round-trip; got " + sess.getValue("cratonvm.f36"));
+        check(sess.getValue("cratonvm.f36") != null
+                        && "java.lang.String".equals(sess.getValue("cratonvm.f36")
+                                .getClass().getName()),
+                "and come back as the java.lang.String that went in, not as the map that"
+                        + " holds it");
+        check("[cratonvm.f36]".equals(Arrays.toString(sess.getValueNames())),
+                "getValueNames must name it; got " + Arrays.toString(sess.getValueNames()));
+        check(sess.getValue("cratonvm.no-such-attribute") == null,
+                "an ABSENT name is null and not a refusal — the negative that separates"
+                        + " \"validates its argument\" from \"throws on anything unfamiliar\"");
+        check(nameOf(raised(() -> sess.removeValue("cratonvm.no-such-attribute"))).equals("none"),
+                "and removing an absent name is a no-op, not a throw");
+        check(nameOf(raised(() -> sess.removeValue("cratonvm.f36"))).equals("none"),
+                "removeValue of a present name returns normally");
+        check("[]".equals(Arrays.toString(sess.getValueNames())),
+                "and the map is empty again — a removeValue that no-ops leaves the name"
+                        + " here; got " + Arrays.toString(sess.getValueNames()));
         System.out.println("CK RJdkSecurity tls=" + modern
                 + " engine=" + (engine.getUseClientMode() ? "client" : "server"));
     }
@@ -594,6 +1040,7 @@ public class RJdkSecurity {
     public static void main(String[] args) throws Exception {
         digests();
         secureRandoms();
+        secureRandomArgumentKinds();
         signatures();
         tls();
         defaultTrustStoreProperty();

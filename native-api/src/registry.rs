@@ -1696,13 +1696,35 @@ pub trait NativeClassAccess {
 
     /// Every module name the VM's module registry knows, in no defined order.
     ///
-    /// The registry is small by construction — `java.base` plus whatever
-    /// `--module-path` supplied — because only two sites populate it, so
-    /// callers may enumerate it eagerly. An empty vector means "this context
-    /// does not model modules", exactly as [`module_is_registered`] returning
-    /// `false` does, and must not be read as "no modules exist".
+    /// The registry is small by construction, so callers may enumerate it
+    /// eagerly. An empty vector means "this context does not model modules",
+    /// exactly as [`module_is_registered`] returning `false` does, and must not
+    /// be read as "no modules exist".
+    ///
+    /// It is NOT just "`java.base` plus whatever `--module-path` supplied", and
+    /// it is NOT populated by only two sites. A THIRD site scans the
+    /// APPLICATION CLASS PATH for `module-info.class` and registers what it
+    /// finds — so a modular jar on `-cp`, which a real JVM treats as an
+    /// unnamed-module citizen whose `module-info` is ignored, appears here as a
+    /// module. That false sentence is what made a real defect look impossible
+    /// from this trait's side: registering such a jar's services twice made
+    /// `ServiceLoader` throw "multiple engines with the same ID". Use
+    /// [`Self::module_is_class_path_only`] below to tell the two apart.
+    /// docs/known-issues/jdk-only/E4-R11-CLASS-PATH-MODULE-BOOT-LAYER-FIX-20260813.md
     fn module_names(&self) -> Vec<String> {
         vec![]
+    }
+
+    /// True when `module_name` reached the registry ONLY by scanning the
+    /// application class path — i.e. a modular jar on `-cp`, which a real JVM
+    /// treats as an unnamed-module citizen whose `module-info` is ignored.
+    ///
+    /// Callers that model the JDK's module *system* must skip these; callers
+    /// that only want labelling may not care. Defaults to `false` so a context
+    /// that does not model modules keeps its existing behaviour.
+    fn module_is_class_path_only(&self, module_name: &str) -> bool {
+        let _ = module_name;
+        false
     }
 
     /// `exports` directives declared by `module_name`, as
@@ -2224,6 +2246,22 @@ pub trait NativeInvokeAccess: NativeClassAccess {
     }
 }
 
+/// The descriptor byte that means "do not decode this slot, hand me the bits".
+///
+/// A JVM field descriptor's first byte is always one of `B C D F I J S Z L [`
+/// (JVMS §4.3.2). `0` is none of them and cannot be produced by a well-formed
+/// class file, so it is unambiguous as a sentinel.
+///
+/// It is load-bearing for [`NativeHeapAccess::get_field_raw`]: the descriptor
+/// -aware decode in `gc::heap::coerce_field_value_for_slot` is a `match` on
+/// this byte whose final arm is `_ => value`, so an unrecognised byte returns
+/// the slot verbatim AND — because every coercion-loss report lives inside one
+/// of the recognised arms — reports nothing to the G30 instrument. If a future
+/// arm is ever added for `0`, `get_field_raw` silently stops being raw; that is
+/// why the byte is named here rather than spelled inline at the call, and why
+/// `a_raw_read_uses_a_byte_that_is_not_a_jvm_descriptor` pins it.
+pub const RAW_SLOT_DESCRIPTOR: u8 = 0;
+
 pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Capability boundary: Allocation, roots, object fields, arrays, and strings.
 
@@ -2582,6 +2620,95 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// The caller must ensure it is in range for `obj`'s class; the
     /// implementation MUST bounds-check and MUST NOT write out of range (M4a).
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value);
+
+    /// Read an object field by slot index **without descriptor coercion** —
+    /// the `Value` exactly as it is stored, tag included.
+    ///
+    /// # Why this exists (G52-1 NOMINATION 1, G56-1)
+    ///
+    /// Every other slot-indexed accessor on this trait resolves the field's
+    /// declared descriptor and routes the slot through
+    /// `gc::heap::coerce_field_value_for_slot`: [`get_field`](Self::get_field),
+    /// [`get_field_volatile`](Self::get_field_volatile),
+    /// [`compare_and_swap_field`](Self::compare_and_swap_field), and
+    /// [`get_field_typed`](Self::get_field_typed) with a real descriptor.
+    /// The only non-coercing pair was
+    /// [`get_field_by_name`](Self::get_field_by_name) /
+    /// [`set_field_by_name`](Self::set_field_by_name), which is **name**-keyed:
+    /// it cannot be driven from a slot index at all, and it resolves a shadowed
+    /// field name to the wrong slot. So a native that holds a slot index and
+    /// wants the stored bits — `Object.clone()`, which the JVM specifies as a
+    /// verbatim field copy, and any reader that must tell "never written" from
+    /// "explicitly null" — had no way to ask for them. `Object.clone()` did not
+    /// opt into coercion; the API moved underneath it.
+    ///
+    /// # Contract
+    ///
+    /// An implementation MUST return the slot's stored `Value` unchanged, and
+    /// MUST still bounds-check `index` and fail safe exactly as
+    /// [`get_field`](Self::get_field) does (M4a). "Raw" licenses skipping the
+    /// descriptor decode; it never licenses an out-of-range access. The
+    /// reference must still be canonicalised (forwarded) before the read — a
+    /// raw read of a stale address is not a raw read of the object.
+    ///
+    /// # The default implementation is already raw, on both impls that exist
+    ///
+    /// It routes through [`get_field_typed`](Self::get_field_typed) with
+    /// [`RAW_SLOT_DESCRIPTOR`], which is not a JVM field-descriptor first byte.
+    ///
+    /// * Production (`NativeContextImpl` in the `vm` crate) overrides
+    ///   `get_field_typed` as `heap.get_field_as(obj, index, descriptor)`, and
+    ///   `coerce_field_value_for_slot` dispatches on the descriptor byte with a
+    ///   final `_ => value` arm. A byte outside `J D F I B C S Z L [` therefore
+    ///   returns the slot verbatim and — this is the half that matters for the
+    ///   G30 instrument — fires **no** coercion-loss event. It is also cheaper
+    ///   than [`get_field`](Self::get_field): the descriptor is supplied, so
+    ///   `resolve_field_descriptor_byte_cached` is skipped entirely.
+    /// * Mocks that do not override `get_field_typed` get this trait's default,
+    ///   which ignores the byte and calls `get_field` — already raw there.
+    ///
+    /// An implementor with a cheaper direct route should override this; one
+    /// with none needs to do nothing.
+    fn get_field_raw(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field_typed(obj, index, RAW_SLOT_DESCRIPTOR)
+    }
+
+    /// Write an object field by slot index **without descriptor coercion** —
+    /// the `Value` is stored with the tag the caller handed over.
+    ///
+    /// The store half of [`get_field_raw`](Self::get_field_raw). See that
+    /// method for why the pair exists; the contract is the same, and an
+    /// implementation MUST still bounds-check `index` and MUST NOT write out
+    /// of range (M4a).
+    ///
+    /// # THIS DEFAULT IS NOT RAW. Read before pairing it with a raw read.
+    ///
+    /// There is no typed setter on this trait to lean on the way
+    /// [`get_field_raw`](Self::get_field_raw) leans on
+    /// [`get_field_typed`](Self::get_field_typed), and the only non-coercing
+    /// setter reachable from here — [`set_field_by_name`](Self::set_field_by_name)
+    /// — is name-keyed and cannot be driven from a slot index. The default
+    /// therefore delegates to [`set_field`](Self::set_field), which in the
+    /// production `NativeContextImpl` resolves the descriptor and coerces.
+    /// Overriding it there is a one-line body — `heap.set_field(obj, index,
+    /// value)` after the usual `load_and_forward` — and until that lands this
+    /// method is raw only on impls whose `set_field` was already raw (the test
+    /// mocks).
+    ///
+    /// **Do not pair a raw read with this default in a copy loop.** That
+    /// combination is strictly worse for the G30 instrument than coercing
+    /// both halves: a `read` of `Int(0)` at an `L` slot currently answers
+    /// `Object(None)` and is counted in the benign `read` column, whereas a
+    /// raw read followed by a coercing store hands the `Int(0)` to the setter
+    /// and re-reports it as a **`store`** — the column `gc/src/collector.rs`
+    /// reserves for real defects ("a read that coerces is usually the slot
+    /// repairing a never-initialised tag, a store that coerces has destroyed
+    /// something a writer meant"). G52-1 §1.5 measured that migration at ~24
+    /// events for `native_object_clone` alone. The verbatim-copy callers must
+    /// wait for both halves to be genuinely raw and then switch together.
+    fn set_field_raw(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field(obj, index, value);
+    }
 
     /// Read an object field by name. Resolves the field name to a slot index
     /// by searching the object's class hierarchy. Returns `Value::Object(None)`
@@ -2984,6 +3111,28 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// objects): stores the units in a plain `char[]` at field 0 via the
     /// generic array/field primitives. The VM override replaces this with
     /// the exact compact-string layout used by every other String natively.
+    ///
+    /// # This IS the lossless String writer — there is no missing primitive
+    ///
+    /// `create_string`/`create_string_uninterned`/`create_string_uninterned_gc_safe`
+    /// all take a `&str`, and a Rust `str` cannot hold an unpaired UTF-16
+    /// surrogate — so a native that reads a Java `String` losslessly and then
+    /// hands the units to any of those has thrown the surrogate away at the
+    /// LAST step. The recurring conclusion from that is "`NativeContext` needs
+    /// a `create_string_from_utf16`". It does not: `new_object("java/lang/
+    /// String")` followed by this method is that constructor, it is what the
+    /// `String(char[])` / `String(char[], int, int)` overrides already use, and
+    /// on the VM it lands in the same `populate_java_string_fields` that
+    /// `create_java_string_from_units` uses — the one place that decides a
+    /// compact `String`'s coder and byte order.
+    ///
+    /// `native-builtins`' `lang_string::sb_string_from_units` packages the pair
+    /// (plus the GC pin and the well-formed fast path) into a single call, and
+    /// is what every `String`-returning native in that file should end in.
+    ///
+    /// A third spelling of the same construction would be a second encoding of
+    /// one concept, reconciled only where the bytes are consumed. Extend or
+    /// re-route this one instead.
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
         let arr = self.new_array(ArrayElementType::Char, units.len());
         for (i, &u) in units.iter().enumerate() {
@@ -4841,6 +4990,105 @@ pub fn dispatch_baos_event(
     }
 }
 
+/// Event emitted by the native `ByteArrayInputStream` implementation when a
+/// reader reaches the end of the buffer, or closes it.
+///
+/// The mirror image of [`BaosEvent`], and it exists for the mirror-image
+/// reason. A bridge API can hand Java a `ByteArrayInputStream`-shaped object
+/// whose *lifetime* matters to native state the bridge holds elsewhere — the
+/// `https:` response body is the motivating case: HotSpot returns the
+/// connection to its `KeepAliveCache` the moment the body is drained, after
+/// which every CONNECTION-level accessor throws `IllegalStateException:
+/// connection not yet open` again, while the `SSLSession` object the
+/// application already holds stays valid. CratonVM reads that body to
+/// completion inside `perform` and hands it over whole, so the drain is the
+/// only observable "the application is done with this exchange" instant, and
+/// it is observable *here* and nowhere else.
+///
+/// Keeping the observation at the API boundary is what avoids making
+/// `native-io` depend on a higher-level protocol crate, exactly as for
+/// [`BaosEvent`].
+///
+/// # This adds no registration
+///
+/// `ByteArrayInputStream.read()I`, `read([BII)I` and `close()V` are **already**
+/// registered natives owned by `native-io` (MEASURED — `--dump-native-registry`
+/// under `--jdk-only`, `9ae371468`: `owns_slot=true` on all three, at
+/// `native-io/src/lib.rs`). A hook inside an existing body registers nothing,
+/// so `regression-suite/bridge-ratchet.sh` and the baselines under `scripts/`
+/// do not move. Every design that instead added a `Bridge` over concrete
+/// bytecode — a dedicated response-stream class, a `SequenceInputStream`
+/// sentinel, a second `close()V` registration — would have needed a baseline
+/// refresh; see
+/// `docs/known-issues/jdk-only/G48-1-the-input-side-hook-and-a-gate-that-could-go-quiet-20260817.md`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BaisEvent {
+    /// A read returned `-1`: `pos >= count`, the buffer is exhausted.
+    ///
+    /// **Fires on EVERY exhausted read, not only on the transition**, because
+    /// the transition is not observable: a stream constructed empty is at
+    /// `pos >= count` from its first read, and the two states are
+    /// indistinguishable from inside the read body. Observers must therefore be
+    /// idempotent — which they must be anyway, since a drained stream that is
+    /// then closed produces `Eof` *and* [`BaisEvent::Close`].
+    Eof,
+    /// `close()` was called on the stream.
+    Close,
+}
+
+/// Observer for [`BaisEvent`].
+///
+/// # Why this returns `()` and [`BaosEventHook`] returns `bool`
+///
+/// **Deliberate, and not an oversight in the mirroring.** A `BaosEvent`
+/// observer legitimately *takes over* the write — the bytes go to a native sink
+/// instead of the in-heap buffer — so `Ok(true)` meaning "consumed, skip the
+/// ordinary path" is a real choice with a real second branch behind it.
+///
+/// There is no such choice on the input side. `ByteArrayInputStream.read()`
+/// **must** return `-1` at `pos >= count` and `close()` **must** be a no-op, on
+/// every path, whatever any observer thinks; those are JDK contracts a lifetime
+/// observer has no business editing. A `bool` here would be a return value that
+/// every caller is required to ignore — the kind of parameter that eventually
+/// gets honoured by someone who reads the type and not the doc, silently
+/// turning an EOF into a non-EOF. So the type says what is true: observe, do
+/// not decide.
+///
+/// `Err` is still available and still propagates, for a genuine internal
+/// failure the VM must not swallow. Observers should treat it as such and
+/// **must not** raise a Java exception from here to signal an ordinary
+/// condition: it would surface out of a `ByteArrayInputStream.read()` that
+/// HotSpot completes normally, which is a divergence bought in exchange for
+/// nothing.
+pub type BaisEventHook =
+    fn(&mut dyn NativeContext, ObjectRef, BaisEvent) -> Result<(), MethodCallFailed>;
+
+static BAIS_EVENT_HOOK: OnceLock<BaisEventHook> = OnceLock::new();
+
+/// Install the process-wide optional BAIS lifetime observer. Registration
+/// happens during native bootstrap; repeated registrations are harmless because
+/// the first (and only) bridge implementation wins — same contract as
+/// [`install_baos_event_hook`].
+pub fn install_bais_event_hook(hook: BaisEventHook) {
+    let _ = BAIS_EVENT_HOOK.set(hook);
+}
+
+/// Offer a BAIS lifetime event to the optional observer.
+///
+/// With no hook installed this is one relaxed `OnceLock` load and a return,
+/// which is strictly cheaper than what [`dispatch_baos_event`] already pays on
+/// every single byte written through `ByteArrayOutputStream.write(I)V`.
+pub fn dispatch_bais_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    event: BaisEvent,
+) -> Result<(), MethodCallFailed> {
+    match BAIS_EVENT_HOOK.get() {
+        Some(hook) => hook(ctx, stream, event),
+        None => Ok(()),
+    }
+}
+
 /// Classification of a registered native method.
 ///
 /// The native overlay is three different things wearing one uniform; this tag
@@ -4871,6 +5119,86 @@ pub enum NativeKind {
     Intrinsic,
     Bridge,
     SyntheticStub,
+}
+
+/// Per-kind dispatch total, carrying the one fact that says whether it may be
+/// believed. Produced by
+/// [`NativeMethodRegistry::invocations_of_kind_checked`].
+///
+/// The pair exists because the total alone is unfalsifiable in the direction
+/// gates actually assert. `synthetic_stub_invocations == 0` is the L4 gate
+/// (`docs/feature-designs/jdk-only-mode.md` §4); it is read from a sum of
+/// [`NativeMethodRegistry::record_invocation`] counters, and any slot wired to a
+/// bypassing dispatch path contributes nothing to that sum however many times
+/// it runs. Four such slots are `SyntheticStub` today — the Panama
+/// `DowncallHandle` arms in `UNCOUNTED_STACKLESS_NATIVES`; see
+/// [`NativeMethodRegistry::invocations_of_kind`] for the measurement. Reading
+/// `total` without `incomplete_slots` cannot distinguish those two zeroes.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct KindInvocations {
+    /// The kind this was measured for.
+    pub kind: NativeKind,
+    /// Counted dispatches summed over every slot of this kind — a **floor** on
+    /// Java-level calls whenever `incomplete_slots > 0`.
+    pub total: u64,
+    /// Slots of this kind that have declared their count a floor
+    /// ([`NativeMethodRegistry::mark_invocations_incomplete`]).
+    pub incomplete_slots: usize,
+}
+
+impl KindInvocations {
+    /// `true` when `total == 0` **and** every slot of this kind is counted, so
+    /// the zero actually means "none ran".
+    ///
+    /// A zero `total` with `incomplete_slots > 0` is not a weaker result than
+    /// this — it is *no result*, and it is the state in which an `== 0`
+    /// assertion passes while proving nothing.
+    pub fn is_conclusive_zero(self) -> bool {
+        self.total == 0 && self.incomplete_slots == 0
+    }
+
+    /// Whether the instrument can currently see every slot of this kind, i.e.
+    /// whether `total` is a total rather than a floor.
+    ///
+    /// Distinguished from [`Self::is_conclusive_zero`] so a caller that wants
+    /// to *report* a non-zero total can still say whether it is the whole
+    /// number.
+    pub fn is_measurable(self) -> bool {
+        self.incomplete_slots == 0
+    }
+
+    /// The gate predicate: no dispatches of this kind were counted **and** none
+    /// could have escaped counting.
+    ///
+    /// Identical to [`Self::is_conclusive_zero`] and named for the call site,
+    /// because the two readings are worth keeping apart in a gate's source:
+    /// `is_conclusive_zero` is a statement about the measurement,
+    /// `is_clean` is the verdict drawn from it. A gate must not pass on
+    /// `total == 0` alone.
+    pub fn is_clean(self) -> bool {
+        self.is_conclusive_zero()
+    }
+
+    /// One line a failing gate can print that names *which* of the two failure
+    /// modes it hit — a gate that says only "assertion failed" sends the reader
+    /// to look for a stub that may not exist.
+    pub fn describe(self) -> String {
+        match (self.total, self.incomplete_slots) {
+            (0, 0) => format!("{}: 0 dispatches, all slots counted", self.kind.as_str()),
+            (0, n) => format!(
+                "{}: 0 counted dispatches, but {n} slot(s) of this kind are declared \
+                 incomplete — this zero proves nothing (see NativeMethodRegistry::\
+                 invocations_of_kind)",
+                self.kind.as_str()
+            ),
+            (t, 0) => format!("{}: {t} dispatches", self.kind.as_str()),
+            (t, n) => format!(
+                "{}: at least {t} dispatches ({n} slot(s) declared incomplete, so this \
+                 is a floor)",
+                self.kind.as_str()
+            ),
+        }
+    }
 }
 
 impl NativeKind {
@@ -4930,9 +5258,37 @@ pub struct NativeCensusEntry {
     /// Kind of the entry this registration overwrote, if any. `Some` means this
     /// row superseded an earlier registration of the identical triple.
     pub overwrote: Option<NativeKind>,
-    /// Times this slot was dispatched through any path this run. `0` on a
-    /// superseded row: the count belongs to whoever currently owns the slot.
+    /// Times this slot was dispatched **through a path that resolved it by
+    /// name or id** this run. `0` on a superseded row: the count belongs to
+    /// whoever currently owns the slot.
+    ///
+    /// # This is a lower bound, and reading it as a call count has cost time
+    ///
+    /// Not "times the method ran". A dispatch served from a pre-resolved
+    /// function pointer — the interpreter's intrinsic table, the JIT's thin
+    /// direct-call helpers — never touches the registry and is not here.
+    /// MEASURED 2026-08-17: 100,000 `Math.abs` calls report `1`; the same run
+    /// under `CRATONVM_DISABLE_INTRINSICS=1` reports `100,000`. 100,000
+    /// `HashMap.get` calls report `1,873` with the JIT on and `100,001` under
+    /// `--nojit`. Full method, controls and the causal test:
+    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`.
+    ///
+    /// Consequences already paid for in this directory: a lane concluded a
+    /// body was dead from `invocations = 0` when its workload simply never
+    /// reached the counted path, and another was told to read the field as a
+    /// boolean. **Check [`Self::invocations_complete`] first.** For a census
+    /// that is exact for everything measured, run with `--nojit` and
+    /// `CRATONVM_DISABLE_INTRINSICS=1`.
     pub invocations: u64,
+    /// Whether [`Self::invocations`] is a total (`true`) or a floor (`false`)
+    /// for this slot — see
+    /// [`NativeMethodRegistry::mark_invocations_incomplete`].
+    ///
+    /// `true` is the default and means "no dispatch path has declared itself a
+    /// bypass for this slot". Until the sites listed on that method actually
+    /// call it, `true` is the answer for every row, and the honest reading of
+    /// the whole column is still the one on [`Self::invocations`].
+    pub invocations_complete: bool,
     /// Whether this registration still **owns its slot**, i.e. whether a
     /// dispatch of this triple would reach *this* row's callback.
     ///
@@ -5312,6 +5668,36 @@ pub struct NativeMethodRegistry {
     /// the accumulated count carries over to the new owner. See
     /// [`invocations_of_kind`](Self::invocations_of_kind).
     slot_invocations: Vec<std::sync::atomic::AtomicU64>,
+    /// Per-slot "this counter is a **lower bound**" flag, index-parallel with
+    /// `slots` and grown in the same single arm as `slot_invocations`.
+    ///
+    /// # Why the census needs a second bit per slot
+    ///
+    /// [`record_invocation`](Self::record_invocation) is exact for every
+    /// dispatch that reaches it. What it cannot see is a dispatch that never
+    /// consults the registry at all, because some caller resolved this
+    /// triple's callback ONCE and then called the resulting function pointer
+    /// directly. Two such families were measured on 2026-08-17
+    /// (`docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`):
+    /// the interpreter's intrinsic table and the JIT's thin direct-call
+    /// helpers. Both are deliberate optimisations, both are correct, and both
+    /// silently removed this counter along with the name resolution it was
+    /// attached to.
+    ///
+    /// Rather than pay a `fetch_add` on those paths — measured at **+9.2 ns
+    /// per call**, which is the whole margin a thin direct-call helper exists
+    /// to buy — a bypassing path sets this bit ONCE, cold, when it binds the
+    /// call site. The census then reports `invocations_complete: false` for
+    /// that slot, and a reader knows the number is a floor rather than a
+    /// count. An instrument that says "at least N" is usable; one that says
+    /// "N" and means "at least N" is not.
+    ///
+    /// `false` (the default) is the *claim*, not the absence of one: it says
+    /// nothing bypassed this slot as far as the registry was told. It is only
+    /// as true as the bypassing paths are honest about calling
+    /// [`mark_invocations_incomplete`](Self::mark_invocations_incomplete) —
+    /// which is why that method's doc carries the list of sites that must.
+    slot_invocations_incomplete: Vec<std::sync::atomic::AtomicBool>,
     /// 128-bit `(class, method, descriptor)` digest -> slot index. A hit here
     /// is a *candidate*, not an answer: `slot_index_for_key` re-checks the full
     /// triple before returning the slot.
@@ -5602,6 +5988,9 @@ impl NativeMethodRegistry {
             // Index-parallel with `slots`; sized identically so the ~3,100 boot
             // pushes never reallocate.
             slot_invocations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
+            // Same index-parallel discipline and the same sizing hint; see the
+            // field doc for what the bit means.
+            slot_invocations_incomplete: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             slot_by_key: FxHashMap::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
@@ -6005,6 +6394,18 @@ impl NativeMethodRegistry {
                     registered_by: prov.map(|p| format!("{}:{}", p.site.file(), p.site.line())),
                     overwrote: prov.and_then(|p| p.overwrote),
                     invocations,
+                    // Read through the same `owner_slot` reverse index as the
+                    // count itself, so the flag always describes the slot the
+                    // number came from. A superseded row reports `0`
+                    // invocations and therefore `true`: a floor of zero on a
+                    // row that can never be dispatched is exact, and claiming
+                    // it might be higher would invent a doubt.
+                    invocations_complete: owning_slot
+                        .and_then(|slot_idx| {
+                            self.slot_invocations_incomplete.get(slot_idx as usize)
+                        })
+                        .map(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(true),
                     // Same index-parallel discipline (and same conservative
                     // fallback direction) as `kind` above: a hypothetical
                     // desync reports "inherited", never a false "adjudicated".
@@ -7209,6 +7610,14 @@ impl NativeMethodRegistry {
                 // `registrations`/`classes_with_natives` pair documents above.
                 self.slot_invocations
                     .push(std::sync::atomic::AtomicU64::new(0));
+                // Index-parallel with `slots` for the same reason and by the
+                // same rule: this is the only arm that grows the slot table,
+                // so it is the only arm that may grow either sidecar. A slot
+                // starts out claiming a complete count; only a bypassing
+                // dispatch path clears that claim, via
+                // `mark_invocations_incomplete`.
+                self.slot_invocations_incomplete
+                    .push(std::sync::atomic::AtomicBool::new(false));
                 self.slot_by_key.insert(key, idx);
             }
         }
@@ -7495,13 +7904,59 @@ impl NativeMethodRegistry {
             .collect()
     }
 
-    /// Count one dispatch of `id`. Called by every dispatch path immediately
-    /// before invoking it (`docs/feature-designs/jdk-only-mode.md` §4).
+    /// Count one dispatch of `id`. Called by every dispatch path **that still
+    /// resolves this triple by name or id** immediately before invoking it
+    /// (`docs/feature-designs/jdk-only-mode.md` §4).
+    ///
+    /// # What this counter does NOT see — read before believing a number
+    ///
+    /// The counter is attached to the *resolution*, not to the call. Every
+    /// optimisation this VM has added to the native path since consists of
+    /// removing the resolution from the hot path, and each one took the
+    /// counter with it. Two families were isolated and causally confirmed on
+    /// 2026-08-17 against the release binary built from `783685c34`
+    /// (`docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`):
+    ///
+    /// * **The interpreter's intrinsic table.** Once an invoke cache installs
+    ///   a `CachedInvokeTarget::Intrinsic`, the site holds a raw `fn` pointer
+    ///   and this registry is never consulted again. MEASURED: 100,000
+    ///   `Math.abs` calls report **1**, and the identical run under
+    ///   `CRATONVM_DISABLE_INTRINSICS=1` reports **100,000**. Arm-independent
+    ///   — it is just as blind under `--nojit`.
+    /// * **The JIT's thin direct-call helpers** (`jit_hashmap_put_direct` and
+    ///   its siblings). The compiler emits a direct `CALL` to a VM function
+    ///   that open-codes the native's semantics with no `NativeMethodId` in
+    ///   scope. MEASURED: 100,000 `HashMap.get` calls report **1,873** in the
+    ///   JIT arm and **100,001** under `--nojit`, and the JIT figure does not
+    ///   move with the workload size or with `CRATONVM_JIT_THRESHOLD` — it is
+    ///   frozen at the count reached before the enclosing loop was compiled.
+    ///
+    /// So `invocations` is a **lower bound on Java-level calls**, and an exact
+    /// count of *registry-resolved dispatches*. A zero is not evidence a body
+    /// is dead; a small number is not evidence a body is cold. There is one
+    /// configuration in which it is exact for everything measured —
+    /// `--nojit` with `CRATONVM_DISABLE_INTRINSICS=1` — and that is the
+    /// configuration to take a census in.
+    ///
+    /// A path that knowingly bypasses this counter must say so once, cold, via
+    /// [`mark_invocations_incomplete`](Self::mark_invocations_incomplete), so
+    /// the census can label the row instead of the reader having to know this
+    /// doc comment exists.
     ///
     /// # Cost
     ///
     /// One bounds-checked index into `slot_invocations` and one **relaxed**
-    /// `fetch_add`. No allocation, no lock, no hashing, no string comparison —
+    /// `fetch_add`. MEASURED (`rustc -O`, 12 interleaved rounds, medians, a
+    /// 12,011-entry counter vector matching this branch's registration count):
+    /// **+9.2 ns/call** against a 1.25 ns bounds-checked-index baseline on a
+    /// single hot slot, **+8.4 ns/call** spread over 64 slots. Against the
+    /// ~141 ns Rust native-call boundary (`G20-1` §5) that is ~6% and
+    /// affordable, which is why it sits here. Against a thin direct-call
+    /// helper, whose entire reason to exist is to be cheaper than that
+    /// boundary, it is not — which is why those helpers are expected to set
+    /// the incomplete bit rather than pay this.
+    ///
+    /// No allocation, no lock, no hashing, no string comparison —
     /// the caller already holds the `NativeMethodId`, so there is nothing left
     /// to resolve. `&self`, because every dispatch path holds only `&` on the
     /// registry; that is why the counter is an atomic and not a `u64`.
@@ -7524,6 +7979,12 @@ impl NativeMethodRegistry {
 
     /// Dispatches recorded against `id` this run, or `None` if the handle does
     /// not belong to this registry. O(1).
+    ///
+    /// A **lower bound** on Java-level calls whenever
+    /// [`invocations_complete`](Self::invocations_complete) answers
+    /// `Some(false)` — see [`record_invocation`](Self::record_invocation) for
+    /// the two measured bypass families and for the one configuration in which
+    /// this number is exact.
     #[inline]
     pub fn invocations_of_id(&self, id: NativeMethodId) -> Option<u64> {
         self.slot_invocations
@@ -7531,9 +7992,130 @@ impl NativeMethodRegistry {
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Declare that this slot is dispatched through a path that does **not**
+    /// call [`record_invocation`](Self::record_invocation), so its count is a
+    /// floor rather than a total.
+    ///
+    /// Call it **once, cold, at bind time** — where a call site is wired to a
+    /// pre-resolved callback — not per dispatch. The whole point of the bit is
+    /// that the bypassing paths cannot afford a per-call atomic; paying one to
+    /// announce that you are not paying one would be absurd.
+    ///
+    /// # The sites that owe this call
+    ///
+    /// Measured 2026-08-17 and recorded in
+    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`.
+    /// None of them calls this yet — this method is the landing point the
+    /// nominations in that record are written against, and it is deliberately
+    /// on the registry rather than in each caller so there is one contract:
+    ///
+    /// * `vm/src/runtime/interpreter/dispatch_static.rs`, where
+    ///   `populate_invoke_cache` installs `CachedInvokeTarget::Intrinsic`, and
+    ///   the matching site in `dispatch_virtual.rs`.
+    /// * `vm/src/jit/helpers.rs`, where `jit::try_compile` binds a call site to
+    ///   `jit_hashmap_put_direct` / `jit_hashmap_get_direct` /
+    ///   `jit_concurrent_hashmap_get_direct` /
+    ///   `jit_string_latin1_to_lower_direct`.
+    /// * `vm/src/vm/vm_exec.rs`'s `invoke_or_native` arms, which resolve with
+    ///   `find_with_kind` and hold no id — that one needs a `resolve_id` first
+    ///   and is the least attractive of the three.
+    ///
+    /// # Sticky by design
+    ///
+    /// Never cleared, including by re-registration of the triple. A
+    /// re-registration updates the slot in place, but a call site already bound
+    /// to the *previous* callback keeps calling it, so the count keeps being
+    /// short. Clearing the bit would make a stale claim of completeness — the
+    /// one direction this instrument must not err in.
+    ///
+    /// An out-of-range `id` is ignored, exactly as in `record_invocation`.
+    #[inline]
+    pub fn mark_invocations_incomplete(&self, id: NativeMethodId) {
+        if let Some(flag) = self.slot_invocations_incomplete.get(id.index()) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether [`invocations_of_id`](Self::invocations_of_id) for this slot is
+    /// a total (`Some(true)`) or a floor (`Some(false)`); `None` if the handle
+    /// does not belong to this registry. O(1).
+    ///
+    /// `Some(true)` means only that no dispatch path has *declared* itself a
+    /// bypass. It is a claim carried by the code, not a proof — read
+    /// [`record_invocation`](Self::record_invocation)'s bypass list before
+    /// treating it as one.
+    #[inline]
+    pub fn invocations_complete(&self, id: NativeMethodId) -> Option<bool> {
+        self.slot_invocations_incomplete
+            .get(id.index())
+            .map(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// How many slots have been declared incomplete
+    /// ([`mark_invocations_incomplete`](Self::mark_invocations_incomplete)).
+    ///
+    /// One number a dump header can print so a reader is told the column is a
+    /// floor *before* reading the column, rather than after quoting it. Cold:
+    /// one relaxed load per slot, run once at report time, the same shape and
+    /// the same justification as
+    /// [`invocations_of_kind`](Self::invocations_of_kind).
+    pub fn slots_with_incomplete_invocations(&self) -> usize {
+        self.slot_invocations_incomplete
+            .iter()
+            .filter(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .count()
+    }
+
     /// Total dispatches recorded for slots currently classified `kind`
     /// (`docs/feature-designs/jdk-only-mode.md` §4). The CI gate reads this with
     /// `NativeKind::SyntheticStub` and asserts zero.
+    ///
+    /// # What a zero from this gate does and does not prove
+    ///
+    /// It is a sum of [`record_invocation`](Self::record_invocation) counters,
+    /// so it inherits that method's blind spots exactly: a synthetic stub
+    /// dispatched only through the interpreter's intrinsic table or a JIT thin
+    /// direct-call helper contributes **nothing** here. The assertion is
+    /// therefore sound in one direction only — non-zero is proof a stub ran,
+    /// zero is not proof none did.
+    ///
+    /// **G33-1's reason the gate had not been wrong yet has EXPIRED.** That
+    /// record said "neither bypass family currently serves a `SyntheticStub`
+    /// (both tables are `java.base` intrinsics and collection fast paths, all
+    /// `Bridge` or `Intrinsic`)". A **third** family has landed since —
+    /// `vm/src/runtime/interpreter/invoke.rs`'s `UNCOUNTED_STACKLESS_NATIVES`,
+    /// the stackless-invoke path that returns `Handled` before the census
+    /// increment — and **four of its fourteen triples are registered
+    /// `SyntheticStub`**:
+    ///
+    /// ```text
+    /// java/lang/foreign/DowncallHandle  type        ()Ljava/lang/invoke/MethodType;
+    /// java/lang/foreign/DowncallHandle  invoke      ([Ljava/lang/Object;)Ljava/lang/Object;
+    /// java/lang/foreign/DowncallHandle  invokeExact ([Ljava/lang/Object;)Ljava/lang/Object;
+    /// java/lang/foreign/DowncallHandle  invokeBasic ([Ljava/lang/Object;)Ljava/lang/Object;
+    /// ```
+    ///
+    /// MEASURED — `--dump-native-registry`, `9ae371468`, default (`compatible`)
+    /// mode: all four `kind = synthetic-stub`, `owns_slot = true`, registered
+    /// at `native-builtins/src/phases_late/foreign_ffm.rs:4247…4265`. So a
+    /// Panama downcall taken through the stackless path runs a `SyntheticStub`
+    /// and contributes **nothing** to this total: the gate reads zero and says
+    /// PASS. That is the quiet failure, not the loud one.
+    ///
+    /// Under `--jdk-only` those four are not registered at all (same dump,
+    /// `mode: jdk-only`: `synthetic-stub` count **0**, total 10,691), so the
+    /// jdk-only gate is safe **today, by mode** — a fact about what
+    /// `foreign_ffm.rs` currently registers, not a property of this method.
+    ///
+    /// **Do not read a zero from this method on its own.** Use
+    /// [`invocations_of_kind_checked`](Self::invocations_of_kind_checked),
+    /// which returns the same total alongside
+    /// [`incomplete_slots_of_kind`](Self::incomplete_slots_of_kind) so a gate
+    /// can tell a *conclusive* zero from an *uninformative* one and go red
+    /// rather than quiet. See
+    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`
+    /// and
+    /// `docs/known-issues/jdk-only/G48-1-the-input-side-hook-and-a-gate-that-could-go-quiet-20260817.md`.
     ///
     /// **Derived, not maintained.** Three per-kind global counters would make
     /// this O(1), but at the price of a SECOND contended atomic RMW on every
@@ -7558,6 +8140,48 @@ impl NativeMethodRegistry {
             .filter(|(slot, _)| slot.kind == kind)
             .map(|(_, counter)| counter.load(std::sync::atomic::Ordering::Relaxed))
             .sum()
+    }
+
+    /// How many slots currently classified `kind` have declared their
+    /// invocation count a floor
+    /// ([`mark_invocations_incomplete`](Self::mark_invocations_incomplete)).
+    ///
+    /// [`slots_with_incomplete_invocations`](Self::slots_with_incomplete_invocations)
+    /// narrowed to one kind, and it is the number that makes
+    /// [`invocations_of_kind`](Self::invocations_of_kind) readable: **a zero
+    /// total means "none ran" only when this is also zero.** Non-zero here
+    /// means at least one slot of that kind is wired to a dispatch path that
+    /// does not tick the counter, so the total is a floor and a zero total
+    /// carries no information at all.
+    ///
+    /// Same cost and same justification as `invocations_of_kind`: one relaxed
+    /// load per slot, cold, at report time.
+    pub fn incomplete_slots_of_kind(&self, kind: NativeKind) -> usize {
+        self.slots
+            .iter()
+            .zip(self.slot_invocations_incomplete.iter())
+            .filter(|(slot, _)| slot.kind == kind)
+            .filter(|(_, flag)| flag.load(std::sync::atomic::Ordering::Relaxed))
+            .count()
+    }
+
+    /// [`invocations_of_kind`](Self::invocations_of_kind) paired with the one
+    /// number that says whether it may be believed.
+    ///
+    /// This is the form a CI gate must read. The bare total is sound in one
+    /// direction only — non-zero proves a stub ran, zero does not prove none
+    /// did — and a gate that asserts `== 0` on it inherits that asymmetry
+    /// silently: when the instrument goes blind the assertion goes **quiet**,
+    /// which is the worst thing a CI check can do. [`KindInvocations::is_conclusive_zero`]
+    /// is the predicate that distinguishes "measured none" from "cannot tell",
+    /// and [`KindInvocations::is_clean`] is the assertion itself — it refuses
+    /// both a non-zero total and an unmeasurable one.
+    pub fn invocations_of_kind_checked(&self, kind: NativeKind) -> KindInvocations {
+        KindInvocations {
+            kind,
+            total: self.invocations_of_kind(kind),
+            incomplete_slots: self.incomplete_slots_of_kind(kind),
+        }
     }
 
     /// The `(class, method, descriptor)` triple that currently owns `id`.
@@ -9388,6 +10012,100 @@ mod tests {
     }
 
     #[test]
+    fn invocations_are_complete_until_a_bypassing_path_says_otherwise() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("c/C", "counted", "()I", dummy_native);
+            r.register("c/C", "bypassed", "()I", dummy_native_2);
+        });
+        let counted = registry
+            .resolve_id("c/C", "counted", "()I")
+            .expect("registered");
+        let bypassed = registry
+            .resolve_id("c/C", "bypassed", "()I")
+            .expect("registered");
+
+        // The default is the claim "nothing bypasses this slot", so a fresh
+        // registry reports every slot complete and none incomplete. A default
+        // of `false` would be honest about the codebase but would make the
+        // column useless — every row would carry the same doubt.
+        assert_eq!(registry.invocations_complete(counted), Some(true));
+        assert_eq!(registry.invocations_complete(bypassed), Some(true));
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+
+        registry.record_invocation(bypassed);
+        registry.mark_invocations_incomplete(bypassed);
+
+        // The count is still readable and still exact as a FLOOR — marking a
+        // slot incomplete must not zero or otherwise disturb the tally, which
+        // is the number a reader falls back on.
+        assert_eq!(registry.invocations_of_id(bypassed), Some(1));
+        assert_eq!(registry.invocations_complete(bypassed), Some(false));
+        assert_eq!(
+            registry.invocations_complete(counted),
+            Some(true),
+            "the flag is per slot, not global"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+
+        // Idempotent: a bind site that runs twice (recompilation, a second
+        // call site on the same triple) must not be able to change the answer.
+        registry.mark_invocations_incomplete(bypassed);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+
+        // Same foreign-handle contract as `record_invocation`: silently
+        // ignored, never a panic, and never a fabricated `Some`.
+        let foreign = NativeMethodId::from_u32(9_999);
+        registry.mark_invocations_incomplete(foreign);
+        assert_eq!(registry.invocations_complete(foreign), None);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+    }
+
+    #[test]
+    fn the_incomplete_flag_survives_re_registration_and_reaches_the_census() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("s/S", "m", "()I", dummy_native);
+        });
+        let id = registry.resolve_id("s/S", "m", "()I").expect("registered");
+        registry.record_invocation(id);
+        registry.mark_invocations_incomplete(id);
+
+        // Re-registering the triple updates the slot in place. A call site
+        // already bound to the previous callback keeps calling it, so the
+        // count keeps being short: clearing the flag here would manufacture a
+        // claim of completeness, the one direction this instrument must not
+        // err in.
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("s/S", "m", "()I", dummy_native_2);
+        });
+        assert_eq!(
+            registry.invocations_complete(id),
+            Some(false),
+            "re-registration must not clear the bypass claim"
+        );
+
+        let census = registry.census();
+        assert_eq!(census.len(), 2, "one row per registration");
+        // The superseded row owns no slot, so its zero is exact and it must
+        // NOT inherit the doubt: a floor of zero on a row that can never be
+        // dispatched is a total.
+        assert!(!census[0].owns_slot);
+        assert_eq!(census[0].invocations, 0);
+        assert!(
+            census[0].invocations_complete,
+            "a row that owns no slot reports an exact zero"
+        );
+        // The surviving row carries both the count and the doubt.
+        assert!(census[1].owns_slot);
+        assert_eq!(census[1].invocations, 1);
+        assert!(
+            !census[1].invocations_complete,
+            "the slot owner must carry the bypass claim into the census"
+        );
+    }
+
+    #[test]
     fn invocations_of_kind_follows_the_slots_current_kind() {
         // Documents the deliberate consequence of DERIVING per-kind totals by
         // scanning instead of keeping three global counters (which would add a
@@ -9416,6 +10134,153 @@ mod tests {
         );
         assert_eq!(registry.invocations_of_kind(NativeKind::SyntheticStub), 0);
         assert_eq!(registry.invocations_of_kind(NativeKind::Bridge), 2);
+    }
+
+    #[test]
+    fn a_stub_total_of_zero_is_not_a_pass_when_a_stub_slot_is_declared_incomplete() {
+        // The L4 gate is `invocations_of_kind(SyntheticStub) == 0`. This is
+        // the state in which that assertion PASSES while proving nothing —
+        // the quiet failure G33-1 §4 flagged and this test makes loud.
+        //
+        // It is not hypothetical. MEASURED on `9ae371468` in default mode:
+        // the four `java/lang/foreign/DowncallHandle` arms are registered
+        // `synthetic-stub` AND listed in `UNCOUNTED_STACKLESS_NATIVES`, the
+        // stackless-invoke bypass family, which returns `Handled` before the
+        // census increment. G33-1's "neither bypass family currently serves a
+        // SyntheticStub" was true when it was written and is not true now.
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("f/Downcall", "invoke", "()I", dummy_native);
+        });
+        let stub = registry
+            .resolve_id("f/Downcall", "invoke", "()I")
+            .expect("registered");
+        registry.mark_invocations_incomplete(stub);
+
+        // The bare total: zero. The old gate reads this and says PASS.
+        assert_eq!(registry.invocations_of_kind(NativeKind::SyntheticStub), 0);
+
+        // The honest form refuses, and says which of the two failure modes
+        // it hit rather than leaving the reader hunting for a stub.
+        let checked = registry.invocations_of_kind_checked(NativeKind::SyntheticStub);
+        assert_eq!(checked.total, 0);
+        assert_eq!(checked.incomplete_slots, 1);
+        assert!(!checked.is_measurable());
+        assert!(!checked.is_conclusive_zero());
+        assert!(
+            !checked.is_clean(),
+            "a gate must not pass on total == 0 alone"
+        );
+        assert!(
+            checked.describe().contains("proves nothing"),
+            "the failure message must name the blindness, not just the count: {}",
+            checked.describe()
+        );
+    }
+
+    #[test]
+    fn a_stub_total_of_zero_with_every_stub_slot_counted_is_a_pass() {
+        // The other side of the same predicate, so `is_clean` cannot be
+        // satisfied by simply never returning true. Marking a slot of a
+        // DIFFERENT kind incomplete — which is the true state of every
+        // `--jdk-only` run today, where the JIT and interpreter bypass lists
+        // resolve only `Bridge` and `Intrinsic` triples — must not make the
+        // stub verdict unmeasurable.
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("s/S", "m", "()I", dummy_native);
+        });
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("b/B", "m", "()I", dummy_native_2);
+        });
+        let bridge = registry.resolve_id("b/B", "m", "()I").expect("registered");
+        registry.mark_invocations_incomplete(bridge);
+        registry.record_invocation(bridge);
+
+        let stubs = registry.invocations_of_kind_checked(NativeKind::SyntheticStub);
+        assert!(
+            stubs.is_clean(),
+            "no stub ran and every stub slot is counted"
+        );
+        assert_eq!(
+            registry.incomplete_slots_of_kind(NativeKind::SyntheticStub),
+            0
+        );
+
+        // The bridge's own total is a floor, and says so.
+        let bridges = registry.invocations_of_kind_checked(NativeKind::Bridge);
+        assert_eq!(bridges.total, 1);
+        assert!(!bridges.is_measurable());
+        assert!(bridges.describe().contains("at least 1"));
+    }
+
+    #[test]
+    fn incomplete_slots_of_kind_follows_the_slots_current_kind() {
+        // The same re-registration consequence
+        // `invocations_of_kind_follows_the_slots_current_kind` pins for the
+        // counter, pinned for the flag — because the two are read together
+        // and a divergence between them would be invisible.
+        //
+        // This is also the one direction that matters for the gate: promoting
+        // a bypassed stub to `Bridge` moves BOTH the count and the blindness
+        // off the stub verdict, which is correct (the stub was fixed). The
+        // reverse — demoting a marked `Bridge` to `SyntheticStub` — makes the
+        // stub verdict unmeasurable, which is exactly when a gate must go red.
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("p/P", "m", "()I", dummy_native);
+        });
+        let id = registry.resolve_id("p/P", "m", "()I").expect("registered");
+        registry.mark_invocations_incomplete(id);
+        assert_eq!(registry.incomplete_slots_of_kind(NativeKind::Bridge), 1);
+        assert_eq!(
+            registry.incomplete_slots_of_kind(NativeKind::SyntheticStub),
+            0
+        );
+        assert!(registry
+            .invocations_of_kind_checked(NativeKind::SyntheticStub)
+            .is_clean());
+
+        // Demote the same triple to a stub. The bit is sticky by design, so
+        // the blindness travels with the slot.
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("p/P", "m", "()I", dummy_native_2);
+        });
+        assert_eq!(
+            registry.resolve_id("p/P", "m", "()I"),
+            Some(id),
+            "re-registration must update the slot in place"
+        );
+        assert_eq!(registry.incomplete_slots_of_kind(NativeKind::Bridge), 0);
+        assert_eq!(
+            registry.incomplete_slots_of_kind(NativeKind::SyntheticStub),
+            1
+        );
+        assert!(
+            !registry
+                .invocations_of_kind_checked(NativeKind::SyntheticStub)
+                .is_clean(),
+            "a bypassed slot that becomes a stub must turn the gate red, not quiet"
+        );
+    }
+
+    #[test]
+    fn the_bais_hook_is_absent_until_installed() {
+        // The BAIS observer is a process-wide `OnceLock` and this crate never
+        // installs one, so `native-io`'s dispatch sites are inert here — the
+        // property that makes adding them a no-op for every consumer until
+        // the nominated `http_url_connection.rs` hook lands. Asserted through
+        // the public surface rather than by reading the static, so it stays
+        // true if the storage changes.
+        //
+        // Deliberately not a behavioural test of a hook: installing one would
+        // be irreversible for every other test in this binary. The
+        // behavioural coverage lives in `native-io`, thread-armed for exactly
+        // that reason.
+        assert!(
+            BAIS_EVENT_HOOK.get().is_none(),
+            "no hook may be installed from within native-api's own tests"
+        );
     }
 
     #[test]
@@ -9665,5 +10530,160 @@ mod tests {
                 .is_some(),
             "the permissive registry is unaffected by the other VM's policy"
         );
+    }
+
+    // ----- G56-1: the slot-indexed raw accessors ---------------------------
+    //
+    // `MockNativeContext` overrides neither `get_field_typed` nor
+    // `get_field_raw`/`set_field_raw`, so every test below exercises the trait
+    // DEFAULTS — which is the code this lane added and the code every mock in
+    // the tree will inherit.
+
+    fn fresh_object(ctx: &mut MockNativeContext) -> ObjectRef {
+        match ctx.new_object("java/lang/Object") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock new_object must hand back an object, got {other:?}"),
+        }
+    }
+
+    /// The sentinel has to be a byte no class file can produce.
+    ///
+    /// JVMS §4.3.2: a field descriptor begins with one of `B C D F I J S Z L
+    /// [`. `RAW_SLOT_DESCRIPTOR` must be outside that set, or `get_field_raw`
+    /// would decode the slot as whichever type it collided with — silently, and
+    /// only for slots whose real descriptor differs.
+    #[test]
+    fn the_raw_slot_descriptor_is_not_a_jvm_field_descriptor() {
+        for d in b"BCDFIJSZL[" {
+            assert_ne!(
+                RAW_SLOT_DESCRIPTOR, *d,
+                "the raw sentinel collided with the real descriptor '{}'",
+                *d as char
+            );
+        }
+    }
+
+    /// A raw read hands back the tag that is stored, not a decoded one.
+    ///
+    /// The distinction this accessor exists for is `Int(0)` vs `Object(None)`
+    /// at a slot the class declares `L`: the first is a never-written slot
+    /// (`gen_heap::read_slot`'s R-niche rule), the second is an explicit null.
+    /// Every other slot-indexed reader on the trait collapses them.
+    #[test]
+    fn get_field_raw_hands_back_the_stored_tag_verbatim() {
+        let mut ctx = MockNativeContext::new();
+        let obj = fresh_object(&mut ctx);
+
+        for (slot, stored) in [
+            Value::Int(0),
+            Value::Int(-7),
+            Value::Long(1 << 40),
+            Value::Float(0.5),
+            Value::Double(-2.5),
+            Value::Object(None),
+            Value::Uninitialized,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.set_field(obj, slot, stored);
+            assert_eq!(
+                ctx.get_field_raw(obj, slot),
+                stored,
+                "slot {slot} must read back byte-identically"
+            );
+        }
+
+        // The falsifier: a reader that always answered null, or always
+        // answered the descriptor default, would pass every assertion above
+        // for exactly one of these two and fail for the other.
+        ctx.set_field(obj, 20, Value::Int(0));
+        ctx.set_field(obj, 21, Value::Object(None));
+        assert_ne!(
+            ctx.get_field_raw(obj, 20),
+            ctx.get_field_raw(obj, 21),
+            "a raw read must keep `Int(0)` and `Object(None)` distinguishable -- \
+             that is the entire capability being added"
+        );
+    }
+
+    /// A live reference survives the round trip.
+    ///
+    /// This is the case that makes a verbatim `Object.clone()` possible and the
+    /// one where the coercing pair can do real damage: an `Object(Some(_))`
+    /// sitting in a slot the class declares primitive is truncated to
+    /// `Int(ptr as i32)` by `coerce_field_value_for_slot`, a stale address no
+    /// collector will remap (G52-1 §1.6).
+    #[test]
+    fn the_raw_pair_round_trips_a_live_reference() {
+        let mut ctx = MockNativeContext::new();
+        let src = fresh_object(&mut ctx);
+        let dst = fresh_object(&mut ctx);
+        let payload = fresh_object(&mut ctx);
+
+        ctx.set_field(src, 3, Value::Object(Some(payload)));
+        let copied = ctx.get_field_raw(src, 3);
+        ctx.set_field_raw(dst, 3, copied);
+
+        assert_eq!(
+            ctx.get_field_raw(dst, 3),
+            Value::Object(Some(payload)),
+            "the copy must hold the SAME reference, not a truncated address"
+        );
+    }
+
+    /// The store half is a real store, and it is the one a copy loop uses.
+    ///
+    /// The default delegates to `set_field`; this pins that the delegation
+    /// exists and lands in the same slot the raw reader reads. It does NOT
+    /// claim the production `NativeContextImpl` stores raw — see the method's
+    /// own doc comment, which says the opposite in as many words.
+    #[test]
+    fn set_field_raw_writes_the_slot_the_raw_reader_reads() {
+        let mut ctx = MockNativeContext::new();
+        let obj = fresh_object(&mut ctx);
+
+        ctx.set_field_raw(obj, 5, Value::Long(0x5EED));
+        assert_eq!(ctx.get_field_raw(obj, 5), Value::Long(0x5EED));
+        assert_eq!(
+            ctx.get_field(obj, 5),
+            Value::Long(0x5EED),
+            "the raw and ordinary readers must agree about WHICH slot was written"
+        );
+    }
+
+    /// A two-line verbatim copy, which is the whole point of the pair.
+    ///
+    /// `Object.clone()` is specified as a verbatim field copy. Before these
+    /// accessors existed there was no slot-indexed way to express one from a
+    /// native: `get_field`/`set_field` resolve and coerce, and the only raw
+    /// pair was name-keyed (G52-1 §1.4). This is the loop the follow-up in
+    /// `native-builtins/src/lib.rs` is expected to become.
+    #[test]
+    fn the_raw_pair_expresses_a_verbatim_field_copy() {
+        let mut ctx = MockNativeContext::new();
+        let src = fresh_object(&mut ctx);
+        let dst = fresh_object(&mut ctx);
+
+        // A receiver whose slots hold three tags the descriptor pair would
+        // rewrite: a never-written reference (raw zero), an explicit null, and
+        // a long.
+        let planted = [Value::Int(0), Value::Object(None), Value::Long(-1)];
+        for (i, v) in planted.iter().enumerate() {
+            ctx.set_field(src, i, *v);
+        }
+
+        for i in 0..planted.len() {
+            let v = ctx.get_field_raw(src, i);
+            ctx.set_field_raw(dst, i, v);
+        }
+
+        for (i, v) in planted.iter().enumerate() {
+            assert_eq!(
+                ctx.get_field_raw(dst, i),
+                *v,
+                "slot {i} of the copy diverged from the original"
+            );
+        }
     }
 }

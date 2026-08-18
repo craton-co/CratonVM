@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-450 tokens.
+453 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -105,6 +105,7 @@ export inherited from a parent shell.
 | `bd-debug` | `CRATONVM_BD_DEBUG` |
 | `blocked-access` | `CRATONVM_DBG_BLOCKED_ACCESS` |
 | `blockgc` | `CRATONVM_DBG_BLOCKGC` |
+| `root-remap-audit` | `CRATONVM_DBG_ROOT_REMAP_AUDIT` |
 | `bufunder` | `CRATONVM_DBG_BUFUNDER` |
 | `bug03` | `CRATONVM_DBG_BUG03` |
 | `bytecode-dump` | `CRATONVM_DBG_BYTECODE_DUMP` |
@@ -193,6 +194,7 @@ export inherited from a parent shell.
 | `gdm-prof` | `CRATONVM_DBG_GDM_PROF` |
 | `g1-dbg-zero` | `CRATONVM_G1_DBG_ZERO` |
 | `g1diag` | `CRATONVM_DBG_G1DIAG` |
+| `g1accessor` | `CRATONVM_DBG_G1ACCESSOR` |
 | `gc-array-guard-bt` | `CRATONVM_GC_ARRAY_GUARD_BT` |
 | `gc-fallback-reasons` | `CRATONVM_DBG_GC_FALLBACK_REASONS` |
 | `gc-overhead` | `CRATONVM_DBG_GC_OVERHEAD` |
@@ -249,6 +251,7 @@ export inherited from a parent shell.
 | `irslot` | `CRATONVM_DBG_IRSLOT` |
 | `isinstance` | `CRATONVM_DBG_ISINSTANCE` |
 | `jar` | `CRATONVM_DBG_JAR` |
+| `native-shadow-sink-cap` | `CRATONVM_NATIVE_SHADOW_SINK_CAP` |
 | `jetty` | `CRATONVM_DBG_JETTY` |
 | `jetty2` | `CRATONVM_DBG_JETTY2` |
 | `jit-alloc` | `CRATONVM_DBG_JIT_ALLOC` |
@@ -516,7 +519,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-179 tokens.
+182 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -539,6 +542,7 @@ export inherited from a parent shell.
 | `bulk-byte-loops` | `CRATONVM_JIT_BULK_BYTE_LOOPS` |
 | `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
 | `census-direct-helpers` | `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` |
+| `cached-entry-owner-reuse` | `CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
@@ -557,6 +561,7 @@ export inherited from a parent shell.
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
 | `dupx` | `CRATONVM_JIT_NO_DUPX` |
 | `dupx-eager-canon` | `CRATONVM_JIT_DUPX_EAGER_CANON` |
+| `eager-callee-chain` | `CRATONVM_JIT_EAGER_CALLEE_CHAIN` |
 | `enable-callee-saved-gpr-locals` | `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS` |
 | `enable-inline-new` | `CRATONVM_JIT_ENABLE_INLINE_NEW` |
 | `exc-table-c2` | `CRATONVM_JIT_NO_EXC_TABLE_C2` |
@@ -625,6 +630,7 @@ export inherited from a parent shell.
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
+| `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
 | `osr-seed-frame-slots` | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` |
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
@@ -702,7 +708,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-54 tokens.
+55 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -757,6 +763,7 @@ export inherited from a parent shell.
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
 | `zgc-gen-header-zero` | `CRATONVM_ZGC_GEN_HEADER_ZERO` |
 | `zgc-gen-dead-runs` | `CRATONVM_ZGC_GEN_DEAD_RUNS` |
+| `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |

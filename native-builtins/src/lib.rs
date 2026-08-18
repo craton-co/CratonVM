@@ -4271,6 +4271,11 @@ pub mod vector_api;
 pub mod boot_loader;
 /// Third-party compression JNI shims (snappy-java + zstd-jni) for Kafka codecs.
 pub mod compression_native;
+/// JDK-25 surface baselines (`scripts/baselines/jdk25-*.tsv`) plus the `audit`
+/// / `audit_off_surface` checks that compare our registrations against them.
+/// Declared here deliberately: without this line the module compiles in no
+/// build, so its tests are not a gate on anything.
+pub mod jdk_baseline;
 pub mod keystore;
 pub mod lookup_define;
 pub mod security_manager;
@@ -8418,22 +8423,30 @@ pub fn register_essential_natives_with_shims(
     // — clobbering the marker `getOurStackTrace()` keys on. The shared natives
     // write `detailMessage` by name, seed the `cause = this` sentinel, and
     // capture the trace.
-    for cls in &[
-        "java/lang/ClassCastException",
-        "java/lang/IllegalArgumentException",
-        "java/lang/IllegalStateException",
-        "java/lang/IllegalThreadStateException",
-        "java/lang/UnsupportedOperationException",
-        "java/lang/NullPointerException",
-        "java/lang/IndexOutOfBoundsException",
-        "java/lang/ArrayIndexOutOfBoundsException",
-        "java/lang/StringIndexOutOfBoundsException",
-        "java/lang/NumberFormatException",
-        "java/lang/SecurityException",
-        "java/lang/NoSuchMethodError",
-        "java/lang/NoSuchFieldError",
-        "java/lang/VerifyError",
-    ] {
+    //
+    // E43 (2026-08-13): this list held fourteen classes. Thirteen of them —
+    // ClassCastException, IllegalArgumentException, IllegalStateException,
+    // UnsupportedOperationException, NullPointerException,
+    // IndexOutOfBoundsException, ArrayIndexOutOfBoundsException,
+    // StringIndexOutOfBoundsException, NumberFormatException,
+    // SecurityException, NoSuchMethodError, NoSuchFieldError and VerifyError —
+    // are rows of the JDK-derived table in
+    // `lang_misc::register_throwable_subclass_natives`, which every one of them
+    // lists with BOTH `()V` and `(Ljava/lang/String;)V`, bound to these exact
+    // two bodies. That registrar is called from THIS function, further down
+    // (search `register_throwable_subclass_natives`), with no early return in
+    // between, and `register` is last-write-wins — so all 26 of those
+    // registrations were overwritten by an identical pair a few hundred lines
+    // later, every boot, in both modes. Deleting them is a provable no-op and
+    // it is 26 fewer shadowed rows for the duplicate-registration census.
+    //
+    // `java/lang/IllegalThreadStateException` is the one name that is NOT in
+    // that table, so it is the one that has to stay. MEASURED on JDK 25.0.3+9:
+    // it declares `()V` and `(Ljava/lang/String;)V` and both are public, so
+    // this pair satisfies the same rule the table is built from — a descriptor
+    // belongs iff the real class declares it and it is public (or was already
+    // registered). It is not registered anywhere else.
+    for cls in &["java/lang/IllegalThreadStateException"] {
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
             cls_static,
@@ -12139,7 +12152,15 @@ pub fn register_essential_natives_with_shims(
                 return Ok(Some(Value::Object(Some(cached))));
             }
 
-            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
+            // 5, not 2: `class_manager.rs:15407` declares the synthetic
+            // `java/lang/Module` as `instance_fields(5)` and
+            // `jboss_jdkspecific.rs:214` allocates `MODULE_FIELD_COUNT = 5`.
+            // The object was 5 slots wide either way (`num_fields.max(real)`);
+            // asking 2 only fired `report_layout_alias(.., 2, 5)` on every
+            // uncached call. The synthetic-mode twin of this triple
+            // (`phases_late/reflect_invoke.rs`) now asks 5 as well — see
+            // docs/known-issues/jdk-only/E28-R11-P59-MODULE-WIDTHS-AND-CATALOG-20260813.md §1.2.
+            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 5)?;
             // GC-safety: `create_string` below allocates (String + char[]) and
             // can trigger a moving GC. `m_obj` lives only in this Rust local —
             // not a GC root — so without pinning it would be relocated/reclaimed
@@ -12154,7 +12175,7 @@ pub fn register_essential_natives_with_shims(
                 .map(|name| Value::Object(Some(ctx.create_string(name))))
                 .unwrap_or(Value::Object(None));
             let m_obj = ctx.read_native_pin(pin, m_obj);
-            // Dual-write the name. Field index 0 is the synthetic 2-field Module
+            // Dual-write the name. Field index 0 is the synthetic Module
             // contract (the `register_p59_module` getName/isNamed/toString natives
             // read slot 0). But real `java.lang.Module.isNamed()`/`getName()`
             // bytecode reads the named `name` field (slot 1 in the real layout —
@@ -13150,11 +13171,35 @@ pub fn register_essential_natives_with_shims(
     // that holds the class.  This satisfies Quarkus/Spring/etc. code paths
     // that derive their application root from `getProtectionDomain().getCodeSource().getLocation().getPath()`.
     //
-    // Layouts (synthetic; field names match what our PD/CS/URL natives read):
-    //   ProtectionDomain — field 0: CodeSource, field 1: Permissions
-    //   CodeSource       — field 0: URL,        field 1: Certificate[]
-    //   URL              — field 0: String path (absolute FS path, '/'-separated)
-    //                      field 1: String protocol ("file"), field 2: String host ("")
+    // Layouts, as the body BELOW actually writes them — this block described a
+    // different object until 2026-08-13 and was contradicted 100 lines further
+    // down inside its own closure:
+    //   ProtectionDomain — slot 0: CodeSource; slot 1 is `classloader`, NOT
+    //                      `Permissions` (see the SBR-13 note at the tail — the
+    //                      Permissions-on-slot-1 layout is the bug that note
+    //                      records fixing). Everything else goes in by name via
+    //                      `populate_protection_domain_fields`.
+    //   CodeSource       — written BY NAME (`location`, `certs`); slot 1 is
+    //                      `signers` on the real class, so the raw-slot form
+    //                      was wrong here too.
+    //   URL              — the real JDK 25 13-field order, NOT a 3-field
+    //                      synthetic one: 0=protocol, 1=host, 2=port(int),
+    //                      3=file, 4=query, 5=authority, 6=path, 7=userInfo,
+    //                      8=ref, 9=hostAddress, 10=handler, 11=hashCode(int),
+    //                      12=tempState. Confirmed against `javap -p java.net.URL`
+    //                      on JDK 25.0.3.
+    //
+    // SHADOWED: this registration has no runtime effect. `Class.getProtectionDomain()`
+    // is registered THREE times in this one function — at `:13017` and again at
+    // `:13234`, both with `lang_class::native_class_get_protection_domain0`, with
+    // this closure sandwiched between them. `register()` is
+    // last-registration-wins, so `:13234` answers and the three allocations in
+    // this closure (`ProtectionDomain` 4, `URL` 13, `CodeSource` 2) never run.
+    // Kept because
+    // the two bodies are not identical and the live one has no equivalent of
+    // this one's `jar:file:` handling; deleting it is a behaviour question, not
+    // a cleanup. See
+    // docs/known-issues/jdk-only/E35-R11-SYNTHETIC-WIDTH-SWEEP-20260813.md §4.
     registry.register(
         "java/lang/Class",
         "getProtectionDomain",
@@ -13667,6 +13712,7 @@ pub fn register_essential_natives_with_shims(
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
+        crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
         let name = Value::Object(Some(thread_default_name(ctx)));
         if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
             populate_real_thread_holder(ctx, this, Value::Object(None), Value::Object(None), name);
@@ -13685,6 +13731,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = Value::Object(Some(thread_default_name(ctx)));
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
@@ -13706,6 +13753,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
             let name = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(thread_default_name(ctx))),
@@ -13734,6 +13782,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
@@ -13758,6 +13807,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = Value::Object(Some(thread_default_name(ctx)));
@@ -13781,6 +13831,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
@@ -13805,6 +13856,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 // Real-JDK Thread: this native intercepts the real Java
                 // constructor, so we must populate the `holder:FieldHolder`
@@ -13840,6 +13892,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
                 let target = args.get(2).cloned().unwrap_or(Value::Object(None));
@@ -13872,6 +13925,35 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            // This is the ONE public constructor that can opt OUT of
+            // inheritance: `inheritThreadLocals == false` becomes
+            // `characteristics |= NO_INHERIT_THREAD_LOCALS` (4), and the JDK
+            // master constructor's `iand`/`ifne` at pc 169..172 then skips the
+            // copy entirely. MEASURED on HotSpot 25.0.3+9
+            // (`ItlProbe` case 11): `new Thread(g, r, n, 0, false)` has the
+            // child read `null` even though the parent had a value set.
+            //
+            // Queue an EMPTY capture rather than skipping the call: an absent
+            // queue entry makes `inheritable_tl_captured_at_construction`
+            // answer false, and `native_thread_start0` would then fall back to
+            // snapshotting the parent's CURRENT map — i.e. opting out would
+            // hand the child MORE than opting in. The empty entry is the same
+            // shape `capture_inheritable_tl_at_construction` queues for a
+            // parent with no inheritable values (`ItlProbe` case 9).
+            //
+            // Slot 5 is the boolean: a `J` occupies ONE slot in this `args`
+            // vec, not two — SOURCE-VERIFIED against
+            // `Unsafe.putBoolean(Object,long,boolean)`, whose body
+            // (`unsafe_natives_ext.rs:3136`) reads the receiver at 1, the
+            // offset at 2 and the boolean at 3. Booleans arrive as
+            // `Value::Int`. The match is deliberately exact: anything that is
+            // not a literal `Int(0)` takes the ordinary capture path.
+            if matches!(args.get(5), Some(Value::Int(0))) {
+                let child_hash = ctx.identity_hash_code(this);
+                crate::phases_early::queue_inherited_tl_for_child(child_hash, Default::default());
+            } else {
+                crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            }
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
                 let target = args.get(2).cloned().unwrap_or(Value::Object(None));
@@ -14625,41 +14707,69 @@ pub fn register_essential_natives_with_shims(
     crate::lang_system::install_spawn_policy_hook();
 
     // Runtime.exec overloads — spawn subprocesses via std::process::Command
-    registry.register(
+    //
+    // W7-17 N1 — `SyntheticStub`, STATED, and the tag is the whole point.
+    // These six and `java/lang/ProcessBuilder.start` share ONE mint:
+    // `native-io/src/process.rs::spawn_and_wrap_with_redirects`, whose
+    // `refused_class(ctx, SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT)?`
+    // propagates a `--jdk-only` refusal out to the caller as
+    // `NoClassDefFoundError: cratonvm/synthetic/Process`. `ProcessBuilder.start`
+    // was re-tagged `SyntheticStub` for exactly that reason; these six were left
+    // ambient `Bridge`, so the OLDER spawn API stayed open into strict mode.
+    // **A retag that pins one caller of a shared mint must enumerate the
+    // callers** — measured 2026-08-12, one probe, both halves:
+    //
+    //     OK   ProcessBuilder.start (the pinned half)
+    //     FAIL Runtime.exec(String[]) -> NoClassDefFoundError:
+    //                                    cratonvm/synthetic/Process
+    //
+    // `Runtime.exec` is ordinary bytecode on the image (`acc_native: false,
+    // has_code: true`), so by contract §1.4 the real method outranks any bridge:
+    // strict drops these, the JDK's own `exec` runs, and it delegates to the
+    // real `ProcessBuilder.start()` -> `ProcessImpl.forkAndExec`, which this
+    // crate registers. Default `--real-jdk` is deliberately unchanged —
+    // `SyntheticStub` survives there and still shadows `exec`.
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "(Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_string,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "([Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_array,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "(Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_string_env,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "([Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_array_env,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "(Ljava/lang/String;[Ljava/lang/String;Ljava/io/File;)Ljava/lang/Process;",
         native_runtime_exec_string_env_dir,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "([Ljava/lang/String;[Ljava/lang/String;Ljava/io/File;)Ljava/lang/Process;",
         native_runtime_exec_array_env_dir,
+        NativeKind::SyntheticStub,
     );
 
     // --- java.lang.Math / StrictMath (native transcendental functions) ---
@@ -14744,11 +14854,27 @@ pub fn register_essential_natives_with_shims(
     // installs no OS signal handlers, so the Java handler that was just
     // registered will never fire. We still report 0 rather than -1: every
     // in-tree caller (`Terminator.setup` during initPhase1, Tomcat/log4j
-    // shutdown hooks) treats the exception as fatal-to-that-feature, and the
+    // shutdown hooks) treats the exception as fatal-to-that-feature, so
+    // throwing here would break boot without buying the caller any working
+    // signal delivery. Deliberate silent accept; see the wave-2 stub-removal
+    // report.
+    //
+    // CORRECTED 2026-08-12 (lane C9). This comment used to end "...and the
     // VM's own shutdown path runs through `Runtime.addShutdownHook`, not
-    // signals — so throwing here would break boot without buying the caller
-    // any working signal delivery. Deliberate silent accept; see the wave-2
-    // stub-removal report.
+    // signals", offering that as the reason the silent accept is harmless.
+    // **That premise is false and it is the second-worst thing about it: the
+    // comment reads as an assurance that orderly shutdown still works.** It
+    // does not. `Runtime.addShutdownHook` is intercepted by a native in
+    // `lang_system.rs` that roots the hook in a `SHUTDOWN_HOOKS` vector whose
+    // only reader is `removeShutdownHook`, and no exit path in this VM runs
+    // it — not `System.exit`, not `Runtime.exit`, not the launcher's
+    // post-`main` return, not the uncaught-exception path. So a Tomcat or
+    // log4j teardown reaches this VM through neither door: the signal
+    // handler is accepted and never fires, AND the shutdown hook is accepted
+    // and never runs. The accept above is still the right call for boot; what
+    // is removed is the false consolation. See
+    // `docs/known-issues/jdk-only/W7-92-shutdown-hooks-never-run.md`, and do
+    // not restore the old sentence until its `RShutdownHooks` vector is green.
     registry.register_with_kind(
         "jdk/internal/misc/Signal",
         "handle0",
@@ -17642,10 +17768,19 @@ pub fn register_essential_natives_with_shims(
                     wrote_real_config = true;
                 }
             }
-            // Our `allocate_logger`-created synthetic loggers (slot0=name,
-            // slot1=level, slot2=parent) have no `config` object at all, so
-            // the branch above never fires for them -- write the level slot
-            // directly so `getLevel()` (below) and the ancestor-walking
+            // Our `allocate_logger`-created synthetic loggers use the DECLARED
+            // layout (`class_manager.rs:14191`, real-JDK field order): name =
+            // `LOGGER_FIELD_NAME` (2), parent = `LOGGER_FIELD_PARENT` (8),
+            // level = `LOGGER_FIELD_LEVEL` (12, the VM-internal slot anchored
+            // past the 12 real fields). The "slot0=name, slot1=level,
+            // slot2=parent" this comment claimed until 2026-08-13 was the
+            // retired 3-field shim layout — and the three lines below it
+            // already use the `logmanager` constants, so the comment described
+            // neither the producer nor the reader it sits between.
+            //
+            // Such a logger has no `config` object at all, so the branch above
+            // never fires for it -- write the level slot directly so
+            // `getLevel()` (below) and the ancestor-walking
             // `getEffectiveLevel()` callers in real Spring Boot bytecode see
             // the update instead of a permanent null.
             if !wrote_real_config {
@@ -17951,6 +18086,24 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(o)) => *o,
                 _ => None,
             };
+            // `setParent(null)` throws a BARE NullPointerException — message
+            // `null`, not a helpful-NPE text. MEASURED on HotSpot 25.0.3+9
+            // (`JulN` probe, 2026-08-17): the real body opens with
+            // `Objects.requireNonNull(parent)`, which raises the no-message
+            // form. Compatible mode returned normally and then reported the
+            // logger as a root, so the null silently became "no parent".
+            //
+            // DO NOT generalise this to Logger's other one-argument setters —
+            // the family is measured and it disagrees with itself:
+            // `setLevel(null)` RETURNS, `setFilter(null)` RETURNS,
+            // `removeHandler(null)` RETURNS, and only `setParent(null)` and
+            // `addHandler(null)` throw. `Handler.setLevel(null)`, the
+            // same-named method on the sibling type, throws — the opposite
+            // verdict from `Logger.setLevel`. A blanket rule breaks the rows
+            // that return. (HANDOFF-20260814 §5; G15-1 §2.)
+            if parent.is_none() {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let is_synthetic = matches!(
                 ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                 Value::Object(Some(name))
@@ -17979,6 +18132,40 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/util/logging/Level;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // The LEVEL is required; the MESSAGE is not. MEASURED on HotSpot
+            // 25.0.3+9 (`JulN` probe, 2026-08-17), three arms of one
+            // constructor:
+            //
+            //   new LogRecord(null, "m")   -> NullPointerException, msg null
+            //   new LogRecord(null, null)  -> NullPointerException, msg null
+            //   new LogRecord(INFO, null)  -> RETURNS; getMessage() is null
+            //
+            // The third arm is why this is not one rule: JDK 25's ctor is
+            // `this.level = Objects.requireNonNull(level); this.message = msg;`
+            // — the message is stored unchecked, and `LogRecord.setMessage
+            // (null)` likewise returns (measured). Nine of LogRecord's eleven
+            // setters return on null; only `setLevel` and `setInstant` throw.
+            // Checking both arguments here would break a legal call that the
+            // oracle answers normally.
+            //
+            // Compatible mode accepted a null level and then built a record
+            // that `Handler.isLoggable` silently rejected, so the divergence
+            // was a dropped log line rather than a visible error.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
+            // JDK 25 ends this ctor with `sequenceNumber =
+            // globalSequenceNumber.getAndIncrement()`. It was never written, so
+            // MEASURED 2026-08-13 two fresh records both read 0 where HotSpot
+            // reads 0 then 1 -- any consumer ordering or de-duplicating by
+            // sequence saw a single record. Process-global rather than VM-scoped
+            // deliberately: the contract is STRICT INCREASE, which a shared
+            // counter still gives (sparser numbers, never repeated or reordered).
+            static LOG_RECORD_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq =
+                LOG_RECORD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i64;
+            ctx.set_field_by_name(this, "sequenceNumber", Value::Long(seq));
             ctx.set_field_by_name(
                 this,
                 "level",
@@ -19611,82 +19798,28 @@ pub fn register_essential_natives_with_shims(
         });
     }
 
-    // S111r15 — Character.toLowerCase / toUpperCase native overrides for
-    // real-JDK mode. The JDK bytecode delegates `(C)C` to `(I)I`, which
-    // walks `CharacterData.of(I)CharacterData` and an invokevirtual on the
-    // returned subclass. After ~2000 invocations the JIT compiles `build()`
-    // (or any caller of `Character.toLowerCase`) and the resulting machine
-    // code returns 0 for most inputs — corrupting Spring's
-    // `BeanPropertyName.toDashedForm`: `bannerMode` becomes
-    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`, tripping
-    // `InvalidConfigurationPropertyNameException` in SportMe boot.
-    // Routing the (C)C / (I)I forms through Rust's `char::to_lowercase` /
-    // `char::to_uppercase` defeats the JIT path entirely. Symmetric
-    // registration of all four forms keeps the native-shadow guard on
-    // every JIT entry point (callee_compiler / try_jit_compile_callee /
-    // try_jit_upgrade_with_gate / first-call / OSR) honored uniformly.
-    registry.register(
-        "java/lang/Character",
-        "toLowerCase",
-        "(C)C",
-        |_ctx, args| {
-            let ch = match args.first() {
-                Some(Value::Int(v)) => *v as u32,
-                _ => 0,
-            };
-            let result = char::from_u32(ch)
-                .and_then(|c| c.to_lowercase().next())
-                .unwrap_or('\0') as u32;
-            Ok(Some(Value::Int(result as i32)))
-        },
-    );
-    registry.register(
-        "java/lang/Character",
-        "toUpperCase",
-        "(C)C",
-        |_ctx, args| {
-            let ch = match args.first() {
-                Some(Value::Int(v)) => *v as u32,
-                _ => 0,
-            };
-            let result = char::from_u32(ch)
-                .and_then(|c| c.to_uppercase().next())
-                .unwrap_or('\0') as u32;
-            Ok(Some(Value::Int(result as i32)))
-        },
-    );
-    registry.register(
-        "java/lang/Character",
-        "toLowerCase",
-        "(I)I",
-        |_ctx, args| {
-            let cp = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let result = char::from_u32(cp as u32)
-                .and_then(|c| c.to_lowercase().next())
-                .map(|c| c as u32 as i32)
-                .unwrap_or(cp);
-            Ok(Some(Value::Int(result)))
-        },
-    );
-    registry.register(
-        "java/lang/Character",
-        "toUpperCase",
-        "(I)I",
-        |_ctx, args| {
-            let cp = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let result = char::from_u32(cp as u32)
-                .and_then(|c| c.to_uppercase().next())
-                .map(|c| c as u32 as i32)
-                .unwrap_or(cp);
-            Ok(Some(Value::Int(result)))
-        },
-    );
+    // The four `Character.toLowerCase`/`toUpperCase` overrides that lived here
+    // were DELETED on 2026-08-12. They were verbatim `Bridge` copies of the
+    // `Intrinsic` bodies in `lang_math.rs`, and being registered later they WON
+    // under last-write-wins. Measured with `--dump-native-registry`: the
+    // `lang_math.rs` rows read `owns=false, invocations=0` while these read
+    // `owns=true, invocations=32, overwrote:intrinsic`. Every fix applied to
+    // the intrinsic bodies was therefore inert until this block went.
+    //
+    // Their stated reason -- a JIT miscompile of `CharacterData.of(I)` that
+    // returned 0 and corrupted Spring's `BeanPropertyName.toDashedForm` -- has
+    // since been fixed at its root in `jit/src/x64/driver.rs`
+    // (`has_dispatch` / `set_jit_thread`). Re-measured 2026-08-12: 6,000,000
+    // cold-vs-hot invocations each of the UNSHADOWED `getType`, `toTitleCase`,
+    // `isSpaceChar`, `isAlphabetic` and `getDirectionality` -- 0 mismatches,
+    // byte-identical to HotSpot. The workaround outlived its defect.
+    //
+    // They were also wrong on their own terms. `char::to_lowercase()` yields
+    // the Unicode FULL mapping (SpecialCasing) where Java specifies the SIMPLE
+    // one (UnicodeData field 12), and `char::from_u32(surrogate)` is `None`, so
+    // `.unwrap_or(cp)` answered NUL for a lone surrogate -- a legal `char`.
+    // A BMP sweep over all 65,536 code points measured 2,051 wrong
+    // `toLowerCase` answers and 2,153 wrong `toUpperCase`.
 
     // ParameterFormatter-fix: real-JDK mode bypass for ZoneId.systemDefault.
     //
@@ -20155,49 +20288,38 @@ pub fn register_essential_natives_with_shims(
     // `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
 
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> Result<cratonvm_types::Value, MethodCallFailed> {
-        // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
-        // current recurring DST rule is known (`tz_dst_rule`), construct a
-        // real `java.util.SimpleTimeZone` through its full constructor — its
-        // real bytecode implements `getOffset(long)`/`inDaylightTime`
-        // correctly for both halves of the year, where the transitions-less
-        // synthetic ZoneInfo below returns the standard (winter) offset
-        // year-round (the HIB-CV-34 known limitation; visible as the
-        // `LocalDateTimeTest` "expected 2018-10-28T01:00 but was
-        // 2018-10-28T00:00" 1-hour skew on any DST-period date). Any failure
-        // falls through to the legacy ZoneInfo path — never worse.
-        if let (Some(std_secs), Some(rule)) =
-            (tz_standard_offset_seconds(id_str), tz_dst_rule(id_str))
-        {
-            let id_obj = ctx.create_string(id_str);
-            let mut args: Vec<Value> = Vec::with_capacity(13);
-            args.push(Value::Int(std_secs.saturating_mul(1000)));
-            args.push(Value::Object(Some(id_obj)));
-            args.extend(rule.iter().map(|&v| Value::Int(v)));
-            if let Ok(Some(Value::Object(Some(obj)))) = ctx.new_object_initialized(
-                "java/util/SimpleTimeZone",
-                "(ILjava/lang/String;IIIIIIIIIII)V",
-                &args,
-            ) {
-                // HIB-DST-STARTYEAR (2026-07-17): gate the just-constructed
-                // SimpleTimeZone's DST rule to real HotSpot's own historical
-                // adoption year for this zone via the real
-                // `SimpleTimeZone.setStartYear(int)` bytecode — see
-                // `dst_start_year` above for how these years were found and
-                // what this fix does/doesn't cover. Best-effort: any
-                // dispatch failure just leaves the SimpleTimeZone ungated
-                // (this project's pre-fix, DST-applied-year-round
-                // behavior) — never worse than before this fix.
-                if let Some(start_year) = dst_start_year(id_str) {
-                    let _ = ctx.invoke_virtual_bytecode_only(
-                        obj,
-                        "setStartYear",
-                        "(I)V",
-                        &[Value::Int(start_year)],
-                    );
-                }
-                return Ok(cratonvm_types::Value::Object(Some(obj)));
-            }
-        }
+        // C12-1 (2026-08-12): the DST-aware `tz_dst_rule` branch that used to
+        // stand here — construct a real `java.util.SimpleTimeZone` through its
+        // 13-arg constructor and gate it with `setStartYear` — is DELETED.
+        //
+        // Three independent reasons, in order of weight:
+        //
+        //  1. It is superseded. The TZDB-OFFSET note below states it in the
+        //     file's own words: the tzdb path "Supersedes the previous
+        //     `tz_dst_rule`/`dst_start_year`/`historical_lmt_offset`
+        //     hand-rolled approximations (a ~20-zone allowlist modeling only
+        //     each zone's *current* recurring DST rule) — this covers every
+        //     zone's full historical transition table instead." The
+        //     approximation's consumers were retired then; the branch that
+        //     PRODUCED it was not.
+        //  2. It disagrees with the oracle. Measured on HotSpot 25.0.3+9-LTS:
+        //     `TimeZone.getTimeZone("America/New_York").getClass()` is
+        //     `sun.util.calendar.ZoneInfo`, for every id tried and never a
+        //     `SimpleTimeZone`. The `ZoneInfo` path below is the shape real
+        //     HotSpot returns, so this deletion moves toward the oracle.
+        //  3. It is what made the `SimpleTimeZone` native family look
+        //     justified. Those four natives existed to make THIS fabricated
+        //     object answer from tzdb, and being per-CLASS they also captured
+        //     every `new SimpleTimeZone(rawOffset, id)` an application builds
+        //     — see the unregistration below and
+        //     `docs/known-issues/jdk-only/C6-2-simpletimezone-id-resolved-instead-of-rawoffset.md`.
+        //     With no fabricated `SimpleTimeZone` left to serve, the
+        //     registration has no remaining constituency at all.
+        //
+        // `tz_dst_rule` and `dst_start_year` above are now unreferenced. They
+        // are left in place only so this diff is one behaviour change rather
+        // than two; they have NO callers and must not acquire new ones —
+        // `crate::tzdb` is the single source of transition data.
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
         // Fall back to allocating with class-id 0 if init fails — the
         // caller only needs an object whose `getID()` returns id_str.
@@ -20208,6 +20330,16 @@ pub fn register_essential_natives_with_shims(
                 Err(_) => return Ok(cratonvm_types::Value::Object(None)),
             },
         };
+        // Resolved BEFORE the allocation, deliberately. `tzdb::raw_offset_
+        // seconds` reads a process-global cache and, on the first call,
+        // `$JAVA_HOME/lib/tzdb.dat` off the filesystem — it never enters Java
+        // and cannot move a heap object today. Computing it up here means the
+        // next reader does not have to re-establish that, and it costs
+        // nothing.
+        let raw_offset_ms = crate::tzdb::raw_offset_seconds(ctx, id_str)
+            .or_else(|| tz_standard_offset_seconds(id_str))
+            .unwrap_or(0)
+            .saturating_mul(1000);
         // Field count: be generous (16) to cover both TimeZone (ID) and
         // ZoneInfo subclass fields (rawOffset, transitions, etc.).
         let obj = ctx.alloc_object(cid, 16);
@@ -20216,18 +20348,69 @@ pub fn register_essential_natives_with_shims(
         // resolve into the correct inherited slot.
         ctx.set_field_by_name(obj, "ID", Value::Object(Some(s)));
         // ZoneInfo subclass fields — best-effort, no-op if missing.
-        // HIB-CV-34: wire the standard UTC offset (ms) from the IANA table so
-        // getRawOffset()/getOffset(long) return the real zone offset instead of
-        // 0. Without transition data this is a standard-offset-year-round
-        // approximation (no DST), but it fixes the silent N-hour shift that
-        // corrupted every custom-zone JDBC timestamp (e.g. America/Los_Angeles
-        // returned 0 instead of -28800000). `transitions` stays null, so
-        // ZoneInfo.getOffset(long) returns this rawOffset for all instants.
-        let raw_offset_ms = tz_standard_offset_seconds(id_str)
-            .unwrap_or(0)
-            .saturating_mul(1000);
+        // HIB-CV-34: wire the standard UTC offset (ms) so the `rawOffset`
+        // FIELD carries the real zone offset instead of 0. This fixes the
+        // silent N-hour shift that corrupted every custom-zone JDBC timestamp
+        // (America/Los_Angeles read 0 instead of -28800000).
+        //
+        // TWO PRODUCERS OF ONE QUANTITY, and the retired one was still
+        // writing. `getRawOffset()` and `getOffset(long)` do NOT read this
+        // field — they are natives (`register_tzdb_offset_natives_for`, below)
+        // that answer from `crate::tzdb`, and MEASURED on the d2e127930 binary
+        // they are correct on all 632 ids `getAvailableIDs()` returns. The
+        // field was seeded from `tz_standard_offset_seconds`, a ~50-entry hand
+        // table whose own successor note calls it superseded, so the field and
+        // the accessor disagreed on every id outside those 50 — the field read
+        // 0 while the accessor read the truth.
+        //
+        // That is not cosmetic. Three real-JDK bytecode paths read the FIELD
+        // and never go near the natives, all SOURCE-VERIFIED against JDK 25's
+        // `sun/util/calendar/ZoneInfo.java` (`$JAVA_HOME/lib/src.zip`):
+        //
+        //   * `getOffset(era, y, m, d, dayOfWeek, ms)` — the six-arg overload,
+        //     which is NOT one of the registered descriptors. MEASURED: on the
+        //     old seeding `TimeZone.getTimeZone("America/New_York")` answered
+        //     it wrongly while the one-arg form answered correctly, which is
+        //     the row `RSimpleTimeZoneRaw`'s `tz.sixarg.New_York.*` pins.
+        //   * `getLastRawOffset()` = `rawOffset + rawOffsetDiff`, which
+        //     `getOffsets` and `toString()` both go through.
+        //   * `inDaylightTime(Date)` in `java.util.SimpleTimeZone` (a
+        //     different class, same trap): `getOffset(t) != this.rawOffset`,
+        //     the field read against the hijacked accessor.
+        //
+        // So the field is now seeded from the SAME source the accessors use,
+        // and the hand table is demoted to the fallback it always should have
+        // been — it still answers for the deprecated three-letter aliases
+        // (`EST`, `CST`, `PST`, `MST`, `HST`) and the `GMT±HH:MM` /
+        // `Etc/GMT±N` synthetic spellings, 28 of which `ZoneId.of` cannot
+        // resolve at all.
         ctx.set_field_by_name(obj, "rawOffset", Value::Int(raw_offset_ms));
         ctx.set_field_by_name(obj, "rawOffsetDiff", Value::Int(0));
+        // `dstSavings` STAYS 0 HERE, and that is a deliberate refusal rather
+        // than an oversight. See the nomination in
+        // `docs/known-issues/jdk-only/G23-1-the-nominations-that-needed-lib-rs-20260817.md`
+        // (N-TZ-1): the value real `ZoneInfoFile` stores is the saving of the
+        // zone's LAST rule, which lives in `ZoneRulesData.last_rules` — a
+        // PRIVATE field of `crate::tzdb`, so it cannot be read from here, and
+        // `tzdb` exposes no `dst_savings_ms`.
+        //
+        // Deriving it here instead, by sampling `tzdb::legacy_offsets_ms`
+        // across a fixed year and taking the maximum saving, was tried and
+        // MEASURED against the oracle on all 632 ids: it agrees on 601 of the
+        // 604 that `ZoneId.of` resolves and is WRONG on `Africa/Casablanca`,
+        // `Africa/El_Aaiun` and `Africa/Windhoek` (it reports 3600000 where
+        // HotSpot reports 0). Those three are right today, by accident, at 0.
+        // A second producer that is 99.5% accurate is what the comment above
+        // is about; it is not an improvement on having one producer.
+        //
+        // NOTE ALSO, SOURCE-VERIFIED, because the obvious expectation is
+        // wrong: seeding `dstSavings` correctly would fix `getDSTSavings()`
+        // AND NOTHING ELSE. `ZoneInfo.useDaylightTime()` is
+        // `return (simpleTimeZoneParams != null);` and
+        // `observesDaylightTime()`/`inDaylightTime(Date)` both read
+        // `transitions` — none of the three consults `dstSavings`. The DST
+        // family needs `transitions`/`simpleTimeZoneParams` populated or a
+        // native override; a field seeding cannot reach it.
         ctx.set_field_by_name(obj, "dstSavings", Value::Int(0));
         Ok(cratonvm_types::Value::Object(Some(obj)))
     }
@@ -20679,8 +20862,11 @@ pub fn register_essential_natives_with_shims(
     // gets `getOffsets`/`getOffsetsByWall` called directly (downcast in
     // `GregorianCalendar`'s own bytecode), anything else (e.g.
     // `SimpleTimeZone`) goes through the generic `TimeZone.getOffset(long)`.
-    // Both concrete classes are covered below so it doesn't matter which one
-    // `alloc_synth_timezone` constructed for a given zone id.
+    // Only `ZoneInfo` and the abstract `TimeZone` itself are registered below:
+    // C12-1 removed `java/util/SimpleTimeZone`, whose id is an opaque LABEL and
+    // whose offset is the caller's `rawOffset`, and `alloc_synth_timezone` no
+    // longer constructs one for any id. See
+    // `docs/known-issues/jdk-only/E1-1-simpledateformat-format-zone-arm-landed.md`.
     fn tzdb_offsets(
         ctx: &mut dyn NativeContext,
         this: cratonvm_types::ObjectRef,
@@ -20803,12 +20989,49 @@ pub fn register_essential_natives_with_shims(
     ()
 }
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
-    register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
-    // The abstract base too. Only the two concrete subclasses above carried the
-    // offset family, so anything holding a `TimeZone`-typed reference — which
-    // is how the API is normally used — had no `getRawOffset`. A subclass
-    // receiver still resolves its own exact-class registration first; this is
-    // the fallback for the base.
+    // C12-1 (2026-08-12): `java/util/SimpleTimeZone` is DELIBERATELY NOT HERE.
+    //
+    // These four bodies answer from the RECEIVER'S `ID` FIELD, resolved against
+    // tzdb. That is right for a `ZoneInfo`, whose id IS the zone. It is wrong
+    // for a `java.util.SimpleTimeZone`, whose id is by contract an opaque LABEL
+    // and whose offset is the `rawOffset` its constructor stored:
+    // `new SimpleTimeZone(18000000, "America/Buenos_Aires").getRawOffset()` is
+    // `18000000` on HotSpot 25 and was `-10800000` here, because the label won.
+    // `SimpleTimeZone.getRawOffset()` is one instruction — `getfield rawOffset`
+    // — and this registration shadowed it. See
+    // `docs/known-issues/jdk-only/C6-2-simpletimezone-id-resolved-instead-of-rawoffset.md`
+    // for the full measurement set, including the silent half: unregistered
+    // `inDaylightTime(Date)` is `getOffset(t) != this.rawOffset` in real
+    // bytecode, so a hijacked `getOffset` against the real field made a zone
+    // with NO DST rule report that it IS in daylight time.
+    //
+    // WHY THE BASE REGISTRATION BELOW DOES NOT SIMPLY INHERIT THE DEFECT.
+    // `NativeMethodRegistry::find` is an exact `(class, method, descriptor)`
+    // lookup with no hierarchy walk of its own; the walk lives in the caller.
+    // For an invokevirtual, `try_stackless_invoke`'s `class_name` is the
+    // RECEIVER's runtime class (`invoke.rs`, `invoke_class`), `walk_native_hierarchy`
+    // is `false`, and the superclass climb is skipped outright when the
+    // receiver's own class declares the method
+    // (`invoke.rs`: `if has_own_bytecode { return None; }`). Real
+    // `java.util.SimpleTimeZone` DECLARES all three live members of this family
+    // — `getRawOffset()I`, `getOffset(J)I` and `getOffsets(J[I)I` (`javap -p`,
+    // JDK 25) — so with the exact-class registration gone each one runs its own
+    // bytecode and never reaches `java/util/TimeZone`'s copy. The late
+    // native-override check at step 6 keys on the DECLARING class of the
+    // resolved method, which is `SimpleTimeZone` for the same reason.
+    //
+    // The base registration therefore still does its job (a `TimeZone`-typed
+    // receiver with no bytecode of its own — the synthetic-JDK stub, and the
+    // `ZoneInfo`-less fallback object this function's tail allocates) without
+    // capturing a real `SimpleTimeZone`. `getOffsetsByWall(J[I)I` is the one
+    // member `SimpleTimeZone` does not declare, and it cannot be reached on one:
+    // `SimpleTimeZone` is not a `ZoneInfo`, and the only caller
+    // (`GregorianCalendar`) downcasts before invoking it.
+    //
+    // The abstract base. Only the concrete subclass above carries the offset
+    // family, so anything holding a `TimeZone`-typed reference to a receiver
+    // with no bytecode of its own — which is how the API is normally used —
+    // would otherwise have no `getRawOffset`.
     register_tzdb_offset_natives_for(registry, "java/util/TimeZone");
 
     // `TimeZone.getID()` reads the `ID` field, exactly as the real base-class
@@ -21597,6 +21820,19 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
     });
+    // The bodies above build their answer with `{:02x}` and never read the
+    // RECEIVER, so every `HexFormat.with*` setting — uppercase, delimiter,
+    // prefix, suffix — was inert: an option object with no reader. They also
+    // carried two panics reachable from ordinary bytecode (`formatHex(b,3,1)`
+    // underflows a usize; `parseHex` byte-slices a String) and answered
+    // `isHexDigit(0x661) == true` through an `as u8` truncation.
+    //
+    // `register_p64_hex_format` is the corrected twin. Registering it LAST is
+    // deliberate: `register()` is last-write-wins, and until this call existed
+    // the phases_late family only ever won in synthetic-jdk mode, so the
+    // shipping default ran the broken copy.
+    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
+    crate::phases_late::register_p64_hex_format(registry);
     registry.set_category(__prev_cat);
 }
 
@@ -21616,6 +21852,86 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
 /// `lang_string::native_string_format` implementation which already
 /// supports `%s`, `%d`, `%x`, `%X`, `%02x`, `%-10s`, `%5d`, `%n`, `%%`,
 /// `%f`, `%c`, `%b`, `%e`, `%E` with flags, width, and precision.
+/// Build the sink a `Formatter` constructed without an `Appendable` writes to.
+///
+/// The real `Formatter(Locale l, Appendable a)` is
+/// `this.a = (a == null) ? new StringBuilder() : a`, so BOTH the no-`Appendable`
+/// constructors and an explicit `new Formatter((Appendable) null)` end up with a
+/// `StringBuilder` — MEASURED on HotSpot 25.0.3+9, all four of
+/// `new Formatter()`, `new Formatter(Locale.ROOT)`, `new Formatter((Locale) null)`
+/// and `new Formatter((Appendable) null)` answer
+/// `out().getClass() == java.lang.StringBuilder`.
+///
+/// This used to write `ctx.create_string("")` instead, which is why `out()`
+/// answered a `java.lang.String`: not an `Appendable` at all, so
+/// `out() instanceof Appendable` was false on a method whose return type is
+/// `Appendable`. A `String` also cannot be appended to, which is why `format`
+/// below had to carry a read-modify-write branch that replaced slot 0 wholesale.
+///
+/// Allocating runs `StringBuilder.<init>()V`, so `this` can move: the caller
+/// passes its pin handle in and gets the re-derived receiver back with the sink.
+fn formatter_alloc_sink(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_pin: usize,
+) -> Result<(ObjectRef, Value), MethodCallFailed> {
+    let sink = match ctx.new_object_initialized("java/lang/StringBuilder", "()V", &[])? {
+        Some(v @ Value::Object(Some(_))) => v,
+        // Allocation refused without reporting a failure. Fall back to a null
+        // sink rather than invent one; `formatter_ensure_open` will then report
+        // the Formatter as closed, which is a refusal rather than a wrong answer.
+        _ => Value::Object(None),
+    };
+    Ok((ctx.read_native_pin(this_pin, this), sink))
+}
+
+/// `Formatter.ensureOpen()` — the guard in front of every public method.
+///
+/// The JDK's `close()` is `finally { a = null; }` and `ensureOpen()` is
+/// `if (a == null) throw new FormatterClosedException()`, so slot 0 being null
+/// IS the closed flag; no extra field is needed, and none is available (the
+/// synthetic layout this registrar targets is two slots). That identification is
+/// only sound because `formatter_alloc_sink` above guarantees a live sink for
+/// every constructor including `new Formatter((Appendable) null)` — before that
+/// fix a null slot 0 was an ordinary open Formatter and this guard would have
+/// mis-reported it as closed.
+///
+/// MEASURED after `close()` on HotSpot 25.0.3+9: `toString()`, `out()`,
+/// `flush()`, `format()` and `locale()` all raise
+/// `java.util.FormatterClosedException` with a **null** message. `close()`
+/// itself is idempotent, and `ioException()` does NOT throw — it is the one
+/// public method with no `ensureOpen`, so it is deliberately left unguarded.
+fn formatter_ensure_open(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Value::Object(Some(sink)) = ctx.get_field(this, 0) {
+        return Ok(sink);
+    }
+    Err(formatter_closed(ctx))
+}
+
+/// `java.util.FormatterClosedException` — an unchecked `IllegalStateException`
+/// subclass with a no-arg constructor and no detail message.
+///
+/// There is no `RuntimeError` variant for it, so it is built as a real Java
+/// object. `ckX` in `RJdkIntrinsics3` compares the EXACT class name, so the
+/// nearest available variant (`IllegalStateException`, its superclass) does not
+/// substitute even though a `catch` would accept it.
+fn formatter_closed(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object_initialized("java/util/FormatterClosedException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        // Could not build the class. Refuse with the superclass rather than let
+        // the call succeed: answering from a closed Formatter is the one
+        // outcome that must not happen.
+        Ok(_) => RuntimeError::IllegalStateException {
+            message: "FormatterClosedException".to_string(),
+        }
+        .into(),
+        Err(e) => e,
+    }
+}
+
 fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: String.format / Formatter fast-path delegating to the real
     // java.util.Formatter impl in lang_string — replicates real JDK bytecode.
@@ -21660,9 +21976,19 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let empty = ctx.create_string("");
-        ctx.set_field(this, 0, Value::Object(Some(empty)));
-        ctx.set_field(this, 1, Value::Object(None));
+        // Slot 1 is the DEFAULT format locale, not null — the real
+        // `java.util.Formatter()` is `this(Locale.getDefault(Category.FORMAT),
+        // new StringBuilder())`. See [`formatter_default_locale`] for the
+        // measured `tr_TR` rows and for the three-rung degradation. Pinned
+        // across the resolution because it runs Java code and can move `this`;
+        // slot 0 is written first so the new sink is rooted through it.
+        let pin = ctx.pin_native_root(this);
+        let (this, sink) = formatter_alloc_sink(ctx, this, pin)?;
+        ctx.set_field(this, 0, sink);
+        let locale = formatter_default_locale(ctx);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(this, 1, locale);
         Ok(None)
     });
     registry.register(f, "<init>", "(Ljava/util/Locale;)V", |ctx, args| {
@@ -21670,9 +21996,25 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let empty = ctx.create_string("");
-        ctx.set_field(this, 0, Value::Object(Some(empty)));
-        ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+        // The locale is the caller's VERBATIM, including an explicit null —
+        // MEASURED: `new Formatter((Locale) null).locale()` is null on HotSpot,
+        // NOT the host default. Only the no-`Locale` constructors default it.
+        // Read it out of `args` BEFORE the allocation below, which can move it,
+        // and write it through the re-derived receiver afterwards.
+        let pin = ctx.pin_native_root(this);
+        let locale = args.get(1).copied().unwrap_or(Value::Object(None));
+        let locale_pin = match locale {
+            Value::Object(Some(l)) => Some((ctx.pin_native_root(l), l)),
+            _ => None,
+        };
+        let (this, sink) = formatter_alloc_sink(ctx, this, pin)?;
+        let locale = match locale_pin {
+            Some((h, l)) => Value::Object(Some(ctx.read_native_pin(h, l))),
+            None => Value::Object(None),
+        };
+        ctx.set_field(this, 0, sink);
+        ctx.set_field(this, 1, locale);
+        ctx.unpin_native_roots(pin);
         Ok(None)
     });
     registry.register(f, "<init>", "(Ljava/lang/Appendable;)V", |ctx, args| {
@@ -21681,8 +22023,28 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             _ => return Ok(None),
         };
         let appendable = args.get(1).copied().unwrap_or(Value::Object(None));
-        ctx.set_field(this, 0, appendable);
-        ctx.set_field(this, 1, Value::Object(None));
+        let pin = ctx.pin_native_root(this);
+        // `Formatter(Locale, Appendable)` is `this.a = (a == null) ? new
+        // StringBuilder() : a`, so a NULL Appendable is not stored as null —
+        // it becomes a fresh StringBuilder. MEASURED:
+        // `new Formatter((Appendable) null).out().getClass()` is
+        // `java.lang.StringBuilder` on HotSpot, where this answered `<null>`.
+        // Storing the null would also collide with `formatter_ensure_open`'s
+        // reading of a null slot 0 as CLOSED.
+        let (this, sink) = match appendable {
+            Value::Object(Some(a)) => {
+                let ah = ctx.pin_native_root(a);
+                let this = ctx.read_native_pin(pin, this);
+                (this, Value::Object(Some(ctx.read_native_pin(ah, a))))
+            }
+            _ => formatter_alloc_sink(ctx, this, pin)?,
+        };
+        ctx.set_field(this, 0, sink);
+        // See the `()V` constructor above: slot 1 is the DEFAULT format locale.
+        let locale = formatter_default_locale(ctx);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(this, 1, locale);
         Ok(None)
     });
     // `Formatter(Appendable, Locale)` is deliberately NOT registered here,
@@ -21696,6 +22058,37 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
     // `format` below reads slot 1, the real constructor is all this needs.
     // The synthetic-mode registrar `register_formatter_natives` DOES need the
     // overload, because there is no real constructor there; it has it.
+    //
+    // F38: that argument was offered as a reason to DELETE the `()V` and
+    // `(Appendable)V` registrations too, rather than teach them the default
+    // locale. It does not carry, and the reason is slot 0, not slot 1.
+    //
+    // The real `Formatter()` writes `a = new StringBuilder()`. `read_string`
+    // (vm_exec.rs) returns `None` for ANY object whose class is known and is
+    // not `java/lang/String` — a deliberate guard, added because the structural
+    // reader decoded a `StringBuilder`'s whole char[] CAPACITY. So with the
+    // native gone, `toString()` below would read a `StringBuilder` out of slot
+    // 0, get `None`, and answer the empty string for every
+    // `new Formatter().format(...).toString()`. `format`'s own appending path
+    // survives it (it falls through to `invoke_virtual(sb, "append", ...)`),
+    // which is what makes the failure silent rather than loud.
+    //
+    // Deleting is therefore not the smaller change: it is the toString fix plus
+    // moving every `new Formatter()` onto real bytecode that resolves
+    // `Locale.getDefault(FORMAT)` AND `DecimalFormatSymbols.getInstance(l)
+    // .getZeroDigit()` at construction. The `toString()` half is done just
+    // below, so whoever wants the deletion now has its precondition; the
+    // decision to keep the registrations is a decision about what a lane that
+    // cannot build or run should land, not a claim that the deletion is wrong.
+    //
+    // G32: the slot-0 argument above is now MOOT for the three constructors
+    // this registrar owns — they write a real `StringBuilder`, exactly as the
+    // JDK does, so `read_string` answering `None` for slot 0 is the expected
+    // case rather than the hazard, and `toString()` below routes through
+    // `formatter_sink_text`'s `invoke_virtual("toString")` arm. The paragraph is
+    // kept because it is still the correct analysis of what deleting the
+    // registrations would cost (the locale and `zero` resolution), and that
+    // cost is unchanged.
     registry.register(
         f,
         "format",
@@ -21705,6 +22098,13 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // `format` is one of the five methods guarded by `ensureOpen()`.
+            // This has to run BEFORE the formatting work, not just before the
+            // append: a post-close `format` that formatted and then refused
+            // would still be observable through a `%n`-counting side effect,
+            // and the row that caught this defect in the first place is the
+            // caller's buffer reading `pre:0051` where HotSpot leaves `pre:005`.
+            formatter_ensure_open(ctx, this)?;
             // args[1] = format string, args[2] = Object[] varargs
             let fmt_obj = args.get(1).copied().unwrap_or(Value::Object(None));
             let arr_obj = args.get(2).copied().unwrap_or(Value::Object(None));
@@ -21734,28 +22134,47 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
                 Some(Value::Object(Some(o))) => ctx.read_string(o).unwrap_or_default(),
                 _ => String::new(),
             };
+            // The unpin that used to sit here has moved to the bottom: the
+            // append below allocates too, so `this` must stay rooted through it.
+            let this = ctx.read_native_pin(this_pin, this);
+
+            // Append to the sink (slot 0), which is ALWAYS an `Appendable`:
+            // either the caller's, or the `StringBuilder` the constructors
+            // above allocate. The read-modify-write branch that used to sit
+            // here — `read_string(slot0)`, concatenate, `set_field` a fresh
+            // `String` — existed only because slot 0 held a `String`, and it is
+            // gone with that design. It was never merely redundant: replacing
+            // slot 0 wholesale means `out()` answers a DIFFERENT object after
+            // every `format`, where HotSpot's `out()` is the same buffer for
+            // the Formatter's whole life (MEASURED: `f.out() == f.out()` and
+            // `f.out().toString().equals(f.toString())` both hold across
+            // repeated `format` calls).
+            //
+            // GC: `create_string` allocates, so the sink must be re-derived
+            // AFTER it. Reading slot 0 into a raw `ObjectRef` first and then
+            // allocating — what this did — leaves a stale reference to append
+            // through. `this` is still pinned by `this_pin` here.
+            let text = ctx.create_string(&formatted_str);
+            let text_pin = ctx.pin_native_root(text);
+            let this = ctx.read_native_pin(this_pin, this);
+            let text = ctx.read_native_pin(text_pin, text);
+            let sink = match ctx.get_field(this, 0) {
+                Value::Object(Some(o)) => o,
+                _ => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(Some(Value::Object(Some(this))));
+                }
+            };
+            let appended = ctx.invoke_virtual(
+                sink,
+                "append",
+                "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;",
+                &[Value::Object(Some(text))],
+            );
             let this = ctx.read_native_pin(this_pin, this);
             ctx.unpin_native_roots(this_pin);
-
-            // Append to internal output (field 0)
-            let sb = match ctx.get_field(this, 0) {
-                Value::Object(Some(o)) => o,
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            if let Some(existing) = ctx.read_string(sb) {
-                let combined = format!("{}{}", existing, formatted_str);
-                let new_str = ctx.create_string(&combined);
-                ctx.set_field(this, 0, Value::Object(Some(new_str)));
-            } else {
-                // Preserve a caller-supplied Appendable.
-                let text = ctx.create_string(&formatted_str);
-                let _ = ctx.invoke_virtual(
-                    sb,
-                    "append",
-                    "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;",
-                    &[Value::Object(Some(text))],
-                )?;
-            }
+            // Propagate an append failure only AFTER the pin is released.
+            let _ = appended?;
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -21764,30 +22183,51 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        match ctx.get_field(this, 0) {
-            Value::Object(Some(o)) => {
-                let s = ctx.read_string(o).unwrap_or_default();
-                Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-            }
-            _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
-        }
+        let sink = formatter_ensure_open(ctx, this)?;
+        Ok(Some(formatter_sink_text(ctx, sink)))
     });
     registry.register(f, "out", "()Ljava/lang/Appendable;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        Ok(Some(ctx.get_field(this, 0)))
+        // Answers slot 0 BY IDENTITY, both for a caller-supplied Appendable and
+        // for the constructor-allocated StringBuilder — `f.out() == f.out()` is
+        // true on HotSpot, and `new Formatter(sb).out() == sb`.
+        let sink = formatter_ensure_open(ctx, this)?;
+        Ok(Some(Value::Object(Some(sink))))
     });
     registry.register(f, "close", "()V", |ctx, args| {
-        // Delegate close() if the underlying Appendable implements Closeable.
+        // `Formatter.close()`:
+        //
+        // ```java
+        // if (a == null) return;                       // idempotent
+        // try { if (a instanceof Closeable c) c.close(); }
+        // catch (IOException ioe) { lastException = ioe; }
+        // finally { a = null; }                        // THE closed flag
+        // ```
+        //
+        // Nulling slot 0 is the whole of it, and it is what this body was
+        // missing: without it `close()` was a pure no-op, every post-close
+        // method answered normally, and a post-close `format()` went on
+        // appending to the caller's buffer (`pre:0051` against HotSpot's
+        // `pre:005`). Delegating the underlying close is the part that WAS
+        // here; it is kept, and its failure is swallowed exactly as the JDK's
+        // `catch (IOException)` swallows it, so `close()` stays non-throwing.
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Value::Object(Some(target)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(target, "close", "()V", &[]);
-        }
+        let Value::Object(Some(target)) = ctx.get_field(this, 0) else {
+            // Already closed. The JDK's `if (a == null) return` — a second
+            // `close()` must NOT throw FormatterClosedException.
+            return Ok(None);
+        };
+        let pin = ctx.pin_native_root(this);
+        let _ = ctx.invoke_virtual(target, "close", "()V", &[]);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(this, 0, Value::Object(None));
         Ok(None)
     });
     registry.register(f, "flush", "()V", |ctx, args| {
@@ -21795,14 +22235,13 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Value::Object(Some(target)) = ctx.get_field(this, 0) {
-            // StringBuilder implements Appendable but not Flushable. Avoid
-            // inventing a StringBuilder.flush() call for the in-memory sink.
-            if ctx.read_string(target).is_none() {
-                return Ok(None);
-            }
-            let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
+        let target = formatter_ensure_open(ctx, this)?;
+        // StringBuilder implements Appendable but not Flushable. Avoid
+        // inventing a StringBuilder.flush() call for the in-memory sink.
+        if ctx.read_string(target).is_none() {
+            return Ok(None);
         }
+        let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
         Ok(None)
     });
     registry.register(f, "locale", "()Ljava/util/Locale;", |ctx, args| {
@@ -21810,9 +22249,181 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Guarded too — `locale()` after `close()` is FormatterClosedException,
+        // MEASURED. It is the row most likely to be missed, because unlike the
+        // other four it touches slot 1 and has no reason of its own to look at
+        // the sink.
+        formatter_ensure_open(ctx, this)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
     registry.set_category(__prev_cat);
+}
+
+// ===========================================================================
+// G32 — java.util.Formatter's lifecycle: the sink's TYPE and the closed flag
+// ===========================================================================
+
+#[cfg(test)]
+mod g32_formatter_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+
+    fn registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_string_format_real_jdk_natives(&mut r);
+        r
+    }
+
+    fn call(
+        r: &NativeMethodRegistry,
+        ctx: &mut MockNativeContext,
+        method: &str,
+        desc: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let cb = r
+            .find("java/util/Formatter", method, desc)
+            .unwrap_or_else(|| panic!("java/util/Formatter.{method}{desc} must be registered"));
+        cb(ctx, args)
+    }
+
+    /// A two-slot Formatter: slot 0 = the sink, slot 1 = the locale.
+    fn make_formatter(ctx: &mut MockNativeContext, sink: Value) -> ObjectRef {
+        let f = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(f, 0, sink);
+        ctx.set_field(f, 1, Value::Object(None));
+        f
+    }
+
+    /// An OPEN Formatter hands its sink back. `formatter_ensure_open` is the
+    /// JDK's `ensureOpen()`, and slot 0 IS the flag (`close()` is
+    /// `finally { a = null; }`).
+    #[test]
+    fn ensure_open_returns_the_sink_while_open() {
+        let mut ctx = mock_ctx();
+        let sink = ctx.alloc_object(ClassId::new(0), 2);
+        let f = make_formatter(&mut ctx, Value::Object(Some(sink)));
+        assert_eq!(formatter_ensure_open(&mut ctx, f).unwrap(), sink);
+    }
+
+    /// A null slot 0 is CLOSED, and the refusal is a real Java throwable, not an
+    /// internal error — `catch (FormatterClosedException)` has to see it.
+    #[test]
+    fn ensure_open_refuses_once_the_sink_is_null() {
+        let mut ctx = mock_ctx();
+        let f = make_formatter(&mut ctx, Value::Object(None));
+        let e = formatter_ensure_open(&mut ctx, f).unwrap_err();
+        assert!(
+            matches!(e, MethodCallFailed::ExceptionThrown(_)),
+            "a closed Formatter must raise a catchable Java exception, got {e:?}"
+        );
+    }
+
+    /// `close()` nulls slot 0. This is the whole of the defect it repairs: the
+    /// body used to delegate the underlying close and RETURN, leaving the
+    /// Formatter open, so every post-close method answered normally and a
+    /// post-close `format()` kept appending to the caller's buffer
+    /// (`pre:0051` against HotSpot's `pre:005`).
+    #[test]
+    fn close_nulls_the_sink_slot() {
+        let r = registry();
+        let mut ctx = mock_ctx();
+        let sink = ctx.alloc_object(ClassId::new(0), 2);
+        let f = make_formatter(&mut ctx, Value::Object(Some(sink)));
+        call(&r, &mut ctx, "close", "()V", &[Value::Object(Some(f))]).unwrap();
+        assert_eq!(ctx.get_field(f, 0), Value::Object(None));
+    }
+
+    /// `close()` is IDEMPOTENT — the JDK's `if (a == null) return`. A second
+    /// close must not raise FormatterClosedException, which is the trap in
+    /// identifying "closed" with "the guard fires".
+    #[test]
+    fn close_twice_does_not_throw() {
+        let r = registry();
+        let mut ctx = mock_ctx();
+        let sink = ctx.alloc_object(ClassId::new(0), 2);
+        let f = make_formatter(&mut ctx, Value::Object(Some(sink)));
+        call(&r, &mut ctx, "close", "()V", &[Value::Object(Some(f))]).unwrap();
+        call(&r, &mut ctx, "close", "()V", &[Value::Object(Some(f))])
+            .expect("a second close() must be a no-op, not a refusal");
+    }
+
+    /// `out()` answers slot 0 BY IDENTITY while open — `f.out() == f.out()` is
+    /// true on HotSpot, and it is what the caller-supplied-Appendable contract
+    /// rests on.
+    #[test]
+    fn out_answers_the_sink_by_identity_while_open() {
+        let r = registry();
+        let mut ctx = mock_ctx();
+        let sink = ctx.alloc_object(ClassId::new(0), 2);
+        let f = make_formatter(&mut ctx, Value::Object(Some(sink)));
+        let got = call(
+            &r,
+            &mut ctx,
+            "out",
+            "()Ljava/lang/Appendable;",
+            &[Value::Object(Some(f))],
+        )
+        .unwrap();
+        assert_eq!(got, Some(Value::Object(Some(sink))));
+    }
+
+    /// All four of the guarded accessors refuse after `close()`.
+    ///
+    /// `locale()` is in the list on purpose: it reads slot 1 and has no reason
+    /// of its own to look at the sink, so it is the row most likely to be
+    /// missed. MEASURED on HotSpot 25.0.3+9 — it throws like the rest.
+    #[test]
+    fn every_guarded_accessor_refuses_after_close() {
+        let r = registry();
+        let mut ctx = mock_ctx();
+        let sink = ctx.alloc_object(ClassId::new(0), 2);
+        let f = make_formatter(&mut ctx, Value::Object(Some(sink)));
+        call(&r, &mut ctx, "close", "()V", &[Value::Object(Some(f))]).unwrap();
+
+        for (method, desc) in [
+            ("toString", "()Ljava/lang/String;"),
+            ("out", "()Ljava/lang/Appendable;"),
+            ("flush", "()V"),
+            ("locale", "()Ljava/util/Locale;"),
+        ] {
+            let e = expect_refusal(
+                call(&r, &mut ctx, method, desc, &[Value::Object(Some(f))]),
+                method,
+            );
+            assert!(
+                matches!(e, MethodCallFailed::ExceptionThrown(_)),
+                "{method} after close() must refuse, got {e:?}"
+            );
+        }
+    }
+
+    /// `ioException()` is the one public method with NO `ensureOpen()` in the
+    /// JDK, and it is deliberately not registered here — MEASURED: it returns
+    /// normally after `close()`. Recorded as a test so a later lane does not
+    /// "complete" the guard set by adding it.
+    #[test]
+    fn io_exception_is_not_registered_and_so_is_not_guarded() {
+        let r = registry();
+        assert!(
+            r.find("java/util/Formatter", "ioException", "()Ljava/io/IOException;")
+                .is_none(),
+            "ioException() must stay on real bytecode: it does NOT throw after close()"
+        );
+    }
+
+    fn expect_refusal(r: MethodCallResult, what: &str) -> MethodCallFailed {
+        match r {
+            Err(e) => e,
+            Ok(v) => panic!("{what} after close() RETURNED {v:?} instead of refusing"),
+        }
+    }
 }
 
 #[cfg(feature = "synthetic-jdk")]
@@ -22054,68 +22665,43 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // subclass natives are registered in BOTH synthetic-jdk and real-JDK
     // modes — see bench/wildfly-boot/diagnostic.md §WP8.10.7.)
 
-    // --- Exception constructors ---
-    // Throwable/Exception/RuntimeException/<init>()V — no-op (fields default to null)
-    // <init>(Ljava/lang/String;)V — set field 0 = message
-    // <init>(Ljava/lang/String;Ljava/lang/Throwable;)V — set field 0 = message, field 1 = cause
-    // <init>(Ljava/lang/Throwable;)V — set field 1 = cause
-    for exc_class in &[
-        "java/lang/Throwable",
-        "java/lang/Exception",
-        "java/lang/RuntimeException",
-        "java/lang/Error",
-        "java/lang/LinkageError",
-        "java/lang/VerifyError",
-        "java/lang/NoClassDefFoundError",
-        "java/lang/NullPointerException",
-        "java/lang/ArithmeticException",
-        "java/lang/ArrayIndexOutOfBoundsException",
-        "java/lang/IndexOutOfBoundsException",
-        "java/lang/StringIndexOutOfBoundsException",
-        "java/lang/ClassCastException",
-        "java/lang/IllegalArgumentException",
-        "java/lang/IllegalStateException",
-        "java/lang/UnsupportedOperationException",
-        "java/lang/ClassNotFoundException",
-        "java/lang/NoSuchMethodException",
-        "java/lang/reflect/InvocationTargetException",
-        "java/lang/StackOverflowError",
-        "java/lang/OutOfMemoryError",
-        "java/util/NoSuchElementException",
-        "java/util/InputMismatchException",
-        "java/io/IOException",
-        "java/io/FileNotFoundException",
-        "java/lang/NumberFormatException",
-        "java/util/ConcurrentModificationException",
-        "java/lang/NegativeArraySizeException",
-        "java/lang/AssertionError",
-        "java/lang/MatchException",
-    ] {
-        // No-arg exception constructor — message defaults to null, but
-        // `cause` must be initialized to the self-sentinel (`this`) so a
-        // later `initCause()` call succeeds. JDK declares
-        // `private Throwable cause = this;` and our `<init>` shadows the
-        // bytecode that mirrors that initializer.
-        registry.register(exc_class, "<init>", "()V", native_exc_init_noargs);
-        registry.register(
-            exc_class,
-            "<init>",
-            "(Ljava/lang/String;)V",
-            native_exc_init_message,
-        );
-        registry.register(
-            exc_class,
-            "<init>",
-            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-            native_exc_init_message_cause,
-        );
-        registry.register(
-            exc_class,
-            "<init>",
-            "(Ljava/lang/Throwable;)V",
-            native_exc_init_cause,
-        );
-    }
+    // --- Exception constructors: DELETED, they are the table's job now ---
+    //
+    // E34-1 §7 site 3, collapsed by E43 (2026-08-13). This was a `for exc_class
+    // in &[30 class names]` loop registering the SAME four descriptors — `()V`,
+    // `(String)V`, `(String,Throwable)V`, `(Throwable)V` — on every one of them:
+    // 120 registrations, of which 82 restated what
+    // `lang_misc::register_throwable_subclass_natives`' per-class JDK-derived
+    // table had already registered (with better bodies) and 38 named
+    // constructors the real JDK 25 class DOES NOT DECLARE.
+    //
+    // All 30 names are in that table (MEASURED: set difference is empty), and
+    // `register_builtins` calls `register_essential_natives` — which reaches
+    // `register_throwable_subclass_natives` — BEFORE it calls this function, so
+    // deleting the loop does not leave a single descriptor unregistered. It
+    // stops this function from LAST-WRITE-WINNING over the table.
+    //
+    // Two consequences worth naming, because they are behaviour changes and not
+    // just bookkeeping:
+    //   * `java/lang/AssertionError.<init>(Ljava/lang/String;)V` — the private
+    //     one that `AssertionError(Object)`'s own bytecode calls via
+    //     `this(String.valueOf(...))` — now runs `lang_misc`'s body instead of
+    //     this loop's identical one, which is the same effect. The (Object)
+    //     overload and the six primitive overloads are unaffected either way:
+    //     this loop never registered them, and the table already does.
+    //   * `java/lang/reflect/InvocationTargetException.<init>()V` and
+    //     `(Ljava/lang/Throwable;)V` were being overwritten HERE with the
+    //     generic message/cause bodies, so the wrapped throwable landed in
+    //     `cause` rather than the JDK's `target` field. The table's
+    //     `native_invocation_target_exception_init_target` now wins, and
+    //     `target` is a declared field on the synthetic stub
+    //     (`class_manager.rs::synthetic_stub_fields`), so the by-name write
+    //     lands in both modes.
+    //
+    // Do not re-add a blanket list here. `the_blanket_four_ctor_loops_stay_
+    // collapsed_onto_the_table` (bottom of this file) is a source witness that
+    // fails if this loop or its twin in `register_exception_extras_natives`
+    // comes back.
 
     // --- java.lang.Thread ---
     registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
@@ -23547,7 +24133,22 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/String",
         "codePoints",
         "()Ljava/util/stream/IntStream;",
-        native_string_code_points,
+        // NOT `native_string_chars`, which is what this line said until
+        // 2026-08-12 with the comment "Same as chars() for BMP characters" —
+        // true for the BMP, and precisely why nobody looked again. `chars()`
+        // yields UTF-16 code UNITS, so a supplementary character arrives as its
+        // two surrogates and `codePoints()` must pair them back into ONE code
+        // point: on HotSpot 25 `"a😀b".codePoints()` is
+        // `[97, 128512, 98]` (3 elements), against `[97, 55357, 56832, 98]`
+        // (4) for `chars()`. So `codePoints().count()` was wrong too, not only
+        // the values.
+        //
+        // This is the SECOND of exactly two registrations of this triple; the
+        // twin is `lang_math.rs`'s, and `register()` is last-write-wins, so
+        // whichever registrar runs later silently decides. Both now bind the
+        // same body, which is what makes the fix independent of that order.
+        // docs/known-issues/jdk-only/W7-95a-string-code-point-family.md
+        crate::lang_string::native_string_code_points,
     );
     registry.register(
         "java/lang/String",
@@ -23555,45 +24156,44 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)Ljava/lang/String;",
         native_string_formatted,
     );
+    // `String.indent(int)` — the SAME body `lang_math::register_wrapper_natives`
+    // binds (`lib.rs:14679`, inside `register_essential_natives_with_shims`),
+    // not a second copy.
+    //
+    // This slot used to hold an inline closure, and because
+    // `register_builtins` runs `register_essential_natives` and only THEN
+    // `register_synthetic_overrides`, and `register()` is last-write-wins, that
+    // closure WON in synthetic-JDK mode — silently reverting W7-95a's fix for
+    // exactly the mode the blocking gate runs in. The closure was the pre-W7-95a
+    // body: `let strip = (-n) as usize; if line.len() > strip { &line[strip..] }`.
+    // Three defects, measured against `openjdk 25.0.3 2026-04-21 LTS
+    // (25.0.3+9-LTS)` (Microsoft build) on this host, `scratchpad/f20/Ind.java`:
+    //
+    //   HotSpot                                     old closure
+    //   "abc".indent(-1)        = "abc\n"           "bc\n"        wrong answer
+    //   "  abc".indent(-5)      = "abc\n"           ""            wrong answer
+    //   (U+00A0)+"abc".indent(-1) = the same string back  VM ABORT  (see below)
+    //   "abc".indent(MIN_VALUE) = "abc\n"           VM ABORT      (debug)
+    //
+    // Row 3 is the VM-fatal one and it is why this had to move rather than be
+    // patched in place: Java strips only leading `Character.isWhitespace`
+    // characters, capped at `-n` — `s.substring(Math.min(-n, s.indexOfNonWhitespace()))`
+    // - and `Character.isWhitespace(U+00A0)` is **false** (measured). The
+    // closure counted BYTES and sliced `&line[1..]`, which lands inside
+    // U+00A0's two-byte UTF-8 encoding: `panic!("byte index 1 is not a char
+    // boundary")`, and a Rust panic is not a Java throwable — it takes the VM
+    // down where HotSpot returns a string. Row 4 is `-i32::MIN`, an overflow
+    // panic in debug; the JDK has an explicit `n == Integer.MIN_VALUE` arm
+    // (`stripLeading()`) for that same reason, `String.java:4036`.
+    //
+    // `lang_string::native_string_indent` is the arm that already gets all four
+    // right. This is a re-point, not a re-implementation: a third copy of one
+    // rule is how the first two drifted.
     registry.register(
         "java/lang/String",
         "indent",
         "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let n = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let indent = if n > 0 {
-                " ".repeat(n as usize)
-            } else {
-                String::new()
-            };
-            let result: String = s
-                .lines()
-                .map(|line| {
-                    if n > 0 {
-                        format!("{}{}\n", indent, line)
-                    } else if n < 0 {
-                        let strip = (-n) as usize;
-                        let trimmed = if line.len() > strip {
-                            &line[strip..]
-                        } else {
-                            ""
-                        };
-                        format!("{}\n", trimmed)
-                    } else {
-                        format!("{}\n", line)
-                    }
-                })
-                .collect();
-            Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
-        },
+        crate::lang_string::native_string_indent,
     );
     registry.register(
         "java/lang/String",
@@ -26164,6 +26764,69 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         cratonvm_types::ObjectKind::Object => {
             let num_fields = ctx.object_num_fields(this);
             let clone_ref = ctx.alloc_object(class_id, num_fields);
+            // G52: THIS LOOP COERCES EVERY FIELD TWICE, AND THAT IS NOT A
+            // CHOICE THIS SITE MADE. Read this before "optimising" it.
+            //
+            // `NativeContextImpl::get_field` and `::set_field`
+            // (`vm/src/vm/vm_exec.rs`) both resolve the slot's declared
+            // descriptor and route through `get_field_as`/`set_field_as`,
+            // i.e. through `gc/src/heap.rs::coerce_field_value_for_slot`
+            // (T10.9.E, added after this loop was written). So a slot whose
+            // raw contents disagree with the class's declared type is
+            // coerced on the way out of the original AND on the way into the
+            // clone.
+            //
+            // `Object.clone()` is specified as a verbatim field copy, so the
+            // obvious question is why this is not one. The answer is that a
+            // verbatim slot copy IS NOT EXPRESSIBLE from a native today:
+            // `NativeContext` exposes no raw slot-INDEXED accessor. The only
+            // raw pair it has is `get_field_by_name`/`set_field_by_name`,
+            // which cannot be driven from a slot index and would resolve a
+            // shadowed field name to the wrong slot. NOMINATED in
+            // `docs/known-issues/jdk-only/G52-1-the-clone-amplifier-and-the-double-arm-20260817.md`.
+            //
+            // Why the double coercion is nonetheless harmless: the coercion
+            // is IDEMPOTENT, pinned by
+            // `gc/src/heap.rs::the_descriptor_coercion_is_idempotent` over
+            // every (variant, descriptor) pair. The clone therefore holds
+            // exactly the original's coerced contents; the second pass can
+            // never compound the first.
+            //
+            // MEASURED 2026-08-17, `--jdk-only`, `CRATONVM_DBG_COERCION=1`
+            // + `CRATONVM_DBG_CLONE=1` on `9ae371468`, and it CONTRADICTS the
+            // standing "clone amplifies whatever the original got wrong"
+            // reading of `G45-1` §3's 54-event cluster:
+            //
+            // * `RJdkSecurity`: 4,534 clones, of which 4,533 are ARRAYS and
+            //   take the `ObjectKind::Array` arm below — which uses
+            //   `get_array_element`/`set_array_element` and never touches
+            //   this path at all. ONE object clone, 3 events.
+            // * `RSerial`: 29 clones, 12 objects, all
+            //   `java/lang/invoke/MemberName`, 21 events.
+            // * ALL 24 events are the same thing: `species=
+            //   primitive-into-reference descriptor=L value=Int(0)` — a READ
+            //   of a slot that was never descriptor-initialised, which under
+            //   `heap.rs`'s R-niche decode rule reads back as `Int(0)`. The
+            //   store half fires nothing, because the read already answered
+            //   `Object(None)`.
+            // * `CRATONVM_DBG_OVERLAY=1` names the slots: `MemberName` 4 and
+            //   5, which `javap -p` on HotSpot 25.0.3+9 gives as
+            //   `method:ResolvedMethodName` and `resolution:Object` — both
+            //   legitimately null on an unresolved `MemberName`.
+            //
+            // So on 100% of the measured population this loop does not
+            // amplify a defect, it NORMALISES one: the original keeps a
+            // mis-tagged raw zero, the clone gets a properly tagged null.
+            //
+            // The hazard that WOULD be amplification, for whoever measures a
+            // non-zero count of it: a slot declared primitive that holds a
+            // live `Object(Some(_))` — the `pointer-into-primitive` species,
+            // 207 events in `RJdkSecurity` from
+            // `jca/provider_chain.rs`. Cloning such an object writes
+            // `Int(ptr as i32)` into the clone: a truncated, stale address
+            // that no collector will remap, and a reference dropped. It has
+            // never fired here because `Provider.clone()` dispatches to the
+            // `java/util/Hashtable.clone` bridge rather than to this native.
             for i in 0..num_fields {
                 let val = ctx.get_field(this, i);
                 ctx.set_field(clone_ref, i, val);
@@ -27200,8 +27863,103 @@ fn system_logger_threshold(ctx: &mut dyn NativeContext, this: Option<ObjectRef>)
     }
 }
 
-/// `System.Logger.isLoggable(Level)`: never true for `OFF`, otherwise true iff
-/// the level is at least as severe as this logger's threshold.
+/// Is the `Level` argument itself `null`?
+///
+/// Distinct from "the level's name could not be read": a minted or
+/// short receiver can present a `Level` whose `name` field is unreadable, and
+/// that is a shape problem to be absorbed, not a caller error to be thrown at.
+/// Only an actually-absent reference is the `null` the JDK raises on.
+fn system_logger_level_arg_is_null(level: Option<&Value>) -> bool {
+    !matches!(level, Some(Value::Object(Some(_))))
+}
+
+/// `System.Logger`'s null-`Level` contract.
+///
+/// Every `System.Logger` method that takes a `Level` dereferences it, and BOTH
+/// implementations a JDK can hand out do so before anything else — before the
+/// message is looked at and before a `Supplier` is evaluated:
+///
+/// * `sun.util.logging.internal.LoggingProviderImpl$JULWrapper` (what
+///   `System.getLogger` returns whenever `java.logging` is resolved, i.e. the
+///   stock case) is `julLogger.isLoggable(toJUL(level))`; `toJUL(null)` is
+///   `null` and `java.util.logging.Logger.isLoggable` then calls
+///   `level.intValue()`.
+/// * `jdk.internal.logger.SimpleConsoleLogger` (the no-`java.logging` fallback,
+///   and the class this VM's own strict fallback constructs) is
+///   `isLoggable(PlatformLogger.toPlatformLevel(level))`;
+///   `toPlatformLevel(null)` returns `null` (`PlatformLogger.java:511`) and the
+///   next line is `level.ordinal()`.
+///
+/// So the two disagree about `OFF` (see [`system_logger_is_loggable`]) but
+/// agree unanimously about `null`. MEASURED on this host, `openjdk 25.0.3
+/// 2026-04-21 LTS (25.0.3+9-LTS)` (Microsoft build), `scratchpad/f20/Slog.java`,
+/// against `System.getLogger("f20.probe")` (which reported itself as
+/// `sun.util.logging.internal.LoggingProviderImpl$JULWrapper`):
+///
+/// ```text
+/// isLoggable(null) !! java.lang.NullPointerException: Cannot invoke "java.util.logging.Level.intValue()" because "level" is null
+/// log(null, "m")   !! java.lang.NullPointerException: Cannot invoke "java.util.logging.Level.intValue()" because "level" is null
+/// ```
+///
+/// Before this, a null `Level` fell through `system_logger_level_name` to
+/// `None`, then through `system_logger_severity_of` to the
+/// `.unwrap_or(SYSTEM_LOGGER_SEVERITY_INFO)` default, and `isLoggable(null)`
+/// answered **true** — a fabricated permission, and the `log` family silently
+/// published at INFO instead of throwing. That is the shape a caller cannot
+/// see: the wrong answer is the permissive one.
+///
+/// The message is the `JULWrapper` road's, because that is the road a stock
+/// JDK takes and therefore the string an oracle diff will hold. The
+/// `SimpleConsoleLogger` road NPEs at a different expression and so would
+/// carry different text; the TYPE is what both roads agree on and what any
+/// `catch` sees.
+fn system_logger_require_level(level: Option<&Value>) -> Result<(), MethodCallFailed> {
+    if system_logger_level_arg_is_null(level) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.util.logging.Level.intValue()\" because \"level\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `System.Logger.isLoggable(Level)`: true iff the level is at least as severe
+/// as this logger's threshold.
+///
+/// # `OFF` — the two JDK implementations DISAGREE, and this is not a guess
+///
+/// This body used to short-circuit `OFF` to `false`, with a comment claiming
+/// that as the contract. It is the contract of exactly one of the two
+/// implementations. MEASURED on this host (`scratchpad/f20/Slog.java`,
+/// OpenJDK 25.0.3+9), against the logger `System.getLogger` actually returns:
+///
+/// ```text
+/// impl class = sun.util.logging.internal.LoggingProviderImpl$JULWrapper
+/// isLoggable(ALL)=false  isLoggable(TRACE)=false  isLoggable(DEBUG)=false
+/// isLoggable(INFO)=true  isLoggable(WARNING)=true isLoggable(ERROR)=true
+/// isLoggable(OFF)=true
+/// ```
+///
+/// `OFF` is **true** there, because JUL's rule is
+/// `level.intValue() >= levelValue && levelValue != offValue` — the `OFF`
+/// exclusion is on the LOGGER's level, not on the argument's, and
+/// `Level.OFF.intValue()` is `Integer.MAX_VALUE`, which clears any threshold.
+/// `SimpleConsoleLogger.isLoggable` (`SimpleConsoleLogger.java:127-131`) is
+/// `level != PlatformLogger.Level.OFF && level.ordinal() >= effectiveLevel.ordinal()`
+/// and answers **false**.
+///
+/// Which one is the oracle for a given CratonVM run depends on whether
+/// `java.logging` is resolved, which this lane could not determine without
+/// running the VM. **The `OFF` arm is therefore left as it is and recorded, not
+/// changed**: flipping it would be right for the stock module graph and wrong
+/// for the strict fallback this file's own
+/// `CRATON_SYSTEM_LOGGER_CLASS` road replaces with a real
+/// `SimpleConsoleLogger`. See
+/// `docs/known-issues/jdk-only/F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic-20260813.md`.
+/// The remaining severity rows above all agree with this body.
 fn system_logger_is_loggable(
     ctx: &mut dyn NativeContext,
     this: Option<ObjectRef>,
@@ -27291,13 +28049,26 @@ fn system_logger_emit(
     level: Option<&Value>,
     message: Option<String>,
     throwable: Option<&Value>,
-) {
+) -> Result<(), MethodCallFailed> {
+    // The null-`Level` NPE is raised BEFORE the message is consulted, because
+    // that is the order both JDK implementations use: the level is
+    // dereferenced by `isLoggable`, which every `log` overload calls first.
+    // Ordering is observable — `log(null, (String) null)` throws on HotSpot and
+    // used to return silently here, since the `message == None` early-return
+    // below came first. See `system_logger_require_level`.
+    system_logger_require_level(level)?;
     let message = match message {
         Some(message) => message,
-        None => return,
+        // MEASURED residual, NOT fixed here: HotSpot publishes a null message
+        // as the text "null" (`log(INFO, (String) null)` printed
+        // `INFO: null`), where this returns without emitting. That is an
+        // output-text divergence with no permission component, and it is
+        // recorded rather than changed because `message: Option<String>` is
+        // this helper's "nothing to say" channel for several callers.
+        None => return Ok(()),
     };
     if !system_logger_is_loggable(ctx, this, level) {
-        return;
+        return Ok(());
     }
     let level_name = system_logger_level_name(ctx, level).unwrap_or_else(|| "INFO".to_string());
     let logger_name = system_logger_name_of(ctx, this);
@@ -27307,6 +28078,7 @@ fn system_logger_emit(
         &format!("[{logger_name}] {message}"),
         throwable,
     );
+    Ok(())
 }
 
 /// The real `java.base` class the strict-mode fallback constructs instead of
@@ -27467,6 +28239,7 @@ fn native_system_logger_is_loggable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    system_logger_require_level(args.get(1))?;
     let loggable = system_logger_is_loggable(ctx, system_logger_this(args), args.get(1));
     Ok(Some(Value::Int(i32::from(loggable))))
 }
@@ -27478,7 +28251,7 @@ fn native_system_logger_log_string(
 ) -> MethodCallResult {
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -27497,7 +28270,7 @@ fn native_system_logger_log_string_throwable(
 ) -> MethodCallResult {
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3))?;
     Ok(None)
 }
 
@@ -27509,7 +28282,7 @@ fn native_system_logger_log_params(
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(2))
         .map(|message| system_logger_format(ctx, &message, args.get(3)));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -27519,11 +28292,14 @@ fn native_system_logger_log_supplier(
     args: &[Value],
 ) -> MethodCallResult {
     let this = system_logger_this(args);
+    // Before the Supplier is invoked: HotSpot dereferences the level in
+    // `isLoggable` and never reaches `Supplier.get()` for a null level.
+    system_logger_require_level(args.get(1))?;
     if !system_logger_is_loggable(ctx, this, args.get(1)) {
         return Ok(None);
     }
     let message = system_logger_supplier_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -27533,11 +28309,14 @@ fn native_system_logger_log_supplier_throwable(
     args: &[Value],
 ) -> MethodCallResult {
     let this = system_logger_this(args);
+    // Before the Supplier is invoked: HotSpot dereferences the level in
+    // `isLoggable` and never reaches `Supplier.get()` for a null level.
+    system_logger_require_level(args.get(1))?;
     if !system_logger_is_loggable(ctx, this, args.get(1)) {
         return Ok(None);
     }
     let message = system_logger_supplier_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3))?;
     Ok(None)
 }
 
@@ -27550,7 +28329,7 @@ fn native_system_logger_log_bundle_throwable(
 ) -> MethodCallResult {
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(3));
-    system_logger_emit(ctx, this, args.get(1), message, args.get(4));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(4))?;
     Ok(None)
 }
 
@@ -27564,7 +28343,7 @@ fn native_system_logger_log_bundle_params(
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(3))
         .map(|message| system_logger_format(ctx, &message, args.get(4)));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -27822,18 +28601,49 @@ fn native_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// turns its CSV row into four columns), so the probe ran green to completion
 /// and reported no number.
 ///
-/// The locale is dropped, exactly as `String.format(Locale, …)` already drops
-/// it (`lang_string::native_string_format_locale`) — so the two overloads now
-/// agree, instead of one of them being empty. When the formatter learns
-/// locales, both should stop dropping it in the same change.
+/// The `Locale` is HONOURED. It used to be dropped, under a comment claiming
+/// that matched `String.format(Locale, …)` — a claim W7-34's locale patch had
+/// already made false, and which became actively wrong once the no-`Locale`
+/// overload started following `Locale.getDefault(Locale.Category.FORMAT)`
+/// (W7-91 §5): delegating to the no-locale entry renders
+/// `printf(Locale.ROOT, …)` in the HOST's locale.
+/// `regression-suite/src/RJdkHello.java` pins that call's output character for
+/// character, so it is a red vector on any non-en-US host — green on en-US CI,
+/// which is the same hiding place the original defect used.
 fn native_printf_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args = [this, Locale, format String, Object[]] -> [this, format, Object[]]
-    let without_locale = [
-        args.first().copied().unwrap_or(Value::Object(None)),
+    let this_opt = match args.first() {
+        Some(Value::Object(obj)) => *obj,
+        _ => None,
+    };
+    // args = [this, Locale, format String, Object[]]
+    let with_locale = [
+        args.get(1).copied().unwrap_or(Value::Object(None)),
         args.get(2).copied().unwrap_or(Value::Object(None)),
         args.get(3).copied().unwrap_or(Value::Object(None)),
     ];
-    native_printf(ctx, &without_locale)
+    // GC: resolving a non-null locale runs real JDK bytecode (resource bundles,
+    // locale providers) and allocates, so the receiver can move across the
+    // format call in a way it could not when this delegated to the no-locale
+    // path. Pin and re-derive — the same argument the `java/util/Formatter`
+    // `format` registration makes.
+    let this_pin = this_opt.map(|t| ctx.pin_native_root(t));
+    let result = lang_string::native_string_format_locale(ctx, &with_locale)?;
+    let this_cur = match (this_pin, this_opt) {
+        (Some(p), Some(t)) => Some(ctx.read_native_pin(p, t)),
+        _ => this_opt,
+    };
+    if let Some(p) = this_pin {
+        ctx.unpin_native_roots(p);
+    }
+    if let Some(Value::Object(Some(str_ref))) = result {
+        let text = ctx.read_string(str_ref).unwrap_or_default();
+        ctx.record_printed_line(text.clone());
+        // `stream_write` and all three of its helpers read only `args[0]`
+        // (`stream_fd`, `route_write_through_out`, `surefire_forwarding_write`),
+        // so the re-derived receiver alone is a complete argument list.
+        stream_write(ctx, &[Value::Object(this_cur)], &text);
+    }
+    Ok(Some(Value::Object(this_cur)))
 }
 
 /// Return the underlying `Writer` from a `PrintWriter` object when it is a
@@ -28321,22 +29131,24 @@ fn native_uuid_random(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 }
 
 fn native_uuid_from_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `UUID.fromString(null)` is a NullPointerException on HotSpot, not a null
+    // return — a native whose descriptor returns java/util/UUID must not answer
+    // the void-shaped `Ok(None)`.
     let s = match args.first() {
         Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
-    // Parse UUID format: 8-4-4-4-12 hex
-    let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
-        return Err(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("Invalid UUID string: {s}"),
-            }
-            .into(),
-        );
-    }
-    let msb = u64::from_str_radix(&hex[0..16], 16).unwrap_or(0) as i64;
-    let lsb = u64::from_str_radix(&hex[16..32], 16).unwrap_or(0) as i64;
+    // The previous body stripped EVERY dash and checked only that 32 hex digits
+    // remained. That is over-strict and over-lax at once — the same missing
+    // spec seen from two sides:
+    //   * it REJECTED "1-2-3-4-5", which HotSpot accepts and zero-pads,
+    //   * it ACCEPTED a dash-less 32-char string and a 7-dash string,
+    //   * `unwrap_or(0)` turned "zzzz…" into the nil UUID instead of throwing,
+    //   * `&hex[0..16]` byte-slices a String and panics on a multi-byte char.
+    // The real algorithm is five `Long.parseLong` calls with masking and no
+    // dash-position count. `uuid_from_string_bits` transcribes it.
+    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
+    let (msb, lsb) = crate::phases_late::uuid_from_string_bits(&s)?;
     let uuid = alloc_uuid(ctx, msb, lsb);
     Ok(Some(Value::Object(Some(uuid?))))
 }
@@ -29360,25 +30172,22 @@ fn native_reference_wait_pending(
 /// The real dispatch happens in the interpreter via CachedInvokeTarget; this native
 /// fallback returns null for now (MH-heavy code paths use the interpreter's dispatch).
 fn native_method_handle_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // A real-JDK Linker returns a synthetic DowncallHandle that is assignable
-    // to MethodHandle. Some signature-polymorphic void call sites resolve the
-    // inherited MethodHandle entry first and reach this fallback instead of
-    // the specialized interpreter route. Do not turn those native calls into
-    // a silent null return: route by the receiver's runtime class.
+    // A real-JDK Linker returns a downcall handle. Some signature-polymorphic
+    // void call sites resolve the inherited MethodHandle entry first and reach
+    // this fallback instead of the specialized interpreter route. Do not turn
+    // those native calls into a silent null return.
+    //
+    // Both former tests are dead as written (P1-E). The class test named
+    // `java/lang/foreign/DowncallHandle`, the invented class `--jdk-only`
+    // refused; and the layout test read `Long` at slot 0 and a
+    // `FunctionDescriptor` at slot 1, which the carrier no longer has — slot 0
+    // is now the real `type` field (an object) and the downcall state lives
+    // above the MethodHandle window. Left as they were, BOTH would go false and
+    // this fallback would return null for every downcall. That is the failure
+    // mode this comment block exists to prevent, so the two halves had to move
+    // together.
     if let Some(Value::Object(Some(receiver))) = args.first() {
-        let receiver_class = ctx.class_name_of_id(ctx.class_id_of_object(*receiver));
-        let has_downcall_layout = matches!(ctx.get_field(*receiver, 0), Value::Long(ptr) if ptr != 0)
-            && match ctx.get_field(*receiver, 1) {
-                Value::Object(Some(descriptor)) => {
-                    ctx.class_name_arc_of_id(ctx.class_id_of_object(descriptor))
-                        .as_deref()
-                        == Some("java/lang/foreign/FunctionDescriptor")
-                }
-                _ => false,
-            };
-        let is_downcall = receiver_class.as_deref() == Some("java/lang/foreign/DowncallHandle")
-            || has_downcall_layout;
-        if is_downcall {
+        if crate::panama::is_downcall_handle(ctx, *receiver) {
             return crate::panama::pe_downcall_invoke(ctx, args);
         }
     }
@@ -33058,62 +33867,200 @@ mod cyclic_barrier_tests {
 
 // ===========================================================================
 // Base64 — Encoder/Decoder for basic, URL-safe, and MIME variants
-// Encoder uses the real JDK field layout: newline, linemax, isURL, doPadding.
-// Decoder = 1-field synthetic (field 0 = Int variant tag)
-// Tags: 0 = basic, 1 = url-safe, 2 = MIME
+//
+// BOTH synthetics use the REAL JDK instance-field layout, in declaration
+// order, so that the public methods this file does NOT register (7 of the 18
+// — see `register_base64_natives`) can run real JDK bytecode against a
+// receiver this file fabricated. Read off `javap -p` on 25.0.3+9-LTS:
+//
+//   java.util.Base64$Encoder   0 newline:[B  1 linemax:I  2 isURL:Z  3 doPadding:Z
+//   java.util.Base64$Decoder   0 isURL:Z     1 isMIME:Z
+//
+// The Decoder was a ONE-field synthetic holding an Int variant tag (0/1/2) in
+// slot 0 until 2026-08-13, which slot 0 of the real layout calls `isURL`. So
+// `getMimeDecoder()` wrote 2 into `isURL` and left `isMIME` false, and every
+// real-bytecode entry point read our MIME decoder as a URL, non-MIME one.
+// Measured on HotSpot by building `Decoder(isURL=true, isMIME=false)` through
+// the private constructor and decoding what `getMimeDecoder()` must accept
+// (`scratchpad/e14/B64Unreg.java`):
+//
+//   input                real getMimeDecoder()  our fabricated shape
+//   76-col wrapped text   len=60                 IllegalArgumentException:
+//                                                  Illegal base64 character d
+//   "-_-_"                len=0                  len=3
+//   "QQ\n=="              len=1                  IllegalArgumentException:
+//                                                  Illegal base64 character a
+//
+// Three of four rows wrong, one of them silently. That is the two-readers-of-
+// one-slot shape: the NATIVE route read slot 0 as a variant tag and the
+// BYTECODE route read it as `isURL`.
+//
+// The variant tag survives as this file's INTERNAL vocabulary (it is what
+// `b64_decode`/`b64_encode` take), derived from the two booleans on read.
+// Tags: 0 = basic, 1 = url-safe, 2 = MIME.
 // ===========================================================================
 
+const B64_ENCODER_CLASS: &str = "java/util/Base64$Encoder";
+const B64_DECODER_CLASS: &str = "java/util/Base64$Decoder";
+const B64_ENCODER_FIELD_NEWLINE: usize = 0;
 const B64_ENCODER_FIELD_LINEMAX: usize = 1;
 const B64_ENCODER_FIELD_IS_URL: usize = 2;
 const B64_ENCODER_FIELD_DO_PADDING: usize = 3;
-const B64_DECODER_FIELD_VARIANT: usize = 0;
+const B64_ENCODER_NUM_FIELDS: usize = 4;
+const B64_DECODER_FIELD_IS_URL: usize = 0;
+const B64_DECODER_FIELD_IS_MIME: usize = 1;
+const B64_DECODER_NUM_FIELDS: usize = 2;
 const B64_VARIANT_BASIC: i32 = 0;
 const B64_VARIANT_URL: i32 = 1;
 const B64_VARIANT_MIME: i32 = 2;
+
+/// `Base64.Encoder.MIMELINEMAX`.
+const B64_MIME_LINEMAX: i32 = 76;
+
+/// What the real JDK writes into `linemax` for every encoder that does NOT
+/// wrap lines — **-1, not 0**, and the difference is load-bearing.
+///
+/// `outLength` and `encode0` both test `linemax > 0`, which reads 0 and -1
+/// alike. `Base64$EncOutputStream` does not: it tests `linepos == linemax`,
+/// and `linepos` starts at 0. Measured on HotSpot by constructing each shape
+/// through the private `Encoder(boolean,byte[],int,boolean)` constructor
+/// (`scratchpad/e14/B64Zero.java`), encoding 60 bytes:
+///
+/// ```text
+/// linemax=0  newline=null  encodeToString=80  wrap(OutputStream)=NPE / "b" is null
+/// linemax=0  newline=CRLF  encodeToString=80  wrap(OutputStream)=82   <- WRONG, a
+///                                                                       basic stream
+///                                                                       with a CRLF in it
+/// linemax=-1 newline=null  encodeToString=80  wrap(OutputStream)=80   <- real getEncoder()
+/// ```
+///
+/// So this file writing 0 meant `Base64.getEncoder().wrap(os)` — one of the
+/// unregistered methods, hence real bytecode — threw NullPointerException on
+/// the first write. Writing -1 is what makes `wrap` correct, and it is ALSO
+/// why "just give the fabricated encoder a CRLF newline" is not the fix on its
+/// own: with linemax still 0 that turns the NPE into a silently wrong 82.
+const B64_NO_LINEMAX: i32 = -1;
+
+/// `Base64.Encoder.CRLF` — the line separator of `getMimeEncoder()`.
+const B64_MIME_CRLF: [u8; 2] = [b'\r', b'\n'];
 
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_URL_CHARS: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// Variant-tag entry point, kept for the callers outside this module
+/// (`http_url_connection.rs`, `net_phase_e.rs`, `regex_matcher.rs`'s test) that
+/// only ever want one of the three canonical encoders. MIME here means the
+/// canonical `getMimeEncoder()` shape, 76 columns and CRLF.
+///
+/// Everything driven by an actual `Base64$Encoder` receiver goes through
+/// [`b64_encode_wrapped`] instead, because a receiver carries its OWN
+/// `linemax`/`newline` and this tag cannot represent them.
 pub(crate) fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8> {
-    let table = if variant == B64_VARIANT_URL {
-        B64_URL_CHARS
+    let (linemax, newline): (i32, &[u8]) = if variant == B64_VARIANT_MIME {
+        (B64_MIME_LINEMAX, &B64_MIME_CRLF)
     } else {
-        B64_CHARS
+        (B64_NO_LINEMAX, &[])
     };
-    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
-    let mut i = 0;
-    let mut line_len = 0;
-    // Real `Base64.Encoder.encode0` writes the MIME line separator only when
-    // more input remains (`if (dp < len && sp < end)`), so a payload that ends
-    // exactly on a 76-char boundary gets NO trailing CRLF (57 bytes → 76
-    // chars, not 78). Emitting it eagerly after the quad that fills the line —
-    // as this loop used to — appended a phantom CRLF at end-of-output. Emit it
-    // lazily instead, just before whatever actually follows.
-    while i + 2 < input.len() {
-        if variant == B64_VARIANT_MIME && line_len == 76 {
-            out.push(b'\r');
-            out.push(b'\n');
-            line_len = 0;
+    b64_encode_wrapped(
+        input,
+        variant == B64_VARIANT_URL,
+        no_padding,
+        linemax,
+        newline,
+    )
+}
+
+/// Line-for-line port of real `java.util.Base64.Encoder.encode0` (JDK 25
+/// `java.base/java/util/Base64.java`), with `linemax` and `newline` taken from
+/// the caller instead of hardcoded at 76/CRLF.
+///
+/// Hardcoding them made `Base64.getMimeEncoder(20, new byte[]{'\n'})` — the one
+/// factory this file does not register, so it runs real bytecode and hands back
+/// a real `Encoder` with `linemax=20, newline=[10]` — encode with 76-column
+/// CRLF wrapping anyway. On the 60-byte fixture (80 base64 chars) that is
+/// `80 + 1 separator x 2 bytes = 82` against HotSpot's
+/// `80 + 3 separators x 1 byte = 83`. **Off by one, not off by a mile**, which
+/// is the dangerous kind: a caller asserting "about the right length", or
+/// `decode`-ing the result (MIME decoding ignores every non-alphabet byte, so
+/// both round-trip), cannot tell. It is wrong in the LINE STRUCTURE, not the
+/// length — one 76-char line where the caller asked for four 20-char lines.
+///
+/// Three details of `encode0` that a plausible rewrite gets wrong, each
+/// measured on HotSpot in `scratchpad/e14/B64Line.java`:
+///
+/// 1. **The separator test is `dlen == linemax`, an EQUALITY.** `slen` is
+///    rounded down to a whole number of triples, so a `linemax` that is not a
+///    multiple of 4 can never be hit and the encoder emits NO separators at
+///    all: `linemax=20 -> 83` but `linemax=22 -> 80`, and `linemax=6 -> 80`.
+///    A `>=` here would wrap all three.
+/// 2. **A separator is written only when input remains** (`&& sp < end`), so a
+///    payload ending exactly on a line boundary gets no trailing separator:
+///    57 bytes at `linemax=76` is 76 chars, not 78; 15 bytes at `linemax=20`
+///    is 20, not 21.
+/// 3. **`linemax > 0` is not the same as "wraps"**, and `linemax` past the
+///    payload is fine: `linemax=1000` on 60 bytes is 80 chars.
+///
+/// The one deliberate divergence is `linemax` in `1..=3`, where
+/// `linemax / 4 * 3` is 0, real JDK's block size becomes 0 and its
+/// `while (sp < sl)` loop never advances. Measured: HotSpot **hangs** (all
+/// three values still running after 1.2 s in `scratchpad/e14/B64Fab.java`).
+/// No public factory can produce it — `getMimeEncoder(int, byte[])` rounds
+/// `lineLength >> 2 << 2` and returns the unwrapped `RFC4648` singleton for
+/// anything below 4 — so it is reachable only through reflection. We treat it
+/// as "no wrapping" rather than reproducing a hang.
+fn b64_encode_wrapped(
+    input: &[u8],
+    is_url: bool,
+    no_padding: bool,
+    linemax: i32,
+    newline: &[u8],
+) -> Vec<u8> {
+    let table = if is_url { B64_URL_CHARS } else { B64_CHARS };
+    let end = input.len();
+    // `int slen = (end - off) / 3 * 3;` — the whole-triple prefix. `sl` is
+    // where the 3-byte loop stops and the 1-or-2-byte tail begins.
+    let sl = end / 3 * 3;
+    // `if (linemax > 0 && slen > linemax / 4 * 3) slen = linemax / 4 * 3;` —
+    // real JDK REUSES `slen` as the per-line block size once the payload is
+    // longer than one line. When it is not, the whole payload is one block and
+    // `dlen` may still equal `linemax` exactly (15 bytes at linemax 20), which
+    // rule 2 above is what keeps from emitting a trailing separator.
+    let line_bytes = if linemax > 0 {
+        (linemax / 4 * 3) as usize
+    } else {
+        0
+    };
+    let block = if linemax > 0 && sl > line_bytes && line_bytes > 0 {
+        line_bytes
+    } else {
+        sl
+    };
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4 + newline.len() * 4);
+    let mut sp = 0usize;
+    while sp < sl {
+        let sl0 = (sp + block).min(sl);
+        let mut sp0 = sp;
+        while sp0 < sl0 {
+            let triple = ((input[sp0] as u32) << 16)
+                | ((input[sp0 + 1] as u32) << 8)
+                | input[sp0 + 2] as u32;
+            out.push(table[((triple >> 18) & 0x3F) as usize]);
+            out.push(table[((triple >> 12) & 0x3F) as usize]);
+            out.push(table[((triple >> 6) & 0x3F) as usize]);
+            out.push(table[(triple & 0x3F) as usize]);
+            sp0 += 3;
         }
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
-        let b2 = input[i + 2] as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(table[((triple >> 18) & 0x3F) as usize]);
-        out.push(table[((triple >> 12) & 0x3F) as usize]);
-        out.push(table[((triple >> 6) & 0x3F) as usize]);
-        out.push(table[(triple & 0x3F) as usize]);
-        i += 3;
-        line_len += 4;
+        let dlen = (sl0 - sp) / 3 * 4;
+        sp = sl0;
+        // `if (dlen == linemax && sp < end)` — see rules 1 and 2 above.
+        if linemax > 0 && dlen == linemax as usize && sp < end {
+            out.extend_from_slice(newline);
+        }
     }
-    let remaining = input.len() - i;
-    if remaining > 0 && variant == B64_VARIANT_MIME && line_len == 76 {
-        out.push(b'\r');
-        out.push(b'\n');
-    }
+    let remaining = end - sp;
     if remaining == 1 {
-        let b0 = input[i] as u32;
+        let b0 = input[sp] as u32;
         out.push(table[((b0 >> 2) & 0x3F) as usize]);
         out.push(table[((b0 << 4) & 0x3F) as usize]);
         if !no_padding {
@@ -33121,8 +34068,8 @@ pub(crate) fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8
             out.push(b'=');
         }
     } else if remaining == 2 {
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
+        let b0 = input[sp] as u32;
+        let b1 = input[sp + 1] as u32;
         out.push(table[((b0 >> 2) & 0x3F) as usize]);
         out.push(table[(((b0 << 4) | (b1 >> 4)) & 0x3F) as usize]);
         out.push(table[((b1 << 2) & 0x3F) as usize]);
@@ -33307,6 +34254,37 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// 11 of `java.util.Base64`'s 18 public methods are registered here. The other
+/// SEVEN are **deliberately left to real JDK bytecode**, which is the whole
+/// point of `--jdk-only` mode: a native that shadows correct bytecode is a
+/// liability, and each of these seven would be one.
+///
+/// | left unregistered | why NOT a native | HotSpot, 60-byte fixture |
+/// |---|---|---|
+/// | `Base64.getMimeEncoder(I[B)LBase64$Encoder;` | a native would have to re-implement three separately measured behaviours: `lineLength >> 2 << 2` rounding (`19 -> 16`, `22 -> 20`), the `IllegalArgumentException / Illegal base64 line separator character 0x41` alphabet check on the separator (`'-'` passes, `'='` does not), and the `lineLength <= 0 -> Encoder.RFC4648` aliasing. The bytecode has all three. | 83 |
+/// | `Base64$Encoder.encode([B[B)I` | real `encode0` + the `Output byte array is too small for encoding all input bytes` contract | 82 mime / 80 basic |
+/// | `Base64$Encoder.encode(LByteBuffer;)LByteBuffer;` | plus ByteBuffer position/limit semantics (measured: source position advances to 60) | 82 |
+/// | `Base64$Encoder.wrap(LOutputStream;)LOutputStream;` | returns a stateful `Base64$EncOutputStream` | 82 |
+/// | `Base64$Decoder.decode([B[B)I` | real `decode0` | 60 |
+/// | `Base64$Decoder.decode(LByteBuffer;)LByteBuffer;` | ditto | 60 |
+/// | `Base64$Decoder.wrap(LInputStream;)LInputStream;` | returns a stateful `Base64$DecInputStream` | 60 |
+///
+/// All seven read their answer off the RECEIVER's fields, so "leave it to
+/// bytecode" is only a real decision once the receiver is honest — which is why
+/// this lane's work is in `b64_alloc_encoder` (writing `newline`, and `-1` not
+/// `0` into `linemax`) and `b64_alloc_decoder` (the two-boolean layout) rather
+/// than in seven new `registry.register` calls. Before those two fixes, four of
+/// the seven threw `NullPointerException` and three silently decoded as the
+/// wrong variant.
+///
+/// **Synthetic-JDK mode is the exception, and it stays broken on purpose.**
+/// There is no bytecode there, so all seven are `NoSuchMethodError`. Registering
+/// them to fix that would ALSO shadow the real bytecode in real-JDK mode,
+/// because a `registry.register` call cannot see the runtime JDK mode — the same
+/// trap in reverse as gating a native on a feature flag and thereby dropping it
+/// from a mode whose stub has no method bodies. Nothing in the corpus is known
+/// to call these seven; leaving them unregistered keeps the real-JDK answer
+/// correct and costs synthetic mode only what it already lacked.
 fn register_base64_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: Base64 encode/decode is a spec-exact algorithm replicating
     // real JDK bytecode → Intrinsic.
@@ -33380,53 +34358,201 @@ fn register_base64_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
+/// Allocate a fabricated `Base64$Encoder` with all FOUR JDK fields written.
+///
+/// **The GC hazard this function's shape exists to avoid.**
+/// `try_alloc_concurrent_synthetic` hands back a bare `ObjectRef` — a raw
+/// pointer into the GC heap (`types/src/value.rs`), not a root. The MIME arm
+/// then has to allocate a second object, the `byte[]{13,10}` line separator,
+/// *between* that allocation and the `set_field` calls that finish the encoder.
+/// `new_array` can trigger a young collection, and this VM's young collector
+/// MOVES: it evacuates survivors and rewrites only the root sets it knows —
+/// thread stacks, statics, `native_pin_roots`, and the per-thread handle-slot
+/// table (`vm/src/memory/roots.rs`). A raw `ObjectRef` in a Rust local is in
+/// none of them, and the encoder is at that moment young, half-built, and
+/// referenced from nowhere in Java — so it is not merely relocatable, it is
+/// *collectable*. The four `set_field`s would then write `newline`, `linemax`,
+/// `isURL`, `doPadding` into whatever now occupies the vacated from-space slot.
+/// That is the bug family `types/src/handle.rs` opens by calling this codebase's
+/// #1 recurring defect, with 37+ independently-found sites.
+///
+/// The old body was safe only because it never allocated between the two — it
+/// simply left `newline` null. Fixing that introduces the hazard, which is why
+/// this is not the one-liner it looks like. `NativeHandleScope` closes it: the
+/// encoder is read back through a collector-updated slot AFTER the array
+/// allocation, never from the pre-allocation local, and the scope pops on every
+/// Rust exit path including the `?` above.
 fn b64_alloc_encoder(
     ctx: &mut dyn NativeContext,
     variant: i32,
     no_padding: bool,
 ) -> MethodCallResult {
-    let encoder = try_alloc_concurrent_synthetic(ctx, "java/util/Base64$Encoder", 4)?;
-    ctx.set_field(
+    use cratonvm_types::ArrayElementType;
+    let mut scope = NativeHandleScope::new(ctx);
+    let encoder =
+        try_alloc_concurrent_synthetic(&mut *scope, B64_ENCODER_CLASS, B64_ENCODER_NUM_FIELDS)?;
+    let encoder_h = scope.root(encoder);
+    // ---- allocating region: `encoder` must not be read as a raw local past here
+    let newline_h = if variant == B64_VARIANT_MIME {
+        let arr = scope.new_array(ArrayElementType::Byte, B64_MIME_CRLF.len());
+        for (i, &b) in B64_MIME_CRLF.iter().enumerate() {
+            scope.set_array_element(arr, i, Value::Int(b as i32));
+        }
+        Some(scope.root(arr))
+    } else {
+        None
+    };
+    // ---- end allocating region: re-read both through their slots
+    let encoder = scope.get(&encoder_h);
+    let newline = newline_h.as_ref().map(|h| scope.get(h));
+    // Real `getEncoder()`/`getUrlEncoder()` have `newline == null`; only the
+    // MIME encoder carries CRLF. Writing null EXPLICITLY (rather than leaving
+    // the slot untouched) is what makes the fabricated object's shape match the
+    // real one even when `try_alloc_concurrent_synthetic` hands back a recycled
+    // span.
+    scope.set_field(encoder, B64_ENCODER_FIELD_NEWLINE, Value::Object(newline));
+    scope.set_field(
         encoder,
         B64_ENCODER_FIELD_LINEMAX,
-        Value::Int(if variant == B64_VARIANT_MIME { 76 } else { 0 }),
+        // -1, not 0, for the non-wrapping encoders — see `B64_NO_LINEMAX`.
+        Value::Int(if variant == B64_VARIANT_MIME {
+            B64_MIME_LINEMAX
+        } else {
+            B64_NO_LINEMAX
+        }),
     );
-    ctx.set_field(
+    scope.set_field(
         encoder,
         B64_ENCODER_FIELD_IS_URL,
-        Value::Int(if variant == B64_VARIANT_URL { 1 } else { 0 }),
+        Value::Int(i32::from(variant == B64_VARIANT_URL)),
     );
-    ctx.set_field(
+    scope.set_field(
         encoder,
         B64_ENCODER_FIELD_DO_PADDING,
-        Value::Int(if no_padding { 0 } else { 1 }),
+        Value::Int(i32::from(!no_padding)),
     );
     Ok(Some(Value::Object(Some(encoder))))
 }
 
+/// Allocate a fabricated `Base64$Decoder` in the real JDK's TWO-boolean layout
+/// (`isURL`, `isMIME`) — see this section's header for the measured damage the
+/// previous one-Int-slot layout did to every real-bytecode entry point.
+///
+/// No allocation happens between the object and its field writes, so unlike
+/// `b64_alloc_encoder` this one needs no handle scope.
 fn b64_alloc_decoder(ctx: &mut dyn NativeContext, variant: i32) -> MethodCallResult {
-    let decoder = try_alloc_concurrent_synthetic(ctx, "java/util/Base64$Decoder", 1)?;
-    ctx.set_field(decoder, B64_DECODER_FIELD_VARIANT, Value::Int(variant));
+    let decoder = try_alloc_concurrent_synthetic(ctx, B64_DECODER_CLASS, B64_DECODER_NUM_FIELDS)?;
+    ctx.set_field(
+        decoder,
+        B64_DECODER_FIELD_IS_URL,
+        Value::Int(i32::from(variant == B64_VARIANT_URL)),
+    );
+    ctx.set_field(
+        decoder,
+        B64_DECODER_FIELD_IS_MIME,
+        Value::Int(i32::from(variant == B64_VARIANT_MIME)),
+    );
     Ok(Some(Value::Object(Some(decoder))))
 }
 
+/// The real JDK's own singleton for one of the six no-arg factories, or `None`
+/// when there is no real class library to take it from.
+///
+/// **Why this, and not a native-side cache.** HotSpot returns the SAME object
+/// from repeated calls — identity, not equality (`scratchpad/e14/B64Ident.java`):
+///
+/// ```text
+/// Base64.getEncoder()    == Base64.getEncoder()    -> true
+/// Base64.getUrlEncoder() == Base64.getUrlEncoder() -> true
+/// Base64.getMimeEncoder()== Base64.getMimeEncoder()-> true
+/// Base64.getDecoder()    == Base64.getDecoder()    -> true
+/// Base64.getUrlDecoder() == Base64.getUrlDecoder() -> true
+/// Base64.getMimeDecoder()== Base64.getMimeDecoder()-> true
+/// ```
+///
+/// and they are exactly the `static final` fields `Encoder.RFC4648` /
+/// `RFC4648_URLSAFE` / `RFC2045` and the matching three on `Decoder`. Caching a
+/// FABRICATED object in a native `static` would reproduce the `==` rows above,
+/// but it cannot reproduce this one, also measured:
+///
+/// ```text
+/// Base64.getMimeEncoder(0, sep) == Base64.getEncoder() -> true
+/// ```
+///
+/// `getMimeEncoder(int, byte[])` is deliberately unregistered (see
+/// `register_base64_natives`), so it runs real bytecode and returns the real
+/// `Encoder.RFC4648` for any `lineLength <= 0`. No amount of native-side caching
+/// makes that equal to an object this file fabricated; only *being* the JDK's
+/// singleton does. Taking the field is also free of the two things a cache would
+/// need and could get wrong: it is already a GC root (a static field), so no
+/// `register_var_handle_root` / `read_var_handle_root` re-read discipline, and
+/// it is already VM-scoped, so no process-global `static` to scope by
+/// `vm_identity()`.
+///
+/// Caching is otherwise SAFE — every instance field of both classes is `final`
+/// (measured), so a shared instance has no mutable state — but unnecessary.
+///
+/// Returns `None`, and the caller fabricates exactly as before, whenever the
+/// real class library is absent (synthetic-JDK mode), the class will not
+/// initialize, the field is not declared, or it holds anything other than a
+/// non-null reference. `Base64$Encoder.<clinit>` and `Base64$Decoder.<clinit>`
+/// build these three statics each and call nothing on `java.util.Base64`
+/// (checked with `javap -c`), so this cannot recurse back into the factory.
+fn b64_jdk_singleton(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    field_name: &str,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    let index = ctx.static_field_index_by_name(cid, field_name)?;
+    match ctx.get_static_field(cid, index) {
+        Value::Object(Some(singleton)) => Some(singleton),
+        _ => None,
+    }
+}
+
+/// One of the three `Encoder` factories: the real JDK's singleton when there is
+/// one, otherwise a fabricated stand-in built to the same field layout.
+fn b64_encoder_factory(
+    ctx: &mut dyn NativeContext,
+    field_name: &str,
+    variant: i32,
+) -> MethodCallResult {
+    match b64_jdk_singleton(ctx, B64_ENCODER_CLASS, field_name) {
+        Some(singleton) => Ok(Some(Value::Object(Some(singleton)))),
+        None => b64_alloc_encoder(ctx, variant, false),
+    }
+}
+
+/// One of the three `Decoder` factories; see [`b64_encoder_factory`].
+fn b64_decoder_factory(
+    ctx: &mut dyn NativeContext,
+    field_name: &str,
+    variant: i32,
+) -> MethodCallResult {
+    match b64_jdk_singleton(ctx, B64_DECODER_CLASS, field_name) {
+        Some(singleton) => Ok(Some(Value::Object(Some(singleton)))),
+        None => b64_alloc_decoder(ctx, variant),
+    }
+}
+
 fn native_b64_get_encoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_encoder(ctx, B64_VARIANT_BASIC, false)
+    b64_encoder_factory(ctx, "RFC4648", B64_VARIANT_BASIC)
 }
 fn native_b64_get_url_encoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_encoder(ctx, B64_VARIANT_URL, false)
+    b64_encoder_factory(ctx, "RFC4648_URLSAFE", B64_VARIANT_URL)
 }
 fn native_b64_get_mime_encoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_encoder(ctx, B64_VARIANT_MIME, false)
+    b64_encoder_factory(ctx, "RFC2045", B64_VARIANT_MIME)
 }
 fn native_b64_get_decoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_decoder(ctx, B64_VARIANT_BASIC)
+    b64_decoder_factory(ctx, "RFC4648", B64_VARIANT_BASIC)
 }
 fn native_b64_get_url_decoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_decoder(ctx, B64_VARIANT_URL)
+    b64_decoder_factory(ctx, "RFC4648_URLSAFE", B64_VARIANT_URL)
 }
 fn native_b64_get_mime_decoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_decoder(ctx, B64_VARIANT_MIME)
+    b64_decoder_factory(ctx, "RFC2045", B64_VARIANT_MIME)
 }
 
 /// Helper: read byte[] arg into a Vec<u8>
@@ -33451,21 +34577,111 @@ fn b64_write_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
     result
 }
 
-/// Helper: get variant tag from encoder/decoder `this`
-fn b64_encoder_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if matches!(ctx.get_field(this, B64_ENCODER_FIELD_IS_URL), Value::Int(v) if v != 0) {
-        B64_VARIANT_URL
-    } else if matches!(ctx.get_field(this, B64_ENCODER_FIELD_LINEMAX), Value::Int(v) if v != 0) {
-        B64_VARIANT_MIME
-    } else {
-        B64_VARIANT_BASIC
+/// Everything real `Base64$Encoder` carries, read off the receiver's four
+/// JDK-aligned fields rather than collapsed into a three-valued variant tag.
+///
+/// A tag cannot express this family. `isURL` picks the ALPHABET and `linemax` /
+/// `newline` control LINE WRAPPING, and in the real JDK the two are
+/// independent — collapsing them meant the wrapping of every encoder was
+/// inferred from a tag instead of read, so a custom `linemax` could not
+/// survive the trip. Measured shapes (`scratchpad/e14/B64Line.java`, all four
+/// fields via reflection):
+///
+/// ```text
+/// getEncoder()                  linemax=-1  isURL=false  newline=null       60B -> 80
+/// getUrlEncoder()               linemax=-1  isURL=true   newline=null       60B -> 80
+/// getMimeEncoder()              linemax=76  isURL=false  newline=[13,10]    60B -> 82
+/// getMimeEncoder(20,{'\n'})     linemax=20  isURL=false  newline=[10]       60B -> 83
+/// getMimeEncoder(20,{'\n'})
+///     .withoutPadding()         linemax=20  isURL=false  newline=[10]       60B -> 83
+/// ```
+struct B64EncoderShape {
+    is_url: bool,
+    linemax: i32,
+    newline: Vec<u8>,
+    no_padding: bool,
+}
+
+impl B64EncoderShape {
+    fn encode(&self, input: &[u8]) -> Vec<u8> {
+        b64_encode_wrapped(
+            input,
+            self.is_url,
+            self.no_padding,
+            self.linemax,
+            &self.newline,
+        )
     }
 }
 
-fn b64_decoder_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field(this, B64_DECODER_FIELD_VARIANT) {
+/// Read the encoder shape off `this`, or throw the `NullPointerException`
+/// HotSpot throws.
+///
+/// A `linemax > 0` encoder with a null `newline` is not merely unusual, it is
+/// FATAL on the real JDK — and fatal on the very first call, not only on inputs
+/// long enough to wrap, because `Encoder.encodedOutLength` sizes the
+/// destination with
+///
+/// ```text
+/// if (linemax > 0) len += (len - 1) / linemax * newline.length;
+/// ```
+///
+/// before `encode0` ever runs. Measured by constructing that exact shape
+/// through the private constructor (`scratchpad/e14/B64Fab.java`) — this is
+/// what CratonVM's fabricated MIME encoder looked like to real bytecode until
+/// `b64_alloc_encoder` started writing field 0:
+///
+/// ```text
+/// Encoder(false, null, 76, true).encodeToString(30 bytes / 40 chars, no wrap needed)
+///   -> java.lang.NullPointerException / Cannot read the array length because "this.newline" is null
+/// ...identically for 57B, 60B, encode([B), encode([B[B), encode(ByteBuffer), wrap(OutputStream).
+/// ```
+///
+/// Reproducing the throw rather than defaulting to CRLF matters because the two
+/// are indistinguishable to a caller that only ever wraps: defaulting would give
+/// a plausible answer for an object the JDK considers malformed, which is the
+/// same "quiet wrong answer" shape as the null-argument defect this family was
+/// last fixed for.
+fn b64_encoder_shape(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<B64EncoderShape, MethodCallFailed> {
+    let linemax = match ctx.get_field(this, B64_ENCODER_FIELD_LINEMAX) {
         Value::Int(v) => v,
-        _ => B64_VARIANT_BASIC,
+        _ => B64_NO_LINEMAX,
+    };
+    let newline = match ctx.get_field(this, B64_ENCODER_FIELD_NEWLINE) {
+        Value::Object(Some(arr)) => b64_read_byte_array(ctx, arr),
+        _ if linemax > 0 => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => Vec::new(),
+    };
+    Ok(B64EncoderShape {
+        is_url: matches!(ctx.get_field(this, B64_ENCODER_FIELD_IS_URL), Value::Int(v) if v != 0),
+        linemax,
+        newline,
+        no_padding: b64_no_padding(ctx, this),
+    })
+}
+
+/// Decoder variant from the real JDK's two booleans.
+///
+/// `isMIME` is tested first because `Decoder.RFC2045` is `(isURL=false,
+/// isMIME=true)` and the ordering only matters for a `(true, true)` decoder,
+/// which no public factory can produce — `getUrlDecoder()` is `(true, false)`,
+/// `getMimeDecoder()` is `(false, true)`, and the constructor is private. Such
+/// a decoder would use the URL alphabet AND ignore junk; this file's
+/// three-valued tag cannot say that, and `b64_decode` — verified 36/36 against
+/// HotSpot over the malformed-input matrix and deliberately not touched here —
+/// is written against the tag. Recorded rather than modelled.
+fn b64_decoder_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    if matches!(ctx.get_field(this, B64_DECODER_FIELD_IS_MIME), Value::Int(v) if v != 0) {
+        B64_VARIANT_MIME
+    } else if matches!(ctx.get_field(this, B64_DECODER_FIELD_IS_URL), Value::Int(v) if v != 0) {
+        B64_VARIANT_URL
+    } else {
+        B64_VARIANT_BASIC
     }
 }
 
@@ -33473,63 +34689,125 @@ fn b64_no_padding(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     !matches!(ctx.get_field(this, B64_ENCODER_FIELD_DO_PADDING), Value::Int(v) if v != 0)
 }
 
+/// Receiver of an instance `Base64$Encoder` / `Base64$Decoder` native.
+///
+/// Two rules live here because every native in this family got both wrong:
+///
+/// 1. A null receiver is `NullPointerException` on HotSpot. The interpreter
+///    throws it before an instance method body runs, so this arm is defensive
+///    rather than reachable — but it must still have the right SHAPE.
+/// 2. It must NOT be `Ok(None)`. Every native in this family has a descriptor
+///    that returns a value (`[B`, `Ljava/lang/String;`,
+///    `Ljava/util/Base64$Encoder;`), and `Ok(None)` is the VOID shape: it hands
+///    the interpreter a value of the wrong kind instead of a result or a throw.
+///    docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
+fn b64_receiver(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(o))) => Ok(*o),
+        _ => Err(RuntimeError::NullPointerException { message: None }.into()),
+    }
+}
+
+/// The `byte[]` / `String` argument of a `Base64` encode/decode native.
+///
+/// HotSpot 25 throws `NullPointerException` for a null argument on EVERY
+/// overload — measured for all 13 encoder/decoder combinations, e.g.
+///
+/// ```text
+/// Encoder.encode((byte[])null)  -> NPE / Cannot read the array length because "src" is null
+/// Encoder.encodeToString(null)  -> NPE / Cannot read the array length because "src" is null
+/// Decoder.decode((byte[])null)  -> NPE / Cannot read the array length because "src" is null
+/// Decoder.decode((String)null)  -> NPE / Cannot invoke
+///                                  "String.getBytes(java.nio.charset.Charset)" because "src" is null
+/// ```
+///
+/// identically for the Url and Mime variants. The message is a HotSpot
+/// helpful-NPE built from the callee's local-variable table, not part of the
+/// specified contract, so `message: None` is left unset here; callers assert on
+/// the TYPE (`RJdkIntrinsics2 --only=b64` checks `nameOf(t)`).
+fn b64_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    match args.get(1) {
+        Some(Value::Object(Some(o))) => Ok(*o),
+        _ => Err(RuntimeError::NullPointerException { message: None }.into()),
+    }
+}
+
 fn native_b64_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let src = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let variant = b64_encoder_variant(ctx, this);
-    let no_padding = b64_no_padding(ctx, this);
+    let this = b64_receiver(args)?;
+    let src = b64_arg(args)?;
+    let shape = b64_encoder_shape(ctx, this)?;
     let bytes = b64_read_byte_array(ctx, src);
-    let encoded = b64_encode(&bytes, variant, no_padding);
+    let encoded = shape.encode(&bytes);
     let result = b64_write_byte_array(ctx, &encoded);
     Ok(Some(Value::Object(Some(result))))
 }
 
 fn native_b64_encode_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let src = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let variant = b64_encoder_variant(ctx, this);
-    let no_padding = b64_no_padding(ctx, this);
+    let this = b64_receiver(args)?;
+    let src = b64_arg(args)?;
+    let shape = b64_encoder_shape(ctx, this)?;
     let bytes = b64_read_byte_array(ctx, src);
-    let encoded = b64_encode(&bytes, variant, no_padding);
+    let encoded = shape.encode(&bytes);
     let s = String::from_utf8_lossy(&encoded);
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// Real `Encoder.withoutPadding()` is
+/// `if (!doPadding) return this; return new Encoder(isURL, newline, linemax, false);`
+///
+/// It **copies the fields**, it does not re-derive them from a variant. This
+/// used to call `b64_alloc_encoder(ctx, variant, true)`, which rebuilt the
+/// encoder from a three-valued tag and so replaced any custom line wrapping with
+/// the canonical 76/CRLF. Measured on HotSpot:
+///
+/// ```text
+/// getMimeEncoder(20,{'\n'})                  linemax=20 newline=[10]  60B -> 83
+/// getMimeEncoder(20,{'\n'}).withoutPadding() linemax=20 newline=[10]  60B -> 83
+/// getMimeEncoder(20,{'\n'}).withoutPadding() 61B -> 86   (padded: 88)
+/// ```
+///
+/// Note the copy shares the SAME `newline` array (real JDK passes the reference
+/// straight through; `getMimeEncoder(int, byte[])` does not defensively copy the
+/// caller's array either — measured: mutating it afterwards changes the
+/// encoder's output). Copying the field VALUE reproduces that, and it is also
+/// why no array is allocated here.
+///
+/// Identity: `withoutPadding()` on an already-unpadded encoder returns THIS
+/// (`np.withoutPadding() == np` measured true), but on a padded one it returns a
+/// FRESH object every call (`enc.withoutPadding() == enc.withoutPadding()`
+/// measured **false**) — so unlike the six factories this one must not be
+/// memoized.
 fn native_b64_without_padding(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let variant = b64_encoder_variant(ctx, this);
+    let this = b64_receiver(args)?;
     if b64_no_padding(ctx, this) {
-        Ok(Some(Value::Object(Some(this))))
-    } else {
-        b64_alloc_encoder(ctx, variant, true)
+        return Ok(Some(Value::Object(Some(this))));
     }
+    // `this` crosses an allocating call, so it is rooted and re-read through the
+    // collector-updated slot; see `b64_alloc_encoder` for the full hazard.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let copy = try_alloc_concurrent_synthetic(
+        &mut *scope,
+        B64_ENCODER_CLASS,
+        B64_ENCODER_NUM_FIELDS,
+    )?;
+    let copy_h = scope.root(copy);
+    let this = scope.get(&this_h);
+    let newline = scope.get_field(this, B64_ENCODER_FIELD_NEWLINE);
+    let linemax = scope.get_field(this, B64_ENCODER_FIELD_LINEMAX);
+    let is_url = scope.get_field(this, B64_ENCODER_FIELD_IS_URL);
+    let copy = scope.get(&copy_h);
+    scope.set_field(copy, B64_ENCODER_FIELD_NEWLINE, newline);
+    scope.set_field(copy, B64_ENCODER_FIELD_LINEMAX, linemax);
+    scope.set_field(copy, B64_ENCODER_FIELD_IS_URL, is_url);
+    scope.set_field(copy, B64_ENCODER_FIELD_DO_PADDING, Value::Int(0));
+    Ok(Some(Value::Object(Some(copy))))
 }
 
 fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let src = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let this = b64_receiver(args)?;
+    let src = b64_arg(args)?;
     let variant = b64_decoder_variant(ctx, this);
     let bytes = b64_read_byte_array(ctx, src);
     match b64_decode(&bytes, variant) {
@@ -33542,15 +34820,16 @@ fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let this = b64_receiver(args)?;
     let variant = b64_decoder_variant(ctx, this);
-    let src_str = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    // This was the FOURTH null-argument site, and the one a
+    // `grep '"decode".*Ljava/lang/String'` misses because its registration
+    // spans four lines. Defaulting a null argument to `String::new()` decoded
+    // the EMPTY input instead of throwing, so `decode((String) null)` RETURNED
+    // a zero-length `byte[]` where HotSpot throws NullPointerException —
+    // the one shape a caller cannot distinguish from a legitimate `decode("")`.
+    let src = b64_arg(args)?;
+    let src_str = ctx.read_string(src).unwrap_or_default();
     // Real `Decoder.decode(String)` is `decode(src.getBytes(ISO_8859_1))`: one
     // byte per UTF-16 unit, with anything above U+00FF replaced by `'?'`.
     // Handing it UTF-8 instead splits every non-ASCII char into a multi-byte
@@ -33571,7 +34850,10 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 #[cfg(test)]
 mod base64_tests {
-    use super::{b64_decode, b64_encode, B64_VARIANT_BASIC, B64_VARIANT_MIME, B64_VARIANT_URL};
+    use super::{
+        b64_decode, b64_encode, b64_encode_wrapped, B64_VARIANT_BASIC, B64_VARIANT_MIME,
+        B64_VARIANT_URL,
+    };
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
@@ -33770,6 +35052,124 @@ mod base64_tests {
         assert_eq!(b64_encode(&[0], B64_VARIANT_BASIC, true), b"AA");
         assert_eq!(b64_encode(&[0, 0], B64_VARIANT_BASIC, false), b"AAA=");
         assert_eq!(b64_encode(&[0, 0], B64_VARIANT_BASIC, true), b"AAA");
+    }
+
+    /// Every row is a literal line of `scratchpad/e14/B64Line.java`'s output on
+    /// HotSpot 25 (`java --add-opens java.base/java.util=ALL-UNNAMED`), encoding
+    /// 60 bytes `0..59` — 80 base64 characters before any separator — through
+    /// `Base64.getMimeEncoder(lineLength, separator)`.
+    ///
+    /// The rows are chosen to separate the three rules that a
+    /// "wrap every `linemax` characters" rewrite gets wrong, so that a
+    /// regression names itself:
+    ///
+    /// * **rounding** — 19 wraps at 16, 21/22/23 wrap at 20 (`lineLength >> 2 << 2`);
+    /// * **`dlen == linemax` is an EQUALITY** — a `linemax` that is not a
+    ///   multiple of 4 emits NO separators (22 -> 80, 6 -> 80), which a `>=`
+    ///   would turn into 83/93;
+    /// * **separator length is not 2** — 80 + 3x1 = 83 for `{'\n'}` against
+    ///   80 + 1x2 = 82 for the canonical 76/CRLF. Those two differ by ONE, which
+    ///   is why a "roughly the right length" assertion cannot see the bug.
+    #[test]
+    fn line_wrapping_matches_hotspot_for_every_measured_linemax() {
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+        let lf = b"\n".as_slice();
+        let crlf = b"\r\n".as_slice();
+
+        // (linemax, separator, expected length) — `lineLength` already rounded,
+        // exactly as `getMimeEncoder(int, byte[])` stores it.
+        let rows: &[(i32, &[u8], usize)] = &[
+            (-1, &[], 80),    // getEncoder()
+            (0, &[], 80),     // no encoder produces this, but `> 0` must reject it
+            (4, crlf, 118),   // 80 + 19x2
+            (8, b"!#$", 107), // 80 + 9x3   — a 3-byte separator
+            (16, lf, 84),     // 80 + 4x1
+            (20, lf, 83),     // 80 + 3x1  <- THE ROW: 83, not 82
+            (24, lf, 83),     // 80 + 3x1, different line count, same total
+            (76, lf, 81),     // 80 + 1x1
+            (76, crlf, 82),   // 80 + 1x2  — canonical getMimeEncoder()
+            (1000, lf, 80),   // linemax past the payload wraps nothing
+            (6, lf, 80),      // not a multiple of 4 -> `dlen == linemax` never holds
+            (22, lf, 80),     // ditto
+            (20, &[], 80),    // an EMPTY separator is legal and adds nothing
+        ];
+        for &(linemax, newline, expected) in rows {
+            let encoded = b64_encode_wrapped(&payload, false, false, linemax, newline);
+            assert_eq!(
+                encoded.len(),
+                expected,
+                "linemax={linemax} newline={newline:?}: HotSpot answers {expected}"
+            );
+        }
+
+        // The full text of the row that used to be wrong, not just its length:
+        // four 20-character lines separated by LF, no trailing separator.
+        let encoded = b64_encode_wrapped(&payload, false, false, 20, lf);
+        assert_eq!(
+            std::str::from_utf8(&encoded).expect("ascii"),
+            "AAECAwQFBgcICQoLDA0O\nDxAREhMUFRYXGBkaGxwd\nHh8gISIjJCUmJygpKiss\nLS4vMDEyMzQ1Njc4OTo7"
+        );
+    }
+
+    /// `dlen == linemax && sp < end`: a payload that ends exactly on a line
+    /// boundary gets no trailing separator, at any linemax.
+    #[test]
+    fn no_trailing_separator_at_any_linemax() {
+        let lf = b"\n".as_slice();
+        // 15 bytes = 20 chars = exactly one line at linemax 20.
+        let exact = b64_encode_wrapped(&[0u8; 15], false, false, 20, lf);
+        assert_eq!(exact.len(), 20, "HotSpot: 20, not 21");
+        // 16 bytes = 20 chars + a 1-byte tail, so the separator DOES appear.
+        let spill = b64_encode_wrapped(&[0u8; 16], false, false, 20, lf);
+        assert_eq!(spill.len(), 25, "HotSpot: 20 + separator + \"AA==\"");
+        assert_eq!(
+            std::str::from_utf8(&spill).expect("ascii"),
+            "AAAAAAAAAAAAAAAAAAAA\nAA=="
+        );
+        // 57 bytes = exactly one 76-char line.
+        assert_eq!(
+            b64_encode_wrapped(&[0u8; 57], false, false, 76, b"\r\n").len(),
+            76
+        );
+    }
+
+    /// A `linemax` of 1..=3 makes real JDK's block size `linemax / 4 * 3` zero,
+    /// and its `while (sp < sl)` loop then never advances — measured: HotSpot
+    /// was still running all three after 1.2 s
+    /// (`scratchpad/e14/B64Fab.java`). No public factory can produce it, so
+    /// this is a deliberate divergence: we treat it as "no wrapping". The test
+    /// exists so the guard is not "simplified" back into a hang.
+    #[test]
+    fn a_sub_quantum_linemax_terminates_instead_of_spinning() {
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+        for linemax in 1..=3 {
+            let encoded = b64_encode_wrapped(&payload, false, false, linemax, b"\n");
+            assert_eq!(
+                encoded.len(),
+                80,
+                "linemax={linemax} must terminate, not wrap"
+            );
+        }
+    }
+
+    /// The variant-tag entry point that this module's out-of-file callers use
+    /// must still mean exactly what it meant before `linemax`/`newline` became
+    /// parameters.
+    #[test]
+    fn the_variant_tag_wrapper_still_means_76_and_crlf() {
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+        assert_eq!(
+            b64_encode(&payload, B64_VARIANT_MIME, false),
+            b64_encode_wrapped(&payload, false, false, 76, b"\r\n")
+        );
+        assert_eq!(
+            b64_encode(&payload, B64_VARIANT_BASIC, false),
+            b64_encode_wrapped(&payload, false, false, -1, &[])
+        );
+        assert_eq!(
+            b64_encode(&payload, B64_VARIANT_URL, true),
+            b64_encode_wrapped(&payload, true, true, -1, &[])
+        );
     }
 }
 
@@ -34293,6 +35693,34 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 let ch = bbacb_char_at(ctx, this, idx)?;
                 Ok(Some(Value::Int(ch as i32)))
             });
+            // get()C — the RELATIVE getter, and the one method on this class
+            // whose out-of-range answer is NOT `IndexOutOfBoundsException`.
+            //
+            // `CharBuffer.get()` is `get(nextGetIndex())`, and
+            // `Buffer.nextGetIndex()` is:
+            //
+            // ```java
+            // if (position >= limit) throw new BufferUnderflowException();
+            // return position++;
+            // ```
+            //
+            // so the refusal is raised by the POSITION bookkeeping, before any
+            // index reaches `checkIndex`. The absolute `get(int)`/`charAt(int)`
+            // and `put(int, char)` on this same class go straight to
+            // `Buffer.checkIndex` and keep `IndexOutOfBoundsException`, and the
+            // relative `put(char)` answers `BufferOverflowException` — four
+            // methods, three exception types, one class. MEASURED on HotSpot
+            // 25.0.3+9 for `ByteBufferAsCharBuffer{B,L,RB}`, including through
+            // `slice()` and `duplicate()` (which return the same class) and the
+            // read-only `RB` form (which inherits this body).
+            //
+            // This delegated to `bbacb_char_at(ctx, this, 0)` and so reported
+            // the absolute class for all four. `phases_late/nio_buffer.rs`'s
+            // `relative::<WIDTH>` is the worked exemplar of the same split.
+            //
+            // `position` advances ONLY on success — HotSpot leaves it at 4
+            // after a failed `get()` at the limit — which is why the check
+            // precedes the read and the store follows it.
             registry.register(bbacb, "get", "()C", |ctx, args| {
                 let this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
@@ -34303,10 +35731,23 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                         .into())
                     }
                 };
-                let pos = match ctx.get_field_by_name(this, "position") {
-                    Value::Int(v) => v,
-                    _ => 0,
+                // `position`/`limit` are read through the same helper the read
+                // path uses, NOT by a bare `get_field_by_name`: it carries the
+                // slot-index fallbacks for the layouts where the names do not
+                // resolve. A `limit` that silently read 0 here would make every
+                // relative `get()` throw, so the fallback is load-bearing.
+                let (_, pos, lim, _, _) = match bbacb_read_underlying_bytes(ctx, this) {
+                    Some(s) => s,
+                    None => {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
+                        }
+                        .into())
+                    }
                 };
+                if pos >= lim {
+                    return Err(RuntimeError::BufferUnderflowException.into());
+                }
                 let ch = bbacb_char_at(ctx, this, 0)?;
                 ctx.set_field_by_name(this, "position", Value::Int(pos + 1));
                 Ok(Some(Value::Int(ch as i32)))
@@ -35004,6 +36445,52 @@ const BD_INFLATED: i64 = i64::MIN;
 /// `BigDecimal.toString` decimal representation (no exponent — used for
 /// arithmetic, not pretty-printing, so we keep it simple and round-trip-able
 /// through `f64::parse`).
+///
+/// # `scale` is an ARGUMENT, and this signature cannot refuse
+///
+/// `scale` reaches here straight off the object's `scale` field, which
+/// `new BigDecimal(BigInteger, int)` lets a caller set to anything, including
+/// `Integer.MIN_VALUE`. Two consequences, one of which was a guaranteed VM
+/// abort:
+///
+/// 1. **`-scale` overflowed.** The negative-scale branch used to write
+///    `(-scale) as usize`. At `scale == i32::MIN` that is `-i32::MIN`, which
+///    **panics in a debug build** ("attempt to negate with overflow") and in
+///    release wraps back to `i32::MIN`, which then *sign-extends* through
+///    `as usize` to 18446744071562067968 and asks `String::repeat` for it. A
+///    Rust panic is not a Java throwable — it takes the VM down and cannot be
+///    caught. Now `scale.unsigned_abs()`, which is total.
+/// 2. **The remaining size is still `scale`-driven**, and this function
+///    returns a `String`, not a `Result`, so the *refusal* has to be at the
+///    caller. It is not there yet — see the NOMINATION in
+///    `docs/known-issues/jdk-only/F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic-20260813.md`.
+///
+/// ## What HotSpot answers at these boundaries — MEASURED
+///
+/// `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)` (Microsoft build) on this
+/// host, `scratchpad/f20/Plain.java`. The reachable caller is
+/// `math_bignum::bd_read` → `BigDecimal.toPlainString()`:
+///
+/// ```text
+/// new BigDecimal(ZERO, MIN).toPlainString() = 0                        [90 ms]
+/// new BigDecimal(ONE,  MIN).toPlainString() !! ArithmeticException: Overflow          [0 ms]
+/// new BigDecimal(ONE,  MAX).toPlainString() !! OutOfMemoryError: too large to fit in a String [0 ms]
+/// ```
+///
+/// Row 1 is why the `unscaled == "0" && scale < 0` short-circuit below is not
+/// an optimisation but the contract: `toPlainString` tests `signum() == 0`
+/// *before* it validates the scale, so a zero value takes any scale. Row 2 is
+/// `checkScaleNonZero(-(long) scale)` — the STATIC form, which always throws,
+/// unlike the instance `checkScale` that `setScale` uses and that exempts a
+/// zero value. Row 3 is a length screen, not an attempted allocation: HotSpot
+/// answers in 0 ms with a 3 GB heap available.
+///
+/// So the two divergences left here are: `scale == i32::MIN` with a nonzero
+/// value, where HotSpot throws `ArithmeticException("Overflow")` and this
+/// returns a ~2 GB string of zeros; and a large positive `scale`, where
+/// HotSpot throws `OutOfMemoryError` immediately and this tries. Neither is a
+/// VM abort any more, which is the part that could be fixed inside this
+/// signature.
 fn apply_scale(unscaled: &str, scale: i32) -> String {
     // A zero value with a POSITIVE scale still renders its fractional zeros:
     // `new BigDecimal("0").setScale(2)` is "0.00", and H2 DECIMAL(p,2) columns
@@ -35029,8 +36516,17 @@ fn apply_scale(unscaled: &str, scale: i32) -> String {
             format!("{}0.{}{}", sign, "0".repeat(pad), abs)
         }
     } else {
-        // Negative scale = trailing zeros.
-        format!("{}{}{}", sign, abs, "0".repeat((-scale) as usize))
+        // Negative scale = trailing zeros. `unsigned_abs`, NOT `-scale`:
+        // `scale` is caller-chosen and `-i32::MIN` is a panic in debug and a
+        // sign-extended 1.8e19 in release. See this function's doc comment.
+        let zeros = scale.unsigned_abs() as usize;
+        let mut out = String::with_capacity(sign.len() + abs.len() + zeros);
+        out.push_str(sign);
+        out.push_str(&abs);
+        for _ in 0..zeros {
+            out.push('0');
+        }
+        out
     }
 }
 
@@ -35066,16 +36562,65 @@ fn bigint_from_i64(v: i64) -> crate::bigint::BigInt {
 /// Multiply an unscaled `BigInt` by `10^n` (n >= 0) — used to align scales for
 /// `add`/`subtract` (BigDecimal rescales the smaller-scale operand up to the
 /// larger scale before adding the unscaled integers).
+///
+/// # `n` comes from an ARGUMENT, and this function cannot refuse
+///
+/// `n` is a difference of two caller-chosen `BigDecimal` scales, so it is
+/// attacker-controlled up to `Integer.MAX_VALUE`. This body used to build the
+/// literal decimal string `"1" + "0"*n` and hand it to `BigInt::from_decimal`:
+/// an `n`-byte `String` (up to ~2 GB from one ordinary call) followed by an
+/// O(n²) digit-at-a-time parse. Both are gone — see below — but the SIZE OF
+/// THE ANSWER is still `n`-driven, and this signature returns a `BigInt`, not
+/// a `Result`, so **the refusal has to be at the call sites**. Every caller
+/// must have run `math_bignum::bd_pow_ten_check(n)?` first. Three had not, as
+/// of 2026-08-13 (lane F20 — see
+/// `docs/known-issues/jdk-only/F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic-20260813.md`):
+/// `native_bd_add`, `native_bd_subtract` and `bd_truncated_bigint`, all in
+/// `native-builtins/src/math_bignum.rs`. `bd_set_scale_impl` is guarded and is
+/// the model.
+///
+/// ## The boundary, MEASURED — do not invent a cap
+///
+/// `BigDecimal`'s own `10^n` factor is `bigTenToThe(n)`, which is
+/// `BigInteger.TEN.pow(n)` for anything past its table, so it inherits
+/// `BigInteger.pow`'s range check verbatim. `bd_pow_ten_check` is that check
+/// specialised to base 10 and nothing more. Its boundary, measured on this
+/// host against `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)` (Microsoft
+/// build), `scratchpad/f20/Pow10.java`, `-Xmx48m`:
+///
+/// ```text
+/// TEN.pow(715827881) !! java.lang.OutOfMemoryError: Java heap space              [61916 ms]
+/// TEN.pow(715827882) !! java.lang.OutOfMemoryError: Java heap space              [73069 ms]
+/// TEN.pow(715827883) !! ArithmeticException: BigInteger would overflow supported range [1 ms]
+/// TEN.pow(715827884) !! ArithmeticException: BigInteger would overflow supported range [0 ms]
+/// ```
+///
+/// So the JDK refuses at `n >= 715_827_883` and NOT below it: at 715827882 it
+/// really tries, and a heap big enough would answer. That is exactly
+/// `bd_pow_ten_check`'s predicate (`3n >= Integer.MAX_VALUE`, since 10 has one
+/// trailing zero bit and `bitLength(5) == 3`). A guessed cap anywhere under
+/// 715827883 would refuse where HotSpot succeeds, which is a fresh divergence
+/// and worse than the DoS it removes.
+///
+/// ## Why the string is gone
+///
+/// `10^n` is now `(5^n) << n`, which is not a rewrite of the JDK's algorithm
+/// but *literally* the JDK's algorithm: `BigInteger.pow` factors
+/// `2^getLowestSetBit()` out of the base, exponentiates the odd part by
+/// repeated squaring and shifts the powers of two back at the end — see
+/// [`bi_pow_check_range`]'s doc comment, which already relies on that
+/// factorisation to bound the answer's bit length. For base 10 that is
+/// `10 = 2·5`, so `TEN.pow(n)` computes `5^n << n`. Reusing [`bigint_pow5`]
+/// keeps it to one square-and-multiply loop in this file rather than a second
+/// copy of one.
 fn bigint_mul_pow10(bi: &crate::bigint::BigInt, n: i32) -> crate::bigint::BigInt {
     if n <= 0 {
         return bi.clone();
     }
-    let mut p = String::with_capacity(1 + n as usize);
-    p.push('1');
-    for _ in 0..n {
-        p.push('0');
-    }
-    bi.mul(&crate::bigint::BigInt::from_decimal(&p))
+    // `BigInteger.TEN.pow(n)` == `5^n << n`. No `n`-byte String, no O(n²)
+    // decimal parse; the remaining cost is the multiplication itself, which is
+    // the cost of the answer and not of the argument's spelling.
+    bi.mul(&bigint_pow5(n as u32).shl(n as u32))
 }
 
 /// Low `bits` of a `BigInt`'s two's-complement representation — the
@@ -36418,8 +37963,22 @@ fn native_level_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     Ok(None)
 }
 
-const LOGGER_FIELD_NAME: usize = 0;
-const LOGGER_FIELD_LEVEL: usize = 1;
+// `java/util/logging/Logger` has exactly ONE slot map in this VM and it is
+// `crate::logmanager::LOGGER_FIELD_*` (name 2, parent 8, level 12), matching
+// the declaration at `class_manager.rs:14191`. A second, local
+// `LOGGER_FIELD_NAME = 0` / `LOGGER_FIELD_LEVEL = 1` used to live here and was
+// read by the four bodies below; it named `config: Logger$ConfigurationData`
+// and `manager: LogManager`, so a name `String` went into the config slot and
+// a `Level` into the manager slot. Nothing ever asserted, because `Logger` IS
+// declared and `try_alloc_concurrent_synthetic`'s `num_fields.max(real)`
+// clamped every 3-slot ask up to 13 — the clamp protects the heap, not the
+// field's identity. Do not reintroduce a local Logger slot constant here —
+// every Logger slot access in this file names the `logmanager` constants.
+//
+// `LEVEL_FIELD_*` below is a DIFFERENT class and stays: those are
+// `java/util/logging/Level`'s own `name`/`value`, they match the real class,
+// and `native_level_init` is registered by
+// `register_essential_natives_with_shims` — live in every mode.
 const LEVEL_FIELD_NAME: usize = 0;
 const LEVEL_FIELD_VALUE: usize = 1;
 
@@ -36447,25 +38006,37 @@ fn native_level_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
+/// `Logger.getLogger(String)`, delegating to the one JUL Logger producer.
+///
+/// Registered only from `logging_shims::register_logging_natives`, which is
+/// shadowed one call later by `register_slf4j_natives` (`lib.rs:24012`) and
+/// again by `logmanager::register_logmanager_natives` (`:24357`) — so this is
+/// unreachable through the registry today. It is corrected rather than left
+/// alone because "currently shadowed" is a registration-ORDER property, and the
+/// map it used to mint (a 3-slot Logger with the name in `config` and an INFO
+/// `Level` in `manager`) is one reorder away from being handed to readers that
+/// index slots 2/8/12. See NOM F3-2 for the paired removal.
+///
+/// `get_or_create_logger` is also the only producer that caches by name,
+/// links `parent`, and pins across the allocating steps.
 fn native_logger_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
-    ctx.set_field(
-        logger,
-        LOGGER_FIELD_NAME,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
-    let info = alloc_level(ctx, "INFO", 800);
-    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info?)));
-    Ok(Some(Value::Object(Some(logger))))
+    let name = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    Ok(Some(Value::Object(Some(
+        crate::logmanager::get_or_create_logger(ctx, &name)?,
+    ))))
 }
 
+/// `Logger.getGlobal()` — `java.util.logging.Logger.GLOBAL_LOGGER_NAME` is
+/// `"global"`, and the JDK returns the SAME object as
+/// `Logger.getLogger("global")`. Going through `get_or_create_logger` is what
+/// makes that identity hold here; minting a fresh Logger per call did not.
 fn native_logger_get_global(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let name = ctx.create_string("global");
-    let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
-    ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name)));
-    let info = alloc_level(ctx, "INFO", 800);
-    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info?)));
-    Ok(Some(Value::Object(Some(logger))))
+    Ok(Some(Value::Object(Some(
+        crate::logmanager::get_or_create_logger(ctx, "global")?,
+    ))))
 }
 
 /// `Logger.getName()`, third of the three registrations for this triple.
@@ -36487,12 +38058,26 @@ fn native_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ))
 }
 
+/// `Logger.getLevel()` — reads the ONE level slot,
+/// `logmanager::LOGGER_FIELD_LEVEL` (12), which is where `setLevel`
+/// (`lib.rs:17613`), `allocate_logger` and `register_slf4j_natives` all write.
+/// It used to read slot 1, i.e. `manager: LogManager`.
+///
+/// The width guard mirrors `logmanager::native_jul_logger_is_loggable`:
+/// `Heap::get_field` asserts `index < num_slots`, and a Logger narrower than
+/// the declaration can still arrive from a bytecode `new` in a mode that sizes
+/// from a stub. Answering `null` there is the JDK's own "no explicit level".
 fn native_logger_get_level(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, LOGGER_FIELD_LEVEL)))
+    if ctx.object_num_fields(this) <= crate::logmanager::LOGGER_FIELD_LEVEL {
+        return Ok(Some(Value::Object(None)));
+    }
+    Ok(Some(
+        ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL),
+    ))
 }
 
 fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -36501,8 +38086,20 @@ fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 /// Log a message only if the logger's current level allows `method_level`.
-/// Compares current level (read from LOGGER_FIELD_LEVEL field 1) against the
-/// method's inherent level (SEVERE=1000 .. FINEST=300).
+///
+/// Compares the logger's configured level — `logmanager::LOGGER_FIELD_LEVEL`
+/// (12), the slot every writer in the tree uses — against the method's
+/// inherent level (SEVERE=1000 .. FINEST=300). The doc line here used to say
+/// "field 1", which was `manager: LogManager`: this read a `LogManager`
+/// reference and asked it for `LEVEL_FIELD_VALUE`, so the threshold silently
+/// stayed at the INFO default and `setLevel(SEVERE)` suppressed nothing.
+///
+/// The slot holds EITHER a `Level` reference or a raw `Int` (an older
+/// `setLevel` stored the decoded int); both shapes are decoded, exactly as
+/// `logmanager::native_jul_logger_is_loggable` does. `LEVEL_FIELD_VALUE` = 1 is
+/// right for both `Level` layouts — the real class is `name` 0, `value` 1
+/// (measured with `javap -p java.util.logging.Level` on JDK 25), and the VM's
+/// 2-slot synthetic `Level` is a prefix of it.
 fn native_logger_log_if(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -36512,9 +38109,19 @@ fn native_logger_log_if(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let current = match ctx.get_field(this, LOGGER_FIELD_LEVEL) {
-        Value::Object(Some(l)) => ctx.get_field(l, LEVEL_FIELD_VALUE).as_int().unwrap_or(800),
-        _ => 800, // default INFO
+    // `Heap::get_field` asserts `index < num_slots`; a Logger narrower than the
+    // declaration keeps the JDK default instead of aborting the VM.
+    let current = if ctx.object_num_fields(this) <= crate::logmanager::LOGGER_FIELD_LEVEL {
+        800
+    } else {
+        match ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL) {
+            Value::Int(v) => v,
+            Value::Object(Some(l)) if ctx.object_num_fields(l) > LEVEL_FIELD_VALUE => ctx
+                .get_field(l, LEVEL_FIELD_VALUE)
+                .as_int()
+                .unwrap_or(800),
+            _ => 800, // no explicit level — the JDK default is INFO
+        }
     };
     if method_level < current {
         return Ok(None); // filter out — level is below logger threshold
@@ -38883,8 +40490,52 @@ fn register_enterprise_natives(registry: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
-    // Register constructors for commonly-needed exception types
-    // All use the standard Throwable 2-field layout (field 0 = message, field 1 = cause)
+    // Bridges for commonly-needed exception types: `getMessage()` and
+    // `toString()`. All use the standard Throwable 2-field layout
+    // (field 0 = message, field 1 = cause).
+    //
+    // THIS FUNCTION NO LONGER REGISTERS CONSTRUCTORS FROM THIS LIST.
+    //
+    // E34-1 §7 site 4, collapsed by E43 (2026-08-13). Until now the loop below
+    // also registered the same four `<init>` descriptors — `()V`, `(String)V`,
+    // `(String,Throwable)V`, `(Throwable)V` — on every name here: 212
+    // registrations. It was a copy-paste twin of
+    // `lang_misc::register_throwable_subclass_natives`, carrying that
+    // function's two long "deliberately NOT in this list" comments verbatim
+    // (they are still below, because they still explain the getMessage
+    // bridges, which is what they were always really about) over a list that
+    // had since drifted, and bound to a second set of ctor bodies.
+    //
+    // It is called from `register_synthetic_overrides` AND from
+    // `reflect_annotations.rs`, i.e. in BOTH modes, and in both it runs AFTER
+    // `register_throwable_subclass_natives`. There is no unregister API, so
+    // `register` is last-write-wins: these 212 rows were the ones actually
+    // answering for ~52 classes, and the JDK-derived table was being buried.
+    //
+    // MEASURED on JDK 25.0.3+9-LTS (`scratchpad/e43/Removals43.java`, which
+    // reflects over every (class, descriptor) this loop registered that the
+    // table does not carry): 89 such pairs across sites 3 and 4, of which
+    //   * 85 are constructors the real class DOES NOT DECLARE AT ALL, so no
+    //     `javac` on any real JDK could ever have compiled a call to them —
+    //     e.g. `java/io/UncheckedIOException` was advertising all four while
+    //     declaring none of them, and `java/text/ParseException` likewise;
+    //   * 4 are real, and all four are `java/lang/VirtualMachineError`, the one
+    //     name here that is outside the table's measured 62. They are restated
+    //     explicitly after the loop rather than deleted.
+    //
+    // The two ctor bodies were diffed, as E34-1 N3 asked. `lang_misc::
+    // native_exc_init_noargs` and `native_exception_init_empty` are the same
+    // three statements. `lang_misc::native_exc_init_message` and
+    // `native_exception_init_msg` are the same three statements plus, in the
+    // latter, the opt-in `CRATONVM_DBG_NPE_TRACE` surefire forensic — which
+    // fires only for `NullPointerException("Name is null")`. That single
+    // difference is preserved by one named re-registration after the loop, so
+    // collapsing onto the table does not silently retire a diagnostic.
+    //
+    // ADDING A CLASS HERE: it must also be a row of the table in
+    // `lang_misc.rs` (or be added to the allow-list in
+    // `the_blanket_four_ctor_loops_stay_collapsed_onto_the_table`, which is a
+    // source witness at the bottom of this file that enforces exactly that).
     let exceptions = [
         "java/lang/Error",
         "java/lang/AssertionError",
@@ -38967,25 +40618,10 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/util/concurrent/BrokenBarrierException",
     ];
     for exc in &exceptions {
-        registry.register(exc, "<init>", "()V", native_exception_init_empty);
-        registry.register(
-            exc,
-            "<init>",
-            "(Ljava/lang/String;)V",
-            native_exception_init_msg,
-        );
-        registry.register(
-            exc,
-            "<init>",
-            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-            crate::lang_misc::native_exc_init_message_cause,
-        );
-        registry.register(
-            exc,
-            "<init>",
-            "(Ljava/lang/Throwable;)V",
-            crate::lang_misc::native_exc_init_cause,
-        );
+        // No `<init>` here — see this function's header. The constructors for
+        // every name in this list come from the JDK-derived per-class table in
+        // `lang_misc::register_throwable_subclass_natives`, which runs earlier
+        // on both boot paths.
         registry.register(
             exc,
             "getMessage",
@@ -38999,6 +40635,69 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
             native_exception_to_string,
         );
     }
+
+    // `java/lang/VirtualMachineError` is the ONE name above that the table does
+    // not carry, so it is the one whose constructors this function must still
+    // register — deleting them would have left it with none. It keeps its
+    // HISTORICAL bodies, byte-for-byte the pair the deleted loop gave it, so
+    // this is a no-op for it and not a quiet re-binding.
+    //
+    // It also happens to be a class for which the blanket four were right.
+    // MEASURED, `javap -p java.lang.VirtualMachineError` on JDK 25.0.3+9-LTS:
+    //     public VirtualMachineError();
+    //     public VirtualMachineError(String);
+    //     public VirtualMachineError(String, Throwable);
+    //     public VirtualMachineError(Throwable);
+    // All four declared, all four public — the same rule the table is built
+    // from admits all four. It is abstract, so no `new` reaches them directly;
+    // the reachable path is a subclass's `super(...)`, which is an
+    // `invokespecial` on this exact triple.
+    //
+    // This is the same treatment application throwables get. A `…/DbException`
+    // is not in the table and never was in this list either; its `<init>` is
+    // answered by `vm_exec.rs`'s final native-registry fallback walking up the
+    // dispatch chain to `java/lang/RuntimeException`, whose four descriptors
+    // the table still carries, and its stub still declares the historical four
+    // via `class_manager.rs::synthetic_stub_ctor_methods`' `is_throwable_like`
+    // arm. Nothing in this change narrows either of those.
+    let vm_error = "java/lang/VirtualMachineError";
+    registry.register(vm_error, "<init>", "()V", native_exception_init_empty);
+    registry.register(
+        vm_error,
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_exception_init_msg,
+    );
+    registry.register(
+        vm_error,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        crate::lang_misc::native_exc_init_message_cause,
+    );
+    registry.register(
+        vm_error,
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+        crate::lang_misc::native_exc_init_cause,
+    );
+
+    // The one behavioural difference between the two ctor-body families, kept
+    // alive by name rather than by a 212-row loop.
+    //
+    // `native_exception_init_msg` is `lang_misc::native_exc_init_message` plus
+    // the `CRATONVM_DBG_NPE_TRACE` surefire forensic, and that forensic fires
+    // for exactly one class and message: `NullPointerException("Name is null")`
+    // (`java.lang.Enum.valueOf(null)`'s text). `(Ljava/lang/String;)V` is a
+    // declared public constructor of `java/lang/NullPointerException` and is a
+    // row of the table, so this restates a triple the table already owns with
+    // a strict superset of its body — it does not widen the registered
+    // surface by one descriptor.
+    registry.register(
+        "java/lang/NullPointerException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_exception_init_msg,
+    );
 }
 
 fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -41020,6 +42719,56 @@ fn native_array_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // For char[] we must return Character, for byte[] Byte, etc. — otherwise
     // the JDK code that unboxes via Character.charValue() / Byte.byteValue()
     // would receive an Integer and fail type-checks.
+    //
+    // DO NOT DEDUPLICATE THE EIGHT ARMS BELOW ONTO THE CACHED BOXING HELPER.
+    // `lang_class::box_value_canonical` exists and routes `I J Z B S C` into
+    // the six `X.valueOf` caches; three reflective call sites take it
+    // (`Field.get`, `Method.invoke`'s return, `SerializedLambda`'s captured
+    // args) because HotSpot answers the CANONICAL box on those paths.
+    // `Array.get` is the one reflective path that does NOT, and allocating
+    // fresh here is the contract, not an oversight.
+    //
+    // The JDK's reason: since JDK 18 `Field.get`/`Method.invoke` run on
+    // `MethodHandle` accessors (`MethodHandleAccessorFactory`) whose boxing
+    // step is a direct handle to `X.valueOf`, so they inherit `IntegerCache`
+    // and friends for free. `java.lang.reflect.Array.get` is a VM native,
+    // `Reflection::array_get`, which boxes with
+    // `java_lang_boxing_object::create` — a function that allocates and has
+    // never consulted a cache. That is an implementation detail of the JDK
+    // and it is nonetheless OBSERVABLE, so it is behaviour we must match.
+    //
+    // MEASURED on this host, `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)`
+    // (Microsoft build), `scratchpad/f20/ArrGet.java` — lane F20 re-took these
+    // rather than inherit them from lane F11's 70-row table
+    // (docs/known-issues/jdk-only/F11-1-reflective-boxing-is-canonical-everywhere-except-array-get.md):
+    //
+    //   Array.get int[]      == Integer.valueOf(7)   : false
+    //   Array.get char[]     == Character.valueOf(a) : false
+    //   Array.get byte[]     == Byte.valueOf(3)      : false
+    //   Array.get short[]    == Short.valueOf(9)     : false
+    //   Array.get long[]     == Long.valueOf(5)      : false
+    //   Array.get boolean[]  == Boolean.TRUE         : false
+    //   Array.get boolean[]  == Boolean.FALSE        : false
+    //   Array.get int[] twice self-identity          : false
+    //   Array.get int[] equals Integer.valueOf(7)    : true      <- see below
+    //   Integer.valueOf(Array.getInt(ia,0)) == Integer.valueOf(7): true
+    //   Field.get int        == Integer.valueOf(7)   : true      <- the contrast
+    //   Method.invoke ()I    == Integer.valueOf(7)   : true      <- the contrast
+    //
+    // Two rows carry the whole warning. `Array.get` is not even SELF-identical
+    // across two calls on the same element, so "returns the canonical box" is
+    // not merely unspecified here, it is false. And every fresh row is still
+    // `.equals`-equal, so no equality-shaped assertion — which is what almost
+    // every reflective test in this tree writes — can see a dedup that breaks
+    // this. The `Boolean` arm is the sharpest edge: `Boolean.TRUE` identity is
+    // exactly what `native_boolean_value_of`'s own comment documents Xerces'
+    // `XML11Configuration.configurePipeline()` relying on, so a "helpful"
+    // rewrite of that arm onto the cache would be right for every OTHER boxing
+    // caller in this tree and wrong here.
+    //
+    // The sibling `Array.getInt`/`getChar`/… return bare primitives and never
+    // box at all; the caller's own `valueOf` is what makes the control row
+    // above canonical. Do not conflate the two families.
     match elem {
         ArrayElementType::Boolean => {
             let v = match val {
@@ -42518,6 +44267,84 @@ fn register_formatter_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// The `Locale` a `java.util.Formatter` constructed WITHOUT one carries — for
+/// the four natives that shadow those constructors.
+///
+/// # Why the slot may not be left null
+///
+/// `Formatter()` is `this(Locale.getDefault(Locale.Category.FORMAT), new
+/// StringBuilder())` and `Formatter(Appendable)` is
+/// `this(Locale.getDefault(Locale.Category.FORMAT), a)`. Both natives wrote
+/// `null` there instead, and `format` reads that slot and hands it to
+/// `lang_string::native_string_format_locale`, which sees an EXPLICIT null —
+/// a request `java.util.Formatter` answers differently from "no locale given"
+/// in three separate places (ASCII separators, `Locale.US` date names,
+/// `Locale.US` zone names). Two different requests collapsed onto one value, so
+/// no amount of correctness at the reading end can separate them.
+///
+/// Measured on HotSpot 25 with `-Duser.language=tr -Duser.country=TR`, which is
+/// what makes the two visible at all:
+///
+/// | expression | HotSpot 25 |
+/// |---|---|
+/// | `new Formatter(sb).format("%tb", d)` | `Kas` |
+/// | `new Formatter(sb, (Locale) null).format("%tb", d)` | `Nov` |
+/// | `new Formatter().format("%,d", 1234567)` | `1.234.567` |
+/// | `String.format((Locale) null, "%,d", 1234567)` | `1,234,567` |
+/// | `new Formatter(sb).locale()` | `tr_TR` |
+/// | `new Formatter(sb, (Locale) null).locale()` | `null` |
+///
+/// The last pair is the proof that the JDK stores a real `Locale` in the field
+/// rather than deciding late: `locale()` is a plain field read.
+///
+/// # Three rungs, each degrading to the one below
+///
+/// 1. `Locale.getDefault(Locale.Category.FORMAT)` — the category the JDK's own
+///    constructors ask for, and the one that can differ from the base default
+///    when `user.language.format` is set or `setDefault(FORMAT, l)` has run.
+///    The `Locale$Category.FORMAT` constant is READ as a static field and the
+///    overload is called only if that read produced an object: real
+///    `Locale.getDefault(Category)` opens with `Objects.requireNonNull`, so
+///    handing it a null would trade a wrong locale for an NPE.
+/// 2. `Locale.getDefault()` — the base default.
+/// 3. `null`, i.e. exactly the previous behaviour. A VM with no reachable
+///    `java.util.Locale` (synthetic-JDK configurations that do not register
+///    one) keeps the answers it had rather than failing construction.
+///
+/// Nothing here FABRICATES a `Locale`. `locale_bootstrap` already overrides
+/// both `getDefault` overloads with a cached, stable-identity object resolved
+/// from `user.language`/`user.country`, so rung 1 runs a native rather than the
+/// JDK adapter chain — which is also why it cannot re-enter `String.format`.
+fn formatter_default_locale(ctx: &mut dyn NativeContext) -> Value {
+    let mut category: Option<ObjectRef> = None;
+    if let Some(cid) = ctx.class_id_by_name("java/util/Locale$Category") {
+        if let Some(idx) = ctx.static_field_index_by_name(cid, "FORMAT") {
+            if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
+                category = Some(o);
+            }
+        }
+    }
+    if let Some(cat) = category {
+        if let Ok(Some(v @ Value::Object(Some(_)))) = ctx.invoke(
+            "java/util/Locale",
+            "getDefault",
+            "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
+            &[Value::Object(Some(cat))],
+        ) {
+            return v;
+        }
+    }
+    match ctx.invoke(
+        "java/util/Locale",
+        "getDefault",
+        "()Ljava/util/Locale;",
+        &[],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(None),
+    }
+}
+
 fn native_formatter_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -42526,7 +44353,16 @@ fn native_formatter_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Store content as a plain string (field 0)
     let empty = ctx.create_string("");
     ctx.set_field(this, 0, Value::Object(Some(empty)));
-    ctx.set_field(this, 1, Value::Object(None));
+    // Slot 1 is the DEFAULT format locale, not null — see
+    // [`formatter_default_locale`]. Resolving it runs Java code, so the
+    // receiver is pinned across the call: `format` two functions down pins for
+    // exactly this reason. Slot 0 is written FIRST so the string just created
+    // is reachable from `this` (and therefore rooted) while that runs.
+    let pin = ctx.pin_native_root(this);
+    let locale = formatter_default_locale(ctx);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(this, 1, locale);
     Ok(None)
 }
 
@@ -42540,7 +44376,12 @@ fn native_formatter_init_appendable(
     };
     let appendable = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(this, 0, appendable);
-    ctx.set_field(this, 1, Value::Object(None));
+    // See the `()V` constructor above: slot 1 is the DEFAULT format locale.
+    let pin = ctx.pin_native_root(this);
+    let locale = formatter_default_locale(ctx);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(this, 1, locale);
     Ok(None)
 }
 
@@ -42616,6 +44457,44 @@ fn native_formatter_format(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `Formatter.toString()`'s body, which is `a.toString()` on the sink in
+/// slot 0 — for the two registrars that each carried a copy of it.
+///
+/// # `read_string` alone is a defaulting reader
+///
+/// Both copies were `ctx.read_string(sink).unwrap_or_default()`.
+/// `NativeContext::read_string` returns `None` for any object whose class is
+/// known and is not `java/lang/String` (vm_exec.rs, a deliberate guard against
+/// the structural reader decoding a `StringBuilder`'s full char[] capacity), so
+/// `unwrap_or_default()` turned every non-`String` sink into the EMPTY STRING —
+/// a plausible answer, silently wrong, and reached by the single most ordinary
+/// use of the class:
+///
+/// | expression | HotSpot 25 | CratonVM before |
+/// |---|---|---|
+/// | `new Formatter(sb).format("%d",42).toString()` | `42` | `` (empty) |
+/// | `new Formatter().format("%d",1).toString()` | `1` | `1` |
+///
+/// The second row is why it survived: the `()V` native writes a real `String`
+/// into slot 0, so only the `Appendable`-taking constructors — the ones whose
+/// sink is the caller's — could show it. `format` itself was never affected;
+/// its own `read_string` miss falls through to `invoke_virtual(sink, "append",
+/// …)`, which works, so the text really is in the caller's `StringBuilder` and
+/// only the `Formatter`'s own view of it was empty.
+///
+/// The fallback is `toString()` on the sink, which is what the JDK does and
+/// what every `Appendable` implements. A sink that answers nothing at all still
+/// degrades to the empty string, which is the previous behaviour.
+fn formatter_sink_text(ctx: &mut dyn NativeContext, sink: ObjectRef) -> Value {
+    if let Some(s) = ctx.read_string(sink) {
+        return Value::Object(Some(ctx.create_string(&s)));
+    }
+    match ctx.invoke_virtual(sink, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(Some(ctx.create_string(""))),
+    }
+}
+
 fn native_formatter_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -42623,10 +44502,7 @@ fn native_formatter_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let sb = ctx.get_field(this, 0);
     match sb {
-        Value::Object(Some(o)) => {
-            let s = ctx.read_string(o).unwrap_or_default();
-            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-        }
+        Value::Object(Some(o)) => Ok(Some(formatter_sink_text(ctx, o))),
         _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
     }
 }
@@ -42863,6 +44739,50 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
         ctx.set_field(g, 1, integrator);
         ctx.set_field(g, 2, Value::Object(None));
         ctx.set_field(g, 3, finisher);
+        ctx.set_field(g, 4, Value::Int(GATHERER_KIND_CUSTOM));
+        Ok(Some(Value::Object(Some(g))))
+    });
+
+    // The TWO-argument `ofSequential(Supplier, Integrator)` — added because its
+    // absence here was an out-of-bounds read, not a missing feature.
+    //
+    // `java/util/stream/Gatherer` has NO `synthetic_stub_fields` arm, so
+    // `class_num_total_fields` answers 0 and `try_alloc_concurrent_synthetic`'s
+    // `num_fields.max(real)` leaves the caller's request as the LITERAL object
+    // width. Two registrars model this class at two widths with two different
+    // slot maps:
+    //
+    //   this file            5 slots: initializer 0, integrator 1, combiner 2,
+    //                        finisher 3, KIND 4
+    //   phases_late/streams.rs  3 slots: initializer 0, integrator 1, finisher 2
+    //
+    // `register_phase_d_natives` (this one) runs AFTER `register_phase67_natives`
+    // inside `register_synthetic_overrides`, and `register()` is
+    // last-registration-wins, so this file's accessors and `Stream.gather` win
+    // for every triple both files spell. Every 3-slot factory in `streams.rs`
+    // was therefore shadowed by a 5-slot one here — EXCEPT this overload, which
+    // only `streams.rs` registered (`streams.rs:4541`). Its 3-slot product then
+    // reached `pd_stream_gather`, whose first act is `ctx.get_field(gatherer, 4)`:
+    // `Heap::get_field` asserts `index < num_slots`, so `stream.gather(g)` on a
+    // gatherer from this overload aborts the VM with "field index 4 out of
+    // bounds (num_slots=3)". `finisher()` (slot 3) is the same panic one slot
+    // lower, and `combiner()` (slot 2) would have returned the FINISHER.
+    //
+    // Registering it here shadows the 3-slot factory with the same 5-slot shape
+    // the sibling overloads already use, which is the whole fix; the alternative
+    // (widening `streams.rs` to 5) would leave two copies of one slot map.
+    // Verified against the oracle: `javap -p java.util.stream.Gatherer` on
+    // JDK 25.0.3 declares all four of `ofSequential`'s/`of`'s arities, of which
+    // this VM serves three — see
+    // docs/known-issues/jdk-only/E35-R11-SYNTHETIC-WIDTH-SWEEP-20260813.md §3.1.
+    r.register(gatherer, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;", |ctx, args| {
+        let initializer = args.first().copied().unwrap_or(Value::Object(None));
+        let integrator = args.get(1).copied().unwrap_or(Value::Object(None));
+        let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
+        ctx.set_field(g, 0, initializer);
+        ctx.set_field(g, 1, integrator);
+        ctx.set_field(g, 2, Value::Object(None));
+        ctx.set_field(g, 3, Value::Object(None));
         ctx.set_field(g, 4, Value::Int(GATHERER_KIND_CUSTOM));
         Ok(Some(Value::Object(Some(g))))
     });
@@ -43638,6 +45558,511 @@ mod base64_encoder_tests {
         };
 
         assert_eq!(ctx.read_string(encoded).as_deref(), Some("__8"));
+    }
+
+    /// A null ARGUMENT to any `Base64` encode/decode overload is a
+    /// `NullPointerException` on HotSpot 25 — measured for all 13
+    /// encoder/decoder combinations, e.g.
+    ///
+    /// ```text
+    /// Decoder.decode((String)null) -> java.lang.NullPointerException
+    ///     / Cannot invoke "String.getBytes(java.nio.charset.Charset)" because "src" is null
+    /// ```
+    ///
+    /// `Base64$Decoder.decode(Ljava/lang/String;)[B` was the LAST of the four
+    /// to be fixed: it defaulted a null to `String::new()` and returned an
+    /// EMPTY `byte[]`, which is why `RJdkIntrinsics2 --only=b64` reported
+    /// "decode((String) null) must throw NullPointerException, got none" while
+    /// the other three arms were already patched. Returning `Ok(None)` is
+    /// equally wrong — every descriptor here returns a value, so `Ok(None)` is
+    /// the VOID shape.
+    ///
+    /// Mutation check: revert any one arm to `Ok(None)` or to a defaulted
+    /// empty input and exactly that row fails.
+    #[test]
+    fn null_argument_throws_npe_on_every_value_returning_overload() {
+        fn assert_npe(label: &str, result: MethodCallResult) {
+            match result {
+                Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NullPointerException { .. },
+                ))) => {}
+                Ok(Some(v)) => {
+                    panic!("{label}: returned {v:?}, HotSpot throws NullPointerException")
+                }
+                Ok(None) => panic!(
+                    "{label}: returned the VOID shape `Ok(None)` for a descriptor that returns a \
+                     value — the interpreter gets a value of the wrong kind"
+                ),
+                Err(other) => panic!("{label}: threw {other:?}, expected NullPointerException"),
+            }
+        }
+
+        // Every (factory, method) pair whose descriptor takes a reference
+        // argument, across all three variants.
+        let encoder_factories: [(&str, NativeCallback); 3] = [
+            ("basic", native_b64_get_encoder),
+            ("url", native_b64_get_url_encoder),
+            ("mime", native_b64_get_mime_encoder),
+        ];
+        let decoder_factories: [(&str, NativeCallback); 3] = [
+            ("basic", native_b64_get_decoder),
+            ("url", native_b64_get_url_decoder),
+            ("mime", native_b64_get_mime_decoder),
+        ];
+
+        for (variant, factory) in encoder_factories {
+            let mut ctx = MockNativeContext::new();
+            let enc = match factory(&mut ctx, &[]).expect("factory ok").expect("encoder") {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected encoder, got {other:?}"),
+            };
+            let null_arg = [Value::Object(Some(enc)), Value::Object(None)];
+            assert_npe(
+                &format!("{variant} Encoder.encode((byte[])null)"),
+                native_b64_encode(&mut ctx, &null_arg),
+            );
+            assert_npe(
+                &format!("{variant} Encoder.encodeToString(null)"),
+                native_b64_encode_to_string(&mut ctx, &null_arg),
+            );
+            // …and through withoutPadding(), which returns a DIFFERENT object.
+            let unpadded = match native_b64_without_padding(&mut ctx, &[Value::Object(Some(enc))])
+                .expect("withoutPadding ok")
+                .expect("encoder")
+            {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected encoder, got {other:?}"),
+            };
+            assert_npe(
+                &format!("{variant} Encoder.withoutPadding().encodeToString(null)"),
+                native_b64_encode_to_string(
+                    &mut ctx,
+                    &[Value::Object(Some(unpadded)), Value::Object(None)],
+                ),
+            );
+        }
+
+        for (variant, factory) in decoder_factories {
+            let mut ctx = MockNativeContext::new();
+            let dec = match factory(&mut ctx, &[]).expect("factory ok").expect("decoder") {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected decoder, got {other:?}"),
+            };
+            let null_arg = [Value::Object(Some(dec)), Value::Object(None)];
+            assert_npe(
+                &format!("{variant} Decoder.decode((byte[])null)"),
+                native_b64_decode_bytes(&mut ctx, &null_arg),
+            );
+            // THE ROW THAT WAS FAILING.
+            assert_npe(
+                &format!("{variant} Decoder.decode((String)null)"),
+                native_b64_decode_string(&mut ctx, &null_arg),
+            );
+        }
+    }
+
+    /// The null-argument fix must not swallow the legitimate EMPTY input:
+    /// HotSpot returns a zero-length array for `decode("")` and
+    /// `decode(new byte[0])`, and that is exactly the answer the broken
+    /// `decode((String) null)` used to give — so this is the negative control
+    /// that keeps the fix from being "throw on anything falsy".
+    #[test]
+    fn empty_input_still_decodes_to_an_empty_array() {
+        let mut ctx = MockNativeContext::new();
+        let dec = match native_b64_get_decoder(&mut ctx, &[])
+            .expect("getDecoder ok")
+            .expect("decoder")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected decoder, got {other:?}"),
+        };
+        let empty_str = ctx.create_string("");
+        let decoded = match native_b64_decode_string(
+            &mut ctx,
+            &[Value::Object(Some(dec)), Value::Object(Some(empty_str))],
+        )
+        .expect("decode(\"\") must NOT throw")
+        .expect("decode returns an array")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected byte[], got {other:?}"),
+        };
+        assert_eq!(ctx.array_length(decoded), 0, "decode(\"\") is empty, not a throw");
+    }
+
+    // ---------------------------------------------------------------------
+    // Below: BEHAVIOURAL cover for the fabricated receiver. Every assertion
+    // reads a value the native WROTE, or an answer the native COMPUTED from a
+    // receiver's fields — never "the triple is registered". A sibling file's 64
+    // registration-only tests all stayed green through a real layout defect.
+    // ---------------------------------------------------------------------
+
+    fn obj(result: MethodCallResult, what: &str) -> ObjectRef {
+        match result.unwrap_or_else(|e| panic!("{what} failed: {e:?}")) {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("{what}: expected an object, got {other:?}"),
+        }
+    }
+
+    fn encode_to_string(ctx: &mut MockNativeContext, enc: ObjectRef, src: &[u8]) -> String {
+        let arr = ctx.new_array(ArrayElementType::Byte, src.len());
+        for (i, &b) in src.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(b as i32));
+        }
+        let s = obj(
+            native_b64_encode_to_string(ctx, &[Value::Object(Some(enc)), Value::Object(Some(arr))]),
+            "encodeToString",
+        );
+        ctx.read_string(s).expect("encodeToString returns a String")
+    }
+
+    /// Give an encoder the field values real `Base64.getMimeEncoder(20, {'\n'})`
+    /// bytecode would have built, since that factory is deliberately
+    /// unregistered and this file therefore never allocates such an object
+    /// itself.
+    fn retune(ctx: &mut MockNativeContext, enc: ObjectRef, linemax: i32, sep: &[u8]) {
+        let nl = ctx.new_array(ArrayElementType::Byte, sep.len());
+        for (i, &b) in sep.iter().enumerate() {
+            ctx.set_array_element(nl, i, Value::Int(b as i32));
+        }
+        ctx.set_field(enc, B64_ENCODER_FIELD_LINEMAX, Value::Int(linemax));
+        ctx.set_field(enc, B64_ENCODER_FIELD_NEWLINE, Value::Object(Some(nl)));
+    }
+
+    /// (1) The fabricated `Encoder` must carry all FOUR JDK fields.
+    ///
+    /// `newline` was left unwritten, and real `Encoder.encodedOutLength` reads
+    /// `newline.length` for EVERY encode call whose `linemax > 0` — not only
+    /// ones long enough to wrap. Measured on HotSpot by building the same shape
+    /// through the private constructor (`scratchpad/e14/B64Fab.java`):
+    ///
+    /// ```text
+    /// Encoder(false, null, 76, true).encodeToString(30 bytes) ->
+    ///   NullPointerException / Cannot read the array length because "this.newline" is null
+    /// Encoder(false, {13,10}, 76, true).encodeToString(60 bytes) -> 82  (== getMimeEncoder())
+    /// ```
+    ///
+    /// The mock's unwritten slots read back as `Value::Int(0)`, so the
+    /// `Value::Object(None)` assertions below fail if the explicit null write is
+    /// dropped — they measure the WRITE, not the default.
+    #[test]
+    fn fabricated_encoders_carry_the_jdk_newline_and_linemax_fields() {
+        let mut ctx = MockNativeContext::new();
+
+        let mime = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        assert_eq!(
+            ctx.get_field(mime, B64_ENCODER_FIELD_LINEMAX),
+            Value::Int(76)
+        );
+        let nl = match ctx.get_field(mime, B64_ENCODER_FIELD_NEWLINE) {
+            Value::Object(Some(a)) => a,
+            other => panic!(
+                "getMimeEncoder()'s `newline` is {other:?}; real encode0 and encodedOutLength \
+                 both dereference it, and HotSpot NPEs on a null one"
+            ),
+        };
+        assert_eq!(ctx.array_length(nl), 2, "CRLF is two bytes");
+        assert_eq!(ctx.get_array_element(nl, 0), Value::Int(13));
+        assert_eq!(ctx.get_array_element(nl, 1), Value::Int(10));
+
+        // (2) -1, NOT 0, for the non-wrapping encoders. `> 0` reads them alike;
+        // `Base64$EncOutputStream`'s `linepos == linemax` does not, and with 0 it
+        // fires on the very first byte: `getEncoder().wrap(os)` measured as
+        // NullPointerException / Cannot read the array length because "b" is null.
+        for (name, factory) in [
+            ("getEncoder", native_b64_get_encoder as NativeCallback),
+            ("getUrlEncoder", native_b64_get_url_encoder),
+        ] {
+            let enc = obj(factory(&mut ctx, &[]), name);
+            assert_eq!(
+                ctx.get_field(enc, B64_ENCODER_FIELD_LINEMAX),
+                Value::Int(-1),
+                "{name}: real JDK writes -1; 0 makes the unregistered wrap(OutputStream) \
+                 throw NullPointerException on its first write"
+            );
+            assert_eq!(
+                ctx.get_field(enc, B64_ENCODER_FIELD_NEWLINE),
+                Value::Object(None),
+                "{name}: `newline` must be written null explicitly, not left as the \
+                 allocator found it"
+            );
+        }
+    }
+
+    /// (2) A custom `linemax`/`newline` must reach the encoder.
+    ///
+    /// `Base64.getMimeEncoder(int, byte[])` is unregistered, so it runs real
+    /// bytecode and hands back an `Encoder` with `linemax=20, newline=[10]`;
+    /// `encodeToString` on it is then intercepted here. HotSpot answers **83**
+    /// for the 60-byte fixture and this file used to answer **82** — one short,
+    /// because it re-derived 76/CRLF from a variant tag. 82 vs 83 is the
+    /// dangerous kind of wrong: both round-trip through a MIME decoder and both
+    /// pass a length-is-about-right assertion. So assert the TEXT.
+    #[test]
+    fn a_custom_linemax_and_separator_reach_the_encoder() {
+        let mut ctx = MockNativeContext::new();
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+
+        let canonical = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        assert_eq!(
+            encode_to_string(&mut ctx, canonical, &payload).len(),
+            82,
+            "getMimeEncoder(): 80 chars + one CRLF"
+        );
+
+        let custom = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        retune(&mut ctx, custom, 20, b"\n");
+        let encoded = encode_to_string(&mut ctx, custom, &payload);
+        assert_eq!(
+            encoded,
+            "AAECAwQFBgcICQoLDA0O\nDxAREhMUFRYXGBkaGxwd\nHh8gISIjJCUmJygpKiss\nLS4vMDEyMzQ1Njc4OTo7",
+            "four 20-char lines separated by LF"
+        );
+        assert_eq!(
+            encoded.len(),
+            83,
+            "HotSpot: 83. The hardcoded 76/CRLF gave 82"
+        );
+    }
+
+    /// (2, cont.) `withoutPadding()` COPIES the fields; it does not rebuild the
+    /// encoder from a variant. Rebuilding silently reset a custom 20/LF encoder
+    /// to 76/CRLF. Measured on HotSpot:
+    /// `getMimeEncoder(20,{'\n'}).withoutPadding()` keeps `linemax=20`,
+    /// `newline=[10]`, and encodes 61 bytes to 86 (88 with padding).
+    #[test]
+    fn without_padding_preserves_a_custom_linemax_and_shares_the_separator() {
+        let mut ctx = MockNativeContext::new();
+        let padded = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        retune(&mut ctx, padded, 20, b"\n");
+        let sep = ctx.get_field(padded, B64_ENCODER_FIELD_NEWLINE);
+
+        let unpadded = obj(
+            native_b64_without_padding(&mut ctx, &[Value::Object(Some(padded))]),
+            "withoutPadding",
+        );
+        assert_ne!(
+            unpadded, padded,
+            "a PADDED encoder returns a fresh object (HotSpot: \
+             enc.withoutPadding() == enc.withoutPadding() is false)"
+        );
+        assert_eq!(
+            ctx.get_field(unpadded, B64_ENCODER_FIELD_LINEMAX),
+            Value::Int(20),
+            "the copy must keep the custom linemax, not fall back to 76"
+        );
+        assert_eq!(
+            ctx.get_field(unpadded, B64_ENCODER_FIELD_NEWLINE),
+            sep,
+            "real JDK passes the SAME newline array to the copy"
+        );
+
+        let payload = vec![0u8; 61];
+        assert_eq!(encode_to_string(&mut ctx, padded, &payload).len(), 88);
+        assert_eq!(encode_to_string(&mut ctx, unpadded, &payload).len(), 86);
+
+        // …and an ALREADY-unpadded encoder returns `this` (HotSpot: identity true).
+        let again = obj(
+            native_b64_without_padding(&mut ctx, &[Value::Object(Some(unpadded))]),
+            "withoutPadding",
+        );
+        assert_eq!(again, unpadded);
+    }
+
+    /// (1, cont.) An encoder with `linemax > 0` and a null `newline` is the
+    /// exact shape this file used to fabricate, and HotSpot throws
+    /// `NullPointerException` for it on every encode call. Reproduce the throw
+    /// rather than quietly defaulting to CRLF — a default would give a plausible
+    /// answer for an object the JDK considers malformed.
+    #[test]
+    fn a_wrapping_encoder_with_a_null_newline_throws_npe() {
+        let mut ctx = MockNativeContext::new();
+        let enc = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        ctx.set_field(enc, B64_ENCODER_FIELD_NEWLINE, Value::Object(None));
+        let arr = ctx.new_array(ArrayElementType::Byte, 30);
+        match native_b64_encode_to_string(
+            &mut ctx,
+            &[Value::Object(Some(enc)), Value::Object(Some(arr))],
+        ) {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { .. },
+            ))) => {}
+            other => panic!(
+                "linemax=76 with a null newline must throw NullPointerException \
+                 (HotSpot: Cannot read the array length because \"this.newline\" is null), got {other:?}"
+            ),
+        }
+        // A NON-wrapping encoder with a null newline is perfectly legal — that
+        // is what `getEncoder()` is — so the throw must not generalise.
+        let basic = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        assert_eq!(encode_to_string(&mut ctx, basic, &[0u8; 30]).len(), 40);
+    }
+
+    /// (4) The `Decoder` synthetic must be the real JDK's TWO-boolean layout.
+    ///
+    /// It was one Int slot holding a variant tag, and slot 0 of the real layout
+    /// is `isURL` — so `getMimeDecoder()` wrote 2 into `isURL` and left `isMIME`
+    /// false. Measured on HotSpot by building `Decoder(isURL=true, isMIME=false)`
+    /// through the private constructor and feeding it what a MIME decoder must
+    /// accept (`scratchpad/e14/B64Unreg.java`): 76-column wrapped text became
+    /// `IllegalArgumentException / Illegal base64 character d`, `"-_-_"` decoded
+    /// to 3 bytes instead of 0, `"QQ\n=="` threw instead of decoding to 1 byte.
+    ///
+    /// Both halves are asserted: the field VALUES (what real bytecode reads) and
+    /// the decode ANSWERS (what this file's own natives compute from them).
+    #[test]
+    fn decoder_uses_the_two_boolean_jdk_layout() {
+        let mut ctx = MockNativeContext::new();
+        // (factory, isURL, isMIME) — read off HotSpot with reflection.
+        let rows: [(&str, NativeCallback, i32, i32); 3] = [
+            ("getDecoder", native_b64_get_decoder, 0, 0),
+            ("getUrlDecoder", native_b64_get_url_decoder, 1, 0),
+            ("getMimeDecoder", native_b64_get_mime_decoder, 0, 1),
+        ];
+        for (name, factory, is_url, is_mime) in rows {
+            let dec = obj(factory(&mut ctx, &[]), name);
+            assert_eq!(
+                ctx.get_field(dec, B64_DECODER_FIELD_IS_URL),
+                Value::Int(is_url),
+                "{name}: field 0 is `isURL`, and real bytecode reads it as a boolean"
+            );
+            assert_eq!(
+                ctx.get_field(dec, B64_DECODER_FIELD_IS_MIME),
+                Value::Int(is_mime),
+                "{name}: field 1 is `isMIME`"
+            );
+        }
+
+        // The three variants must still answer differently — this is what the
+        // old layout broke, by making the MIME decoder read back as a URL one.
+        // `None` means the decoder threw, which is a legitimate answer here.
+        //
+        // `-_-_` is the input with THREE different correct answers across the
+        // variants, so it alone separates all three field pairs above.
+        assert_eq!(
+            decode_len(
+                &mut ctx,
+                native_b64_get_url_decoder,
+                "getUrlDecoder",
+                "-_-_"
+            ),
+            Some(3),
+            "the URL alphabet decodes -_-_ to 3 bytes"
+        );
+        assert_eq!(
+            decode_len(
+                &mut ctx,
+                native_b64_get_mime_decoder,
+                "getMimeDecoder",
+                "-_-_"
+            ),
+            Some(0),
+            "MIME IGNORES them -> empty. Under the old layout this decoder read \
+             back as URL and answered 3."
+        );
+        assert_eq!(
+            decode_len(&mut ctx, native_b64_get_decoder, "getDecoder", "-_-_"),
+            None,
+            "BASIC rejects them"
+        );
+        // A CRLF-wrapped payload: MIME accepts, BASIC rejects.
+        assert_eq!(
+            decode_len(
+                &mut ctx,
+                native_b64_get_mime_decoder,
+                "getMimeDecoder",
+                "QQ\r\n=="
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            decode_len(&mut ctx, native_b64_get_decoder, "getDecoder", "QQ\r\n=="),
+            None
+        );
+    }
+
+    /// Decoded length through a factory's decoder, or `None` when it threw.
+    fn decode_len(
+        ctx: &mut MockNativeContext,
+        factory: NativeCallback,
+        name: &str,
+        text: &str,
+    ) -> Option<usize> {
+        let dec = obj(factory(ctx, &[]), name);
+        let s = ctx.create_string(text);
+        match native_b64_decode_string(ctx, &[Value::Object(Some(dec)), Value::Object(Some(s))]) {
+            Ok(Some(Value::Object(Some(a)))) => Some(ctx.array_length(a)),
+            Ok(other) => panic!("{name}.decode({text:?}): expected a byte[], got {other:?}"),
+            Err(_) => None,
+        }
+    }
+
+    /// (3) The six no-arg factories are SINGLETONS on HotSpot — `==`, not
+    /// `equals` (`scratchpad/e14/B64Ident.java`, all six rows `true`) — and the
+    /// singletons are the JDK's own `Encoder.RFC4648` / `RFC4648_URLSAFE` /
+    /// `RFC2045` statics and the three matching ones on `Decoder`.
+    ///
+    /// So the fix is to RETURN THE JDK'S FIELD, not to memoize a fabricated
+    /// object in a native `static`. A cache would reproduce `getEncoder() ==
+    /// getEncoder()` but not this, also measured:
+    ///
+    /// ```text
+    /// Base64.getMimeEncoder(0, sep) == Base64.getEncoder() -> true
+    /// ```
+    ///
+    /// because `getMimeEncoder(int, byte[])` is unregistered, runs real
+    /// bytecode, and returns the real `RFC4648` for any `lineLength <= 0`.
+    ///
+    /// This test DECLARES the static field on the mock rather than relying on a
+    /// name-to-slot fallback, so it measures the lookup and not the mock.
+    #[test]
+    fn the_factories_return_the_jdk_singleton_when_there_is_one() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx
+            .ensure_class_initialized("java/util/Base64$Encoder")
+            .expect("class");
+        let marker = obj(
+            native_b64_get_mime_encoder(&mut ctx, &[]),
+            "stand-in object",
+        );
+        ctx.set_declared_fields(
+            cid,
+            vec![FieldMetadata {
+                name: "RFC4648".to_string(),
+                descriptor: "Ljava/util/Base64$Encoder;".to_string(),
+                access_flags: 0x0008, // ACC_STATIC
+                slot_index: 0,
+                declaring_class_id: cid,
+                is_static: true,
+            }],
+        );
+        ctx.set_static_field(cid, 0, Value::Object(Some(marker)));
+
+        let first = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        let second = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        assert_eq!(
+            first, marker,
+            "getEncoder() must hand back java.util.Base64$Encoder.RFC4648 itself"
+        );
+        assert_eq!(first, second, "HotSpot: getEncoder() == getEncoder()");
+    }
+
+    /// …and the fallback is what keeps the row above from being a regression in
+    /// synthetic-JDK mode, where there is no `RFC4648` field to take. With no
+    /// declared static the factory must fabricate, exactly as before, and the
+    /// fabricated object must still be usable.
+    #[test]
+    fn the_factories_fabricate_when_there_is_no_jdk_singleton() {
+        let mut ctx = MockNativeContext::new();
+        let first = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        let second = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        assert_ne!(
+            first, second,
+            "with no real class library there is nothing to be a singleton OF; \
+             fabricating a fresh encoder is the documented fallback"
+        );
+        assert_eq!(encode_to_string(&mut ctx, first, b"\xff\xff\xff").len(), 4);
     }
 }
 
@@ -44727,5 +47152,658 @@ mod radix_to_string_tests {
         assert_eq!(java_int_to_string_radix(255, 16), "ff");
         assert_eq!(java_int_to_string_radix(255, 8), "377");
         assert_eq!(java_long_to_string_radix(255, 36), "73");
+    }
+}
+
+/// The Throwable `<init>` rule is allowed to exist at ONE place in this crate.
+///
+/// Background: the rule "register these four fixed `<init>` descriptors on a
+/// list of throwable class names" was implemented at five sites. E34 replaced
+/// site 1 (`lang_misc::register_throwable_subclass_natives`) with a per-class
+/// table derived from JDK 25 by reflection, and mirrored it into the synthetic
+/// stub declarations in `classloading/src/class_manager.rs`. E43 deleted the
+/// other copies in this file. The copies were not harmless: they ran LATER, and
+/// `NativeMethodRegistry::register` is last-write-wins with no unregister API,
+/// so the blanket four buried the measured table for ~52 classes and kept 85
+/// descriptors registered that the real JDK class does not declare at all.
+///
+/// The failure mode this test exists to catch is the one that already happened
+/// four times: someone needs one more exception constructor, finds a
+/// convenient list of exception class names in this file, and adds a blanket
+/// loop next to it. That is silent — nothing errors, the registry just answers
+/// with the wrong body for fifty classes.
+///
+/// This is a SOURCE witness. It reads this crate's own working-tree sources
+/// rather than a built registry, because the two boot paths that reach the
+/// collapsed sites live behind different feature configurations
+/// (`register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]`,
+/// `reflect_annotations`' promotion is the real-JDK one) and a `#[cfg(feature
+/// = ...)]` test only guards the configuration it is compiled into. A source
+/// scan guards both, and it runs with no VM boot.
+///
+/// Non-vacuity, since a source witness that finds nothing passes loudly:
+/// every lookup below panics with a named message when it misses, the two
+/// extracted function bodies are size-checked, the parsed table is
+/// row-count-checked, and the allow-list is checked to be exactly as small as
+/// it claims — including that its one member is genuinely absent from the
+/// table, so the exemption expires the moment the table absorbs it.
+#[cfg(test)]
+mod throwable_ctor_single_table_witness {
+    /// The only class this crate may register throwable constructors for
+    /// outside the JDK-derived table, and why.
+    ///
+    /// `java/lang/VirtualMachineError` is the single name in
+    /// `register_exception_extras_natives`' list that E34's 62-class table does
+    /// not carry. MEASURED (`javap -p`, JDK 25.0.3+9-LTS): it declares `()V`,
+    /// `(String)V`, `(String,Throwable)V` and `(Throwable)V`, all public — so
+    /// the blanket four are, for this one class, exactly the right set. When a
+    /// future regeneration adds it to the table, this list must shrink to
+    /// empty; the assertion below fails until it does.
+    const ALLOWED_OUTSIDE_THE_TABLE: &[&str] = &["java/lang/VirtualMachineError"];
+
+    /// Text of one top-level `fn` in this file, from its signature to the next
+    /// closing brace in column 0. Panics rather than returning an empty body.
+    fn top_level_fn_body<'a>(src: &'a str, signature: &str, what: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{what}: {signature:?} not found in native-builtins/src/lib.rs — this witness cannot check what it cannot find"));
+        let rest = &src[start + 1..];
+        let stop = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{what}: no column-0 closing brace after {signature:?}"));
+        &rest[..stop]
+    }
+
+    #[test]
+    fn the_blanket_four_ctor_loops_stay_collapsed_onto_the_table() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let lib = std::fs::read_to_string(src_dir.join("lib.rs"))
+            .expect("native-builtins/src/lib.rs is readable");
+        let lang_misc = std::fs::read_to_string(src_dir.join("lang_misc.rs"))
+            .expect("native-builtins/src/lang_misc.rs is readable");
+
+        // Assembled, not written as one literal, so this test's own text is
+        // never what a scan of these files finds.
+        let begin = format!("// THROWABLE-CTOR-{}-BEGIN", "TABLE").replace("-BEGIN", " BEGIN");
+        let end = format!("// THROWABLE-CTOR-{}-END", "TABLE").replace("-END", " END");
+        let ctor = format!("\"{}\"", "<init>");
+
+        // --- 1. the one table, read out of the file that owns it -------------
+        let start = lang_misc
+            .find(&begin)
+            .unwrap_or_else(|| panic!("table start marker {begin:?} not found in lang_misc.rs"));
+        let stop = lang_misc[start..]
+            .find(&end)
+            .map(|i| start + i)
+            .unwrap_or_else(|| panic!("table end marker {end:?} not found in lang_misc.rs"));
+        let table: Vec<&str> = lang_misc[start..stop]
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("(\"")
+                    .and_then(|rest| rest.split_once("\", &["))
+                    .map(|(class, _)| class)
+            })
+            .collect();
+        assert!(
+            table.len() >= 60,
+            "parsed only {} rows out of the throwable ctor table; the extractor is broken and \
+             everything below would be comparing against nothing",
+            table.len()
+        );
+
+        // --- 2. site 3 is gone and stays gone --------------------------------
+        let synthetic = top_level_fn_body(
+            &lib,
+            "\npub fn register_synthetic_overrides(",
+            "site 3 (register_synthetic_overrides)",
+        );
+        assert!(
+            synthetic.len() > 50_000,
+            "register_synthetic_overrides extracted as only {} bytes — the body scan is broken",
+            synthetic.len()
+        );
+        let site3_binder = format!("for {} in", "exc_class");
+        assert!(
+            !synthetic.contains(&site3_binder),
+            "`register_synthetic_overrides` has a `{site3_binder} ...` loop again. That was E34-1 \
+             §7 site 3: 120 registrations over 30 class names, of which 82 restated the \
+             JDK-derived table in lang_misc.rs (worse: LATER, so they won the slot) and 38 named \
+             constructors JDK 25 does not declare. Add the class to the table instead."
+        );
+
+        // --- 3. site 4 registers no constructors from its list ---------------
+        let extras = top_level_fn_body(
+            &lib,
+            "\nfn register_exception_extras_natives(",
+            "site 4 (register_exception_extras_natives)",
+        );
+        assert!(
+            extras.len() > 2_000,
+            "register_exception_extras_natives extracted as only {} bytes — body scan is broken",
+            extras.len()
+        );
+        let loop_head = format!("for {} in &exceptions {{", "exc");
+        let loop_start = extras.find(&loop_head).unwrap_or_else(|| {
+            panic!("site 4's `{loop_head}` loop is gone; re-point this witness")
+        });
+        let loop_body = {
+            let rest = &extras[loop_start..];
+            let stop = rest
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("site 4's loop has no column-4 closing brace"));
+            &rest[..stop]
+        };
+        assert!(
+            loop_body.len() > 200,
+            "site 4's loop body extracted as {} bytes — the scan is broken",
+            loop_body.len()
+        );
+        assert!(
+            !loop_body.contains(&ctor),
+            "`register_exception_extras_natives` registers constructors from its class list \
+             again. That list is a getMessage/toString bridge list; it is NOT a constructor \
+             table, and it drifted away from the real one for long enough to keep 85 \
+             non-existent descriptors registered. The constructors belong in the per-class \
+             table in lang_misc.rs."
+        );
+
+        // --- 4. every class it does bridge is a row of the table -------------
+        let list_start = extras
+            .find("let exceptions = [")
+            .expect("site 4's class list is gone; re-point this witness");
+        let list_end = extras[list_start..]
+            .find("];")
+            .map(|i| list_start + i)
+            .expect("site 4's class list has no terminator");
+        let listed: Vec<&str> = extras[list_start..list_end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix("\","))
+                    .filter(|c| c.contains('/'))
+            })
+            .collect();
+        assert!(
+            listed.len() >= 50,
+            "parsed only {} classes out of site 4's list; the extractor is broken",
+            listed.len()
+        );
+        for class in &listed {
+            assert!(
+                table.contains(class) || ALLOWED_OUTSIDE_THE_TABLE.contains(class),
+                "`register_exception_extras_natives` bridges {class}, which is neither a row of \
+                 the JDK-derived throwable table in lang_misc.rs nor in this witness's \
+                 allow-list. Two lists of throwable class names that are allowed to disagree is \
+                 exactly how the four copies of this rule drifted apart. Add it to the table \
+                 (regenerate with scratchpad/e34/Gen34.java) or justify it here."
+            );
+        }
+
+        // --- 5. the allow-list cannot be padded ------------------------------
+        for exempt in ALLOWED_OUTSIDE_THE_TABLE {
+            assert!(
+                listed.contains(exempt),
+                "{exempt} is exempted by this witness but is not actually registered by \
+                 `register_exception_extras_natives` — a stale exemption is a hole"
+            );
+            assert!(
+                !table.contains(exempt),
+                "{exempt} is now a row of the JDK-derived table, so its hand-written \
+                 constructors in `register_exception_extras_natives` are a second copy again. \
+                 Delete them and remove it from ALLOWED_OUTSIDE_THE_TABLE."
+            );
+        }
+
+        // --- 6. the constructors site 4 still registers are the named few ----
+        // Four for the allow-listed class, plus one deliberate restatement of
+        // `NullPointerException.<init>(Ljava/lang/String;)V` that carries the
+        // opt-in CRATONVM_DBG_NPE_TRACE forensic. Pinned so that a new
+        // constructor smuggled in here is a failing diff, not a silent one.
+        let ctors_outside_the_loop = extras.matches(&ctor).count();
+        assert_eq!(
+            ctors_outside_the_loop,
+            4 * ALLOWED_OUTSIDE_THE_TABLE.len() + 1,
+            "`register_exception_extras_natives` registers {ctors_outside_the_loop} constructor \
+             descriptors; it is allowed exactly four per allow-listed class plus the one \
+             `NullPointerException.<init>(Ljava/lang/String;)V` restatement that keeps the \
+             surefire NPE forensic alive. Anything else belongs in the table."
+        );
+    }
+}
+
+#[cfg(test)]
+mod g23_nomination_witnesses {
+    //! Source witnesses for the four nominations this lane closed in
+    //! `lib.rs`. Each of them is a small edit inside a large registrar, and
+    //! each was reported by ANOTHER lane precisely because a large registrar
+    //! is where an edit goes quiet — so what is checked here is not the
+    //! behaviour (the crate's tests cannot start a VM) but the thing that
+    //! actually went wrong before: **an edit that is present at some of its
+    //! sites and missing at the rest**.
+    //!
+    //! HANDOFF-20260814 §5 names both failure modes these witnesses cover:
+    //! "a scripted edit matched zero sites" and "scripted edits land on the
+    //! wrong twin". A nine-site change with eight sites done looks exactly
+    //! like a nine-site change with nine.
+    //!
+    //! Written against the FILE TEXT rather than against a mock context on
+    //! purpose. `alloc_synth_timezone` and the nine `Thread.<init>` bodies are
+    //! closures inside `register_essential_natives_with_shims`; nothing in
+    //! this crate can name them, and a mock-context test would have to
+    //! re-implement the registrar to reach them.
+
+    fn lib_rs() -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs");
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("native-builtins/src/lib.rs is readable: {e}"))
+    }
+
+    /// `register_essential_natives_with_shims`, and ONLY that function.
+    ///
+    /// This scoping is load-bearing, and it is the hazard the sibling lanes
+    /// warned about (`http_url_connection.rs` / `net_phase_e.rs`: one
+    /// registrar silently overwriting five of six accessors under the same
+    /// function name). `java/lang/Thread.<init>` is registered by FOUR
+    /// families in this file: this one at ~13705, one inside
+    /// `alloc_carrier_thread_mirror` (~6921), and twenty-two more inside
+    /// `register_synthetic_overrides` (~22196 onward). `register()` is
+    /// last-write-wins with no unregister API, so which family owns the slot
+    /// is a question about CALL ORDER and cannot be read off the file.
+    ///
+    /// It was settled by measurement, not by reading: `--dump-native-registry`
+    /// on the d2e127930 binary reports all nine essential-registrar rows with
+    /// `owns_slot=true` and `overwrote=null`, in `--jdk-only` AND in
+    /// Compatible. The `register_synthetic_overrides` copies do not run in
+    /// either configuration. So this witness checks the nine that answer, and
+    /// a scan over the whole file would have checked thirty-two bodies of
+    /// which twenty-three are unreachable.
+    fn essential_registrar(src: &str) -> &str {
+        let start = src
+            .find("\nfn register_essential_natives_with_shims(")
+            .or_else(|| src.find("\npub fn register_essential_natives_with_shims("))
+            .expect("register_essential_natives_with_shims is still in lib.rs");
+        let rest = &src[start + 1..];
+        let stop = rest
+            .find("\nfn register_synthetic_overrides(")
+            .or_else(|| rest.find("\npub fn register_synthetic_overrides("))
+            .expect(
+                "register_synthetic_overrides is still in lib.rs, after the essential registrar",
+            );
+        &rest[..stop]
+    }
+
+    /// The bodies of every `registry.register("java/lang/Thread", "<init>",
+    /// ...)` in the given slice, one string per registration, cut at the next
+    /// registration or the end of the slice.
+    fn thread_ctor_bodies(src: &str) -> Vec<String> {
+        // Assembled rather than written as one literal so this test's own
+        // text is never what the scan finds.
+        let ctor = format!("\"{}\"", "<init>");
+        let multiline = format!("\"java/lang/Thread\",\n        {ctor},");
+        let inline = format!("register(\"java/lang/Thread\", {ctor}, \"()V\"");
+        let mut out = Vec::new();
+        for pat in [multiline.as_str(), inline.as_str()] {
+            let mut from = 0usize;
+            while let Some(i) = src[from..].find(pat) {
+                let start = from + i;
+                let rest = &src[start..];
+                // A registration body ends where the next one begins.
+                let stop = rest[1..]
+                    .find("registry.register")
+                    .map(|k| k + 1)
+                    .unwrap_or(rest.len());
+                out.push(rest[..stop].to_string());
+                from = start + 1;
+            }
+        }
+        out
+    }
+
+    /// G5-1 N2, and the reason it is a witness rather than a comment: the
+    /// change is ONE line repeated across NINE constructor bodies that differ
+    /// from each other in arity, in layout arm and in argument order. Eight of
+    /// nine compiles, runs, and closes eight of the fifteen measured rows —
+    /// silently.
+    ///
+    /// MEASURED with `--dump-native-registry` on the d2e127930 binary
+    /// (`ItlProbe`, both modes): all nine own their slot, `kind=bridge`, and
+    /// seven of the nine record non-zero `invocations` on a ten-case probe.
+    /// They are live under `--jdk-only` as well as in Compatible — which
+    /// falsifies G5-1 N2's own prediction that they would be inert there.
+    #[test]
+    fn every_thread_constructor_captures_inheritable_thread_locals() {
+        let src = lib_rs();
+        let bodies = thread_ctor_bodies(essential_registrar(&src));
+        assert_eq!(
+            bodies.len(),
+            9,
+            "expected exactly 9 java/lang/Thread constructor registrations, found \
+             {} — the scan is broken or a constructor was added or removed; either \
+             way the per-body check below would be checking the wrong population",
+            bodies.len()
+        );
+        let call = format!("capture_inheritable_tl_at_{}(ctx, this)", "construction");
+        let queue = format!("queue_inherited_tl_for_{}(child_hash", "child");
+        for (n, body) in bodies.iter().enumerate() {
+            assert!(
+                body.contains(&call) || body.contains(&queue),
+                "Thread constructor registration #{n} does not capture inheritable \
+                 ThreadLocals at construction. HotSpot captures in the master \
+                 constructor that ALL eight public forms forward to (MEASURED, \
+                 G5-1 section 2, rows 1/3/9/12/15), so a constructor that skips \
+                 the capture lets Thread.start() re-snapshot the parent's LATER \
+                 values. Body began:\n{}",
+                &body[..body.len().min(300)]
+            );
+        }
+    }
+
+    /// The opt-out arm, which is the one of the nine that must NOT take the
+    /// plain capture. `new Thread(g, r, n, 0, false)` sets
+    /// `characteristics |= NO_INHERIT_THREAD_LOCALS` and HotSpot's master
+    /// constructor then skips the copy entirely — MEASURED, the child reads
+    /// `null` where the parent had a value set.
+    ///
+    /// It still has to queue an EMPTY capture, because an ABSENT queue entry
+    /// sends `native_thread_start0` back to snapshotting the parent's CURRENT
+    /// map — i.e. opting out would inherit MORE than opting in.
+    #[test]
+    fn the_opt_out_constructor_queues_an_empty_capture_not_the_parents_values() {
+        let src = lib_rs();
+        let marker = "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V";
+        let i = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("the 5-argument Thread constructor {marker} is gone"));
+        let body = &src[i..(i + 3000).min(src.len())];
+        assert!(
+            body.contains("args.get(5)"),
+            "the opt-out constructor must read the inheritThreadLocals flag at \
+             argument slot 5 — a `J` occupies ONE slot in this args vec, not two \
+             (SOURCE-VERIFIED against Unsafe.putBoolean(Object,long,boolean), whose \
+             body reads the receiver at 1, the offset at 2 and the boolean at 3)"
+        );
+        assert!(
+            body.contains("Default::default()"),
+            "opting out must QUEUE AN EMPTY capture, not skip the capture: an \
+             absent queue entry is indistinguishable from 'nobody asked', and \
+             native_thread_start0 then snapshots the parent at start time"
+        );
+    }
+
+    /// The rawOffset FIELD and `getRawOffset()` are two producers of one
+    /// quantity, and the retired one was still writing: MEASURED on the
+    /// d2e127930 binary, `getRawOffset()` is right on all 632 ids
+    /// `TimeZone.getAvailableIDs()` returns, while the field was seeded from a
+    /// roughly 50-entry hand table whose own successor note calls it
+    /// superseded.
+    #[test]
+    fn the_synthetic_timezone_seeds_raw_offset_from_tzdb_not_the_hand_table() {
+        let src = lib_rs();
+        let i = src
+            .find("fn alloc_synth_timezone")
+            .expect("alloc_synth_timezone is still in lib.rs");
+        let body = &src[i..(i + 7000).min(src.len())];
+        let tzdb_call = format!("crate::tzdb::raw_offset_{}(ctx, id_str)", "seconds");
+        assert!(
+            body.contains(&tzdb_call),
+            "alloc_synth_timezone must seed the rawOffset FIELD from the same \
+             source getRawOffset() answers from. The hand table is the FALLBACK — \
+             for the deprecated three-letter aliases and the GMT+HH:MM spellings \
+             ZoneId.of cannot resolve — and not the primary."
+        );
+        // The comment this replaced claimed getOffset(long) reads the field. It
+        // does not: it is a registered native (register_tzdb_offset_natives_for)
+        // that answers from tzdb regardless of what the field holds. A comment
+        // saying otherwise sends the next reader to the wrong producer.
+        assert!(
+            !body.contains("ZoneInfo.getOffset(long) returns this rawOffset"),
+            "the retired claim that getOffset(long) reads the rawOffset field is \
+             back in alloc_synth_timezone. It is a registered native and it reads tzdb."
+        );
+    }
+
+    /// `java.util.logging` punishes generalisation, and this is the row it
+    /// punishes: on `Logger`, `setParent(null)` and `addHandler(null)` THROW
+    /// while `setLevel(null)`, `setFilter(null)` and `removeHandler(null)`
+    /// RETURN — and `Handler.setLevel(null)`, the same-named method one type
+    /// over, throws. All MEASURED on HotSpot 25.0.3+9 (G15-1 section 1;
+    /// re-measured 2026-08-17 by this lane).
+    ///
+    /// So this witness is deliberately NEGATIVE as well as positive: it fails
+    /// if a later edit widens the refusal onto `Logger.setLevel`.
+    #[test]
+    fn only_set_parent_refuses_null_among_loggers_one_argument_setters() {
+        let src = lib_rs();
+        let i = src
+            .find("\"setParent\",\n        \"(Ljava/util/logging/Logger;)V\"")
+            .expect("Logger.setParent registration is still in lib.rs");
+        let body = &src[i..(i + 4000).min(src.len())];
+        assert!(
+            body.contains("NullPointerException { message: None }"),
+            "Logger.setParent(null) must raise a BARE NullPointerException — its \
+             getMessage() is null, not a helpful-NPE text (MEASURED)"
+        );
+
+        let level = src
+            .find("\"setLevel\",\n        \"(Ljava/util/logging/Level;)V\"")
+            .expect("Logger.setLevel registration is still in lib.rs");
+        let level_body = &src[level..(level + 1200).min(src.len())];
+        assert!(
+            !level_body.contains("NullPointerException"),
+            "Logger.setLevel(null) RETURNS NORMALLY on HotSpot (MEASURED) — the \
+             OPPOSITE verdict from Handler.setLevel(null), which throws. A blanket \
+             null rule across this family breaks 22 measured rows."
+        );
+    }
+
+    /// `new LogRecord(null, "m")` throws and `new LogRecord(INFO, null)` is
+    /// LEGAL — one constructor, two arguments, opposite verdicts. MEASURED on
+    /// HotSpot; the JDK body is
+    /// `this.level = Objects.requireNonNull(level); this.message = msg;`.
+    #[test]
+    fn the_log_record_constructor_requires_the_level_and_permits_a_null_message() {
+        let src = lib_rs();
+        let ctor = format!("\"{}\"", "<init>");
+        let marker = format!("\"java/util/logging/LogRecord\",\n        {ctor}");
+        let i = src
+            .find(&marker)
+            .expect("the LogRecord(Level,String) registration is still in lib.rs");
+        let body = &src[i..(i + 2600).min(src.len())];
+        assert!(
+            body.contains("matches!(args.get(1), None | Some(Value::Object(None)))"),
+            "the LogRecord constructor must refuse a null LEVEL (argument slot 1)"
+        );
+        assert!(
+            !body.contains("args.get(2), None | Some(Value::Object(None))"),
+            "the LogRecord constructor must NOT refuse a null MESSAGE (slot 2): \
+             `new LogRecord(Level.INFO, null)` returns normally on HotSpot and its \
+             getMessage() is null. Nine of LogRecord's eleven setters likewise \
+             return on null; only setLevel and setInstant throw."
+        );
+    }
+}
+
+#[cfg(test)]
+mod g52_object_clone_tests {
+    //! `native_object_clone`, pinned.
+    //!
+    //! `G45-1` §3 ranked this site fourth in the tree by descriptor-coercion
+    //! events (54 in a 19-vector sweep, 270 corpus-wide) and the standing
+    //! reading was that clone AMPLIFIES whatever the original store got
+    //! wrong. G52 measured it and that is not what it does — see the block
+    //! comment inside the `ObjectKind::Object` arm for the numbers, and
+    //! `docs/known-issues/jdk-only/G52-1-the-clone-amplifier-and-the-double-arm-20260817.md`
+    //! for the record.
+    //!
+    //! What these tests can and cannot reach: `MockNativeContext`'s
+    //! `get_field`/`set_field` are RAW, because the descriptor resolution
+    //! lives in `NativeContextImpl` (`vm/src/vm/vm_exec.rs`) and this crate
+    //! cannot start a VM. So the coercion half is pinned where it lives, in
+    //! `gc/src/heap.rs` (`the_descriptor_coercion_is_idempotent` is the
+    //! theorem this loop's double coercion rests on). What is pinned HERE is
+    //! the half the mock can see and the half a refactor is most likely to
+    //! break: that the copy is total, that it is field-for-field faithful
+    //! through a raw accessor pair, and that the array arm does not go
+    //! through the field path at all — which is where 4,533 of
+    //! `RJdkSecurity`'s 4,534 clones go.
+
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_types::ArrayElementType;
+    // The heap/array accessors live on the component traits, not on the
+    // `NativeContext` bundle, so they must be in scope for method resolution
+    // on the concrete mock. Same import block as the other test modules here.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
+    fn clone_of(ctx: &mut crate::test_utils::MockNativeContext, obj: ObjectRef) -> ObjectRef {
+        match native_object_clone(ctx, &[Value::Object(Some(obj))]) {
+            Ok(Some(Value::Object(Some(c)))) => c,
+            other => panic!("clone must return an object reference, got {other:?}"),
+        }
+    }
+
+    /// The copy is TOTAL and FAITHFUL. Every slot, in order, with the value
+    /// the source held — including the `Value` variant, which is the part
+    /// `Object.clone()`'s "copy the fields" contract turns on and the part a
+    /// descriptor-driven rewrite would silently change.
+    #[test]
+    fn object_clone_copies_every_slot_verbatim_through_a_raw_accessor_pair() {
+        let mut ctx = mock_ctx();
+        let src = ctx.alloc_object(ClassId::new(41), 6);
+        let pointee = ctx.alloc_object(ClassId::new(42), 0);
+        let planted = [
+            Value::Int(7),
+            Value::Long(-9),
+            Value::Object(Some(pointee)),
+            Value::Object(None),
+            // The measured population: a raw `Int(0)` sitting in a slot the
+            // real class declares a reference. Through the production
+            // accessors this is the read that fires
+            // `primitive-into-reference`; through the mock it must simply
+            // survive, which is what proves the loop itself copies rather
+            // than rewrites.
+            Value::Int(0),
+            Value::Float(1.5),
+        ];
+        for (i, v) in planted.iter().enumerate() {
+            ctx.set_field(src, i, *v);
+        }
+
+        let dst = clone_of(&mut ctx, src);
+        assert_ne!(
+            dst.as_ptr(),
+            src.as_ptr(),
+            "clone must be a distinct object, not the receiver",
+        );
+        assert_eq!(
+            ctx.object_num_fields(dst),
+            planted.len(),
+            "the clone must be as wide as the receiver; a short clone drops \
+             the tail slots silently",
+        );
+        for (i, v) in planted.iter().enumerate() {
+            assert_eq!(
+                ctx.get_field(dst, i),
+                *v,
+                "slot {i} of the clone must equal slot {i} of the receiver",
+            );
+            assert_eq!(
+                ctx.get_field(src, i),
+                *v,
+                "cloning must not disturb the receiver at slot {i}",
+            );
+        }
+    }
+
+    /// The clone is INDEPENDENT: writing one must not move the other. A
+    /// "clone" that handed back an alias would pass the equality test above
+    /// and fail every real use.
+    #[test]
+    fn writing_the_clone_does_not_move_the_receiver() {
+        let mut ctx = mock_ctx();
+        let src = ctx.alloc_object(ClassId::new(43), 2);
+        ctx.set_field(src, 0, Value::Int(1));
+        ctx.set_field(src, 1, Value::Int(2));
+
+        let dst = clone_of(&mut ctx, src);
+        ctx.set_field(dst, 0, Value::Int(99));
+
+        assert_eq!(ctx.get_field(src, 0), Value::Int(1));
+        assert_eq!(ctx.get_field(dst, 0), Value::Int(99));
+        assert_eq!(ctx.get_field(dst, 1), Value::Int(2));
+    }
+
+    /// THE RATIO THAT DECIDES WHETHER THIS SITE IS WORTH ANY WORK. MEASURED,
+    /// `RJdkSecurity` `--jdk-only` under `CRATONVM_DBG_CLONE=1`: 4,534
+    /// clones, 4,533 of them arrays. The array arm uses
+    /// `get_array_element`/`set_array_element`, which are NOT
+    /// descriptor-aware and never reach
+    /// `gc/src/heap.rs::coerce_field_value_for_slot` — so the coercion
+    /// question does not touch 99.98% of what `Object.clone()` actually does
+    /// in that vector. This test pins that the array arm stays on the array
+    /// accessors: if someone "unifies" the two arms onto `get_field`, the
+    /// element type is lost and every array clone starts paying (and
+    /// reporting) a coercion.
+    #[test]
+    fn the_array_arm_copies_elements_and_keeps_the_element_type() {
+        let mut ctx = mock_ctx();
+        let src = ctx.new_array(ArrayElementType::Int, 4);
+        for i in 0..4 {
+            ctx.set_array_element(src, i, Value::Int(i as i32 * 10));
+        }
+
+        let dst = clone_of(&mut ctx, src);
+        assert_ne!(dst.as_ptr(), src.as_ptr());
+        assert_eq!(ctx.array_length(dst), 4);
+        assert_eq!(ctx.heap_element_type_of(dst), ArrayElementType::Int);
+        for i in 0..4 {
+            assert_eq!(ctx.get_array_element(dst, i), Value::Int(i as i32 * 10));
+        }
+        assert_eq!(
+            ctx.object_num_fields(dst),
+            0,
+            "an array clone must be an array, not an object with fields",
+        );
+    }
+
+    /// A reference array clones through `new_ref_array`, so the clone is a
+    /// reference array and its elements are references — not the `Int(0)`
+    /// zero-init that `new_array` would have produced.
+    #[test]
+    fn a_reference_array_clones_as_a_reference_array() {
+        let mut ctx = mock_ctx();
+        let src = ctx.new_ref_array(ClassId::new(44), 3);
+        let a = ctx.alloc_object(ClassId::new(45), 0);
+        ctx.set_array_element(src, 1, Value::Object(Some(a)));
+
+        let dst = clone_of(&mut ctx, src);
+        assert_eq!(
+            ctx.heap_element_type_of(dst),
+            ArrayElementType::Reference,
+            "a reference array must not clone into a primitive array",
+        );
+        assert_eq!(ctx.get_array_element(dst, 0), Value::Object(None));
+        assert_eq!(ctx.get_array_element(dst, 1), Value::Object(Some(a)));
+    }
+
+    /// `clone` on `null` is an NPE and not a panic, and not a clone of
+    /// nothing.
+    #[test]
+    fn clone_on_null_is_a_null_pointer_exception() {
+        let mut ctx = mock_ctx();
+        for arg in [vec![], vec![Value::Object(None)], vec![Value::Int(3)]] {
+            assert!(
+                native_object_clone(&mut ctx, &arg).is_err(),
+                "clone on {arg:?} must raise, not fabricate an object",
+            );
+        }
     }
 }

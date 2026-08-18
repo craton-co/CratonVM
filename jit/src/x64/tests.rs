@@ -399,6 +399,10 @@ fn test_helpers() -> JitRuntimeHelpers {
         // Unwired (0) — these tests build no class-`ldc` site, and 0 makes
         // the backend refuse one rather than emit a null CALL.
         ldc_class_cp: 0,
+        // Wired to the panicking sentinel: the `0x53` arm is unconditionally
+        // inline and always emits a CALL to this slot, and the slot is
+        // `required` in `jit-api`, so 0 would fail `validate()` rather than
+        // select a different lowering.
         aastore_type_check: sentinel,
     }
 }

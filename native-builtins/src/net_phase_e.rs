@@ -232,8 +232,22 @@ const SS_LISTENER_ID: usize = 3;
 // W3-A2 side-tables — bypass the synthetic-vs-real-JDK field-layout
 // collision by storing Socket / ServerSocket state in process-wide HashMaps
 // keyed by ObjectRef. Synthetic field slots collide with real-JDK private
-// fields (e.g. real `ServerSocket` slot 0 is `boolean created`, not the int
-// port we write through SS_PORT=0). Side-tables are independent of layout.
+// fields. Side-tables are independent of layout.
+//
+// The example this comment used to give was wrong in a way that matters:
+// real `ServerSocket` slot 0 is NOT `boolean created`, it is `impl`, the
+// reference-typed `SocketImpl`. MEASURED 2026-08-17, `javap -p
+// java.net.ServerSocket` on JDK 25, declaration order:
+//
+//     0 impl (SocketImpl)   1 created (boolean)   2 bound (boolean)
+//     3 closed (boolean)    4 socketLock (Object) 5 options (Set)
+//
+// A `Value::Int` written into slot 0 is therefore DROPPED by the field guard
+// rather than merely misfiled, `impl` stays null, and every inherited method
+// whose bytecode reads `getImpl()` throws NPE. That is not hypothetical: it
+// is how `RSslLiveSession` died on `ServerSocket.setSoTimeout` in the
+// `javax.net.ssl.SSLServerSocket` twin of this surface. See
+// `docs/known-issues/jdk-only/` record `G16-1` (2026-08-17).
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Debug, Clone)]
@@ -322,13 +336,23 @@ pub(crate) struct SsSide {
     pub so_timeout: i32,
 }
 
+/// A GC-stable identity for a Java object, used as a side-table key.
+///
+/// `pub(crate)` because `http_url_connection` has to hold one ACROSS the life
+/// of a response stream — see `forget_https_carrier_session_by_key`. Both
+/// fields are plain integers and both survive relocation, which is the whole
+/// reason this shape exists rather than a raw `ObjectRef`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct NativeObjKey {
+pub(crate) struct NativeObjKey {
     vm: usize,
-    identity: i32,
+    /// `System.identityHashCode`. Exposed because the sibling table in
+    /// `http_url_connection` (`https_peer_info`) is keyed on
+    /// `identity_hash_code as u32 as u64`, so one `NativeObjKey` is enough to
+    /// address both tables and a caller does not have to carry two keys.
+    pub(crate) identity: i32,
 }
 
-fn native_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> NativeObjKey {
+pub(crate) fn native_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> NativeObjKey {
     NativeObjKey {
         vm: ctx.vm_identity(),
         identity: ctx.identity_hash_code(obj),
@@ -857,13 +881,36 @@ pub fn gc_update_ds_refs(pointer_map: &cratonvm_types::PointerMap) {
 /// `setSessionCacheSize`/`setSessionTimeout`. Side-tabled for the same reason
 /// as the socket state above, and one more: the carrier is an instance of the
 /// real `SSLSessionContext`, which is an INTERFACE declaring zero fields, so
-/// there are no instance slots to write at all. Both defaults are 0, which is
-/// this API's spelling of "unlimited" / "no expiry" and matches the answer the
-/// constant getters used to give.
-#[derive(Default, Debug, Clone, Copy)]
+/// there are no instance slots to write at all.
+///
+/// The defaults used to be 0/0, on the reading that 0 is this API's spelling
+/// of "unlimited" / "no expiry". MEASURED 2026-08-17 (probe `G16Ctx`, HotSpot
+/// 25.0.3+9-LTS): a freshly `init`-ed `SSLContext` answers **20480** and
+/// **86400** on both its client and its server context, on the first call,
+/// before anything is configured. 0 is a value a caller can SET — and setting
+/// it does read back as 0 on HotSpot, so the two are distinguishable states
+/// and the old default was reporting the configured one as the initial one.
+#[derive(Debug, Clone, Copy)]
 struct SscSide {
     cache_size: i32,
     timeout_secs: i32,
+}
+
+/// `sun.security.ssl.SSLSessionContextImpl`'s initial cache bound. MEASURED,
+/// not derived: it is `javax.net.ssl.sessionCacheSize`'s built-in value.
+const SSC_DEFAULT_CACHE_SIZE: i32 = 20480;
+
+/// The initial session lifetime in SECONDS (24 h). MEASURED alongside the
+/// cache bound above.
+const SSC_DEFAULT_TIMEOUT_SECS: i32 = 86400;
+
+impl Default for SscSide {
+    fn default() -> Self {
+        SscSide {
+            cache_size: SSC_DEFAULT_CACHE_SIZE,
+            timeout_secs: SSC_DEFAULT_TIMEOUT_SECS,
+        }
+    }
 }
 
 /// Which logical session context a carrier stands for: the identity hash of
@@ -899,7 +946,11 @@ fn ssc_owner_table() -> &'static Mutex<HashMap<i32, SscKey>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ssc_bind(ctx: &dyn NativeContext, carrier: ObjectRef, owner: ObjectRef, tag: u8) {
+/// `pub(crate)` for the session-accessor lanes outside this file: a carrier
+/// minted anywhere else has to be bound to its owning `SSLContext` here, or
+/// `ssc_key` files it under `SSC_TAG_ORPHAN` and it round-trips only against
+/// itself.
+pub(crate) fn ssc_bind(ctx: &dyn NativeContext, carrier: ObjectRef, owner: ObjectRef, tag: u8) {
     let carrier_id = ctx.identity_hash_code(carrier);
     let key = (ctx.identity_hash_code(owner), tag);
     ssc_owner_table().lock().insert(carrier_id, key);
@@ -927,6 +978,60 @@ fn ssc_set<F: FnOnce(&mut SscSide)>(ctx: &dyn NativeContext, this: ObjectRef, f:
     let key = ssc_key(ctx, this);
     let mut t = ssc_side_table().lock();
     f(t.entry(key).or_default());
+}
+
+/// One `SscKey` -> the ONE carrier object that stands for it, as a global-root
+/// handle.
+///
+/// MEASURED 2026-08-17 (probe `G16Ctx`, HotSpot 25.0.3+9-LTS):
+///
+/// ```text
+/// ctx.getServerSessionContext() == ctx.getServerSessionContext()   ->  true
+/// ```
+///
+/// Every call used to mint a FRESH carrier, so that row read `false` here.
+/// `ssc_owner_table` already made the state round-trip across two different
+/// carriers, which is why the values agreed while the identity did not — and
+/// identity is not cosmetic on this API: a caller that caches the context and
+/// later compares, or uses it as a map key, silently accumulates one entry per
+/// call.
+fn ssc_carrier_roots() -> &'static Mutex<HashMap<SscKey, usize>> {
+    static T: OnceLock<Mutex<HashMap<SscKey, usize>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The carrier for `(owner, tag)`, minted once and handed back thereafter.
+///
+/// GC-safety: `try_alloc_concurrent_synthetic` can relocate `owner`, so the
+/// caller pins it and this reads the forwarded address back before binding the
+/// identity hash. The carrier itself is remembered as a root HANDLE, never a
+/// bare `ObjectRef`.
+fn ssc_carrier(
+    ctx: &mut dyn NativeContext,
+    owner: ObjectRef,
+    tag: u8,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let key = (ctx.identity_hash_code(owner), tag);
+    let known = ssc_carrier_roots().lock().get(&key).copied();
+    if let Some(root) = known {
+        if let Some(carrier) = ctx.resolve_global_root(root) {
+            return Ok(carrier);
+        }
+    }
+    let owner_pin = ctx.pin_native_root(owner);
+    let carrier = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    ssc_bind(ctx, carrier, owner, tag);
+    ctx.unpin_native_roots(owner_pin);
+    let root = ctx.add_global_root(carrier);
+    if root == 0 {
+        // No root available: hand back the fresh carrier rather than fail. It
+        // still round-trips through `ssc_owner_table`; only the identity row
+        // degrades to the pre-2026-08-17 behaviour.
+        return Ok(carrier);
+    }
+    ssc_carrier_roots().lock().insert(key, root);
+    Ok(ctx.resolve_global_root(root).unwrap_or(carrier))
 }
 
 fn ds_default() -> DsSide {
@@ -2560,6 +2665,7 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
     register_uri_natives(registry);
     register_re5_http_client(registry);
     register_re6_ssl_context(registry);
+    register_ssl_server_socket_options(registry);
     register_re7_datagram_socket(registry);
     register_re8_network_interface(registry);
     register_re9_nio_selector(registry);
@@ -2610,6 +2716,55 @@ pub(crate) fn uri_has_synthetic_layout(ctx: &dyn NativeContext, uri: ObjectRef) 
 /// when the receiver actually has it — on a real `java.net.URI` slot 6 is
 /// `path` and slot 5 is `port`, so reading them answers the wrong field and,
 /// for slot 5, a primitive where a `String` was expected.
+/// The Java `String` OBJECT holding this URI's full text, when there is one.
+///
+/// Mirrors [`uri_raw_string`]'s search order exactly and returns the object
+/// rather than a decoded copy, for the one caller whose answer IS that string:
+/// `URI.toString()`.
+///
+/// WHY THIS EXISTS. A Rust `String` cannot hold an unpaired surrogate, so
+/// `read_string` -> `create_string` is a lossy round trip. MEASURED on
+/// `RJdkBridge1`'s `surrog` family at `3fcc8d90f`: `new URI` over a path
+/// carrying a lone high surrogate came back with U+FFFD in its place, where
+/// HotSpot returns the 12-character string with the surrogate intact. The
+/// text was never lost on the OBJECT -- a real `java.net.URI` caches it in
+/// its `string` field and our synthetic layout keeps it in slot 6/5/0 --
+/// only in the decode. Handing the object back preserves it by construction,
+/// and allocates nothing.
+///
+/// Same defect class as `G55-1`'s, and its N1. The difference is that this
+/// caller does not need to REASON about the text, so it needs no units
+/// reader: it needs to stop copying.
+fn uri_raw_string_object(ctx: &dyn NativeContext, uri: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
+        if ctx.read_string(s).is_some_and(|r| !r.is_empty()) {
+            return Some(s);
+        }
+    }
+    if !uri_has_synthetic_layout(ctx, uri) {
+        return None;
+    }
+    for &idx in &[6usize, 5usize] {
+        if let Value::Object(Some(s)) = ctx.get_field(uri, idx) {
+            if ctx.read_string(s).is_some_and(|r| !r.is_empty()) {
+                return Some(s);
+            }
+        }
+    }
+    // Slot 0 is the scheme on both layouts and only answers here when it
+    // happens to hold a whole URI -- the same guard `uri_raw_string` applies,
+    // kept identical so the two cannot disagree about which slot won.
+    if let Value::Object(Some(s)) = ctx.get_field(uri, 0) {
+        if ctx
+            .read_string(s)
+            .is_some_and(|v| v.contains(":/") || v.contains(":\\"))
+        {
+            return Some(s);
+        }
+    }
+    None
+}
+
 pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     // Real-JDK `java.net.URI` caches its full text in the `string` field.
     // Reading it by NAME works regardless of the instance-field slot order
@@ -3201,45 +3356,297 @@ pub(crate) fn uri_split(
 }
 
 /// Split a URI authority (`[userinfo "@"] host [":" port]`, RFC 3986 §3.2) into
-/// `(userInfo, host, port)`. `port` is -1 when absent or unparsable. Host of an
-/// IPv6 literal keeps its brackets (`[::1]`), matching `java.net.URI.getHost()`.
+/// `(userInfo, host, port)`. Host of an IPv6 literal keeps its brackets
+/// (`[::1]`), matching `java.net.URI.getHost()`.
+///
+/// **The three components stand or fall TOGETHER.** `java.net.URI` parses an
+/// authority twice: first as *server-based* (`parseServer`), and — when that
+/// fails and `requireServerAuthority` is false, which is the case for every
+/// `new URI(String)` — it **undoes the whole attempt** and keeps the authority
+/// as *registry-based*:
+///
+/// ```text
+/// } catch (URISyntaxException x) {
+///     // Undo results of failed parse
+///     userInfo = null;
+///     host = null;
+///     port = -1;
+/// ```
+/// (`java.base/java/net/URI.java`, `Parser.parseAuthority`, JDK 25.0.3+9.)
+///
+/// So `new URI("http://h:-5/p")` is a perfectly legal URI whose
+/// `getAuthority()` is `h:-5` and whose `getHost()`, `getUserInfo()` and
+/// `getPort()` are `null`, `null` and `-1`. This function used to end in
+/// `p.parse::<i32>().ok()`, which took Rust's leading `+`/`-` and answered
+/// `-5`/`80` where HotSpot answers `-1`, and kept a non-null host besides —
+/// `RJdkBridge1`'s check 197. Clamping only the port would have satisfied
+/// `RJdkBridge1.java:1181` and failed `:1183`; the demotion is the contract.
+///
+/// Returning `(None, None, -1)` here is also what the callers already expect:
+/// [`uri_equals`], [`uri_hash_code`] and `uri_compare` all branch on
+/// `host.is_some()` to pick the JDK's server-vs-registry comparison, so a
+/// demoted authority routes them onto the raw-string branch by itself.
 pub(crate) fn uri_parse_authority(authority: &str) -> (Option<String>, Option<String>, i32) {
-    // userinfo ends at the last '@' (host cannot contain '@').
-    let (userinfo, hostport) = match authority.rfind('@') {
-        Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
-        None => (None, authority),
-    };
-    let (host, port_str) = if hostport.starts_with('[') {
-        // IPv6 literal: host is "[...]", optional ":port" after the ']'.
-        match hostport.find(']') {
-            Some(j) => {
-                let h = hostport[..=j].to_string();
-                let p = hostport[j + 1..].strip_prefix(':').map(|x| x.to_string());
-                (h, p)
+    uri_parse_server_authority(authority).unwrap_or((None, None, -1))
+}
+
+/// Transcription of `java.net.URI$Parser.parseServer` (JDK 25.0.3+9) as a pure
+/// function over the authority text. `None` is the JDK's "server-based parse
+/// failed", which `parseAuthority` turns into a registry-based authority.
+///
+/// The JDK's `checkChars(p, q, L_USERINFO, …, "user info")` is deliberately NOT
+/// transcribed, and that is not a gap: `L_REG_NAME` and `L_USERINFO` differ by
+/// exactly one character, `@`, and an `@` inside the user-info span can only
+/// arise when a *later* `@` was chosen as the delimiter — which never happens,
+/// because the JDK takes the FIRST `@` (`scan(p, n, "/?#", "@")` stops at it),
+/// and the text after it then fails `parseHostname` anyway. MEASURED:
+/// `new URI("http://a@b@c/p").getUserInfo()` is `null` on HotSpot. Every other
+/// character that is legal in a user info but not in an authority is already
+/// refused upstream by the whole-authority character check.
+fn uri_parse_server_authority(a: &str) -> Option<(Option<String>, Option<String>, i32)> {
+    let b = a.as_bytes();
+    let n = b.len();
+    let mut p = 0usize;
+
+    // userinfo — `q = scan(p, n, "/?#", "@")`, i.e. the FIRST '@', and never
+    // across a '/', '?' or '#'.
+    let mut user_info: Option<String> = None;
+    {
+        let mut q = p;
+        let mut at = None;
+        while q < n {
+            match b[q] {
+                b'/' | b'?' | b'#' => break,
+                b'@' => {
+                    at = Some(q);
+                    break;
+                }
+                _ => q += 1,
             }
-            None => (hostport.to_string(), None),
+        }
+        if let Some(q) = at {
+            user_info = Some(a[p..q].to_string());
+            p = q + 1; // skip '@'
+        }
+    }
+
+    // hostname, IPv4 address, or IPv6 address
+    let host;
+    if p < n && b[p] == b'[' {
+        // DEVIATION from RFC2396, per RFC2732: an IPv6 literal. The body's own
+        // grammar (`parseIPv6Reference`, scope ids) is policed by the URI
+        // constructor before an object exists, so it is not re-checked here;
+        // what matters for the accessors is where the host ends.
+        let start = p;
+        p += 1;
+        let mut q = p;
+        let mut close = None;
+        while q < n {
+            match b[q] {
+                b'/' | b'?' | b'#' => break,
+                b']' => {
+                    close = Some(q);
+                    break;
+                }
+                _ => q += 1,
+            }
+        }
+        match close {
+            Some(q) if q > p => {
+                host = Some(a[start..=q].to_string());
+                p = q + 1;
+            }
+            // failExpecting("closing bracket for IPv6 address")
+            _ => return None,
         }
     } else {
-        // Reg-name: port (if any) follows the last ':'.
-        match hostport.rfind(':') {
-            Some(j) => (
-                hostport[..j].to_string(),
-                Some(hostport[j + 1..].to_string()),
-            ),
-            None => (hostport.to_string(), None),
-        }
-    };
-    let port = port_str
-        .and_then(|p| {
-            if p.is_empty() {
-                None
-            } else {
-                p.parse::<i32>().ok()
+        match uri_parse_ipv4_address(b, p, n) {
+            Some(q) if q > p => {
+                host = Some(a[p..q].to_string());
+                p = q;
             }
-        })
-        .unwrap_or(-1);
-    let host = if host.is_empty() { None } else { Some(host) };
-    (userinfo, host, port)
+            _ => {
+                let (h, q) = uri_parse_hostname(a, p, n)?;
+                host = Some(h);
+                p = q;
+            }
+        }
+    }
+
+    // port
+    let mut port = -1i32;
+    if p < n && b[p] == b':' {
+        p += 1;
+        // `q = scan(p, n, "/")` — an authority never contains a '/', so the
+        // port runs to the end of the authority. That is why `http://h:80:90/p`
+        // has port text "80:90" and demotes, rather than splitting on the LAST
+        // colon and answering 90.
+        let q = n;
+        if q > p {
+            // checkChars(p, q, L_DIGIT, H_DIGIT, "port number") — DIGITS ONLY.
+            // No sign, no space, no trailing junk.
+            if !b[p..q].iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            // Integer.parseInt(input, p, q, 10); a NumberFormatException here
+            // is `fail("Malformed port number")`, which demotes just the same.
+            // Leading zeros are fine and are not part of the value:
+            // MEASURED `http://h:00000000080/p` → 80, `http://h:007/p` → 7.
+            port = a[p..q].parse::<i32>().ok()?;
+            p = q;
+        }
+    } else if p < n {
+        // `else if (p < n && skipParseException) return p;` — the caller then
+        // sees `q < n` and demotes.
+        return None;
+    }
+
+    if p < n {
+        // failExpecting("port number", p)
+        return None;
+    }
+    Some((user_info, host, port))
+}
+
+/// Transcription of `java.net.URI$Parser.parseHostname` (JDK 25.0.3+9).
+/// Returns `(host, end)` or `None` when the hostname parse fails — which is
+/// the JDK's `fail(...)`, and also its `skipParseException` early return, both
+/// of which end in the same registry-based demotion.
+///
+/// The grammar is `domainlabel = alphanum [ *( alphanum | "-" ) alphanum ]`,
+/// labels joined by `.`, and one extra rule that is NOT in RFC 2396: when
+/// there is more than one label, the LAST one must START with a letter.
+/// MEASURED: `http://a.9b/p` has a null host and `http://a.b9/p` does not,
+/// while the single-label `http://9h/p` and `http://12/p` are both fine
+/// because the check is `l > start`.
+fn uri_parse_hostname(a: &str, start: usize, n: usize) -> Option<(String, usize)> {
+    let b = a.as_bytes();
+    let mut p = start;
+    let mut l: Option<usize> = None; // start of last parsed label
+    loop {
+        let q = {
+            let mut q = p;
+            while q < n && b[q].is_ascii_alphanumeric() {
+                q += 1;
+            }
+            q
+        };
+        if q <= p {
+            break;
+        }
+        l = Some(p);
+        p = q;
+        let q = {
+            let mut q = p;
+            while q < n && (b[q].is_ascii_alphanumeric() || b[q] == b'-') {
+                q += 1;
+            }
+            q
+        };
+        if q > p {
+            if b[q - 1] == b'-' {
+                // fail("Illegal character in hostname", q - 1)
+                return None;
+            }
+            p = q;
+        }
+        if !(p < n && b[p] == b'.') {
+            break;
+        }
+        p += 1;
+        if p >= n {
+            break;
+        }
+    }
+    if p < n && b[p] != b':' {
+        return None;
+    }
+    let l = l?; // if (l < 0) failExpecting("hostname", start)
+    if l > start && !b[l].is_ascii_alphabetic() {
+        return None;
+    }
+    Some((a[start..p].to_string(), p))
+}
+
+/// Transcription of `java.net.URI$Parser.parseIPv4Address` plus the non-strict
+/// arm of `scanIPv4Address` (JDK 25.0.3+9). `Some(end)` when the text at
+/// `start` begins with a legal dotted quad that is followed by nothing or by a
+/// `:`; `None` otherwise, which sends the caller to `parseHostname`.
+fn uri_parse_ipv4_address(b: &[u8], start: usize, n: usize) -> Option<usize> {
+    let p = uri_scan_ipv4_address(b, start, n)?;
+    if p > start && p < n && b[p] != b':' {
+        return None;
+    }
+    Some(p)
+}
+
+fn uri_scan_ipv4_address(b: &[u8], start: usize, n: usize) -> Option<usize> {
+    let mut p = start;
+    // m = scan(p, n, L_DIGIT | L_DOT, …) — the address may only be looked for
+    // inside the leading run of digits and dots.
+    let mut m = p;
+    while m < n && (b[m].is_ascii_digit() || b[m] == b'.') {
+        m += 1;
+    }
+    if m <= p {
+        return None;
+    }
+    // The JDK's unrolled four-byte loop: `scanByte`, `.`, `scanByte`, `.`,
+    // `scanByte`, `.`, `scanByte`, and then the whole digit-and-dot run must be
+    // consumed. Any short break is a failure (the non-strict arm returns -1).
+    for i in 0..4 {
+        if i > 0 {
+            if !(p < m && b[p] == b'.') {
+                return None;
+            }
+            p += 1;
+        }
+        let q = uri_scan_byte(b, p, m);
+        if q <= p {
+            return None;
+        }
+        p = q;
+    }
+    if p < m {
+        return None;
+    }
+    Some(p)
+}
+
+/// `java.net.URI$Parser.scanByte` — a run of decimal digits whose value fits in
+/// a byte. Leading zeros do not count towards the three-digit limit, which is
+/// why `http://01.2.3.4/p` has host `01.2.3.4` on HotSpot (MEASURED) while
+/// `http://256.1.1.1/p` has none.
+fn uri_scan_byte(b: &[u8], start: usize, n: usize) -> usize {
+    let p = start;
+    let mut q = p;
+    while q < n && b[q].is_ascii_digit() {
+        q += 1;
+    }
+    if q <= p {
+        return q;
+    }
+    let mut i = p;
+    while i < q && b[i] == b'0' {
+        i += 1;
+    }
+    let significant = q - i;
+    if significant < 3 {
+        return q; // definitely < 255
+    }
+    if significant > 3 {
+        return p; // definitely > 255
+    }
+    // Exactly three significant digits: at most 999, so no overflow is possible
+    // and the JDK's `Integer.parseInt` cannot throw here.
+    let v: u32 = std::str::from_utf8(&b[i..q])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
+    if v > 255 {
+        return p;
+    }
+    q
 }
 
 /// Match `java.net.URI`'s server-based host acceptance for the cases keycloak's
@@ -3441,9 +3848,19 @@ pub(crate) fn uri_publish_named(
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
     let uri = "java/net/URI";
 
-    // toString() → raw string
+    // toString() -> the cached text, as the OBJECT, not a decoded copy.
+    //
+    // HotSpot's `URI.toString()` is `string != null ? string : defineString()`
+    // -- it hands back the very string it cached. Doing the same here is both
+    // exact and free: see `uri_raw_string_object` for the measured reason (a
+    // Rust `String` cannot carry an unpaired surrogate, so the copy
+    // substituted U+FFFD). The decode fallback stays for a URI with no cached
+    // text to hand back.
     r.register(uri, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(s) = uri_raw_string_object(ctx, this) {
+            return Ok(Some(Value::Object(Some(s))));
+        }
         let s = uri_raw_string(ctx, this);
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
@@ -3608,10 +4025,18 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             };
             return Ok(Some(host));
         }
-        // No authority section in the raw string → fall back to an explicit host
-        // slot set during construction. Slot 1 is OUR model's `host`; on a real
-        // `java.net.URI` it is `fragment`, so ask before reading it, and prefer
-        // the real class's own `host` field when the receiver has one.
+        // No authority section in the raw string. java.net.URI parses the host
+        // ONLY out of an authority, so there is no host here -- MEASURED
+        // 2026-08-13 (/tmp/U.java): `mailto:a@b.com`.getHost() and
+        // `a/b`.getHost() are both null on HotSpot, and this fallback answered
+        // "mailto:a@b.com" and "a" respectively by reading a slot that means
+        // something else on a real receiver. Keep the fallback ONLY when we
+        // could not obtain a raw string at all, which is the synthetic-model
+        // case it was written for.
+        if !raw.is_empty() {
+            return Ok(Some(Value::Object(None)));
+        }
+        // Fall back to an explicit host slot set during construction.
         if uri_has_synthetic_layout(ctx, this) {
             if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
                 if let Some(v) = ctx.read_string(s) {
@@ -3634,9 +4059,31 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // authority. Absent port is -1 (java.net.URI contract), not the int-default 0.
     r.register(uri, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Slot 2 is OUR model's `port`; on a real `java.net.URI` it is
-        // `authority`, a `String`, so this read used to answer a reference
-        // where an `Int` was expected on every real-layout receiver.
+        // The raw string is the authoritative source, exactly as it is for
+        // `getHost` above, and for the same reason: the stored `port` slot is
+        // written by several producers that do not all use `java.net.URI`'s
+        // grammar. `url_parse` serves `java.net.URL` too, whose port production
+        // is `Integer.parseInt` and therefore accepts a leading `+` — MEASURED,
+        // `new URL("http://h:+80/p").getPort()` is 80 on HotSpot while
+        // `new URI("http://h:+80/p").getPort()` is -1. While this read came
+        // first, guarded only by `if p > 0`, a URL-shaped 80 in the slot
+        // masked the URI answer; and for an authority-less `urn:isbn:0451450523`
+        // the same slot held 451450523. Deriving from the raw string keeps
+        // `getPort` and `getHost` on ONE model, so they cannot disagree about
+        // whether the authority demoted.
+        let raw = uri_raw_string(ctx, this);
+        if !raw.is_empty() {
+            if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+                let (_, _, port) = uri_parse_authority(&auth);
+                return Ok(Some(Value::Int(port)));
+            }
+            // A raw string with no `//authority` has no port at all.
+            return Ok(Some(Value::Int(-1)));
+        }
+        // No raw string: a purely synthetic receiver. Slot 2 is OUR model's
+        // `port`; on a real `java.net.URI` it is `authority`, a `String`, so
+        // this read used to answer a reference where an `Int` was expected on
+        // every real-layout receiver.
         if uri_has_synthetic_layout(ctx, this) {
             if let Value::Int(p) = ctx.get_field(this, 2) {
                 if p > 0 {
@@ -3647,11 +4094,6 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             if p > 0 {
                 return Ok(Some(Value::Int(p)));
             }
-        }
-        let raw = uri_raw_string(ctx, this);
-        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
-            let (_, _, port) = uri_parse_authority(&auth);
-            return Ok(Some(Value::Int(port)));
         }
         Ok(Some(Value::Int(-1)))
     });
@@ -8007,8 +8449,655 @@ fn url_component_ref(
     None
 }
 
+// ---------------------------------------------------------------------------
+// The `https:` carrier's TLS session
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. `URL.openConnection()` on an `https:` URL used to hand back
+// `javax/net/ssl/HttpsURLConnection` ITSELF, which is `abstract`. On HotSpot 25:
+//
+//     $ javap -p --module java.base javax.net.ssl.HttpsURLConnection
+//       public abstract java.lang.String getCipherSuite();
+//       public abstract java.security.cert.Certificate[] getLocalCertificates();
+//       public abstract java.security.cert.Certificate[] getServerCertificates()
+//
+// so all three threw `AbstractMethodError: ... has no Code attribute` on a
+// connection that had completed a real, certificate-verified handshake, and the
+// CONCRETE `getSSLSession()` on the same class answered `Optional.empty()`
+// SILENTLY -- "this connection has no TLS session" on a connection that has
+// one, with no diagnostic for a caller that branches on it. Measured against
+// HotSpot 25 in `docs/known-issues/jdk-only/P4A-TOMCAT-20260812.md` section 3
+// and re-measured for this record.
+//
+// The carrier is now the concrete `HttpsURLConnectionImpl`, as HotSpot returns.
+// That alone is NOT a fix: every method on that class is
+// `getfield delegate; invokevirtual DelegateHttpsURLConnection....`, and this
+// VM's carrier is allocated rather than constructed, so `delegate` is null and
+// the swap by itself only trades the `AbstractMethodError` for an NPE. The six
+// accessors below are the other half; they are registered on BOTH the Impl and
+// the abstract base so neither receiver can reach that bytecode.
+//
+// THE UNCONNECTED SHAPE IS MEASURED, NOT ASSUMED. On HotSpot 25, all six
+// accessors on a connection that has not completed a handshake throw the SAME
+// exception:
+//
+//     class = sun.net.www.protocol.https.HttpsURLConnectionImpl
+//     getCipherSuite        THREW java.lang.IllegalStateException: connection not yet open
+//     getServerCertificates THREW java.lang.IllegalStateException: connection not yet open
+//     getLocalCertificates  THREW java.lang.IllegalStateException: connection not yet open
+//     getPeerPrincipal      THREW java.lang.IllegalStateException: connection not yet open
+//     getLocalPrincipal     THREW java.lang.IllegalStateException: connection not yet open
+//     getSSLSession         THREW java.lang.IllegalStateException: connection not yet open
+//
+// `getSSLSession()` included -- so today's silent `Optional.empty()` is wrong
+// even for the unconnected case, and answering `IllegalStateException` here
+// cannot regress a caller relative to HotSpot.
+//
+// GC. The table holds PLAIN DATA only (two `String`s and the peer chain's DER
+// bytes), never an `ObjectRef`, so it needs no rooting in any collector path --
+// the same rule `sock_side_table` above states and for the same reason. It is
+// keyed by `NativeObjKey` (VM identity + `identityHashCode`), which is stable
+// across relocation and scoped to one VM, not by a raw address.
+
+/// One completed client handshake, as the six `HttpsURLConnection` session
+/// accessors need to answer it.
+#[derive(Clone, Debug, Default)]
+struct HttpsCarrierSession {
+    /// `TLSv1.3` / `TLSv1.2`, exactly as the handshake reported it.
+    protocol: String,
+    /// The negotiated cipher suite name, e.g. `TLS_AES_256_GCM_SHA384`.
+    cipher: String,
+    /// The peer's certificate chain, leaf first, DER-encoded.
+    peer_chain_der: Vec<Vec<u8>>,
+    /// Global-root HANDLE (never an `ObjectRef`) for the ONE `SSLSession`
+    /// object this carrier hands out; `0` until the first accessor mints it.
+    ///
+    /// A handle is plain data, so the "this table holds no `ObjectRef`" rule
+    /// stated above still holds exactly: the collector owns the reference, and
+    /// [`NativeContext::resolve_global_root`] hands back its current, possibly
+    /// relocated address. This is the same shape `jca::provider_chain` and
+    /// `jboss_jdkspecific` already use for a cached Java object.
+    ///
+    /// WHY IT HAS TO BE CACHED. MEASURED, `RSslLiveSession` on
+    /// `9964ca733`, 2026-08-17:
+    ///
+    /// ```text
+    /// CK RSslLiveSession client.sslSession.sameObjectTwice = false  WANT true
+    /// ```
+    ///
+    /// HotSpot's `HttpsURLConnection` holds one `SSLSession` for the
+    /// connection's lifetime; every accessor answers from it and
+    /// `getSSLSession()` wraps *that* object in a fresh `Optional`. This VM
+    /// minted a new session on every accessor call, which was invisible while
+    /// `getId()` answered `byte[0]` and became visible the moment the ids were
+    /// real — `getId()` is seeded from the object's identity, so two reads of
+    /// one connection disagreed about the same handshake.
+    session_root: usize,
+    /// The endpoint this connection DIALLED, as the URL named it — never
+    /// derived from the peer certificate and never from SNI.
+    ///
+    /// G51-1 §1 MEASURED both derivations wrong, with the IP-literal request
+    /// as the counter-example: leaf subject `CN=localhost`, SNI `localhost`,
+    /// and HotSpot's `getPeerHost()` answering `127.0.0.1`. The port is the
+    /// resolved one, so a default-port `https:` URL records `443` — which is
+    /// what the connection actually connected to.
+    ///
+    /// Carried here rather than looked up later because
+    /// [`https_session_object`] mints at the first ACCESSOR call, arbitrarily
+    /// long after the request returned; G51-1 §2 refused a "last dialled
+    /// endpoint" latch for exactly that reason, since `RSslLiveSession`'s
+    /// `distinct` family opens a second connection before re-reading the
+    /// first session and a latch would answer one connection's endpoint for
+    /// another's session.
+    peer_host: String,
+    peer_port: i32,
+}
+
+fn https_carrier_sessions() -> &'static OrderedPlMutex<HashMap<NativeObjKey, HttpsCarrierSession>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<NativeObjKey, HttpsCarrierSession>>> =
+        OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
+}
+
+/// Record the TLS session a completed `https:` request negotiated, against the
+/// `HttpsURLConnection` carrier that made it.
+///
+/// Called from the handshake path in `http_url_connection.rs`, which is the one
+/// place that has the protocol, the cipher suite, the peer chain and the
+/// dialled endpoint in hand at the same time. Without a call to this, every accessor below answers
+/// `IllegalStateException: connection not yet open`, which is HotSpot's own
+/// answer for a connection that has not handshaken -- so a missing call is a
+/// missing ANSWER, never a wrong one.
+///
+/// THE CALL SITE HAS ARRIVED. It is a single line inside
+/// `http_url_connection.rs`'s `huc_verify_hostname` (STEP 0), which is the only
+/// place holding all three values at once, and that file's own test asserts the
+/// line stays ABOVE the built-in check's early return. The note that used to
+/// stand here said this function was uncalled and carried `#[allow(dead_code)]`
+/// as "the reviewer's cue that the call site arrived"; the cue has fired.
+///
+/// A second handshake recorded against the same carrier REPLACES the entry, so
+/// the previously cached session object is released here rather than left
+/// rooted for the life of the VM — the `provider_chain::set_cached_provider`
+/// idiom. That is why this takes `&mut dyn NativeContext`: releasing a global
+/// root is a mutation. The existing call site passes a `&mut dyn
+/// NativeContext` already, so the signature change is invisible to it.
+pub(crate) fn record_https_carrier_session(
+    ctx: &mut dyn NativeContext,
+    connection: ObjectRef,
+    protocol: &str,
+    cipher: &str,
+    peer_chain_der: &[Vec<u8>],
+    peer_host: &str,
+    peer_port: u16,
+) {
+    let key = native_obj_key(&*ctx, connection);
+    let stale = {
+        let mut table = https_carrier_sessions().lock();
+        let stale = table.get(&key).map(|e| e.session_root).unwrap_or(0);
+        table.insert(
+            key,
+            HttpsCarrierSession {
+                protocol: protocol.to_string(),
+                cipher: cipher.to_string(),
+                peer_chain_der: peer_chain_der.to_vec(),
+                session_root: 0,
+                peer_host: peer_host.to_string(),
+                peer_port: i32::from(peer_port),
+            },
+        );
+        stale
+    };
+    if stale != 0 {
+        ctx.remove_global_root(stale);
+    }
+}
+
+/// Forget the recorded handshake for a carrier that has been RECYCLED, and
+/// release the `SSLSession` object it was holding.
+///
+/// MEASURED on HotSpot, `RSslLiveSession`'s `drainTrap` family: once the
+/// response body is fully drained the connection goes back to the
+/// `KeepAliveCache`, its delegate is released, and every CONNECTION-level
+/// accessor throws `IllegalStateException: connection not yet open` again —
+/// the same exception a never-handshaked connection throws. The SESSION object
+/// the application already holds survives and stays valid; it is the
+/// *connection's* view that is torn down. MEASURED on CratonVM
+/// (`9ae371468`, `target-rel3`) the four rows that says:
+///
+/// ```text
+/// drain.conn.cipherSuite.raises  = none  WANT java.lang.IllegalStateException
+/// drain.conn.cipherSuite.message = none  WANT connection not yet open
+/// drain.conn.sslSession.raises   = none  WANT java.lang.IllegalStateException
+/// drain.conn.sslSession.message  = none  WANT connection not yet open
+/// ```
+///
+/// This is the entry point that closes them, and it is deliberately the ONLY
+/// thing this file can contribute to it: the place that knows a body has been
+/// drained to EOF is the `https:` input stream in `http_url_connection.rs`, so
+/// the call site is a NOMINATION. Nothing here is unsafe while it is uncalled —
+/// the accessors simply answer for longer than HotSpot does, which is the
+/// friendlier direction and is what they do today.
+///
+/// It is also the table's only eviction path. Without it an entry — and, since
+/// this commit, a global root on one `SSLSession` — lives for as long as the VM
+/// does, one per HTTPS carrier ever handshaked.
+pub(crate) fn forget_https_carrier_session(ctx: &mut dyn NativeContext, connection: ObjectRef) {
+    let key = native_obj_key(&*ctx, connection);
+    forget_https_carrier_session_by_key(ctx, key);
+}
+
+/// [`forget_https_carrier_session`] for a caller that has the KEY but not the
+/// object.
+///
+/// The response-body drain observer is that caller. It is handed the
+/// `ByteArrayInputStream` and nothing else, and the carrier it must recycle
+/// may by then be unreachable from any root the observer can see — so the key
+/// is captured when the stream is built and carried, rather than the object.
+/// A `NativeObjKey` is two integers and holds nothing alive, which is exactly
+/// why it can be stored across an arbitrary span of Java execution when an
+/// `ObjectRef` could not.
+pub(crate) fn forget_https_carrier_session_by_key(ctx: &mut dyn NativeContext, key: NativeObjKey) {
+    let stale = {
+        let mut table = https_carrier_sessions().lock();
+        table.remove(&key).map(|e| e.session_root).unwrap_or(0)
+    };
+    if stale != 0 {
+        ctx.remove_global_root(stale);
+    }
+}
+
+/// The recorded session for this carrier, CLONED out of the table before
+/// anything else happens.
+///
+/// Cloning rather than holding the guard is load-bearing: every caller below
+/// goes on to allocate Java objects and to `invoke_virtual` into Java, and a
+/// native that holds a process-global lock across a call back into bytecode is
+/// the lock cycle this project has already paid for once (`registry-guard
+/// across a blocking call`).
+fn https_carrier_session(
+    ctx: &dyn NativeContext,
+    connection: ObjectRef,
+) -> Option<HttpsCarrierSession> {
+    let key = native_obj_key(ctx, connection);
+    https_carrier_sessions().lock().get(&key).cloned()
+}
+
+/// HotSpot's exact refusal for any session accessor on a connection that has
+/// not completed a handshake -- see the transcript above. A real, catchable
+/// `java.lang.IllegalStateException`, not an `IOException` whose message merely
+/// reads like one: callers catch this by type.
+fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    let jmsg = ctx.create_string("connection not yet open");
+    match ctx.new_object_initialized(
+        "java/lang/IllegalStateException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            // The caller's Java frame has no catch-local root for this yet and
+            // `new_object_initialized` has already released its constructor
+            // pin -- same hand-off as `socket_ex`.
+            let exc_pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        Ok(_) => ioex("connection not yet open"),
+        Err(failed) => failed,
+    }
+}
+
+/// The value BOTH HTTPS-client `SSLSession` minters write into
+/// `ssl_security::NEW13_SESS_TLSID` — a **presence marker, never a lookup
+/// key**.
+///
+/// F10. This slot used to hold `Int(-1)` on both of them, and `-1` is the
+/// "never negotiated" sentinel: `t27_tls::session_has_negotiated` reads exactly
+/// this slot and answers `slot2 >= 0`. Both minters are reached only from a
+/// handshake that **completed**, so `-1` asserted the opposite of the truth.
+/// While `session_has_negotiated`'s width-4 case fell into a catch-all
+/// `_ => true` the lie was invisible; F6 merged that arm onto `3 | 4` — the
+/// correct fix — and the lie became the answer. MEASURED, HotSpot 25.0.3+9-LTS
+/// `Microsoft-13877124`, loopback `HttpsServer` + `HttpsURLConnection`, three
+/// byte-identical runs (`scratchpad/f10/F10HttpsSession.java`):
+///
+/// ```text
+///   completed HTTPS handshake   isValid=true  idLen=32 cipher=TLS_AES_256_GCM_SHA384 proto=TLSv1.3
+///   never-connected SSLSocket   isValid=false idLen=0  cipher=SSL_NULL_WITH_NULL_NULL proto=NONE
+/// ```
+///
+/// **Why a marker and not a real id.** The preferred fix is to register the
+/// connection in the `servlet` TLS id space and write
+/// `RUSTLS_SOCK_ID_BASE + stream_id`, as `t27_tls`'s `SSLServerSocket.accept`
+/// does. That is not available here, and not merely because it is invasive:
+/// this connection's rustls state is a `StreamOwned<ClientConnection,
+/// TcpStream>` local to `http_url_connection::perform`, which **drops it before
+/// any of these accessors run** — `https_session_object` is called from
+/// `getSSLSession()`/`getPeerPrincipal()`/... long after `perform` returned, so
+/// at that moment there is no stream to register. Registering the still-live
+/// one from inside `huc_verify_hostname` would insert an entry that the HTTP
+/// exchange then closes locally and that nothing ever removes (`s2_tls_close`
+/// is the only remover, and it is never called for this stream): one leaked
+/// registry entry per HTTPS request, each permanently answering "this stream is
+/// alive". That trades a wrong boolean for an unbounded leak.
+///
+/// **Why THIS value, and why it is load-bearing.** Slot 2 is read as a lookup
+/// key by registrations that are LIVE in real-JDK mode — in particular
+/// `phases_late::ssl_security`'s `SSLSession.getPeerPrincipal`, which
+/// `s2_tls_peer_cert_chain_der(tls_id)`s it (E22-1 §1's `--dump-native-registry`
+/// table: `getPeerPrincipal` is owned by `ssl_security`, not `t27_tls`). So a
+/// marker that could ever equal a live TLS stream id would hand one connection
+/// **another connection's peer certificate chain** — a far worse failure than
+/// the one being fixed. This value sits outside every id range in
+/// `servlet.rs`: below `PENDING_CONNECT_SOCK_ID_BASE` (`0x1000_0000`),
+/// `PENDING_LAYERED_SOCK_ID_BASE` (`0x2000_0000`) and `RUSTLS_SOCK_ID_BASE`
+/// (`0x4000_0000`), and far above the small monotonic counter `s2_next_free_id`
+/// hands out, so `s2_tls_session_info`/`s2_tls_peer_cert_chain_der` on it are
+/// plain `HashMap` misses. It continues those three constants' halving
+/// sequence and rests on the identical, already load-bearing assumption they
+/// state: *"native-tls and rustls ids are small counters, so the high offset
+/// never collides."*
+///
+/// **What a miss costs, stated rather than assumed:** nothing changes
+/// direction. With `-1` those readers skipped the lookup and used an empty
+/// chain; with this marker they perform the lookup, miss, and use an empty
+/// chain. Same answer, same exception, for a reason that is now written down.
+/// (That answer is itself wrong for a completed handshake — HotSpot measures
+/// `getPeerPrincipal() == CN=localhost` — but it is wrong identically before
+/// and after this change; see this file's F10 record, NOMINATION 2.)
+///
+/// **Deliberately ONE constant rather than a per-connection counter.**
+/// `getId()`'s bytes do not come from this slot in either mode — `t27_tls`'s
+/// real-mode copy seeds from `gc_stable_objref_key(session)` and `tls.rs`'s
+/// `--synthetic-jdk` copy from `identity_hash_code(session)` — so per-session
+/// distinctness is already carried by the session object's identity, and
+/// varying this value would buy nothing while re-opening the collision surface
+/// the paragraph above closes.
+pub(crate) const HTTPS_CLIENT_SESSION_MARKER: i32 = 0x0800_0000;
+
+/// Materialise the recorded handshake as the same synthetic
+/// `javax/net/ssl/SSLSession` shape the hostname-verifier path builds, so the
+/// layout-aware accessors already registered in
+/// `t27_tls::register_ssl_session_real` read it correctly.
+///
+/// Deliberately NOT a second certificate decoder. `getPeerCertificates`,
+/// `getPeerPrincipal` and `getLocalPrincipal` are already implemented once, on
+/// `javax/net/ssl/SSLSession`; the accessors below delegate to them rather than
+/// re-deriving an X.509 subject from DER, which is the "thin direct helper
+/// reimplements the native" shape this workspace keeps finding.
+/// ONE OBJECT PER CARRIER, not one per call. The first accessor to ask mints
+/// the session, roots it globally and records the handle against the carrier;
+/// every later ask — from any of the six accessors, and from
+/// [`https_carrier_session_object`] — gets that same object back. See
+/// [`HttpsCarrierSession::session_root`] for the measured row this closes.
+fn https_session_object(
+    ctx: &mut dyn NativeContext,
+    connection: ObjectRef,
+    s: &HttpsCarrierSession,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(cached) = https_cached_session_object(&*ctx, connection) {
+        return Ok(cached);
+    }
+    // GC: the carrier is read again AFTER the allocations below, to key the
+    // table when the new session is published. A raw `ObjectRef` does not
+    // survive a moving young GC, and `identity_hash_code` on a vacated
+    // from-space address is not the identity of anything — so pin it first.
+    // This pin must be taken BEFORE the session's, because releasing a pin
+    // truncates the stack above it.
+    let conn_pin = ctx.pin_native_root(connection);
+    let session0 = try_alloc_concurrent_synthetic(
+        ctx,
+        "javax/net/ssl/SSLSession",
+        crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
+    )?;
+    let session_pin = ctx.pin_native_root(session0);
+
+    // GC: each allocated argument must survive the allocations that follow it,
+    // so the session is re-read from its pin before every write.
+    let proto_s = ctx.create_string(&s.protocol);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_PROTO,
+        Value::Object(Some(proto_s)),
+    );
+    let cipher_s = ctx.create_string(&s.cipher);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
+        Value::Object(Some(cipher_s)),
+    );
+    // This session's handshake COMPLETED — `https_carrier_session` only has an
+    // entry because `record_https_carrier_session` was called from the far side
+    // of a successful TLS handshake — so slot 2 must not carry the "never
+    // negotiated" sentinel. See `HTTPS_CLIENT_SESSION_MARKER` for the measured
+    // contract, for why this connection cannot be given a real `servlet` TLS id,
+    // and for why the marker's numeric value is not free to choose. Same value
+    // and same reason as `http_url_connection::huc_verify_hostname`'s session:
+    // the two minters share the constant so they cannot drift apart.
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_TLSID,
+        Value::Int(HTTPS_CLIENT_SESSION_MARKER),
+    );
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_client_peer_chain(ctx, session, s.peer_chain_der.clone());
+    // G51-1 N1. `getPeerHost()`/`getPeerPort()` cannot be answered from this
+    // shape or from the socket registry: slot 2 carries
+    // `HTTPS_CLIENT_SESSION_MARKER`, a constant chosen SO THAT every
+    // socket-registry lookup misses (see its doc comment for why this
+    // connection cannot be given a real `servlet` TLS id without leaking a
+    // registry entry per request). The fallback therefore misses by design,
+    // and the side table is the only place the answer can live.
+    //
+    // `record_session_peer_endpoint` is a no-op on an empty host AND a
+    // non-positive port, so a carrier recorded before this field existed —
+    // or any future path that cannot name an endpoint — leaves the readers
+    // falling through to `session_stream_id` exactly as they did before,
+    // rather than being shadowed by a row of `("", -1)`.
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_session_peer_endpoint(ctx, session, &s.peer_host, s.peer_port);
+
+    // Publish it as THE session for this carrier. The root is taken before the
+    // table is touched, and the table is consulted under its own lock with no
+    // allocation in between, so a second thread that minted concurrently loses
+    // its object here rather than leaving two live sessions and a leaked root.
+    let session = ctx.read_native_pin(session_pin, session0);
+    let handle = ctx.add_global_root(session);
+    let connection = ctx.read_native_pin(conn_pin, connection);
+    let key = native_obj_key(&*ctx, connection);
+    let mut claimed = false;
+    let mut winner = 0usize;
+    {
+        let mut table = https_carrier_sessions().lock();
+        if let Some(entry) = table.get_mut(&key) {
+            if entry.session_root == 0 {
+                entry.session_root = handle;
+                claimed = true;
+            } else {
+                winner = entry.session_root;
+            }
+        }
+    }
+    if !claimed {
+        ctx.remove_global_root(handle);
+        if winner != 0 {
+            if let Some(obj) = ctx.resolve_global_root(winner) {
+                return Ok(obj);
+            }
+        }
+    }
+    Ok(ctx.read_native_pin(session_pin, session0))
+}
+
+/// The session object already minted for this carrier, or `None` if none has
+/// been. Reads through the global-root handle, so the address is the collector's
+/// current one even after a moving collection.
+fn https_cached_session_object(
+    ctx: &dyn NativeContext,
+    connection: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = native_obj_key(ctx, connection);
+    let handle = {
+        let table = https_carrier_sessions().lock();
+        table.get(&key).map(|e| e.session_root)?
+    };
+    if handle == 0 {
+        return None;
+    }
+    ctx.resolve_global_root(handle)
+}
+
+/// THE `SSLSession` for a carrier whose handshake completed, for callers
+/// OUTSIDE this file — specifically `http_url_connection::huc_verify_hostname`,
+/// which currently mints a second, private one to hand to the application's
+/// `HostnameVerifier`.
+///
+/// MEASURED on HotSpot (`RSslLiveSession`'s `verifier` family): the object a
+/// `HostnameVerifier` is given and the object `getSSLSession()` returns
+/// afterwards are the SAME object — `verifier.sameObjectAsGetSSLSession`. Two
+/// minters cannot satisfy that no matter how identical their field writes are,
+/// which is why the fix is one minter with an entry point rather than a second
+/// copy of the same four `set_field` calls.
+///
+/// `None` means the carrier has no recorded handshake, i.e. the caller is
+/// upstream of `record_https_carrier_session`; it is NOT an error.
+pub(crate) fn https_carrier_session_object(
+    ctx: &mut dyn NativeContext,
+    connection: ObjectRef,
+) -> Option<Result<ObjectRef, MethodCallFailed>> {
+    let s = https_carrier_session(&*ctx, connection)?;
+    Some(https_session_object(ctx, connection, &s))
+}
+
+/// The six `javax.net.ssl.HttpsURLConnection` session accessors, on BOTH
+/// carrier classes.
+///
+/// Registered on the abstract base as well as the Impl because the base is
+/// still reachable: `javax/net/ssl/HttpsURLConnection` remains a carrier for
+/// anything that constructed one directly, and its three abstract declarations
+/// have no Code attribute at all, so without a native there is nothing to run.
+///
+/// REGISTRATION ORDER -- and a correction. `register()` is last-write-wins.
+/// The note that used to stand here checked ONE function, `http_url_connection
+/// .rs`'s `register_one`, found none of these six names in it, and concluded
+/// they could not be overwritten. That conclusion is FALSE, and the dump says
+/// so. `http_url_connection.rs` holds a SECOND registrar with the same
+/// function name as this one -- `register_https_session_accessors`, at
+/// `http_url_connection.rs:404` -- and it runs later.
+///
+/// RE-MEASURED 2026-08-17 on `9964ca733` (`target-rel2`), after another lane
+/// had edited `http_url_connection.rs`: the collapse is UNCHANGED, only the
+/// line numbers moved. `--dump-native-registry` under `--jdk-only`, both
+/// carrier classes, identical rows:
+///
+/// ```text
+/// getCipherSuite         owns_slot=false  net_phase_e.rs:8439
+/// getCipherSuite         owns_slot=TRUE   http_url_connection.rs:445  overwrote=bridge
+/// getServerCertificates  owns_slot=false  net_phase_e.rs:8447
+/// getServerCertificates  owns_slot=TRUE   http_url_connection.rs:405  overwrote=bridge
+/// getLocalCertificates   owns_slot=false  net_phase_e.rs:8470
+/// getLocalCertificates   owns_slot=TRUE   http_url_connection.rs:433  overwrote=bridge
+/// getPeerPrincipal       owns_slot=false  net_phase_e.rs:8488
+/// getPeerPrincipal       owns_slot=TRUE   http_url_connection.rs:466  overwrote=bridge
+/// getLocalPrincipal      owns_slot=false  net_phase_e.rs:8501
+/// getLocalPrincipal      owns_slot=TRUE   http_url_connection.rs:495  overwrote=bridge
+/// getSSLSession          owns_slot=TRUE   net_phase_e.rs:8519
+/// ```
+///
+/// `invocations` is 0 on every row of that dump, and that is NOT evidence of
+/// death: the probe it was taken from makes no HTTPS request. The field that
+/// settles ownership is `owns_slot`.
+///
+/// So FIVE of the six bodies below are dead: only `getSSLSession` runs, and
+/// only because the other file does not register it. A change to any of the
+/// other five here has no runtime effect at all -- it must be made in
+/// `http_url_connection.rs::register_https_session_accessors` instead (that
+/// file is not this lane's to edit; see the NOMINATION in
+/// `G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got-20260817.md`).
+///
+/// The general lesson, which the old note had exactly backwards: a shadowing
+/// registrar is not ruled out by grepping one function for one name. Only the
+/// dump settles it. `owns_slot=true` with a non-zero `invocations` is proof;
+/// source order is not.
+fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
+    // Bridge, explicitly and locally: these stand in for real JDK bytecode that
+    // exists and would work if `delegate` were populated. Set here rather than
+    // inherited from whatever category the enclosing registration scope happens
+    // to be in, so the `--dump-native-registry` kind for these six does not
+    // depend on where the call sits.
+    let __prev_cat = r.current_category();
+    r.set_category(NativeKind::Bridge);
+    for cls in [
+        "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+        "javax/net/ssl/HttpsURLConnection",
+    ] {
+        r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(s) = https_carrier_session(ctx, this) else {
+                return Err(https_not_yet_open(ctx));
+            };
+            let out = ctx.create_string(&s.cipher);
+            Ok(Some(Value::Object(Some(out))))
+        });
+        r.register(
+            cls,
+            "getServerCertificates",
+            "()[Ljava/security/cert/Certificate;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, this, &s)?;
+                // `SSLSession.getPeerCertificates` is the single implementation
+                // of "decode this chain into java.security.cert.Certificate
+                // mirrors", and it already throws SSLPeerUnverifiedException
+                // for an empty chain -- the real-JDK contract, and the same one
+                // HttpsURLConnection.getServerCertificates declares.
+                ctx.invoke_virtual(
+                    session,
+                    "getPeerCertificates",
+                    "()[Ljava/security/cert/Certificate;",
+                    &[],
+                )
+            },
+        );
+        r.register(
+            cls,
+            "getLocalCertificates",
+            "()[Ljava/security/cert/Certificate;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, this, &s)?;
+                ctx.invoke_virtual(
+                    session,
+                    "getLocalCertificates",
+                    "()[Ljava/security/cert/Certificate;",
+                    &[],
+                )
+            },
+        );
+        r.register(
+            cls,
+            "getPeerPrincipal",
+            "()Ljava/security/Principal;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, this, &s)?;
+                ctx.invoke_virtual(session, "getPeerPrincipal", "()Ljava/security/Principal;", &[])
+            },
+        );
+        r.register(
+            cls,
+            "getLocalPrincipal",
+            "()Ljava/security/Principal;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, this, &s)?;
+                ctx.invoke_virtual(
+                    session,
+                    "getLocalPrincipal",
+                    "()Ljava/security/Principal;",
+                    &[],
+                )
+            },
+        );
+        r.register(cls, "getSSLSession", "()Ljava/util/Optional;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(s) = https_carrier_session(ctx, this) else {
+                // NOT `Optional.empty()`. HotSpot throws here too (transcript
+                // above), and the empty Optional is precisely the silent lie
+                // this change exists to remove.
+                return Err(https_not_yet_open(ctx));
+            };
+            let session = https_session_object(ctx, this, &s)?;
+            let session_pin = ctx.pin_native_root(session);
+            // `java.util.Optional` has exactly one instance field, `value`, at
+            // slot 0 -- this is `Optional.ofNullable(session)` in the real
+            // layout, not the two-slot flag+value shape `http2.rs` uses.
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let session = ctx.read_native_pin(session_pin, session);
+            ctx.set_field(opt, 0, Value::Object(Some(session)));
+            Ok(Some(Value::Object(Some(opt))))
+        });
+    }
+    r.set_category(__prev_cat);
+}
+
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
+    register_https_session_accessors(r);
 
     // ---- java.net.URL(String) ------------------------------------------
     //
@@ -8950,20 +10039,71 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 // the carrier with `instanceof HttpsURLConnection`.  Returning
                 // the plain HTTP base here skipped that whole configuration
                 // branch, so its permissive TrustManager was never created.
-                "javax/net/ssl/HttpsURLConnection"
+                //
+                // The CONCRETE subclass is what the real JDK returns and it
+                // still satisfies that `instanceof` -- `javap` on HotSpot 25
+                // confirms
+                //   sun.net.www.protocol.https.HttpsURLConnectionImpl
+                //       extends javax.net.ssl.HttpsURLConnection
+                // -- so the Spring branch above is preserved. Handing back the
+                // ABSTRACT base instead made getCipherSuite(),
+                // getLocalCertificates() and getServerCertificates(), all three
+                // DECLARED ABSTRACT on it, throw
+                // `AbstractMethodError: ... has no Code attribute`. See
+                // `https_session_accessors` below, which is the other half of
+                // this change and must not be separated from it: the Impl's
+                // own bytecode is `getfield delegate; invokevirtual ...` for
+                // every one of those methods, and this carrier is allocated
+                // rather than constructed, so `delegate` is null and the swap
+                // alone would only trade the AbstractMethodError for an NPE.
+                "sun/net/www/protocol/https/HttpsURLConnectionImpl"
             } else {
                 "java/net/HttpURLConnection"
             };
             let conn = try_alloc_concurrent_synthetic(ctx, carrier, 16)?;
-            // Field HUC_URL holds the originating URL so `huc_url_string`
-            // and `getInputStream` can recover its external form.
-            ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
+            // BY NAME, NOT BY SLOT — and this is not a style preference.
+            //
+            // Both carriers selected above are REAL JDK classes with the
+            // JDK's own field layout, and this file's `HUC_*` constants are a
+            // synthetic map that does not match it. MEASURED at `e7e840264`
+            // on `RSslLiveSession`, with `CRATONVM_DBG_COERCION=1` naming
+            // this closure as the writer and `CRATONVM_DBG_LAYOUT=1`
+            // resolving the class (`cid=735 ... refs=7 fields=20`, which is
+            // exactly `javap`'s flattened instance-field list):
+            //
+            // ```text
+            //  slot  this file meant   the real field it hit        outcome
+            //  ----  ---------------   --------------------------  --------------------
+            //   0    HUC_URL           URLConnection.url      (L)   right by luck
+            //   1    HUC_METHOD        URLConnection.doInput  (Z)   String -> DESTROYED
+            //   7    HUC_DO_INPUT      URLConnection.connectTimeout (I)  silently = 1ms
+            //   9    HUC_CONNECTED     URLConnection.requests (L)   Int -> DESTROYED, null
+            // ```
+            //
+            // The guard fired on two of the four and said nothing about the
+            // other two, because `connectTimeout` is an `I` and takes an
+            // `Int(1)` without complaint. So the visible half was a warning
+            // and the invisible half was a 1-millisecond connect timeout on
+            // every connection this path hands out.
+            //
+            // `sun.net.www.MessageHeader requests` is the field that holds
+            // every request header the JDK's own code path would send, and it
+            // was being set to null on construction.
+            //
+            // Writing by name asks the class where its field is, so the four
+            // values land where they mean something: this is also the ONLY
+            // reason `HUC_URL` looked correct — `url` genuinely is slot 0.
+            // See `http_url_connection.rs`, which states the same rule for
+            // itself ("never write synthetic slots (they alias real fields on
+            // a real-JDK object)") and keeps its state in an identity-keyed
+            // side table.
+            ctx.set_field_by_name(conn, "url", Value::Object(Some(this)));
             // Default request method "GET" so `huc_perform` doesn't trip
             // on a missing method when the http(s) path is exercised.
             let m = ctx.create_string("GET");
-            ctx.set_field(conn, HUC_METHOD, Value::Object(Some(m)));
-            ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
-            ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+            ctx.set_field_by_name(conn, "method", Value::Object(Some(m)));
+            ctx.set_field_by_name(conn, "doInput", Value::Int(1));
+            ctx.set_field_by_name(conn, "connected", Value::Int(0));
             Ok(Some(Value::Object(Some(conn))))
         },
     );
@@ -10776,7 +11916,10 @@ fn re5_build_response(
 /// `"key: value"` lines (the shape both the synthetic `HttpResponse` and the
 /// synthetic `ResponseInfo` carry). The array is pinned across the
 /// allocation so a moving collector can't leave the stored reference stale.
-fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn re5_make_http_headers(
+    ctx: &mut dyn NativeContext,
+    hdr_arr: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pinned = match hdr_arr {
         Value::Object(Some(a)) => Some((ctx.pin_native_root(a), a)),
         _ => None,
@@ -11371,7 +12514,337 @@ fn re5_request_body_bytes(
     re5_collect_publisher_body(ctx, obj)
 }
 
-const RE5_REQUEST_TIMEOUT_FIELD: usize = 4;
+// ---------------------------------------------------------------------------
+// The synthetic `java/net/http/HttpRequest` / `HttpRequest$Builder` slot map.
+//
+// G29-1 (Mechanism A, instance 4). `HttpRequest$Builder.build()` mints an
+// object stamped with the ABSTRACT class `java/net/http/HttpRequest`, so the
+// receiver's runtime class IS the class every accessor resolves against.
+// `java.net.http.HttpRequest` declares SEVEN abstract instance methods
+// (`method`, `uri`, `timeout`, `version`, `bodyPublisher`, `expectContinue`,
+// `headers`); until 2026-08-17 only three had a native, and the other four
+// threw `AbstractMethodError: ... has no Code attribute` — the correct JVMS
+// answer to a question that should never have been asked, because the mistake
+// is at the mint, one call earlier. `HttpClient` in this same file is the
+// control: it registers 7 of 7 and all seven are measured correct.
+//
+// Both the builder and the request it builds use THIS layout, and `build()`
+// copies slot-for-slot, so the two must not drift. Slots 0..=4 predate G29-1
+// and are named here for the first time; 5..=7 are new.
+const RE5_REQUEST_METHOD: usize = 0; // String, never null (defaults to "GET")
+const RE5_REQUEST_URI: usize = 1; // String (the URI's text), null until set
+const RE5_REQUEST_BODY: usize = 2; // String | byte[] | Flow.Publisher: wire body
+const RE5_REQUEST_HEADERS: usize = 3; // String[] of "key: value", null until set
+const RE5_REQUEST_TIMEOUT_FIELD: usize = 4; // java.time.Duration, null = unset
+const RE5_REQUEST_EXPECT_CONTINUE: usize = 5; // Int 0/1 — a (Z) parameter really
+                                              // does arrive as an int here
+const RE5_REQUEST_VERSION: usize = 6; // HttpClient$Version, null = unset
+const RE5_REQUEST_BODY_PUBLISHER: usize = 7; // the BodyPublisher OBJECT itself
+const RE5_REQUEST_NUM_FIELDS: usize = 8;
+
+// The synthetic `java/net/http/HttpRequest$BodyPublisher`. Slot 0 is the
+// payload every existing reader already expects (`re5_request_body_bytes`
+// dispatches on its runtime type); slot 1 is the content length DECLARED by
+// `fromPublisher(pub, len)`, which cannot be derived from slot 0 because a
+// Flow.Publisher has no length until it is subscribed.
+const RE5_BP_PAYLOAD: usize = 0;
+const RE5_BP_DECLARED_LENGTH: usize = 1; // Long, or Object(None) = derive
+const RE5_BP_NUM_FIELDS: usize = 2;
+
+/// Allocate a fresh `HttpRequest$Builder` with every slot of
+/// [`RE5_REQUEST_NUM_FIELDS`] explicitly initialised.
+///
+/// Every slot is written, including the ones whose "unset" value is the
+/// allocator's zero: `build()` copies the whole range slot-for-slot, and a
+/// builder that only initialises a prefix leaves the tail reading whatever the
+/// allocator happened to leave there. That is how `expectContinue()` would
+/// come to answer a value nobody set.
+fn re5_new_request_builder(
+    ctx: &mut dyn NativeContext,
+    uri: Option<ObjectRef>,
+) -> MethodCallResult {
+    // `re5_uri_string`, `try_alloc_concurrent_synthetic` and `create_string`
+    // ALL allocate, and a moving collector can run inside any of them — so the
+    // URI text is produced first and pinned, the builder is pinned as soon as
+    // it exists, and both are read back through their pins before use. The
+    // batch started FIRST is the one unpinned at the end: releasing it releases
+    // everything pinned after it.
+    let uri_text = match uri {
+        Some(u) => Some(re5_uri_string(ctx, u)),
+        None => None,
+    };
+    let text_pin = uri_text.map(|t| (ctx.pin_native_root(t), t));
+    let b = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/net/http/HttpRequest$Builder",
+        RE5_REQUEST_NUM_FIELDS,
+    )?;
+    let b_pin = ctx.pin_native_root(b);
+    let m = ctx.create_string("GET");
+    let b_now = ctx.read_native_pin(b_pin, b);
+    ctx.set_field(b_now, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+    let text_now = text_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
+    ctx.set_field(b_now, RE5_REQUEST_URI, Value::Object(text_now));
+    ctx.set_field(b_now, RE5_REQUEST_BODY, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_HEADERS, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_TIMEOUT_FIELD, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_EXPECT_CONTINUE, Value::Int(0));
+    ctx.set_field(b_now, RE5_REQUEST_VERSION, Value::Object(None));
+    ctx.set_field(b_now, RE5_REQUEST_BODY_PUBLISHER, Value::Object(None));
+    match text_pin {
+        Some((pin, _)) => ctx.unpin_native_roots(pin),
+        None => ctx.unpin_native_roots(b_pin),
+    }
+    Ok(Some(Value::Object(Some(b_now))))
+}
+
+fn ise<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: message.into(),
+    }
+    .into()
+}
+
+/// A `NullPointerException` with NO message, which is what
+/// `Objects.requireNonNull(x)` produces. MEASURED: HotSpot's `POST(null)`,
+/// `method(null, …)`, `method("POST", null)`, `timeout(null)` and
+/// `version(null)` all report `getMessage() == null`, where `header(null, …)`
+/// reports the string `"name"`. The difference is observable from Java, so it
+/// is modelled rather than approximated.
+fn npe_no_message() -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::NullPointerException { message: None }.into()
+}
+
+/// The shared body of `HttpRequest$Builder.POST` and `.PUT`.
+fn re5_builder_verb_with_body(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    verb: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // MEASURED: `POST(null)` is `NullPointerException` with a null message on
+    // HotSpot. Do not silently build a body-less POST.
+    let publisher = match args.get(1).copied() {
+        Some(v @ Value::Object(Some(_))) => v,
+        _ => return Err(npe_no_message()),
+    };
+    let m = ctx.create_string(verb);
+    ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+    re5_builder_set_publisher(ctx, this, publisher);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// Record a `BodyPublisher` on a builder: both the wire payload (slot 2, which
+/// `re5_do_request` has always read) and the publisher OBJECT (slot 7, which
+/// `HttpRequest.bodyPublisher()` hands back). Two slots because they are two
+/// different questions — "what goes on the socket" and "what did the caller
+/// give me" — and the second one had no answer at all before G29-1.
+fn re5_builder_set_publisher(ctx: &mut dyn NativeContext, this: ObjectRef, publisher: Value) {
+    match publisher {
+        Value::Object(Some(bp)) => {
+            let body = ctx.get_field(bp, RE5_BP_PAYLOAD);
+            ctx.set_field(this, RE5_REQUEST_BODY, body);
+            ctx.set_field(this, RE5_REQUEST_BODY_PUBLISHER, Value::Object(Some(bp)));
+        }
+        _ => {
+            ctx.set_field(this, RE5_REQUEST_BODY, Value::Object(None));
+            ctx.set_field(this, RE5_REQUEST_BODY_PUBLISHER, Value::Object(None));
+        }
+    }
+}
+
+/// Mint a `BodyPublisher` over `payload`, with an optionally DECLARED content
+/// length. `None` means "derive the length from the payload at call time",
+/// which is what `ofString`/`ofByteArray`/`noBody` want.
+pub(crate) fn re5_new_body_publisher(
+    ctx: &mut dyn NativeContext,
+    payload: Value,
+    declared_length: Option<i64>,
+) -> MethodCallResult {
+    // The payload is pinned across the allocation so a moving collector cannot
+    // leave the stored reference stale — the same treatment
+    // `re5_make_http_headers` gives its header array.
+    let payload_pin = match payload {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let body = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/net/http/HttpRequest$BodyPublisher",
+        RE5_BP_NUM_FIELDS,
+    )?;
+    let payload_now = match payload_pin {
+        Some((pin, o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+        None => payload,
+    };
+    ctx.set_field(body, RE5_BP_PAYLOAD, payload_now);
+    ctx.set_field(
+        body,
+        RE5_BP_DECLARED_LENGTH,
+        match declared_length {
+            Some(n) => Value::Long(n),
+            None => Value::Object(None),
+        },
+    );
+    if let Some((pin, _)) = payload_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    Ok(Some(Value::Object(Some(body))))
+}
+
+/// Append one `"name: value"` line to a builder's header array, growing it if
+/// the fixed-size backing array is full.
+///
+/// The array was allocated at a fixed 32 entries and the old `header()` simply
+/// stopped writing when it ran out — the 33rd header vanished with no error at
+/// all. Grow instead: a silently dropped header is exactly the class of defect
+/// this directory exists to remove.
+fn re5_builder_append_header(ctx: &mut dyn NativeContext, this: ObjectRef, line: &str) {
+    // `create_string` and `new_array` allocate, so the builder is read back
+    // through a pin after each of them rather than carried as a bare local.
+    let this_pin = ctx.pin_native_root(this);
+    let line_obj = ctx.create_string(line);
+    let line_pin = ctx.pin_native_root(line_obj);
+    let this = ctx.read_native_pin(this_pin, this);
+    let arr = match ctx.get_field(this, RE5_REQUEST_HEADERS) {
+        Value::Object(Some(a)) => a,
+        _ => {
+            let a = ctx.new_array(ArrayElementType::Reference, 32);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this, RE5_REQUEST_HEADERS, Value::Object(Some(a)));
+            a
+        }
+    };
+    let line_obj = ctx.read_native_pin(line_pin, line_obj);
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        // "Free" is anything that is NOT a live reference, not specifically
+        // `Object(None)`. A reference array's cells are null on a real heap, so
+        // the two agree there — but they do not agree everywhere, and a
+        // free-slot scan that only recognises one spelling of empty walks off
+        // the end of a full array and doubles it on every single append.
+        if !matches!(ctx.get_array_element(arr, i), Value::Object(Some(_))) {
+            ctx.set_array_element(arr, i, Value::Object(Some(line_obj)));
+            ctx.unpin_native_roots(this_pin);
+            return;
+        }
+    }
+    // Full: copy into a doubled array and append there.
+    let arr_pin = ctx.pin_native_root(arr);
+    let grown = ctx.new_array(ArrayElementType::Reference, (len * 2).max(32));
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let line_obj = ctx.read_native_pin(line_pin, line_obj);
+    for i in 0..len {
+        let v = ctx.get_array_element(arr, i);
+        ctx.set_array_element(grown, i, v);
+    }
+    ctx.set_array_element(grown, len, Value::Object(Some(line_obj)));
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, RE5_REQUEST_HEADERS, Value::Object(Some(grown)));
+    ctx.unpin_native_roots(this_pin);
+}
+
+/// `setHeader(name, value)` — drop every existing line whose name matches
+/// case-insensitively, then append. HotSpot, MEASURED:
+/// `header("Accept","a").setHeader("Accept","z")` -> `{Accept=[z]}`.
+fn re5_builder_set_header(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, value: &str) {
+    if let Value::Object(Some(arr)) = ctx.get_field(this, RE5_REQUEST_HEADERS) {
+        let len = ctx.array_length(arr);
+        let mut kept: Vec<Value> = Vec::with_capacity(len);
+        for i in 0..len {
+            let cell = ctx.get_array_element(arr, i);
+            let drop = match cell {
+                Value::Object(Some(s)) => ctx
+                    .read_string(s)
+                    .and_then(|line| line.find(':').map(|c| line[..c].trim().to_string()))
+                    .is_some_and(|k| k.eq_ignore_ascii_case(name)),
+                _ => false,
+            };
+            if !drop {
+                kept.push(cell);
+            }
+        }
+        for (i, v) in kept.iter().enumerate() {
+            ctx.set_array_element(arr, i, *v);
+        }
+        for i in kept.len()..len {
+            ctx.set_array_element(arr, i, Value::Object(None));
+        }
+    }
+    re5_builder_append_header(ctx, this, &format!("{name}: {value}"));
+}
+
+/// The name/value validation `HttpRequest.Builder.header` and `setHeader`
+/// share. MEASURED on HotSpot 25.0.3+9-LTS:
+///
+/// ```text
+/// header(null, "v") -> NullPointerException: name
+/// header("k", null) -> NullPointerException: value
+/// header("",   "v") -> IllegalArgumentException: invalid header name: ""
+/// ```
+fn re5_check_header_pair(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Result<(String, String), MethodCallFailed> {
+    let name = match args.get(1).copied() {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => return Err(npe("name")),
+    };
+    let value = match args.get(2).copied() {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => return Err(npe("value")),
+    };
+    if name.is_empty() {
+        return Err(iae("invalid header name: \"\""));
+    }
+    Ok((name, value))
+}
+
+/// The `name` argument the four `HttpHeaders` readers share.
+/// MEASURED: `firstValue(null)` is a message-less NPE on HotSpot
+/// (`Objects.requireNonNull(name)`), not an empty Optional.
+fn re5_header_name_arg(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Result<String, MethodCallFailed> {
+    match args.get(1).copied() {
+        Some(Value::Object(Some(s))) => Ok(ctx.read_string(s).unwrap_or_default()),
+        _ => Err(npe_no_message()),
+    }
+}
+
+/// The `"key: value"` lines a request carries, grouped case-insensitively in
+/// first-seen order. Shared by `HttpHeaders.map`/`firstValue`/`allValues`/
+/// `firstValueAsLong`/`toString` so the five cannot come to disagree about
+/// what a header name means.
+fn re5_header_groups(ctx: &dyn NativeContext, headers: ObjectRef) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    if let Value::Object(Some(arr)) = ctx.get_field(headers, 0) {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                if let Some(line) = ctx.read_string(s) {
+                    if let Some(c) = line.find(':') {
+                        let k = line[..c].trim().to_string();
+                        let v = line[c + 1..].trim().to_string();
+                        if k.is_empty() {
+                            continue;
+                        }
+                        if let Some(g) = groups
+                            .iter_mut()
+                            .find(|(gk, _)| gk.eq_ignore_ascii_case(&k))
+                        {
+                            g.1.push(v);
+                        } else {
+                            groups.push((k, vec![v]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    groups
+}
 
 fn re5_request_timeout(
     ctx: &mut dyn NativeContext,
@@ -12001,30 +13474,23 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         req,
         "newBuilder",
         "()Ljava/net/http/HttpRequest$Builder;",
-        |ctx, _args| {
-            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
-            let m = ctx.create_string("GET");
-            ctx.set_field(b, 0, Value::Object(Some(m)));
-            ctx.set_field(b, 1, Value::Object(None));
-            ctx.set_field(b, 2, Value::Object(None));
-            ctx.set_field(b, 3, Value::Object(None));
-            Ok(Some(Value::Object(Some(b))))
-        },
+        |ctx, _args| re5_new_request_builder(ctx, None),
     );
     r.register(
         req,
         "newBuilder",
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
-            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
-            let m = ctx.create_string("GET");
-            ctx.set_field(b, 0, Value::Object(Some(m)));
-            let uri = obj_arg(args, 0)?;
-            let uri_s = re5_uri_string(ctx, uri);
-            ctx.set_field(b, 1, Value::Object(Some(uri_s)));
-            ctx.set_field(b, 2, Value::Object(None));
-            ctx.set_field(b, 3, Value::Object(None));
-            Ok(Some(Value::Object(Some(b))))
+            // MEASURED on HotSpot 25.0.3+9-LTS:
+            //   HttpRequest.newBuilder((URI) null)
+            //     -> NullPointerException: uri must be non-null
+            // `obj_arg` would raise an NPE too, but with the generic
+            // "null object argument" text that no differential can match.
+            let uri = match args.first().copied() {
+                Some(Value::Object(Some(u))) => u,
+                _ => return Err(npe("uri must be non-null")),
+            };
+            re5_new_request_builder(ctx, Some(uri))
         },
     );
     r.register(req, "timeout", "()Ljava/util/Optional;", |ctx, args| {
@@ -12058,14 +13524,14 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     // own logging/retry bookkeeping after building the request).
     r.register(req, "method", "()Ljava/lang/String;", |ctx, args| {
         let request = obj_arg(args, 0)?;
-        match ctx.get_field(request, 0) {
+        match ctx.get_field(request, RE5_REQUEST_METHOD) {
             m @ Value::Object(Some(_)) => Ok(Some(m)),
             _ => Ok(Some(Value::Object(Some(ctx.create_string("GET"))))),
         }
     });
     r.register(req, "uri", "()Ljava/net/URI;", |ctx, args| {
         let request = obj_arg(args, 0)?;
-        let uri_str = match ctx.get_field(request, 1) {
+        let uri_str = match ctx.get_field(request, RE5_REQUEST_URI) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
@@ -12077,6 +13543,69 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             &[Value::Object(Some(uri_string_obj))],
         )
     });
+    // G29-1. THE OTHER FOUR. `java.net.http.HttpRequest` declares seven
+    // abstract instance methods; `method`/`uri`/`timeout` above had natives and
+    // `version`/`bodyPublisher`/`expectContinue`/`headers` did not, so a request
+    // this VM had just minted answered four of its own seven accessors with
+    // `AbstractMethodError: ... has no Code attribute` (MEASURED, RJdkOptionalShape
+    // and G29-1's `HttpProbe` on every builder shape). Nothing about the object
+    // was missing — the builder had recorded the state for all four — the
+    // registrations simply stopped after three. `HttpClient` a few hundred lines
+    // above is the control: 7 of 7, and 7 of 7 measured correct.
+    //
+    // MEASURED on HotSpot 25.0.3+9-LTS for a request built with nothing set:
+    // `version()` and `bodyPublisher()` are `Optional.empty`, `expectContinue()`
+    // is `false`, `headers()` is an empty `HttpHeaders` — never null, and never
+    // an exception.
+    r.register(req, "version", "()Ljava/util/Optional;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let stored = ctx.get_field(request, RE5_REQUEST_VERSION);
+        re5_optional(ctx, stored)
+    });
+    r.register(
+        req,
+        "bodyPublisher",
+        "()Ljava/util/Optional;",
+        |ctx, args| {
+            let request = obj_arg(args, 0)?;
+            let stored = ctx.get_field(request, RE5_REQUEST_BODY_PUBLISHER);
+            re5_optional(ctx, stored)
+        },
+    );
+    // A (Z)-returning accessor: the int encoding is CORRECT here, unlike the
+    // reference-shaped setters. `RJdkOptionalShape.httpmint` calls this out
+    // explicitly as the family's negative control.
+    r.register(req, "expectContinue", "()Z", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let flag = ctx
+            .get_field(request, RE5_REQUEST_EXPECT_CONTINUE)
+            .as_int()
+            .unwrap_or(0);
+        Ok(Some(Value::Int(i32::from(flag != 0))))
+    });
+    r.register(
+        req,
+        "headers",
+        "()Ljava/net/http/HttpHeaders;",
+        |ctx, args| {
+            let request = obj_arg(args, 0)?;
+            let arr = ctx.get_field(request, RE5_REQUEST_HEADERS);
+            let headers = re5_make_http_headers(ctx, arr)?;
+            Ok(Some(Value::Object(Some(headers))))
+        },
+    );
+    // MEASURED: `HttpRequest.newBuilder(u).build().toString()` is
+    // `http://example.com/x GET` — `jdk.internal.net.http.ImmutableHttpRequest`
+    // overrides `toString`. Our object is stamped with the abstract class,
+    // which declares no `toString`, so it inherited `Object`'s
+    // `java.net.http.HttpRequest@1b6d3586`.
+    r.register(req, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let uri = read_field_string_or(ctx, request, RE5_REQUEST_URI, "");
+        let method = read_field_string_or(ctx, request, RE5_REQUEST_METHOD, "GET");
+        let s = ctx.create_string(&format!("{uri} {method}"));
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     let bl = "java/net/http/HttpRequest$Builder";
     r.register(
@@ -12085,12 +13614,23 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let uri = obj_arg(args, 1)?;
+            // MEASURED: HotSpot answers `NullPointerException: uri must be
+            // non-null`, the same text as the static `newBuilder(null)`.
+            let uri = match args.get(1).copied() {
+                Some(Value::Object(Some(u))) => u,
+                _ => return Err(npe("uri must be non-null")),
+            };
             let uri_s = re5_uri_string(ctx, uri);
-            ctx.set_field(this, 1, Value::Object(Some(uri_s)));
+            ctx.set_field(this, RE5_REQUEST_URI, Value::Object(Some(uri_s)));
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // GET()/DELETE() take no publisher, and MEASURED on HotSpot they CLEAR any
+    // publisher a previous POST/PUT put on the builder:
+    // `newBuilder(u).GET().build().bodyPublisher()` is `Optional.empty`, while
+    // `method("GET", BodyPublishers.noBody())` is `present:contentLength=0`.
+    // The two are not the same request, and a builder that only ever adds
+    // would report the first as the second.
     r.register(
         bl,
         "GET",
@@ -12098,7 +13638,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let m = ctx.create_string("GET");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
+            ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+            re5_builder_set_publisher(ctx, this, Value::Object(None));
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -12109,39 +13650,44 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let m = ctx.create_string("DELETE");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
+            ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+            re5_builder_set_publisher(ctx, this, Value::Object(None));
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // HEAD() is a DEFAULT interface method — it has real bytecode, and that
+    // bytecode is `method("HEAD", BodyPublishers.noBody())`, which would leave
+    // the built request reporting `bodyPublisher() == present:0`. MEASURED on
+    // HotSpot, `newBuilder(u).HEAD().build().bodyPublisher()` is **empty**:
+    // `HttpRequestBuilderImpl` overrides the default and passes no publisher at
+    // all, exactly as it does for `GET()`/`DELETE()`. Register it so the
+    // default body cannot run and invent one.
+    r.register(
+        bl,
+        "HEAD",
+        "()Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let m = ctx.create_string("HEAD");
+            ctx.set_field(this, RE5_REQUEST_METHOD, Value::Object(Some(m)));
+            re5_builder_set_publisher(ctx, this, Value::Object(None));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // `register` takes a plain `fn` pointer, so these two cannot be folded into
+    // a loop over the verb name without capturing it — hence one body each,
+    // both delegating to the same helper so they cannot drift.
     r.register(
         bl,
         "POST",
         "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let m = ctx.create_string("POST");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
-            if let Some(Value::Object(Some(bp))) = args.get(1) {
-                let body = ctx.get_field(*bp, 0);
-                ctx.set_field(this, 2, body);
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
+        |ctx, args| re5_builder_verb_with_body(ctx, args, "POST"),
     );
     r.register(
         bl,
         "PUT",
         "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let m = ctx.create_string("PUT");
-            ctx.set_field(this, 0, Value::Object(Some(m)));
-            if let Some(Value::Object(Some(bp))) = args.get(1) {
-                let body = ctx.get_field(*bp, 0);
-                ctx.set_field(this, 2, body);
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
+        |ctx, args| re5_builder_verb_with_body(ctx, args, "PUT"),
     );
     r.register(
         bl,
@@ -12149,57 +13695,166 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let k = value_or_string(ctx, args.get(1).copied().unwrap_or(Value::Object(None)), "");
-            let v = value_or_string(ctx, args.get(2).copied().unwrap_or(Value::Object(None)), "");
-            let line = ctx.create_string(&format!("{k}: {v}"));
-            let arr = match ctx.get_field(this, 3) {
-                Value::Object(Some(a)) => a,
-                _ => {
-                    let a = ctx.new_array(ArrayElementType::Reference, 32);
-                    ctx.set_field(this, 3, Value::Object(Some(a)));
-                    a
-                }
+            let (k, v) = re5_check_header_pair(ctx, args)?;
+            re5_builder_append_header(ctx, this, &format!("{k}: {v}"));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // setHeader(name, value) — REPLACES every existing value for `name`.
+    // Unregistered until G29-1: `HttpRequest$Builder` is an interface and the
+    // builder is minted as an instance of it, so calling this threw
+    // `AbstractMethodError: ... setHeader ... has no Code attribute` (MEASURED).
+    r.register(
+        bl,
+        "setHeader",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (k, v) = re5_check_header_pair(ctx, args)?;
+            re5_builder_set_header(ctx, this, &k, &v);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // headers(String...) — name/value PAIRS, appended like `header`.
+    // MEASURED: an odd count is `IllegalArgumentException: wrong number, 1, of
+    // parameters`; `headers()` with zero arguments is accepted and is a no-op.
+    r.register(
+        bl,
+        "headers",
+        "([Ljava/lang/String;)Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = match args.get(1).copied() {
+                Some(Value::Object(Some(a))) => a,
+                _ => return Err(npe_no_message()),
             };
-            let len = ctx.array_length(arr);
-            for i in 0..len {
-                if let Value::Object(None) = ctx.get_array_element(arr, i) {
-                    ctx.set_array_element(arr, i, Value::Object(Some(line)));
-                    break;
+            let n = ctx.array_length(arr);
+            if n % 2 != 0 {
+                return Err(iae(format!("wrong number, {n}, of parameters")));
+            }
+            let mut pairs: Vec<(String, String)> = Vec::with_capacity(n / 2);
+            let mut i = 0;
+            while i < n {
+                let name = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => return Err(npe_no_message()),
+                };
+                let value = match ctx.get_array_element(arr, i + 1) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => return Err(npe_no_message()),
+                };
+                if name.is_empty() {
+                    return Err(iae("invalid header name: \"\""));
                 }
+                pairs.push((name, value));
+                i += 2;
+            }
+            for (name, value) in pairs {
+                re5_builder_append_header(ctx, this, &format!("{name}: {value}"));
             }
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // copy() — an independent builder carrying the same state. The header
+    // array must be COPIED, not shared: two builders that alias one array are
+    // not two builders.
+    r.register(
+        bl,
+        "copy",
+        "()Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Two allocations happen below (the new builder, then the duplicate
+            // header array), so BOTH the source and the copy have to survive a
+            // collection that runs between them. One pin batch covers both:
+            // `unpin_native_roots(this_pin)` releases everything pinned from
+            // that point on, which is why the early-return path takes it too.
+            let this_pin = ctx.pin_native_root(this);
+            let copy = match re5_new_request_builder(ctx, None)? {
+                Some(Value::Object(Some(c))) => c,
+                other => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(other);
+                }
+            };
+            let copy_pin = ctx.pin_native_root(copy);
+            let src = ctx.read_native_pin(this_pin, this);
+            let copy_now = ctx.read_native_pin(copy_pin, copy);
+            for slot in 0..RE5_REQUEST_NUM_FIELDS {
+                if slot == RE5_REQUEST_HEADERS {
+                    continue;
+                }
+                let v = ctx.get_field(src, slot);
+                ctx.set_field(copy_now, slot, v);
+            }
+            if let Value::Object(Some(arr)) = ctx.get_field(src, RE5_REQUEST_HEADERS) {
+                let len = ctx.array_length(arr);
+                let dup = ctx.new_array(ArrayElementType::Reference, len);
+                let src = ctx.read_native_pin(this_pin, this);
+                let arr = match ctx.get_field(src, RE5_REQUEST_HEADERS) {
+                    Value::Object(Some(a)) => a,
+                    _ => arr,
+                };
+                for i in 0..len {
+                    let v = ctx.get_array_element(arr, i);
+                    ctx.set_array_element(dup, i, v);
+                }
+                let copy_now = ctx.read_native_pin(copy_pin, copy);
+                ctx.set_field(copy_now, RE5_REQUEST_HEADERS, Value::Object(Some(dup)));
+            }
+            let copy_now = ctx.read_native_pin(copy_pin, copy);
+            ctx.unpin_native_roots(this_pin);
+            Ok(Some(Value::Object(Some(copy_now))))
+        },
+    );
     // method(String, BodyPublisher) — the generic verb setter Spring uses for
-    // POST/PUT/PATCH (and any custom verb). Slot 0 = method name, slot 2 = body
-    // (carried only for literal publishers; see `re5_do_request`).
+    // POST/PUT/PATCH (and any custom verb).
     r.register(
         bl,
         "method",
         "(Ljava/lang/String;Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if let Some(m @ Value::Object(Some(_))) = args.get(1).copied() {
-                ctx.set_field(this, 0, m);
+            // MEASURED on HotSpot:
+            //   method(null, p)  -> NullPointerException (null message)
+            //   method("",   p)  -> IllegalArgumentException: illegal method <empty string>
+            //   method("POST", null) -> NullPointerException (null message)
+            // The old body accepted all three: a null name left the previous
+            // verb in place and an empty name was stored verbatim, so a
+            // request could go on the wire with a method nobody chose.
+            let name_obj = match args.get(1).copied() {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => return Err(npe_no_message()),
+            };
+            let name = value_or_string(ctx, name_obj, "");
+            if name.is_empty() {
+                return Err(iae("illegal method <empty string>"));
             }
-            if let Some(Value::Object(Some(bp))) = args.get(2) {
-                let body = ctx.get_field(*bp, 0);
-                ctx.set_field(this, 2, body);
-            }
+            let publisher = match args.get(2).copied() {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => return Err(npe_no_message()),
+            };
+            ctx.set_field(this, RE5_REQUEST_METHOD, name_obj);
+            re5_builder_set_publisher(ctx, this, publisher);
             Ok(Some(Value::Object(Some(this))))
         },
     );
-    // timeout(Duration) / expectContinue(boolean) / version(Version) — accepted
-    // and chained, but not separately modelled (request timeout is enforced by
-    // the caller; the bare client speaks HTTP/1.1). Returning `this` keeps the
-    // fluent builder chain intact instead of throwing AbstractMethodError.
     r.register(
         bl,
         "timeout",
         "(Ljava/time/Duration;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let timeout = obj_arg(args, 1)?;
+            // MEASURED: `timeout(null)` is a message-less NPE, and a
+            // non-positive duration is
+            // `IllegalArgumentException: Invalid duration: PT-1S` — the
+            // Duration's own `toString`. The message this raised until G29-1
+            // ("HttpRequest timeout must be positive") was the right refusal
+            // with the wrong words, which a differential vector compares.
+            let timeout = match args.get(1).copied() {
+                Some(Value::Object(Some(d))) => d,
+                _ => return Err(npe_no_message()),
+            };
             let is_zero = matches!(
                 ctx.invoke_virtual(timeout, "isZero", "()Z", &[])?,
                 Some(Value::Int(value)) if value != 0
@@ -12209,7 +13864,12 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(value)) if value != 0
             );
             if is_zero || is_negative {
-                return Err(iae("HttpRequest timeout must be positive"));
+                let text =
+                    match ctx.invoke_virtual(timeout, "toString", "()Ljava/lang/String;", &[])? {
+                        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                return Err(iae(format!("Invalid duration: {text}")));
             }
             ctx.set_field(
                 this,
@@ -12219,23 +13879,75 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // expectContinue(boolean) / version(Version) — both were `Ok(Some(args[0]))`
+    // until G29-1: they returned the builder for the fluent chain and DISCARDED
+    // the argument, so the two matching accessors on the built request had
+    // nothing to read even once they existed. (This is the second half of the
+    // same defect: `HttpRequest.version()` had no native AND no state.)
     r.register(
         bl,
         "expectContinue",
         "(Z)Ljava/net/http/HttpRequest$Builder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let flag = args.get(1).copied().and_then(|v| v.as_int()).unwrap_or(0);
+            ctx.set_field(
+                this,
+                RE5_REQUEST_EXPECT_CONTINUE,
+                Value::Int(i32::from(flag != 0)),
+            );
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
     r.register(
         bl,
         "version",
         "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpRequest$Builder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // MEASURED: `version(null)` is a message-less NPE on HotSpot.
+            let version = match args.get(1).copied() {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => return Err(npe_no_message()),
+            };
+            ctx.set_field(this, RE5_REQUEST_VERSION, version);
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
 
     r.register(bl, "build", "()Ljava/net/http/HttpRequest;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let req = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 5)?;
-        for i in 0..5 {
+        // MEASURED on HotSpot, in this order:
+        //   newBuilder().build()                    -> IllegalStateException: uri is null
+        //   newBuilder(URI.create("/relative"))     -> IllegalArgumentException: URI with undefined scheme
+        //   newBuilder(URI.create("ftp://h/x"))     -> IllegalArgumentException: invalid URI scheme ftp
+        // The refusals live on `build()` and not on `uri()` because that is
+        // where HotSpot puts them: `newBuilder(URI.create("ftp://..."))` alone
+        // does not throw.
+        let uri_text = read_field_string(ctx, this, RE5_REQUEST_URI);
+        match uri_text.as_deref() {
+            None => return Err(ise("uri is null")),
+            Some(text) => match text.find(':') {
+                None => return Err(iae("URI with undefined scheme")),
+                Some(colon) => {
+                    let scheme = text[..colon].to_ascii_lowercase();
+                    if scheme != "http" && scheme != "https" {
+                        return Err(iae(format!("invalid URI scheme {scheme}")));
+                    }
+                }
+            },
+        }
+        let req = try_alloc_concurrent_synthetic(
+            ctx,
+            "java/net/http/HttpRequest",
+            RE5_REQUEST_NUM_FIELDS,
+        )?;
+        // Slot-for-slot, over the WHOLE range. This loop read `0..5` while the
+        // builder carried five slots; every slot added after that would have
+        // been silently dropped at `build()` — which is how `expectContinue`
+        // and `version` could round-trip on the builder and vanish on the
+        // request. `RE5_REQUEST_NUM_FIELDS` is the single name both ends use.
+        for i in 0..RE5_REQUEST_NUM_FIELDS {
             let v = ctx.get_field(this, i);
             ctx.set_field(req, i, v);
         }
@@ -12248,14 +13960,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
-            ctx.set_field(
-                body,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            Ok(Some(Value::Object(Some(body))))
+            let payload = args.first().copied().unwrap_or(Value::Object(None));
+            re5_new_body_publisher(ctx, payload, None)
         },
     );
     r.register(
@@ -12263,11 +13969,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "noBody",
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             let empty = ctx.create_string("");
-            ctx.set_field(body, 0, Value::Object(Some(empty)));
-            Ok(Some(Value::Object(Some(body))))
+            re5_new_body_publisher(ctx, Value::Object(Some(empty)), None)
         },
     );
     r.register(
@@ -12275,41 +13978,64 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofByteArray",
         "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             // Keep the original byte[] rather than round-tripping it through a
             // Java String.  Request builders copy this literal value into their
             // request body slot, and `re5_request_body_bytes` already knows how
             // to materialise byte[] verbatim.  String::from_utf8_lossy changed
             // every non-UTF-8 octet into U+FFFD, corrupting compressed Zipkin
             // payloads (notably gzip's 0x8b and 0xff bytes) on the wire.
-            ctx.set_field(
-                body,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            Ok(Some(Value::Object(Some(body))))
+            let payload = args.first().copied().unwrap_or(Value::Object(None));
+            re5_new_body_publisher(ctx, payload, None)
         },
     );
     // fromPublisher(Flow.Publisher[, contentLength]) — Spring's streaming
     // POST/PUT path. Keep the publisher object in slot 0; `re5_do_request`
     // subscribes a native collector, requests demand, and assembles the emitted
-    // ByteBuffers into the wire body before opening the socket.
+    // ByteBuffers into the wire body before opening the socket. The one-arg
+    // overload has NO length until then, which is exactly what a declared
+    // length of -1 means; the two-arg overload carries the caller's.
     for desc in [
         "(Ljava/util/concurrent/Flow$Publisher;)Ljava/net/http/HttpRequest$BodyPublisher;",
         "(Ljava/util/concurrent/Flow$Publisher;J)Ljava/net/http/HttpRequest$BodyPublisher;",
     ] {
         r.register(bps, "fromPublisher", desc, |ctx, args| {
-            let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
-            ctx.set_field(
-                body,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            Ok(Some(Value::Object(Some(body))))
+            let payload = args.first().copied().unwrap_or(Value::Object(None));
+            let declared = match args.get(1).copied() {
+                Some(Value::Long(n)) => Some(n),
+                Some(Value::Int(n)) => Some(i64::from(n)),
+                _ => Some(-1),
+            };
+            re5_new_body_publisher(ctx, payload, declared)
         });
     }
+    // G29-1. `HttpRequest$BodyPublisher` is an INTERFACE declaring exactly one
+    // method, `contentLength()J`, and it had no native at all — the same 0-of-1
+    // ratio `PathMatcher.matches` had. Every publisher the five factories above
+    // mint is stamped with that interface, so
+    // `BodyPublishers.ofString("hi").contentLength()` threw
+    // `AbstractMethodError: ... has no Code attribute` (MEASURED), and
+    // `RJdkOptionalShape.httpmint` asks for it twice.
+    //
+    // MEASURED on HotSpot 25.0.3+9-LTS:
+    //   noBody()                  -> 0
+    //   ofString("hello")         -> 5   (UTF-8 bytes, not chars)
+    //   ofByteArray(new byte[5])  -> 5
+    //   fromPublisher(p)          -> -1
+    //   fromPublisher(p, 12)      -> 12
+    r.register(
+        "java/net/http/HttpRequest$BodyPublisher",
+        "contentLength",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Long(declared) = ctx.get_field(this, RE5_BP_DECLARED_LENGTH) {
+                return Ok(Some(Value::Long(declared)));
+            }
+            let payload = ctx.get_field(this, RE5_BP_PAYLOAD);
+            let bytes = re5_request_body_bytes(ctx, payload)?;
+            Ok(Some(Value::Long(bytes.len() as i64)))
+        },
+    );
 
     let bhs = "java/net/http/HttpResponse$BodyHandlers";
     r.register(
@@ -12467,32 +14193,22 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     let hh = "java/net/http/HttpHeaders";
     r.register(hh, "map", "()Ljava/util/Map;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Parse the stored "key: value" lines into insertion-ordered groups.
-        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let n = ctx.array_length(arr);
-            for i in 0..n {
-                if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
-                    if let Some(line) = ctx.read_string(s) {
-                        if let Some(c) = line.find(':') {
-                            let k = line[..c].trim().to_string();
-                            let v = line[c + 1..].trim().to_string();
-                            if k.is_empty() {
-                                continue;
-                            }
-                            if let Some(g) = groups
-                                .iter_mut()
-                                .find(|(gk, _)| gk.eq_ignore_ascii_case(&k))
-                            {
-                                g.1.push(v);
-                            } else {
-                                groups.push((k, vec![v]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Grouping is shared with `firstValue`/`allValues`/`firstValueAsLong`/
+        // `toString` (`re5_header_groups`) so the five cannot come to disagree
+        // about what a header name means. It was open-coded here.
+        //
+        // MEASURED on HotSpot 25.0.3+9-LTS: the map a real `HttpHeaders`
+        // returns is sorted CASE-INSENSITIVELY by name, not kept in first-seen
+        // order — `header("Z-Last",…).header("a-mid",…).header("A-First",…)`
+        // gives `{A-First=[3], a-mid=[2], Z-Last=[1]}`. (The real backing
+        // store is a `TreeMap<>(String.CASE_INSENSITIVE_ORDER)` made
+        // unmodifiable.) Values WITHIN one name stay in insertion order.
+        let mut groups = re5_header_groups(ctx, this);
+        groups.sort_by(|a, b| {
+            a.0.to_ascii_lowercase()
+                .cmp(&b.0.to_ascii_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let map_val = ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])?;
         let map = match map_val {
             Some(Value::Object(Some(m))) => m,
@@ -12531,6 +14247,141 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         let map_now = ctx.read_native_pin(map_pin, map);
         ctx.unpin_native_roots(map_pin);
         Ok(Some(Value::Object(Some(map_now))))
+    });
+    // G29-1. `headers()` is one of the four accessors that had no native, so
+    // until now nothing could reach an `HttpHeaders` from a REQUEST at all and
+    // `map()` was the only method this class carried. `java.net.http.HttpHeaders`
+    // declares four public readers; the other three were reachable only from a
+    // response and answered by real JDK bytecode reading slot 0 as the `Map` it
+    // declares — but slot 0 holds a `String[]` of "key: value" lines. Register
+    // all four against the shape this VM actually mints.
+    //
+    // MEASURED on HotSpot 25.0.3+9-LTS, headers {Accept: text/plain,
+    // Accept: text/html, X-Num: 42}:
+    //   firstValue("Accept")     -> Optional[text/plain]
+    //   firstValue("accept")     -> Optional[text/plain]   (case-insensitive)
+    //   firstValue("Nope")       -> Optional.empty
+    //   allValues("Accept")      -> [text/plain, text/html]
+    //   allValues("Nope")        -> []                     (empty list, not null)
+    //   firstValueAsLong("X-Num")-> OptionalLong[42]
+    //   firstValueAsLong("Nope") -> OptionalLong.empty
+    //   firstValueAsLong("Accept") -> NumberFormatException: For input string: "text/plain"
+    //   firstValue(null)         -> NullPointerException (null message)
+    r.register(
+        hh,
+        "firstValue",
+        "(Ljava/lang/String;)Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = re5_header_name_arg(ctx, args)?;
+            let first = re5_header_groups(ctx, this)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .and_then(|(_, v)| v.into_iter().next());
+            match first {
+                Some(v) => {
+                    let s = ctx.create_string(&v);
+                    ctx.invoke(
+                        "java/util/Optional",
+                        "of",
+                        "(Ljava/lang/Object;)Ljava/util/Optional;",
+                        &[Value::Object(Some(s))],
+                    )
+                }
+                None => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+            }
+        },
+    );
+    r.register(
+        hh,
+        "allValues",
+        "(Ljava/lang/String;)Ljava/util/List;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = re5_header_name_arg(ctx, args)?;
+            let values = re5_header_groups(ctx, this)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            let list_val = ctx.new_object_initialized("java/util/ArrayList", "()V", &[])?;
+            let list = match list_val {
+                Some(Value::Object(Some(l))) => l,
+                _ => return Ok(list_val),
+            };
+            let list_pin = ctx.pin_native_root(list);
+            for v in values {
+                let vs = ctx.create_string(&v);
+                let list_now = ctx.read_native_pin(list_pin, list);
+                ctx.invoke_virtual(
+                    list_now,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(vs))],
+                )?;
+            }
+            let list_now = ctx.read_native_pin(list_pin, list);
+            ctx.unpin_native_roots(list_pin);
+            Ok(Some(Value::Object(Some(list_now))))
+        },
+    );
+    r.register(
+        hh,
+        "firstValueAsLong",
+        "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = re5_header_name_arg(ctx, args)?;
+            let first = re5_header_groups(ctx, this)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .and_then(|(_, v)| v.into_iter().next());
+            match first {
+                None => ctx.invoke(
+                    "java/util/OptionalLong",
+                    "empty",
+                    "()Ljava/util/OptionalLong;",
+                    &[],
+                ),
+                // A header that is present but not a number is an ERROR, not
+                // an empty Optional: HotSpot lets `Long.parseLong`'s
+                // NumberFormatException out, message included. Answering
+                // `empty` here would make an unparsable Content-Length look
+                // like an absent one.
+                Some(text) => match text.trim().parse::<i64>() {
+                    Ok(n) => ctx.invoke(
+                        "java/util/OptionalLong",
+                        "of",
+                        "(J)Ljava/util/OptionalLong;",
+                        &[Value::Long(n)],
+                    ),
+                    Err(_) => Err(RuntimeError::NumberFormatException {
+                        message: format!("For input string: \"{text}\""),
+                    }
+                    .into()),
+                },
+            }
+        },
+    );
+    // MEASURED: `java.net.http.HttpHeaders@361e4cfc { {A-First=[3], …} }` —
+    // the Object-style identity prefix, then the map in braces.
+    r.register(hh, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mut groups = re5_header_groups(ctx, this);
+        groups.sort_by(|a, b| {
+            a.0.to_ascii_lowercase()
+                .cmp(&b.0.to_ascii_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let body = groups
+            .iter()
+            .map(|(k, v)| format!("{k}=[{}]", v.join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hash = ctx.identity_hash_code(this);
+        let text = format!("java.net.http.HttpHeaders@{hash:x} {{ {{{body}}} }}");
+        let s = ctx.create_string(&text);
+        Ok(Some(Value::Object(Some(s))))
     });
     ()
 }
@@ -12993,16 +14844,12 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getClientSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
-            // GC-safety: the allocation below can relocate `this`, and the
-            // identity hash we bind afterwards must be read from the live
-            // object. Pin across the alloc and read the forwarded address.
-            let this0 = obj_arg(args, 0)?;
-            let this_pin = ctx.pin_native_root(this0);
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
-            let this = ctx.read_native_pin(this_pin, this0);
-            ssc_bind(ctx, obj, this, SSC_TAG_CLIENT);
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(obj))))
+            // One carrier per (SSLContext, side), not one per call — see
+            // `ssc_carrier` for the measured identity row this restores. The
+            // GC-safety that used to live here moved in there with it.
+            let this = obj_arg(args, 0)?;
+            let carrier = ssc_carrier(ctx, this, SSC_TAG_CLIENT)?;
+            Ok(Some(Value::Object(Some(carrier))))
         },
     );
 
@@ -13013,13 +14860,9 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getServerSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
-            let this0 = obj_arg(args, 0)?;
-            let this_pin = ctx.pin_native_root(this0);
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
-            let this = ctx.read_native_pin(this_pin, this0);
-            ssc_bind(ctx, obj, this, SSC_TAG_SERVER);
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(obj))))
+            let this = obj_arg(args, 0)?;
+            let carrier = ssc_carrier(ctx, this, SSC_TAG_SERVER)?;
+            Ok(Some(Value::Object(Some(carrier))))
         },
     );
     // SSLSessionContext cache tuning, as driven by Tomcat's `SSLHostConfig`.
@@ -13043,7 +14886,12 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if size < 0 {
-            return Err(iae(format!("negative session cache size: {size}")));
+            // MEASURED: HotSpot throws `IllegalArgumentException` with a NULL
+            // message here, not a described one. Empty string is this crate's
+            // marker for a null `getMessage()` (see `types/src/error.rs`), and
+            // a message that cannot be derived can only be transcribed --
+            // here the transcription is "no message at all".
+            return Err(iae(String::new()));
         }
         ssc_set(ctx, this, |s| s.cache_size = size);
         Ok(None)
@@ -13052,7 +14900,9 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let secs = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if secs < 0 {
-            return Err(iae(format!("negative session timeout: {secs}")));
+            // Same null message as `setSessionCacheSize` above, measured on the
+            // same run.
+            return Err(iae(String::new()));
         }
         ssc_set(ctx, this, |s| s.timeout_secs = secs);
         Ok(None)
@@ -13095,7 +14945,19 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         ssc,
         "getSession",
         "([B)Ljavax/net/ssl/SSLSession;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |_ctx, args| {
+            // MEASURED (probe `G16Ctx`, HotSpot 25.0.3+9-LTS):
+            // `getSession(null)` throws `NullPointerException("session id
+            // cannot be null")`. It is the ONLY row of this family where a
+            // null argument is not just "nothing cached under that id": the
+            // empty array and an unknown id both answer null, and both already
+            // agreed. Returning null for a null id told a caller its lookup
+            // had MISSED when the JDK would have refused the call.
+            match args.get(1) {
+                Some(Value::Object(Some(_))) => Ok(Some(Value::Object(None))),
+                _ => Err(npe("session id cannot be null")),
+            }
+        },
     );
 
     let sf = "javax/net/ssl/SSLSocketFactory";
@@ -13584,6 +15446,260 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // `native-builtins/tests/registry_contracts.rs::
     // ssl_default_factory_and_context_have_the_documented_single_owner`.
     // See `fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
+}
+
+// ===========================================================================
+// RE.6b - the `java.net.ServerSocket` surface `javax.net.ssl.SSLServerSocket`
+//         INHERITS
+// ===========================================================================
+//
+// MEASURED 2026-08-17 on HotSpot 25.0.3+9-LTS vs the `--jdk-only` binary from
+// `d87dff06a`+2 (probe `G16Sweep`, record
+// `G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got-20260817.md`).
+//
+// `t27_tls::create_ssl_server_socket` hands back an instance of the REAL
+// `javax.net.ssl.SSLServerSocket`, then stores its listener id / local port /
+// closed flag in object slots 0/1/2. Those are not free slots: `javap -p
+// java.net.ServerSocket` (JDK 25) declares
+//
+//     0 impl (SocketImpl)   1 created (boolean)   2 bound (boolean)
+//     3 closed (boolean)    4 socketLock (Object) 5 options (Set)
+//
+// so slot 0 is the reference-typed `impl`. Writing a `Value::Int` there is
+// DROPPED by the field-layout guard (the same drop `SockSide`/`SsSide` were
+// introduced for), `impl` stays null, and every inherited method whose real
+// bytecode reads `getImpl()` throws
+//
+//     NullPointerException: Cannot invoke "java.net.SocketImpl.setOption(int,
+//     Object)" because the return value of "java.net.ServerSocket.getImpl()"
+//     is null
+//
+// which is where `RSslLiveSession` died on its FIRST statement,
+// `ss.setSoTimeout(SO_TIMEOUT_MS)`, before any TLS work.
+//
+// The repair here does not transcribe the JDK's answers - it borrows them.
+// Each of these nine methods is forwarded to a real, **unbound**
+// `java.net.ServerSocket` created on first use and remembered per receiver.
+// That is not an approximation: the sweep measured all four lifecycle points
+// on both VMs and every option row of a BOUND `sun.security.ssl.
+// SSLServerSocketImpl` is byte-identical to the same row on an UNBOUND plain
+// `ServerSocket` - value, exception class and message alike, including
+// `SO_REUSEPORT` -> `UnsupportedOperationException("'SO_REUSEPORT' not
+// supported")`, `setSoTimeout(-1)` -> `IllegalArgumentException("timeout <
+// 0")`, `setReceiveBufferSize(0)` -> `IllegalArgumentException("negative
+// receive size")` and `getOption(null)` -> a message-less NPE. The two
+// argument-check orderings that differ between siblings (`setSoTimeout` tests
+// closed-ness FIRST, `setReceiveBufferSize` tests the argument first) come
+// out right for free, because they are the real bytecode's orderings.
+//
+// Deliberately NOT registered here, and nominated to `t27_tls.rs` instead:
+// `isBound`, `getInetAddress`, `getLocalSocketAddress` and `toString`. They
+// need the bind ADDRESS, which only `create_ssl_server_socket` sees, and they
+// have to move together: `ServerSocket.toString()` returns the constant
+// `"ServerSocket[unbound]"` while `isBound()` is false, so making `isBound()`
+// answer the oracle's `true` on its own converts a row that currently AGREES
+// with HotSpot into an NPE on `impl.getInetAddress()`.
+
+/// The real, unbound `java.net.ServerSocket` standing behind one
+/// `javax.net.ssl.SSLServerSocket`'s inherited option surface.
+///
+/// Held as a global-root HANDLE (`NativeContext::add_global_root`), never a
+/// bare `ObjectRef`: the collector moves objects and a stale reference
+/// resolves to whatever now occupies the slot. Same rule as `lang_class`'s
+/// package cache and `jca::provider_chain`'s provider table.
+#[derive(Clone, Copy, Debug)]
+struct SssOptionDelegate {
+    /// `add_global_root` handle of the delegate `java.net.ServerSocket`.
+    root: usize,
+    /// Whether the SSL socket's `close()` has already been mirrored onto the
+    /// delegate. One-way — a `ServerSocket` never reopens.
+    closed: bool,
+}
+
+/// Receiver identity hash -> its delegate. Only a `usize` handle and a `bool`
+/// are stored, so the table needs no GC roots of its own and survives object
+/// relocation (identity hash codes are stable across a move).
+fn sss_option_delegates() -> &'static Mutex<HashMap<i32, SssOptionDelegate>> {
+    static T: OnceLock<Mutex<HashMap<i32, SssOptionDelegate>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve — creating on first use — the delegate handle for `this`, and bring
+/// its closed-ness up to date with the SSL socket's.
+///
+/// `isClosed()` is asked of the SSL socket itself rather than read out of any
+/// field: `t27_tls` owns that native, its side table is the authority, and the
+/// object slot it also writes (`SSS_CLOSED = 2`) is really `ServerSocket.bound`
+/// (see the layout above), so the field says the opposite thing.
+fn sss_option_delegate_root(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<usize, MethodCallFailed> {
+    let key = ctx.identity_hash_code(this);
+    let known = sss_option_delegates().lock().get(&key).copied();
+
+    let mut entry = match known {
+        Some(e) if ctx.resolve_global_root(e.root).is_some() => e,
+        _ => {
+            let created = match ctx.new_object_initialized("java/net/ServerSocket", "()V", &[])? {
+                Some(Value::Object(Some(obj))) => obj,
+                _ => {
+                    return Err(ioex(
+                        "SSLServerSocket: could not create the delegate java.net.ServerSocket",
+                    ))
+                }
+            };
+            let root = ctx.add_global_root(created);
+            if root == 0 {
+                return Err(ioex(
+                    "SSLServerSocket: no global root for the delegate java.net.ServerSocket",
+                ));
+            }
+            // A FRESH delegate is open, whatever the previous one was, so the
+            // flag starts false and the sync below re-derives it from the SSL
+            // socket and closes this one if it has to. Inheriting the old
+            // `closed: true` would skip that sync and leave an OPEN delegate
+            // answering for a CLOSED socket -- the one state where every row of
+            // this surface is supposed to throw.
+            let fresh = SssOptionDelegate {
+                root,
+                closed: false,
+            };
+            sss_option_delegates().lock().insert(key, fresh);
+            fresh
+        }
+    };
+
+    if !entry.closed {
+        let closed = ctx
+            .invoke_virtual(this, "isClosed", "()Z", &[])?
+            .and_then(|v| v.as_int())
+            .unwrap_or(0)
+            != 0;
+        if closed {
+            let delegate = ctx.resolve_global_root(entry.root).ok_or_else(|| {
+                ioex("SSLServerSocket: delegate java.net.ServerSocket was collected")
+            })?;
+            ctx.invoke_virtual(delegate, "close", "()V", &[])?;
+            entry.closed = true;
+            sss_option_delegates().lock().insert(key, entry);
+        }
+    }
+    Ok(entry.root)
+}
+
+/// Forward one inherited call to the delegate, unchanged.
+///
+/// Every reference argument is pinned across the delegate lookup: creating the
+/// delegate runs a Java constructor and `isClosed()` runs a registered native,
+/// and either can move objects under the collector.
+fn sss_option_call(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    name: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let pin_base = ctx.pin_native_root(this);
+    let mut pinned: Vec<(usize, ObjectRef)> = Vec::new();
+    for value in args.iter().skip(1) {
+        if let Value::Object(Some(obj)) = value {
+            pinned.push((ctx.pin_native_root(*obj), *obj));
+        }
+    }
+    let receiver = ctx.read_native_pin(pin_base, this);
+    let root = match sss_option_delegate_root(ctx, receiver) {
+        Ok(root) => root,
+        Err(error) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(error);
+        }
+    };
+    let mut rest: Vec<Value> = Vec::with_capacity(args.len().saturating_sub(1));
+    let mut next = 0usize;
+    for value in args.iter().skip(1) {
+        match value {
+            Value::Object(Some(_)) => {
+                let (handle, fallback) = pinned[next];
+                next += 1;
+                rest.push(Value::Object(Some(ctx.read_native_pin(handle, fallback))));
+            }
+            other => rest.push(*other),
+        }
+    }
+    let delegate = ctx.resolve_global_root(root);
+    ctx.unpin_native_roots(pin_base);
+    let delegate = delegate
+        .ok_or_else(|| ioex("SSLServerSocket: delegate java.net.ServerSocket was collected"))?;
+    ctx.invoke_virtual(delegate, name, descriptor, &rest)
+}
+
+/// Descriptor of `ServerSocket.setOption`, spelled once so the registration and
+/// the forwarded call cannot drift apart.
+const SSS_SET_OPTION_DESC: &str =
+    "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/ServerSocket;";
+
+/// Register the nine inherited `java.net.ServerSocket` methods that a
+/// `javax.net.ssl.SSLServerSocket` receiver cannot answer for itself.
+///
+/// Every name here is disjoint from the set `t27_tls::register_sslserversocket`
+/// claims on the same class (`accept`, `bind`, `close`, `isClosed`,
+/// `getLocalPort`, and the protocol/client-auth pairs). That matters: this
+/// registrar runs from `register_phase_e_networking` (lib.rs:18688) and
+/// `register_sslserversocket` runs later, from `register_t27_natives`
+/// (lib.rs:18731), so a name in both files would be silently taken over by
+/// t27's body — the shadowing shape that has already cost this codebase a
+/// working fix more than once. `ssl_server_socket_option_registrar_*` below
+/// fails if a t27-owned name is ever added here.
+fn register_ssl_server_socket_options(r: &mut NativeMethodRegistry) {
+    let sss = "javax/net/ssl/SSLServerSocket";
+
+    r.register(sss, "getSoTimeout", "()I", |ctx, args| {
+        sss_option_call(ctx, args, "getSoTimeout", "()I")
+    });
+    r.register(sss, "setSoTimeout", "(I)V", |ctx, args| {
+        sss_option_call(ctx, args, "setSoTimeout", "(I)V")
+    });
+    r.register(sss, "getReuseAddress", "()Z", |ctx, args| {
+        sss_option_call(ctx, args, "getReuseAddress", "()Z")
+    });
+    r.register(sss, "setReuseAddress", "(Z)V", |ctx, args| {
+        sss_option_call(ctx, args, "setReuseAddress", "(Z)V")
+    });
+    r.register(sss, "getReceiveBufferSize", "()I", |ctx, args| {
+        sss_option_call(ctx, args, "getReceiveBufferSize", "()I")
+    });
+    r.register(sss, "setReceiveBufferSize", "(I)V", |ctx, args| {
+        sss_option_call(ctx, args, "setReceiveBufferSize", "(I)V")
+    });
+    r.register(sss, "supportedOptions", "()Ljava/util/Set;", |ctx, args| {
+        sss_option_call(ctx, args, "supportedOptions", "()Ljava/util/Set;")
+    });
+    r.register(
+        sss,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        |ctx, args| {
+            sss_option_call(
+                ctx,
+                args,
+                "getOption",
+                "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+            )
+        },
+    );
+    // `setOption` returns the socket for chaining, and it must be the SSL
+    // socket the caller passed in — handing back the delegate would let
+    // `ss.setOption(..).accept()` accept on the plain listener instead.
+    r.register(sss, "setOption", SSS_SET_OPTION_DESC, |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pin = ctx.pin_native_root(this);
+        let result = sss_option_call(ctx, args, "setOption", SSS_SET_OPTION_DESC);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        result?;
+        Ok(Some(Value::Object(Some(this))))
+    });
 }
 
 // ===========================================================================
@@ -18599,6 +20715,487 @@ mod tests {
         assert_eq!(fragment.as_deref(), Some("frag"));
     }
 
+    /// Helper for the authority family: `(userInfo, host, port)` as three
+    /// `Option`-free strings so a row reads like the oracle's own output.
+    fn auth_row(authority: &str) -> (String, String, i32) {
+        let (u, h, p) = uri_parse_authority(authority);
+        (
+            u.unwrap_or_else(|| "null".into()),
+            h.unwrap_or_else(|| "null".into()),
+            p,
+        )
+    }
+
+    const DEMOTED: (&str, &str, i32) = ("null", "null", -1);
+
+    fn assert_demoted(authority: &str) {
+        let (u, h, p) = auth_row(authority);
+        assert_eq!(
+            (u.as_str(), h.as_str(), p),
+            DEMOTED,
+            "authority {authority:?} must demote to registry-based: HotSpot answers \
+             null/null/-1 for getUserInfo/getHost/getPort together"
+        );
+    }
+
+    /// The blocker behind `RJdkBridge1`'s check 197 (`RJdkBridge1.java:1181`).
+    ///
+    /// MEASURED on Temurin 25.0.3+9-LTS, 2026-08-17: `java.net.URI`'s port
+    /// production is `*DIGIT`. Rust's `str::parse::<i32>` takes a leading `+`
+    /// or `-`, and the old body ended in `p.parse::<i32>().ok()`, so
+    /// `http://h:-5/p` answered `-5` where HotSpot answers `-1`.
+    ///
+    /// The half that a port-only clamp would have missed is on the next line
+    /// of the vector: a failed server-based parse does not just drop the port,
+    /// it demotes the whole authority to registry-based, so `getHost()` is
+    /// `null` too.
+    #[test]
+    fn uri_authority_port_is_digits_only_and_a_bad_port_demotes_the_whole_authority() {
+        for bad in [
+            "h:-5",          // leading '-'
+            "h:+80",         // leading '+', which java.net.URL DOES take
+            "h:-0",          // sign, even on a value that would parse
+            "h:8x",          // trailing non-digit
+            "h:x80",         // leading non-digit
+            "h:x",           // no digits at all
+            "h:80x80",       // digits either side of a non-digit
+            "h:99999999999", // all digits, overflows int
+            "h:2147483648",  // one past Integer.MAX_VALUE
+            "h:4294967296",  // and past the unsigned range too
+            "h:80:90",       // the port text runs to the END of the authority
+            "h::80",         // so a second colon is a non-digit, not a split
+            "u@h:x",         // userInfo is discarded WITH the host and port
+            "u:pw@h:8x",
+            "u@1.2.3.4:8x",
+        ] {
+            assert_demoted(bad);
+        }
+    }
+
+    /// The boundary rows that keep the demotion from over-firing. Leading
+    /// zeros are not part of the value and do not overflow anything.
+    #[test]
+    fn uri_authority_keeps_every_port_java_actually_accepts() {
+        for (authority, expect_host, expect_port) in [
+            ("h:80", "h", 80),
+            ("h:0", "h", 0),
+            ("h:007", "h", 7),
+            ("h:080", "h", 80),
+            ("h:00000000080", "h", 80),
+            ("h:0000000000000", "h", 0),
+            ("h:2147483647", "h", 2147483647),
+            ("h:", "h", -1),
+            ("h", "h", -1),
+            ("[::1]:80", "[::1]", 80),
+            ("[::1]:", "[::1]", -1),
+            ("[::1]:0", "[::1]", 0),
+            ("[::1]", "[::1]", -1),
+            ("1.2.3.4:80", "1.2.3.4", 80),
+        ] {
+            let (u, h, p) = auth_row(authority);
+            assert_eq!(
+                (u.as_str(), h.as_str(), p),
+                ("null", expect_host, expect_port),
+                "authority {authority:?}"
+            );
+        }
+    }
+
+    /// An EMPTY host demotes exactly like a bad port — `parseHostname`'s
+    /// `if (l < 0) failExpecting("hostname", start)`. MEASURED:
+    /// `new URI("http://:80/p").getPort()` is `-1` on HotSpot, not `80`, and
+    /// `new URI("http://u@:80/p").getUserInfo()` is `null`, not `u`.
+    #[test]
+    fn uri_authority_with_no_host_demotes_even_though_the_port_is_well_formed() {
+        assert_demoted(":80");
+        assert_demoted("u@:80");
+        assert_demoted("");
+        assert_demoted(".a");
+        assert_demoted("a..");
+    }
+
+    /// `parseHostname`'s grammar, which is NOT "anything that is not a port".
+    /// MEASURED, HotSpot answers a null host for every row here.
+    #[test]
+    fn uri_authority_hostname_grammar_rejects_what_java_rejects() {
+        for bad in [
+            "a_b",       // '_' is legal in a reg-name, not in a domain label
+            "a..b",      // empty label
+            "-h",        // label must START alphanumeric
+            "h-",        // and must not END with '-'
+            "a.9b",      // multi-label: the LAST label must start with a letter
+            "1.2.3",     // three octets is not an IPv4 address, and "3" is a
+            "1.2.3.4.5", //  digit-leading last label, so neither production fits
+            "1.2.3.4x",
+            "256.1.1.1",
+            "192.196.0.5555",
+            "h$x",
+            "h,x",
+            "h;x",
+            "h=x",
+            "h&x",
+            "h!x",
+            "h~x",
+            "h*x",
+            "h'x",
+            "h(x)",
+            "h%20x",
+            "h%41x", // an escape is legal in a reg-name, not in a host
+            "a@b@c", // the FIRST '@' delimits, so "b@c" must parse as a host
+            "u@h@",
+            "u@h:80@x",
+        ] {
+            assert_demoted(bad);
+        }
+    }
+
+    /// …and the hostnames it must keep. `9h` and `12` are single labels, where
+    /// the "starts with a letter" rule does not apply (`l > start` is false).
+    #[test]
+    fn uri_authority_hostname_grammar_keeps_what_java_keeps() {
+        for (authority, expect_host) in [
+            ("h.", "h."),
+            ("a.b.", "a.b."),
+            ("9h", "9h"),
+            ("h9", "h9"),
+            ("12", "12"),
+            ("a.b9", "a.b9"),
+            ("a-b", "a-b"),
+            ("a-b.c-d", "a-b.c-d"),
+            ("xn--d1acufc.xn--p1ai", "xn--d1acufc.xn--p1ai"),
+            ("A.B", "A.B"),
+            ("1.2.3.4", "1.2.3.4"),
+            ("255.255.255.255", "255.255.255.255"),
+            ("01.2.3.4", "01.2.3.4"), // leading zeros are not significant digits
+        ] {
+            let (_, h, p) = auth_row(authority);
+            assert_eq!(
+                (h.as_str(), p),
+                (expect_host, -1),
+                "authority {authority:?}"
+            );
+        }
+    }
+
+    /// User-info survives only when the whole server-based parse survives.
+    #[test]
+    fn uri_authority_user_info_is_taken_at_the_first_at_sign() {
+        assert_eq!(
+            auth_row("u:pw@h:80"),
+            ("u:pw".to_string(), "h".to_string(), 80)
+        );
+        assert_eq!(auth_row("u@h"), ("u".to_string(), "h".to_string(), -1));
+        // An empty user-info is not an absent one: HotSpot's
+        // `new URI("http://@h/p").getUserInfo()` is "".
+        assert_eq!(auth_row("@h"), (String::new(), "h".to_string(), -1));
+        // Escapes are legal in a user info; `getUserInfo` decodes them.
+        assert_eq!(
+            auth_row("a%40b@h"),
+            ("a%40b".to_string(), "h".to_string(), -1)
+        );
+        assert_eq!(
+            auth_row("u@[::1]:80"),
+            ("u".to_string(), "[::1]".to_string(), 80)
+        );
+    }
+
+    /// A second handshake recorded against the same carrier must DROP the
+    /// cached session handle, so the next accessor mints a session for the new
+    /// handshake instead of handing back the previous one, and so the old
+    /// global root is released rather than pinning that object for the life of
+    /// the VM.
+    ///
+    /// The mock context has no moving collector, so `add_global_root` is a
+    /// no-op returning 0 there; the handle slot is therefore driven directly.
+    /// What this test can see — and what a live run cannot easily be made to
+    /// show — is the INVALIDATION, which is the half that leaks if it is
+    /// missing.
+    #[test]
+    fn re_recording_a_carrier_handshake_drops_the_cached_session_handle() {
+        let mut ctx = MockNativeContext::new();
+        let carrier = ctx.alloc_object(ClassId::new(0), 4);
+        let key = native_obj_key(&ctx, carrier);
+
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384",
+            &[],
+            "example.test",
+            443,
+        );
+        let first = https_carrier_session(&ctx, carrier).expect("the handshake was recorded");
+        assert_eq!(first.protocol, "TLSv1.3");
+        assert_eq!(first.cipher, "TLS_AES_256_GCM_SHA384");
+        assert_eq!(
+            first.session_root, 0,
+            "a freshly recorded handshake has no session object yet"
+        );
+
+        // Stand in for "an accessor minted and rooted the session".
+        https_carrier_sessions()
+            .lock()
+            .get_mut(&key)
+            .expect("entry")
+            .session_root = 7;
+        assert_eq!(
+            https_carrier_session(&ctx, carrier).unwrap().session_root,
+            7
+        );
+
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.2",
+            "TLS_RSA_WITH_AES_128",
+            &[],
+            "example.test",
+            443,
+        );
+        let second = https_carrier_session(&ctx, carrier).expect("still recorded");
+        assert_eq!(second.protocol, "TLSv1.2");
+        assert_eq!(
+            second.session_root, 0,
+            "a new handshake must not hand out the previous handshake's SSLSession"
+        );
+    }
+
+    /// SOURCE WITNESS — the real-JDK carriers must be initialised BY NAME.
+    ///
+    /// `URL.openConnection()` hands back an instance of a real JDK class
+    /// (`HttpsURLConnectionImpl`, or the abstract `java/net/HttpURLConnection`),
+    /// and this file's `HUC_*` constants are a synthetic slot map that does not
+    /// match the JDK's layout. Four indexed writes landed on `url`, `doInput`,
+    /// `connectTimeout` and `requests`; the coercion guard caught two of them
+    /// and the other two were silent, because an `Int(1)` into `connectTimeout`
+    /// is a perfectly well-typed 1-millisecond timeout.
+    ///
+    /// This cannot be asserted behaviourally here: the mock context has no
+    /// real class layout, so an indexed write and a by-name write are the same
+    /// operation to it — which is exactly why the bug survived a full unit
+    /// suite. The witness is against the source, deliberately, and it is
+    /// scoped to the carrier branch rather than the whole file: the `jrt:`
+    /// carrier a few lines above IS a CratonVM synthetic with 16 slots of our
+    /// own, and indexed writes are correct there.
+    #[test]
+    fn the_real_jdk_carriers_are_initialised_by_field_name() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("net_phase_e.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("net_phase_e.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+
+        let anchor = lines
+            .iter()
+            .position(|l| l.contains(r#""sun/net/www/protocol/https/HttpsURLConnectionImpl""#))
+            .expect("the https carrier class must still be named here");
+        let alloc = lines[anchor..]
+            .iter()
+            .position(|l| l.contains("try_alloc_concurrent_synthetic(ctx, carrier"))
+            .map(|i| anchor + i)
+            .expect("the carrier allocation must still follow the class choice");
+        // The initialisation runs until the closure hands the object back.
+        let end = lines[alloc..]
+            .iter()
+            .position(|l| l.contains("Ok(Some(Value::Object(Some(conn))))"))
+            .map(|i| alloc + i)
+            .expect("the carrier must still be returned");
+
+        let indexed: Vec<&&str> = lines[alloc..end]
+            .iter()
+            .filter(|l| l.contains("ctx.set_field(conn,"))
+            .collect();
+        assert!(
+            indexed.is_empty(),
+            "a real-JDK carrier is being written by SLOT INDEX: {indexed:?}. Those              constants are this file's synthetic map and do not match the JDK's field              layout — MEASURED, slot 1 is URLConnection.doInput and slot 9 is              URLConnection.requests. Use ctx.set_field_by_name."
+        );
+        assert!(
+            lines[alloc..end]
+                .iter()
+                .filter(|l| l.contains("ctx.set_field_by_name(conn,"))
+                .count()
+                >= 4,
+            "the four values this carrier needs (url, method, doInput, connected) must              each be written by name"
+        );
+    }
+
+    /// G51-1 N1 — the carrier must CARRY the dialled endpoint, because the
+    /// object that needs it is minted long after the request returned.
+    ///
+    /// `https_session_object` runs at the first ACCESSOR call. By then
+    /// `perform` has returned, its `Url1` is gone, and — as G51-1 §2 measured
+    /// on `RSslLiveSession`'s own `distinct` family — a second connection may
+    /// already have been opened. Anything that recovers the endpoint at mint
+    /// time rather than carrying it from the handshake reports one
+    /// connection's peer for another's session. This test is what stops the
+    /// two fields being quietly dropped as unused.
+    #[test]
+    fn a_recorded_handshake_carries_the_endpoint_the_url_named() {
+        let mut ctx = MockNativeContext::new();
+        let carrier = ctx.alloc_object(ClassId::new(0), 4);
+
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384",
+            &[],
+            "127.0.0.1",
+            45123,
+        );
+
+        let s = https_carrier_session(&ctx, carrier).expect("the handshake was recorded");
+        assert_eq!(
+            s.peer_host, "127.0.0.1",
+            "the host is the one the URL NAMED. G51-1 §1 measured HotSpot answering the              IP literal for a request to https://127.0.0.1/, against a leaf subject of              CN=localhost and an SNI of localhost — so neither the certificate nor SNI              may be used to derive it"
+        );
+        assert_eq!(s.peer_port, 45123);
+    }
+
+    /// SOURCE WITNESS — `https_session_object` must write the endpoint it
+    /// carries into the side table the readers consult.
+    ///
+    /// This cannot be asserted behaviourally from here: `https_session_object`
+    /// allocates a real `javax/net/ssl/SSLSession` through
+    /// `try_alloc_concurrent_synthetic` and publishes it under a global root,
+    /// none of which the mock context models. What CAN be checked is that the
+    /// call is present and that it sits after the session is re-read from its
+    /// pin — a `record_session_peer_endpoint` on a stale `ObjectRef` would key
+    /// the table on a vacated from-space address and answer nothing, which is
+    /// indistinguishable from the bug this closes.
+    #[test]
+    fn the_minted_session_records_its_endpoint() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("net_phase_e.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("net_phase_e.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+
+        let fn_start = lines
+            .iter()
+            .position(|l| l.contains("fn https_session_object("))
+            .expect("https_session_object must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("https_session_object must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        let write = body
+            .iter()
+            .position(|l| l.contains("record_session_peer_endpoint("))
+            .expect(
+                "https_session_object must record the dialled endpoint; without it                  getPeerHost()/getPeerPort() answer null/-1 on every HTTPS client                  session — slot 2 is HTTPS_CLIENT_SESSION_MARKER, chosen so that the                  socket-registry fallback misses BY DESIGN, so the side table is the                  only place the answer can come from",
+            );
+        let reread = body[..write]
+            .iter()
+            .rposition(|l| l.contains("read_native_pin(session_pin, session0)"))
+            .expect("the session must be re-read from its pin before it is used");
+        assert!(
+            body[reread + 1..write]
+                .iter()
+                .all(|l| !l.contains("ctx.create_string(") && !l.contains("try_alloc")),
+            "an allocation sits between the session's re-read at body line {reread} and              record_session_peer_endpoint at body line {write} — a moving young GC there              leaves the table keyed on a vacated address"
+        );
+    }
+
+    /// Recycling a carrier removes its entry outright, so the six accessors go
+    /// back to answering `IllegalStateException: connection not yet open` —
+    /// HotSpot's own answer after a drained body — and the cached session stops
+    /// being held.
+    #[test]
+    fn forgetting_a_recycled_carrier_removes_the_entry_entirely() {
+        let mut ctx = MockNativeContext::new();
+        let carrier = ctx.alloc_object(ClassId::new(0), 4);
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_128_GCM_SHA256",
+            &[],
+            "example.test",
+            443,
+        );
+        assert!(https_carrier_session(&ctx, carrier).is_some());
+
+        forget_https_carrier_session(&mut ctx, carrier);
+        assert!(
+            https_carrier_session(&ctx, carrier).is_none(),
+            "a recycled carrier must have no recorded handshake left — a stale entry is how \
+             a connection that HotSpot reports as closed keeps answering"
+        );
+        // Idempotent: draining twice, or draining a connection that never
+        // handshaked, must not panic and must not release a handle twice.
+        forget_https_carrier_session(&mut ctx, carrier);
+    }
+
+    /// `https_session_object` must consult the cache BEFORE it allocates.
+    ///
+    /// The order is the whole fix: an allocation-first body that only *then*
+    /// looked at the table would still mint one `SSLSession` per accessor call
+    /// and only cache the last one, which is exactly the shape that made
+    /// `RSslLiveSession`'s `client.sslSession.sameObjectTwice` answer `false`.
+    /// No behavioural test can see that without a live TLS peer, so the
+    /// ordering is asserted against the source — the same witness shape
+    /// `http_url_connection.rs` already uses for `huc_verify_hostname`'s
+    /// capture-before-early-return rule.
+    #[test]
+    fn the_session_cache_lookup_precedes_the_allocation() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("net_phase_e.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("net_phase_e.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn https_session_object("))
+            .expect("https_session_object must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("https_session_object must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        let lookup = body
+            .iter()
+            .position(|l| l.contains("https_cached_session_object("))
+            .expect(
+                "https_session_object must consult the per-carrier cache; without it every \
+                 accessor mints a new SSLSession and getSSLSession() is not idempotent",
+            );
+        let alloc = body
+            .iter()
+            .position(|l| l.contains("try_alloc_concurrent_synthetic("))
+            .expect("https_session_object must still be the minter");
+        assert!(
+            lookup < alloc,
+            "the cache lookup is at body line {lookup}, BELOW the allocation at {alloc} — \
+             a session would be minted on every call and the cache would only ever record \
+             the last one"
+        );
+        assert!(
+            body.iter().any(|l| l.contains("add_global_root(")),
+            "the minted session must be held by a GLOBAL root: a raw ObjectRef in \
+             https_carrier_sessions would dangle after a moving collection"
+        );
+    }
+
     #[test]
     fn uri_scheme_specific_part_excludes_fragment() {
         assert_eq!(
@@ -19458,6 +22055,128 @@ mod tests {
         assert_eq!(req.body, b"hi");
     }
 
+    /// MEASURED 2026-08-17 (probe `G16Ctx`, HotSpot 25.0.3+9-LTS): a freshly
+    /// `init`-ed `SSLContext`'s session contexts answer 20480 and 86400 on the
+    /// first call, before anything is configured. They used to answer 0 and 0 —
+    /// which is not "no answer", it is the answer a caller gets after SETTING
+    /// zero, so the initial state was reporting itself as a configured one.
+    #[test]
+    fn ssl_session_context_defaults_are_the_measured_hotspot_values() {
+        let fresh = SscSide::default();
+        assert_eq!(
+            fresh.cache_size, 20480,
+            "SSLSessionContext.getSessionCacheSize() on an unconfigured context"
+        );
+        assert_eq!(
+            fresh.timeout_secs, 86400,
+            "SSLSessionContext.getSessionTimeout() on an unconfigured context, in seconds"
+        );
+    }
+
+    /// The nine inherited `java.net.ServerSocket` methods RE.6b takes over on a
+    /// `javax.net.ssl.SSLServerSocket` receiver. Each one was MEASURED throwing
+    /// `NullPointerException: ... the return value of
+    /// "java.net.ServerSocket.getImpl()" is null` before this registrar existed
+    /// (probe `G16Sweep`, 2026-08-17); `RSslLiveSession` died on the second of
+    /// them at its first statement.
+    #[test]
+    fn ssl_server_socket_inherited_option_surface_is_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_ssl_server_socket_options(&mut registry);
+        for (method, descriptor) in [
+            ("getSoTimeout", "()I"),
+            ("setSoTimeout", "(I)V"),
+            ("getReuseAddress", "()Z"),
+            ("setReuseAddress", "(Z)V"),
+            ("getReceiveBufferSize", "()I"),
+            ("setReceiveBufferSize", "(I)V"),
+            ("supportedOptions", "()Ljava/util/Set;"),
+            ("getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;"),
+            (
+                "setOption",
+                "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/ServerSocket;",
+            ),
+        ] {
+            assert!(
+                registry
+                    .find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                    .is_some(),
+                "missing SSLServerSocket.{method}{descriptor} native"
+            );
+        }
+    }
+
+    /// The registrar must NOT claim any name `t27_tls::register_sslserversocket`
+    /// owns on the same class. `register_phase_e_networking` runs at
+    /// lib.rs:18688 and `register_t27_natives` at lib.rs:18731, so a name in
+    /// both files is silently taken over by t27's later body — a fix that
+    /// compiles, registers, and never runs. That failure shape has already
+    /// landed twice in this codebase (HANDOFF-20260814 §5); this test is the
+    /// tripwire for the third time.
+    #[test]
+    fn ssl_server_socket_option_registrar_leaves_the_t27_owned_names_alone() {
+        let mut registry = NativeMethodRegistry::new();
+        register_ssl_server_socket_options(&mut registry);
+        for (method, descriptor) in [
+            ("accept", "()Ljava/net/Socket;"),
+            ("bind", "(Ljava/net/SocketAddress;)V"),
+            ("close", "()V"),
+            ("isClosed", "()Z"),
+            ("getLocalPort", "()I"),
+            ("getEnabledProtocols", "()[Ljava/lang/String;"),
+            ("getSupportedProtocols", "()[Ljava/lang/String;"),
+            ("setEnabledProtocols", "([Ljava/lang/String;)V"),
+            ("getNeedClientAuth", "()Z"),
+            ("setNeedClientAuth", "(Z)V"),
+            ("getWantClientAuth", "()Z"),
+            ("setWantClientAuth", "(Z)V"),
+        ] {
+            assert!(
+                registry
+                    .find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                    .is_none(),
+                "SSLServerSocket.{method}{descriptor} is t27_tls's; registering it \
+                 here is dead code, because register_t27_natives runs later and wins"
+            );
+        }
+    }
+
+    /// `isBound` / `getInetAddress` / `getLocalSocketAddress` / `toString` are
+    /// deliberately absent, and must stay absent until the bind ADDRESS reaches
+    /// this surface. MEASURED: `ServerSocket.toString()` short-circuits to the
+    /// constant `"ServerSocket[unbound]"` while `isBound()` is false, which is
+    /// the only reason `toString()` currently agrees with HotSpot on a live SSL
+    /// server socket. Registering `isBound` alone flips that agreeing row into
+    /// `NullPointerException: ... "this.impl" is null`. They move together or
+    /// not at all — see the NOMINATION in
+    /// `G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got-20260817.md`.
+    #[test]
+    fn ssl_server_socket_bound_identity_rows_are_not_registered_piecemeal() {
+        let mut registry = NativeMethodRegistry::new();
+        register_ssl_server_socket_options(&mut registry);
+        let bound_rows = [
+            ("isBound", "()Z"),
+            ("getInetAddress", "()Ljava/net/InetAddress;"),
+            ("getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
+            ("toString", "()Ljava/lang/String;"),
+        ];
+        let mut registered = 0usize;
+        for (method, descriptor) in bound_rows {
+            if registry
+                .find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                .is_some()
+            {
+                registered += 1;
+            }
+        }
+        assert!(
+            registered == 0 || registered == bound_rows.len(),
+            "{registered} of {} bind-address-dependent rows registered; isBound and \
+             toString are one contract and cannot land separately",
+            bound_rows.len()
+        );
+    }
+
     #[test]
     fn re6_ssl_context_session_accessors_are_registered() {
         let mut registry = NativeMethodRegistry::new();
@@ -19604,5 +22323,375 @@ mod tests {
                 "missing {class}.getExecutor bridge"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // G29-1 — the fabricated HttpRequest and its missing accessors.
+    //
+    // `HttpRequest$Builder.build()` mints an object stamped with the ABSTRACT
+    // class `java/net/http/HttpRequest`, so the receiver's runtime class IS the
+    // class every accessor resolves against and a missing registration is an
+    // `AbstractMethodError`, not a fallback. These tests pin the surface (every
+    // declared method has a row) and the slot map that surface reads.
+    // -----------------------------------------------------------------------
+
+    /// The seven instance accessors `java.net.http.HttpRequest` declares
+    /// (`javap -p`, JDK 25.0.3+9-LTS). Four of the seven had no row until
+    /// G29-1, and each of those four threw `AbstractMethodError` (MEASURED).
+    #[test]
+    fn http_request_registers_all_seven_declared_accessors() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        for (name, descriptor) in [
+            ("method", "()Ljava/lang/String;"),
+            ("uri", "()Ljava/net/URI;"),
+            ("timeout", "()Ljava/util/Optional;"),
+            ("version", "()Ljava/util/Optional;"),
+            ("bodyPublisher", "()Ljava/util/Optional;"),
+            ("expectContinue", "()Z"),
+            ("headers", "()Ljava/net/http/HttpHeaders;"),
+        ] {
+            assert!(
+                registry
+                    .find("java/net/http/HttpRequest", name, descriptor)
+                    .is_some(),
+                "java/net/http/HttpRequest.{name}{descriptor} has no native — it is \
+                 ABSTRACT and the receiver IS this class, so the call throws \
+                 AbstractMethodError"
+            );
+        }
+    }
+
+    /// `HttpRequest$Builder` is an INTERFACE and the builder object is stamped
+    /// with it, so the same rule covers every method it declares. `HEAD()` is a
+    /// default method with real bytecode and is registered anyway — MEASURED,
+    /// that bytecode leaves `bodyPublisher()` present where HotSpot answers
+    /// empty.
+    #[test]
+    fn http_request_builder_registers_its_whole_declared_surface() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        let b = "Ljava/net/http/HttpRequest$Builder;";
+        let publisher = "Ljava/net/http/HttpRequest$BodyPublisher;";
+        for (name, descriptor) in [
+            ("uri", format!("(Ljava/net/URI;){b}")),
+            ("expectContinue", format!("(Z){b}")),
+            (
+                "version",
+                format!("(Ljava/net/http/HttpClient$Version;){b}"),
+            ),
+            (
+                "header",
+                format!("(Ljava/lang/String;Ljava/lang/String;){b}"),
+            ),
+            ("headers", format!("([Ljava/lang/String;){b}")),
+            ("timeout", format!("(Ljava/time/Duration;){b}")),
+            (
+                "setHeader",
+                format!("(Ljava/lang/String;Ljava/lang/String;){b}"),
+            ),
+            ("GET", format!("(){b}")),
+            ("HEAD", format!("(){b}")),
+            ("POST", format!("({publisher}){b}")),
+            ("PUT", format!("({publisher}){b}")),
+            ("DELETE", format!("(){b}")),
+            ("method", format!("(Ljava/lang/String;{publisher}){b}")),
+            ("build", "()Ljava/net/http/HttpRequest;".to_string()),
+            ("copy", format!("(){b}")),
+        ] {
+            assert!(
+                registry
+                    .find("java/net/http/HttpRequest$Builder", name, &descriptor)
+                    .is_some(),
+                "java/net/http/HttpRequest$Builder.{name}{descriptor} has no native"
+            );
+        }
+    }
+
+    /// `BodyPublisher` declares exactly one method and had ZERO registrations —
+    /// the same 0-of-1 ratio `PathMatcher.matches` had. `HttpHeaders` declares
+    /// four public readers and carried only `map`.
+    #[test]
+    fn body_publisher_and_http_headers_readers_are_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        assert!(
+            registry
+                .find(
+                    "java/net/http/HttpRequest$BodyPublisher",
+                    "contentLength",
+                    "()J"
+                )
+                .is_some(),
+            "BodyPublisher.contentLength()J has no native"
+        );
+        for (name, descriptor) in [
+            ("map", "()Ljava/util/Map;"),
+            ("firstValue", "(Ljava/lang/String;)Ljava/util/Optional;"),
+            ("allValues", "(Ljava/lang/String;)Ljava/util/List;"),
+            (
+                "firstValueAsLong",
+                "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+            ),
+            ("toString", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                registry
+                    .find("java/net/http/HttpHeaders", name, descriptor)
+                    .is_some(),
+                "java/net/http/HttpHeaders.{name}{descriptor} has no native"
+            );
+        }
+    }
+
+    /// `build()` copies `0..RE5_REQUEST_NUM_FIELDS` slot-for-slot. It copied
+    /// `0..5` against a five-slot builder; the moment a slot was added past the
+    /// fifth, the copy would drop it and the accessor reading it would answer
+    /// the allocator's zero. Pin the map so the two ends cannot drift.
+    #[test]
+    fn request_slot_map_is_dense_distinct_and_bounded() {
+        let slots = [
+            RE5_REQUEST_METHOD,
+            RE5_REQUEST_URI,
+            RE5_REQUEST_BODY,
+            RE5_REQUEST_HEADERS,
+            RE5_REQUEST_TIMEOUT_FIELD,
+            RE5_REQUEST_EXPECT_CONTINUE,
+            RE5_REQUEST_VERSION,
+            RE5_REQUEST_BODY_PUBLISHER,
+        ];
+        let mut sorted = slots.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            slots.len(),
+            "two request slots share an index — one accessor is reading another's state"
+        );
+        assert_eq!(sorted, (0..RE5_REQUEST_NUM_FIELDS).collect::<Vec<_>>());
+        assert_eq!(RE5_BP_NUM_FIELDS, 2);
+        assert!(RE5_BP_PAYLOAD < RE5_BP_DECLARED_LENGTH);
+    }
+
+    /// `re5_new_request_builder` must initialise EVERY slot, not a prefix:
+    /// `build()` copies the whole range, so an uninitialised tail becomes the
+    /// built request's state.
+    #[test]
+    fn a_fresh_builder_initialises_every_slot_it_declares() {
+        let mut ctx = MockNativeContext::new();
+        let b = match re5_new_request_builder(&mut ctx, None).unwrap() {
+            Some(Value::Object(Some(b))) => b,
+            other => panic!("expected a builder object, got {other:?}"),
+        };
+        let method = match ctx.get_field(b, RE5_REQUEST_METHOD) {
+            Value::Object(Some(s)) => s,
+            other => panic!("method slot is not a String: {other:?}"),
+        };
+        assert_eq!(ctx.read_string(method), Some("GET".to_string()));
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_URI), Value::Object(None));
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_BODY), Value::Object(None));
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_HEADERS), Value::Object(None));
+        assert_eq!(
+            ctx.get_field(b, RE5_REQUEST_TIMEOUT_FIELD),
+            Value::Object(None)
+        );
+        assert_eq!(
+            ctx.get_field(b, RE5_REQUEST_EXPECT_CONTINUE),
+            Value::Int(0),
+            "expectContinue defaults to false on HotSpot (MEASURED)"
+        );
+        assert_eq!(ctx.get_field(b, RE5_REQUEST_VERSION), Value::Object(None));
+        assert_eq!(
+            ctx.get_field(b, RE5_REQUEST_BODY_PUBLISHER),
+            Value::Object(None)
+        );
+    }
+
+    /// MEASURED on HotSpot: two `header("Accept", …)` calls group into one name
+    /// with two values in insertion order, and a differently-cased name joins
+    /// the same group.
+    #[test]
+    fn header_lines_group_case_insensitively_in_first_seen_order() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), 1);
+        let arr = ctx.new_array(ArrayElementType::Reference, 4);
+        for (i, line) in ["Accept: a", "X-Foo: b", "accept: c"].iter().enumerate() {
+            let s = ctx.create_string(line);
+            ctx.set_array_element(arr, i, Value::Object(Some(s)));
+        }
+        ctx.set_field(holder, 0, Value::Object(Some(arr)));
+        let groups = re5_header_groups(&ctx, holder);
+        assert_eq!(
+            groups,
+            vec![
+                ("Accept".to_string(), vec!["a".to_string(), "c".to_string()]),
+                ("X-Foo".to_string(), vec!["b".to_string()]),
+            ]
+        );
+    }
+
+    /// The header array was a fixed 32 entries and `header()` stopped writing
+    /// when it filled up. MEASURED on HotSpot, a request with 40 headers reports
+    /// `map().size() == 40`, so the 33rd was being dropped in silence.
+    #[test]
+    fn appending_past_the_initial_capacity_grows_instead_of_dropping() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), RE5_REQUEST_NUM_FIELDS);
+        ctx.set_field(holder, RE5_REQUEST_HEADERS, Value::Object(None));
+        for i in 0..40 {
+            re5_builder_append_header(&mut ctx, holder, &format!("H{i}: v{i}"));
+        }
+        let groups = re5_header_groups(&ctx, holder);
+        assert_eq!(
+            groups.len(),
+            40,
+            "a header past the 32nd was dropped without a word"
+        );
+        assert_eq!(groups[39].0, "H39");
+        assert_eq!(groups[39].1, vec!["v39".to_string()]);
+    }
+
+    /// MEASURED: `header("Accept","a").setHeader("Accept","z")` leaves
+    /// `{Accept=[z]}` — `setHeader` REPLACES, and must not disturb other names.
+    #[test]
+    fn set_header_replaces_every_value_for_that_name_only() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), RE5_REQUEST_NUM_FIELDS);
+        ctx.set_field(holder, RE5_REQUEST_HEADERS, Value::Object(None));
+        re5_builder_append_header(&mut ctx, holder, "Accept: a");
+        re5_builder_append_header(&mut ctx, holder, "X-Foo: keep");
+        re5_builder_append_header(&mut ctx, holder, "accept: b");
+        re5_builder_set_header(&mut ctx, holder, "Accept", "z");
+        let groups = re5_header_groups(&ctx, holder);
+        assert_eq!(
+            groups,
+            vec![
+                ("X-Foo".to_string(), vec!["keep".to_string()]),
+                ("Accept".to_string(), vec!["z".to_string()]),
+            ]
+        );
+    }
+
+    /// A publisher minted with a DECLARED length answers it verbatim, including
+    /// the `-1` that `fromPublisher(p)` means by "unknown until subscribed".
+    /// Deriving it from the payload instead would subscribe a Flow.Publisher
+    /// inside a `contentLength()` call — a side effect in a getter.
+    #[test]
+    fn a_declared_publisher_length_is_stored_verbatim() {
+        let mut ctx = MockNativeContext::new();
+        let unknown = match re5_new_body_publisher(&mut ctx, Value::Object(None), Some(-1)).unwrap()
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a publisher, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(unknown, RE5_BP_DECLARED_LENGTH),
+            Value::Long(-1)
+        );
+        let derived = match re5_new_body_publisher(&mut ctx, Value::Object(None), None).unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a publisher, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(derived, RE5_BP_DECLARED_LENGTH),
+            Value::Object(None),
+            "no declared length must stay absent so contentLength() derives it"
+        );
+    }
+
+    /// `GET()`/`DELETE()`/`HEAD()` clear the publisher; the verb setters set
+    /// both the wire payload and the publisher object. MEASURED: a builder that
+    /// only ever ADDS reports `newBuilder(u).POST(p).GET().build()
+    /// .bodyPublisher()` as present, where HotSpot answers empty.
+    #[test]
+    fn clearing_the_publisher_clears_both_slots_it_owns() {
+        let mut ctx = MockNativeContext::new();
+        let holder = ctx.alloc_object(ClassId::new(0), RE5_REQUEST_NUM_FIELDS);
+        let publisher =
+            match re5_new_body_publisher(&mut ctx, Value::Object(None), Some(7)).unwrap() {
+                Some(Value::Object(Some(o))) => o,
+                other => panic!("expected a publisher, got {other:?}"),
+            };
+        let payload = ctx.create_string("hi");
+        ctx.set_field(publisher, RE5_BP_PAYLOAD, Value::Object(Some(payload)));
+        re5_builder_set_publisher(&mut ctx, holder, Value::Object(Some(publisher)));
+        assert_eq!(
+            ctx.get_field(holder, RE5_REQUEST_BODY_PUBLISHER),
+            Value::Object(Some(publisher))
+        );
+        assert_eq!(
+            ctx.get_field(holder, RE5_REQUEST_BODY),
+            Value::Object(Some(payload))
+        );
+        re5_builder_set_publisher(&mut ctx, holder, Value::Object(None));
+        assert_eq!(
+            ctx.get_field(holder, RE5_REQUEST_BODY_PUBLISHER),
+            Value::Object(None)
+        );
+        assert_eq!(ctx.get_field(holder, RE5_REQUEST_BODY), Value::Object(None));
+    }
+
+    /// The refusals, MEASURED on HotSpot 25.0.3+9-LTS. `header(null, v)` and
+    /// `header(k, null)` carry DIFFERENT messages, and both differ from the
+    /// message-less NPE the publisher/version/timeout setters raise. The
+    /// difference is observable from Java, so it is modelled, not approximated.
+    #[test]
+    fn header_pair_refusals_carry_the_measured_messages() {
+        let mut ctx = MockNativeContext::new();
+        let name = ctx.create_string("k");
+        let value = ctx.create_string("v");
+        let empty = ctx.create_string("");
+        let ok = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(Some(value)),
+            ],
+        );
+        assert_eq!(ok.ok(), Some(("k".to_string(), "v".to_string())));
+
+        let null_name = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(Some(value)),
+            ],
+        );
+        let text = format!("{:?}", null_name.err().unwrap());
+        assert!(
+            text.contains("name"),
+            "header(null, v) must be NullPointerException: name — got {text}"
+        );
+
+        let null_value = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(None),
+            ],
+        );
+        let text = format!("{:?}", null_value.err().unwrap());
+        assert!(
+            text.contains("value"),
+            "header(k, null) must be NullPointerException: value — got {text}"
+        );
+
+        let empty_name = re5_check_header_pair(
+            &ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(empty)),
+                Value::Object(Some(value)),
+            ],
+        );
+        let text = format!("{:?}", empty_name.err().unwrap());
+        assert!(
+            text.contains("invalid header name"),
+            "header(\"\", v) must be IllegalArgumentException: invalid header \
+             name — got {text}"
+        );
     }
 }

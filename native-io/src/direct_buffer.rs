@@ -740,12 +740,15 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // ByteBuffer defaults to BIG_ENDIAN. This allocator bypasses the Java
     // DirectByteBuffer constructor, so seed the order fields explicitly; XNIO
     // Remoting frames depend on putInt writing network-order lengths.
-    ctx.set_field_by_name(buf, "bigEndian", Value::Int(1));
-    ctx.set_field_by_name(
-        buf,
-        "nativeByteOrder",
-        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
-    );
+    //
+    // CONVERGED (F37-1 §4, landing F26-1's N1 and closing the fourth of W7-76
+    // §8.2's five sites). Byte-for-byte the pair this replaced — same two field
+    // names, same two values, same `cfg!(target_endian)` test — so this is a
+    // no-op today BY CONSTRUCTION, which is the point: the copy it removes is
+    // one that could drift, and its sibling in `native-builtins/src/charset.rs`
+    // already HAD (that one wrote `bigEndian` and not `nativeByteOrder`). Same
+    // crate as the helper, so a plain `crate::` path, not a cross-crate one.
+    crate::seed_buffer_byte_order(ctx, buf);
     // NIO-DIRECTBUFFER FIX (2026-06-04): the fixed-slot writes below assume a
     // layout (position@0/limit@1/capacity@2/mark@3) that does NOT match the real
     // `java.nio.Buffer` layout (mark@0/position@1/limit@2/capacity@3/address@4/

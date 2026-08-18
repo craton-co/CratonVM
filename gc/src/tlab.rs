@@ -1704,7 +1704,14 @@ mod tests {
     /// `cursor == end`, so `reserved_tail()` is `None` afterwards. The
     /// sub-8-byte-slack path used to return with `cursor < end` still true,
     /// which left a publishable span the filler had not covered.
-    #[test]
+    ///
+    /// **The `#[test]` for this used to sit HERE, above the doc comment of the
+    /// test below.** An insertion between an attribute and its `fn` moved the
+    /// attribute onto the wrong item: `retire_charges_...` was registered twice
+    /// and this test was registered NOT AT ALL. The only trace was a
+    /// `duplicate_macro_attributes` warning. See the crate-level
+    /// `deny(duplicate_macro_attributes)` in `lib.rs`, which now makes that a
+    /// build failure -- the warning was there and was read past.
     /// `retire` must charge the thread for what it CONSUMED, not for the whole
     /// chunk. `install_tail_filler` sets `cursor = end`, so a `consumed_bytes()`
     /// read taken after it returns the TLAB size — which made
@@ -1742,6 +1749,7 @@ mod tests {
         assert_eq!(once, 128);
     }
 
+    #[test]
     fn install_tail_filler_always_consumes_the_tlab() {
         for consumed in [0usize, 8, 40, 56, 64] {
             let (_owner, base, usable) = aligned_buffer(64);

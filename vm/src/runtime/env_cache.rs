@@ -399,6 +399,35 @@ pub fn osr_newarray_allowed() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_OSR_EXC_TABLE` — back-edge OSR for a method with a non-empty
+/// exception table. **Default: ON** (2026-08-17, this is the RBC.6b lift).
+///
+/// RBC.6b refused every such method outright. Because OSR is the ONLY door out
+/// of the interpreter for a method invoked once — a `@Test` body, a `main`, any
+/// one-shot driver — that made "a hot loop with a try/catch in it" run
+/// interpreted for its whole life: netty's two `HttpHeaderValidationUtilTest`
+/// exhaustive loops measured 19 242 and 309 423 ns/iteration against HotSpot's
+/// 8.2 and 9.4.
+///
+/// The lift stages the method-entry path's precise-exception-frame contract for
+/// the OSR compile and admits only methods where every throwing site inside a
+/// protected range publishes a reason-9 frame
+/// (`first_unsupported_precise_frame_site`). Set `=0` to restore the blanket
+/// refusal, so one binary can A/B the lift — the arm that answers "did this
+/// change the answer, or only the speed?". Read once and cached.
+///
+/// See fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md.
+#[inline]
+pub fn osr_exception_table_allowed() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_EXC_TABLE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.
@@ -1303,6 +1332,29 @@ pub fn jit_native_shadow_interface_blind() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND")
+            .map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
+/// Transitive eager callee compilation (default-ON).
+///
+/// A statically bound call site can only be bound to a raw `CALL` if the callee is
+/// compiled ALREADY. `try_jit_compile_callee_slow`'s resolver used to answer only
+/// from `jit_cache`, so a caller compiled one moment before its callee bound that
+/// site to the generic `jit_invoke_dispatch` helper — and a compiled body never
+/// re-binds. Measured on `probes/org/junit/jupiter/api/CompileOrderProbe.java`:
+/// 478 ns/iter when the chain compiles top-down against 73 when it compiles
+/// bottom-up, entirely accounted for by ~1 helper round trip per iteration
+/// (`CRATONVM_DBG_MIC_PROF=1`: `disp_calls` 2 003 538 against 3 926).
+///
+/// `CRATONVM_JIT='-eager-callee-chain'` (or `CRATONVM_JIT_EAGER_CALLEE_CHAIN=0`)
+/// restores the one-level behaviour. Correct either way: the fallback is the
+/// checked dispatch helper.
+#[inline]
+pub fn jit_eager_callee_chain() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_EAGER_CALLEE_CHAIN")
             .map_or(true, |v| v != "0" && v != "false")
     })
 }

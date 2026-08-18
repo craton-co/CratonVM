@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run the four instrument guards of harness-guard.sh over every SCHEDULED
-# vector, using HotSpot alone.
+# Run the output-side instrument guards of harness-guard.sh (G1-G4, G6) over
+# every SCHEDULED vector, using HotSpot alone.
 #
 # This exists as its own entry point for two reasons.
 #
@@ -19,6 +19,16 @@
 # Env: JDK=<jdk home>  ONLY="RJitGc RCrypto"  SUITE=core|jdk-only|all
 #      MUTATE="RFoo:s/CK RFoo/EVIDENCE RFoo/"
 #      KEEP=1   leave the scratch build tree in place for inspection
+#
+# 3. It is where the LAUNCH CONFIGURATION is checked against run.sh's. This
+#    script used to launch every vector with a bare `-cp "$WORK/cls"` and one
+#    hard-coded RJdkModule special case, while run.sh grew class_args() and
+#    class_cp_extra() hooks; the first vector that needed one
+#    (RServiceLoaderDoubleSource) was correctly wired in the suite and flagged
+#    G4+G3 here, i.e. the instrument-check reported a defect the tree did not
+#    have. Both scripts now call the SHARED hooks in harness-guard.sh, and
+#    harness_hooks_drift() holds them equal to run.sh's remaining copies until
+#    those are deleted.
 set +e
 export MSYS2_ARG_CONV_EXCL='*'; export MSYS_NO_PATHCONV=1
 
@@ -64,11 +74,25 @@ cp "$HERE"/src/*.java "$WORK/src/" || exit 3
 if [ -n "${MUTATE:-}" ]; then
   mut_class="${MUTATE%%:*}"; mut_expr="${MUTATE#*:}"
   [ -f "$WORK/src/$mut_class.java" ] || { echo "ERROR: MUTATE names no vector: $mut_class"; exit 3; }
+  # A mutation that changed nothing produces a green run that looks like
+  # evidence and is not — the whole failure mode this file is about. So the
+  # no-op check has to be right, and until 2026-08-13 it was NOT: it was
+  # `cmp -s <mutant> "$HERE/src/$c.java"`, and on Git Bash `sed -i` REWRITES THE
+  # FILE WITH LF ENDINGS whatever the expression did. Measured on this tree:
+  # RArrayStoreTiers.java 16534 bytes -> 16190 after `sed -i s/ZZ_NOT_PRESENT/x/`,
+  # exactly one byte per line. So cmp differed for every mutant, the guard could
+  # not fire on the platform the suite is usually run from, and
+  # `MUTATE='RFoo:s/typo/x/'` reported a clean run as a mutation control.
+  #
+  # Compare the CONTENT, normalised for exactly that rewrite, and against the
+  # pre-sed state rather than the source tree — a guard whose own precondition
+  # is a platform behaviour is a guard with a platform-shaped hole in it.
+  mut_before=$(tr -d '\r' < "$WORK/src/$mut_class.java" | md5sum)
   sed -i "$mut_expr" "$WORK/src/$mut_class.java" || exit 3
-  if cmp -s "$WORK/src/$mut_class.java" "$HERE/src/$mut_class.java"; then
-    # A mutation that changed nothing would produce a green run that looks like
-    # evidence and is not. This is the whole failure mode the file is about.
-    echo "ERROR: MUTATE='$MUTATE' left $mut_class.java byte-identical — the mutant is a no-op."
+  mut_after=$(tr -d '\r' < "$WORK/src/$mut_class.java" | md5sum)
+  if [ "$mut_before" = "$mut_after" ]; then
+    echo "ERROR: MUTATE='$MUTATE' left $mut_class.java UNCHANGED — the mutant is a no-op,"
+    echo "       so a green run below would be evidence of nothing. Check the expression."
     exit 3
   fi
   echo "== MUTANT: $mut_class  ($mut_expr)"
@@ -99,18 +123,32 @@ if [ -f "$HERE/modules/$JDKONLY_MODULE/module-info.java" ]; then
     HAVE_MODULE=1
   fi
 fi
-jc_mod=""; [ -n "$HAVE_MODULE" ] && jc_mod="--module-path $WORK/mod --add-modules $JDKONLY_MODULE"
+# The shared hooks are written against $MODBUILD, which is run.sh's name for the
+# compiled-module directory. Bind it to this script's equivalent so ONE
+# definition serves both — rather than teaching the hooks a second variable.
+MODBUILD="$WORK/mod"
+jc_mod=""; [ -n "$HAVE_MODULE" ] && jc_mod="--module-path $MODBUILD --add-modules $JDKONLY_MODULE"
 "$JAVAC" $jc_mod -d "$WORK/cls" "$WORK"/src/*.java || { echo "ERROR: javac failed"; exit 3; }
 copy_tree "$HERE/resources" "$WORK/cls"
 
 harness_load_uncounted "$HERE/harness-uncounted.txt"
 
+# Before guarding a single vector, prove that the configuration this script
+# launches them in is the configuration run.sh launches them in. A guard that
+# runs the vector differently from the suite reports on a different experiment.
+HARNESS_GUARD_MSGS=""; hookdrift=0
+harness_hooks_drift "$HERE/run.sh" "$CORE_CLASSES $JDKONLY_CLASSES" "$WORK/hooks" || {
+  hookdrift=1; printf '%s\n' "$HARNESS_GUARD_MSGS"; }
+
 ok=0; bad=0; badlist=""
 for c in $CLASSES; do
   [ -f "$WORK/src/$c.java" ] || { echo "  LIST ERROR: src/$c.java does not exist"; bad=$((bad+1)); badlist="$badlist missing:$c"; continue; }
-  extra=""
-  [ "$c" = RJdkModule ] && [ -n "$HAVE_MODULE" ] && extra="--module-path $WORK/mod --add-modules $JDKONLY_MODULE"
-  timeout "$TIMEOUT" "$HS" $extra -cp "$WORK/cls" "$c" > "$WORK/out/$c.raw" 2>&1
+  # class_args + class_cp_extra come from harness-guard.sh — ONE definition,
+  # shared with run.sh. $extra and $cpx are intentionally unquoted: a flag word
+  # list and a class-path suffix that already carries its own separator.
+  extra=$(class_args "$c")
+  cpx=$(class_cp_extra "$c")
+  timeout "$TIMEOUT" "$HS" $extra -cp "$WORK/cls$cpx" "$c" > "$WORK/out/$c.raw" 2>&1
   rc=$?
   extract < "$WORK/out/$c.raw" > "$WORK/out/$c.key"
   HARNESS_GUARD_MSGS=""
@@ -126,5 +164,9 @@ done
 
 [ -n "${KEEP:-}" ] || rm -rf "$WORK"
 echo "---------------------------------------------"
+# Reported on its own line and NOT folded into $bad: hook drift is one fact
+# about two files, not a per-vector flag, and summing it into the vector count
+# would make "N flagged" mean two different things. It is fatal either way.
+[ "$hookdrift" -eq 0 ] || echo "HARNESS SELF-CHECK: launch hooks DRIFTED from run.sh (see [H1] above)"
 echo "HARNESS SELF-CHECK: $ok vectors sound, $bad flagged${badlist:+ (${badlist# })}"
-[ "$bad" -eq 0 ]
+[ "$bad" -eq 0 ] && [ "$hookdrift" -eq 0 ]

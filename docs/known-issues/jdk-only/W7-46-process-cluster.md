@@ -126,7 +126,7 @@ not re-derive them.
 | `os_parent_pid` (Linux), unreadable `/proc/<pid>/status` | `Ok(-1)` | **correct, and the asymmetry is the point.** One unreadable status means that process is gone; a failed `opendir("/proc")` means the scan did not run and is an `Err`. W6-10 finding 4 established this split |
 | `direct_child_pids`, unreadable `task/` | `Ok(vec![])` | same: a descendant that dies mid-walk must not abort the walk |
 | `start_time_matches`, unknown start time | counts as a MATCH | documented at the site — "unknown is not disagreement" |
-| `p60_unmeasurable_process_tree` | empty stream | **synthetic-JDK only, and refused under strict**, where the `SyntheticStub` tag drops the registration that reaches it |
+| `p60_unmeasurable_process_tree` | empty stream | **synthetic-JDK only, and refused under strict**, where the `SyntheticStub` tag drops the registration that reaches it. **MEASURED 2026-08-12 (lane A31): CONFIRMED LIVE — and it is a fabricated success, not an "unmeasurable" answer.** See §9 |
 | `p60_empty_optional` on the five `$Info` accessors | `Optional.empty()` | **the specified answer**, not a concession — the JDK's own accessors derive exactly this from an unwritten field |
 
 ### Two-gate `#[cfg]` with a default-off inner gate: **none**
@@ -760,3 +760,128 @@ the code, in the units the rest of this record uses.
   are registered nowhere else in that file, but "nowhere else in that file" is
   not the census that question needs — it needs a `--dump-native-registry` diff,
   which needs a build.
+
+---
+
+# 9. Re-verified 2026-08-12 (record-triage lane, doc-only — nothing built or run)
+
+A source read of today's tree. Line numbers are today's.
+
+## 9.1 §8.2's out-of-file patch has been APPLIED — that row is discharged
+
+`native-builtins/src/lib.rs:38139-38153` now carries the replacement comment
+this record wrote, and the four `java/lang/ProcessBuilder` registrations are
+gone: the only `java/lang/ProcessBuilder` string left in that file is an
+unrelated comment at `:14533`. `native_pb_init` and `native_pb_command` survive
+as definitions with **zero callers** (`native-builtins/src/lang_system.rs:3667`,
+`:3676`) — exactly the leftover §8.2 said it was deliberately not prescribing,
+and harmless under the workspace's `dead_code = "allow"`.
+
+So each of the four triples now has one owner per mode:
+`phases_late::register_phase57_process` (`native-builtins/src/phases_late.rs:1343`,
+`SyntheticStub` stated) for all four, plus `native-io`'s
+`register_process_natives` re-winning `start` last, as §8.2 measured.
+
+**What is discharged is the SOURCE half only.** §8.2's own proof —
+`--dump-native-registry` on a `--features synthetic-jdk` binary in
+`--synthetic-jdk` mode, the three rows moving from `Intrinsic` back to
+`SyntheticStub` with empty `overwrote=` — still has not been run by anyone, and
+cannot be seen from Compatible mode. Treat the kind-rewrite claim as repaired in
+source and unmeasured.
+
+## 9.2 §8.1 and §3 are present, and the Linux half is still uncompiled
+
+* `linux_liveness_and_start_time` — `native-io/src/process.rs:3041`; its parser
+  `linux_stat_line_times` at `:2310`.
+* Both `foreign_pid_is_alive` tombstone comments are in place (`:2841` Linux,
+  `:2854` Windows); the surviving `foreign_pid_is_alive` at `:3100` is the
+  platform-of-last-resort one, as stated.
+* `win_liveness_and_start_time` at `:2916`; the three `foreign_start_time_or_dead`
+  arms at `:3069`, `:3077`, `:3085`.
+* Both mirror tests exist:
+  `one_open_reports_the_same_start_time_as_the_separate_probe` (`:5783`) and
+  `one_stat_read_reports_the_same_start_time_as_the_separate_probe` (`:5834`).
+  The Linux one **has still never run**; that remains the standing item.
+* §3's fix is at `:4096-4108` — `invoke_virtual(this, "toHandle", …)` then
+  `invoke_virtual(handle, "descendants", …)`, with the
+  `UnsupportedOperationException` arm for a refusing `toHandle()`, as written.
+
+## 9.3 Scheduling, per claim
+
+`RJdkProcess` is in `JDKONLY_CLASSES` (`regression-suite/run.sh:119`), and
+`EXPECTED_CHECKS = 55` is a constant at `RJdkProcess.java:89` asserted at
+`:413`. So §1's ratchet and §3's and §4's falsifiers are **scheduled** and will
+run on all three arms. The two that are not scheduled anywhere are the Linux
+mirror test (needs a Linux build) and §8.2's registry diff (needs a
+`synthetic-jdk` build) — the same two holes this record has carried since §8.
+
+## 9.4 A neighbour that belongs on this cluster's map, not in it
+
+Today's committed strict census — `P1-BASELINE-20260812.md` — lists
+`cratonvm/synthetic/Process` as one of the **nine** families that still block
+`--jdk-only`, entered as **P1-I** through `Runtime.exec` (all six overloads),
+with `ProcessBuilder.start` printed beside it as the **passing control**. That
+is the same shared mint this cluster owns:
+`native-io/src/process.rs::spawn_and_wrap_with_redirects`.
+
+The repair is in source today and this record's readers should not re-derive it:
+`native-builtins/src/lib.rs:14531-14560` re-tags all six `Runtime.exec` overloads
+`NativeKind::SyntheticStub`, on the argument that `Runtime.exec` is ordinary
+bytecode on the image, so strict drops the shadow and the JDK's own `exec` runs
+down to the real `ProcessBuilder.start()`. **Unbuilt, unmeasured**, and its
+comment states the general rule this cluster keeps paying for: *a retag that
+pins one caller of a shared mint must enumerate the callers*.
+
+---
+
+## 9. `p60_unmeasurable_process_tree` adjudicated in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+This record is SOURCE-ONLY and says so. The one row in its fabricated-answer
+table scoped "synthetic-JDK only" has now been run: a `--features synthetic-jdk`
+binary, launched with `--synthetic-jdk`.
+
+**The naming is the problem.** `p60_unmeasurable_process_tree` answers an empty
+stream, and the row above justifies it as an honest "unmeasurable". The name
+asserts that the process tree could not be determined. Measured, it is asserted
+even when the tree is trivially determinable — the probe **holds a live child**
+and asks in the same breath:
+
+```
+                                  HotSpot 25            --jdk-only            --synthetic-jdk
+R processHandle.childrenWithChild children=1            children=1            children=0
+                                  descendants=2         descendants=1         descendants=0
+                                  childAlive=true       childAlive=true       childAlive=true
+```
+
+`childAlive=true` on the same line is the discriminator: the child exists, the
+VM spawned it, `Process.isAlive()` confirms it, and `children()` says there are
+none. There is no error, no violation, no `UnsupportedOperationException` — the
+JDK contract for a platform that cannot enumerate is to throw
+`UnsupportedOperationException`, not to answer `Stream.empty()`. A caller that
+iterates (`children().forEach(kill)`) reads a clean pass and kills nothing.
+
+That belongs in the `W7-20` species (a refusal laundered into a wrong answer),
+not in this record's "correct, and load-bearing" column beside
+`p60_empty_optional`. The distinction the table draws for `p60_empty_optional` —
+*"the specified answer … the JDK's own accessors derive exactly this from an
+unwritten field"* — genuinely applies there and does **not** apply here.
+
+Two neighbouring rows are honest absences by comparison, and are recorded so
+nobody re-derives them:
+
+```
+--synthetic-jdk:
+  R processHandle.allProcesses ! java.lang.NoSuchMethodError:
+      java.lang.ProcessHandle.allProcesses()Ljava/util/stream/Stream;
+  R processHandle.ofPid.self   ! java.lang.NoSuchMethodError:
+      java.lang.ProcessHandle.of(J)Ljava/util/Optional;
+--jdk-only: allProcesses=316 / present=true
+```
+
+Green in `--synthetic-jdk` and needing no further work: `ProcessHandle.current().pid()`
+(> 0), `.info().command()` (present), `.parent()` (present),
+`ProcessBuilder.start()` itself.
+
+**Verdict: CONFIRMED LIVE, synthetic-mode only, and mis-classified in the table
+above.** See lane A31's NOMINATION A31-6. Nothing was changed in
+`native-io/src/process.rs` by that lane — it writes no Rust.

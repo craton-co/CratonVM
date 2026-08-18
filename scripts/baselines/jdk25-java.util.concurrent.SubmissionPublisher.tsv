@@ -1,0 +1,58 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.concurrent.SubmissionPublisher
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/concurrent/SubmissionPublisher.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	17
+# protected-methods	0
+# declared-methods	24
+# declared-fields	11
+# rows	42
+# columns	kind	name	descriptor	flags
+CLASS	java.util.concurrent.SubmissionPublisher		public
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.lang.AutoCloseable		
+IMPLEMENTS	java.util.concurrent.Flow$Publisher		
+SUPERTYPE	java.lang.AutoCloseable		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.util.concurrent.Flow$Publisher		
+METHOD	<init>	()V	public
+METHOD	<init>	(Ljava/util/concurrent/Executor;I)V	public
+METHOD	<init>	(Ljava/util/concurrent/Executor;ILjava/util/function/BiConsumer;)V	public
+METHOD	cleanAndCount	()I	private
+METHOD	close	()V	public
+METHOD	closeExceptionally	(Ljava/lang/Throwable;)V	public
+METHOD	consume	(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;	public
+METHOD	doOffer	(Ljava/lang/Object;JLjava/util/function/BiPredicate;)I	private
+METHOD	estimateMaximumLag	()I	public
+METHOD	estimateMinimumDemand	()J	public
+METHOD	getClosedException	()Ljava/lang/Throwable;	public
+METHOD	getExecutor	()Ljava/util/concurrent/Executor;	public
+METHOD	getMaxBufferCapacity	()I	public
+METHOD	getNumberOfSubscribers	()I	public
+METHOD	getSubscribers	()Ljava/util/List;	public
+METHOD	hasSubscribers	()Z	public
+METHOD	isClosed	()Z	public
+METHOD	isSubscribed	(Ljava/util/concurrent/Flow$Subscriber;)Z	public
+METHOD	offer	(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;Ljava/util/function/BiPredicate;)I	public
+METHOD	offer	(Ljava/lang/Object;Ljava/util/function/BiPredicate;)I	public
+METHOD	retryOffer	(Ljava/lang/Object;JLjava/util/function/BiPredicate;Ljava/util/concurrent/SubmissionPublisher$BufferedSubscription;IZ)I	private
+METHOD	roundCapacity	(I)I	static,final
+METHOD	submit	(Ljava/lang/Object;)I	public
+METHOD	subscribe	(Ljava/util/concurrent/Flow$Subscriber;)V	public
+FIELD	BUFFER_CAPACITY_LIMIT	I	static,final
+FIELD	INITIAL_CAPACITY	I	static,final
+FIELD	clients	Ljava/util/concurrent/SubmissionPublisher$BufferedSubscription;	
+FIELD	closed	Z	volatile
+FIELD	closedException	Ljava/lang/Throwable;	volatile
+FIELD	executor	Ljava/util/concurrent/Executor;	final
+FIELD	lock	Ljava/util/concurrent/locks/ReentrantLock;	final
+FIELD	maxBufferCapacity	I	final
+FIELD	onNextHandler	Ljava/util/function/BiConsumer;	final
+FIELD	owner	Ljava/lang/Thread;	
+FIELD	subscribed	Z	

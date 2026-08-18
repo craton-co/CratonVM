@@ -36,6 +36,14 @@
 //! `getVersion()` D-typed return path keeps working; `getVersionStr()`
 //! formats it as `"<int(version)>"` to match JDK 25's HotSpot output
 //! (`"25"` not `"25.0"`).
+//!
+//! **That table describes the SYNTHETIC layout only, and since G43-1 it is
+//! only written when the receiver actually has it.** On a real image
+//! `java.security.Provider extends java.util.Properties extends
+//! java.util.Hashtable`, so slots 0/1/2 are the inherited `table` /
+//! `count` / `threshold` and writing this table onto one corrupts a live
+//! hash map. `make_provider` decides per instance, by reading back its own
+//! `set_field_by_name("name", …)` — see `provider_has_named_layout`.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
@@ -251,6 +259,50 @@ fn resolve_real_provider(ctx: &mut dyn NativeContext, name: &str) -> Option<Obje
 // Provider synthetic — slot layout documented at module top.
 // ---------------------------------------------------------------------------
 
+/// Did the `set_field_by_name("versionStr", …)` write in [`make_provider`]
+/// actually land — i.e. does this `Provider` have the REAL JDK layout rather
+/// than CratonVM's synthetic one?
+///
+/// Exactly the read-back predicate `service_has_named_layout` uses for
+/// `Provider$Service`, for exactly the same reason: it answers the question
+/// the caller actually has ("did my named write take?") in both modes, with no
+/// new `NativeContext` surface, and it is per-instance where a registration is
+/// global.
+///
+/// `versionStr` and not `name`, for two reasons that happen to agree.
+/// Substantively: `versionStr` is declared by `java.security.Provider` itself
+/// and by nothing above it, so a receiver that satisfies it has Provider's own
+/// layout, not merely some superclass's. Mechanically: the unit-test mock
+/// resolves the bare name `name` through a class-blind mirror table
+/// (`test_utils::mock_jdk_field_slot`), so a `name`-based predicate would
+/// answer "real layout" under every test in this file and the synthetic arm
+/// would be untestable — the DIVERGENCE hazard `MockNativeContext::
+/// get_field_by_name` documents, met head-on rather than papered over.
+///
+/// G43-1 — why the answer matters. `java.security.Provider extends
+/// java.util.Properties extends java.util.Hashtable extends java.util.Dictionary`,
+/// so on a real image slots 0/1/2 of a `Provider` are not Provider's own
+/// fields at all; they are `Hashtable.table:[Ljava/util/Hashtable$Entry;`,
+/// `Hashtable.count:I` and `Hashtable.threshold:I`. (The comment on the
+/// accessors below used to say slot 0+1 was `serialVersionUID` and slot 2 was
+/// `debug`. Both of those are STATIC — `javap -p java.security.Provider`, JDK
+/// 25.0.3+9 — so they occupy no instance slot, and the real occupants are the
+/// inherited `Hashtable` ones.) The legacy mirror therefore wrote a `String`
+/// over the hash table, a `Double` over `count`, and a heap ADDRESS over
+/// `threshold` — the last of which is the `pointer-into-primitive` coercion
+/// species `G30-1` §4.1 declared could not occur, MEASURED firing twice per
+/// `RCrypto` run at `make_provider`.
+fn provider_has_named_layout(
+    ctx: &mut dyn NativeContext,
+    provider: ObjectRef,
+    version_str_obj: ObjectRef,
+) -> bool {
+    matches!(
+        ctx.get_field_by_name(provider, "versionStr"),
+        Value::Object(Some(got)) if got == version_str_obj
+    )
+}
+
 /// Materialise a fresh `java.security.Provider` synthetic with name +
 /// numeric version. Used by every read-side path
 /// (`getProviders`, `getProvider`); we never cache `ObjectRef` values
@@ -319,12 +371,55 @@ pub(crate) fn make_provider(
     // defaults) instead of a hard failure.
     ctx.set_field_by_name(p, "initialized", Value::Int(1));
 
-    // Synthetic fallback — populate the legacy slots 0/1/2 too so
-    // `phases_early::register_phase53_security` callers that haven't
-    // migrated to the real-JDK accessors still see consistent state.
-    ctx.set_field(p, 0, Value::Object(Some(n)));
-    ctx.set_field(p, 1, Value::Double(version));
-    ctx.set_field(p, 2, Value::Object(Some(info)));
+    // Synthetic fallback — populate the legacy slots 0/1/2 so the readers that
+    // have not migrated to the real-JDK accessors still see consistent state:
+    // `provider_get_name` (slot 0), `provider_get_version` /
+    // `provider_get_version_str` / `provider_to_string` (slot 1) and
+    // `provider_get_info` (slot 2) in this file, plus the `getName` / `getVersion`
+    // Bridges `phases_early::register_phase53_security` registers, which read
+    // slots 0 and 1.
+    //
+    // G43-1 — ONLY in synthetic mode, and the guard is the whole change.
+    //
+    // The two modes genuinely need different answers, and the trap named in
+    // the previous lane's note is real: "correct the indices to the real JDK
+    // layout" is not available, because there is nothing to correct them TO.
+    // Slots 0/1/2 on a real `Provider` are inherited `Hashtable` state
+    // (`table` / `count` / `threshold` — see `provider_has_named_layout`),
+    // and Provider's own `name` / `version` / `info` already have the four
+    // `set_field_by_name` writes above. Relocating the mirror to the real
+    // `name`/`version`/`info` slots would just repeat those writes; pointing
+    // it anywhere else corrupts a live `Hashtable`. The synthetic layout, in
+    // turn, HAS no `Hashtable` and its readers are the slot-indexed ones. So
+    // the correct value at slot 2 in synthetic mode and the correct value at
+    // slot 2 in real-JDK mode are different values in different fields, and
+    // the only reconciliation is to write the mirror only where it is the
+    // truth.
+    //
+    // Skipping it in real-JDK mode is observationally inert on the read side:
+    // every reader in this file consults `get_field_by_name` FIRST and only
+    // falls through to the slot when the named read comes back absent, and the
+    // named reads are exactly the writes we just made. `register_phase53_security`
+    // is reached solely from `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]`, so its slot-indexed Bridges do not
+    // exist in real-JDK mode at all — a 10,691-row `--jdk-only` registry dump
+    // has zero rows for `java/security/Provider` from that registrar.
+    //
+    // What it removes is not inert: it stops publishing a heap address into
+    // `Hashtable.threshold` and a `Double`'s raw bit pattern into
+    // `Hashtable.count` on an object that IS a live `Hashtable` and that we
+    // deliberately mark `initialized = 1` a few lines up so that real
+    // `keys()` / `entrySet()` / `getAlgorithms` bytecode RUNS over it. Today
+    // that survives only by luck — `Double(25.0).to_bits() as i32` is 0, so
+    // `count == 0` and `Hashtable.getEnumeration` early-returns before it can
+    // dereference the `String` sitting in `table`. Any provider version with a
+    // fractional part (`1.8` → low 32 bits `0xCCCCCCCD`) makes `count` nonzero
+    // and the next `keys()` walks a `String` as an `Entry[]`.
+    if !provider_has_named_layout(ctx, p, ver_str) {
+        ctx.set_field(p, 0, Value::Object(Some(n)));
+        ctx.set_field(p, 1, Value::Double(version));
+        ctx.set_field(p, 2, Value::Object(Some(info)));
+    }
     Ok(p)
 }
 
@@ -334,15 +429,24 @@ pub(crate) fn make_provider(
 
 // WP6.5: Provider field accessors must be layout-aware. The synthetic
 // Provider allocated by `make_provider` stores `name`/`version`/`info` in
-// slots 0/1/2.  Real-JDK `java.security.Provider`, however, declares
-// `serialVersionUID` (long, slot 0+1 — category 2), `debug` (slot 2),
-// `name` (slot 3), `info` (slot 4), `version` (double, slot 5+6),
-// `versionStr` (slot 7), etc.  Reading slot 0 from a real-JDK Provider
-// returns the high half of `serialVersionUID`, which appears to callers
-// as `null` (or whatever junk happens to be there) and made every
-// `Provider.getName()` / `getVersionStr()` call lie about the receiver,
-// which in turn broke `BouncyCastleProvider.setup()` (it queries its
-// own name from inside `loadServiceClass` to build cache keys).
+// slots 0/1/2.  Real-JDK `java.security.Provider` puts something else there
+// entirely, so reading slot 0 from a real-JDK Provider returned junk that
+// appeared to callers as `null` and made every `Provider.getName()` /
+// `getVersionStr()` call lie about the receiver, which in turn broke
+// `BouncyCastleProvider.setup()` (it queries its own name from inside
+// `loadServiceClass` to build cache keys).
+//
+// G43-1 CORRECTION. This comment used to say the real-JDK occupants were
+// `serialVersionUID` (long, slot 0+1), `debug` (slot 2), `name` (slot 3),
+// `info` (slot 4), `version` (double, slot 5+6), `versionStr` (slot 7).
+// That is wrong twice over and the wrongness was load-bearing — it is why
+// the legacy mirror in `make_provider` looked harmless. `javap -p
+// java.security.Provider` on JDK 25.0.3+9: `serialVersionUID` and `debug`
+// are both `static`, so they occupy no instance slot at all; and `Provider
+// extends java.util.Properties extends java.util.Hashtable`, so the low
+// slots belong to the SUPERCLASSES. The real occupants of 0/1/2 are
+// `Hashtable.table:[Ljava/util/Hashtable$Entry;`, `Hashtable.count:I` and
+// `Hashtable.threshold:I` — see `provider_has_named_layout`.
 //
 // Fix: prefer `get_field_by_name`, which resolves the slot from the
 // receiver's actual class layout.  Fall back to slots 0/1/2 only when
@@ -358,7 +462,16 @@ fn provider_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if matches!(&by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
     }
-    Ok(Some(ctx.get_field(this, 0)))
+    // G43-1: the slot fallback is only meaningful on a synthetic. On a real
+    // Provider slot 0 is `Hashtable.table`, and an unwritten reference slot
+    // reads back as `Int(0)` (field_read.rs's niche-0 note), so return the
+    // slot only when it actually holds a reference — the descriptor here is
+    // `()Ljava/lang/String;` and handing the interpreter an `Int` back is a
+    // guaranteed type error at the call site.
+    match ctx.get_field(this, 0) {
+        v @ Value::Object(_) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
 }
 
 fn provider_get_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -468,7 +581,17 @@ fn provider_get_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if matches!(&by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
     }
-    Ok(Some(ctx.get_field(this, 2)))
+    // G43-1: same rule as `provider_get_name`, and here it is not theoretical.
+    // Slot 2 on a real `Provider` is `Hashtable.threshold:I`, so this fallback
+    // could return an `Int` from a `()Ljava/lang/String;` native. It is also
+    // the only reader of slot 2 anywhere in the tree — `register_phase53_security`'s
+    // `getInfo` Bridge synthesises its string from slot 0 and never touches
+    // slot 2 — which is what makes `make_provider`'s slot-2 write purely a
+    // synthetic-mode obligation.
+    match ctx.get_field(this, 2) {
+        v @ Value::Object(_) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
 }
 
 fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -4905,6 +5028,148 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::test_utils::MockNativeContext;
+
+    // -----------------------------------------------------------------
+    // G43-1 — `make_provider`'s legacy slot mirror is synthetic-mode-only.
+    //
+    // The two arms below are the whole decision. Under `--jdk-only` the
+    // receiver is a real `java.security.Provider`, whose slots 0/1/2 are the
+    // inherited `Hashtable.table` / `count` / `threshold`; the slot-2 write
+    // published a heap ADDRESS into an `I` field, MEASURED twice per `RCrypto`
+    // run by `CRATONVM_DBG_COERCION=1` as species `pointer-into-primitive` at
+    // `provider_chain.rs:317`. Under `--synthetic-jdk` the same three slots
+    // ARE name/version/info and `provider_get_name` / `provider_get_version` /
+    // `provider_get_info` read them.
+    // -----------------------------------------------------------------
+
+    /// Declare `java.security.Provider`'s OWN instance fields at slots that do
+    /// not overlap the legacy mirror, which is what a real-JDK layout looks
+    /// like from a native's point of view: the named writes resolve, and 0/1/2
+    /// belong to somebody else (`Hashtable`).
+    fn declare_real_provider_layout(ctx: &MockNativeContext, cid: cratonvm_types::ClassId) {
+        let fields = ["name", "info", "version", "versionStr", "initialized"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| cratonvm_native_api::FieldMetadata {
+                name: (*n).to_string(),
+                descriptor: "Ljava/lang/Object;".to_string(),
+                access_flags: 0,
+                // Slot 3 upward — 0/1/2 are the inherited Hashtable fields.
+                slot_index: i + 3,
+                declaring_class_id: cid,
+                is_static: false,
+            })
+            .collect();
+        ctx.set_declared_fields(cid, fields);
+    }
+
+    #[test]
+    fn g43_1_make_provider_writes_the_legacy_slots_only_in_synthetic_mode() {
+        let mut ctx = MockNativeContext::new();
+        // No declared layout → every `set_field_by_name` for a Provider-only
+        // name is a no-op, which is exactly what production does when the real
+        // class has no bytes. `versionStr` cannot read back, so the mirror runs.
+        let p = make_provider(&mut ctx, "SUN", 25.0, "test coverage").expect("alloc");
+
+        assert!(
+            matches!(ctx.get_field(p, 0), Value::Object(Some(_))),
+            "synthetic slot 0 must carry the name String (provider_get_name reads it)"
+        );
+        assert_eq!(
+            ctx.get_field(p, 1),
+            Value::Double(25.0),
+            "synthetic slot 1 must carry the numeric version (provider_get_version reads it)"
+        );
+        assert!(
+            matches!(ctx.get_field(p, 2), Value::Object(Some(_))),
+            "synthetic slot 2 must carry the info String (provider_get_info reads it)"
+        );
+        // The two Strings are distinct objects — a mirror that wrote the same
+        // ref twice would satisfy the two assertions above vacuously.
+        assert_ne!(
+            ctx.get_field(p, 0),
+            ctx.get_field(p, 2),
+            "name and info must be different objects"
+        );
+    }
+
+    #[test]
+    fn g43_1_make_provider_does_not_publish_an_address_into_a_real_provider_int_slot() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx
+            .ensure_class_initialized("java/security/Provider")
+            .expect("mock registers the class");
+        declare_real_provider_layout(&ctx, cid);
+
+        let p = make_provider(&mut ctx, "SUN", 25.0, "test coverage").expect("alloc");
+
+        // The named writes landed where the class says they go...
+        assert!(
+            matches!(ctx.get_field_by_name(p, "name"), Value::Object(Some(_))),
+            "real-layout `name` must be written by name"
+        );
+        assert!(
+            matches!(
+                ctx.get_field_by_name(p, "versionStr"),
+                Value::Object(Some(_))
+            ),
+            "real-layout `versionStr` must be written by name"
+        );
+        assert!(
+            matches!(ctx.get_field_by_name(p, "info"), Value::Object(Some(_))),
+            "real-layout `info` must be written by name"
+        );
+
+        // ...and the legacy mirror did NOT run. Slot 2 is `Hashtable.threshold:I`
+        // on a real Provider; a reference there is the `pointer-into-primitive`
+        // coercion, and slot 0 is `Hashtable.table`, whose occupant a live
+        // `Hashtable.keys()` walks as an `Entry[]`.
+        assert!(
+            !matches!(ctx.get_field(p, 2), Value::Object(Some(_))),
+            "slot 2 is Hashtable.threshold on a real Provider — writing a \
+             reference there is the pointer-into-primitive coercion this fixes"
+        );
+        assert!(
+            !matches!(ctx.get_field(p, 0), Value::Object(Some(_))),
+            "slot 0 is Hashtable.table on a real Provider — a String there is \
+             walked as an Entry[] by any live keys()/entrySet()"
+        );
+        assert_ne!(
+            ctx.get_field(p, 1),
+            Value::Double(25.0),
+            "slot 1 is Hashtable.count on a real Provider — a Double there \
+             decodes to the low half of its IEEE-754 bit pattern"
+        );
+    }
+
+    #[test]
+    fn g43_1_provider_get_info_never_returns_a_primitive_from_the_slot_fallback() {
+        // `provider_get_info`'s descriptor is `()Ljava/lang/String;`. On a real
+        // Provider slot 2 is an `int`, and an unwritten reference slot reads
+        // back as `Int(0)` besides — either way, handing the interpreter an
+        // `Int` from a reference-returning native is a type error at the call
+        // site, so the fallback must degrade to null instead.
+        let mut ctx = MockNativeContext::new();
+        let p = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(p, 2, Value::Int(12));
+
+        let got = provider_get_info(&mut ctx, &[Value::Object(Some(p))])
+            .expect("getInfo must not fail")
+            .expect("getInfo returns a value");
+        assert_eq!(
+            got,
+            Value::Object(None),
+            "an `I` slot must not become a String"
+        );
+
+        // The reference case still passes through unchanged.
+        let info = ctx.create_string("SUN security provider");
+        ctx.set_field(p, 2, Value::Object(Some(info)));
+        let got = provider_get_info(&mut ctx, &[Value::Object(Some(p))])
+            .expect("getInfo must not fail")
+            .expect("getInfo returns a value");
+        assert_eq!(got, Value::Object(Some(info)));
+    }
 
     /// Helper: allocate a synthetic Provider$Service heap entry sized
     /// large enough for the slot fallback (synthetic getters at 0/1/2)

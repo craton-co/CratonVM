@@ -431,3 +431,380 @@ output is exactly the vector's output, so subtracting the filter from it names
 every blind vector in one pass, with no VM build, in under a minute — and the
 subtraction had never been performed, in a suite that had been read carefully
 many times by people who wrote precise headers about what it measured.
+
+---
+
+## 9. Verified in the tree, and the harness this record did not reach — 2026-08-12 (doc-only lane)
+
+No cargo, no Rust, no run. This section is a **verification** of what this record
+claims about the tree, and a **finding** about the neighbouring harness.
+
+### 9.1 Everything this record claims about the tree is there
+
+Checked by symbol, not by line number:
+
+* `extract()` is defined **exactly once**, at `regression-suite/harness-guard.sh:53`.
+  `run.sh` does not redefine it; it sources the guard file at `run.sh:236` with a
+  hard `exit 3` if the source fails. The "two filters drifting apart would be the
+  same defect one level up" argument holds in the tree, not just on paper.
+* The guards are invoked on the real control flow — `harness_guard_oracle` at
+  `run.sh:496`, `harness_guard_extract` at `:507` — and they are **fatal, not
+  advisory**: `guarded=1` feeds `hbad`/`hfailed`, which is folded into
+  `total_failed` at `run.sh:613` and reported under its own `HARNESS:` heading at
+  `:609`. The separate-counter claim of §6.6 is real; so is the exit-status claim.
+* G2/G3 deliberately run even with no HotSpot present (`run.sh:502-507` and its
+  comment), which is the run where they matter most.
+* `harness-uncounted.txt` holds **exactly one** live entry, `RClassUnloadSweep`,
+  with the two cleared rows recorded as a comment block rather than as rows —
+  the reverse-ratchet direction, applied to itself.
+* CI wiring: `harness-selfcheck.sh` at `.github/workflows/ci.yml:1332`,
+  `STRICT_COVERAGE: 1` at `:1350`, `run.sh` at `:1354`, and W7-51's
+  `CRATONVM_REQUIRE_E2E: 1` producer at `:211`.
+
+### 9.2 The blind spot the same subtraction has not been pointed at
+
+This record closed the question *"what does the instrument delete"* for the 72
+vectors `run.sh` schedules. The adjacent corpus is untouched and much larger:
+
+| | files | scheduled |
+| --- | --- | --- |
+| `regression-suite/src/*.java` | 72 | 70, and four guards watch them |
+| `probes/*.java` | **449** | **3** |
+
+The string `probes` appears **zero** times in `run.sh` at any `SUITE=` value. The
+sole scheduled consumer is `scripts/jdk-only-strict-probes.sh`
+(`ci.yml:315`, `:1404`), whose `PROBE_LIST` default is
+`JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlatformProbe` plus the agent.
+**This is the standing reason a finding whose only evidence is a probe cannot be
+discharged by a suite run, however green** — it is the live situation for
+`W7-33-differential-dead-sections.md` and `W7-36-differential-view-families.md`,
+whose entire evidence base is `probes/ShadowDifferentialProbe.java`, a file named
+by no `.sh` and no `.yml` in the tree.
+
+That is not a call to schedule 449 probes. It is the reason to say, per record,
+whether a claim has a scheduled witness — and this record's numbers, uniquely in
+the set, do.
+
+### 9.3 G4's defect, still live and still scheduled, in the harness next door
+
+**This is the finding of this section.** G4 exists because `run.sh` discarded the
+oracle's exit code, so a control that never produced evidence was scored as
+ground truth. `scripts/jdk-only-strict-probes.sh` — which CI runs on the whole
+OS × JDK matrix — has the same defect in a second form, and its own comments
+argue that the defect is correct behaviour:
+
+```
+scripts/jdk-only-strict-probes.sh:249-251
+    echo "WARNING: the agent jar did not build; the agent section will report absent"
+    echo "         in EVERY arm, so the arms still agree and the gate stays honest."
+```
+
+```
+scripts/jdk-only-strict-probes.sh:277, :280
+      echo "         The jni section will report lib=absent in EVERY arm."
+    echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
+```
+
+The gate is a cross-arm **agreement** ratchet. When a fixture fails to build,
+every arm reports `absent`, every arm agrees, no section diverges, and the script
+reaches `RESULT: PASS` with `exit 0`. The whole agent section and the whole JNI
+section — the two that cover the JNI boundary and instrumentation under
+`--jdk-only`, i.e. the surface least covered anywhere else — are silently
+switched off, and the only trace is a `WARNING:` inside a green build.
+
+**Three arms that all failed to build agree with each other**, and agreement
+between three broken instruments is this record's entire subject. It is exactly
+the shape §6.6 rejects — *"a warning inside a green build is how the previous
+version of this defect survived long enough to be measured"* — and exactly the
+shape G4 was written to make fatal. The script already has the right vocabulary
+for it: its self-test failure path prints `RESULT: REFUSED` and exits 2, on the
+principle that a gate which cannot adjudicate must say so rather than pass.
+
+W7-51 §3 has carried this as an open residual since it was found. It is harder to
+close now than when it was merely unnoticed, because the source comments assert
+that the behaviour is honest, so a fixer has to disagree with the file first.
+**NOMINATION below**, with exact text; a doc-only lane cannot make it.
+
+**The two quoted comment blocks above are the PRE-FIX text.** They no longer
+exist; §9.3.1 records what replaced them and what was measured doing it. The
+quotes are kept because the argument they make is the point of this section.
+
+#### NOMINATION — `scripts/jdk-only-strict-probes.sh`: a fixture that did not build must REFUSE, not PASS
+
+**LANDED 2026-08-12 — see §9.3.1 for the shipped shape, which differs.**
+
+Shape deliberately mirrors `harness-uncounted.txt`: degradation is allowed, but
+only when it is **declared**, so the default run cannot be quietly hollowed out.
+Three edits, anchored on literal text.
+
+**(1)** After the `SRCS=""` initialisation block, add the flag. Anchor —
+`scripts/jdk-only-strict-probes.sh`, immediately before the agent fixture
+comment:
+
+```sh
+# ------------------------------------------------------- fixture: the agent jar
+```
+
+becomes
+
+```sh
+# Set by any fixture that failed to build. A missing fixture makes its section
+# report `absent` in EVERY arm, so the arms AGREE and the agreement ratchet sees
+# no divergence — the section is switched off and the gate still says PASS. That
+# is the G4 defect of W7-60-harness-extract-blindness.md: a control that produced
+# no evidence being scored as ground truth. Declared degradation is fine;
+# silent degradation is not.
+DEGRADED_FIXTURES=""
+
+# ------------------------------------------------------- fixture: the agent jar
+```
+
+**(2)** Mark each degraded fixture. Three sites, each gaining one line.
+
+```sh
+    echo "WARNING: the agent jar did not build; the agent section will report absent"
+    echo "         in EVERY arm, so the arms still agree and the gate stays honest."
+```
+
+becomes
+
+```sh
+    echo "WARNING: the agent jar did not build; the agent section will report absent"
+    echo "         in EVERY arm. The arms then agree because NEITHER measured"
+    echo "         anything, which is not honesty — see the DEGRADED_FIXTURES note."
+    DEGRADED_FIXTURES="$DEGRADED_FIXTURES agent-jar"
+```
+
+```sh
+      echo "WARNING: the JNI fixture did not build (see $OUT/logs/jni-build.log)."
+      echo "         The jni section will report lib=absent in EVERY arm."
+```
+
+becomes
+
+```sh
+      echo "WARNING: the JNI fixture did not build (see $OUT/logs/jni-build.log)."
+      echo "         The jni section will report lib=absent in EVERY arm."
+      DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib"
+```
+
+```sh
+    echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
+```
+
+becomes
+
+```sh
+    echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
+    DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib-no-cc"
+```
+
+**(3)** Refuse at the verdict. Anchor — the final three lines of the file:
+
+```sh
+echo "RESULT: PASS -- every arm completed and no section diverged that the"
+echo "        baseline does not already carry."
+exit 0
+```
+
+becomes
+
+```sh
+if [ -n "$DEGRADED_FIXTURES" ] && [ "${ALLOW_DEGRADED_FIXTURES:-0}" != "1" ]; then
+  echo ""
+  echo "DEGRADED FIXTURES:$DEGRADED_FIXTURES"
+  echo "  Each of these switches a whole SECTION off in every arm at once. The"
+  echo "  arms then agree, no section diverges, and the ratchet cannot fire --"
+  echo "  so a PASS here would mean 'nothing was measured', not 'nothing broke'."
+  echo "  Fix the fixture, or declare the degradation with"
+  echo "  ALLOW_DEGRADED_FIXTURES=1 so the run says out loud what it did not cover."
+  echo "RESULT: REFUSED -- a fixture did not build, so its section is absent in"
+  echo "        every arm and the agreement between them is vacuous."
+  exit 2
+fi
+
+echo "RESULT: PASS -- every arm completed and no section diverged that the"
+echo "        baseline does not already carry."
+exit 0
+```
+
+Two notes for whoever lands it. **A permanently-red job is a job nobody reads** —
+W7-51 §1.2's rule — so if the CI matrix has a runner with no C compiler, that
+runner's step sets `ALLOW_DEGRADED_FIXTURES=1` and the WARNING then stands as a
+declared gap rather than a hidden one. And this changes an **exit code**, so it
+must be run once on each matrix OS before landing: the failure mode of this fix
+is a REFUSED on a platform where the fixture never built and nobody knew.
+
+### 9.3.1 What landed — 2026-08-12
+
+The nomination above is discharged. Four differences from the sketch, each
+because the sketch was measured against the file rather than trusted.
+
+**Five tokens, not three.** The sketch marked the three sites that print a
+`WARNING`. There are **two more degradation paths in the same file that printed
+nothing at all** — quieter than the WARNING and with the identical effect:
+
+* `if [ -f "$OUT/classes/JdkOnlyProbeAgent.class" ]` had no `else`, so an agent
+  source that is missing or fails to produce a class yields no jar, no message,
+  and an `agent=absent` section in all three arms;
+* `if [ -f "$JNI_SRC" ]` likewise, for `probes/jdkonly_jni_probe.c`.
+
+Both now have an `else` that warns and marks (`agent-class`, `jni-source`).
+
+**The hatch takes a list.** `ALLOW_DEGRADED_FIXTURES=1` (or `all`) still allows
+everything, but `ALLOW_DEGRADED_FIXTURES="jni-lib-no-cc"` allows exactly that
+one. This matters for the leg that will use it: a Windows leg declaring `=1` to
+cover its missing C compiler would *also* silence the agent jar, which does
+build there — so the blanket spelling would hide a real regression in the one
+place the hatch is expected to be used. The file says to prefer the list.
+
+**The adjudication sits before `--update-baseline`, not just before `PASS`.**
+Both readings of the baseline are wrong under a degraded run: gating a hollowed
+run against a full baseline, and — worse — `--update-baseline` freezing the
+hollowed set as the new normal, silently deleting the agent and JNI rows from
+the ratchet. A declared-degraded `--update-baseline` still writes, but stamps
+the generated file with a `WARNING: frozen from a DEGRADED run` header naming
+the fixtures.
+
+**The new guard is self-tested, in the file's own idiom.** The hermetic
+`selftest()` — which already refuses to adjudicate if the ratchet cannot fire —
+gained four assertions on the single `undeclared_degradations()` helper that the
+verdict also calls (one copy of the decision, for `extract()`'s reason): an
+undeclared fixture is reported, a declared one is not, `=1` covers all, and a
+*partial* declaration still reports the rest. A guard that has never been shown
+to fire is the same species as the defect it guards against — the sentence this
+whole record is built on.
+
+**Decision table.**
+
+| state | before | after |
+| --- | --- | --- |
+| all fixtures built, no new divergence | `PASS`, 0 | `PASS`, 0 — unchanged |
+| all fixtures built, ratchet fires | `FAIL`, 5 | unchanged |
+| an arm did not complete | `FAIL`, 4 | unchanged (still adjudicated first) |
+| **fixture failed, undeclared** | **`PASS`, 0** | **`REFUSED`, 2** |
+| fixture failed, declared in the list | `PASS`, 0 | `PASS (DEGRADED: …)`, 0, naming the uncovered sections in the verdict |
+| fixture failed, `--update-baseline`, undeclared | baseline written from a hollow run, 0 | `REFUSED`, 2 |
+| no baseline for `<feature>-<os>` | `REFUSED`, 2 | unchanged |
+
+**Measured, on the real file, not on a copy.** No CratonVM build exists on the
+Windows host this was written on, so all three arms were pointed at a stand-in
+that strips `--real-jdk`/`--jdk-only`/`--java-home` and execs the real `java`.
+That makes the three transcripts genuinely byte-identical, which is the exact
+state the defect needs, and the run reproduces it verbatim:
+
+```
+JdkOnlyPlatformProbe.hotspot.norm : jni mapped=cratonjniprobe.dll lib=absent
+JdkOnlyPlatformProbe.strict.norm  : jni mapped=cratonjniprobe.dll lib=absent
+transcript: byte-identical to HotSpot in both modes
+```
+
+Three arms agreeing about a boundary none of them crossed. All three verdict
+paths were then executed end to end: undeclared → `RESULT: REFUSED`, exit 2;
+declared → the run continues past the guard; declared with a baseline present →
+`RESULT: PASS (DEGRADED: jni-lib-no-cc)`, exit 0. One of the five tokens
+(`jni-lib-no-cc`) was reached by its real branch on this host; the other four
+are one-line appends in branches whose conditions are plain `[ -f ]` tests, and
+the adjudicator that consumes every token is what the self-test exercises.
+
+**Which arms build where.** `jar` comes from `JAVA_HOME`, so the agent jar
+builds anywhere the corpus compiles — including Windows, verified here
+(`agent premain=true transformed=positive … attach=list-ok`). The JNI fixture
+needs `$CC` (default `cc`): absent on this Windows box (`cc`, `gcc`, `cl` all
+unresolved), so Windows is the leg that will need the declaration. On Linux the
+fixture demonstrably builds — the committed baseline's own note records the
+thirteen JNI marshalling families being measured and cleared over three
+consecutive three-arm runs, which is not something a `lib=absent` run can say.
+So the blocking `ubuntu-latest` step at `ci.yml:315` should see **no change at
+all**, which is the point: this is not a new red job. Not verified from here:
+the GitHub `ubuntu-latest` image itself, which cannot be executed from this
+host.
+
+**Exit 2 is not distinguished from exit 1 by CI, and cannot be.** Both call
+sites are plain `run:` steps (`ci.yml:315`, `:1404`); GitHub Actions fails a
+step on any non-zero status and exposes no way to branch on the value. So the
+refusal lands as an ordinary red step whose *message* carries the distinction —
+which is also true of the existing exit-2 no-baseline refusal, and is why the
+refusal text names the fixture and the escape hatch on the same screen. Note
+that three of the four `jdk-only` matrix legs already exit 2 today for the
+missing `25-windows` / `21-*` baselines, and that job is `continue-on-error` at
+the job level (`ci.yml:1027`); the only legs whose verdict this change can move
+are the ones that reach `PASS`, i.e. jdk-25-on-linux.
+
+### 9.4 The instrument this record's `--jdk-only` neighbours should be using
+
+Adjacent, and worth recording here because this record is the one about
+instruments: for `--jdk-only` questions there is now a complete per-run census —
+`cratonvm --jdk-only --explain-jdk-only --jdk-only-report r.json -cp <cp> <Main>`
+emits `compatibility-class-requested`, `native-shadows-bytecode` and
+`synthetic-native-registered` rows, each with class, method, descriptor and the
+requester's `file:line`. Three cautions, all of the same species this record is
+about:
+
+* **the flags are silently ignored if placed after the main class** — no file, no
+  warning, exit 0. A missing report is indistinguishable from a clean one, which
+  is a G4-shaped hazard in the census itself;
+* **`--explain-jdk-only` reports boot-time refusals and only those.** Every
+  runtime refusal is silent, so a clean startup banner licenses nothing;
+* **the census over-reports and a probe under-reports.** A requested-and-refused
+  row is not a failure — the caller recovers onto real bytecode. Only the
+  intersection of the two is the blocking set.
+
+### 9.5 The same shape swept across `scripts/` — one more instance, in a blocking step
+
+The repair in §9.3.1 fixes one script. The generalisation is worth more, so all
+twelve `scripts/*.sh` were swept for the same shape: **a step whose failure mode
+is "section skipped, still green"**. Three are scheduled in `ci.yml`
+(`jdk-only-strict-probes` ×2, `jdk-only-census` ×4, `check-no-diag-prints` ×1);
+the other nine are hand-run and score nothing.
+
+**Found — `scripts/check-no-diag-prints.sh`, blocking at `ci.yml:143`.** The
+scan is defined twice, `rg` when present and `find | grep` otherwise, and *both
+definitions end in `|| true`*:
+
+```sh
+hits=$(search)
+if [[ -z "$hits" ]]; then
+    exit 0
+fi
+```
+
+Empty output means "no forbidden prints" and empty output is also what a
+*failed* search produces, because `|| true` erases the distinction. There is no
+positive control: nothing asserts that the scan reached a single `.rs` file.
+Demonstrated by mutating the search rather than the file — one unrecognised
+flag is enough:
+
+```
+$ rg --no-heading --line-number --type rustx -e 'println' . 2>/dev/null || true
+(no output, status 0)  ->  gate prints nothing and exits 0
+```
+
+Milder than §9.3's defect on two counts: the script `cd`s to the repo root, so
+the classic wrong-directory version is already closed; and the pattern is a
+static regex over the tree rather than a fixture that has to build, so it
+degrades far less often. It is the same species all the same — the instrument's
+own failure is indistinguishable from a clean tree — and unlike
+`jdk-only-strict-probes.sh` it is a *blocking* step on the Linux leg.
+
+The fix is a sentinel, not a rewrite: commit one file containing a string the
+pattern must match (or match against the script's own comment header, which
+already lists the forbidden prefixes as literals), assert the search finds it,
+and exit non-zero if it does not. That is G4 for a grep: an oracle that returned
+nothing must not score green. **NOMINATION — not owned by this lane.**
+
+**Not found elsewhere.** `jdk-only-census.sh` already does the right thing: it
+collects a `missing` list of absent audit artifacts and exits non-zero naming
+them (`scripts/jdk-only-census.sh:424`), rather than treating an absent dump as
+an empty census. `jdk-only-measure-refusals-and-overlays.sh` counts
+`PARTIAL_RUNS` and terminates its log with `MEASUREPARTIAL runs_incomplete=N`
+vs `MEASURECOMPLETE` — it is a measuring instrument, not a gate, and it publishes
+its own completeness, which is the correct posture for one. `jck-matrix.sh` and
+`capture-hotspot-baseline.sh` exit non-zero on a missing interpreter and are
+scheduled by nothing.
+
+Re-verified while sweeping, because §9.2 turns on it: `grep -c 'probes/'
+regression-suite/run.sh` is still **0**, and so is `grep -c 'probes'` — no
+`SUITE=` value of the regression suite runs a single probe. That is now stated
+in `scripts/jdk-only-strict-probes.sh`'s own header, where the person deciding
+whether to silence a degraded section will be reading.

@@ -8,6 +8,60 @@ that the vector passes. Every measurement below was taken with the pre-change
 binary at `C:/craton/CratonVM/target/release/cratonvm.exe` and with Adoptium
 JDK 25.0.3.9, and each is reproducible.
 
+> ## Re-verified 2026-08-12 (record-triage lane, doc-only — nothing built or run)
+>
+> A source read of today's tree, stated as such. Line numbers below are today's.
+>
+> * **The strict fix is present and is exactly what this record describes.**
+>   `common_factory_from_image` is at
+>   `native-builtins/src/phases_late/concurrent.rs:8909`, and
+>   `alloc_common_factory` (`:8933-8987`) calls it only from the `Err(_)` arm,
+>   **after** `try_alloc_concurrent_synthetic`. The ordering this record calls
+>   the contract is intact, comment and all.
+> * **The `Compatible` half is still NOT taken.**
+>   `resolve_common_factory_internal_name` (`:8864-8873`) still returns the
+>   JDK-21 name and its doc comment still hands the decision back. The
+>   out-of-file patch below is unapplied; it remains a human's call.
+> * **The sweep table's line numbers are stale.** The file has moved ~690 lines:
+>   the fabrication-target rows are now `:8871` (the fallback string) and
+>   `:9103` (`t19_k3_safe_factory_class_name_accepts_quarkus`).
+> * **The two `StructuredTaskScope$ShutdownOn*` rows are no longer true as
+>   written, and in the good direction — treat them as CLOSED.** No
+>   `java/util/concurrent/StructuredTaskScope$ShutdownOn{Success,Failure}`
+>   registration exists in this file any more; the JEP 505 lane deleted the ~16
+>   of them and left the tombstone at `:5429-5437`. What survives is the
+>   `jdk/incubator/concurrent/` spelling (`:4574`, `:4629`) inside
+>   `register_p67_structured_task_scope` — dead for a *different* reason (JDK 25
+>   ships no `jdk.incubator.concurrent`), already saying so at `:4431-4448`, and
+>   counted by `W7-5-registrars-that-never-shipped.md`. Do not re-file it here.
+> * **`SynchronousQueue$Itr` is unchanged and still dead** —
+>   `try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2)`
+>   at `:1864`. Still the never-shipped-registrar census owner's deletion, not
+>   this record's.
+> * **The fixture handles the common-pool parallelism divergence correctly and
+>   wants no change.** `regression-suite/src/RJdkForkJoin.java:212-260` pins
+>   `getCommonPoolParallelism()` to `max(1, procs-1)` **or** the documented
+>   inline-proxy clamp of 1, asserts the static and instance readouts agree, and
+>   prints only VM-independent facts on the `CK` line (`commonParAccepted=true
+>   singleCpuHost=…`). CratonVM clamps the common pool to 1 for determinism where
+>   HotSpot answers `max(1, procs-1)`; printing the number would fail the
+>   harness's cross-VM `CK` diff on every host with 3+ CPUs. That divergence is
+>   legitimate and is not this record's defect.
+> * **Scheduling: half.** `RJdkForkJoin` is in `JDKONLY_CLASSES`
+>   (`regression-suite/run.sh:119`), so falsifier bullet 1 — the vector getting
+>   past `parallelStreams():209` — is scheduled and will run. **Bullets 2 and 3
+>   are not scheduled.** Nothing in the fixture reads `getFactory()`, so neither
+>   the strict-side answer nor the "`Compatible` must not move" guard has an
+>   executable form; the evidence for both is this record's hand-run probes. A
+>   single uniform assertion is impossible while the two modes are *specified*
+>   here to answer differently — which is itself an argument for taking the
+>   Compatible half rather than leaving it. The interim shape, if someone wants
+>   cover before that decision, is the accepted-set form the parallelism check in
+>   the same file already uses: assert the class name is one of the two known
+>   answers and that the identity relation agrees with whichever name came back,
+>   so a *third* answer fails. It would not have failed the pre-fix binary (that
+>   one threw earlier), so it is cover against future rot, not a RED.
+
 ## The failure
 
 ```

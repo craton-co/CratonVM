@@ -6,7 +6,10 @@
 use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
-use crate::util_concurrent_ext::{atomic_array_cas, atomic_array_rmw};
+use crate::util_concurrent_ext::{
+    atomic_array_cas, atomic_array_index, atomic_array_new_length, atomic_array_raw_index,
+    atomic_array_rmw,
+};
 
 /// The deadline a `java/net/SocketInputStream` read must honour, derived from
 /// the socket's own `SO_RCVTIMEO`.
@@ -1994,22 +1997,23 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
 
-    // --- String.chars() → IntStream ---
-    r.register(s, "chars", "()Ljava/util/stream/IntStream;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let val = ctx.read_string(this).unwrap_or_default();
-        // Create an int array of char values
-        let chars: Vec<i32> = val.chars().map(|c| c as i32).collect();
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, chars.len());
-        for (i, &c) in chars.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(c));
-        }
-        // Wrap in IntStream synthetic (field 0 = int[], field 1 = length)
-        let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2)?;
-        ctx.set_field(stream, 0, Value::Object(Some(arr)));
-        ctx.set_field(stream, 1, Value::Int(chars.len() as i32));
-        Ok(Some(Value::Object(Some(stream))))
-    });
+    // --- String.chars() → IntStream — RETIRED, deliberately not registered ---
+    //
+    // The twin of the `codePointAt` retirement below, found by the same
+    // question and removed for the same reason. The closure that was here did
+    // `ctx.read_string(this).chars().map(|c| c as i32)`, which is Rust's
+    // `char` iterator — CODE POINTS. Java's `chars()` is the code-UNIT view:
+    // `"a\u{1F600}b".chars()` is `[97, 55357, 56832, 98]` (four), and this
+    // body answered `[97, 128512, 98]` (three), so `chars().count()` was wrong
+    // over any astral character, not merely the values. The `read_string`
+    // round trip also folded an unpaired surrogate to U+FFFD.
+    //
+    // `lang_string::native_string_chars` is the body that reads the String's
+    // own `value` array as UTF-16, and `lang_math.rs:729` registers it. As
+    // with `codePointAt`, that registration owns the slot in real-JDK mode
+    // and was OVERWRITTEN by this one in synthetic-jdk mode, where
+    // `register_enterprise_final_natives` runs after `register_wrapper_natives`.
+    // W7-95a.
 
     // --- String.toUpperCase(Locale) / toLowerCase(Locale) ---
     // Share the locale-aware implementation rather than folding with Rust's
@@ -2056,14 +2060,50 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- String.codePointAt(int) ---
-    r.register(s, "codePointAt", "(I)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let val = ctx.read_string(this).unwrap_or_default();
-        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let cp = val.chars().nth(idx).map(|c| c as i32).unwrap_or(0);
-        Ok(Some(Value::Int(cp)))
-    });
+    // --- String.codePointAt(int) — RETIRED, deliberately not registered here ---
+    //
+    // What used to be here:
+    //
+    //     r.register(s, "codePointAt", "(I)I", |ctx, args| {
+    //         let val = ctx.read_string(this).unwrap_or_default();
+    //         let idx = args.get(1)... as usize;
+    //         let cp = val.chars().nth(idx).map(|c| c as i32).unwrap_or(0);
+    //     });
+    //
+    // `chars().nth(idx)` counts Rust `char`s — CODE POINTS — and Java's
+    // `codePointAt(int index)` takes an index in UTF-16 CODE UNITS. The two
+    // agree for a wholly-BMP string and diverge silently for anything else:
+    // no exception, just a wrong character, and one code point of skew for
+    // every astral character to the left of `index`. The `read_string` round
+    // trip made it worse — a Rust `str` cannot hold an unpaired surrogate, so
+    // `"x\uD800y".codePointAt(1)` answered U+FFFD. And out of range answered
+    // `0` where the spec says `StringIndexOutOfBoundsException`.
+    //
+    // Which body wins is not a matter of which is better —
+    // `NativeMethodRegistry::register` is LAST-WRITE-WINS, and this
+    // registration ran LATER than the good one in exactly one of the two
+    // shipping modes. Measured from `--dump-native-registry`:
+    //
+    //   real-JDK / compatible mode  `register_core_stdlib_extras` is not
+    //     called at all (it is reached only through
+    //     `register_enterprise_final_natives`), so `lang_math.rs:760` ->
+    //     `lang_string::native_string_code_point_at` already owned the slot.
+    //     Two dumps agree: `owns_slot=true, overwrote=None`, and no
+    //     `phases_early` row for `java/lang/String` exists.
+    //
+    //   synthetic-jdk mode  `register_synthetic_overrides` calls
+    //     `register_wrapper_natives` (lib.rs:23411) FIRST and
+    //     `register_enterprise_final_natives` (lib.rs:24005) after it, so this
+    //     closure overwrote the good body and was the live answer.
+    //
+    // So this was not dead code, and removing it is a behaviour change in
+    // synthetic-jdk mode — to the body that decodes the String's own `value`
+    // array as UTF-16, handles surrogate pairs, and throws SIOOBE with
+    // HotSpot's message. W7-95a.
+    //
+    // Same defect family as the atomic-array bounds hole fixed this wave:
+    // an implementation that is right for the common case and silently wrong
+    // at the edge, with nothing in the type system or the fixtures to notice.
 
     // --- StringJoiner ---
     // Layout: 3-field (delimiter=0 String, prefix=1 String, parts=2 ArrayList)
@@ -2698,15 +2738,22 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
         Ok(Some(Value::Double(a + b)))
     });
+    // `Double.min`/`max` have their OWN bodies here, so the `java/lang/Math`
+    // repair does not reach them — a third copy of one rule. JDK 25's
+    // `Double.min` is literally `return Math.min(a, b);`, so sharing one tree
+    // is a theorem, not a convenience. Measured wrong before this:
+    // `Double.min(1.0, NaN)` answered `1.0` and `Double.min(-0.0, 0.0)`
+    // answered `+0.0`; Java requires `NaN` and `-0.0`. See the helpers' doc in
+    // `lang_math.rs` for why Rust's `f64::min` is the wrong primitive.
     r.register("java/lang/Double", "max", "(DD)D", |_ctx, args| {
         let a = args.first().and_then(|v| v.as_double()).unwrap_or(0.0);
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
-        Ok(Some(Value::Double(a.max(b))))
+        Ok(Some(Value::Double(crate::lang_math::java_math_max_f64(a, b))))
     });
     r.register("java/lang/Double", "min", "(DD)D", |_ctx, args| {
         let a = args.first().and_then(|v| v.as_double()).unwrap_or(0.0);
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
-        Ok(Some(Value::Double(a.min(b))))
+        Ok(Some(Value::Double(crate::lang_math::java_math_min_f64(a, b))))
     });
 
     // --- Charset ---
@@ -3573,14 +3620,32 @@ pub(crate) fn tl_with_initial_suppliers(
     S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-/// Identity hashes of every TL instance whose runtime class is (or extends)
-/// `java/lang/InheritableThreadLocal`. Populated by `<init>` of the ITL
-/// variant; consulted by `Thread.start` when building the child's
+/// Every TL instance whose runtime class is (or extends)
+/// `java/lang/InheritableThreadLocal`, keyed by JLS identity hash → the
+/// ThreadLocal OBJECT itself. Populated by `<init>` of the ITL variant;
+/// consulted by `Thread.<init>` / `Thread.start` when building the child's
 /// inherited snapshot.
-pub(crate) fn tl_inheritable_ids() -> &'static parking_lot::Mutex<rustc_hash::FxHashSet<i32>> {
-    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashSet<i32>>> =
+///
+/// G43-1: this was an `FxHashSet<i32>`. A bare identity hash is enough to
+/// decide WHETHER an entry is inherited, but not WHAT the child receives:
+/// HotSpot's `ThreadLocal.createInheritedMap` stores `key.childValue(value)`,
+/// and an overriding subclass is arbitrary application bytecode that needs a
+/// receiver to be invoked on. There was no receiver here, so `childValue` was
+/// never applied and every child got the parent value verbatim (G36-2 §3.1,
+/// oracle row 16: HotSpot `cv(cvparent)`, CratonVM `cvparent`).
+///
+/// GC (same contract as `tl_with_initial_suppliers` above): the object is
+/// registered with `register_var_handle_root` at `native_itl_init` and re-read
+/// with `read_var_handle_root` — keyed by the map key, which IS its identity
+/// hash — at every use. The raw `ObjectRef` stored here is a
+/// stale-after-a-moving-GC fallback for contexts that do not implement the
+/// registry (mocks), never the address we call through when the registry
+/// answers.
+pub(crate) fn tl_inheritable_ids(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>>> =
         std::sync::OnceLock::new();
-    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashSet::default()))
+    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 /// Map from a child Java Thread's identity hash → snapshot of inherited
@@ -3693,7 +3758,13 @@ fn native_tl_init(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 fn native_itl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let id = ctx.identity_hash_code(this);
-    tl_inheritable_ids().lock().insert(id);
+    // G43-1: root the ITL object itself, because `snapshot_inheritable_tl_entries`
+    // has to invoke `childValue` ON it and the table outlives every frame that
+    // could otherwise keep it reachable. `register_var_handle_root` is the
+    // pattern `tl_with_initial_suppliers` uses for its suppliers; the identity
+    // key it is read back by is the same `id` we key the table with.
+    ctx.register_var_handle_root(this);
+    tl_inheritable_ids().lock().insert(id, this);
     Ok(None)
 }
 
@@ -3781,32 +3852,117 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 /// Build a snapshot of this OS thread's TL entries whose keys are
-/// flagged inheritable. Called from `native_thread_start0` (parent side)
-/// before the child OS thread is spawned. Returns `None` if there are
-/// no inheritable entries to copy.
+/// flagged inheritable, with `InheritableThreadLocal.childValue` applied to
+/// each. This is CratonVM's `ThreadLocal.createInheritedMap`.
 ///
-/// NOTE: this only sees the parent's local map. Suppliers registered via
-/// `withInitial` are NOT eagerly evaluated for the child — the child's
-/// first `get()` will invoke its own supplier copy. That matches JDK
-/// semantics: `InheritableThreadLocal` inherits only set values, and
-/// `withInitial` ThreadLocals are not inheritable by default anyway.
+/// Called from `lang_system::capture_inheritable_tl_at_construction` (the
+/// construction-time capture the nine `Thread.<init>` bridges in `lib.rs` go
+/// through) and, only when nothing was captured at construction, from
+/// `native_thread_start0`. Exactly one of the two runs per child, so
+/// `childValue` is applied exactly once per constructed Thread — matching
+/// HotSpot, MEASURED (G36-2 §3.1 `G36Cv` rows 6 and 8: one call for a Thread
+/// that is started, one for a Thread that never is), and it runs on the
+/// CONSTRUCTING thread (row 10), which is where this function already was.
+///
+/// Returns `None` if there are no inheritable entries to copy.
+///
+/// NOTE: this sees the parent's local map, plus (since G43-1) whatever the
+/// parent itself inherited but has not yet read — see the drain at the top of
+/// the body. Suppliers registered via `withInitial` are NOT eagerly evaluated
+/// for the child — the child's first `get()` will invoke its own supplier
+/// copy. That matches JDK semantics: `InheritableThreadLocal` inherits only
+/// set values, and `withInitial` ThreadLocals are not inheritable by default
+/// anyway.
+///
+/// An explicitly stored `null` IS an entry, so `childValue(null)` is called
+/// for it; a `remove()`d ThreadLocal is not an entry, so nothing is called.
+/// Both MEASURED against HotSpot (`G36Cv` rows 4 and 5).
 pub(crate) fn snapshot_inheritable_tl_entries(
     ctx: &mut dyn NativeContext,
 ) -> Option<rustc_hash::FxHashMap<i32, ThreadLocalValue>> {
-    let inheritable = tl_inheritable_ids().lock();
-    if inheritable.is_empty() {
+    // G43-1 row 24 — inheritance must be TRANSITIVE. The drain is lazy: a
+    // thread's own inherited entries sit in `tl_inherited_pending` until its
+    // first `ThreadLocal` get/set/remove moves them into `TL_MAP`. A thread
+    // that inherited a value and then constructs a child WITHOUT ever reading
+    // it had an empty `TL_MAP` here, so the grandchild inherited nothing —
+    // `null` where HotSpot gives the grandparent's value. Draining first makes
+    // "what this thread would see if it read now" the thing we snapshot, which
+    // is what `createInheritedMap` copies on HotSpot. Idempotent, and a single
+    // bool check after the first call.
+    drain_inherited_for_current_thread(ctx);
+
+    // Three passes, and the split is NOT cosmetic. Pass 3 calls `childValue`,
+    // which is arbitrary application bytecode: an override that reads any
+    // ThreadLocal re-enters `TL_MAP.borrow()` (a `RefCell` double-borrow
+    // PANIC), and one that constructs an `InheritableThreadLocal` re-enters
+    // `native_itl_init` and this same non-reentrant `parking_lot::Mutex` (a
+    // DEADLOCK on the thread-construction path, i.e. a hang in every executor
+    // that ever mints a worker). So: take the table out and drop the lock,
+    // read the values out and drop the borrow, and only then call into Java
+    // holding neither.
+
+    // PASS 1 — copy the inheritable table; the lock is released at the brace.
+    let inheritable: Vec<(i32, ObjectRef)> = {
+        let guard = tl_inheritable_ids().lock();
+        if guard.is_empty() {
+            return None;
+        }
+        guard.iter().map(|(&k, &tl)| (k, tl)).collect()
+    };
+
+    // PASS 2 — copy this thread's own values for those keys. `ThreadLocalValue`
+    // is `Copy` and each `Root` variant already holds a global-root handle, so
+    // nothing here needs `ctx` and nothing here can allocate: the borrow is
+    // held across pure copies only, and is released at the closure's end.
+    let mut parent_entries: Vec<(i32, ObjectRef, ThreadLocalValue)> = Vec::new();
+    TL_MAP.with(|m| {
+        let map = m.borrow();
+        for &(key, tl) in &inheritable {
+            if let Some(stored) = map.get(&key) {
+                parent_entries.push((key, tl, *stored));
+            }
+        }
+    });
+    if parent_entries.is_empty() {
         return None;
     }
-    let snap: rustc_hash::FxHashMap<i32, ThreadLocalValue> = TL_MAP.with(|m| {
-        let map = m.borrow();
-        map.iter()
-            .filter(|(k, _)| inheritable.contains(k))
-            .map(|(k, v)| {
-                let java_value = tl_value_to_java(ctx, *v);
-                (*k, tl_value_from_java(ctx, java_value))
-            })
-            .collect()
-    });
+
+    // PASS 3 — apply `childValue`. No lock, no borrow, re-entrant-safe.
+    //
+    // The erased descriptor `(Ljava/lang/Object;)Ljava/lang/Object;` is the
+    // one that reaches BOTH `InheritableThreadLocal.childValue` itself and
+    // javac's synthetic bridge for a `childValue(String)`-shaped override.
+    //
+    // Values are re-resolved through `tl_value_to_java` immediately around the
+    // call rather than materialised in pass 2: `childValue` can allocate, and
+    // a moving GC would leave a pre-computed `ObjectRef` stale. The
+    // `ThreadLocalValue` we carry is the GC-stable form.
+    //
+    // BOUNDED DEVIATION (recorded here because it cannot be fixed at this
+    // layer): HotSpot propagates an exception thrown by `childValue` out of
+    // `Thread.<init>`. This function returns `Option`, not `Result`, and its
+    // callers are nine `Thread.<init>` bodies that return `()`, so a throwing
+    // override is swallowed and the child inherits the PARENT value — which is
+    // also what the base implementation would have produced. `Ok(None)` (no
+    // body found, e.g. a synthetic-JDK image that does not declare
+    // `childValue`) takes the same arm for the same reason.
+    let mut snap: rustc_hash::FxHashMap<i32, ThreadLocalValue> = rustc_hash::FxHashMap::default();
+    for (key, cached_tl, stored) in parent_entries {
+        let tl = ctx.read_var_handle_root(key).unwrap_or(cached_tl);
+        let parent_value = tl_value_to_java(ctx, stored);
+        let called = ctx.invoke_virtual(
+            tl,
+            "childValue",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[parent_value],
+        );
+        let child_value = match called {
+            Ok(Some(v)) => v,
+            // Re-resolve: the callee may have run a moving GC under us.
+            Ok(None) | Err(_) => tl_value_to_java(ctx, stored),
+        };
+        snap.insert(key, tl_value_from_java(ctx, child_value));
+    }
     if snap.is_empty() {
         None
     } else {
@@ -6127,6 +6283,36 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
 
 fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A null key type is a `NullPointerException`, in BOTH modes.
+    //
+    // `EnumMap(Class<K> keyType)` is `keyUniverse = getKeyUniverse(keyType)`,
+    // which reaches `keyType.getEnumConstantsShared()` — an unguarded
+    // dereference, so the JDK throws before storing anything. This body instead
+    // fell through to the `_ =>` arm below, built a zero-length universe and
+    // RETURNED, leaving a live `EnumMap` with a null `keyType` whose every
+    // subsequent `put` would fail somewhere else with an unrelated message.
+    //
+    // The message is HotSpot 25.0.3+9's helpful-NPE text, transcribed:
+    // `Cannot invoke "java.lang.Class.getEnumConstantsShared()" because "klass"
+    // is null`. `RJdkIntrinsics3`'s `ckX` compares only the exception CLASS, so
+    // the text is fidelity rather than gate; it is recorded here so a later
+    // lane that does compare messages has the measured one and not a guess.
+    //
+    // Placed ahead of the real/synthetic split deliberately: the contract is
+    // the Java one and does not depend on which layout backs the map, and no
+    // in-VM caller constructs an `EnumMap` with a null class (the bootstrap
+    // logging path that motivated the essential-set registration passes a real
+    // enum class; `alloc_enum_map` builds its instance without this ctor).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.lang.Class.getEnumConstantsShared()\" \
+                 because \"klass\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
     // `<init>` is dispatched via invokespecial, where a registered native
     // ALWAYS wins over bytecode (see `invoke_special_shared`'s "Native
     // override always wins" priority) — unlike invokevirtual calls such as
@@ -12605,6 +12791,51 @@ fn p52_isa_check_port(port: i32) -> Result<i32, cratonvm_types::error::MethodCal
     Ok(port)
 }
 
+/// `InetSocketAddress.checkHost` — a null hostname is an
+/// `IllegalArgumentException`, NOT the `NullPointerException` a native that
+/// simply dereferences the argument produces.
+///
+/// The message is TRANSCRIBED from HotSpot 25.0.3+9, not paraphrased: it is
+/// `hostname can't be null` — an apostrophe, no article, no trailing period.
+///
+/// **The order this runs in relative to [`p52_isa_check_port`] is different in
+/// the two callers, and neither is derivable from the other.** The JDK:
+///
+/// ```java
+/// public static InetSocketAddress createUnresolved(String host, int port) {
+///     return new InetSocketAddress(checkPort(port), checkHost(host));
+/// }
+/// public InetSocketAddress(String hostname, int port) {
+///     checkHost(hostname);
+///     ...
+///     holder = new InetSocketAddressHolder(host, addr, checkPort(port));
+/// }
+/// ```
+///
+/// `createUnresolved` evaluates `checkPort` FIRST because it is the first
+/// *argument*; the constructor calls `checkHost` first as its first
+/// *statement*. MEASURED, both wrong at once:
+///
+/// | call | HotSpot |
+/// |---|---|
+/// | `createUnresolved(null, -1)` | `IllegalArgumentException: port out of range:-1` |
+/// | `new InetSocketAddress((String) null, -1)` | `IllegalArgumentException: hostname can't be null` |
+///
+/// Two methods that look interchangeable, opposite answers. A guard written
+/// once and shared in one order gets one of these rows right and the other
+/// wrong, and the wrong one is the row a reviewer would call obviously
+/// equivalent. Do not "simplify" the two call sites into a common helper that
+/// fixes an order.
+fn p52_isa_check_host(host: Value) -> Result<(), MethodCallFailed> {
+    if matches!(host, Value::Object(None)) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "hostname can't be null".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) -> Result<(), MethodCallFailed> {
     // Cross-call GC-safety (2026-08-04): `alloc_concurrent_synthetic` allocates
     // (and on a cold VM also loads + initialises the holder class), so `this`,
@@ -12817,6 +13048,14 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     });
     r.register(isa, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // HOST FIRST, then port — see [`p52_isa_check_host`]. This is the
+        // opposite order from `createUnresolved` below, and it is measured, not
+        // assumed: `new InetSocketAddress((String) null, -1)` reports the
+        // hostname on HotSpot while `createUnresolved(null, -1)` reports the
+        // port. `obj_arg(args, 1)?` used to run here and raised
+        // `NullPointerException: null object argument` for both.
+        let host_val = args.get(1).copied().unwrap_or(Value::Object(None));
+        p52_isa_check_host(host_val)?;
         let host = obj_arg(args, 1)?;
         let port = p52_isa_check_port(args[2].as_int().unwrap_or(0))?;
         // Real JDK resolves the hostname via `InetAddress.getByName(host)`
@@ -12908,8 +13147,15 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         "createUnresolved",
         "(Ljava/lang/String;I)Ljava/net/InetSocketAddress;",
         |ctx, args| {
-            let host = obj_arg(args, 0)?;
+            // PORT FIRST, then host — the reverse of the `(String,I)V`
+            // constructor above, because `createUnresolved` is
+            // `new InetSocketAddress(checkPort(port), checkHost(host))` and
+            // `checkPort` is the first argument evaluated. MEASURED:
+            // `createUnresolved(null, -1)` is `port out of range:-1`, not
+            // `hostname can't be null`. See [`p52_isa_check_host`].
             let port = p52_isa_check_port(args[1].as_int().unwrap_or(0))?;
+            p52_isa_check_host(args.first().copied().unwrap_or(Value::Object(None)))?;
+            let host = obj_arg(args, 0)?;
             // Cross-call GC-safety: the allocation below can move `host`.
             let mut scope = NativeHandleScope::new(ctx);
             let host_h = scope.root(host);
@@ -20581,6 +20827,31 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
 ///
 /// Called from `register_phase54_atomics` in synthetic mode and directly from
 /// `register_essential_natives` in real-JDK mode.
+/// Resolve `(backing array, RANGE-CHECKED index)` for an `AtomicReferenceArray`
+/// element native.
+///
+/// The twin of `util_concurrent_ext`'s `atomic_array_slot`, differing only in
+/// how the backing array is reached: `AtomicIntegerArray`/`AtomicLongArray`
+/// read slot 0, this one reads the field by NAME so it lands on the real JDK
+/// layout's `array` whatever number that layout gives it.
+///
+/// `Ok(None)` = no receiver / no backing array, which keeps each caller's
+/// historical `null`-shaped default. `Err` = out of range, and HotSpot throws
+/// `ArrayIndexOutOfBoundsException` there — see `atomic_array_index` for the
+/// measured before/after table and for why the check belongs on a funnel.
+fn ara_slot(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Option<(ObjectRef, usize)>, MethodCallFailed> {
+    let this = obj_arg(args, 0)?;
+    let raw = atomic_array_raw_index(args);
+    let arr = match ctx.get_field_by_name(this, "array") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    Ok(Some((arr, atomic_array_index(ctx, arr, raw)?)))
+}
+
 pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -20588,7 +20859,10 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
     let ara = "java/util/concurrent/atomic/AtomicReferenceArray";
     r.register(ara, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let len = args[1].as_int().unwrap_or(0) as usize;
+        // `new AtomicReferenceArray(-1)` throws NegativeArraySizeException on
+        // HotSpot (measured, JDK 25.0.3+9). The old `as usize` handed
+        // `usize::MAX` to `new_array` instead.
+        let len = atomic_array_new_length(args[1].as_int().unwrap_or(0))?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
         // Use by-name writes so we land on the real `array` slot regardless of
         // how the class layout numbers its fields.
@@ -20604,41 +20878,29 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
             Ok(Some(Value::Int(0)))
         }
     });
-    r.register(ara, "get", "(I)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-            Ok(Some(ctx.get_array_element(arr, idx)))
-        } else {
-            Ok(Some(Value::Object(None)))
+    let ara_get = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
+        match ara_slot(ctx, args)? {
+            Some((arr, idx)) => Ok(Some(ctx.get_array_element(arr, idx))),
+            None => Ok(Some(Value::Object(None))),
         }
-    });
-    r.register(ara, "set", "(ILjava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
+    };
+    r.register(ara, "get", "(I)Ljava/lang/Object;", ara_get);
+    let ara_set = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
         let val = args[2];
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
+        if let Some((arr, idx)) = ara_slot(ctx, args)? {
             ctx.set_array_element(arr, idx, val);
         }
         Ok(None)
-    });
-    r.register(ara, "lazySet", "(ILjava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
-        let val = args[2];
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-            ctx.set_array_element(arr, idx, val);
-        }
-        Ok(None)
-    });
+    };
+    r.register(ara, "set", "(ILjava/lang/Object;)V", ara_set);
+    r.register(ara, "lazySet", "(ILjava/lang/Object;)V", ara_set);
     let ara_cas = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-            let ok = atomic_array_cas(ctx, arr, idx, args[2], args[3]);
-            Ok(Some(Value::Int(i32::from(ok))))
-        } else {
-            Ok(Some(Value::Int(0)))
+        match ara_slot(ctx, args)? {
+            Some((arr, idx)) => {
+                let ok = atomic_array_cas(ctx, arr, idx, args[2], args[3]);
+                Ok(Some(Value::Int(i32::from(ok))))
+            }
+            None => Ok(Some(Value::Int(0))),
         }
     };
     r.register(
@@ -20664,14 +20926,13 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
         "getAndSet",
         "(ILjava/lang/Object;)Ljava/lang/Object;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let idx = args[1].as_int().unwrap_or(0) as usize;
-            if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-                let new_val = args[2];
-                let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| new_val);
-                Ok(Some(old))
-            } else {
-                Ok(Some(Value::Object(None)))
+            let new_val = args[2];
+            match ara_slot(ctx, args)? {
+                Some((arr, idx)) => {
+                    let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| new_val);
+                    Ok(Some(old))
+                }
+                None => Ok(Some(Value::Object(None))),
             }
         },
     );
@@ -20765,7 +21026,6 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // an answer the bytecode would not; this constructor gives a DIFFERENT
     // object. JDK 25's `LogRecord(Level, String)` ends with
     // `needToInferCaller = true` and assigns `sequenceNumber` from
-    // `globalSequenceNumber.getAndIncrement()`. This one writes neither.
     //
     // `needToInferCaller` is the whole defect. Measured under `--jdk-only` with
     // `--add-opens=java.logging/java.util.logging=ALL-UNNAMED`, on a binary
@@ -20785,8 +21045,11 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // `Bridge`, and this function's ambient category is `Intrinsic` — so the
     // entry has been INERT the whole time. Under `--jdk-only` the OTHER
     // registration of this triple (native-builtins/src/lib.rs, `Bridge`) is
-    // refused and this one silently owns the slot, which is why retiring that
-    // one measured verdict-neutral: nothing changed because this kept running.
+    // registration of this triple (native-builtins/src/lib.rs, `Bridge`) OWNS
+    // the slot -- MEASURED 2026-08-13 with `--dump-native-registry`:
+    // lib.rs owns=true inv=2, this one owns=false inv=0. The claim that ran
+    // the other way round sent a later fix into THIS dead body, where it
+    // changed nothing. Put LogRecord ctor changes in lib.rs.
     // Fourth instance of the ambient-category defect on this file's JUL rows.
     // W7-56-infercaller-strict.md
     //
@@ -21038,12 +21301,64 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
 
     // --- Handler (abstract base, 1-field: level=0) ---
     let handler = "java/util/logging/Handler";
+    // `setLevel` REFUSES a null level, and the refusal happens BEFORE the
+    // store. Both halves are MEASURED (2026-08-17, `scratchpad/g21`, HotSpot
+    // 25.0.3+9-LTS vs `--jdk-only`):
+    //
+    //   Handler.setLevel(null)                          HotSpot NPE msg=null
+    //   Handler.getLevel() after the REFUSED setLevel   HotSpot ALL
+    //
+    // The second row is why the check cannot be "store, then throw": this body
+    // used to write the null and return, so `getLevel()` afterwards answered
+    // `null` where HotSpot still answers the level that was there. Two
+    // assertions of `RJdkIntrinsics3`'s `logrec` family ride on this one body.
+    //
+    // The NPE is BARE. `Level.parse(null)` in `logmanager.rs` carried an
+    // invented `"Name cannot be null"` for months on a row whose CLASS was
+    // already right; do not add a message here that HotSpot does not produce.
+    // `Handler.setFormatter(null)` and `LogRecord.setLevel(null)` are the same
+    // bare shape.
+    //
+    // NOT A BLANKET JUL RULE, and the surrounding rows prove it. MEASURED on
+    // the same oracle run, same probe:
+    //
+    //   Handler.setFilter(null)      RETURNS   Handler.setEncoding(null) RETURNS
+    //   Logger.setLevel(null)        RETURNS   <- the SAME NAME, opposite verdict
+    //   Logger.removeHandler(null)   RETURNS   while addHandler(null) throws
+    //   LogRecord.set{Message,LoggerName,Parameters,Thrown,ResourceBundle,
+    //     ResourceBundleName}(null) RETURN, and so do the retired
+    //     set{SourceClassName,SourceMethodName} pair
+    //     -- those six ARE the `lr_set` store-then-return bodies a few dozen
+    //     lines above, so "add a null check to the JUL setters" would break
+    //     six measured rows in THIS function to fix one. Only
+    //     `LogRecord.setLevel` and `setInstant` throw, and this file registers
+    //     NEITHER: the real bytecode already gets both right.
+    //
+    // The shape underneath: a JUL method throws when its own first statement
+    // dereferences the argument, and returns when the argument is merely
+    // stored. `Handler.setLevel` opens `if (newLevel == null) throw`; on
+    // `Logger` a null level MEANS "inherit from the parent" and is a legal
+    // state. That explains the difference; it does not license deriving any
+    // other row from it. G21-1, G15-1 §2, HANDOFF-20260814 §5.
+    //
+    // In `Compatible` this registration does not own the slot --
+    // `reflect_annotations.rs:370` overwrites it and already carries this
+    // contract (MEASURED: `owns_slot=false inv=0` here, `owns_slot=true inv=11`
+    // there). `--jdk-only` never runs `register_synthetic_overrides`, so THIS
+    // body is the only one, and it owns the slot (MEASURED: `kind=intrinsic
+    // owns_slot=true overwrote=null inv=12`). The `java/util/logging/` shadow
+    // retirement does not reach it either: `retired_shadow.rs:445` lists the
+    // triple, but that retag fires only on an effective category of `Bridge`
+    // and this function's ambient category is `Intrinsic`.
     r.register(
         handler,
         "setLevel",
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             ctx.set_field(this, 0, args[1]);
             Ok(Some(Value::Object(None)))
         },
@@ -21132,14 +21447,23 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             |ctx, args| match args.get(1) {
                 Some(Value::Object(Some(rec))) => jul_formatter_format_message(ctx, *rec),
                 // A null record is an NPE on HotSpot (`record.getMessage()` is
-                // the method's first act). This row has answered with an empty
-                // string since it was written and nothing measured exercises
-                // the null, so the historical answer is kept rather than
-                // introducing a throw that no test can adjudicate.
-                _ => {
-                    let s = ctx.create_string("");
-                    Ok(Some(Value::Object(Some(s))))
+                // the method's first act). This arm used to answer with the
+                // EMPTY STRING, and its comment used to say "nothing measured
+                // exercises the null, so the historical answer is kept". That
+                // is no longer true: MEASURED 2026-08-17 (`scratchpad/g21`),
+                // HotSpot 25.0.3+9-LTS throws the helpful NPE below, and
+                // CratonVM returned `""` in BOTH modes — this registration owns
+                // the slot in both (`owns_slot=true overwrote=null inv=2`).
+                //
+                // The message is TRANSCRIBED from that run, not derived. It is
+                // a helpful-NPE naming the parameter `record`, unlike the BARE
+                // NPE of `Handler.setLevel(null)` a few dozen lines above; the
+                // two rows are in the same family and do not share a shape.
+                // G21-1 N2 / G15-1 §6 N2.
+                _ => Err(RuntimeError::NullPointerException {
+                    message: Some(JUL_NPE_NULL_FORMAT_RECORD.to_string()),
                 }
+                .into()),
             },
         );
     });
@@ -21213,6 +21537,16 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.set_category(__prev_cat);
 }
+
+/// HotSpot's helpful-NPE text for `Formatter.formatMessage(null)`.
+///
+/// TRANSCRIBED from a HotSpot 25.0.3+9-LTS run (`scratchpad/g21`, 2026-08-17),
+/// not derived: `formatMessage`'s first act is `record.getMessage()`, and the
+/// helpful-NPE machinery names the receiver expression and the parameter. The
+/// class alone is not enough to assert — `Level.parse(null)` shipped the right
+/// class with an invented `"Name cannot be null"` for months (G15-1 §4).
+const JUL_NPE_NULL_FORMAT_RECORD: &str =
+    "Cannot invoke \"java.util.logging.LogRecord.getMessage()\" because \"record\" is null";
 
 /// Does the message look like a `java.text` format string?
 ///
@@ -21415,6 +21749,28 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     r.register(uri, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw_ref = obj_arg(args, 1)?;
+        // The ARGUMENT is the authoritative text, and it must be stored rather
+        // than rebuilt. `read_string` decodes to a Rust `String`, which cannot
+        // hold an unpaired surrogate; every `create_string(&raw)` below is
+        // therefore a lossy round trip. MEASURED on both VMs at `b9f302019`:
+        //
+        //   new URI("http://h/a<U+D800>b").toString()
+        //     HotSpot   len=12  charAt(10)=d800
+        //     CratonVM  len=12  charAt(10)=fffd
+        //
+        // The length was right, which is why this survived so long — only the
+        // one code unit was wrong. `raw` stays for the PARSING below, which
+        // splits on ASCII delimiters and is unaffected by the substitution;
+        // what must not be rebuilt is the text handed back verbatim.
+        //
+        // Pinned because this closure allocates a dozen strings between here
+        // and the stores, and a moving young collection would leave `raw_ref`
+        // pointing into from-space. NOTE, and deliberately NOT fixed here:
+        // `this` and the parsed component refs are held across those same
+        // allocations with no pin. That hazard is pre-existing and widening
+        // this change to cover it would put an unmeasured rewrite of the whole
+        // constructor behind a one-code-unit fix.
+        let raw_pin = ctx.pin_native_root(raw_ref);
         let raw = ctx.read_string(raw_ref).unwrap_or_default();
         // JDK URI authority is introduced only by `//` after the optional
         // scheme. A plain relative URI such as `docProps/core.xml` is all path;
@@ -21510,7 +21866,10 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         } else {
             Value::Object(None)
         };
-        let raw_str = ctx.create_string(&raw);
+        // Slot 6 and `string` are the same text and may be the same object:
+        // `java.lang.String` is immutable, and HotSpot's `URI` likewise keeps
+        // one reference to the string it was constructed from.
+        let raw_str = ctx.read_native_pin(raw_pin, raw_ref);
         ctx.set_field(this, 0, scheme);
         ctx.set_field(this, 1, host);
         ctx.set_field(this, 2, port);
@@ -21518,7 +21877,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 4, query_val);
         ctx.set_field(this, 5, fragment_val);
         ctx.set_field(this, 6, Value::Object(Some(raw_str)));
-        let named_raw = ctx.create_string(&raw);
+        let named_raw = ctx.read_native_pin(raw_pin, raw_ref);
         ctx.set_field_by_name(this, "string", Value::Object(Some(named_raw)));
         if let Some(scheme) = scheme_text {
             let named_scheme = ctx.create_string(scheme);
@@ -21539,6 +21898,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
             let named_decoded_path = ctx.create_string(path_str);
             ctx.set_field_by_name(this, "decodedPath", Value::Object(Some(named_decoded_path)));
         }
+        ctx.unpin_native_roots(raw_pin);
         Ok(Some(Value::Object(None)))
     });
     r.register(
@@ -25297,5 +25657,648 @@ mod t2_tests {
         // for a digit, and must not miss a pattern that follows one.
         assert!(!jul_message_is_java_text_format("héllo {x}"));
         assert!(jul_message_is_java_text_format("héllo {0}"));
+    }
+
+    // =======================================================================
+    // G21 — the JUL null axis on the rows THIS file owns.
+    //
+    // Every expectation below is transcribed from a HotSpot 25.0.3+9-LTS run
+    // (`scratchpad/g21/G21Probe.java`, 2026-08-17, 34 rows), not read off the
+    // JDK source and not carried over from another record.
+    //
+    // The tests come in PAIRS on purpose, and the second half is the half that
+    // matters. `Handler.setLevel(null)` throws while `Handler.setFilter(null)`,
+    // `Logger.setLevel(null)` and NINE `LogRecord` setters return normally — a
+    // blanket "JUL rejects null" rule passes every throws-test here and breaks
+    // 22 measured rows. HANDOFF-20260814 §5 records that generalisation as
+    // having already cost this family working paths once. If a later change
+    // adds a null guard to `lr_set`, or to the `Handler` setters this file does
+    // not register, `jul_log_record_reference_setters_accept_null_and_must_not_
+    // throw` and `jul_this_file_registers_no_other_handler_setter` are what go
+    // red.
+    // =======================================================================
+
+    /// A registry with only this file's JUL rows in it.
+    fn jul_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_phase54_logging_extras(&mut r);
+        r
+    }
+
+    fn jul_find(
+        r: &NativeMethodRegistry,
+        class: &str,
+        name: &str,
+        desc: &str,
+    ) -> cratonvm_native_api::NativeCallback {
+        r.find(class, name, desc)
+            .unwrap_or_else(|| panic!("{class}.{name}{desc} is not registered by this file"))
+    }
+
+    fn jul_runtime_error(failed: MethodCallFailed) -> RuntimeError {
+        match failed {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(e)) => e,
+            other => panic!("expected a RuntimeError, got {other:?}"),
+        }
+    }
+
+    /// Assert an NPE whose message is EXACTLY `expected` — `None` for the bare
+    /// NPE HotSpot throws from `Handler.setLevel`. The message is asserted, not
+    /// just the class: `Level.parse(null)` threw the right class with an
+    /// invented `"Name cannot be null"` for months (G15-1 §4), so a
+    /// class-only assertion is not enough to pin one of these rows.
+    fn jul_assert_npe(result: MethodCallResult, expected: Option<&str>, what: &str) {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{what}: expected a throw, got a return"));
+        match jul_runtime_error(err) {
+            RuntimeError::NullPointerException { message } => assert_eq!(
+                message.as_deref(),
+                expected,
+                "{what}: NPE message must be HotSpot's text verbatim"
+            ),
+            other => panic!("{what}: expected NullPointerException, got {other:?}"),
+        }
+    }
+
+    const JUL_SET_LEVEL_DESC: &str = "(Ljava/util/logging/Level;)V";
+    const JUL_GET_LEVEL_DESC: &str = "()Ljava/util/logging/Level;";
+
+    /// MEASURED: `Handler.setLevel(null)` throws a BARE `NullPointerException`
+    /// (`getMessage()` is null), and — the half a "store, then throw" fix would
+    /// still get wrong — `getLevel()` afterwards answers the level that was
+    /// already there.
+    #[test]
+    fn jul_handler_set_level_null_is_refused_before_the_store() {
+        let r = jul_registry();
+        let set_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "setLevel",
+            JUL_SET_LEVEL_DESC,
+        );
+        let get_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "getLevel",
+            JUL_GET_LEVEL_DESC,
+        );
+
+        let mut ctx = mock_ctx();
+        let handler = ctx.alloc_object(ClassId::new(0), 1);
+        let level = ctx.alloc_object(ClassId::new(1), 0);
+        set_level(
+            &mut ctx,
+            &[Value::Object(Some(handler)), Value::Object(Some(level))],
+        )
+        .expect("a non-null level must be stored");
+
+        jul_assert_npe(
+            set_level(
+                &mut ctx,
+                &[Value::Object(Some(handler)), Value::Object(None)],
+            ),
+            None,
+            "Handler.setLevel(null)",
+        );
+
+        // The store must NOT have happened. This is the second `RJdkIntrinsics3`
+        // assertion: `logrec:Handler.getLevel() unchanged by the failed set`.
+        assert_eq!(
+            get_level(&mut ctx, &[Value::Object(Some(handler))]).unwrap(),
+            Some(Value::Object(Some(level))),
+            "a refused setLevel(null) must leave the previous level in place"
+        );
+    }
+
+    /// The happy path still stores, so the guard cannot be a blanket refusal.
+    #[test]
+    fn jul_handler_set_level_still_stores_a_real_level() {
+        let r = jul_registry();
+        let set_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "setLevel",
+            JUL_SET_LEVEL_DESC,
+        );
+        let get_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "getLevel",
+            JUL_GET_LEVEL_DESC,
+        );
+
+        let mut ctx = mock_ctx();
+        let handler = ctx.alloc_object(ClassId::new(0), 1);
+        let warning = ctx.alloc_object(ClassId::new(1), 0);
+        let all = ctx.alloc_object(ClassId::new(1), 0);
+
+        set_level(
+            &mut ctx,
+            &[Value::Object(Some(handler)), Value::Object(Some(warning))],
+        )
+        .unwrap();
+        assert_eq!(
+            get_level(&mut ctx, &[Value::Object(Some(handler))]).unwrap(),
+            Some(Value::Object(Some(warning)))
+        );
+        set_level(
+            &mut ctx,
+            &[Value::Object(Some(handler)), Value::Object(Some(all))],
+        )
+        .unwrap();
+        assert_eq!(
+            get_level(&mut ctx, &[Value::Object(Some(handler))]).unwrap(),
+            Some(Value::Object(Some(all))),
+            "setLevel must still overwrite an existing level"
+        );
+    }
+
+    /// **The anti-generalisation half.** Nine `LogRecord` setters take null and
+    /// RETURN on HotSpot. Six of them are reference-typed rows this test can
+    /// reach through the shared `lr_set` store-then-return body; the
+    /// `setSourceClassName` / `setSourceMethodName` pair is left out because it
+    /// is `Bridge`-tagged and retired under `--jdk-only`, and
+    /// `setLongThreadID` is not reference-typed. MEASURED rows 23-30 of the G21
+    /// probe: `setLoggerName`, `setMessage`, `setParameters`, `setThrown`,
+    /// `setResourceBundle`, `setResourceBundleName` all RETURNED, on HotSpot
+    /// and on CratonVM alike.
+    ///
+    /// This test fails the moment someone "fixes the JUL null contract" by
+    /// putting a guard in `lr_set`.
+    #[test]
+    fn jul_log_record_reference_setters_accept_null_and_must_not_throw() {
+        let r = jul_registry();
+        let lr = "java/util/logging/LogRecord";
+        let legal: [(&str, &str); 6] = [
+            ("setLoggerName", "(Ljava/lang/String;)V"),
+            ("setMessage", "(Ljava/lang/String;)V"),
+            ("setParameters", "([Ljava/lang/Object;)V"),
+            ("setThrown", "(Ljava/lang/Throwable;)V"),
+            ("setResourceBundle", "(Ljava/util/ResourceBundle;)V"),
+            ("setResourceBundleName", "(Ljava/lang/String;)V"),
+        ];
+        let mut ctx = mock_ctx();
+        let record = ctx.alloc_object(ClassId::new(0), 12);
+        for (name, desc) in legal {
+            let cb = jul_find(&r, lr, name, desc);
+            let result = cb(
+                &mut ctx,
+                &[Value::Object(Some(record)), Value::Object(None)],
+            );
+            assert!(
+                result.is_ok(),
+                "LogRecord.{name}{desc} with null is LEGAL on HotSpot and must not throw"
+            );
+        }
+    }
+
+    /// `LogRecord.setLevel` and `setInstant` DO throw on HotSpot — and this
+    /// file must not be the reason. Neither is registered here, so the real
+    /// bytecode runs and throws on its own; MEASURED rows 21 and 31 already
+    /// match on `--jdk-only` with no native involved.
+    ///
+    /// Pinning the absence keeps a later lane from "completing the set" by
+    /// adding a raw-slot `setLevel` here, which is exactly how `Handler`'s
+    /// unguarded body got written.
+    #[test]
+    fn jul_log_record_set_level_and_set_instant_are_left_to_real_bytecode() {
+        let r = jul_registry();
+        let lr = "java/util/logging/LogRecord";
+        assert!(
+            r.find(lr, "setLevel", JUL_SET_LEVEL_DESC).is_none(),
+            "LogRecord.setLevel must stay unregistered: the real bytecode already throws"
+        );
+        assert!(
+            r.find(lr, "setInstant", "(Ljava/time/Instant;)V").is_none(),
+            "LogRecord.setInstant must stay unregistered: the real bytecode already throws"
+        );
+    }
+
+    /// **The other anti-generalisation half.** `Handler.setFilter(null)`,
+    /// `setEncoding(null)` RETURN on HotSpot while `setFormatter(null)` and
+    /// `setErrorManager(null)` throw — four siblings, two verdicts. This file
+    /// registers NONE of them, so under `--jdk-only` the real bytecode gives
+    /// all four the right answer (MEASURED rows 3-10, all matching).
+    ///
+    /// Registering any of them here would put the verdict back in Rust's hands
+    /// for no measured gain, and the two that must RETURN are the ones a
+    /// copy of the `setLevel` guard would break.
+    #[test]
+    fn jul_this_file_registers_no_other_handler_setter() {
+        let r = jul_registry();
+        let handler = "java/util/logging/Handler";
+        let untouched: [(&str, &str); 4] = [
+            ("setFilter", "(Ljava/util/logging/Filter;)V"),
+            ("setEncoding", "(Ljava/lang/String;)V"),
+            ("setFormatter", "(Ljava/util/logging/Formatter;)V"),
+            ("setErrorManager", "(Ljava/util/logging/ErrorManager;)V"),
+        ];
+        for (name, desc) in untouched {
+            assert!(
+                r.find(handler, name, desc).is_none(),
+                "Handler.{name}{desc} is served correctly by real bytecode; do not register it here"
+            );
+        }
+    }
+
+    /// MEASURED: `Formatter.formatMessage(null)` throws a HELPFUL NPE naming
+    /// the `record` parameter — a different shape from `Handler.setLevel`'s
+    /// bare one, in the same family, which is why both are asserted verbatim.
+    /// This row was wrong in BOTH modes (it answered `""`).
+    #[test]
+    fn jul_formatter_format_message_null_record_throws_the_measured_npe() {
+        let r = jul_registry();
+        let cb = jul_find(
+            &r,
+            "java/util/logging/Formatter",
+            "formatMessage",
+            "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
+        );
+        let mut ctx = mock_ctx();
+        let formatter = ctx.alloc_object(ClassId::new(0), 0);
+        jul_assert_npe(
+            cb(
+                &mut ctx,
+                &[Value::Object(Some(formatter)), Value::Object(None)],
+            ),
+            Some(JUL_NPE_NULL_FORMAT_RECORD),
+            "Formatter.formatMessage(null)",
+        );
+    }
+
+    /// The one NPE message this file hard-codes, transcribed from the oracle
+    /// run. `Handler.setLevel`'s NPE has no message at all and is pinned as
+    /// `None` above; if HotSpot's text ever changes, these are the two cells to
+    /// re-measure.
+    #[test]
+    fn jul_the_null_messages_are_the_measured_hotspot_text() {
+        assert_eq!(
+            JUL_NPE_NULL_FORMAT_RECORD,
+            "Cannot invoke \"java.util.logging.LogRecord.getMessage()\" because \"record\" is null"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // G32: InetSocketAddress's two guards, and the ORDER each caller runs them in
+    // -------------------------------------------------------------------------
+
+    /// Pull the class and message out of whatever a guard returned.
+    fn refusal(e: MethodCallFailed) -> String {
+        match e {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(r)) => {
+                format!("{r}")
+            }
+            other => format!("UNEXPECTED {other:?}"),
+        }
+    }
+
+    /// TRANSCRIBED from HotSpot 25.0.3+9, not paraphrased: an apostrophe, no
+    /// article, no trailing period. This body used to raise
+    /// `NullPointerException: null object argument` instead, because it read the
+    /// host with `obj_arg`.
+    #[test]
+    fn g32_isa_null_host_is_illegal_argument_with_the_measured_text() {
+        let e = p52_isa_check_host(Value::Object(None)).unwrap_err();
+        assert_eq!(
+            refusal(e),
+            "IllegalArgumentException: hostname can't be null"
+        );
+    }
+
+    /// A non-null host passes, and so does a host the VM cannot read as text —
+    /// the guard is about NULLNESS only, and must not start decoding.
+    #[test]
+    fn g32_isa_non_null_host_passes_the_guard() {
+        let mut ctx = mock_ctx();
+        let s = ctx.create_string("example.invalid");
+        assert!(p52_isa_check_host(Value::Object(Some(s))).is_ok());
+    }
+
+    /// `port out of range:-1` — NO SPACE after the colon. A `{port}` written as
+    /// `: {port}` reads identically in a review and differs on the wire.
+    #[test]
+    fn g32_isa_port_message_has_no_space_after_the_colon() {
+        let e = p52_isa_check_port(-1).unwrap_err();
+        assert_eq!(refusal(e), "IllegalArgumentException: port out of range:-1");
+        let e = p52_isa_check_port(65536).unwrap_err();
+        assert_eq!(
+            refusal(e),
+            "IllegalArgumentException: port out of range:65536"
+        );
+    }
+
+    /// 0 and 65535 are both LEGAL — 65535 is the last legal port, and an
+    /// exclusive upper bound is the obvious off-by-one here.
+    #[test]
+    fn g32_isa_port_bounds_are_inclusive_at_both_ends() {
+        assert_eq!(p52_isa_check_port(0).unwrap(), 0);
+        assert_eq!(p52_isa_check_port(65535).unwrap(), 65535);
+    }
+
+    /// **The row that cannot be derived, pinned in both directions.**
+    ///
+    /// When host AND port are both invalid, the two entry points disagree about
+    /// which one to report, because the JDK writes them differently:
+    ///
+    /// ```java
+    /// createUnresolved(host, port) -> new InetSocketAddress(checkPort(port), checkHost(host));
+    /// InetSocketAddress(hostname, port) { checkHost(hostname); ... checkPort(port) ... }
+    /// ```
+    ///
+    /// `checkPort` is `createUnresolved`'s first *argument*; `checkHost` is the
+    /// constructor's first *statement*. MEASURED on HotSpot 25.0.3+9:
+    /// `createUnresolved(null, -1)` answers `port out of range:-1` and
+    /// `new InetSocketAddress((String) null, -1)` answers
+    /// `hostname can't be null`.
+    ///
+    /// This test reproduces the two call sites' orderings rather than calling
+    /// the registered natives (which need a live heap), so it fails the moment
+    /// someone "simplifies" the two into one shared guard — which is exactly the
+    /// change that looks obviously correct and is not.
+    #[test]
+    fn g32_isa_the_two_entry_points_check_in_opposite_orders() {
+        // createUnresolved: PORT first.
+        let created = p52_isa_check_port(-1)
+            .map(|_| ())
+            .and_then(|_| p52_isa_check_host(Value::Object(None)));
+        assert_eq!(
+            refusal(created.unwrap_err()),
+            "IllegalArgumentException: port out of range:-1",
+            "createUnresolved(null, -1) must report the PORT"
+        );
+
+        // <init>(String, int): HOST first.
+        let constructed = p52_isa_check_host(Value::Object(None))
+            .and_then(|_| p52_isa_check_port(-1).map(|_| ()));
+        assert_eq!(
+            refusal(constructed.unwrap_err()),
+            "IllegalArgumentException: hostname can't be null",
+            "new InetSocketAddress((String) null, -1) must report the HOST"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // G32: EnumMap(null)
+    // -------------------------------------------------------------------------
+
+    /// `EnumMap(Class)` reaches `keyType.getEnumConstantsShared()` unguarded, so
+    /// a null key type is a `NullPointerException` before anything is stored.
+    /// This body used to build a zero-length universe and RETURN, leaving a live
+    /// map with a null `keyType`.
+    #[test]
+    fn g32_enum_map_null_key_type_throws_npe() {
+        let mut ctx = mock_ctx();
+        let this = crate::try_alloc_concurrent_synthetic(&mut ctx, "java/util/EnumMap", 3).unwrap();
+        let e = native_em_init(&mut ctx, &[Value::Object(Some(this)), Value::Object(None)])
+            .unwrap_err();
+        assert!(
+            refusal(e).starts_with("NullPointerException"),
+            "a null key type must be an NPE"
+        );
+    }
+
+    /// A MISSING argument is the same case as an explicit null — a native must
+    /// not read a shorter `args` slice as "no key type was requested".
+    #[test]
+    fn g32_enum_map_missing_key_type_arg_throws_npe() {
+        let mut ctx = mock_ctx();
+        let this = crate::try_alloc_concurrent_synthetic(&mut ctx, "java/util/EnumMap", 3).unwrap();
+        let e = native_em_init(&mut ctx, &[Value::Object(Some(this))]).unwrap_err();
+        assert!(refusal(e).starts_with("NullPointerException"));
+    }
+
+    // -----------------------------------------------------------------
+    // G43-1 — `InheritableThreadLocal`: `childValue` and transitivity.
+    //
+    // Each body runs on its OWN `std::thread`. `TL_MAP` and the
+    // `TL_INHERITED_DRAINED` one-shot are thread-locals, so a fresh thread is
+    // the only way to be sure the drain under test has not already been run by
+    // a sibling — which is exactly the state that would make these tests pass
+    // vacuously under `--test-threads=1`.
+    // -----------------------------------------------------------------
+
+    /// Register `obj` as an `InheritableThreadLocal` through the real `<init>`
+    /// native and return the key the snapshot will use for it.
+    fn itl_register(ctx: &mut MockNativeContext, obj: ObjectRef) -> i32 {
+        native_itl_init(ctx, &[Value::Object(Some(obj))]).expect("ITL <init> must not fail");
+        ctx.identity_hash_code(obj)
+    }
+
+    #[test]
+    fn g43_1_snapshot_applies_child_value_to_each_inherited_entry() {
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+
+            let parent = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(
+                &mut ctx,
+                &[Value::Object(Some(itl)), Value::Object(Some(parent))],
+            )
+            .expect("set must not fail");
+
+            // The one scripted `invoke_virtual` stands in for an override of
+            // `childValue`. HotSpot stores `key.childValue(value)`; CratonVM
+            // stored `value` verbatim, which is oracle row 16.
+            let child = ctx.alloc_object(ClassId::new(0), 0);
+            ctx.set_invoke_virtual_result(Ok(Some(Value::Object(Some(child)))));
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one inheritable entry");
+            let stored = *snap.get(&key).expect("the ITL entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, stored),
+                Value::Object(Some(child)),
+                "the child must receive childValue(parent), not the parent value verbatim"
+            );
+            assert_ne!(
+                tl_value_to_java(&ctx, stored),
+                Value::Object(Some(parent)),
+                "returning the parent value here is precisely the divergence"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    #[test]
+    fn g43_1_child_value_falls_back_to_the_parent_value_with_no_body_or_a_throw() {
+        std::thread::spawn(|| {
+            // No override and no scripted result: `invoke_virtual` answers
+            // `Ok(None)`, the shape a synthetic-JDK image that does not declare
+            // `childValue` produces. The base implementation returns its
+            // argument, so the parent value is the correct fallback.
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+            let parent = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(
+                &mut ctx,
+                &[Value::Object(Some(itl)), Value::Object(Some(parent))],
+            )
+            .expect("set must not fail");
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(parent)),
+                "Ok(None) must fall back to the parent value"
+            );
+
+            // A THROWING override takes the same arm — the bounded deviation
+            // recorded at the call site: this function returns `Option`, not
+            // `Result`, so the throw cannot propagate out of `Thread.<init>`
+            // the way it does on HotSpot.
+            let exc = ctx.alloc_object(ClassId::new(0), 0);
+            ctx.set_invoke_virtual_result(Err(MethodCallFailed::ExceptionThrown(exc)));
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(parent)),
+                "a throwing childValue must degrade to the base implementation, not lose the entry"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    #[test]
+    fn g43_1_child_value_runs_for_an_explicit_null_but_not_after_remove() {
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+
+            // MEASURED on HotSpot (`G36Cv` row 4): an explicitly stored `null`
+            // IS an entry, so `childValue(null)` runs and its result is what
+            // the child gets.
+            native_tl_set(&mut ctx, &[Value::Object(Some(itl)), Value::Object(None)])
+                .expect("set(null) must not fail");
+            let child = ctx.alloc_object(ClassId::new(0), 0);
+            ctx.set_invoke_virtual_result(Ok(Some(Value::Object(Some(child)))));
+            let snap = snapshot_inheritable_tl_entries(&mut ctx)
+                .expect("an explicit null is still an inherited entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(child)),
+                "childValue must be applied to a stored null too"
+            );
+
+            // MEASURED (`G36Cv` row 5): after `remove()` there is no entry, so
+            // nothing is called and nothing is inherited.
+            native_tl_remove(&mut ctx, &[Value::Object(Some(itl))]).expect("remove");
+            assert!(
+                snapshot_inheritable_tl_entries(&mut ctx).is_none(),
+                "a removed ThreadLocal must not be inherited"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    #[test]
+    fn g43_1_snapshot_drains_this_threads_pending_inheritance_first() {
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+
+            // The state a child thread is in before its FIRST ThreadLocal
+            // access: its inherited entries are queued, not yet in `TL_MAP`.
+            // Constructing a grandchild from here used to snapshot an empty
+            // map, which is oracle row 24 (`gp-init` on HotSpot, `null` here).
+            let gp_value = ctx.alloc_object(ClassId::new(0), 0);
+            let mut pending: rustc_hash::FxHashMap<i32, ThreadLocalValue> =
+                rustc_hash::FxHashMap::default();
+            let rooted = tl_value_from_java(&mut ctx, Value::Object(Some(gp_value)));
+            pending.insert(key, rooted);
+
+            // The mock mints a fresh "current thread" object on every call and
+            // steps its pointer by 8 (`test_utils::alloc_entry`), and identity
+            // hash IS the pointer — so the object the drain is about to
+            // allocate is one step past this probe. Nothing between here and
+            // the call may allocate.
+            let probe = ctx.current_thread_object();
+            let drain_thread_hash = ctx.identity_hash_code(probe).wrapping_add(8);
+            queue_inherited_tl_for_child(drain_thread_hash, pending);
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx)
+                .expect("pending inheritance must be drained before the snapshot is taken");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(gp_value)),
+                "inheritance must be transitive even when this thread never read the value"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    /// The hazard that stopped the previous lane, pinned as a test: `childValue`
+    /// is application bytecode, and the old body called into Java while holding
+    /// `tl_inheritable_ids().lock()` AND `TL_MAP.borrow()`. An override that
+    /// constructs an `InheritableThreadLocal` re-enters `native_itl_init` (the
+    /// same non-reentrant `parking_lot::Mutex` — a deadlock on the
+    /// thread-construction path, i.e. a hang in every executor), and one that
+    /// reads a `ThreadLocal` re-enters `TL_MAP.borrow_mut()` (a `RefCell`
+    /// double-borrow panic). This hook does BOTH from inside the callback.
+    /// The test hanging or panicking is the regression.
+    #[test]
+    fn g43_1_child_value_may_reenter_the_threadlocal_machinery() {
+        fn reentrant_child_value(
+            ctx: &mut MockNativeContext,
+            _receiver: ObjectRef,
+            method: &str,
+            _descriptor: &str,
+            args: &[Value],
+        ) -> Option<MethodCallResult> {
+            if method != "childValue" {
+                return None;
+            }
+            // Re-enter the global mutex...
+            let nested = ctx.alloc_object(ClassId::new(0), 0);
+            native_itl_init(ctx, &[Value::Object(Some(nested))]).expect("nested ITL <init>");
+            let nested_key = ctx.identity_hash_code(nested);
+            tl_inheritable_ids().lock().remove(&nested_key);
+            // ...and the RefCell, through a real ThreadLocal write.
+            let other = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(ctx, &[Value::Object(Some(other)), Value::Object(None)])
+                .expect("nested set");
+            // Hand the parent value straight back.
+            let parent = args.first().copied().unwrap_or(Value::Object(None));
+            Some(Ok(Some(parent)))
+        }
+
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            ctx.set_invoke_virtual_hook(reentrant_child_value);
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+            let parent = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(
+                &mut ctx,
+                &[Value::Object(Some(itl)), Value::Object(Some(parent))],
+            )
+            .expect("set must not fail");
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(parent))
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not deadlock or panic");
     }
 }

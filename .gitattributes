@@ -26,3 +26,20 @@ apps/hib-suite-runner/known-benign-aborts.tsv text eol=lf
 # observed one reads as new -- the ratchet would fire on all 28 at once, on
 # Windows only. Same hazard, same fix, as the shell scripts above.
 scripts/baselines/*.txt text eol=lf
+
+# Same hazard for the JDK surface baselines. `scripts/jdk-baseline/generate.py`
+# writes them with an explicit '\n' so the file is byte-identical on every
+# platform, and its `--check` mode diffs the working tree against a fresh
+# generation. With core.autocrlf=true and no pin here, the checked-out copy is
+# CRLF on Windows and LF on Linux while the generator's output is always LF, so
+# the check would answer differently on the two hosts for a difference that is
+# not in the data. Both readers trim_end() anyway; this makes the bytes match.
+#
+# Measured before this line existed: `git ls-files --eol scripts/baselines/`
+# reports `i/lf w/crlf` for every unpinned neighbour in this directory
+# (`jdk-only-kind-map-25-linux.tsv`, `jdk-only-dead-everywhere.tsv`, …) and
+# `i/lf w/lf attr/text eol=lf` for the one file the stanza above pins. The
+# jdk25-*.tsv are LF in the working tree today only because they were just
+# written by the generator and have not yet been through a checkout; the first
+# clone on Windows is where they would flip.
+scripts/baselines/jdk25-*.tsv text eol=lf

@@ -1,5 +1,94 @@
 # `Cipher.getInstance("ChaCha20")` returned AES-256-ECB
 
+> **RUN AND VERIFIED 2026-08-12 (lane A32, record triage). THE HEADLINE DEFECT
+> IS GONE, AND THIS IS THE FIRST TIME ANY OF IT WAS EXECUTED.** Every block
+> below this one is source reading against an unbuilt tree — the record says so
+> five times ("Nothing was rebuilt", "No claim is made that the new code
+> works"). Measured here on `cratonvm-merged-dev.exe` against Temurin/Microsoft
+> `jdk-25.0.3.9-hotspot` on windows/x64, `--jdk-only` and `--real-jdk`, with
+> HotSpot 25 as the oracle in the same session. Fixed key/nonce, no
+> `SecureRandom`, hex rendered by hand (Patch D).
+>
+> **The anchor row is a known-answer test, not a round trip.** All-zero key,
+> all-zero nonce, counter 0, all-zero plaintext ⇒ the raw RFC 8439 keystream:
+>
+> ```text
+> HotSpot 25   ks[32]=76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7
+> --jdk-only   ks[32]=76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7
+> --real-jdk   ks[32]=76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7
+> ```
+>
+> That is the RFC 8439 §2.4.2 vector. It is **not** AES-ECB, and it is not this
+> engine agreeing with itself: the expectation came from the RFC and from
+> HotSpot independently. `ChaCha20` under a fixed key and `ChaCha20-Poly1305`
+> are byte-identical to HotSpot **including the 16-byte tag**, and the ECB
+> signature the original measurement turned on — the repeated first and second
+> ciphertext block for a plaintext of two identical halves — is gone.
+>
+> **The AEAD rule holds where it matters most.** One bit flipped in the
+> ciphertext:
+>
+> ```text
+> HotSpot 25   ChaCha20-Poly1305  javax.crypto.AEADBadTagException: Tag mismatch
+> --jdk-only   ChaCha20-Poly1305  javax.crypto.AEADBadTagException: Tag mismatch
+> --jdk-only   AES/GCM/NoPadding  javax.crypto.AEADBadTagException: Tag mismatch
+> ```
+>
+> `TAMPERED ACCEPTED` — the string this record was opened for — does not appear
+> in any arm.
+>
+> **Two rows of the "before and after" table are now STALE IN THE SAFE
+> DIRECTION, and one is stale in the other direction. Read them before citing
+> this record.**
+>
+> * `Blowfish`, `RC4`, `ARCFOUR` are **admitted and correct** — byte-identical
+>   to HotSpot (`Blowfish` ⇒ `76bd8a813c6f122e…`, `RC4` ⇒ `7b8132ffc9352dc5…`,
+>   and `RC4` no longer equals `Blowfish`, which was the whole defect in one
+>   line). The table's "→ `NoSuchAlgorithmException`" row for them is stale:
+>   they route to the real SunJCE now, they are not refused.
+> * `AES/KWP/NoPadding` and `AES/KW/PKCS5Padding` are **admitted and
+>   byte-identical to HotSpot** (`9bc75dcd2a6c3e6c…` and `0be6f5769063a5b0…`).
+>   The "Removed — advertised, computed by nothing" table lists both as removed
+>   because RFC 5649 "is a different scheme". Something implemented them; the
+>   table is historical for these two as well.
+> * Still refused where HotSpot serves, i.e. honest under-serving and NOT a
+>   defect of this species: `RC2`, `AES/CTR/NoPadding`,
+>   `AES/CBC/ISO10126Padding`, bare `DESede`, `AES_128`, `IDEA`/`SEED`/`SM4`
+>   (HotSpot refuses the last three too). Every one raises
+>   `NoSuchAlgorithmException` naming the transformation at the `getInstance`
+>   call site. That is the trade this record chose, and it is what it looks like.
+>
+> **The malformed-input wording matches, verbatim:** `Invalid transformation
+> format:AES/CBC` and `Invalid transformation: missing mode and/or
+> padding-AES/CBC/`, identical to HotSpot's.
+>
+> **The rows that must not move, did not.** `AES/GCM/NoPadding`,
+> `AES/CBC/PKCS5Padding` and `AESWrap_128` are byte-identical to HotSpot in
+> both arms. The "single falsifying observation" this record names — a rebuilt
+> binary refusing `AES/GCM`, `AES/CBC/PKCS5Padding` or `AESWrap_128` — did not
+> occur.
+>
+> **Patch 2's live half is confirmed gone by run, not only by grep.**
+> `KeyGenerator.getInstance("AES").generateKey()` is 32 random bytes in both
+> arms (`len=32`, different every run, never zero); the 2-arg
+> `getInstance("AES","SunJCE")` form returns `len=32`, not all zeros — the
+> `keygen2arg` cover this record specifies. `DESede` ⇒ 24, `DES` ⇒ 8,
+> `HmacSHA256` ⇒ 32, `Blowfish` ⇒ 16, `ChaCha20` ⇒ 32, all matching HotSpot's
+> lengths.
+>
+> **The coverage gap is closed AND scheduled.** `regression-suite/src/
+> RChaCha20Cipher.java` is now tracked by git (it was untracked, so
+> `prune_missing` dropped it from every run) and is in `run.sh`'s
+> `CORE_CLASSES`. Executed: `PASS RChaCha20Cipher (41 checks)` in **both**
+> arms. `PASS RCrypto (57 checks)` in both arms. This record's evidence is
+> therefore scheduled; the four `CipherCensus`-style probes it was measured
+> with are not in the tree and `probes/` is not run by `run.sh` at any `SUITE=`,
+> but the two suite vectors cover the same ground and do run.
+>
+> **Disposition: FIXED, verified by execution. Nothing in the "Out-of-file
+> patches" section remains live.** The residual worth keeping is documentary:
+> the three stale table rows above.
+
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — THREE OF THE FOUR
 > "recorded, NOT applied" PATCHES ARE NOW SETTLED.**
 >

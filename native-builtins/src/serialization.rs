@@ -5004,253 +5004,64 @@ pub(crate) fn register_object_stream_class_for_phases_late(r: &mut NativeMethodR
 }
 
 // ---------------------------------------------------------------------------
-// ByteArrayOutputStream  (2-field synthetic)
-//   0: data (byte[]), 1: size (Int)
+// ByteArrayOutputStream — the twelve registrations and their five helpers are
+// GONE (lane G50, 2026-08-17). The function is kept, empty, because its two
+// call sites are in `lib.rs`, which that lane does not own.
 // ---------------------------------------------------------------------------
 
-// `pub(crate)`: unlike the sibling `register_*` helpers (called from this
-// module's aggregator), this one is also invoked cross-module from `lib.rs`
-// (the real-JCA ByteArrayOutputStream intrinsic wiring), so it must be visible
-// outside this module. Pre-existing `synthetic-jdk`-config build break (E0603).
-
-fn baos_buffer_bytes(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
-    let size = match ctx.get_field_by_name(this, "count") {
-        Value::Int(n) => n.max(0) as usize,
-        _ => ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize,
-    };
-    let arr = match ctx.get_field_by_name(this, "buf") {
-        Value::Object(Some(a)) => a,
-        _ => match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Vec::new(),
-        },
-    };
-    let len = size.min(ctx.array_length(arr));
-    let mut bytes = Vec::with_capacity(len);
-    for i in 0..len {
-        bytes.push(ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8);
-    }
-    bytes
-}
-
-fn baos_charset_key(charset: &str) -> String {
-    charset
-        .chars()
-        .filter(|c| *c != '-' && *c != '_' && !c.is_whitespace())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn decode_utf16_bytes(bytes: &[u8], little_endian: bool) -> String {
-    let mut units = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let pair = [bytes[i], bytes[i + 1]];
-        let unit = if little_endian {
-            u16::from_le_bytes(pair)
-        } else {
-            u16::from_be_bytes(pair)
-        };
-        units.push(unit);
-        i += 2;
-    }
-    let mut out: String = std::char::decode_utf16(units)
-        .map(|r| r.unwrap_or('\u{FFFD}'))
-        .collect();
-    if i < bytes.len() {
-        out.push('\u{FFFD}');
-    }
-    out
-}
-
-fn decode_baos_bytes(bytes: &[u8], charset: &str) -> String {
-    match baos_charset_key(charset).as_str() {
-        "iso88591" | "latin1" | "latin" | "csisolatin1" => {
-            bytes.iter().map(|&b| char::from(b)).collect()
-        }
-        "usascii" | "ascii" => bytes
-            .iter()
-            .map(|&b| if b < 0x80 { char::from(b) } else { '\u{FFFD}' })
-            .collect(),
-        "utf16" | "unicode" => {
-            if bytes.starts_with(&[0xFE, 0xFF]) {
-                decode_utf16_bytes(&bytes[2..], false)
-            } else if bytes.starts_with(&[0xFF, 0xFE]) {
-                decode_utf16_bytes(&bytes[2..], true)
-            } else {
-                decode_utf16_bytes(bytes, false)
-            }
-        }
-        "utf16be" | "unicodebigunmarked" => decode_utf16_bytes(bytes, false),
-        "utf16le" | "unicodelittleunmarked" => decode_utf16_bytes(bytes, true),
-        _ => String::from_utf8_lossy(bytes).into_owned(),
-    }
-}
-
-fn charset_object_name(ctx: &mut dyn NativeContext, charset: ObjectRef) -> Option<String> {
-    match ctx.invoke_virtual(charset, "name", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
-        _ => match ctx.get_field(charset, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        },
-    }
-}
-
-pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
-    let cls = "java/io/ByteArrayOutputStream";
-
-    r.register(cls, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let buf = ctx.new_array(ArrayElementType::Byte, 32);
-        ctx.set_field(this, 0, Value::Object(Some(buf)));
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(None)
-    });
-    r.register(cls, "<init>", "(I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let capacity = args.get(1).and_then(|v| v.as_int()).unwrap_or(32).max(1) as usize;
-        let buf = ctx.new_array(ArrayElementType::Byte, capacity);
-        ctx.set_field(this, 0, Value::Object(Some(buf)));
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(None)
-    });
-    r.register(cls, "write", "(I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(None),
-        };
-        let cap = ctx.array_length(arr);
-        if size >= cap {
-            // Grow: allocate new array of double capacity
-            let new_cap = (cap * 2).max(size + 1);
-            let new_arr = ctx.new_array(ArrayElementType::Byte, new_cap);
-            for i in 0..size {
-                let v = ctx.get_array_element(arr, i);
-                ctx.set_array_element(new_arr, i, v);
-            }
-            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-            ctx.set_array_element(new_arr, size, Value::Int(byte as i8 as i32));
-        } else {
-            ctx.set_array_element(arr, size, Value::Int(byte as i8 as i32));
-        }
-        ctx.set_field(this, 1, Value::Int((size + 1) as i32));
-        Ok(None)
-    });
-    r.register(cls, "write", "([BII)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let src = obj_arg(args, 1)?;
-        let off = args[2].as_int().unwrap_or(0) as usize;
-        let len = args[3].as_int().unwrap_or(0) as usize;
-        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(None),
-        };
-        let cap = ctx.array_length(arr);
-        let needed = size + len;
-        let dest_arr = if needed > cap {
-            let new_cap = (cap * 2).max(needed);
-            let new_arr = ctx.new_array(ArrayElementType::Byte, new_cap);
-            for i in 0..size {
-                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
-            }
-            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-            new_arr
-        } else {
-            arr
-        };
-        for i in 0..len {
-            let v = ctx.get_array_element(src, off + i);
-            ctx.set_array_element(dest_arr, size + i, v);
-        }
-        ctx.set_field(this, 1, Value::Int(needed as i32));
-        Ok(None)
-    });
-    r.register(cls, "toByteArray", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => {
-                let empty = ctx.new_array(ArrayElementType::Byte, 0);
-                return Ok(Some(Value::Object(Some(empty))));
-            }
-        };
-        let result = ctx.new_array(ArrayElementType::Byte, size);
-        for i in 0..size {
-            let v = ctx.get_array_element(arr, i);
-            ctx.set_array_element(result, i, v);
-        }
-        Ok(Some(Value::Object(Some(result))))
-    });
-    r.register(cls, "size", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    r.register(cls, "reset", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(None)
-    });
-    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let bytes = baos_buffer_bytes(ctx, this);
-        let s = decode_baos_bytes(&bytes, "UTF-8");
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-    });
-    r.register(
-        cls,
-        "toString",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let charset = match args.get(1) {
-                Some(Value::Object(Some(s))) => {
-                    ctx.read_string(*s).unwrap_or_else(|| "UTF-8".to_string())
-                }
-                _ => "UTF-8".to_string(),
-            };
-            let bytes = baos_buffer_bytes(ctx, this);
-            let s = decode_baos_bytes(&bytes, &charset);
-            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-        },
-    );
-    r.register(
-        cls,
-        "toString",
-        "(Ljava/nio/charset/Charset;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let charset = match args.get(1) {
-                Some(Value::Object(Some(c))) => {
-                    charset_object_name(ctx, *c).unwrap_or_else(|| "UTF-8".to_string())
-                }
-                _ => "UTF-8".to_string(),
-            };
-            let bytes = baos_buffer_bytes(ctx, this);
-            let s = decode_baos_bytes(&bytes, &charset);
-            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-        },
-    );
-    // KEEP — both real bodies are empty, verified against JDK 25 source:
-    //   * `ByteArrayOutputStream.close()` (ByteArrayOutputStream.java, last
-    //     method in the class) is literally
-    //     `public void close() throws IOException { }`, and its javadoc says
-    //     closing has no effect — the buffer stays readable afterwards;
-    //   * `flush()` is not declared here at all, so it is inherited from
-    //     `java.io.OutputStream`, whose body is likewise `{ }`.
-    // A no-op is therefore the real behaviour, not an approximation of it:
-    // this stream has no sink to push to and no descriptor to release.
-    // Registering them at all matters because the surrounding natives own the
-    // `buf`/`count` state by name; falling through to bytecode for two empty
-    // methods would only cost a dispatch.
-    r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
-    r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
-}
+/// Registers nothing. `java/io/ByteArrayOutputStream` is served in **every**
+/// mode by `cratonvm_native_io::register_io_natives`.
+///
+/// # Why the twelve registrations that used to be here were dead — MEASURED
+///
+/// This function has exactly two callers — `register_serialization_natives`
+/// above, and a direct call from `lib.rs` — and BOTH are reached only from
+/// `register_synthetic_overrides`, which is
+/// `#[cfg(feature = "synthetic-jdk")]`. In the one VM arm that calls it
+/// (`vm/src/vm/vm_init.rs`, the `config.use_synthetic_jdk` branch) the very
+/// next statement is `register_io_natives`, and
+/// `NativeMethodRegistry::register` is last-registration-wins **on the
+/// callback**: re-registering a known key assigns `slot.callback = callback`
+/// in place (`native-api/src/registry.rs`, the `Some(idx)` arm). So
+/// native-io's thirteen `java/io/ByteArrayOutputStream` registrations
+/// (`<init>` ×2, `write` ×3, `toByteArray`, `size`, `reset`, `toString` ×3,
+/// `close`, `flush`) replaced all twelve of these before any bytecode ran, in
+/// every build that ever compiled them.
+///
+/// `--dump-native-registry` from `cratonvm.exe` at `9ae371468`, taken
+/// 2026-08-17 in BOTH modes, agrees: all thirteen rows read `kind = bridge`,
+/// `owns_slot = true`, `overwrote = null`,
+/// `registered_by = native-io/src/lib.rs:6871`–`:6898`; and `serialization.rs`
+/// owns **zero** of the 12,039 (compatible) / 10,691 (`--jdk-only`) rows.
+/// Five rows carry `invocations > 0` — `write([BII)V` 77, `flush()V` 14,
+/// `<init>()V` 11, `toByteArray()[B` 11, `close()V` 7 — which is positive
+/// proof the native-io bodies are the ones that run. (`invocations == 0` would
+/// have proved nothing; four dispatch families bypass the counter, `G33-1`.)
+///
+/// `F34-1` §5's trap — that dropping a synthetic-only pass can drop triples
+/// its shipping twin never registered — does not apply: native-io's set is a
+/// strict SUPERSET (it also binds `write([B)V`, which was never here).
+///
+/// # Why leaving them would have been worse than deleting them
+///
+/// `close()`/`flush()` carried a KEEP comment arguing that a no-op *is* the
+/// real behaviour. That is true of the JDK contract and false of this VM:
+/// `native_baos_close` / `native_baos_flush` dispatch `BaosEvent::Close` /
+/// `BaosEvent::Flush` and then drive `process_pipe_output_close` /
+/// `fd_table().flush(fd)` — the machinery behind a `Process`'s stdin pipe,
+/// which a no-op silently skips. A plausible-looking synthetic twin that would
+/// be wrong the moment the registration order changed is exactly the shape
+/// this branch has already shipped a fix into once (`8c72d23ca`).
+///
+/// Deleted with the arms: `baos_buffer_bytes`, `baos_charset_key`,
+/// `decode_utf16_bytes`, `decode_baos_bytes` and `charset_object_name`. None
+/// had any referent outside this file in any of the seven crates (`grep`,
+/// excluding `target/` and `scratch*/`); the surviving `decode_utf16_bytes` in
+/// `xml_stax.rs` is an unrelated private function that happens to share the
+/// name.
+///
+/// Record: `docs/known-issues/jdk-only/G50-1-two-drift-families-settled-20260817.md`.
+pub(crate) fn register_byte_array_output_stream(_r: &mut NativeMethodRegistry) {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -5377,6 +5188,64 @@ mod serialization_tests {
     }
 
     // --- Registration tests ---
+
+    /// `register_byte_array_output_stream` must stay EMPTY (lane G50).
+    ///
+    /// Its twelve registrations were deleted because
+    /// `cratonvm_native_io::register_io_natives` re-registers every one of them
+    /// afterwards in the only arm that reaches this pass — measured on
+    /// `--dump-native-registry` in both modes, where all thirteen
+    /// `java/io/ByteArrayOutputStream` rows read `owns_slot = true`,
+    /// `registered_by = native-io/src/lib.rs`, and `serialization.rs` owns none
+    /// of the 12,039 / 10,691 rows. Refilling this pass would put a synthetic
+    /// no-op `close()`/`flush()` back in front of `native_baos_close` /
+    /// `native_baos_flush`, whose `BaosEvent` dispatch and
+    /// `process_pipe_output_close` are what make a `Process` stdin pipe work.
+    ///
+    /// The `assert!(added > 0)` half is the vacuity guard: without it this test
+    /// would pass just as happily on the day `register_serialization_natives`
+    /// stops registering anything at all.
+    #[test]
+    fn baos_registrar_is_empty_and_stays_empty() {
+        let mut r = NativeMethodRegistry::new();
+        let before = r.len();
+        register_byte_array_output_stream(&mut r);
+        assert_eq!(
+            r.len(),
+            before,
+            "register_byte_array_output_stream registered something; \
+             native-io owns this family in every mode"
+        );
+        for (name, desc) in [
+            ("close", "()V"),
+            ("flush", "()V"),
+            ("toByteArray", "()[B"),
+            ("<init>", "()V"),
+            ("write", "([BII)V"),
+        ] {
+            assert!(
+                r.find("java/io/ByteArrayOutputStream", name, desc)
+                    .is_none(),
+                "serialization.rs re-registered ByteArrayOutputStream.{name}{desc}"
+            );
+        }
+
+        // Vacuity guard: the aggregate this pass belongs to must still work.
+        let mut full = NativeMethodRegistry::new();
+        let base = full.len();
+        register_serialization_natives(&mut full);
+        let added = full.len() - base;
+        assert!(
+            added > 0,
+            "register_serialization_natives registered nothing, so the assertion \
+             above proves nothing"
+        );
+        assert!(
+            full.find("java/io/ByteArrayOutputStream", "toByteArray", "()[B")
+                .is_none(),
+            "the serialization aggregate still binds ByteArrayOutputStream"
+        );
+    }
 
     #[test]
     fn test_oos_init_registered() {

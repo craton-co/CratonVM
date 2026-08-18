@@ -1,5 +1,82 @@
 # `KeyGenerator` ignored its algorithm, and the "shadowing" twin was shadowed
 
+> **RUN AND VERIFIED 2026-08-12 (lane A32, record triage). PATCHES A, C AND D
+> ALL HOLD UNDER EXECUTION, AND THE `StackWalker$Option` RESIDUAL IS CLOSED —
+> THE ONE ITEM THIS RECORD HANDED OUT OF THE LANE IS NO LONGER TRUE.**
+>
+> Every pass above this one was source reading or a measurement on a *pre-fix*
+> binary; the fourth pass's own verification was a reflective work-around, not a
+> run of the fix. Measured here on `cratonvm-merged-dev.exe` against
+> `jdk-25.0.3.9-hotspot`, `--jdk-only` and `--real-jdk`, HotSpot 25 as the
+> same-session oracle, fixed inputs, hex by hand.
+>
+> **`StackWalker$Option` — CLOSED. Re-check before citing it.** This record
+> states, as an out-of-lane open item, that "**Every** `java/lang/StackWalker$Option`
+> constant reads back null in this VM" and that `DROP_METHOD_INFO` has no
+> registration at all. Measured under `--jdk-only`:
+>
+> ```text
+> ROW StackWalker RETAIN_CLASS_REFERENCE | v=RETAIN_CLASS_REFERENCE
+> ROW StackWalker DROP_METHOD_INFO       | v=DROP_METHOD_INFO
+> ROW StackWalker getInstance(Set)       | walker=true
+> ```
+>
+> All three identical to HotSpot. The `Set.of(DROP_METHOD_INFO,
+> RETAIN_CLASS_REFERENCE)` construction that killed
+> `JceSecurityManager.<clinit>` — the exact call at its line 71 — now succeeds.
+> That is the wall the fourth pass could only route *around*; it is gone, so the
+> `getMaxAllowedKeyLength` natives are no longer the only thing standing between
+> `KeyGenerator` and the real path.
+>
+> **The chokepoint answers HotSpot's values, from the public doors:**
+> `Cipher.getMaxAllowedKeyLength("AES") = 2147483647` and
+> `getMaxAllowedParameterSpec("AES") = null`, both arms, both identical to
+> HotSpot — the `crypto.policy=unlimited` answers the applied fix specifies.
+>
+> **Patch A — verified by run, not by registry dump.** The deletion did not
+> strand the 2-arg form:
+> `KeyGenerator.getInstance("AES","SunJCE").generateKey().getEncoded()` is
+> `len=32`, **not all zeros**, in both arms. Result 4's four
+> `NullPointerException: … "this.spi" is null` rows are gone. The 1-arg family
+> matches HotSpot's lengths across `AES` 32, `HmacSHA256` 32, `DESede` 24, `DES`
+> 8, `Blowfish` 16, `ChaCha20` 32, and `generateKey().getAlgorithm()` answers
+> `DESede` for `DESede` — the carrier no longer hardcodes `"AES"` on the path a
+> caller can reach.
+>
+> **Patch C — verified, both halves, and the class distinction holds:**
+>
+> ```text
+>                                      HotSpot 25 / --jdk-only / --real-jdk  (identical)
+> new SecretKeySpec(new byte[0],"AES")  IllegalArgumentException: Empty key
+> new SecretKeySpec(null,"AES")         IllegalArgumentException: Missing argument
+> ```
+>
+> The null case raises `IllegalArgumentException`, **not** `NullPointerException`
+> — which is the point the third pass makes about ordering the null test before
+> `obj_arg`, now confirmed from outside.
+>
+> **The key-material copy boundary holds under a caller that scrubs**, which is
+> the mechanism that produced the all-zero key. Construct from an array, scrub
+> the array, re-read: unchanged. Mutate a `getEncoded()` result, re-read:
+> unchanged. Same for `IvParameterSpec.getIV()`. All byte-identical to HotSpot.
+>
+> **Patch D — verified.** `String.format("%02x")` over
+> `{00,01,0e,0f,10,ff}` gives `[00010e0f10ff]` in both arms, matching HotSpot.
+> The `" e"`/`" f"` corruption is gone, so a hex-dumping probe is trustworthy
+> again.
+>
+> **Scheduled evidence:** `PASS RCrypto (57 checks)` in both arms — the vector
+> is in `run.sh`'s `CORE_CLASSES`, and its `maxKeyLen=2147483647` line is the
+> `getMaxAllowedKeyLength` fix under permanent guard. `KeyMaterialCensus` and
+> `KeyGenProbe2`, the two probes this record was measured with, are **not in the
+> tree**, and `probes/` is not run by `run.sh` at any `SUITE=` value.
+>
+> **Still open, re-confirmed as open:** `java/security/Key.getAlgorithm`
+> hardcoding `"AES"` (synthetic-jdk only, blocked on a missing `NativeContext`
+> slot count — a missing capability, not a deferral), and
+> `init(AlgorithmParameterSpec)` accepting and ignoring. Neither is reachable by
+> the probes above in a shipping binary.
+
 > **PATCH A IS VINDICATED, AND IT UNCOVERED A SECOND WALL ONE FRAME FURTHER IN.
 > 2026-08-12 (fourth pass, JCA lane). `RCrypto` went RED after Patch A; the
 > deletion was not the defect.**

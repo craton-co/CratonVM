@@ -376,6 +376,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gdm-prof", on_key: Some("CRATONVM_DBG_GDM_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-zero", on_key: Some("CRATONVM_G1_DBG_ZERO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1diag", on_key: Some("CRATONVM_DBG_G1DIAG"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "g1accessor", on_key: Some("CRATONVM_DBG_G1ACCESSOR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-array-guard-bt", on_key: Some("CRATONVM_GC_ARRAY_GUARD_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-fallback-reasons", on_key: Some("CRATONVM_DBG_GC_FALLBACK_REASONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-overhead", on_key: Some("CRATONVM_DBG_GC_OVERHEAD"), off_key: None, off_word: None },
@@ -437,6 +438,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "irslot", on_key: Some("CRATONVM_DBG_IRSLOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "isinstance", on_key: Some("CRATONVM_DBG_ISINSTANCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jar", on_key: Some("CRATONVM_DBG_JAR"), off_key: None, off_word: None },
+    // Scalar, not a boolean: `=<n>` raises the `--jdk-only` shadow-observation
+    // sink above its 256-row default so an APPLICATION census is complete
+    // rather than truncated. Diagnostic only — it changes nothing a program can
+    // observe. Declared rather than read through bare `getenv` so it comes from
+    // the latched snapshot like every other knob; see the doc on
+    // `vm::jdk_only_native_shadow_cap`.
+    E { group: Group::DBG, token: "native-shadow-sink-cap", on_key: Some("CRATONVM_NATIVE_SHADOW_SINK_CAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jetty", on_key: Some("CRATONVM_DBG_JETTY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jetty2", on_key: Some("CRATONVM_DBG_JETTY2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-alloc", on_key: Some("CRATONVM_DBG_JIT_ALLOC"), off_key: None, off_word: None },
@@ -806,6 +814,7 @@ pub const INVENTORY: &[E] = &[
     // AFTER `CRATONVM_JIT_FORCE_C2` in the admission chain).
     E { group: Group::JIT, token: "c1-vector-veto", on_key: Some("CRATONVM_JIT_C1_VECTOR_VETO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "census-direct-helpers", on_key: Some("CRATONVM_JIT_CENSUS_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "cached-entry-owner-reuse", on_key: Some("CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "c2-first-call", on_key: Some("CRATONVM_JIT_C2_FIRST_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "callee-oop-flush", on_key: None, off_key: Some("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH"), off_word: None },
@@ -824,6 +833,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "dup-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X2"), off_word: None },
     E { group: Group::JIT, token: "dupx", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUPX"), off_word: None },
     E { group: Group::JIT, token: "dupx-eager-canon", on_key: Some("CRATONVM_JIT_DUPX_EAGER_CANON"), off_key: None, off_word: None },
+    // Transitive eager callee compilation, so a body compiled bottom-up binds its
+    // statically bound call sites to raw CALLs instead of the generic dispatch
+    // helper. Default ON; `CRATONVM_JIT='-eager-callee-chain'` restores the
+    // one-level behaviour, which is the A/B control for the ~6.5x measured on a
+    // call-dense loop. Correct either way — the fallback is the checked helper.
+    E { group: Group::JIT, token: "eager-callee-chain", on_key: Some("CRATONVM_JIT_EAGER_CALLEE_CHAIN"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "enable-callee-saved-gpr-locals", on_key: Some("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "enable-inline-new", on_key: Some("CRATONVM_JIT_ENABLE_INLINE_NEW"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "exc-table-c2", on_key: None, off_key: Some("CRATONVM_JIT_NO_EXC_TABLE_C2"), off_word: None },
@@ -951,6 +966,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
     // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
     // the contrast is the reason these two carry a comment at all.
     // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
@@ -1207,6 +1223,11 @@ pub const INVENTORY: &[E] = &[
     // and not a rebuild.
     E { group: Group::GC, token: "zgc-gen-header-zero", on_key: Some("CRATONVM_ZGC_GEN_HEADER_ZERO"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-gen-dead-runs", on_key: Some("CRATONVM_ZGC_GEN_DEAD_RUNS"), off_key: None, off_word: Some("0") },
+    // C5 (2026-08-18). Hand the mark coordinator the heap's own `Arc` instead of
+    // a forwarding wrapper -- one fewer indirect call per marked object on the
+    // parallel path. Default-on and `0` restores the wrapper, so the A/B is one
+    // binary; the whole path is already opt-in behind `zgc-parmark`.
+    E { group: Group::GC, token: "zgc-mark-ctx-direct", on_key: Some("CRATONVM_ZGC_MARK_CTX_DIRECT"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that

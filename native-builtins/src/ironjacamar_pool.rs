@@ -537,12 +537,37 @@ mod tests {
         assert_eq!(one, 1);
     }
 
+    /// A max-size-1 pool with its one connection out must REFUSE a second
+    /// acquire, and `native_pool_get_connection` must wrap the refusal in the
+    /// JCA `ResourceException` shape.
+    ///
+    /// The body used to re-write `native_pool_get_connection`'s error
+    /// classification over a hard-coded string literal and then assert its own
+    /// copy's output. The native was never invoked on any error path, so
+    /// deleting the classification from production left this green — while
+    /// WildFly/Keycloak would have seen a raw `SQLTransientConnectionException`
+    /// escape where the JCA contract requires a `ResourceException`.
+    ///
+    /// Mutations this now catches:
+    ///  * remove the `max_size` gate in `agroal_pool::acquire` (the pool would
+    ///    over-allocate and the waiter below would finish immediately);
+    ///  * delete the error mapping in `native_pool_get_connection` and
+    ///    propagate the raw acquire error instead — the message stops being
+    ///    `ResourceException: …`;
+    ///  * change the non-timeout arm's wrapping text or drop the cause from it.
+    ///
+    /// Residual, and it is NOT fixable from a test: the `"pool exhausted"` arm
+    /// itself — the one that fires on `e.contains("timeout")` — is only
+    /// reachable by letting `acquire` run out its `DEFAULT_ACQUIRE_TIMEOUT`,
+    /// which is a hard-coded 30 s constant in `agroal_pool.rs` with no
+    /// per-pool override. Closing that needs a configurable acquire timeout in
+    /// `PoolConfig`, which is a production change.
     #[test]
     fn t19_8_ironjacamar_pool_exhausted_throws_resource_exception() {
         let _g = test_lock();
         reset_for_tests();
         let mut ctx = mock_ctx();
-        let mcf = make_mcf(&mut ctx, "jdbc:h2:mem:exhaust");
+        let _mcf = make_mcf(&mut ctx, "jdbc:h2:mem:exhaust");
         let cid = ctx.ensure_class_initialized(CLS_STRATEGY_POOL).unwrap();
         let pool = ctx.alloc_object(cid, AP_NUM_FIELDS);
         // Manually create a max-size-1 pool so exhaustion is easy to hit.
@@ -560,28 +585,54 @@ mod tests {
             ],
         )
         .expect("first acquire");
-        // Second acquire must block until timeout and return a
-        // ResourceException. Use a short-timeout variant by spinning the
-        // pool into timeout ourselves via direct acquire call — but here
-        // we assert the "pool exhausted" classification path by pre-
-        // filling max capacity and asserting the error is mapped.
-        // Since the acquire call above exhausts the pool (capacity=1),
-        // the native path should raise a ResourceException when we hit
-        // the timeout. We use a short-cut: call acquire directly twice
-        // and assert the error type is "pool exhausted" through the
-        // native mapping.
-        // To keep the test fast we replicate the native mapping check
-        // synthetically: any err containing "timeout" should surface as
-        // "ResourceException: pool exhausted".
-        let err = "SQLTransientConnectionException: timeout foo".to_string();
-        // This mirrors what `native_pool_get_connection` does on a timeout.
-        let mapped =
-            if err.starts_with("SQLTransientConnectionException") || err.contains("timeout") {
-                "ResourceException: pool exhausted".to_string()
-            } else {
-                format!("ResourceException: {}", err)
-            };
-        assert_eq!(mapped, "ResourceException: pool exhausted");
+
+        // The premise, measured rather than assumed: the pool really is at
+        // capacity. `pool_stats` is (idle, in_use, opened_total, closed).
+        let (idle, in_use, _, _) = pool_stats(pool_id).expect("pool is registered");
+        assert_eq!(
+            (idle, in_use),
+            (0, 1),
+            "a max_size=1 pool holding its only connection has nothing idle"
+        );
+
+        // A second acquire must WAIT for a slot instead of over-allocating.
+        // `acquire` takes only the pool id, so it can run on another thread
+        // without the (non-`Send`) mock context.
+        let waiter = std::thread::spawn(move || acquire(pool_id));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !waiter.is_finished(),
+            "a max_size=1 pool must not hand out a second connection while the \
+             first is still in use"
+        );
+
+        // Unblock the waiter deterministically rather than paying the 30 s
+        // acquire timeout; `close_pool` makes the next loop iteration fail.
+        close_pool(pool_id);
+        let second = waiter.join().expect("acquire waiter panicked");
+        assert!(
+            second.is_err(),
+            "the blocked acquire must fail, not invent a connection; got {second:?}"
+        );
+
+        // Now the classification itself, through the production native: an
+        // acquire failure must reach Java as a `ResourceException` carrying the
+        // cause, not as the bare Rust error string.
+        let err = native_pool_get_connection(
+            &mut ctx,
+            &[
+                Value::Object(Some(pool)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        )
+        .expect_err("a closed pool must refuse to hand out a connection");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("ResourceException: pool closed"),
+            "getConnection must raise the JCA `ResourceException: <cause>` \
+             shape that IronJacamar callers catch; got {text}"
+        );
     }
 
     #[test]

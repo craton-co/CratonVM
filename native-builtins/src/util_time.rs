@@ -35,7 +35,13 @@
 //!
 //! Checked 2026-08-11 against a `--dump-native-registry` census of the shipped
 //! `cratonvm-cli` build: **not one** of its 11,665 registrations names this
-//! file. That is the `#[cfg(feature = "synthetic-jdk")]` on `pub mod
+//! file. RE-CHECKED 2026-08-17 (lane G50) on `cratonvm.exe` at `9ae371468`, in
+//! **both** modes this time, which the 2026-08-11 census did not do:
+//! **0** of 12,039 compatible-mode rows and **0** of 10,691 `--jdk-only` rows
+//! carry a `registered_by` naming this file. So the answer to "does anything
+//! in `util_time.rs` have `--jdk-only` reach" is a measured **no**, and an
+//! edit here cannot change any shipping behaviour in any mode. That is the
+//! `#[cfg(feature = "synthetic-jdk")]` on `pub mod
 //! util_time;` doing exactly what it says — the module is not compiled into
 //! the default build at all, and its three registrars are reached only from
 //! `register_builtins`, the synthetic arm. All three shadow ratchets
@@ -360,6 +366,48 @@ pub(crate) fn register_time_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lt, "hashCode", "()I", native_lt_hash_code);
 
     // --- Instant ---
+    //
+    // ADJUDICATED 2026-08-17 (lane G50), `G3-1` N4 / `G41-1` N4. These sixteen
+    // triples are the second-largest known mode-drift family: the shipping twin
+    // is `register_synthetic_instant_stub_natives`
+    // (`lib.rs`, reached from `reflect_annotations.rs`'s
+    // `register_essential_natives_with_shims`), which tags itself
+    // `NativeKind::SyntheticStub`. The arms below tag themselves `Bridge`. The
+    // consequence, MEASURED on `--dump-native-registry` from `9ae371468` in both
+    // modes:
+    //
+    // * compatible mode — the stub OWNS all sixteen slots (`kind =
+    //   synthetic-stub`, `owns_slot = true`), but `java/time/Instant` is on
+    //   `real_protected_stub_class_common`'s yield list
+    //   (`vm/src/runtime/interpreter/native_override.rs`), so a loaded real
+    //   `Instant` runs its own bytecode anyway;
+    // * `--jdk-only` — `allowed_in` refuses a `SyntheticStub` outright, so the
+    //   registry has **no** `java/time/Instant` row at all and
+    //   `--jdk-only-report` files sixteen `synthetic-native-registered`
+    //   violations naming `lib.rs:41698`–`:41783`. NEITHER copy is registered.
+    //
+    // So under `--jdk-only` these sixteen methods fall through to real JDK
+    // bytecode. **That is CORRECT, and it was measured rather than assumed**: a
+    // 58-assertion `java.time.Instant` probe — the factories, nano carry and
+    // borrow, `toEpochMilli` on negative millis, every `toString` shape from
+    // `0001-01-01` to `+1000000000-12-31`, `parse` round-trip, `MIN`/`MAX`,
+    // and both `ArithmeticException` overflow paths — is **byte-identical**
+    // across HotSpot 25.0.3+9-LTS, CratonVM compatible mode, and CratonVM
+    // `--jdk-only`. The defect in this family is therefore the misleading
+    // registration and its name, not the behaviour.
+    //
+    // The arms below are NOT deleted, and the reason is the difference from the
+    // `TreeMap` (`G41-1` §3) and `ByteArrayOutputStream` (`G50-1` §2) closures:
+    // those deleted copies were proven never to run in ANY build, because a
+    // shipping registrar re-registered the same triples afterwards. These ones
+    // DO run — in a `--features synthetic-jdk` build they are `Bridge`s
+    // registered after the essentials' `SyntheticStub`, so they win, and on a
+    // synthetic image there is no real `java.time.Instant` bytecode behind them.
+    // Both copies share the same two-slot layout (slot 0 epoch-seconds `Long`,
+    // slot 1 nano `Int` — `INST_FIELD_EPOCH_SEC`/`INST_FIELD_NANO` against
+    // `synthetic_instant_parts`), so the stub probably could serve them alone —
+    // but "probably" is not the standard here and no synthetic build could be
+    // made to check it. See `G50-1` §3.
     let inst = "java/time/Instant";
     registry.register(inst, "now", "()Ljava/time/Instant;", native_inst_now);
     registry.register(

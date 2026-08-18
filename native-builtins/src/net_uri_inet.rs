@@ -1051,6 +1051,25 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
     // keeps the OBJECT right for the real bytecode that reads the field
     // directly (`URI.equals`, `URI.hashCode`, `URI.toString`).
     let (_, authority, _, query, fragment) = net_phase_e::uri_split(full);
+    // A URI with no `//authority` has NO port, full stop. `url_parse` ran on
+    // this same receiver a moment ago and, having no `//` to anchor on, split
+    // the whole string on its LAST colon: `urn:isbn:0451450523` came out as
+    // host `urn:isbn` and port `451450523`, which it then wrote to the named
+    // `port` field. `net_phase_e`'s `getPort` returns that field verbatim
+    // whenever it is positive, so the port survived all the way out.
+    // MEASURED 2026-08-17 against Temurin 25.0.3+9-LTS — HotSpot answers -1 for
+    // every one of these and we answered the trailing digits:
+    //
+    //   new URI("urn:isbn:0451450523").getPort()   HotSpot -1, ours 451450523
+    //   new URI("a:1234").getPort()                HotSpot -1, ours 1234
+    //   new URI("mailto:a@b.com:25").getPort()     HotSpot -1, ours 25
+    //
+    // Writing the sentinel back is enough: with a non-positive field `getPort`
+    // falls through to the raw-string parse, which sees no authority and
+    // answers -1 on its own.
+    if authority.is_none() {
+        ctx.set_field_by_name(this, "port", Value::Int(-1));
+    }
     let mut store_named = |ctx: &mut dyn NativeContext, name: &str, v: &Option<String>| {
         if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
             let s = ctx.create_string(v);
@@ -1154,11 +1173,59 @@ pub(crate) fn uri_scheme_name_fail_index(s: &str) -> Option<(usize, &'static str
 /// goal is to match HotSpot on the clearly-malformed ASCII cases (spaces,
 /// `{}<>"\^|`), not to police every Unicode edge.
 pub(crate) fn uri_first_illegal_index(s: &str) -> Option<usize> {
+    uri_first_char_fault(s).map(|(index, _)| index)
+}
+
+/// Why [`uri_first_char_fault`] stopped at a character.
+///
+/// The JDK reports these as two DIFFERENT `URISyntaxException` reasons at the
+/// same index, and the difference is visible in `getMessage()`. MEASURED
+/// 2026-08-17 against Temurin 25.0.3+9-LTS -- every one of these is
+/// `Malformed escape pair`, never `Illegal character in <component>`:
+///
+/// ```text
+///   new URI("http://h/a%")       Malformed escape pair at index 10
+///   new URI("http://h/a%2")      Malformed escape pair at index 10
+///   new URI("http://h/a%zz")     Malformed escape pair at index 10
+///   new URI("http://h/p?q=%2")   Malformed escape pair at index 13
+///   new URI("http://h/p#f%2")    Malformed escape pair at index 12
+///   new URI("http://h%2/p")      Malformed escape pair at index 8
+///   new URI("%2")                Malformed escape pair at index 0
+///   new URI("mailto:a%2")        Malformed escape pair at index 8
+/// ```
+///
+/// The component name is NOT part of it: the same reason is used in the path,
+/// the query, the fragment, the authority and a bare relative reference. It is
+/// the JDK's `Parser.scanEscape`, which runs before any component-specific
+/// character check, so whichever offence comes FIRST left-to-right wins --
+/// also measured: `http://h/a b%2` is `Illegal character in path at index 10`
+/// (the space) while `http://h/a%2 b` is `Malformed escape pair at index 10`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UriCharFault {
+    /// The character is outside the URI character set for its component.
+    Illegal,
+    /// A `%` that does not begin a `%` HEX HEX triple.
+    MalformedEscape,
+}
+
+/// The first character `java.net.URI`'s single-string parser would refuse, and
+/// why. [`uri_first_illegal_index`] is the index-only view of this, kept for
+/// the `URI.create` caller that only needs the position.
+pub(crate) fn uri_first_char_fault(s: &str) -> Option<(usize, UriCharFault)> {
     let bytes = s.as_bytes();
+    // Inside an IPv6 literal a `%` is a scope-id separator, NOT the start of an
+    // escape triple -- the JDK switches the authority to `L_SERVER_PERCENT` as
+    // soon as the authority contains a `]`. MEASURED 2026-08-17: HotSpot
+    // ACCEPTS `new URI("http://[::1%eth0]/p")` and `new URI("http://[::1%zz]/p")`
+    // and reports host `[::1%eth0]`, while we refused both with
+    // `Illegal character in authority at index 11`. Refusing a URI the JDK
+    // accepts is the worse half of this bug, so the exemption is deliberately
+    // narrow: only the bytes strictly between the authority's `[` and its `]`.
+    let bracket = uri_ipv6_bracket_span(s);
     for (i, c) in s.char_indices() {
         let u = c as u32;
         if u < 0x20 || u == 0x7f {
-            return Some(i);
+            return Some((i, UriCharFault::Illegal));
         }
         if u >= 0x80 {
             continue;
@@ -1172,10 +1239,13 @@ pub(crate) fn uri_first_illegal_index(s: &str) -> Option<usize> {
         // catch-and-reencode fallback (it never got a chance to run) and the
         // "malformed path must throw IllegalStateException" contract.
         if c == '%' {
+            if bracket.is_some_and(|(open, close)| open < i && i < close) {
+                continue;
+            }
             let valid_escape = bytes.get(i + 1).copied().map(is_ascii_hex_digit) == Some(true)
                 && bytes.get(i + 2).copied().map(is_ascii_hex_digit) == Some(true);
             if !valid_escape {
-                return Some(i);
+                return Some((i, UriCharFault::MalformedEscape));
             }
             continue;
         }
@@ -1191,10 +1261,485 @@ pub(crate) fn uri_first_illegal_index(s: &str) -> Option<usize> {
                 | '#'
             );
         if !ok {
-            return Some(i);
+            return Some((i, UriCharFault::Illegal));
         }
     }
     None
+}
+
+/// The `[` … `]` span of the authority's IPv6 literal, as absolute byte
+/// offsets into `s` (`open` is the `[`, `close` the `]` or the end of the
+/// authority when the bracket is never closed).
+///
+/// Anchored on `://` for the same reason the closing-bracket check in
+/// [`native_uri_init`] is: that is the only authority shape the URI natives
+/// currently police, and widening it to bare `//authority` references is a
+/// separate change with its own blast radius.
+fn uri_ipv6_bracket_span(s: &str) -> Option<(usize, usize)> {
+    let open_auth = s.find("://")? + 3;
+    let auth_end = s[open_auth..]
+        .find(['/', '?', '#'])
+        .map(|r| open_auth + r)
+        .unwrap_or(s.len());
+    let br = s[open_auth..auth_end].find('[').map(|i| open_auth + i)?;
+    let close = s[br + 1..auth_end]
+        .find(']')
+        .map(|i| br + 1 + i)
+        .unwrap_or(auth_end);
+    Some((br, close))
+}
+
+/// A refusal from the transcribed `java.net.URI` parser: HotSpot's `reason`
+/// string exactly as `URI$Parser` spells it, plus the index it reports.
+///
+/// `index: None` is the JDK's one-argument `fail(String reason)` site. It
+/// builds the `URISyntaxException` through the two-argument constructor, whose
+/// index is -1, and `URISyntaxException.getMessage()` then omits the
+/// `" at index N"` clause entirely. MEASURED 2026-08-17 -- the only URI parse
+/// failure in the whole family that carries no index:
+/// `new URI("http://[::1%]/p")` is `scope id expected: http://[::1%]/p`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UriParseFail {
+    pub(crate) reason: &'static str,
+    pub(crate) index: Option<usize>,
+}
+
+impl UriParseFail {
+    fn at(reason: &'static str, index: usize) -> Self {
+        UriParseFail {
+            reason,
+            index: Some(index),
+        }
+    }
+}
+
+/// `java.net.URI$Parser`'s IPv6 scanner, transcribed.
+///
+/// This is a direct transcription of `parseIPv6Reference` / `scanHexPost` /
+/// `scanHexSeq` / `scanIPv4Address` / `takeIPv4Address` / `scanByte` from
+/// `java.base/java/net/URI.java` (Temurin 25.0.3+9-LTS `src.zip`), because the
+/// indices these report cannot be derived from the grammar -- they are
+/// wherever that particular scan happened to stop. All positions are ABSOLUTE
+/// offsets into the whole URI string, which is what the exception carries.
+struct Ipv6Scanner<'a> {
+    b: &'a [u8],
+    /// The JDK's `ipv6byteCount`: two per hex group, four per embedded IPv4.
+    byte_count: i32,
+}
+
+impl<'a> Ipv6Scanner<'a> {
+    fn at_char(&self, p: usize, n: usize, c: u8) -> bool {
+        p < n && self.b[p] == c
+    }
+
+    fn at_double_colon(&self, p: usize, n: usize) -> bool {
+        n.saturating_sub(p) >= 2 && self.b[p] == b':' && self.b[p + 1] == b':'
+    }
+
+    fn scan_char(&self, p: usize, n: usize, c: u8) -> usize {
+        if self.at_char(p, n, c) {
+            p + 1
+        } else {
+            p
+        }
+    }
+
+    fn scan_hex(&self, p: usize, n: usize) -> usize {
+        let mut q = p;
+        while q < n && self.b[q].is_ascii_hexdigit() {
+            q += 1;
+        }
+        q
+    }
+
+    fn scan_digits(&self, p: usize, n: usize) -> usize {
+        let mut q = p;
+        while q < n && self.b[q].is_ascii_digit() {
+            q += 1;
+        }
+        q
+    }
+
+    fn scan_digits_and_dots(&self, p: usize, n: usize) -> usize {
+        let mut q = p;
+        while q < n && (self.b[q].is_ascii_digit() || self.b[q] == b'.') {
+            q += 1;
+        }
+        q
+    }
+
+    /// `scanByte` — a run of decimal digits whose value fits in a byte. Returns
+    /// `p` unchanged when the run is too large, which is how the caller detects
+    /// the failure and where it reports it.
+    fn scan_byte(&self, p: usize, n: usize) -> usize {
+        let q = self.scan_digits(p, n);
+        if q <= p {
+            return q;
+        }
+        let mut i = p;
+        while i < q && self.b[i] == b'0' {
+            i += 1;
+        }
+        let significant = q - i;
+        if significant < 3 {
+            return q;
+        }
+        if significant > 3 {
+            return p;
+        }
+        let value = std::str::from_utf8(&self.b[i..q])
+            .ok()
+            .and_then(|d| d.parse::<u32>().ok())
+            .unwrap_or(u32::MAX);
+        if value > 255 {
+            p
+        } else {
+            q
+        }
+    }
+
+    /// `scanIPv4Address`. `Ok(None)` is the JDK's `-1` ("not an IPv4 address").
+    fn scan_ipv4(
+        &self,
+        start: usize,
+        n: usize,
+        strict: bool,
+    ) -> Result<Option<usize>, UriParseFail> {
+        let m = self.scan_digits_and_dots(start, n);
+        if m <= start || (strict && m != n) {
+            return Ok(None);
+        }
+        let mut p = start;
+        let mut q = start;
+        loop {
+            q = self.scan_byte(p, m);
+            if q <= p {
+                break;
+            }
+            p = q;
+            q = self.scan_char(p, m, b'.');
+            if q <= p {
+                break;
+            }
+            p = q;
+            q = self.scan_byte(p, m);
+            if q <= p {
+                break;
+            }
+            p = q;
+            q = self.scan_char(p, m, b'.');
+            if q <= p {
+                break;
+            }
+            p = q;
+            q = self.scan_byte(p, m);
+            if q <= p {
+                break;
+            }
+            p = q;
+            q = self.scan_char(p, m, b'.');
+            if q <= p {
+                break;
+            }
+            p = q;
+            q = self.scan_byte(p, m);
+            if q <= p {
+                break;
+            }
+            p = q;
+            if q < m {
+                break;
+            }
+            return Ok(Some(q));
+        }
+        if strict {
+            return Err(UriParseFail::at("Malformed IPv4 address", q));
+        }
+        Ok(None)
+    }
+
+    /// `takeIPv4Address`. `expected` is the already-composed
+    /// `"Expected " + expected` reason, since `failExpecting` only ever
+    /// prefixes that one word.
+    fn take_ipv4(
+        &mut self,
+        start: usize,
+        n: usize,
+        expected: &'static str,
+    ) -> Result<usize, UriParseFail> {
+        match self.scan_ipv4(start, n, true)? {
+            Some(p) if p > start => Ok(p),
+            _ => Err(UriParseFail::at(expected, start)),
+        }
+    }
+
+    /// `scanHexSeq`. `Ok(None)` is the JDK's `-1`.
+    fn scan_hex_seq(&mut self, start: usize, n: usize) -> Result<Option<usize>, UriParseFail> {
+        let mut p = start;
+        let mut q = self.scan_hex(p, n);
+        if q <= p {
+            return Ok(None);
+        }
+        if self.at_char(q, n, b'.') {
+            // Beginning of an IPv4 address, not a hex group.
+            return Ok(None);
+        }
+        if q > p + 4 {
+            return Err(UriParseFail::at(
+                "IPv6 hexadecimal digit sequence too long",
+                p,
+            ));
+        }
+        self.byte_count += 2;
+        p = q;
+        while p < n {
+            if !self.at_char(p, n, b':') {
+                break;
+            }
+            if self.at_char(p + 1, n, b':') {
+                break;
+            }
+            p += 1;
+            q = self.scan_hex(p, n);
+            if q <= p {
+                return Err(UriParseFail::at("Expected digits for an IPv6 address", p));
+            }
+            if self.at_char(q, n, b'.') {
+                p -= 1;
+                break;
+            }
+            if q > p + 4 {
+                return Err(UriParseFail::at(
+                    "IPv6 hexadecimal digit sequence too long",
+                    p,
+                ));
+            }
+            self.byte_count += 2;
+            p = q;
+        }
+        Ok(Some(p))
+    }
+
+    /// `scanHexPost`.
+    fn scan_hex_post(&mut self, start: usize, n: usize) -> Result<usize, UriParseFail> {
+        let mut p = start;
+        if p == n {
+            return Ok(p);
+        }
+        match self.scan_hex_seq(p, n)? {
+            Some(q) if q > p => {
+                p = q;
+                if self.at_char(p, n, b':') {
+                    p += 1;
+                    p = self.take_ipv4(p, n, "Expected hex digits or IPv4 address")?;
+                    self.byte_count += 4;
+                }
+            }
+            _ => {
+                p = self.take_ipv4(p, n, "Expected hex digits or IPv4 address")?;
+                self.byte_count += 4;
+            }
+        }
+        Ok(p)
+    }
+
+    /// `parseIPv6Reference` over `b[start..n]` (the bracket BODY, without the
+    /// brackets themselves).
+    fn parse_reference(&mut self, start: usize, n: usize) -> Result<usize, UriParseFail> {
+        let mut p = start;
+        let mut compressed_zeros = false;
+        match self.scan_hex_seq(p, n)? {
+            Some(q) if q > p => {
+                p = q;
+                if self.at_double_colon(p, n) {
+                    compressed_zeros = true;
+                    p = self.scan_hex_post(p + 2, n)?;
+                } else if self.at_char(p, n, b':') {
+                    p = self.take_ipv4(p + 1, n, "Expected IPv4 address")?;
+                    self.byte_count += 4;
+                }
+            }
+            _ => {
+                if self.at_double_colon(p, n) {
+                    compressed_zeros = true;
+                    p = self.scan_hex_post(p + 2, n)?;
+                }
+            }
+        }
+        if p < n {
+            return Err(UriParseFail::at("Malformed IPv6 address", start));
+        }
+        if self.byte_count > 16 {
+            return Err(UriParseFail::at("IPv6 address too long", start));
+        }
+        if !compressed_zeros && self.byte_count < 16 {
+            return Err(UriParseFail::at("IPv6 address too short", start));
+        }
+        if compressed_zeros && self.byte_count == 16 {
+            return Err(UriParseFail::at("Malformed IPv6 address", start));
+        }
+        Ok(p)
+    }
+}
+
+/// The refusal `java.net.URI`'s server-based authority parser would raise for a
+/// bracketed (IPv6-literal) authority, or `None` if it would accept it.
+///
+/// Only bracketed authorities are policed here, and that is deliberate: the
+/// JDK falls back to a REGISTRY-based authority when the server-based parse
+/// fails, which is why `new URI("http://h:-5/p")` is perfectly legal (it just
+/// answers `getHost() == null`, `getPort() == -1`). An authority containing a
+/// `]` is not a legal registry name, so there is no fallback and the parse
+/// failure is fatal -- that asymmetry is the whole reason these refusals exist
+/// only inside brackets. MEASURED 2026-08-17 against Temurin 25.0.3+9-LTS:
+///
+/// ```text
+///   http://[abc]/p                 IPv6 address too short at index 8
+///   http://[abcd]/p                IPv6 address too short at index 8
+///   http://[1:2:3:4:5:6:7]/p       IPv6 address too short at index 8
+///   http://[abcde]/p               IPv6 hexadecimal digit sequence too long at index 8
+///   http://[12345::1]/p            IPv6 hexadecimal digit sequence too long at index 8
+///   http://[v7.abc]/p              Malformed IPv6 address at index 8
+///   http://[1.2.3.4]/p             Malformed IPv6 address at index 8
+///   http://[g::1]/p                Malformed IPv6 address at index 8
+///   http://[:1]/p                  Malformed IPv6 address at index 8
+///   http://[%eth0]/p               Malformed IPv6 address at index 8
+///   http://[::1:2:3:4:5:6:7:8]/p   Malformed IPv6 address at index 8
+///   http://[1:2:3:4:5:6:7:8:9]/p   IPv6 address too long at index 8
+///   http://[1:]/p                  Expected digits for an IPv6 address at index 10
+///   http://[::1:]/p                Expected digits for an IPv6 address at index 12
+///   http://[::256.1.1.1]/p         Malformed IPv4 address at index 10
+///   http://[::1.2.3]/p             Malformed IPv4 address at index 15
+///   http://[::1.2.3.400]/p         Malformed IPv4 address at index 16
+///   http://[::1.2.3.4.5]/p         Malformed IPv4 address at index 17
+///   http://[::ffff:1.2.3.999]/p    Malformed IPv4 address at index 21
+///   http://[::1.2.3.4x]/p          Expected hex digits or IPv4 address at index 10
+///   http://[::1%]/p                scope id expected            (NO index)
+///   http://[::1]]/p                Expected port number at index 12
+///   http://[::1]x/p                Expected port number at index 12
+///   http://[::1]:x/p               Illegal character in port number at index 13
+///   http://[::1]:-5/p              Illegal character in port number at index 13
+///   http://[::1]:+80/p             Illegal character in port number at index 13
+///   http://[::1]:8x/p              Illegal character in port number at index 14
+///   http://u@[::1]:x/p             Illegal character in port number at index 15
+///   http://[::1]:99999999999/p     Malformed port number at index 13
+///   http://[::1]:2147483648/p      Malformed port number at index 13
+/// ```
+///
+/// and these are ACCEPTED, so the check must not fire for them:
+/// `[::1]`, `[::]`, `[fe80::1]`, `[1:2:3:4:5:6:7:8]`, `[1:2:3:4:5:6:1.2.3.4]`,
+/// `[::1.2.3.4]`, `[::ffff:1.2.3.4]`, `[1234::1]`, `[::1%eth0]`, `[::1%zz]`,
+/// `[::1%25]`, `[::1]:`, `[::1]:0`, `[::1]:007`, `[::1]:2147483647`.
+///
+/// Returns `None` for the unclosed / empty-bracket shapes, which the older
+/// `Expected closing bracket for IPv6 address` check in [`native_uri_init`]
+/// already refuses at the same indices.
+pub(crate) fn uri_ipv6_authority_fail(s: &str) -> Option<UriParseFail> {
+    let b = s.as_bytes();
+    let open_auth = s.find("://")? + 3;
+    let auth_end = s[open_auth..]
+        .find(['/', '?', '#'])
+        .map(|r| open_auth + r)
+        .unwrap_or(s.len());
+    // `parseServer` takes the userinfo off first: `scan(p, n, "/?#", "@")`, so
+    // the host begins after the FIRST `@` in the authority, if there is one.
+    let host_start = s[open_auth..auth_end]
+        .find('@')
+        .map(|i| open_auth + i + 1)
+        .unwrap_or(open_auth);
+    if b.get(host_start) != Some(&b'[') {
+        return None;
+    }
+    let body_start = host_start + 1;
+    let close = s[body_start..auth_end].find(']').map(|i| body_start + i)?;
+    if close == body_start {
+        return None;
+    }
+
+    let mut scanner = Ipv6Scanner { b, byte_count: 0 };
+    match s[body_start..close].find('%').map(|i| body_start + i) {
+        // `int r = scan(p, q, "%")` only counts as a scope id when it advanced,
+        // i.e. when the `%` is not the very first byte of the body. A leading
+        // `%` stays part of the address and fails there instead.
+        Some(pct) if pct > body_start => {
+            if let Err(fail) = scanner.parse_reference(body_start, pct) {
+                return Some(fail);
+            }
+            if pct + 1 == close {
+                return Some(UriParseFail {
+                    reason: "scope id expected",
+                    index: None,
+                });
+            }
+            // checkChars(r + 1, q, L_SCOPE_ID, …) — scope_id = alphanum | "_" | "."
+            for i in pct + 1..close {
+                let c = b[i];
+                if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
+                    return Some(UriParseFail::at("Illegal character in scope id", i));
+                }
+            }
+        }
+        _ => {
+            if let Err(fail) = scanner.parse_reference(body_start, close) {
+                return Some(fail);
+            }
+        }
+    }
+
+    // After the `]`: either the end of the authority, or `:` <port>. The
+    // authority never contains `/`, so the JDK's `q = scan(p, n, "/")` is just
+    // the end of the authority.
+    let mut p = close + 1;
+    if p < auth_end && b[p] == b':' {
+        p += 1;
+        if auth_end > p {
+            if let Some(bad) = (p..auth_end).find(|i| !b[*i].is_ascii_digit()) {
+                return Some(UriParseFail::at("Illegal character in port number", bad));
+            }
+            if s[p..auth_end].parse::<i32>().is_err() {
+                return Some(UriParseFail::at("Malformed port number", p));
+            }
+        }
+        p = auth_end;
+    }
+    if p < auth_end {
+        return Some(UriParseFail::at("Expected port number", p));
+    }
+    None
+}
+
+/// Build the `java.net.URISyntaxException` for a [`UriParseFail`], choosing the
+/// two- or three-argument constructor exactly as the JDK's `fail` overloads do.
+fn uri_syntax_exception(
+    ctx: &mut dyn NativeContext,
+    input: &str,
+    fail: &UriParseFail,
+) -> Option<MethodCallFailed> {
+    let input_obj = ctx.create_string(input);
+    let reason_obj = ctx.create_string(fail.reason);
+    let built = match fail.index {
+        Some(index) => ctx.new_object_initialized(
+            "java/net/URISyntaxException",
+            "(Ljava/lang/String;Ljava/lang/String;I)V",
+            &[
+                Value::Object(Some(input_obj)),
+                Value::Object(Some(reason_obj)),
+                Value::Int(index as i32),
+            ],
+        ),
+        None => ctx.new_object_initialized(
+            "java/net/URISyntaxException",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(input_obj)),
+                Value::Object(Some(reason_obj)),
+            ],
+        ),
+    };
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => Some(MethodCallFailed::ExceptionThrown(exc)),
+        _ => None,
+    }
 }
 
 /// Returns the index at which `java.net.URI`'s single-string parser would throw
@@ -1246,9 +1791,31 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let url_str = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => String::new(),
+    // MEASURED 2026-08-13 (/tmp/T.java): `new URI(null)` is a helpful NPE
+    // naming the JDK's own private field, not a URISyntaxException and not a
+    // silently-empty URI. The `_ => String::new()` arm below turned a null
+    // argument into the empty string, which is a LEGAL relative URI -- so the
+    // constructor succeeded and handed back a usable object.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"this.input\" is null".into(),
+            ),
+        }
+        .into());
+    }
+    // The argument object is pinned HERE, before anything below allocates.
+    // It is restored verbatim at the end of this function (see the note
+    // there); a raw `ObjectRef` re-read from `args` after the parse would be
+    // a from-space address under a moving young collection.
+    let raw_arg = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let raw_pin = raw_arg.map(|o| ctx.pin_native_root(o));
+    let url_str = match raw_arg {
+        Some(o) => ctx.read_string(o).unwrap_or_default(),
+        None => String::new(),
     };
     // Reject a malformed scheme name before any other check — the real JDK
     // parser validates this first (see `uri_scheme_name_fail_index`).
@@ -1282,18 +1849,115 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // rejected unconditionally even with the opt-out gate (preserves the
     // keycloak fix); the broader ASCII check is gated default-ON so it can be
     // disabled (CRATONVM_URI_STRICT_CHARS=0) if a regression surfaces.
+    // An IPv6 literal in the authority must be `[` <non-empty> `]`. MEASURED
+    // 2026-08-13 (/tmp/W.java) -- both of these are URISyntaxException on
+    // HotSpot and were ACCEPTED here, i.e. a malformed URI parsed clean:
+    //
+    //   new URI("http://[::1/")  Expected closing bracket for IPv6 address at index 11
+    //   new URI("http://[]/")    Expected closing bracket for IPv6 address at index 8
+    //
+    // The reported index is where the address parse stopped: the end of the
+    // authority when the `]` is missing, and the position just past `[` when the
+    // body is empty. `http://[fe80::1]/` and `http://[::1]:80/` stay legal.
+    if let Some(open) = url_str.find("://").map(|s| s + 3) {
+        let auth_end = url_str[open..]
+            .find(['/', '?', '#'])
+            .map(|r| open + r)
+            .unwrap_or(url_str.len());
+        let auth = &url_str[open..auth_end];
+        if let Some(br) = auth.find('[') {
+            let abs_br = open + br;
+            let rest = &url_str[abs_br + 1..auth_end];
+            let bad = match rest.find(']') {
+                None => Some(auth_end),
+                Some(0) => Some(abs_br + 1),
+                Some(_) => None,
+            };
+            if let Some(pos) = bad {
+                let input = ctx.create_string(&url_str);
+                let reason = ctx.create_string("Expected closing bracket for IPv6 address");
+                if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+                    "java/net/URISyntaxException",
+                    "(Ljava/lang/String;Ljava/lang/String;I)V",
+                    &[
+                        Value::Object(Some(input)),
+                        Value::Object(Some(reason)),
+                        Value::Int(pos as i32),
+                    ],
+                ) {
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+            }
+        }
+    }
+
     let strict_uri_chars = crate::nbflags().uri_strict_chars;
     let illegal = if strict_uri_chars {
-        uri_first_illegal_index(&url_str)
+        uri_first_char_fault(&url_str)
     } else {
         url_str
             .char_indices()
             .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
-            .map(|(i, _)| i)
+            .map(|(i, _)| (i, UriCharFault::Illegal))
     };
-    if let Some(pos) = illegal {
+    if let Some((pos, UriCharFault::MalformedEscape)) = illegal {
+        // A `%` that does not begin a `%` HEX HEX triple is its OWN reason in
+        // the JDK, produced by `Parser.scanEscape` before any component-specific
+        // character check runs — see [`UriCharFault`] for the sixteen measured
+        // rows. We reported the component name here, so `getMessage()` read
+        // `Illegal character in path at index 10` where HotSpot says
+        // `Malformed escape pair at index 10`.
+        if let Some(exc) = uri_syntax_exception(
+            ctx,
+            &url_str,
+            &UriParseFail::at("Malformed escape pair", pos),
+        ) {
+            return Err(exc);
+        }
+    }
+    if let Some((pos, UriCharFault::Illegal)) = illegal {
         let input = ctx.create_string(&url_str);
-        let reason = ctx.create_string("Illegal character in URI");
+        // The JDK names the COMPONENT the offending character sits in, not the
+        // URI as a whole. MEASURED 2026-08-13 (/tmp/W2.java) -- five distinct
+        // names, and the boundaries are the delimiters themselves:
+        //
+        //   htt<p://h/      Illegal character in scheme name at index 3
+        //   //auth<x/p      Illegal character in authority   at index 6
+        //   http://h/pa<th  Illegal character in path        at index 11
+        //   http://h/p?q<1  Illegal character in query       at index 12
+        //   http://h/p#f<1  Illegal character in fragment    at index 12
+        //
+        // A relative "/pa<th" with no scheme and no authority is still "path",
+        // so the component is decided by position, not by what the URI has.
+        let component = {
+            let frag = url_str.find('#');
+            let query = url_str.find('?').filter(|q| frag.is_none_or(|f| *q < f));
+            let scheme_end = url_str.find(':').filter(|c| {
+                url_str[..*c].chars().all(|ch| ch.is_ascii_alphanumeric() || "+-.".contains(ch))
+                    && url_str[..*c].starts_with(|ch: char| ch.is_ascii_alphabetic())
+            });
+            let auth_start = url_str.find("//").map(|s| s + 2);
+            let auth_stop = auth_start.map(|s| {
+                url_str[s..]
+                    .find(['/', '?', '#'])
+                    .map(|r| s + r)
+                    .unwrap_or(url_str.len())
+            });
+            if frag.is_some_and(|f| pos > f) {
+                "fragment"
+            } else if query.is_some_and(|q| pos > q) {
+                "query"
+            } else if scheme_end.is_some_and(|c| pos < c) {
+                "scheme name"
+            } else if auth_start.is_some_and(|s| pos >= s)
+                && auth_stop.is_some_and(|e| pos < e)
+            {
+                "authority"
+            } else {
+                "path"
+            }
+        };
+        let reason = ctx.create_string(&format!("Illegal character in {component}"));
         if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
             "java/net/URISyntaxException",
             "(Ljava/lang/String;Ljava/lang/String;I)V",
@@ -1304,6 +1968,19 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             ],
         ) {
             return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
+    // Reject a bracketed authority whose IPv6 literal, scope id or port the
+    // JDK's server-based parser would refuse. This runs AFTER the generic
+    // character check on purpose: HotSpot scans the authority against its
+    // character set first, so `http://[abc]<>/p` is an illegal-character
+    // failure and only a character-clean authority reaches `parseServer`.
+    // See [`uri_ipv6_authority_fail`] for the thirty measured rows.
+    if strict_uri_chars {
+        if let Some(fail) = uri_ipv6_authority_fail(&url_str) {
+            if let Some(exc) = uri_syntax_exception(ctx, &url_str, &fail) {
+                return Err(exc);
+            }
         }
     }
     // Reject an absolute URI with an empty scheme-specific part (`file:`,
@@ -1326,6 +2003,39 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     url_parse(ctx, this, &url_str);
     uri_store_named(ctx, this, &url_str);
+    // Hand back the text we were GIVEN, not a copy of the decode.
+    //
+    // `url_str` is a Rust `String`, which cannot hold an unpaired surrogate,
+    // so every store built from it substitutes U+FFFD. MEASURED on both VMs
+    // at `e9bed7b89`, with the source built from a `char[]` so no
+    // constant-pool interning is involved:
+    //
+    //   new URI("http://h/a<U+D800>b").toString()
+    //     HotSpot   charAt(10)=d800, and toString() == the argument
+    //     CratonVM  charAt(10)=fffd, and toString() != the argument
+    //
+    // The LENGTH was right on both, which is why this survived: exactly one
+    // code unit differed, so nothing that measures size or splits on ASCII
+    // delimiters ever noticed. `url_str` stays for the PARSING above, which
+    // splits on ASCII delimiters and is unaffected by the substitution.
+    //
+    // Only the verbatim text is restored. The parsed components are still
+    // built from the decode and still carry U+FFFD — see this file's
+    // nomination in `G61-1`; fixing those needs component slicing by code
+    // unit, which is a different and much larger change.
+    //
+    // Slot 6 is written ONLY on our synthetic layout: on a real
+    // `java.net.URI`, slot 6 is `path`, and writing the whole URI there would
+    // corrupt it. Same rule, and the same reason, as the JDK-ONLY-LAYOUT
+    // guard in `phases_early.rs`.
+    if let (Some(pin), Some(raw0)) = (raw_pin, raw_arg) {
+        let raw_ref = ctx.read_native_pin(pin, raw0);
+        ctx.set_field_by_name(this, "string", Value::Object(Some(raw_ref)));
+        if net_phase_e::uri_has_synthetic_layout(ctx, this) {
+            ctx.set_field(this, 6, Value::Object(Some(raw_ref)));
+        }
+        ctx.unpin_native_roots(pin);
+    }
     Ok(None)
 }
 
@@ -2203,5 +2913,324 @@ mod new2_net_tests {
                  cannot route"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // G14-1: the `new URI(String)` refusal surface.
+    //
+    // Every expectation below is a TRANSCRIPTION of a row measured on
+    // Temurin 25.0.3+9-LTS on 2026-08-17, not a derivation from the grammar.
+    // The reason strings and the indices are what `URISyntaxException`'s
+    // `getReason()` / `getIndex()` actually answered; where they look
+    // arbitrary (an index pointing at the first non-digit for one port
+    // failure and at the port's first character for another) that is because
+    // they ARE arbitrary — they are wherever the JDK's scan stopped.
+    // ---------------------------------------------------------------------
+
+    /// The offending character's index, and whether the JDK would blame a
+    /// malformed escape triple rather than the component's character set.
+    #[track_caller]
+    fn assert_escape_fault(uri: &str, index: usize) {
+        assert_eq!(
+            uri_first_char_fault(uri),
+            Some((index, UriCharFault::MalformedEscape)),
+            "`{uri}` must be a `Malformed escape pair` at index {index}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_illegal_char(uri: &str, index: usize) {
+        assert_eq!(
+            uri_first_char_fault(uri),
+            Some((index, UriCharFault::Illegal)),
+            "`{uri}` must be an illegal-character refusal at index {index}"
+        );
+    }
+
+    #[test]
+    fn uri_malformed_escape_pairs_are_their_own_reason() {
+        // MEASURED: all sixteen are `Malformed escape pair at index N`, never
+        // `Illegal character in <component>` — and the component makes no
+        // difference to the reason, only to the index.
+        assert_escape_fault("http://h/a%", 10);
+        assert_escape_fault("http://h/a%2", 10);
+        assert_escape_fault("http://h/a%A", 10);
+        assert_escape_fault("http://h/a%zz", 10);
+        assert_escape_fault("http://h/a%2z", 10);
+        assert_escape_fault("http://h/a%z2", 10);
+        assert_escape_fault("http://h/a%GG", 10);
+        assert_escape_fault("http://h/a%2G", 10);
+        assert_escape_fault("http://h/a%%20", 10);
+        assert_escape_fault("http://h/p?q=%2", 13);
+        assert_escape_fault("http://h/p?q=%zz", 13);
+        assert_escape_fault("http://h/p#f%2", 12);
+        assert_escape_fault("http://h/p#f%zz", 12);
+        assert_escape_fault("http://h%2/p", 8);
+        assert_escape_fault("http://h%zz/p", 8);
+        assert_escape_fault("http://u%2@h/p", 8);
+        assert_escape_fault("%2", 0);
+        assert_escape_fault("a%zzb", 1);
+        assert_escape_fault("mailto:a%2", 8);
+    }
+
+    #[test]
+    fn uri_well_formed_escapes_are_accepted() {
+        for uri in [
+            "http://h/a%20b",
+            "http://h/a%41b",
+            "http://h/a%C3%A9",
+            "http://h/a%c3%a9",
+            "http://h/a%FF",
+            "http://h/a%ff%fe",
+        ] {
+            assert_eq!(uri_first_char_fault(uri), None, "`{uri}` is legal");
+        }
+    }
+
+    #[test]
+    fn uri_first_offence_wins_left_to_right() {
+        // MEASURED — the JDK scans forward and reports whichever offence it
+        // reaches first, so the SAME two characters swap the reason when their
+        // order swaps.
+        assert_illegal_char("http://h/a b%2", 10); // the space, at 10
+        assert_escape_fault("http://h/a%2 b", 10); // the `%`, at 10
+        assert_illegal_char("http://h/a<b%2", 10);
+        assert_escape_fault("http://h/a%2<b", 10);
+        assert_escape_fault("http://h/a%2%2", 10);
+    }
+
+    #[test]
+    fn percent_inside_an_ipv6_literal_is_a_scope_id_not_an_escape() {
+        // MEASURED — HotSpot ACCEPTS all three. We used to refuse the first two
+        // with `Illegal character in authority`, which is the worse half of the
+        // bug: refusing input the JDK accepts.
+        for uri in [
+            "http://[::1%eth0]/p",
+            "http://[::1%zz]/p",
+            "http://[::1%25]/p",
+        ] {
+            assert_eq!(
+                uri_first_char_fault(uri),
+                None,
+                "`{uri}` must survive the character scan"
+            );
+        }
+        // …but only INSIDE the brackets. A bare `%` anywhere else is still an
+        // escape triple that has to be well formed.
+        assert_escape_fault("http://[::1]/a%2", 14);
+        assert_escape_fault("http://h%2/p", 8);
+    }
+
+    #[track_caller]
+    fn assert_ipv6_fail(uri: &str, reason: &str, index: Option<usize>) {
+        let got = uri_ipv6_authority_fail(uri).map(|f| (f.reason, f.index));
+        assert_eq!(
+            got,
+            Some((reason, index)),
+            "`{uri}` must be refused with `{reason}` at {index:?}"
+        );
+    }
+
+    #[test]
+    fn ipv6_literal_bodies_match_the_jdk_parser() {
+        assert_ipv6_fail("http://[abc]/p", "IPv6 address too short", Some(8));
+        assert_ipv6_fail("http://[abcd]/p", "IPv6 address too short", Some(8));
+        assert_ipv6_fail("http://[1]/p", "IPv6 address too short", Some(8));
+        assert_ipv6_fail("http://[12]/p", "IPv6 address too short", Some(8));
+        assert_ipv6_fail("http://[1:2]/p", "IPv6 address too short", Some(8));
+        assert_ipv6_fail("http://[1:2:3]/p", "IPv6 address too short", Some(8));
+        assert_ipv6_fail(
+            "http://[1:2:3:4:5:6:7]/p",
+            "IPv6 address too short",
+            Some(8),
+        );
+        assert_ipv6_fail(
+            "http://[abcde]/p",
+            "IPv6 hexadecimal digit sequence too long",
+            Some(8),
+        );
+        assert_ipv6_fail(
+            "http://[12345]/p",
+            "IPv6 hexadecimal digit sequence too long",
+            Some(8),
+        );
+        assert_ipv6_fail(
+            "http://[12345::1]/p",
+            "IPv6 hexadecimal digit sequence too long",
+            Some(8),
+        );
+        assert_ipv6_fail("http://[v7.abc]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[V7.abc]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[vz.abc]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[v.abc]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[v7.]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[1.2.3.4]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[g::1]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[:1]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail("http://[%eth0]/p", "Malformed IPv6 address", Some(8));
+        assert_ipv6_fail(
+            "http://[::1:2:3:4:5:6:7:8]/p",
+            "Malformed IPv6 address",
+            Some(8),
+        );
+        assert_ipv6_fail(
+            "http://[1:2:3:4:5:6:7:8:9]/p",
+            "IPv6 address too long",
+            Some(8),
+        );
+        assert_ipv6_fail(
+            "http://[1:2:3:4:5:6:7:1.2.3.4]/p",
+            "IPv6 address too long",
+            Some(8),
+        );
+        assert_ipv6_fail(
+            "http://[1:]/p",
+            "Expected digits for an IPv6 address",
+            Some(10),
+        );
+        assert_ipv6_fail(
+            "http://[::1:]/p",
+            "Expected digits for an IPv6 address",
+            Some(12),
+        );
+    }
+
+    #[test]
+    fn embedded_ipv4_indices_are_wherever_the_scan_stopped() {
+        // These four indices are the reason this is a transcription: each one
+        // is a different position for the same reason string.
+        assert_ipv6_fail("http://[::256.1.1.1]/p", "Malformed IPv4 address", Some(10));
+        assert_ipv6_fail("http://[::1.2.3]/p", "Malformed IPv4 address", Some(15));
+        assert_ipv6_fail("http://[::1.2.3.400]/p", "Malformed IPv4 address", Some(16));
+        assert_ipv6_fail("http://[::1.2.3.4.5]/p", "Malformed IPv4 address", Some(17));
+        assert_ipv6_fail(
+            "http://[::ffff:1.2.3.999]/p",
+            "Malformed IPv4 address",
+            Some(21),
+        );
+        assert_ipv6_fail(
+            "http://[::1.2.3.4x]/p",
+            "Expected hex digits or IPv4 address",
+            Some(10),
+        );
+    }
+
+    #[test]
+    fn ipv6_scope_id_rules() {
+        // The ONE refusal in the family that carries no index at all.
+        assert_ipv6_fail("http://[::1%]/p", "scope id expected", None);
+        for uri in [
+            "http://[::1%eth0]/p",
+            "http://[::1%zz]/p",
+            "http://[::1%25]/p",
+        ] {
+            assert_eq!(uri_ipv6_authority_fail(uri), None, "`{uri}` is legal");
+        }
+    }
+
+    #[test]
+    fn port_after_an_ipv6_literal_is_digits_only() {
+        assert_ipv6_fail(
+            "http://[::1]:x/p",
+            "Illegal character in port number",
+            Some(13),
+        );
+        assert_ipv6_fail(
+            "http://[::1]:-5/p",
+            "Illegal character in port number",
+            Some(13),
+        );
+        assert_ipv6_fail(
+            "http://[::1]:+80/p",
+            "Illegal character in port number",
+            Some(13),
+        );
+        // The index moves to the first NON-digit, not the start of the port.
+        assert_ipv6_fail(
+            "http://[::1]:8x/p",
+            "Illegal character in port number",
+            Some(14),
+        );
+        assert_ipv6_fail(
+            "http://[::1]:80x80/p",
+            "Illegal character in port number",
+            Some(15),
+        );
+        // …and userinfo shifts every index along with it.
+        assert_ipv6_fail(
+            "http://u@[::1]:x/p",
+            "Illegal character in port number",
+            Some(15),
+        );
+        // All digits but out of `int` range is a DIFFERENT reason, reported at
+        // the start of the port rather than at any particular digit.
+        assert_ipv6_fail(
+            "http://[::1]:99999999999/p",
+            "Malformed port number",
+            Some(13),
+        );
+        assert_ipv6_fail(
+            "http://[::1]:2147483648/p",
+            "Malformed port number",
+            Some(13),
+        );
+    }
+
+    #[test]
+    fn anything_but_a_colon_after_the_closing_bracket_expects_a_port() {
+        assert_ipv6_fail("http://[::1]]/p", "Expected port number", Some(12));
+        assert_ipv6_fail("http://[::1]x/p", "Expected port number", Some(12));
+    }
+
+    #[test]
+    fn well_formed_ipv6_authorities_are_left_alone() {
+        for uri in [
+            "http://[::1]/p",
+            "http://[::]/p",
+            "http://[fe80::1]/p",
+            "http://[1:2:3:4:5:6:7:8]/p",
+            "http://[1234::1]/p",
+            "http://[1:2:3:4:5:6:1.2.3.4]/p",
+            "http://[::1.2.3.4]/p",
+            "http://[::ffff:1.2.3.4]/p",
+            "http://[::1]:80/p",
+            "http://[::1]:0/p",
+            "http://[::1]:007/p",
+            "http://[::1]:2147483647/p",
+            "http://[::1]:/p",
+            "http://[::1]",
+            "http://[::1]?q",
+            "http://[::1]#f",
+            "http://u@[::1]/p",
+            "http://u@[::1]:80/p",
+        ] {
+            assert_eq!(uri_ipv6_authority_fail(uri), None, "`{uri}` is legal");
+        }
+    }
+
+    #[test]
+    fn unclosed_and_empty_brackets_stay_with_the_older_check() {
+        // `native_uri_init`'s `Expected closing bracket for IPv6 address` check
+        // already refuses these at the right indices; the IPv6 body scanner
+        // must not also claim them, or the reason would change.
+        for uri in ["http://[/", "http://[]/p", "http://[::1/"] {
+            assert_eq!(uri_ipv6_authority_fail(uri), None, "`{uri}` is not ours");
+        }
+    }
+
+    #[test]
+    fn an_authority_less_uri_has_no_port_to_find() {
+        // The three rows `uri_store_named`'s sentinel write exists for: with no
+        // `//`, `url_parse` reads the LAST colon as a port delimiter.
+        for uri in ["urn:isbn:0451450523", "a:1234", "mailto:a@b.com:25"] {
+            let (_, authority, _, _, _) = crate::net_phase_e::uri_split(uri);
+            assert!(
+                authority.is_none(),
+                "`{uri}` has no authority, so `getPort()` must be -1"
+            );
+        }
+        // …and a URI that DOES have one keeps it.
+        let (_, authority, _, _, _) = crate::net_phase_e::uri_split("http://h:80/p");
+        assert_eq!(authority.as_deref(), Some("h:80"));
     }
 }

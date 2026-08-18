@@ -2706,12 +2706,97 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
             p60_unmeasurable_process_tree(ctx)
         },
     );
+    // `onExit()` — W7-10 §7.1, the residual that record left open. It was the
+    // one row in this block that neither delegated nor measured: it answered an
+    // already-COMPLETED `CompletableFuture` carrying `null`, for every receiver
+    // and every process state. That is wrong three ways at once, and each way
+    // is measured on this host (openjdk 25.0.3+9-LTS) rather than read off the
+    // javadoc:
+    //
+    //     ProcessHandle.current().onExit()  !! IllegalStateException: onExit for current process not allowed
+    //     deadChild.onExit()                -> future, isDone()=false   (alive=false)
+    //
+    // 1. For the CURRENT process the JDK REFUSES — a process cannot wait for
+    //    itself — where this returned a future saying it had already exited.
+    // 2. The future the JDK hands back completes with the ProcessHandle, never
+    //    with `null`; `f.get()` here returned `null` on every path.
+    // 3. It is not complete when it is handed back. Note the second measured
+    //    row: even for a child that HAS already exited, HotSpot returns
+    //    `isDone()==false` synchronously and completes it from the reaper. So
+    //    "completed immediately" was not merely early — it is not a state
+    //    HotSpot returns at all.
+    //
+    // The fix is the one every sibling row in this registrar already takes —
+    // `children`, `descendants`, `info` and `parent` all delegate — and W7-10's
+    // stated reason for exempting this one is verifiable, so it was verified
+    // rather than believed. That reason was that delegating "registers a reaper
+    // against `ProcessHandleImpl.completions` and `waitForProcessExit0`" and so
+    // "changes process-reaping behaviour rather than just an answer". The
+    // machinery it names is present, implemented and already measured against
+    // HotSpot: `native-io/src/process.rs` registers
+    // `ProcessHandleImpl.waitForProcessExit0(JZ)I`, whose own-child arm blocks
+    // in `wait_for_handle` inside a `begin_blocking_region`, and whose
+    // foreign-pid arm returns the JDK's `NOT_A_CHILD` (-2) so the JDK's own
+    // `isAlive0` poll loop takes over — pinned by `probes/ForeignHandleProbe.java`
+    // against HotSpot 25. This is the same path `Process.onExit()` on a spawned
+    // child already runs, so delegation adds no reaper the VM was not already
+    // running.
+    //
+    // The current-process refusal is nonetheless answered HERE, ahead of the
+    // delegation, and not left to fall out of the real
+    // `ProcessHandleImpl.onExit()`'s `this.equals(current)` test. Two reasons:
+    // it is the only arm that must hold in synthetic-JDK mode too, where there
+    // is no `ProcessHandleImpl` to delegate to; and `p60_handle_destroy`
+    // earlier in this file already refuses the current process by pid with the
+    // JDK's own message ("destroy of current process not allowed"), so this is
+    // the established shape here rather than a new one. The message is
+    // HotSpot's verbatim.
+    //
+    // Mode reach: `register_p60_process_handle` is NOT synthetic-only, unlike
+    // the phase bundles — `vm/src/vm/vm_init.rs` calls it from BOTH real-JDK
+    // arms ("SmallRye calls ProcessHandle.current().info() in real-JDK mode as
+    // well"). So this row is live in `--real-jdk`, and refused in `--jdk-only`
+    // by the `SyntheticStub` category this registrar sets.
     r.register(
         ph,
         "onExit",
         "()Ljava/util/concurrent/CompletableFuture;",
-        |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true)?;
+        |ctx, args| {
+            if p60_handle_pid(ctx, args) == Some(std::process::id() as i64) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "onExit for current process not allowed".to_string(),
+                }
+                .into());
+            }
+            if let Some(result) = p60_delegate_to_real_handle(
+                ctx,
+                args,
+                "onExit",
+                "()Ljava/util/concurrent/CompletableFuture;",
+            ) {
+                return result;
+            }
+            // Synthetic-JDK fallback: no `java.lang.ProcessHandleImpl` exists,
+            // so there is no reaper to complete a future from and no honest way
+            // to build one. What CAN be corrected without inventing a waiter is
+            // the VALUE: complete with the receiver handle, which is what the
+            // JDK's future carries (`.handleAsync((exitStatus, unused) -> this)`),
+            // instead of the `null` this answered.
+            //
+            // RESIDUAL, stated in place rather than implied — the same
+            // convention `p60_unmeasurable_process_tree` below uses for the
+            // empty stream. Completing at all still asserts "this process has
+            // exited" for a process that may be running. It is NOT converted to
+            // an incomplete future here, because `p60_pid_is_alive` answers a
+            // flat `true` for every foreign pid on non-unix (it has no portable
+            // probe), so on Windows that would turn a wrong answer into a
+            // silent forever-hang in `get()` — a worse failure with a harder
+            // diagnosis. Removing the last of it needs the same thing §7.2
+            // needs: a process waiter `native-builtins` can call without a real
+            // JDK. Under `--jdk-only` the `SyntheticStub` tag on this whole
+            // registrar means this arm is not reachable at all.
+            let this = args.first().copied().unwrap_or(Value::Object(None));
+            let cf = p58_new_cf(ctx, this, true)?;
             Ok(Some(Value::Object(Some(cf))))
         },
     );
@@ -4150,8 +4235,287 @@ pub(crate) fn register_phase64_natives(registry: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // HexFormat — Java 17
-// HexFormat = 2-field (delimiter=0 String, prefix=1 String)
+//
+// `HexFormat` is an immutable OPTION OBJECT: `of()` / `ofDelimiter()` mint one
+// and every `with*` returns a copy with one setting changed. The whole family
+// used to be written as if it were a bare byte<->hex codec:
+//
+//   * `withUpperCase()` was `Ok(Some(args[0]))` -- literally "return self",
+//     under the comment *"Simplified: return self (real impl would flag
+//     uppercase)"*. Measured: expected `00FF0A80`, produced `00ff0a80`.
+//   * `withDelimiter`, `withSuffix`, `withLowerCase` were not registered.
+//   * `formatHex` built its answer from the raw bytes with `{:02x}` and never
+//     looked at the receiver AT ALL, so `withPrefix` -- which WAS honoured to
+//     the extent of being stored -- was dropped on the floor too. The defect
+//     was therefore never "uppercase is missing"; it was that a configuration
+//     object had no reader, so EVERY setting was inert.
+//
+// Three of the old bodies could also reach a Rust panic, which is not a Java
+// throwable and takes the VM with it:
+//
+//   * `formatHex(b, 3, 1)` computed `(to - from) * 2` on `usize` -- `3 - 1`
+//     reversed is fine, but `from > to` (HotSpot: `IndexOutOfBoundsException:
+//     Range [3, 1) out of bounds for length 4`) underflows, and a negative
+//     `from` widened to `usize::MAX` before that.
+//   * `parseHex` sliced the Rust `String` by BYTE index, `&s[i*2..i*2+2]`,
+//     which panics with "byte index is not a char boundary" on any non-ASCII
+//     input. HotSpot answers `NumberFormatException: not a hexadecimal digit`.
+//
+// Instance layout, and it is the REAL JDK 25 one (verified by reflection on
+// Microsoft OpenJDK 25.0.3+9: `String delimiter, String prefix, String suffix,
+// boolean ucase`), so the same slot numbers serve both modes:
+//
+//     delimiter@0   prefix@1   suffix@2   ucase@3
+//
+// Every expected value below is a transcript from that JDK, not a memory.
 // =============================================================================
+
+const P64_HF_DELIMITER: usize = 0;
+const P64_HF_PREFIX: usize = 1;
+const P64_HF_SUFFIX: usize = 2;
+const P64_HF_UCASE: usize = 3;
+const P64_HF_SLOTS: usize = 4;
+
+/// A `HexFormat` receiver's configuration, read off the object rather than
+/// assumed. The reader that did not exist.
+struct P64HexCfg {
+    delimiter: String,
+    prefix: String,
+    suffix: String,
+    ucase: bool,
+}
+
+fn p64_hf_string(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize) -> String {
+    if ctx.object_num_fields(this) <= slot {
+        return String::new();
+    }
+    match ctx.get_field(this, slot) {
+        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn p64_hex_cfg(ctx: &mut dyn NativeContext, this: ObjectRef) -> P64HexCfg {
+    let delimiter = p64_hf_string(ctx, this, P64_HF_DELIMITER);
+    let prefix = p64_hf_string(ctx, this, P64_HF_PREFIX);
+    let suffix = p64_hf_string(ctx, this, P64_HF_SUFFIX);
+    let ucase = ctx.object_num_fields(this) > P64_HF_UCASE
+        && matches!(ctx.get_field(this, P64_HF_UCASE), Value::Int(v) if v != 0);
+    P64HexCfg {
+        delimiter,
+        prefix,
+        suffix,
+        ucase,
+    }
+}
+
+/// `HexFormat.of()` and `ofDelimiter("")` are the SAME OBJECT on HotSpot —
+/// `of()` returns the `HEX_FORMAT` static, minted once in `<clinit>`
+/// (`HexFormat.java:161-162`, `:200-202`). MEASURED:
+///
+/// ```text
+/// HexFormat.of() == HexFormat.of()                          true
+/// HexFormat.of().withUpperCase() == of().withUpperCase()    true    (HEX_UPPER_FORMAT)
+/// ```
+///
+/// A factory that fabricates a fresh receiver per call fails an identity
+/// comparison and NOTHING else, which is exactly how the `Base64` factories
+/// failed (E14-1). The cache lives in the class's OWN static field, not in a
+/// Rust-side `OnceLock`: a static is a GC root, so the reference stays valid
+/// across a moving collection, and it is per-VM rather than per-process.
+///
+/// Degrades to the old fabricate-every-time behaviour when the field cannot be
+/// resolved — a synthetic stub that does not declare `HEX_FORMAT` answers
+/// `None` here and nothing changes for it.
+///
+/// RESIDUAL, measured and left: `HEX_UPPER_FORMAT` is a singleton too, so
+/// `of().withUpperCase() == of().withUpperCase()` is `true` on HotSpot and
+/// `false` here. `withUpperCase` is not a factory the fixture compares by
+/// identity and no caller in this tree depends on it; the row is recorded
+/// rather than fixed, so this file keeps ONE cached instance and not two
+/// interacting ones.
+const P64_HF_SINGLETON: &str = "HEX_FORMAT";
+
+fn p64_hf_static_slot(ctx: &dyn NativeContext, field: &str) -> Option<(ClassId, usize)> {
+    let cid = ctx.class_id_by_name("java/util/HexFormat")?;
+    let idx = ctx.static_field_index_by_name(cid, field)?;
+    Some((cid, idx))
+}
+
+/// The cached instance, if one has been minted (by `<clinit>` or by an earlier
+/// call) and it carries the four settings this family reads.
+fn p64_hf_cached(ctx: &dyn NativeContext, field: &str) -> Option<ObjectRef> {
+    let (cid, idx) = p64_hf_static_slot(ctx, field)?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(r)) if ctx.object_num_fields(r) >= P64_HF_SLOTS => Some(r),
+        _ => None,
+    }
+}
+
+fn p64_hf_cache(ctx: &mut dyn NativeContext, field: &str, obj: ObjectRef) {
+    if let Some((cid, idx)) = p64_hf_static_slot(ctx, field) {
+        ctx.set_static_field(cid, idx, Value::Object(Some(obj)));
+    }
+}
+
+/// Mint a `HexFormat` carrying the four settings.
+fn p64_hex_new(
+    ctx: &mut dyn NativeContext,
+    cfg: &P64HexCfg,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", P64_HF_SLOTS)?;
+    let d = ctx.create_string(&cfg.delimiter);
+    ctx.set_field(obj, P64_HF_DELIMITER, Value::Object(Some(d)));
+    let p = ctx.create_string(&cfg.prefix);
+    ctx.set_field(obj, P64_HF_PREFIX, Value::Object(Some(p)));
+    let s = ctx.create_string(&cfg.suffix);
+    ctx.set_field(obj, P64_HF_SUFFIX, Value::Object(Some(s)));
+    ctx.set_field(obj, P64_HF_UCASE, Value::Int(i32::from(cfg.ucase)));
+    Ok(obj)
+}
+
+/// `Objects.requireNonNull(arg, name)` — `HexFormat.withDelimiter(null)` throws
+/// `NullPointerException: delimiter` on HotSpot, measured.
+fn p64_hf_required_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    name: &'static str,
+) -> Result<String, MethodCallFailed> {
+    match args.get(1) {
+        Some(Value::Object(Some(r))) => Ok(ctx.read_string(*r).unwrap_or_default()),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(name.to_string()),
+        }
+        .into()),
+    }
+}
+
+fn p64_hex_digits(ucase: bool) -> &'static [u8; 16] {
+    if ucase {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    }
+}
+
+fn p64_push_byte(out: &mut String, b: u8, ucase: bool) {
+    let d = p64_hex_digits(ucase);
+    out.push(d[(b >> 4) as usize] as char);
+    out.push(d[(b & 0x0f) as usize] as char);
+}
+
+/// `HexFormat.isHexDigit(int ch)` accepts ONLY ASCII `0-9 a-f A-F`.
+///
+/// The old body did `*v as u8 as char`, truncating the code point to its low
+/// byte: `isHexDigit(0x661)` (ARABIC-INDIC DIGIT ONE) became `0x61` = `'a'` and
+/// answered `true`. HotSpot answers `false` — measured.
+fn p64_is_hex_digit(ch: i32) -> bool {
+    matches!(ch, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66)
+}
+
+/// Digit value, or HotSpot's `NumberFormatException: not a hexadecimal digit:
+/// "g" = 103` (the trailing number is the code point, measured).
+///
+/// The argument is ONE UTF-16 CODE UNIT, not a Rust `char`. Every method in
+/// this family walks `CharSequence.charAt` / `char[]`, so a surrogate PAIR is
+/// two failing digits, not one astral code point, and the reported number is
+/// the unit's own value. MEASURED on 25.0.3+9 (`scratchpad/f2/HexProbe.java`):
+///
+/// ```text
+/// of().parseHex("𐐷")  !! NumberFormatException: not a hexadecimal digit: "?" = 55297
+/// of().parseHex("\uD801")        !! IllegalArgumentException: string length not even: 1
+/// of().parseHex("١١")  !! NumberFormatException: not a hexadecimal digit: "?" = 1633
+/// ```
+///
+/// 55297 is the high surrogate `\uD801`, not the pair's code point 66615, and
+/// the odd-length row counts the lone surrogate as ONE character — both of
+/// which a `Vec<char>` reader gets wrong, because it fuses the pair into a
+/// single `char` and shortens the sequence by one.
+///
+/// RESIDUAL: a Rust `String` cannot hold a lone surrogate, so the quoted
+/// character is rendered U+FFFD where HotSpot emits the raw unit (which prints
+/// as `?` on a console anyway). The code point — the comparable part — is
+/// exact.
+fn p64_hex_digit_value(unit: u16) -> Result<u32, MethodCallFailed> {
+    let cp = i32::from(unit);
+    if p64_is_hex_digit(cp) {
+        // `p64_is_hex_digit` admitted only ASCII `0-9 a-f A-F`, so both
+        // conversions below are total for every value that reaches here.
+        Ok(char::from_u32(u32::from(unit))
+            .and_then(|c| c.to_digit(16))
+            .unwrap_or(0))
+    } else {
+        Err(RuntimeError::NumberFormatException {
+            message: format!(
+                "not a hexadecimal digit: \"{}\" = {cp}",
+                char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')
+            ),
+        }
+        .into())
+    }
+}
+
+/// `Objects.checkFromToIndex(fromIndex, toIndex, length)` — the bounds test
+/// every ranged `HexFormat` method opens with, and HotSpot's exact wording.
+///
+/// MEASURED (`scratchpad/f2/HexProbe.java`), on a length-4 operand:
+///
+/// ```text
+/// parseHex(x, 3, 1)   !! IndexOutOfBoundsException: Range [3, 1) out of bounds for length 4
+/// parseHex(x, -1, 2)  !! IndexOutOfBoundsException: Range [-1, 2) out of bounds for length 4
+/// parseHex(x, 0, 9)   !! IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4
+/// parseHex(x, 4, 4)    = []        <- an EMPTY range at the very end is legal
+/// ```
+///
+/// Note that the third failure class is reached only after this one passes:
+/// `parseHex(x, 1, 4)` is `IllegalArgumentException: string length not even: 3`
+/// — the length in that message is the RANGE's, not the operand's.
+fn p64_hf_check_from_to(from: i32, to: i32, length: usize) -> Result<(), MethodCallFailed> {
+    if from < 0 || to < from || i64::from(to) > length as i64 {
+        return Err(RuntimeError::ioobe(format!(
+            "Range [{from}, {to}) out of bounds for length {length}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// The UTF-16 code units of a `CharSequence` argument.
+///
+/// `NativeContext::read_string` answers `None` for anything that is not a real
+/// `java.lang.String`, and the old readers all spelled that
+/// `.unwrap_or_default()` — so every non-`String` `CharSequence` parsed as the
+/// EMPTY sequence and `parseHex` handed back a zero-length array, silently.
+/// That is not a hypothetical receiver: `parseHex(char[], int, int)` is
+/// specified as `parseHex(CharBuffer.wrap(chars, fromIndex, toIndex -
+/// fromIndex))`, so the JDK's own bytecode arrives here holding a `CharBuffer`.
+///
+/// `charset_buffers::read_wrapped_char_sequence` is the reader this family was
+/// missing and it already exists — it falls back to the receiver's own
+/// `toString()` for `CharBuffer`, `StringBuilder` and any application type.
+fn p64_hf_seq_units(ctx: &mut dyn NativeContext, seq: ObjectRef) -> Vec<u16> {
+    if ctx.read_string(seq).is_some() {
+        // A real String: read it losslessly, without a UTF-8 round trip that
+        // would fold an unpaired surrogate into U+FFFD before it can be
+        // reported as the digit that failed.
+        return crate::lang_string::read_string_chars(ctx, seq);
+    }
+    charset_buffers::read_wrapped_char_sequence(ctx, seq)
+        .encode_utf16()
+        .collect()
+}
+
+/// The units of a `char[]` argument. The elements are `Value::Int`, one UTF-16
+/// unit each.
+fn p64_hf_char_array_units(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u16> {
+    let len = ctx.array_length(arr);
+    (0..len)
+        .map(|i| match ctx.get_array_element(arr, i) {
+            Value::Int(v) => v as u16,
+            _ => 0,
+        })
+        .collect()
+}
 
 pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -4159,11 +4523,21 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let hf = "java/util/HexFormat";
 
     r.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
-        let empty = ctx.create_string("");
-        ctx.set_field(obj, 0, Value::Object(Some(empty))); // delimiter
-        let empty2 = ctx.create_string("");
-        ctx.set_field(obj, 1, Value::Object(Some(empty2))); // prefix
+        // `of()` is `return HEX_FORMAT;` — a SINGLETON, measured. See
+        // `p64_hf_cached`.
+        if let Some(obj) = p64_hf_cached(ctx, P64_HF_SINGLETON) {
+            return Ok(Some(Value::Object(Some(obj))));
+        }
+        let obj = p64_hex_new(
+            ctx,
+            &P64HexCfg {
+                delimiter: String::new(),
+                prefix: String::new(),
+                suffix: String::new(),
+                ucase: false,
+            },
+        )?;
+        p64_hf_cache(ctx, P64_HF_SINGLETON, obj);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(
@@ -4171,10 +4545,25 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "ofDelimiter",
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            let empty = ctx.create_string("");
-            ctx.set_field(obj, 1, Value::Object(Some(empty)));
+            // STATIC: the delimiter is args[0], not args[1].
+            let delimiter = match args.first() {
+                Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("delimiter".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let obj = p64_hex_new(
+                ctx,
+                &P64HexCfg {
+                    delimiter,
+                    prefix: String::new(),
+                    suffix: String::new(),
+                    ucase: false,
+                },
+            )?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4196,44 +4585,91 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)[B",
         native_p64_parse_hex,
     );
+    r.register(
+        hf,
+        "parseHex",
+        "(Ljava/lang/CharSequence;)[B",
+        native_p64_parse_hex,
+    );
+    // The two RANGED overloads. Neither was registered, and in real-JDK mode
+    // that was not a `NoSuchMethodError` but something quieter: the JDK's own
+    // `parseHex(char[], int, int)` bytecode ran, wrapped the array in a
+    // `CharBuffer`, and handed it to the one-argument native above — which
+    // read a non-`String` `CharSequence` as the empty string. `parseHex(chars,
+    // 1, 5)` therefore answered `[]` instead of `[0, -1]`, with no exception
+    // anywhere. See `native_p64_parse_hex_chars`.
+    r.register(
+        hf,
+        "parseHex",
+        "(Ljava/lang/CharSequence;II)[B",
+        native_p64_parse_hex_range,
+    );
+    r.register(hf, "parseHex", "([CII)[B", native_p64_parse_hex_chars);
     r.register(hf, "toHexDigits", "(B)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
         let b = match args.get(1) {
             Some(Value::Int(v)) => *v as u8,
             _ => 0,
         };
-        let s = format!("{:02x}", b);
-        let obj = ctx.create_string(&s);
+        let mut out = String::with_capacity(2);
+        p64_push_byte(&mut out, b, ucase);
+        let obj = ctx.create_string(&out);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(hf, "toHexDigits", "(I)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
         let v = match args.get(1) {
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        let s = format!("{:08x}", v);
-        let obj = ctx.create_string(&s);
+        let mut out = String::with_capacity(8);
+        for shift in (0..4).rev() {
+            p64_push_byte(&mut out, (v >> (shift * 8)) as u8, ucase);
+        }
+        let obj = ctx.create_string(&out);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(hf, "toHexDigits", "(J)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
         let v = match args.get(1) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let s = format!("{:016x}", v);
-        let obj = ctx.create_string(&s);
+        let mut out = String::with_capacity(16);
+        for shift in (0..8).rev() {
+            p64_push_byte(&mut out, (v >> (shift * 8)) as u8, ucase);
+        }
+        let obj = ctx.create_string(&out);
         Ok(Some(Value::Object(Some(obj))))
     });
+    // STATIC methods: the CharSequence is args[0].
+    //
+    // Both used to be `from_str_radix(s.trim(), 16).unwrap_or(0)`, which is
+    // three divergences in one line: `trim()` accepted `" ff "` where HotSpot
+    // throws `NumberFormatException: not a hexadecimal digit: " " = 32`;
+    // `unwrap_or(0)` turned every malformed input into the answer `0`; and an
+    // over-long string silently wrapped where HotSpot throws
+    // `IllegalArgumentException: string length greater than 8: 9`.
     r.register(
         hf,
         "fromHexDigits",
         "(Ljava/lang/CharSequence;)I",
         |ctx, args| {
-            let s = match args.get(1) {
-                Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let val = i64::from_str_radix(s.trim(), 16).unwrap_or(0) as i32;
-            Ok(Some(Value::Int(val)))
+            let chars = p64_hf_digits_arg(ctx, args)?;
+            if chars.len() > 8 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("string length greater than 8: {}", chars.len()),
+                }
+                .into());
+            }
+            let mut acc: u32 = 0;
+            for ch in chars {
+                acc = (acc << 4) | p64_hex_digit_value(ch)?;
+            }
+            Ok(Some(Value::Int(acc as i32)))
         },
     );
     r.register(
@@ -4241,119 +4677,517 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "fromHexDigitsToLong",
         "(Ljava/lang/CharSequence;)J",
         |ctx, args| {
-            let s = match args.get(1) {
-                Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let val = u64::from_str_radix(s.trim(), 16).unwrap_or(0) as i64;
-            Ok(Some(Value::Long(val)))
+            let chars = p64_hf_digits_arg(ctx, args)?;
+            if chars.len() > 16 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("string length greater than 16: {}", chars.len()),
+                }
+                .into());
+            }
+            let mut acc: u64 = 0;
+            for ch in chars {
+                acc = (acc << 4) | u64::from(p64_hex_digit_value(ch)?);
+            }
+            Ok(Some(Value::Long(acc as i64)))
+        },
+    );
+    // The RANGED twins of the two above. In real-JDK mode they were served by
+    // the JDK's own bytecode and were correct; in synthetic-jdk mode there is
+    // no bytecode to fall through to, so half of one family was registered —
+    // the shape that has cost this tree a dozen defects. Both are the JDK's
+    // `checkFromToIndex` then `checkDigitCount` (`HexFormat.java:863-869` and
+    // `:977-986`), in that order.
+    r.register(
+        hf,
+        "fromHexDigits",
+        "(Ljava/lang/CharSequence;II)I",
+        |ctx, args| {
+            let units = p64_hf_range_digits(ctx, args, 8)?;
+            let mut acc: u32 = 0;
+            for u in units {
+                acc = (acc << 4) | p64_hex_digit_value(u)?;
+            }
+            Ok(Some(Value::Int(acc as i32)))
+        },
+    );
+    r.register(
+        hf,
+        "fromHexDigitsToLong",
+        "(Ljava/lang/CharSequence;II)J",
+        |ctx, args| {
+            let units = p64_hf_range_digits(ctx, args, 16)?;
+            let mut acc: u64 = 0;
+            for u in units {
+                acc = (acc << 4) | u64::from(p64_hex_digit_value(u)?);
+            }
+            Ok(Some(Value::Long(acc as i64)))
         },
     );
     r.register(hf, "isHexDigit", "(I)Z", |_ctx, args| {
         let ch = match args.first() {
-            Some(Value::Int(v)) => *v as u8 as char,
-            _ => '\0',
+            Some(Value::Int(v)) => *v,
+            _ => -1,
         };
-        Ok(Some(Value::Int(if ch.is_ascii_hexdigit() { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(p64_is_hex_digit(ch)))))
     });
     r.register(hf, "delimiter", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let s = p64_hf_string(ctx, this, P64_HF_DELIMITER);
+        let obj = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(obj))))
     });
     r.register(hf, "prefix", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        let s = p64_hf_string(ctx, this, P64_HF_PREFIX);
+        let obj = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(obj))))
     });
-    r.register(hf, "toString", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("HexFormat");
+    r.register(hf, "suffix", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = p64_hf_string(ctx, this, P64_HF_SUFFIX);
+        let obj = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(obj))))
+    });
+    r.register(hf, "isUpperCase", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
+        Ok(Some(Value::Int(i32::from(ucase))))
+    });
+    r.register(hf, "toString", "()Ljava/lang/String;", |ctx, args| {
+        // HotSpot 25.0.3+9, measured:
+        //   uppercase: true, delimiter: "", prefix: "", suffix: ""
+        let this = obj_arg(args, 0)?;
+        let cfg = p64_hex_cfg(ctx, this);
+        let text = format!(
+            "uppercase: {}, delimiter: \"{}\", prefix: \"{}\", suffix: \"{}\"",
+            cfg.ucase, cfg.delimiter, cfg.prefix, cfg.suffix
+        );
+        let s = ctx.create_string(&text);
         Ok(Some(Value::Object(Some(s))))
     });
+    r.register(
+        hf,
+        "withDelimiter",
+        "(Ljava/lang/String;)Ljava/util/HexFormat;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let delimiter = p64_hf_required_string(ctx, args, "delimiter")?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.delimiter = delimiter;
+            let obj = p64_hex_new(ctx, &cfg)?;
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(
         hf,
         "withPrefix",
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
-            ctx.set_field(obj, 0, ctx.get_field(this, 0)); // keep delimiter
-            ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let prefix = p64_hf_required_string(ctx, args, "prefix")?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.prefix = prefix;
+            let obj = p64_hex_new(ctx, &cfg)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(
         hf,
-        "withUpperCase",
-        "()Ljava/util/HexFormat;",
-        |_ctx, args| {
-            // Simplified: return self (real impl would flag uppercase)
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        "withSuffix",
+        "(Ljava/lang/String;)Ljava/util/HexFormat;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let suffix = p64_hf_required_string(ctx, args, "suffix")?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.suffix = suffix;
+            let obj = p64_hex_new(ctx, &cfg)?;
+            Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.register(hf, "withUpperCase", "()Ljava/util/HexFormat;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mut cfg = p64_hex_cfg(ctx, this);
+        cfg.ucase = true;
+        let obj = p64_hex_new(ctx, &cfg)?;
+        Ok(Some(Value::Object(Some(obj))))
+    });
+    r.register(hf, "withLowerCase", "()Ljava/util/HexFormat;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mut cfg = p64_hex_cfg(ctx, this);
+        cfg.ucase = false;
+        let obj = p64_hex_new(ctx, &cfg)?;
+        Ok(Some(Value::Object(Some(obj))))
+    });
     r.set_category(__prev_cat);
 }
 
-fn native_p64_format_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
+/// The `CharSequence` argument of the two one-argument STATIC `fromHexDigits`
+/// forms, as UTF-16 code units. `null` is HotSpot's
+/// `NullPointerException: Cannot invoke "java.lang.CharSequence.length()"
+/// because "string" is null` — measured. (The RANGED forms name the parameter
+/// instead, because they open with an explicit `Objects.requireNonNull`; see
+/// `p64_hf_range_digits`.)
+fn p64_hf_digits_arg(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Vec<u16>, MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(r))) => Ok(p64_hf_seq_units(ctx, *r)),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.lang.CharSequence.length()\" because \"string\" is null"
+                    .to_string(),
+            ),
+        }
+        .into()),
+    }
+}
+
+/// The `(CharSequence, fromIndex, toIndex)` argument triple of the two ranged
+/// STATIC digit readers, checked in the JDK's order: null, then range, then
+/// digit count.
+///
+/// `limit` is 8 for `fromHexDigits` and 16 for `fromHexDigitsToLong`, and the
+/// message quotes the RANGE's length, not the sequence's —
+/// `checkDigitCount(fromIndex, toIndex, limit)`, `HexFormat.java:863-869`.
+fn p64_hf_range_digits(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    limit: usize,
+) -> Result<Vec<u16>, MethodCallFailed> {
+    let units = match args.first() {
+        Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
         _ => {
-            let s = ctx.create_string("");
-            return Ok(Some(Value::Object(Some(s))));
+            return Err(RuntimeError::NullPointerException {
+                message: Some("string".to_string()),
+            }
+            .into())
         }
     };
-    let len = ctx.array_length(arr);
-    let mut hex = String::with_capacity(len * 2);
-    for i in 0..len {
+    let from = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let to = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    p64_hf_check_from_to(from, to, units.len())?;
+    let slice = &units[from as usize..to as usize];
+    if slice.len() > limit {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("string length greater than {limit}: {}", slice.len()),
+        }
+        .into());
+    }
+    Ok(slice.to_vec())
+}
+
+/// The shared body of both `formatHex` forms: the READER the family was
+/// missing.
+///
+/// Shape, verified against HotSpot 25.0.3+9 with `{00, FF, 0A, 80}`:
+///
+/// ```text
+/// of()                                      00ff0a80
+/// of().withUpperCase()                      00FF0A80
+/// ofDelimiter(":")                          00:ff:0a:80
+/// of().withPrefix("0x")                     0x000xff0x0a0x80
+/// of().withSuffix(";")                      00;ff;0a;80;
+/// ofDelimiter(", ").withPrefix("0x")
+///        .withSuffix("!").withUpperCase()   0x00!, 0xFF!, 0x0A!, 0x80!
+/// ```
+///
+/// i.e. each byte is `prefix + 2 digits + suffix` and the DELIMITER goes
+/// between elements only — a suffix trails the last element, a delimiter does
+/// not.
+fn p64_format_hex_impl(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    arr: ObjectRef,
+    from: usize,
+    to: usize,
+) -> MethodCallResult {
+    let cfg = p64_hex_cfg(ctx, this);
+    let mut out = String::with_capacity((to - from) * (2 + cfg.prefix.len() + cfg.suffix.len()));
+    for i in from..to {
+        if i > from {
+            out.push_str(&cfg.delimiter);
+        }
+        out.push_str(&cfg.prefix);
         let b = match ctx.get_array_element(arr, i) {
             Value::Int(v) => v as u8,
             _ => 0,
         };
-        hex.push_str(&format!("{:02x}", b));
+        p64_push_byte(&mut out, b, cfg.ucase);
+        out.push_str(&cfg.suffix);
     }
-    let s = ctx.create_string(&hex);
+    let s = ctx.create_string(&out);
     Ok(Some(Value::Object(Some(s))))
+}
+
+/// `formatHex(byte[])`'s null contract: HotSpot throws
+/// `NullPointerException: Cannot read the array length because "bytes" is null`
+/// (measured). The old body answered `""`.
+fn p64_hf_bytes_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    match args.get(1) {
+        Some(Value::Object(Some(a))) => Ok(*a),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot read the array length because \"bytes\" is null".to_string(),
+            ),
+        }
+        .into()),
+    }
+}
+
+fn native_p64_format_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let arr = p64_hf_bytes_arg(args)?;
+    let len = ctx.array_length(arr);
+    p64_format_hex_impl(ctx, this, arr, 0, len)
 }
 
 fn native_p64_format_hex_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => {
-            let s = ctx.create_string("");
-            return Ok(Some(Value::Object(Some(s))));
-        }
-    };
+    let this = obj_arg(args, 0)?;
+    let arr = p64_hf_bytes_arg(args)?;
+    let len = ctx.array_length(arr);
     let from = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let to = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let mut hex = String::with_capacity((to - from) * 2);
-    for i in from..to {
-        let b = match ctx.get_array_element(arr, i) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-        hex.push_str(&format!("{:02x}", b));
+    // `Objects.checkFromToIndex` — HotSpot's exact wording, measured:
+    //   Range [0, 9) out of bounds for length 4
+    //   Range [3, 1) out of bounds for length 4     (from > to)
+    // The old body widened both to `usize` and then computed `to - from`,
+    // so a reversed or negative range was an arithmetic overflow panic
+    // before it could be an exception.
+    if from < 0 || to < from || (to as i64) > len as i64 {
+        return Err(RuntimeError::ioobe(format!(
+            "Range [{from}, {to}) out of bounds for length {len}"
+        ))
+        .into());
     }
-    let s = ctx.create_string(&hex);
-    Ok(Some(Value::Object(Some(s))))
+    p64_format_hex_impl(ctx, this, arr, from as usize, to as usize)
 }
 
+/// `parseHex` — the inverse of `formatHex`, and it must honour the same
+/// configuration.
+///
+/// Measured on HotSpot 25.0.3+9:
+///
+/// ```text
+/// of().parseHex("00ff0a80")            [0, -1, 10, -128]
+/// of().parseHex("abc")                 IllegalArgumentException: string length not even: 3
+/// of().parseHex("0g")                  NumberFormatException: not a hexadecimal digit: "g" = 103
+/// ofDelimiter(":").parseHex("00:ff")   [0, -1]
+/// ofDelimiter(":").parseHex("00ff")    IllegalArgumentException: extra or missing delimiters
+///                                        or values consisting of prefix, two hexadecimal
+///                                        digits, and suffix
+/// of().parseHex(null)                  NullPointerException
+/// ```
+///
+/// The old body was `hex_str.len()/2` pairs sliced out of the Rust `String` by
+/// BYTE index with `unwrap_or(0)` on each — it accepted odd lengths by
+/// truncating, answered `0` for every bad digit, ignored the delimiter, and
+/// PANICKED on any non-ASCII input.
 fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let hex_str = match args.get(1) {
-        Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-        _ => String::new(),
+    let this = obj_arg(args, 0)?;
+    let cfg = p64_hex_cfg(ctx, this);
+    let units = match args.get(1) {
+        Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"java.lang.CharSequence.length()\" because \"string\" is null"
+                        .to_string(),
+                ),
+            }
+            .into())
+        }
     };
-    let bytes_len = hex_str.len() / 2;
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes_len);
-    for i in 0..bytes_len {
-        let byte_str = &hex_str[i * 2..i * 2 + 2];
-        let b = u8::from_str_radix(byte_str, 16).unwrap_or(0);
-        ctx.set_array_element(arr, i, Value::Int(b as i32));
+    p64_parse_hex_answer(ctx, &cfg, &units)
+}
+
+/// `parseHex(CharSequence string, int fromIndex, int toIndex)`.
+///
+/// The range is in UTF-16 CODE UNITS (`string.length()`'s unit), it is
+/// half-open, and the null check comes FIRST — MEASURED
+/// (`scratchpad/f2/HexProbe.java`):
+///
+/// ```text
+/// of().parseHex("00ff0a80", 2, 6)            = [-1, 10]
+/// of().parseHex("00ff", 4, 4)                = []
+/// of().parseHex("00ff", 1, 4)               !! IllegalArgumentException: string length not even: 3
+/// of().parseHex("00ff", 0, 9)               !! IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4
+/// of().parseHex((CharSequence) null, -1, 9) !! NullPointerException: string
+/// ```
+///
+/// The last row is why the order is load-bearing: a null operand with an
+/// out-of-range pair reports the NULL, not the range. Note also that the
+/// `null` MESSAGE differs between the two overloads — the one-argument form is
+/// `Objects.requireNonNull`-free and fails inside `string.length()`, so it
+/// carries the helpful-NPE text, while this one names the parameter.
+fn native_p64_parse_hex_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cfg = p64_hex_cfg(ctx, this);
+    let units = match args.get(1) {
+        Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("string".to_string()),
+            }
+            .into())
+        }
+    };
+    p64_parse_hex_slice(ctx, &cfg, &units, args, 2)
+}
+
+/// `parseHex(char[] chars, int fromIndex, int toIndex)`.
+///
+/// The JDK spells this `parseHex(CharBuffer.wrap(chars, fromIndex, toIndex -
+/// fromIndex))` (JDK 25 `HexFormat.java:577-582`), and the parameters are a
+/// half-open index PAIR despite the class javadoc calling them
+/// "offset, length" at line 79. MEASURED:
+///
+/// ```text
+/// of().parseHex("x00ff0a80".toCharArray(), 1, 5)   = [0, -1]
+/// of().parseHex(chars4, 3, 1)   !! IndexOutOfBoundsException: Range [3, 1) out of bounds for length 4
+/// of().parseHex((char[]) null, 0, 0)  !! NullPointerException: chars
+/// ```
+///
+/// Registering it is what stops the JDK's `CharBuffer` from arriving at the
+/// one-argument native, which read it through `read_string` — `None` for a
+/// non-`String` — and answered the EMPTY array for every range.
+fn native_p64_parse_hex_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cfg = p64_hex_cfg(ctx, this);
+    let units = match args.get(1) {
+        Some(Value::Object(Some(r))) => p64_hf_char_array_units(ctx, *r),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("chars".to_string()),
+            }
+            .into())
+        }
+    };
+    p64_parse_hex_slice(ctx, &cfg, &units, args, 2)
+}
+
+/// The shared tail of both ranged overloads: bounds-check, slice, parse.
+fn p64_parse_hex_slice(
+    ctx: &mut dyn NativeContext,
+    cfg: &P64HexCfg,
+    units: &[u16],
+    args: &[Value],
+    first: usize,
+) -> MethodCallResult {
+    let from = match args.get(first) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let to = match args.get(first + 1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    p64_hf_check_from_to(from, to, units.len())?;
+    p64_parse_hex_answer(ctx, cfg, &units[from as usize..to as usize])
+}
+
+/// Parse `units` under the receiver's configuration and box the result.
+///
+/// GC-SAFETY: the caller reads the configuration off the receiver BEFORE it
+/// reads the sequence, because `p64_hf_seq_units` can call back into Java
+/// (`CharBuffer.toString()`) and a collection there may move the receiver —
+/// which would leave the `this` handle in `args[0]` stale. `P64HexCfg` is
+/// Rust-owned, so once it is read nothing on the Java heap is held across the
+/// re-entry.
+fn p64_parse_hex_answer(
+    ctx: &mut dyn NativeContext,
+    cfg: &P64HexCfg,
+    units: &[u16],
+) -> MethodCallResult {
+    let bytes = p64_parse_hex_chars(units, cfg)?;
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(i32::from(*b as i8)));
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+const P64_HF_STRIDE_ERR: &str = "extra or missing delimiters or values consisting of prefix, \
+     two hexadecimal digits, and suffix";
+
+fn p64_parse_hex_chars(chars: &[u16], cfg: &P64HexCfg) -> Result<Vec<u8>, MethodCallFailed> {
+    let pre: Vec<u16> = cfg.prefix.encode_utf16().collect();
+    let suf: Vec<u16> = cfg.suffix.encode_utf16().collect();
+    let del: Vec<u16> = cfg.delimiter.encode_utf16().collect();
+
+    if pre.is_empty() && suf.is_empty() && del.is_empty() {
+        if chars.len() % 2 != 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("string length not even: {}", chars.len()),
+            }
+            .into());
+        }
+        let mut out = Vec::with_capacity(chars.len() / 2);
+        for pair in chars.chunks(2) {
+            let hi = p64_hex_digit_value(pair[0])?;
+            let lo = p64_hex_digit_value(pair[1])?;
+            out.push(((hi << 4) | lo) as u8);
+        }
+        return Ok(out);
+    }
+
+    if chars.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One element is prefix + 2 digits + suffix; elements are joined by the
+    // delimiter, so the whole string is `n*stride - delimiter` characters.
+    let stride = pre.len() + 2 + suf.len() + del.len();
+    if (chars.len() + del.len()) % stride != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: P64_HF_STRIDE_ERR.to_string(),
+        }
+        .into());
+    }
+    let count = (chars.len() + del.len()) / stride;
+    let mut out = Vec::with_capacity(count);
+    let mut at = 0usize;
+    for i in 0..count {
+        if i > 0 {
+            if chars[at..at + del.len()] != del[..] {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: P64_HF_STRIDE_ERR.to_string(),
+                }
+                .into());
+            }
+            at += del.len();
+        }
+        if chars[at..at + pre.len()] != pre[..] {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: P64_HF_STRIDE_ERR.to_string(),
+            }
+            .into());
+        }
+        at += pre.len();
+        let hi = p64_hex_digit_value(chars[at])?;
+        let lo = p64_hex_digit_value(chars[at + 1])?;
+        out.push(((hi << 4) | lo) as u8);
+        at += 2;
+        if chars[at..at + suf.len()] != suf[..] {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: P64_HF_STRIDE_ERR.to_string(),
+            }
+            .into());
+        }
+        at += suf.len();
+    }
+    Ok(out)
 }
 
 
@@ -4365,43 +5199,89 @@ fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // Register for Random (already exists) and ThreadLocalRandom
 // =============================================================================
 
+/// The SIX `java/util/random/RandomGenerator` registrations that used to open
+/// this function — `nextInt()I`, `nextInt(I)I`, `nextLong()J`, `nextDouble()D`,
+/// `nextFloat()F`, `nextBoolean()Z` — were DELETED 2026-08-13 (lane F15).
+/// They are not moved, not renamed and not conditional: they are gone, and the
+/// reachability argument that says nothing loses an answer is here so the next
+/// reader does not re-add them on the strength of `Random implements
+/// RandomGenerator`.
+///
+/// **They were dead, and they were dead-wrong, which is the order that matters:
+/// a registration nothing can reach is a registration whose wrongness is
+/// invisible.** All six were backed by `p64_simple_random()`, which takes no
+/// receiver — so any seeded `Random`/`SplittableRandom` that had ever reached
+/// them would have had its whole stream silently replaced by an unrelated
+/// xorshift, and `nextInt(I)`'s body divided by `bound as u64` with **no
+/// guard**: `bound == 0` is a Rust integer divide-by-zero, i.e. a PANIC that
+/// kills the VM, where HotSpot 25.0.3+9 raises
+/// `IllegalArgumentException: bound must be positive` (measured on this host
+/// for `Random`, `ThreadLocalRandom` and `SplittableRandom` alike). A negative
+/// bound did not panic; it sign-extended into a huge modulus and returned
+/// garbage. The `ThreadLocalRandom` sibling below carries the identical final
+/// expression WITH a `bound <= 0` guard — one rule, two copies, disagreeing.
+///
+/// **Which mode this registrar even runs in — check this FIRST, it shortens
+/// every other argument.** `register_p64_random_generator` is reached only
+/// through `register_phase64_natives`, whose sole caller is
+/// `lib.rs::register_synthetic_overrides` — which is `#[cfg(feature =
+/// "synthetic-jdk")]` and is called only from `register_builtins`, i.e. the
+/// synthetic path. `vm/src/vm/vm_init.rs`'s real-JDK arms say so in as many
+/// words ("the phase bundles are synthetic-only") and hand-register the
+/// handful of phase natives they actually want. So in `--real-jdk` and
+/// `--jdk-only` these six rows were never registered at all, and everything
+/// below is about the one mode where they were.
+///
+/// **Why no receiver reaches them THERE either.** Three facts, each checked in
+/// the tree rather than taken from the nominating lane (NOM F12-3). Facts 1–2
+/// are stated for the real-JDK shape as well, because that is the shape a
+/// reader will reason about when tempted to re-add these:
+///
+/// 1. The registry has no hierarchy of its own. `NativeMethodRegistry
+///    ::resolve_id` (`native-api/src/registry.rs`) is a digest probe plus a
+///    re-check of all three strings; its only fallback,
+///    `resolve_id_with_descriptor_quirks`, rewrites the DESCRIPTOR. No
+///    superclass walk, no superinterface walk. So the question is entirely
+///    which class name the interpreter hands it.
+/// 2. The interpreter hands it the RESOLVED DECLARING class
+///    (`vm/src/runtime/interpreter/invoke.rs`, "look up in the registry by
+///    declaring class"; the second site takes `class_name_arc` from
+///    `cm.get_class(declaring_id)`, not from the constant pool), and
+///    `find_method_recursive` (`classloading/src/class.rs`) returns on the
+///    first CONCRETE superclass-chain match, entering its interface BFS only
+///    when there is none. `javap -p java.util.Random` on JDK 25 declares all
+///    six concretely, so Phase 1 answers `java/util/Random` and
+///    `securerandom.rs`'s registration wins. In synthetic-JDK mode
+///    `class_manager.rs`'s `"java/util/Random" => instance_fields(2)` has no
+///    `implements` clause at all, so the interface is not even in the
+///    hierarchy.
+/// 3. **There IS an interface-name native fallback, and it still cannot fire
+///    here.** F12's "nothing dispatches on interface names" is too strong:
+///    `vm/src/vm/vm_exec.rs`'s slow dispatch path ends with a *"fall back to a
+///    native registered on any interface name (legacy behavior)"* loop over the
+///    receiver's transitive superinterface closure. It is reached only after
+///    the concrete-chain lookup has already failed, and it is preceded by a
+///    first pass that PREFERS a non-abstract interface default. `javap -p
+///    java.util.random.RandomGenerator` shows `nextLong()J` is the interface's
+///    ONLY abstract method — every legal implementor must therefore declare it
+///    concretely — and the other five are `default`, so that first pass routes
+///    them to the JDK's own bytecode before the native loop is consulted.
+///    Both gates would have to fail at once, and each closes the other's case.
+///
+/// Deleting rather than guarding is the right end state. Guarding the divide
+/// would have kept six receiver-ignoring bodies alive under a `Bridge` tag,
+/// which is the tag `--jdk-only` does NOT drop — so the day something did
+/// reach them, in whichever mode, a fabricated PRNG would have been served in
+/// silence rather than refused. `java/util/random/RandomGenerator` now occurs
+/// nowhere in this repository outside the JDK jars.
+///
+/// Ratchet: −6 `Bridge` registrations, all of them on the synthetic-mode
+/// total; the `--jdk-only`/strict total is unchanged because they were never
+/// in it. See
+/// docs/known-issues/jdk-only/F15-1-two-registrars-that-no-bytecode-can-name-20260813.md
 pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // RandomGenerator interface methods
-    let rg = "java/util/random/RandomGenerator";
-    r.register(rg, "nextInt", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(p64_simple_random() as i32)))
-    });
-    r.register(rg, "nextInt", "(I)I", |_ctx, args| {
-        let bound = match args.get(1) {
-            Some(Value::Int(v)) => *v,
-            _ => 1,
-        };
-        Ok(Some(Value::Int(
-            ((p64_simple_random() as i64).unsigned_abs() % (bound as u64)) as i32,
-        )))
-    });
-    r.register(rg, "nextLong", "()J", |_ctx, _args| {
-        let hi = (p64_simple_random() as i64) << 32;
-        let lo = p64_simple_random() as i64 & 0xFFFF_FFFF;
-        Ok(Some(Value::Long(hi | lo)))
-    });
-    r.register(rg, "nextDouble", "()D", |_ctx, _args| {
-        let v = (p64_simple_random() & 0x001F_FFFF_FFFF_FFFF) as f64 / (1u64 << 53) as f64;
-        Ok(Some(Value::Double(v)))
-    });
-    r.register(rg, "nextFloat", "()F", |_ctx, _args| {
-        let v = (p64_simple_random() as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
-        Ok(Some(Value::Float(v)))
-    });
-    r.register(rg, "nextBoolean", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(if p64_simple_random() & 1 == 0 {
-            0
-        } else {
-            1
-        })))
-    });
 
     // ThreadLocalRandom
     let tlr = "java/util/concurrent/ThreadLocalRandom";
@@ -4419,13 +5299,41 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
     r.register(tlr, "nextInt", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(p64_simple_random() as i32)))
     });
+    // `ThreadLocalRandom` is `final` and declares `nextInt(int)` and
+    // `nextInt(int,int)` concretely (`javap -p`), so unlike the interface rows
+    // deleted above these are keyed on the class name the interpreter actually
+    // hands the registry — they WIN for a `ThreadLocalRandom` receiver wherever
+    // they are registered. That is synthetic-JDK mode only (see the mode note
+    // on this function): in `--real-jdk`/`--jdk-only` this bundle does not run
+    // and the JDK's own `RandomSupport.checkBound` answers. So these were live
+    // wrong answers in one mode, not dead ones in all of them, and the fix
+    // below is a synthetic-mode fix.
+    //
+    // Both used to swallow the bad bound and return a NUMBER — `0` for
+    // `nextInt(0)`, `origin` for `nextInt(5,5)` — so a caller that had computed
+    // an empty range got a plausible index instead of the exception that says
+    // its range is empty. MEASURED on this host (openjdk 25.0.3+9-LTS), for
+    // `ThreadLocalRandom`, `Random` and `SplittableRandom` alike:
+    //
+    //     ThreadLocalRandom.current().nextInt(0)   !! IllegalArgumentException: bound must be positive
+    //     ThreadLocalRandom.current().nextInt(-5)  !! IllegalArgumentException: bound must be positive
+    //     ThreadLocalRandom.current().nextInt(5,5) !! IllegalArgumentException: bound must be greater than origin
+    //     ThreadLocalRandom.current().nextInt(5,1) !! IllegalArgumentException: bound must be greater than origin
+    //
+    // The two messages are DIFFERENT and are the JDK's own
+    // (`RandomSupport.checkBound` / `checkRange`, `BAD_BOUND` / `BAD_RANGE`);
+    // they are quoted verbatim rather than paraphrased because a caller that
+    // greps the message is the caller most likely to be relying on it.
     r.register(tlr, "nextInt", "(I)I", |_ctx, args| {
         let bound = match args.get(1) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
         if bound <= 0 {
-            return Ok(Some(Value::Int(0)));
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "bound must be positive".to_string(),
+            }
+            .into());
         }
         Ok(Some(Value::Int(
             ((p64_simple_random() as i64).unsigned_abs() % (bound as u64)) as i32,
@@ -4441,12 +5349,24 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
             _ => 1,
         };
         if bound <= origin {
-            return Ok(Some(Value::Int(origin)));
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "bound must be greater than origin".to_string(),
+            }
+            .into());
         }
-        let range = (bound - origin) as u64;
-        Ok(Some(Value::Int(
-            origin + ((p64_simple_random() as i64).unsigned_abs() % range) as i32,
-        )))
+        // WIDENED to i64 before subtracting, and the offset added in i64 too.
+        // `bound - origin` in `i32` overflows for any range wider than
+        // `Integer.MAX_VALUE` — `nextInt(Integer.MIN_VALUE, Integer.MAX_VALUE)`
+        // is the whole-domain call, and it is LEGAL: measured on this host it
+        // returns an ordinary int. In Rust that subtraction is a checked
+        // overflow in release builds too, so the previous line turned the
+        // JDK's widest legal range into a PANIC — and the `origin + …` that
+        // followed had the same defect one line later. Neither is reachable
+        // through a bad argument only: `nextInt(-2_000_000_000, 2_000_000_000)`
+        // is an ordinary application call.
+        let range = (i64::from(bound) - i64::from(origin)) as u64;
+        let offset = (p64_simple_random() % range) as i64;
+        Ok(Some(Value::Int((i64::from(origin) + offset) as i32)))
     });
     r.register(tlr, "nextLong", "()J", |_ctx, _args| {
         let hi = (p64_simple_random() as i64) << 32;
@@ -4914,7 +5834,7 @@ pub(crate) fn register_phase66_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 // Phase 67: StructuredTaskScope, ScopedValue, Stream.Gatherer stubs,
 //           AsynchronousFileChannel/SocketChannel, Foreign Memory API stubs,
-//           StringTemplate stubs, additional Thread/Process/IO refinements
+//           additional Thread/Process/IO refinements
 // =============================================================================
 
 pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
@@ -4925,7 +5845,47 @@ pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
     register_p67_gatherer(registry);
     register_p67_async_channels(registry);
     register_p67_foreign_memory(registry);
-    register_p67_string_template(registry);
+    // `register_p67_string_template(registry);` — DELETED 2026-08-13 (lane F15),
+    // with the eight registrations it made and its banner comment.
+    //
+    // `java.lang.StringTemplate` DOES NOT EXIST on JDK 25. Measured on this
+    // host, not recalled:
+    //
+    //     $ javap -p java.lang.StringTemplate
+    //     Error: class not found: java.lang.StringTemplate
+    //     $ java -version
+    //     openjdk version "25.0.3" 2026-04-21 LTS (Microsoft-13877124, 25.0.3+9-LTS)
+    //
+    // The string-template API was a preview feature and was WITHDRAWN after
+    // JDK 23. Every row the registrar made was therefore a fabricated
+    // compatibility stand-in for a class no bytecode on this JDK can name —
+    // the exact thing `--jdk-only` exists to refuse — and one of them was
+    // type-confused on top of that: `fragments` was registered under
+    // `()Ljava/util/List;` and returned slot 0, which `of(String)` had just
+    // filled with a `java.lang.String`.
+    //
+    // Re-verified before deleting, because `call_native` PANICS on an
+    // unregistered triple that something still reaches, and a Rust panic is
+    // not a Java throwable — it kills the VM. `grep -rIn StringTemplate`
+    // over the whole tree (excluding `target/`, `.git/` and `docs/`) leaves
+    // only comments: `lib.rs`'s phase-67 header line and the tombstone in
+    // `vm/src/vm/tests.rs` where `string_template_basics_p67`, the sole
+    // caller, was already deleted whole (E40-1 §1b). No class declaration
+    // names `java/lang/StringTemplate` or its `$Processor` on the synthetic
+    // side either, so neither mode can reach a `StringTemplate` triple.
+    //
+    // Mode reach, stated so nobody has to re-derive it: this whole phase
+    // bundle is SYNTHETIC-ONLY. `register_phase67_natives`' one caller is
+    // `lib.rs::register_synthetic_overrides`, which is `#[cfg(feature =
+    // "synthetic-jdk")]` and is called only from `register_builtins`;
+    // `vm/src/vm/vm_init.rs`'s real-JDK arms say "the phase bundles are
+    // synthetic-only" and hand-register the few phase natives they want.
+    // So these eight rows never existed in `--real-jdk`/`--jdk-only`, and
+    // deleting them cannot move a strict-mode count.
+    //
+    // Ratchet: −8 `Bridge` registrations off the synthetic-mode total; the
+    // strict total is unchanged. See
+    // docs/known-issues/jdk-only/F15-1-two-registrars-that-no-bytecode-can-name-20260813.md
     register_p67_misc(registry);
     registry.set_category(__prev_cat);
 }
@@ -4994,90 +5954,6 @@ pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
 
 
 
-
-// =============================================================================
-// StringTemplate — Java 21 (preview, removed in Java 25 in favor of string templates)
-// Stub for template processor API
-// =============================================================================
-
-pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let st = "java/lang/StringTemplate";
-    // StringTemplate.of(String) → StringTemplate
-    r.register(
-        st,
-        "of",
-        "(Ljava/lang/String;)Ljava/lang/StringTemplate;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate", 2)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None))); // fragments
-            ctx.set_field(obj, 1, Value::Object(None)); // values
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(st, "fragments", "()Ljava/util/List;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(st, "values", "()Ljava/util/List;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    r.register(st, "interpolate", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-
-    // StringTemplate.STR processor
-    r.register(
-        st,
-        "STR",
-        "Ljava/lang/StringTemplate$Processor;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // StringTemplate.RAW processor
-    r.register(
-        st,
-        "RAW",
-        "Ljava/lang/StringTemplate$Processor;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // Processor interface
-    let proc = "java/lang/StringTemplate$Processor";
-    r.register(
-        proc,
-        "process",
-        "(Ljava/lang/StringTemplate;)Ljava/lang/Object;",
-        |ctx, args| {
-            // Default STR behavior: just return the interpolated string
-            let template = match args.get(1) {
-                Some(Value::Object(Some(t))) => *t,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            Ok(Some(ctx.get_field(template, 0)))
-        },
-    );
-
-    // FMT processor (FormatProcessor)
-    r.register(
-        st,
-        "FMT",
-        "Ljava/lang/StringTemplate$Processor;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.set_category(__prev_cat);
-}
 
 
 // =============================================================================
@@ -5264,62 +6140,46 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackWalker.Option enum
+    // StackWalker.Option enum — the three field-shaped registrations that used
+    // to sit here (`RETAIN_CLASS_REFERENCE`, `SHOW_HIDDEN_FRAMES`,
+    // `SHOW_REFLECT_FRAMES`, each with the FIELD descriptor
+    // `Ljava/lang/StackWalker$Option;` in the METHOD registry's descriptor
+    // slot) are DELETED as of 2026-08-13, lane E36. This note is kept because
+    // it is the second time someone will come here looking for where an
+    // `Option` constant is minted.
     //
-    // DEAD REGISTRATIONS — measured, not inferred (2026-08-12; see
-    // docs/known-issues/jdk-only/W7-93-stackwalker-option-constants-null.md).
-    // These three name a FIELD descriptor in the METHOD registry's descriptor
-    // slot, so the triple they key is one no dispatch can ever produce: a
-    // `getstatic` resolves through the class's static-field storage and never
-    // consults the native method registry, and no call site invokes a method
-    // named `RETAIN_CLASS_REFERENCE`. Confirmed under `--jdk-only`: the values
-    // a program actually reads back out of these statics are the objects
-    // `stack_walker::native_option_clinit` allocated (identity-checked), and
-    // `values()[0] == Option.RETAIN_CLASS_REFERENCE` holds — so nothing here
-    // ran.
+    // They were a duplicate-fix shadow, not merely dead. The initialiser that
+    // actually answers is `stack_walker.rs`'s `native_option_clinit`,
+    // registered as `("java/lang/StackWalker$Option", "<clinit>", "()V")` —
+    // the ONE shape a `getstatic` can reach, because `vm_util.rs` consults the
+    // registry for `<clinit>` and class initialization then publishes into the
+    // statics that `getstatic` reads. `class_manager.rs` declares the three
+    // statics for the stub, so those publishes land. Verified before deleting:
+    // that registration is present, it writes all three constants and
+    // `$VALUES`, and its own unit test
+    // (`option_clinit_populates_enum_values_array`) asserts `values()[i]` is
+    // `==` the published static AND that each carries a populated `name`.
     //
-    // They are worse than merely inert: `p57_alloc_enum` allocates a FRESH
-    // instance per call, so if a future dispatch change ever made them live
-    // they would hand back constants that are NOT `==` to the ones in
-    // `$VALUES`, breaking `Enum.valueOf`, `EnumSet` and every `==` comparison
-    // an enum switch compiles to. Do not treat them as the place to fix an
-    // `Option` constant; the initialiser is `native_option_clinit`. They are
-    // left in place only because deleting registrations moves
-    // `scripts/baselines/jdk-only-bridge-ratchet.json`, which needs a build to
-    // re-freeze.
-    let swo = "java/lang/StackWalker$Option";
-    r.register(
-        swo,
-        "RETAIN_CLASS_REFERENCE",
-        "Ljava/lang/StackWalker$Option;",
-        |ctx, _args| {
-            p57_alloc_enum(
-                ctx,
-                "java/lang/StackWalker$Option",
-                "RETAIN_CLASS_REFERENCE",
-                0,
-            )
-        },
-    );
-    r.register(
-        swo,
-        "SHOW_HIDDEN_FRAMES",
-        "Ljava/lang/StackWalker$Option;",
-        |ctx, _args| p57_alloc_enum(ctx, "java/lang/StackWalker$Option", "SHOW_HIDDEN_FRAMES", 1),
-    );
-    r.register(
-        swo,
-        "SHOW_REFLECT_FRAMES",
-        "Ljava/lang/StackWalker$Option;",
-        |ctx, _args| {
-            p57_alloc_enum(
-                ctx,
-                "java/lang/StackWalker$Option",
-                "SHOW_REFLECT_FRAMES",
-                2,
-            )
-        },
-    );
+    // The deleted rows were also worse than inert: `p57_alloc_enum` mints a
+    // FRESH instance per call, so had any dispatch change made them live they
+    // would have handed back constants that are NOT `==` to the ones in
+    // `$VALUES`, breaking `Enum.valueOf`, `EnumSet` and every `==` an enum
+    // switch compiles to.
+    //
+    // Two consequences of the deletion, both stated rather than hidden:
+    //   * it moves `scripts/baselines/jdk-only-bridge-ratchet.json`'s
+    //     registration counts by three, which needs a build to re-freeze; that
+    //     baseline's own note already says it is stale and pending re-freeze.
+    //   * `jca/cipher.rs` points at "phases_late.rs's three StackWalker$Option
+    //     static-field registrations" while explaining why
+    //     `JceSecurityManager.<clinit>` dies. That cross-reference is now
+    //     dangling and its diagnosis is unchanged by this deletion — the
+    //     constants were never coming from here. Nominated, not edited: that
+    //     file belongs to another lane.
+    //
+    // Nothing in the tree called these: `grep -rn "StackWalker\$Option"`
+    // returns only `class_manager.rs`, `stack_walker.rs`, the `cipher.rs`
+    // comment and this block, so no test had to change with them.
 
     // java.lang.invoke.SerializedLambda — used by lambda serialization support
     let sl = "java/lang/invoke/SerializedLambda";
@@ -5468,7 +6328,43 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     crate::register_system_logger_methods(r, crate::CRATON_SYSTEM_LOGGER_CLASS);
     crate::register_system_logger_methods(r, "java/lang/System$Logger");
 
-    // System.Logger.Level enum
+    // System.Logger.Level enum — SEVEN FIELD-SHAPED ROWS, DEAD, VERDICT
+    // "CONVERT", NOT CONVERTED HERE (2026-08-13, lane E36).
+    //
+    // Same shape as the `StackWalker$Option` rows deleted above: a field name
+    // in the method slot and `Ljava/lang/System$Logger$Level;` where a method
+    // descriptor belongs. No `getstatic` path in this VM consults the native
+    // registry, so none of the seven can fire in any tier, and
+    // `p57_alloc_enum` mints a fresh instance per call so if one ever did it
+    // would fail `==` against the class's own constants.
+    //
+    // They are NOT in the "dead twice over" class that the primitive rows are:
+    // measured on this host, `System.Logger.Level.INFO` compiles to
+    // `getstatic java/lang/System$Logger$Level.INFO:Ljava/lang/System$Logger$Level;`
+    // — a real runtime read. So the right end state is a native `<clinit>`.
+    // Three things have to land WITH that conversion, and none of them is in
+    // this lane's files, which is why the rows are still here:
+    //
+    //   1. `classloading/src/class_manager.rs` declares NO statics for this
+    //      class (`grep "System\$Logger\$Level"` → nothing), and
+    //      `set_static_field_by_name` resolves a DECLARED static and is a
+    //      silent no-op otherwise. A `<clinit>` landed alone publishes into
+    //      the void — measured next door: that is exactly the state
+    //      `HttpClient$Version`'s converted `<clinit>` is in today.
+    //   2. This is a REAL JDK class with real `<clinit>` bytecode in every
+    //      image, and a registered native beats real bytecode on the cold
+    //      interpreter path (see the note on `native_option_clinit`). A native
+    //      `<clinit>` here SHADOWS the JDK's, so it must reproduce it fully —
+    //      including `private final int severity`, which the constants carry
+    //      and `Level.getSeverity()` returns. Measured on the oracle:
+    //      ALL=-2147483648, TRACE=400, DEBUG=500, INFO=800, WARNING=900,
+    //      ERROR=1000, OFF=2147483647. A conversion that writes only
+    //      name/ordinal turns `getSeverity()` into 0 for every level in the
+    //      mode that matters most.
+    //   3. `vm/src/vm/tests.rs`'s `system_logger_p67` `call_native`s the
+    //      `INFO` row directly, so deleting these seven turns it red. That
+    //      file belongs to another lane; the paired edit is nominated so the
+    //      two land together.
     let sll = "java/lang/System$Logger$Level";
     r.register(
         sll,
@@ -7491,6 +8387,99 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
 
 
 
+/// The `byte[]` argument of a `BigInteger` constructor.
+///
+/// Both byte-array constructors reach their array through
+/// `this(val, 0, val.length)` / `this(signum, magnitude, 0, magnitude.length)`,
+/// so a null fails on the ARRAY LENGTH READ at the delegating call site and
+/// HotSpot's helpful NPE names the parameter. MEASURED:
+///
+/// ```text
+/// new BigInteger((byte[]) null)      !! NullPointerException: Cannot read the array length because "val" is null
+/// new BigInteger(2, (byte[]) null)   !! NullPointerException: Cannot read the array length because "magnitude" is null
+/// ```
+///
+/// The generic `obj_arg` NPE these used carries no message at all.
+fn p71_bi_array_arg(
+    args: &[Value],
+    idx: usize,
+    name: &'static str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Object(Some(a))) => Ok(*a),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(format!(
+                "Cannot read the array length because \"{name}\" is null"
+            )),
+        }
+        .into()),
+    }
+}
+
+/// `value << k` with the JDK's range guard, decided from the bit count BEFORE
+/// anything is allocated.
+///
+/// `BigInteger` supports a magnitude of at most `Integer.MAX_VALUE` bits.
+/// `checkRange` (JDK 25 `BigInteger.java:1213-1217`) is
+///
+/// ```text
+///     if (mag.length > MAX_MAG_LENGTH || mag.length == MAX_MAG_LENGTH && mag[0] < 0)
+///         reportOverflow();   // ArithmeticException("BigInteger would overflow supported range")
+/// ```
+///
+/// with `MAX_MAG_LENGTH == Integer.MAX_VALUE / 32 + 1 == 1 << 26`; `mag[0] < 0`
+/// means the top word's sign bit is set, so the two arms together say exactly
+/// "magnitude bit length > `Integer.MAX_VALUE`".
+///
+/// MEASURED on Microsoft OpenJDK 25.0.3+9 (`scratchpad/f2/BiProbe.java`):
+///
+/// ```text
+/// ONE.shiftRight(Integer.MIN_VALUE) !! ArithmeticException: BigInteger would overflow supported range  [103 ms]
+/// ONE.shiftLeft(Integer.MAX_VALUE)  !! ArithmeticException: BigInteger would overflow supported range  [ 28 ms]
+/// (-1).shiftRight(Integer.MIN_VALUE)!! ArithmeticException: BigInteger would overflow supported range  [ 84 ms]
+/// ONE.shiftLeft(Integer.MAX_VALUE-1) = <signum=1 bitLength=2147483647>                                 [ 32 ms]
+/// ONE.shiftLeft(Integer.MIN_VALUE)   = 0        ZERO.shiftRight(Integer.MIN_VALUE) = 0
+/// ```
+///
+/// The three refusals are HotSpot allocating `new int[1 + 67_108_864]` (~256 MB)
+/// and only then failing `checkRange` — that is what the 84-103 ms rows are.
+/// Because `shiftRight(n)`'s negative arm is a LEFT shift by `n.unsigned_abs()`
+/// (the JDK's own unsigned-distance rule, `BigInteger.java:3494-3506`), the
+/// same 256 MB is reachable here from one ordinary call with an
+/// attacker-chosen `n`. Refusing from the bit count gives the identical
+/// observable answer without the allocation.
+///
+/// DUPLICATE RESOLVED 2026-08-13 (lane F7, applied here by F15). The
+/// `math_bignum::bi_checked_shl` copy and that registrar's
+/// `shiftLeft`/`shiftRight` rows are DELETED, so this is now the single
+/// implementation and it is reached in every mode. F7 established the mode
+/// question by tracing `vm/src/vm/vm_init.rs` rather than assuming it:
+/// synthetic mode runs BOTH registrars with `math_bignum`'s SECOND
+/// (`use_synthetic_jdk` → essentials, then the synthetic overrides), real-JDK
+/// mode runs essentials only — so neither copy was unreachable, they were live
+/// in different modes and guaranteed to drift.
+///
+/// The magnitude-bit count is `BigInt::magnitude_bits` (`bigint.rs`), NOT a
+/// fourth private copy of the same three lines. This function used to call a
+/// local `p71_bi_mag_bits`, deleted with this change (F7 NOM 1); the
+/// `bitLength()`-vs-magnitude warning and F2's `(-2).shiftLeft(MAX-2)`
+/// measurement now live once, on `magnitude_bits` itself.
+fn p71_bi_checked_shl(
+    v: &crate::bigint::BigInt,
+    k: u32,
+) -> Result<crate::bigint::BigInt, MethodCallFailed> {
+    if v.is_zero() || k == 0 {
+        return Ok(v.clone());
+    }
+    if v.magnitude_bits() + u64::from(k) > i32::MAX as u64 {
+        return Err(RuntimeError::ArithmeticException {
+            message: "BigInteger would overflow supported range".to_string(),
+        }
+        .into());
+    }
+    Ok(v.shl(k))
+}
+
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -7507,12 +8496,57 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)?))))
         },
     );
+    // `isProbablePrime(certainty)` — two arms this body did not have, both
+    // ahead of the primality test itself. JDK 25 `BigInteger.java:1156-1166`:
+    //
+    //     if (certainty <= 0) return true;
+    //     BigInteger w = this.abs();
+    //     if (w.equals(TWO)) return true;
+    //     if (!w.testBit(0) || w.equals(ONE)) return false;
+    //     return w.primeToCertainty(certainty, null);
+    //
+    // MEASURED on this host (openjdk 25.0.3+9-LTS) — F7 reported these and
+    // every row reproduced here before the edit was written:
+    //
+    //     (-7).isProbablePrime(10) = true     (-2).isProbablePrime(10) = true
+    //     (-4).isProbablePrime(10) = false    (-1).isProbablePrime(10) = false
+    //     0.isProbablePrime(10)    = false
+    //     4.isProbablePrime(0)     = true     4.isProbablePrime(-1)    = true
+    //     4.isProbablePrime(1)     = false
+    //     0.isProbablePrime(0)     = true     (-1).isProbablePrime(0)  = true
+    //
+    // The last row is the one that fixes the ORDER and is not in F7's record:
+    // `certainty <= 0` short-circuits before ANY inspection of the value, so
+    // even zero and −1 answer `true`. The guard must therefore precede
+    // `bi_read_int`, not sit beside it.
+    //
+    // `BigInt::is_probable_prime` opens `if self.neg || self.is_zero() { false }`,
+    // so calling it directly made `(-7).isProbablePrime(10)` FALSE where
+    // HotSpot says true — the JDK takes `this.abs()` first, and sign has no
+    // part in primality. Zero survives the `abs()` and still answers false,
+    // which matches.
+    //
+    // Not this file's defect but worth stating where the pair is: the twin in
+    // `math_bignum.rs` (which wins in synthetic mode, running second) was worse
+    // in the direction that matters — trial division capped at `i <= 10000`
+    // that returned TRUE on reaching the cap, so `1000003 * 1000033` and a
+    // 512-bit semiprime were both reported prime to a key-generation caller.
+    // F7 fixed it there; this is the same rule, in the copy that wins in
+    // real-JDK mode.
     r.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
+        let certainty = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        if certainty <= 0 {
+            return Ok(Some(Value::Int(1)));
+        }
         // Limb-based Miller-Rabin (rewrite step 3): read mag:[I directly into
         // BigInt — no decimal round-trip — so the inner modPow is fast. This
         // is the hot path for createRandomPrime / RSA key-gen.
         let v = bi_read_int(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Int(if v.is_probable_prime() { 1 } else { 0 })))
+        let w = if v.is_neg() { v.neg_value() } else { v };
+        Ok(Some(Value::Int(if w.is_probable_prime() { 1 } else { 0 })))
     });
     // shiftLeft/shiftRight via limb BigInt (rewrite step 4). Negative counts
     // flip direction (BigInteger contract). Arithmetic (floor) right shift.
@@ -7522,8 +8556,14 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        // A left shift past `Integer.MAX_VALUE` magnitude bits is
+        // `ArithmeticException("BigInteger would overflow supported range")`
+        // (JDK 25 BigInteger.java:1213 `checkRange`), decided from the bit
+        // count so the oversized magnitude is never allocated. `unsigned_abs`
+        // on the right arm is the JDK's own rule and is NOT the defect:
+        // `shiftRightImpl` reads `-n` as UNSIGNED (BigInteger.java:3494-3506).
         let res = if n >= 0 {
-            v.shl(n as u32)
+            p71_bi_checked_shl(&v, n as u32)?
         } else {
             v.shr(n.unsigned_abs())
         };
@@ -7539,10 +8579,13 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            // The negative arm is a LEFT shift by an UNSIGNED distance, so
+            // `shiftRight(Integer.MIN_VALUE)` is `<< 2_147_483_648` — the
+            // 256 MB allocation. Same guard, same message as `shiftLeft`.
             let res = if n >= 0 {
                 v.shr(n as u32)
             } else {
-                v.shl(n.unsigned_abs())
+                p71_bi_checked_shl(&v, n.unsigned_abs())?
             };
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
         },
@@ -7620,8 +8663,22 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(bi, "<init>", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let arr = obj_arg(args, 1)?;
+        let arr = p71_bi_array_arg(args, 1, "val")?;
         let len = ctx.array_length(arr);
+        // `new BigInteger(byte[])` is `this(val, 0, val.length)`, whose first
+        // statement is the length check (JDK 25 BigInteger.java:348-350).
+        // MEASURED: `new BigInteger(new byte[0])` is
+        // `NumberFormatException: Zero length BigInteger`; this body answered
+        // ZERO, because `bi_from_byte_array_signed(&[])` is `"0"`. A
+        // zero-length array is exactly what a truncated read or an empty
+        // network frame hands to a decoder, so the wrong answer is silent and
+        // the value it invents is the one that compares equal to nothing.
+        if len == 0 {
+            return Err(RuntimeError::NumberFormatException {
+                message: "Zero length BigInteger".to_string(),
+            }
+            .into());
+        }
         let bytes: Vec<u8> = (0..len)
             .map(|i| match ctx.get_array_element(arr, i) {
                 Value::Int(x) => x as u8,
@@ -7675,8 +8732,43 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
-        let arr = obj_arg(args, 2)?;
+        // The null check precedes the signum check, and it is not an ordering
+        // choice: `new BigInteger(int, byte[])` is
+        // `this(signum, magnitude, 0, magnitude.length)`, so `magnitude.length`
+        // is evaluated at the DELEGATING call site, before the 4-argument
+        // constructor's first statement. MEASURED:
+        // `new BigInteger(2, (byte[]) null)` is
+        // `NullPointerException: Cannot read the array length because
+        // "magnitude" is null`, NOT "Invalid signum value".
+        let arr = p71_bi_array_arg(args, 2, "magnitude")?;
         let len = ctx.array_length(arr);
+        // JDK 25 BigInteger.java:440-442. MEASURED: every signum outside
+        // -1..=1 is `NumberFormatException: Invalid signum value`, INCLUDING
+        // `new BigInteger(2, new byte[0])`, so the check is ahead of the
+        // zero-magnitude shortcut. This body accepted any `i32` and let
+        // `bi_from_byte_array_with_signum` interpret it.
+        if !(-1..=1).contains(&signum) {
+            return Err(RuntimeError::NumberFormatException {
+                message: "Invalid signum value".to_string(),
+            }
+            .into());
+        }
+        // JDK 25 BigInteger.java:446-453: a magnitude that strips to nothing
+        // is the value ZERO whatever the signum says (`new BigInteger(1, new
+        // byte[0])` and `new BigInteger(-1, new byte[]{0,0})` are both 0,
+        // measured) — and only a NON-empty magnitude with signum 0 is the
+        // mismatch. Testing `signum == 0` against the raw bytes would reject
+        // `new BigInteger(0, new byte[]{0})`, which is legal.
+        if signum == 0
+            && (0..len).any(
+                |i| matches!(ctx.get_array_element(arr, i), Value::Int(x) if (x & 0xff) != 0),
+            )
+        {
+            return Err(RuntimeError::NumberFormatException {
+                message: "signum-magnitude mismatch".to_string(),
+            }
+            .into());
+        }
         let bytes: Vec<u8> = (0..len)
             .map(|i| match ctx.get_array_element(arr, i) {
                 Value::Int(x) => x as u8,
@@ -9183,46 +10275,98 @@ mod cert_verify_bounds_security_tests {
     /// demonstrated works.
     ///
     /// That is exactly how `doFinal([BI)V` went missing: it broke every
-    /// SCRAM-SHA-256 login (hibernate-reactive / Vert.x reactive Postgres saw
+    /// SCRAM-SHA-256 login (hibernate / Vert.x reactive Postgres saw
     /// `FATAL: expected SASL response, got message type 88` — 88 is 'X', the
     /// client sending Terminate after `com.ongres.scram`'s PBKDF2 loop died on
     /// iteration 2 of 4096), while every other Mac caller in the tree stayed
     /// green. A per-descriptor census is the only thing that catches the next
     /// one.
+    ///
+    /// **The population below is the JDK's, not this VM's.** Read off
+    /// `javap -public -s javax.crypto.Mac` on the oracle
+    /// (openjdk 25.0.3 2026-04-21 LTS, Microsoft-13877124, build 25.0.3+9-LTS)
+    /// on 2026-08-13: **17** public methods. Until then this test listed
+    /// **16** of them — every one of which is registered — so a census whose
+    /// stated subject is "every PUBLIC method, not most of them" was itself
+    /// built from the registered set and could not go red for the one case it
+    /// exists to catch.
+    ///
+    /// The seventeenth, `getInstance(String, java.security.Provider)`, was the
+    /// gap that census found, and it is now CLOSED: it is registered at
+    /// `phases_late/ssl_security.rs`, so its row below reads `true` like the
+    /// other sixteen. The prose here used to say it was "NOT registered
+    /// anywhere in the tree" and carried "as an explicit `false` row" — stale
+    /// as of 2026-08-13, and stale in the direction that matters, because the
+    /// reverse ratchet makes a closed gap a FAILURE (NOM E25-1). A reader who
+    /// trusted this paragraph over the table would have read the assertion as
+    /// a standing exemption, which is the one thing the ratchet exists to
+    /// prevent.
+    ///
+    /// **The sentence that must survive every edit:** the population is
+    /// `javap`'s, not the registry's. A row is added here because the JDK
+    /// declares the method, never because this VM happens to register it.
+    ///
+    /// The `expect_registered` column is ratcheted in BOTH directions: a row
+    /// that flips either way fails, so registering the missing overload
+    /// requires deleting its `false` and its note, and a registration silently
+    /// disappearing is a failure rather than a shorter list.
     #[test]
     fn every_public_mac_method_is_registered() {
         let mut r = NativeMethodRegistry::new();
         register_p68_crypto_mac(&mut r);
-        for (name, desc) in [
-            ("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;"),
+        // (method, descriptor, expect_registered, note when NOT expected)
+        for (name, desc, expect_registered, why_not) in [
+            ("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;", true, ""),
             (
                 "getInstance",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
+                true,
+                "",
             ),
-            ("getAlgorithm", "()Ljava/lang/String;"),
-            ("getProvider", "()Ljava/security/Provider;"),
-            ("getMacLength", "()I"),
-            ("init", "(Ljava/security/Key;)V"),
+            (
+                "getInstance",
+                "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
+                true,
+                "",
+            ),
+            ("getAlgorithm", "()Ljava/lang/String;", true, ""),
+            ("getProvider", "()Ljava/security/Provider;", true, ""),
+            ("getMacLength", "()I", true, ""),
+            ("init", "(Ljava/security/Key;)V", true, ""),
             (
                 "init",
                 "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+                true,
+                "",
             ),
-            ("update", "(B)V"),
-            ("update", "([B)V"),
-            ("update", "([BII)V"),
-            ("update", "(Ljava/nio/ByteBuffer;)V"),
-            ("doFinal", "()[B"),
-            ("doFinal", "([B)[B"),
-            ("doFinal", "([BI)V"),
-            ("reset", "()V"),
-            ("clone", "()Ljava/lang/Object;"),
+            ("update", "(B)V", true, ""),
+            ("update", "([B)V", true, ""),
+            ("update", "([BII)V", true, ""),
+            ("update", "(Ljava/nio/ByteBuffer;)V", true, ""),
+            ("doFinal", "()[B", true, ""),
+            ("doFinal", "([B)[B", true, ""),
+            ("doFinal", "([BI)V", true, ""),
+            ("reset", "()V", true, ""),
+            ("clone", "()Ljava/lang/Object;", true, ""),
         ] {
-            assert!(
-                r.find("javax/crypto/Mac", name, desc).is_some(),
-                "javax/crypto/Mac.{name}{desc} is not registered — it will run the \
-                 real JDK body against never-initialised instance fields and throw \
-                 \"MAC not initialized\""
-            );
+            let registered = r.find("javax/crypto/Mac", name, desc).is_some();
+            if expect_registered {
+                assert!(
+                    registered,
+                    "javax/crypto/Mac.{name}{desc} is not registered — it will run \
+                     the real JDK body against never-initialised instance fields \
+                     and throw \"MAC not initialized\""
+                );
+            } else {
+                assert!(
+                    !registered,
+                    "javax/crypto/Mac.{name}{desc} IS now registered, but this \
+                     census still carries it as a known gap. Delete the `false` row \
+                     and its note — a recorded gap that has been closed must stop \
+                     being recorded, or the next reader takes the note as a \
+                     standing exemption. The note said:\n{why_not}"
+                );
+            }
         }
     }
 
@@ -9237,6 +10381,265 @@ mod cert_verify_bounds_security_tests {
         assert!(r2
             .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
             .is_some());
+    }
+}
+
+// =============================================================================
+// java.util.UUID.fromString — the SPEC, not a canonical-form matcher
+// =============================================================================
+//
+// `UUID.fromString` is LENIENT in a way almost nobody remembers, and the
+// in-tree parser was strict in one direction and lax in the other — which is
+// the usual signature of a missing specification rather than two bugs.
+//
+// What it did: strip EVERY `-`, require exactly 32 remaining characters, then
+// `u64::from_str_radix(&hex[0..16]).unwrap_or(0)`. Measured against HotSpot
+// 25.0.3+9, that is wrong in five ways at once:
+//
+// ```text
+//                                                HotSpot            CratonVM (before)
+// "1-2-3-4-5"                                    00000001-0002-...  IAE Invalid UUID string
+// "0112233-4455-6677-8899-00aabbccddeef"         00112233-4455-...  IAE (35 chars, re-padded)
+// "00112233445566778899aabbccddeeff"  (no dash)  IAE                ACCEPTED
+// "0011-2233-4455-6677-8899-aabb-ccdd-eeff"      IAE / too large    ACCEPTED (dashes stripped)
+// "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"         NumberFormatEx     00000000-0000-...-000000000000
+// fromString(null)                               NPE                null
+// ```
+//
+// and `&hex[0..16]` sliced a Rust `String` by BYTE index, so a 32-byte input
+// containing one multi-byte character whose boundary straddles offset 16
+// PANICS ("byte index is not a char boundary"). A panic is not a Java
+// throwable; it takes the VM.
+//
+// The actual algorithm (JDK 25 `java.base/java/util/UUID.java`), which every
+// row above follows from:
+//
+//   1. `length() > 36` -> `IllegalArgumentException: UUID string too large`.
+//   2. Locate five successive `-` by `indexOf`. If the FOURTH is absent or a
+//      FIFTH exists -> `IllegalArgumentException: Invalid UUID string: <s>`.
+//      Nothing checks where the dashes are, which is why the 36-character
+//      `"001122334455-6677-8899-0aab-bccddeef"` parses (to
+//      `22334455-6677-8899-0aab-0000bccddeef`).
+//   3. Each of the five groups goes through `Long.parseLong(cs, from, to, 16)`
+//      and is then MASKED to its field width, so a group may be shorter than
+//      its canonical length (zero-padded on the way in) or longer (truncated).
+//      A leading `+` or `-` is legal, because `parseLong` accepts one.
+//
+// So the parser is a `parseLong` five times over, and every divergence above
+// is the same missing fact: this is not a canonical-form matcher.
+//
+// Lives here rather than in `lib.rs` because that file is owned elsewhere;
+// `native_uuid_from_string` calls it. See the NOMINATIONS in
+// docs/known-issues/jdk-only/W8-C15-*.md.
+
+/// `Long.parseLong(CharSequence, begin, end, 16)`, transcribed including its
+/// two exception texts, which are observable through `UUID.fromString`:
+///
+/// ```text
+/// ""      / "-" / "+"   NumberFormatException: For input string: "" under radix 16
+/// "0x1"                 NumberFormatException: Error at index 1 in: "0x1"
+/// 17 x 'f'              NumberFormatException: Error at index 15 in: "fffffffffffffffff"
+/// ```
+///
+/// The overflow index is not the last character: HotSpot's `result < multmin`
+/// test fires one digit EARLY, at 15 for a 17-digit input, and this
+/// transcription keeps that so the message matches character for character.
+pub(crate) fn uuid_parse_long_hex(group: &[char]) -> Result<i64, MethodCallFailed> {
+    let text: String = group.iter().collect();
+    let sign_only_or_empty = || RuntimeError::NumberFormatException {
+        message: format!("For input string: \"{text}\" under radix 16"),
+    };
+    let err_at = |i: usize| RuntimeError::NumberFormatException {
+        message: format!("Error at index {i} in: \"{text}\""),
+    };
+    if group.is_empty() {
+        return Err(sign_only_or_empty().into());
+    }
+    let mut i = 0usize;
+    let mut negative = false;
+    let first = group[0];
+    if first < '0' {
+        if first == '-' {
+            negative = true;
+        } else if first != '+' {
+            return Err(err_at(0).into());
+        }
+        if group.len() == 1 {
+            return Err(sign_only_or_empty().into());
+        }
+        i = 1;
+    }
+    // Accumulate NEGATIVELY, as HotSpot does, so `Long.MIN_VALUE` is
+    // representable and the overflow test is a single comparison.
+    let limit: i64 = if negative { i64::MIN } else { -i64::MAX };
+    let multmin: i64 = limit / 16;
+    let mut result: i64 = 0;
+    while i < group.len() {
+        let digit = match group[i].to_digit(16) {
+            Some(d) => i64::from(d),
+            None => return Err(err_at(i).into()),
+        };
+        if result < multmin {
+            return Err(err_at(i).into());
+        }
+        result *= 16;
+        if result < limit + digit {
+            return Err(err_at(i).into());
+        }
+        result -= digit;
+        i += 1;
+    }
+    Ok(if negative { result } else { -result })
+}
+
+/// `UUID.fromString(name)` reduced to its `(mostSigBits, leastSigBits)` pair.
+///
+/// Returns the same throwables HotSpot does, including the message text —
+/// `IllegalArgumentException` for a shape failure and `NumberFormatException`
+/// for a group failure, which is a distinction a caller can and does test.
+pub(crate) fn uuid_from_string_bits(name: &str) -> Result<(i64, i64), MethodCallFailed> {
+    // `chars()`, not byte indices: the old parser's `&hex[0..16]` was a
+    // char-boundary panic waiting for a multi-byte input.
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() > 36 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "UUID string too large".to_string(),
+        }
+        .into());
+    }
+    let dash_after = |from: usize| -> Option<usize> {
+        if from > chars.len() {
+            return None;
+        }
+        chars[from..].iter().position(|c| *c == '-').map(|p| p + from)
+    };
+    let invalid = || RuntimeError::IllegalArgumentException {
+        message: format!("Invalid UUID string: {name}"),
+    };
+    let dash1 = match dash_after(0) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    let dash2 = match dash_after(dash1 + 1) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    let dash3 = match dash_after(dash2 + 1) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    let dash4 = match dash_after(dash3 + 1) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    // A FIFTH dash is what rejects "1-2-3-4-5-6" and "-1-2-3-4-5".
+    if dash_after(dash4 + 1).is_some() {
+        return Err(invalid().into());
+    }
+    let g0 = uuid_parse_long_hex(&chars[0..dash1])? as u64;
+    let g1 = uuid_parse_long_hex(&chars[dash1 + 1..dash2])? as u64;
+    let g2 = uuid_parse_long_hex(&chars[dash2 + 1..dash3])? as u64;
+    let g3 = uuid_parse_long_hex(&chars[dash3 + 1..dash4])? as u64;
+    let g4 = uuid_parse_long_hex(&chars[dash4 + 1..chars.len()])? as u64;
+
+    let mut msb = g0 & 0xffff_ffff;
+    msb <<= 16;
+    msb |= g1 & 0xffff;
+    msb <<= 16;
+    msb |= g2 & 0xffff;
+    let mut lsb = g3 & 0xffff;
+    lsb <<= 48;
+    lsb |= g4 & 0xffff_ffff_ffff;
+    Ok((msb as i64, lsb as i64))
+}
+
+#[cfg(test)]
+mod uuid_from_string_spec_tests {
+    use super::{uuid_from_string_bits, uuid_parse_long_hex};
+
+    /// Every expectation is a line of `scratchpad/c15/P4Uuid` / `P4b` output on
+    /// Microsoft OpenJDK 25.0.3+9, transcribed, not remembered.
+    #[test]
+    fn lenient_forms_hotspot_accepts() {
+        assert_eq!(
+            uuid_from_string_bits("1-2-3-4-5").expect("HotSpot accepts this"),
+            (0x0000_0001_0002_0003, 0x0004_0000_0000_0005)
+        );
+        assert_eq!(
+            uuid_from_string_bits("0112233-4455-6677-8899-00aabbccddeef").expect("35-char form"),
+            (0x0011_2233_4455_6677, 0x8899_0aab_bccd_deefu64 as i64)
+        );
+        // Groups WIDER than their field are masked, not rejected.
+        assert_eq!(
+            uuid_from_string_bits("fffffffff-2-3-4-5").expect("9 f's mask to 8"),
+            (0xffff_ffff_0002_0003u64 as i64, 0x0004_0000_0000_0005)
+        );
+        // `Long.parseLong` accepts a leading sign, so `UUID.fromString` does.
+        assert_eq!(
+            uuid_from_string_bits("+1-2-3-4-5").expect("leading plus"),
+            (0x0000_0001_0002_0003, 0x0004_0000_0000_0005)
+        );
+        // Dash POSITIONS are not checked, only that there are exactly four.
+        assert_eq!(
+            uuid_from_string_bits("001122334455-6677-8899-0aab-bccddeef")
+                .expect("36 chars, misplaced dashes"),
+            (0x2233_4455_6677_8899u64 as i64, 0x0aab_0000_bccd_deef)
+        );
+    }
+
+    #[test]
+    fn strict_forms_hotspot_rejects() {
+        // The over-LAX half of the same missing spec: the old parser stripped
+        // dashes and counted to 32, so both of these were ACCEPTED.
+        for bad in [
+            "00112233445566778899aabbccddeeff",
+            "1-2-3-4-5-6",
+            "-1-2-3-4-5",
+            "1-2-3-4",
+            "",
+        ] {
+            assert!(
+                uuid_from_string_bits(bad).is_err(),
+                "HotSpot rejects {bad:?}"
+            );
+        }
+        assert!(uuid_from_string_bits(&"a".repeat(37)).is_err(), "too large");
+        // Not silently zero: a non-hex group is a NumberFormatException.
+        assert!(uuid_from_string_bits("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz").is_err());
+        // An empty group is a NumberFormatException, not an IAE.
+        assert!(uuid_from_string_bits("1-2-3-4-").is_err());
+    }
+
+    #[test]
+    fn parse_long_hex_matches_hotspot_messages() {
+        let e = uuid_parse_long_hex(&"0x1".chars().collect::<Vec<_>>()).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("Error at index 1"),
+            "bad digit index, got {e:?}"
+        );
+        // Overflow is reported one digit EARLY, at 15 of 17.
+        let e = uuid_parse_long_hex(&"f".repeat(17).chars().collect::<Vec<_>>()).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("Error at index 15"),
+            "overflow index, got {e:?}"
+        );
+        // A 16-digit group is fine and wraps to a negative i64.
+        assert_eq!(
+            uuid_parse_long_hex(&"ffffffffffffffff".chars().collect::<Vec<_>>()).ok(),
+            None,
+            "16 f's overflow a signed long — HotSpot masks AFTER parseLong, \
+             and parseLong itself refuses; UUID's own groups are never that wide \
+             except the 12-digit one"
+        );
+    }
+
+    /// The mutation check the standing lesson asks for: if the fifth-dash
+    /// rejection is removed, `strict_forms_hotspot_rejects` must go red. Kept
+    /// as an assertion on the boundary rather than a comment.
+    #[test]
+    fn fifth_dash_is_the_rejecting_rule() {
+        assert!(uuid_from_string_bits("1-2-3-4-5").is_ok());
+        assert!(uuid_from_string_bits("1-2-3-4-5-6").is_err());
     }
 }
 
@@ -9336,92 +10739,356 @@ mod essential_vs_synthetic_jdk_coverage_audit {
             .collect()
     }
 
-    /// Diffs the (class, method, descriptor) triples reachable from
-    /// `register_p59_module` (synthetic-jdk-only — dead code in the default
-    /// `cratonvm-cli` build) against `register_essential_natives` (the
-    /// real-JDK path the default build actually uses). Anything in the
-    /// former but not the latter has the same "silently missing from the
-    /// build that matters" shape that broke `Module.getDescriptor()`.
+    /// Turn a declared row list into the triple set it names, rejecting a
+    /// duplicated row (which would make the two-way ratchet below silently
+    /// tolerant of one deletion).
+    fn declared(label: &str, rows: &[Row]) -> BTreeSet<(String, String, String)> {
+        let set: BTreeSet<(String, String, String)> = rows
+            .iter()
+            .map(|(c, m, d, _why)| (c.to_string(), m.to_string(), d.to_string()))
+            .collect();
+        assert_eq!(
+            set.len(),
+            rows.len(),
+            "{label} lists a triple twice; a duplicated row makes the reverse \
+             ratchet unable to see the first deletion"
+        );
+        set
+    }
+
+    /// `(class, method, descriptor, why this row is here)`. The fourth field is
+    /// load-bearing: it is what stops a row being added to shut the gate up.
+    type Row = (&'static str, &'static str, &'static str, &'static str);
+
+    /// Triples `register_p59_module` registers and `register_essential_natives`
+    /// does NOT — the population the original `difference` check watched.
     ///
-    /// Every entry below was individually triaged against a real-HotSpot
-    /// probe (see task history / `reference_essential_vs_synthetic_jdk_registration_split`
-    /// memory); this is not a blanket allowlist, it's a closed list of the
-    /// exact 8 candidates this audit originally surfaced:
+    /// Each was individually triaged against a real-HotSpot probe (see task
+    /// history / `reference_essential_vs_synthetic_jdk_registration_split`
+    /// memory). This is not a blanket allowlist; it is a closed list, and
+    /// `phase59_module_vs_essential_natives` fails in BOTH directions against
+    /// it.
+    const P59_ONLY: &[Row] = &[
+        (
+            "java/lang/Module",
+            "isNamed",
+            "()Z",
+            "probe-verified to already match HotSpot through the real-bytecode \
+             fallback: real `isNamed` reads the dual-written `name` field.",
+        ),
+        (
+            "java/lang/Module",
+            "toString",
+            "()Ljava/lang/String;",
+            "probe-verified: real `toString`'s \"module X\" format never touches \
+             the null `descriptor`/`reads` fields.",
+        ),
+        (
+            "java/lang/Module",
+            "addReads",
+            "(Ljava/lang/Module;)Ljava/lang/Module;",
+            "the PUBLIC instance method, distinct from `addReads0` which the \
+             essential path does register (lib.rs). Real `implAddReads` \
+             delegates to `addReads0`, which updates the `ModuleRegistry`; the \
+             `addReads` then `canRead` round trip was probe-verified against \
+             HotSpot.",
+        ),
+    ];
+
+    /// Triples registered by BOTH registrars — the population the original
+    /// `difference` check was structurally unable to see.
     ///
-    /// - `canRead`, `addExports`, `addOpens` — FIXED on this branch
-    ///   (registered above via `native_module_can_read`/
-    ///   `native_module_add_exports`/`native_module_add_opens`), so they no
-    ///   longer appear in the diff at all and are not listed here.
-    /// - `getDescriptor` — already fixed on the separate, not-yet-merged
-    ///   `fix/es-module-getdescriptor-null` branch (registers the same shape
-    ///   of essential-native override there). Not duplicated here to avoid
-    ///   two divergent implementations existing pre-merge.
-    /// - `isNamed`, `toString` — probe-verified to already match real
-    ///   HotSpot via the real-bytecode fallback (real bytecode reads a
-    ///   dual-written `name` field for `isNamed`, and `toString`'s basic
-    ///   "module X" format doesn't touch the null `descriptor`/`reads`
-    ///   fields). No essential registration needed.
-    /// - `addReads` (the public instance method, distinct from the
-    ///   already-essential-registered `addReads0`) — real bytecode's
-    ///   `implAddReads` delegates to `addReads0`, which is already reachable
-    ///   in the essential path and correctly updates the `ModuleRegistry`;
-    ///   probe-verified round-trip (`addReads` then `canRead`) matches
-    ///   HotSpot. No separate registration needed.
-    /// - `ModuleDescriptor.isAutomatic()`/`isOpen()` — trivial field reads
-    ///   (`return automatic;`/`return open;`); correctness is contingent on
-    ///   the `getDescriptor` fix above populating those fields, so this
-    ///   resolves once that branch merges. Not independently testable here
-    ///   since this worktree doesn't have that fix (`getDescriptor()`
-    ///   returns null).
+    /// A triple lands here when `register_p59_module` and
+    /// `register_essential_natives` each install a body for it. In
+    /// synthetic-jdk mode phase 59 runs LAST and therefore WINS
+    /// (`register_builtins` calls `register_essential_natives` and then
+    /// `register_synthetic_overrides`); in `--real-jdk` / `--jdk-only`
+    /// `register_p59_module` is never called at all, so the essential body is
+    /// the only one. That asymmetry is the hazard: a divergence between the two
+    /// bodies is a MODE-DEPENDENT behaviour change that no diff of the triples
+    /// can show, because the triple is identical on both sides.
     ///
-    /// If this test starts failing again with an entry NOT in the list
-    /// above, that's a genuinely new candidate — triage it the same way
-    /// (real-HotSpot probe comparison) before deciding fix vs. no-op.
+    /// Rows are marked:
+    ///
+    /// - **SHARED FN** — both sides register the same `fn` item, so there are
+    ///   no two bodies to diverge. Safe by construction, not by review.
+    /// - **TWIN** — two separately written bodies. Whoever changes one must
+    ///   read the other, and say here what the difference is for.
+    ///
+    /// Two TWIN rows below carry a KNOWN divergence, established by
+    /// `docs/known-issues/jdk-only/E16-R11-P59-MODULE-LAYER-TWIN-20260813.md`
+    /// §1.4 and §5, and NOT closed by this lane (both bodies live in
+    /// `phases_late/reflect_invoke.rs`, which this lane does not own).
+    const P59_AND_ESSENTIAL: &[Row] = &[
+        (
+            "java/lang/ModuleLayer",
+            "boot",
+            "()Ljava/lang/ModuleLayer;",
+            "TWIN, KNOWN DIVERGENT. essential: `jboss_jdkspecific::native_module_layer_boot`, \
+             memoised per VM (`ModuleLayer.boot() == ModuleLayer.boot()` is a \
+             spec'd identity), allocating `MODULE_LAYER_FIELD_COUNT` = 2 slots \
+             and populating `parents`/`nameToModule`/`modules` by NAME. p59: a \
+             fresh, unmemoised layer per call, requesting 1 slot against a \
+             declared synthetic width of 2 (class_manager.rs `instance_fields(2)`), \
+             with none of those three fields. See E16 §5.3.",
+        ),
+        (
+            "java/lang/ModuleLayer",
+            "modules",
+            "()Ljava/util/Set;",
+            "TWIN, KNOWN DIVERGENT. essential: `jboss_jdkspecific::native_module_layer_modules`, \
+             which derives and CACHES `layer.servicesCatalog` from `nameToModule` \
+             as a side effect. `service_loader.rs:775` invokes this method purely \
+             for that side effect and then reads the field by name. p59 ignores \
+             its receiver and builds a fresh `HashSet` from the module registry, \
+             so in synthetic-jdk mode (where p59 wins) that read finds nothing. \
+             See E16 §1.4.",
+        ),
+        (
+            "java/lang/ModuleLayer",
+            "findModule",
+            "(Ljava/lang/String;)Ljava/util/Optional;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_layer_find_module`, \
+             which answers from the layer's `nameToModule`. p59 answers from \
+             `all_module_names()` filtered by `module_is_class_path_only`. Both \
+             now exclude a modular jar that reached the registry only through \
+             `-cp`; that filter was added to p59 by lane E16 precisely because \
+             this row exists.",
+        ),
+        (
+            "java/lang/Module",
+            "getName",
+            "()Ljava/lang/String;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_get_name` (reads \
+             the real `name` field by NAME, on a Module that is an instance of \
+             the real class). p59 reads slot 0 of a 2-slot synthetic Module. The \
+             two agree only because p59's Modules are the ones p59 itself \
+             allocated.",
+        ),
+        (
+            "java/lang/Module",
+            "getLayer",
+            "()Ljava/lang/ModuleLayer;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_get_layer`. See \
+             the `MODULE_FIELD_COUNT` doc comment in jboss_jdkspecific.rs for \
+             what a hand-picked slot index costs on this exact method: a raw \
+             slot-1 write intended for `layer` landed on the REAL `name` field \
+             of the shared unnamed-module mirror.",
+        ),
+        (
+            "java/lang/Module",
+            "getPackages",
+            "()Ljava/util/Set;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_get_packages`, \
+             backed by the off-object `module_packages_table` that \
+             `defineModule0` seeds, falling back to `BOOT_JDK_PACKAGES`. p59 \
+             answers from the VM's package index. Different sources, same \
+             question.",
+        ),
+        (
+            "java/lang/Module",
+            "canRead",
+            "(Ljava/lang/Module;)Z",
+            "SHARED FN. lib.rs registers `crate::phases_late::native_module_can_read` \
+             — the same fn item p59 registers. One body.",
+        ),
+        (
+            "java/lang/Module",
+            "addExports",
+            "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+            "SHARED FN. lib.rs registers `crate::phases_late::native_module_add_exports`. \
+             One body.",
+        ),
+        (
+            "java/lang/Module",
+            "addOpens",
+            "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+            "SHARED FN. lib.rs registers `crate::phases_late::native_module_add_opens`. \
+             One body.",
+        ),
+        (
+            "java/lang/Module",
+            "getDescriptor",
+            "()Ljava/lang/module/ModuleDescriptor;",
+            "TWIN. Was P59-ONLY when this guard was written, with the note that \
+             the essential-side fix lived on an unmerged branch. That branch \
+             merged: lib.rs now registers a `getDescriptor` that prefers the \
+             object's real `descriptor` field and falls back to building one \
+             from the module name. p59 allocates a 2-slot `ModuleDescriptor` \
+             and copies slot 0. The stale P59-ONLY row is deleted, which is the \
+             reverse direction of this ratchet doing its job.",
+        ),
+        (
+            "java/lang/Module",
+            "isExported",
+            "(Ljava/lang/String;)Z",
+            "TWIN. essential (lib.rs) resolves the receiver with \
+             `module_name_of_mirror`; p59 uses `read_module_name`. Both then ask \
+             the VM's export graph.",
+        ),
+        (
+            "java/lang/Module",
+            "isExported",
+            "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            "TWIN. Qualified form of the row above; same receiver-resolution \
+             difference.",
+        ),
+        (
+            "java/lang/Module",
+            "isOpen",
+            "(Ljava/lang/String;)Z",
+            "TWIN. Same shape as `isExported(String)`, against the opens graph.",
+        ),
+        (
+            "java/lang/Module",
+            "isOpen",
+            "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            "TWIN. Qualified form of the row above.",
+        ),
+        (
+            "java/lang/module/ModuleDescriptor",
+            "name",
+            "()Ljava/lang/String;",
+            "TWIN. essential: `reflect_annotations::register_module_builder_overrides`, \
+             reached from `register_essential_natives_with_shims`, on a \
+             16-slot descriptor written by NAME. p59 reads slot 0 of the 2-slot \
+             descriptor its own `getDescriptor` allocates.",
+        ),
+        (
+            "java/lang/module/ModuleDescriptor",
+            "isAutomatic",
+            "()Z",
+            "TWIN. Was P59-ONLY when this guard was written (\"resolves once the \
+             getDescriptor branch merges\"). It merged, via \
+             `register_module_builder_overrides`. Stale row deleted.",
+        ),
+        (
+            "java/lang/module/ModuleDescriptor",
+            "isOpen",
+            "()Z",
+            "TWIN. Same history as `isAutomatic` above.",
+        ),
+        (
+            "java/lang/Class",
+            "getModule",
+            "()Ljava/lang/Module;",
+            "TWIN. essential (lib.rs) caches ONE canonical Module per module \
+             name, because the JDK compares Modules by identity and a fresh \
+             instance per call broke \
+             `Throwable.validateSuppressedExceptionsList`. p59 has its own \
+             canonical-per-name cache. Two caches for one identity invariant.",
+        ),
+    ];
+
+    /// Partitions `register_p59_module`'s triples against
+    /// `register_essential_natives` and ratchets BOTH halves, in BOTH
+    /// directions, against the two lists above.
+    ///
+    /// **What makes this fail.** Any of:
+    ///
+    /// 1. a triple `register_p59_module` registers that `register_essential_natives`
+    ///    does not, and that `P59_ONLY` does not name — the original check, the
+    ///    "silently missing from the build that matters" shape that broke
+    ///    `Module.getDescriptor()`;
+    /// 2. a triple registered by BOTH and not named in `P59_AND_ESSENTIAL` —
+    ///    the shape the original check was structurally unable to see, because
+    ///    `p59.difference(&essential)` is empty for exactly the triples where
+    ///    two bodies compete and the mode decides which one runs;
+    /// 3. a row in either list that no longer describes reality — a triple that
+    ///    stopped being p59-only because the essential path picked it up, or
+    ///    stopped being double-registered because one side dropped it. Three
+    ///    such rows were found stale when this ratchet was added
+    ///    (`Module.getDescriptor`, `ModuleDescriptor.isAutomatic`,
+    ///    `ModuleDescriptor.isOpen`), all of which the one-way `difference`
+    ///    check had been quietly carrying as permission;
+    /// 4. the same triple named on both lists, or twice on one list.
+    ///
+    /// It does NOT compare BODIES. Nothing here can tell you that p59's
+    /// `ModuleLayer.modules()` dropped the `servicesCatalog` side effect the
+    /// essential twin has — only that both register the method, and that
+    /// somebody had to write down which one wins where. That is the whole
+    /// claim: an unnamed intersection triple is now loud, and a name left
+    /// behind after the intersection changes is also loud.
     #[test]
     fn phase59_module_vs_essential_natives() {
         let p59 = dump_triples(|r| register_p59_module(r));
         let essential = dump_triples(|r| register_essential_natives(r));
 
-        let already_triaged: BTreeSet<(String, String, String)> = [
-            (
-                "java/lang/Module",
-                "getDescriptor",
-                "()Ljava/lang/module/ModuleDescriptor;",
-            ),
-            ("java/lang/Module", "isNamed", "()Z"),
-            ("java/lang/Module", "toString", "()Ljava/lang/String;"),
-            (
-                "java/lang/Module",
-                "addReads",
-                "(Ljava/lang/Module;)Ljava/lang/Module;",
-            ),
-            ("java/lang/module/ModuleDescriptor", "isAutomatic", "()Z"),
-            ("java/lang/module/ModuleDescriptor", "isOpen", "()Z"),
-        ]
-        .into_iter()
-        .map(|(c, m, d)| (c.to_string(), m.to_string(), d.to_string()))
-        .collect();
+        let declared_only = declared("P59_ONLY", P59_ONLY);
+        let declared_both = declared("P59_AND_ESSENTIAL", P59_AND_ESSENTIAL);
+        let on_both_lists: Vec<_> = declared_only.intersection(&declared_both).collect();
+        assert!(
+            on_both_lists.is_empty(),
+            "a triple cannot be both p59-only and double-registered; \
+             listed twice: {on_both_lists:?}"
+        );
 
-        let missing: Vec<_> = p59
-            .difference(&essential)
-            .filter(|t| !already_triaged.contains(*t))
-            .collect();
-        if !missing.is_empty() {
-            let report = missing
-                .iter()
-                .map(|(c, m, d)| format!("{c}.{m}{d}"))
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            panic!(
-                "\n{} NEW triple(s) registered in register_p59_module but NOT \
-                 in register_essential_natives, and not in the already-triaged \
-                 allowlist above (candidates for the same class of gap that \
-                 broke Module.getDescriptor() — triage against a real-HotSpot \
-                 probe before fixing or allowlisting):\n  {}\n",
-                missing.len(),
-                report
-            );
+        let actual_only: BTreeSet<(String, String, String)> =
+            p59.difference(&essential).cloned().collect();
+        let actual_both: BTreeSet<(String, String, String)> =
+            p59.intersection(&essential).cloned().collect();
+
+        fn audit(
+            problems: &mut Vec<String>,
+            label: &str,
+            actual: &BTreeSet<(String, String, String)>,
+            listed: &BTreeSet<(String, String, String)>,
+            undeclared_hint: &str,
+            stale_hint: &str,
+        ) {
+            for t in actual.difference(listed) {
+                problems.push(format!(
+                    "UNDECLARED in {label}: {}.{}{} — {undeclared_hint}",
+                    t.0, t.1, t.2
+                ));
+            }
+            for t in listed.difference(actual) {
+                problems.push(format!(
+                    "STALE row in {label}: {}.{}{} — {stale_hint}",
+                    t.0, t.1, t.2
+                ));
+            }
         }
+
+        let mut problems: Vec<String> = Vec::new();
+        audit(
+            &mut problems,
+            "P59_ONLY",
+            &actual_only,
+            &declared_only,
+            "register_p59_module registers it and register_essential_natives does \
+             not, so it is missing from the build the corpora run. Triage against \
+             a real-HotSpot probe, then either register it on the essential path \
+             or add a P59_ONLY row saying why that is correct.",
+            "it is no longer p59-only. If the essential path picked it up, MOVE \
+             the row to P59_AND_ESSENTIAL and say which body wins in which mode; \
+             if p59 dropped it, DELETE the row. Leaving it here is how a triaged \
+             list turns into permission.",
+        );
+        audit(
+            &mut problems,
+            "P59_AND_ESSENTIAL",
+            &actual_both,
+            &declared_both,
+            "BOTH registrars install a body for this triple. In synthetic-jdk mode \
+             phase 59 runs last and WINS; in --real-jdk/--jdk-only phase 59 is \
+             never called and the essential body is the only one. Read both \
+             bodies, then add a row saying whether they are the same fn item \
+             (SHARED FN) or two implementations (TWIN) and what the difference \
+             is for. An unread intersection is how ModuleLayer.modules() lost \
+             its servicesCatalog side effect in one mode only.",
+            "it is no longer double-registered. Find out which side dropped it: \
+             if the essential path did, this is now a p59-only triple and the \
+             row belongs in P59_ONLY; if p59 did, DELETE the row.",
+        );
+
+        assert!(
+            problems.is_empty(),
+            "\n{} problem(s) in the phase-59 / essential module-native \
+             partition:\n  {}\n",
+            problems.len(),
+            problems.join("\n  ")
+        );
     }
 }
 

@@ -6952,6 +6952,83 @@ pub(crate) fn register_atomic_extras_natives(registry: &mut NativeMethodRegistry
 // which is what the scalar `AtomicInteger` natives have always used. Route
 // every array RMW through it.
 
+/// Range-check an atomic-array element index, throwing HotSpot's
+/// `ArrayIndexOutOfBoundsException` when it is out of range.
+///
+/// **Why this has to exist at all.** The heap DOES range-check --
+/// `VmHeap::get_array_element` returns `Err(index)` past the end and
+/// `set_array_element` writes nothing -- but `vm_exec.rs`'s `NativeContext`
+/// impl deliberately swallows both results (`get` ends in a typed default,
+/// `set` in `let _ = ...`), and its own doc comment says so: *"The caller
+/// range-checks."* Every `AtomicIntegerArray` / `AtomicLongArray` /
+/// `AtomicReferenceArray` native below was a caller that never did. Measured
+/// on a 3-element array:
+///
+/// ```text
+///                            HotSpot 25.0.3+9        CratonVM (before)
+/// ARA.get(-1)                AIOOBE                  null
+/// ARA.get(3) / get(100)      AIOOBE                  null
+/// AIA.get(-1) / get(3)       AIOOBE                  0
+/// ARA.set(-1, "x")           AIOOBE                  silently no-op
+/// AIA.compareAndSet(-1,0,9)  AIOOBE                  returned true, wrote nothing
+/// ```
+///
+/// This is a *missing-exception* defect, not a memory-safety one: the heap's
+/// own check still suppresses the access, so no out-of-range read or write
+/// reaches adjacent memory (verified with a sentinel neighbour swept over
+/// -32..63). It is still serious -- an off-by-one gets a plausible `null`/`0`
+/// and the program keeps running, and a *write* that silently does nothing is
+/// worse than a read that answers wrong, because the loss surfaces arbitrarily
+/// far away. A `compareAndSet` that reports success without storing is the
+/// sharpest form: it is the same idiom H2's `TestFileSystem.testConcurrent`
+/// uses as a spin lock.
+///
+/// The check lives on a shared funnel rather than on each accessor for the
+/// reason `lang_invoke`'s `vh_array_index` gives for the identical decision on
+/// the VarHandle side: there are ~26 registered triples per class here, and a
+/// check added to twenty-five of them is a silent hole in the twenty-sixth.
+/// `RuntimeError::aioobe` produces HotSpot's exact text
+/// (`Index -1 out of bounds for length 3`).
+///
+/// The negative case is the one that mattered most: the old code did
+/// `*v as usize`, so `-1` became `usize::MAX` and only the heap's own
+/// `index >= len` test stopped it from being a wild read.
+pub(crate) fn atomic_array_index(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    idx: i32,
+) -> Result<usize, MethodCallFailed> {
+    let len = ctx.array_length(arr);
+    if idx < 0 || (idx as usize) >= len {
+        return Err(RuntimeError::aioobe(idx, len as i32).into());
+    }
+    Ok(idx as usize)
+}
+
+/// Read the `int` index argument of an atomic-array native WITHOUT widening it
+/// to `usize`. The widening is what erased the sign; keep it `i32` until
+/// [`atomic_array_index`] has passed judgement on it.
+pub(crate) fn atomic_array_raw_index(args: &[Value]) -> i32 {
+    match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    }
+}
+
+/// Validate the `length` argument of an atomic-array constructor.
+///
+/// `new AtomicIntegerArray(-1)` throws `NegativeArraySizeException: -1` on
+/// HotSpot (measured; same for the `Long` and `Reference` twins). The old code
+/// did `as usize`, handing `18446744073709551615` to `new_array` -- which is
+/// either a catchable `OutOfMemoryError` or a hard abort depending on whether
+/// a JIT frame is in between, and is the wrong exception either way.
+pub(crate) fn atomic_array_new_length(len: i32) -> Result<usize, MethodCallFailed> {
+    if len < 0 {
+        return Err(RuntimeError::NegativeArraySizeException { size: len }.into());
+    }
+    Ok(len as usize)
+}
+
 /// Atomically apply `f` to element `idx` of `arr`, retrying until the CAS wins.
 /// Returns `(previous, new)`. `f` must be side-effect free -- it can run more
 /// than once.
@@ -6984,70 +7061,66 @@ pub(crate) fn atomic_array_cas(
     ctx.compare_and_swap_field(arr, idx, expected, update)
 }
 
+/// Resolve `(backing array, RANGE-CHECKED index)` for an atomic-array element
+/// native whose backing array lives in slot 0 (`AtomicIntegerArray` /
+/// `AtomicLongArray`).
+///
+/// `Ok(None)` means the receiver or the backing array is missing, which keeps
+/// each caller's historical typed default. `Err` means the index was out of
+/// range and HotSpot would have thrown -- see [`atomic_array_index`].
+fn atomic_array_slot(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Option<(ObjectRef, usize)>, MethodCallFailed> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let raw = atomic_array_raw_index(args);
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    Ok(Some((arr, atomic_array_index(ctx, arr, raw)?)))
+}
+
 // --- AtomicIntegerArray ---
 fn native_aia_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let len = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let len = atomic_array_new_length(atomic_array_raw_index(args))?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, len);
     ctx.set_field(this, 0, Value::Object(Some(arr)));
     Ok(None)
 }
 
 fn native_aia_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(ctx.get_array_element(arr, idx)))
 }
 
 fn native_aia_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
     let val = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(None),
     };
     ctx.set_array_element(arr, idx, Value::Int(val));
     Ok(None)
 }
 
 fn native_aia_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let new_val = match args.get(2) {
         Some(Value::Int(v)) => *v,
@@ -7058,17 +7131,9 @@ fn native_aia_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_aia_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let expected = match args.get(2) {
         Some(Value::Int(v)) => *v,
@@ -7083,17 +7148,9 @@ fn native_aia_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_aia_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
         Value::Int(cur.as_int().unwrap_or(0).wrapping_add(1))
@@ -7103,17 +7160,9 @@ fn native_aia_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_aia_get_and_dec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
         Value::Int(cur.as_int().unwrap_or(0).wrapping_sub(1))
@@ -7123,17 +7172,9 @@ fn native_aia_get_and_dec(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_aia_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let delta = match args.get(2) {
         Some(Value::Int(v)) => *v,
@@ -7146,17 +7187,9 @@ fn native_aia_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_aia_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
         Value::Int(cur.as_int().unwrap_or(0).wrapping_add(1))
@@ -7166,17 +7199,9 @@ fn native_aia_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_aia_dec_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
         Value::Int(cur.as_int().unwrap_or(0).wrapping_sub(1))
@@ -7198,21 +7223,13 @@ fn native_aia_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_aia_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
     let delta = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
         Value::Int(cur.as_int().unwrap_or(0).wrapping_add(delta))
@@ -7223,14 +7240,6 @@ fn native_aia_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// `compareAndExchange`: like `compareAndSet` but returns the WITNESS value
 /// (the value actually found), not a boolean.
 fn native_aia_cae(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
     let expected = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -7239,9 +7248,9 @@ fn native_aia_cae(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     loop {
         let current = ctx.get_array_element(arr, idx);
@@ -7260,64 +7269,37 @@ fn native_ala_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let len = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let len = atomic_array_new_length(atomic_array_raw_index(args))?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, len);
     ctx.set_field(this, 0, Value::Object(Some(arr)));
     Ok(None)
 }
 
 fn native_ala_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Long(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(ctx.get_array_element(arr, idx)))
 }
 
 fn native_ala_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
     let val = match args.get(2) {
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(None),
     };
     ctx.set_array_element(arr, idx, Value::Long(val));
     Ok(None)
 }
 
 fn native_ala_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Long(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
     };
     let new_val = match args.get(2) {
         Some(Value::Long(v)) => *v,
@@ -7328,17 +7310,9 @@ fn native_ala_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_ala_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
     };
     let expected = match args.get(2) {
         Some(Value::Long(v)) => *v,
@@ -7353,17 +7327,9 @@ fn native_ala_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_ala_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Long(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
     };
     let (old, _) = atomic_array_rmw(ctx, arr, idx, |cur| {
         Value::Long(cur.as_long().unwrap_or(0).wrapping_add(1))
@@ -7372,17 +7338,9 @@ fn native_ala_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_ala_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Long(0))),
+    let (arr, idx) = match atomic_array_slot(ctx, args)? {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
     };
     let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
         Value::Long(cur.as_long().unwrap_or(0).wrapping_add(1))
@@ -7390,24 +7348,20 @@ fn native_ala_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(new_val))
 }
 
-/// Resolve `(backing array, index)` for an `AtomicLongArray` native call.
-fn ala_target(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, usize)> {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return None,
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => Some((o, idx)),
-        _ => None,
-    }
+/// Resolve `(backing array, RANGE-CHECKED index)` for an `AtomicLongArray`
+/// native call. Was an unchecked `Option`-returning helper that widened the
+/// index with `as usize`; it is now a thin alias for [`atomic_array_slot`] so
+/// the five callers below get the bounds check for free rather than each
+/// needing its own.
+fn ala_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Option<(ObjectRef, usize)>, MethodCallFailed> {
+    atomic_array_slot(ctx, args)
 }
 
 fn native_ala_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let (arr, idx) = match ala_target(ctx, args) {
+    let (arr, idx) = match ala_target(ctx, args)? {
         Some(t) => t,
         None => return Ok(Some(Value::Long(0))),
     };
@@ -7422,7 +7376,7 @@ fn native_ala_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_ala_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let (arr, idx) = match ala_target(ctx, args) {
+    let (arr, idx) = match ala_target(ctx, args)? {
         Some(t) => t,
         None => return Ok(Some(Value::Long(0))),
     };
@@ -7437,7 +7391,7 @@ fn native_ala_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_ala_get_and_dec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let (arr, idx) = match ala_target(ctx, args) {
+    let (arr, idx) = match ala_target(ctx, args)? {
         Some(t) => t,
         None => return Ok(Some(Value::Long(0))),
     };
@@ -7448,7 +7402,7 @@ fn native_ala_get_and_dec(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_ala_dec_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let (arr, idx) = match ala_target(ctx, args) {
+    let (arr, idx) = match ala_target(ctx, args)? {
         Some(t) => t,
         None => return Ok(Some(Value::Long(0))),
     };
@@ -7459,7 +7413,7 @@ fn native_ala_dec_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_ala_cae(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let (arr, idx) = match ala_target(ctx, args) {
+    let (arr, idx) = match ala_target(ctx, args)? {
         Some(t) => t,
         None => return Ok(Some(Value::Long(0))),
     };

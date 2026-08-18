@@ -177,6 +177,17 @@ struct HttpsPeerInfo {
     /// JSSE spelling (see `t27_tls`'s `suite_to_java_cipher_name`), not
     /// rustls's `Debug` spelling.
     cipher: String,
+    /// The CONNECTION-level view of this exchange has been torn down — see
+    /// [`https_recycle_carrier`]. The entry is kept rather than removed for one
+    /// load-bearing reason: [`https_ensure_exchanged`] treats "no entry" as
+    /// "this connection has never handshaked" and drives a fresh exchange, so
+    /// removing the entry would make the very next accessor re-issue the HTTPS
+    /// request over the network and repopulate the table — the accessor would
+    /// answer again, and it would have made a second request to do it.
+    ///
+    /// A `record_https_peer_info` for the same carrier clears it: a connection
+    /// that was recycled and then genuinely re-handshaked is open again.
+    recycled: bool,
 }
 
 /// Peer info per connection object, keyed by identity hash.
@@ -213,8 +224,148 @@ fn record_https_peer_info(
         HttpsPeerInfo {
             chain_der: chain_der.to_vec(),
             cipher: cipher.to_string(),
+            recycled: false,
         },
     );
+}
+
+/// Tear down the CONNECTION-level view of a completed `https:` exchange, the
+/// way HotSpot does when the connection leaves the application's hands.
+///
+/// MEASURED, HotSpot 25.0.3+9-LTS (`scratchpad/g7/TlsProbe.java`, transcribed
+/// in `G7-1` §1d): after `disconnect()` all six `HttpsURLConnection` session
+/// accessors throw `IllegalStateException: connection not yet open` again — the
+/// same exception, with the same message, that a never-handshaked connection
+/// throws. The message describes the STATE and not the call order, which is why
+/// the pre-connect and post-disconnect rows are identical. CratonVM kept
+/// answering for the life of the carrier object.
+///
+/// Both tables are torn down, because the six accessors read from two of them
+/// (`G7-1` §5.1): the five this file owns read [`https_peer_info`], and
+/// `getSSLSession` — the one name this file deliberately does not register —
+/// reads `net_phase_e`'s `https_carrier_sessions`. Recycling one and not the
+/// other would leave the six disagreeing about whether the connection is open,
+/// which is the split that table comment warns about made real.
+///
+/// `forget_https_carrier_session` is called UNCONDITIONALLY, not only when this
+/// file's table has an entry. The two populators do not agree on when they
+/// fire: `record_https_peer_info` early-returns for an empty peer chain, while
+/// `record_https_carrier_session` runs on every completed handshake, so an
+/// anonymous-suite exchange has a carrier session and no peer info. Gating the
+/// release on this table would leak exactly those.
+///
+/// It is also the first call site `net_phase_e::forget_https_carrier_session`
+/// has ever had, and therefore the first time anything is removed from
+/// `https_carrier_sessions` — which, since `aed6a3b73`, also holds a global
+/// root on one `SSLSession` per entry. Until now that table grew by one entry
+/// per HTTPS carrier for the life of the process.
+fn https_recycle_carrier(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let carrier_key = crate::net_phase_e::native_obj_key(&*ctx, this);
+    https_recycle_carrier_by_key(ctx, carrier_key);
+}
+
+/// The response streams currently outstanding for an `https` carrier, mapping
+/// the stream's identity to the carrier's key.
+///
+/// WHY A TABLE AND NOT A FIELD ON THE STREAM. The object handed to Java is a
+/// `java/io/ByteArrayInputStream` with the JDK's own four-field layout
+/// (`buf`, `pos`, `mark`, `count`); there is no spare slot, and writing one
+/// would corrupt a real field — the same rule `HttpsPeerInfo`'s own comment
+/// states for the carrier. The observer is handed the stream and nothing
+/// else, so the association has to live somewhere it can be looked up by
+/// stream identity.
+///
+/// **Bounded.** A row is inserted only for a carrier that already has an
+/// `https_peer_info` entry (i.e. a real TLS exchange), and is removed by the
+/// first `Eof` or `Close` the stream produces. A stream that is neither
+/// drained nor closed leaves one two-integer row — strictly less than what
+/// this whole mechanism removes, since an unrecycled carrier holds a GC root
+/// on an `SSLSession` for the life of the process.
+fn https_response_streams() -> &'static Mutex<HashMap<u64, crate::net_phase_e::NativeObjKey>> {
+    static R: OnceLock<Mutex<HashMap<u64, crate::net_phase_e::NativeObjKey>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remember that `stream` is the response body of `carrier`, so draining it
+/// recycles the connection the way HotSpot's `KeepAliveCache` does.
+///
+/// A no-op unless the carrier has a recorded TLS exchange: a plain `http:`
+/// connection has no session state to tear down, and registering one would
+/// grow the table for every non-TLS request in the process for no effect.
+fn note_response_stream(ctx: &dyn NativeContext, stream: ObjectRef, carrier: Option<ObjectRef>) {
+    let Some(carrier) = carrier else { return };
+    let carrier_key = crate::net_phase_e::native_obj_key(ctx, carrier);
+    if !https_peer_info()
+        .lock()
+        .map(|t| t.contains_key(&(carrier_key.identity as u32 as u64)))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Ok(mut table) = https_response_streams().lock() {
+        table.insert(ctx.identity_hash_code(stream) as u32 as u64, carrier_key);
+    }
+}
+
+/// The `BaisEvent` observer: HotSpot's drain instant, made observable.
+///
+/// MEASURED contract (G44-1 N2, `RSslLiveSession`'s `drainTrap` family): once
+/// the response body is fully drained the connection returns to the
+/// `KeepAliveCache` and every CONNECTION-level accessor throws
+/// `IllegalStateException: connection not yet open` again — the same exception
+/// a never-handshaked connection throws — while **the `SSLSession` object the
+/// application already holds stays valid**. That second half is the row that
+/// separates "recycled" from "destroyed", and it is why this recycles the
+/// CARRIER's view and never touches the session object.
+///
+/// Both events are handled and the row is removed on the first of them, so
+/// the `Eof`-then-`Close` sequence a drained-and-closed stream produces
+/// recycles once. `BaisEvent::Eof` fires on every exhausted read rather than
+/// on the transition (its doc explains why the transition is not observable),
+/// so idempotence here is required, not defensive.
+fn huc_live_bais_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    _event: cratonvm_native_api::registry::BaisEvent,
+) -> Result<(), MethodCallFailed> {
+    let stream_key = ctx.identity_hash_code(stream) as u32 as u64;
+    // Scoped so the lock is released before the call below, which takes two
+    // more process-global locks and can release a GC root. Same rule, and the
+    // same reason, as the scoped guard in `https_recycle_carrier_by_key`.
+    let carrier_key = {
+        let Ok(mut table) = https_response_streams().lock() else {
+            return Ok(());
+        };
+        table.remove(&stream_key)
+    };
+    if let Some(key) = carrier_key {
+        https_recycle_carrier_by_key(ctx, key);
+    }
+    Ok(())
+}
+
+/// [`https_recycle_carrier`] for a caller holding the carrier's KEY rather
+/// than the object — see [`huc_live_bais_event`], which is handed the response
+/// stream and has no way back to the carrier except this key.
+fn https_recycle_carrier_by_key(
+    ctx: &mut dyn NativeContext,
+    carrier_key: crate::net_phase_e::NativeObjKey,
+) {
+    let key = carrier_key.identity as u32 as u64;
+    // Scoped, and NOT written as `if let Some(..) = https_peer_info().lock()
+    // ...`: under Rust 2021's drop rules the guard produced in an `if let`
+    // scrutinee lives to the end of the block, so the process-global lock would
+    // still be held across the `forget_https_carrier_session` call below —
+    // which takes another process-global lock and can release a GC root. That
+    // is the "native holds a lock across a call that re-enters the VM" cycle
+    // this workspace has already paid for once.
+    {
+        let mut table = https_peer_info().lock().unwrap();
+        if let Some(info) = table.get_mut(&key) {
+            info.recycled = true;
+        }
+    }
+    crate::net_phase_e::forget_https_carrier_session_by_key(ctx, carrier_key);
 }
 
 /// Make sure the exchange that produces the handshake info has actually run.
@@ -233,6 +384,13 @@ fn record_https_peer_info(
 /// `SSLPeerUnverifiedException`, and the caller below raises that when the
 /// table is still empty. A connect failure surfaces properly on the next
 /// `getResponseCode`/`getInputStream`.
+///
+/// The early return below is `contains_key`, deliberately NOT
+/// "contains a live entry": a RECYCLED carrier must not re-issue its request.
+/// That is why [`https_recycle_carrier`] flips a flag instead of removing the
+/// row — remove it and this function would drive a second HTTPS exchange on the
+/// next accessor call, repopulate the table, and answer as if the connection
+/// had never been torn down.
 fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // Key before the guard — see `record_https_peer_info`.
     let key = ctx.identity_hash_code(this) as u32 as u64;
@@ -248,30 +406,113 @@ fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let _ = ensure_connected(ctx, this);
 }
 
-/// The peer chain recorded for `this`, or an `SSLPeerUnverifiedException` when
-/// there is none — the JSSE contract `HttpsURLConnection.getServerCertificates`
-/// documents, and the one callers actually catch.
+/// `IllegalStateException: connection not yet open` — HotSpot's answer for a
+/// session accessor called on a connection that has never handshaked.
+///
+/// **G7 — this is a DIFFERENT refusal from `SSLPeerUnverifiedException`, and
+/// the two were conflated here.** MEASURED, HotSpot 25.0.3+9-LTS,
+/// `scratchpad/g7/TlsProbe.java`, against a real loopback HTTPS server:
+///
+/// ```text
+///   before connect()   getCipherSuite         -> IllegalStateException: connection not yet open
+///                      getServerCertificates  -> IllegalStateException: connection not yet open
+///                      getLocalCertificates   -> IllegalStateException: connection not yet open
+///                      getPeerPrincipal       -> IllegalStateException: connection not yet open
+///                      getLocalPrincipal      -> IllegalStateException: connection not yet open
+///                      getSSLSession          -> IllegalStateException: connection not yet open
+///   after  connect()   real values; getSSLSession isPresent = true
+///   after  disconnect() IllegalStateException: connection not yet open   (again)
+/// ```
+///
+/// All six, one message, and the post-`disconnect()` row shows the message is
+/// about the state and not about the call order. `SSLPeerUnverifiedException`
+/// is the answer to a DIFFERENT question — the connection is open and the peer
+/// did not authenticate — and it is the one `getServerCertificates` and
+/// `getPeerPrincipal` declare in their throws clause.
+///
+/// SOURCE-VERIFIED, `javap -p javax.net.ssl.HttpsURLConnection` on the oracle:
+///
+/// ```text
+///   public abstract java.lang.String getCipherSuite();
+///   public abstract java.security.cert.Certificate[] getLocalCertificates();
+///   public abstract java.security.cert.Certificate[] getServerCertificates()
+///           throws javax.net.ssl.SSLPeerUnverifiedException;
+///   public java.security.Principal getPeerPrincipal()
+///           throws javax.net.ssl.SSLPeerUnverifiedException;
+///   public java.security.Principal getLocalPrincipal();
+/// ```
+///
+/// So `getCipherSuite` and the two "local" accessors have NO checked exception
+/// in their signature at all: raising `SSLPeerUnverifiedException` (an
+/// `IOException` subclass) out of them delivered an undeclared checked
+/// exception through a `throws`-free method, which no `catch` written against
+/// this API can name.
+fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/IllegalStateException",
+        "connection not yet open",
+    )
+}
+
+/// Has a handshake been recorded against `this` at all?
+///
+/// The discriminator between the two refusals above: no entry means the
+/// exchange never completed (`connection not yet open`); an entry with an empty
+/// chain means it did and the peer presented nothing
+/// (`peer not authenticated`).
+///
+/// A RECYCLED entry answers `false`, not `true`. It records that a handshake
+/// once happened, which is not the question — the question is whether this
+/// CONNECTION is open now, and after [`https_recycle_carrier`] it is not. See
+/// that function for HotSpot's measured post-`disconnect()` transcript.
+fn https_has_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    https_ensure_exchanged(ctx, this);
+    let key = ctx.identity_hash_code(this) as u32 as u64;
+    https_peer_info()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|info| !info.recycled)
+}
+
+/// The peer chain recorded for `this`, or the measured refusal for the state
+/// it is in: `IllegalStateException` when no handshake was ever recorded,
+/// `SSLPeerUnverifiedException` when one was and it carried no chain.
 fn https_peer_chain_or_throw(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     https_ensure_exchanged(ctx, this);
     let key = ctx.identity_hash_code(this) as u32 as u64;
-    // Cloned out first: the `match` arm below re-enters the VM through
-    // `throw_jca_exc`, and as a `match` scrutinee the guard would still be
-    // alive there.
-    let chain = https_peer_info()
+    // A recycled entry is filtered out here rather than matched below, so it
+    // lands on the `None` arm — `IllegalStateException: connection not yet
+    // open`, which is HotSpot's measured post-`disconnect()` answer, and NOT
+    // `SSLPeerUnverifiedException`, which would claim the connection is open
+    // and the peer anonymous.
+    let found = https_peer_info()
         .lock()
         .unwrap()
         .get(&key)
+        .filter(|info| !info.recycled)
         .map(|info| info.chain_der.clone());
-    match chain {
+    match found {
         Some(chain) if !chain.is_empty() => Ok(chain),
-        _ => Err(crate::phases_early::throw_jca_exc(
+        // An entry exists, so the handshake happened; it just produced no
+        // chain. That is the state `SSLPeerUnverifiedException` names, and it
+        // is the exception both of this helper's callers declare.
+        Some(_) => Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLPeerUnverifiedException",
             "peer not authenticated",
         )),
+        // RESIDUAL, stated because it makes this arm reachable more often than
+        // it should be: `record_https_peer_info` early-returns when the chain
+        // is empty, so an anonymous-suite handshake leaves NO entry and lands
+        // here rather than one line above. Fixing that means recording the
+        // entry unconditionally, which is `record_https_peer_info`'s call
+        // contract and is left alone here — see G7-1 §5.
+        None => Err(https_not_yet_open(ctx)),
     }
 }
 
@@ -293,6 +534,52 @@ fn https_peer_chain_or_throw(
 /// needed: an app that reads the chain almost always reads the cipher suite
 /// beside it, and leaving the siblings abstract just moves the same
 /// `AbstractMethodError` one line down.
+///
+/// ## G7 — THIS registrar wins, and the other one's comment says it cannot
+///
+/// `net_phase_e.rs` has a function of the SAME NAME,
+/// `register_https_session_accessors`, registering the same six names on the
+/// same two classes. Its doc comment reasons about which copy is live and
+/// concludes: *"None of the six names below appear in `register_one`, so none
+/// of them can be overwritten by it. If a later change adds any of them there,
+/// THAT copy wins and this one goes silently dead."*
+///
+/// The premise is true of `register_one` and the conclusion is false, because
+/// the names were added to THIS function instead — a second registrar in the
+/// same file, reached from the same `register_http_url_connection_real`:
+///
+/// ```text
+///   lib.rs:18688  net_phase_e::register_phase_e_networking
+///                   -> register_re4_url_http -> register_https_session_accessors  (6 names)
+///   lib.rs:18805  http_url_connection::register_http_url_connection_real
+///                   -> register_https_session_accessors(r, "sun/net/www/protocol/https/HttpsURLConnectionImpl")
+///                   -> register_https_session_accessors(r, "javax/net/ssl/HttpsURLConnection")   (5 names)
+/// ```
+///
+/// Both calls are inside `register_essential_natives_with_shims`, 18805 after
+/// 18688, and registration is last-write-wins. So on the real-JDK path the
+/// bodies below own `getServerCertificates`, `getLocalCertificates`,
+/// `getCipherSuite`, `getPeerPrincipal` and `getLocalPrincipal`, and
+/// net_phase_e's five copies are dead. `getSSLSession` is the ONE name this
+/// function does not register, so net_phase_e's survives for it alone.
+///
+/// **The consequence is that the six accessors answer from TWO DIFFERENT
+/// TABLES.** These five read `https_peer_info()` (this file, populated by
+/// `record_https_peer_info` on the handshake path); the surviving
+/// `getSSLSession` reads net_phase_e's `https_carrier_session` (populated by
+/// `record_https_carrier_session`, called from `huc_verify_hostname` STEP 0).
+/// Both populators run on the same successful exchange, so the split is not
+/// currently observable — but it is one deleted call away from being so, and
+/// it is why the refusal wording had drifted apart between the two halves
+/// (net_phase_e's `https_not_yet_open` was already right; this file's
+/// `SSLPeerUnverifiedException` was not). NOMINATED in G7-1: collapse the two
+/// registrars and the two tables into one.
+///
+/// Established by reading the two call sites in `lib.rs`, not from either
+/// comment — this file's own history (C6-3) is that a comment about which body
+/// runs is the least reliable thing in the tree. It has NOT been confirmed
+/// against a `--dump-native-registry` dump, because no binary carrying this
+/// change exists yet; that check is listed for the orchestrator in G7-1 §7.
 fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
     r.register(
         cls,
@@ -311,29 +598,52 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
     );
     // No client certificate is ever sent by `perform` (it builds its rustls
     // client config without one), so this is `null` — the JDK's own answer for
-    // a connection that did not authenticate itself, not a stand-in.
+    // a connection that did not authenticate itself, not a stand-in. MEASURED
+    // and confirmed: a completed client connection answers `null` here, and so
+    // does `getLocalPrincipal` below.
+    //
+    // G7: but only ONCE THE CONNECTION IS OPEN. This body used to answer `null`
+    // unconditionally, including before any handshake, where HotSpot throws
+    // `IllegalStateException: connection not yet open` (measured — see
+    // `https_not_yet_open`). A `null` there is the silent-lie shape this VM
+    // removes elsewhere: it tells a caller "no local certificate was sent" for
+    // a connection that has not been opened, which is an answer to a question
+    // that has no answer yet.
     r.register(
         cls,
         "getLocalCertificates",
         "()[Ljava/security/cert/Certificate;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !https_has_session(ctx, this) {
+                return Err(https_not_yet_open(ctx));
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
     r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         https_ensure_exchanged(ctx, this);
         let key = ctx.identity_hash_code(this) as u32 as u64;
+        // `filter` before `map`: a recycled connection has no cipher suite to
+        // report, and falls through to the refusal below. See
+        // `https_recycle_carrier`.
         let cipher = https_peer_info()
             .lock()
             .unwrap()
             .get(&key)
+            .filter(|i| !i.recycled)
             .map(|i| i.cipher.clone());
         match cipher {
             Some(c) if !c.is_empty() => Ok(Some(Value::Object(Some(ctx.create_string(&c))))),
-            _ => Err(crate::phases_early::throw_jca_exc(
-                ctx,
-                "javax/net/ssl/SSLPeerUnverifiedException",
-                "peer not authenticated",
-            )),
+            // G7: `IllegalStateException`, not `SSLPeerUnverifiedException`.
+            // `getCipherSuite()` is declared `public abstract String
+            // getCipherSuite();` with NO throws clause (SOURCE-VERIFIED by
+            // `javap` — see `https_not_yet_open`), so the old refusal was an
+            // undeclared checked exception out of a method whose signature
+            // cannot name it. HotSpot's measured refusal in this state is
+            // `IllegalStateException: connection not yet open`.
+            _ => Err(https_not_yet_open(ctx)),
         }
     });
     r.register(
@@ -362,11 +672,20 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
             }
         },
     );
+    // Same split as `getLocalCertificates` above: `null` once the connection is
+    // open (MEASURED — a client that sent no certificate has no local
+    // principal), the "not yet open" refusal before that.
     r.register(
         cls,
         "getLocalPrincipal",
         "()Ljava/security/Principal;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !https_has_session(ctx, this) {
+                return Err(https_not_yet_open(ctx));
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
 }
 
@@ -1020,6 +1339,15 @@ fn huc_real_perform(
                 e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
             ))
         }
+        // An application `HostnameVerifier` was consulted and answered `false`.
+        // MEASURED: a plain `java.io.IOException`, NOT the
+        // `SSLPeerUnverifiedException` above — see
+        // `TLS_HOSTNAME_REFUSED_SENTINEL` for the transcript and the JDK source
+        // line.
+        Err(ref e) if e.starts_with(TLS_HOSTNAME_REFUSED_SENTINEL) => Err(ioex(
+            e.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL)
+                .to_string(),
+        )),
         // A refused TCP connect (see `CONNECT_REFUSED_SENTINEL`'s doc) must
         // reach Java as `ConnectException`, not a generic IOException — real
         // code catches it specifically (see the type's own doc).
@@ -1074,8 +1402,18 @@ fn make_response_input_stream(
     ctx: &mut dyn NativeContext,
     body: &[u8],
     truncated: bool,
+    carrier: Option<ObjectRef>,
 ) -> MethodCallResult {
     let head = make_byte_array_input_stream(ctx, body);
+    // Associate the BAIS — never the `SequenceInputStream` wrapper — with the
+    // carrier: the BAIS is what `native-io` observes, and on the truncated
+    // path the wrapper produces no `BaisEvent` of its own. The truncated case
+    // is registered too, deliberately: its EOF still means the application is
+    // done with the bytes that arrived, and the error tail that follows is a
+    // read failure, not a reason to keep the connection's view open.
+    if let Ok(Value::Object(Some(head_ref))) = head {
+        note_response_stream(&*ctx, head_ref, carrier);
+    }
     if !truncated {
         return Ok(Some(head?));
     }
@@ -1517,6 +1855,54 @@ const TLS_HANDSHAKE_FAILURE_SENTINEL: &str = "__cratonvm_tls_handshake_failure__
 /// certificate is deterministic, so retrying would just run the app's verifier
 /// a second time and fail identically.
 const TLS_PEER_UNVERIFIED_SENTINEL: &str = "__cratonvm_tls_peer_unverified__: ";
+
+/// Prefix on an error string returned by [`perform`] when an application
+/// `HostnameVerifier` WAS consulted and answered `false`.
+///
+/// **A separate sentinel from [`TLS_PEER_UNVERIFIED_SENTINEL`] because HotSpot
+/// answers it with a different exception CLASS, which is the opposite of what
+/// this file assumed.** [`huc_unverified_peer_message`]'s doc used to argue
+/// that the three ways to reach a failed endpoint identification "cannot
+/// describe the same outcome three different ways" and gave all three one
+/// message. MEASURED 2026-08-17 on HotSpot 25.0.3+9-LTS over a live loopback
+/// TLS 1.3 handshake (`scratchpad/g31/HvCase.java`, one case per process so a
+/// refusal cannot poison the next row), they are three different outcomes:
+///
+/// ```text
+///   case      installed verifier      HotSpot getResponseCode()
+///   -----     --------------------    -----------------------------------------
+///   true      returns true            200
+///   false     returns false           java.io.IOException
+///                                       Wrong HTTPS hostname: should be <127.0.0.1>
+///   throws    throws ISE              java.lang.RuntimeException
+///                                       java.lang.IllegalStateException: verifier exploded
+///   none      none installed          javax.net.ssl.SSLHandshakeException
+///                                       (certificate_unknown) No subject alternative
+///                                       names matching IP address 127.0.0.1 found
+/// ```
+///
+/// The `false` row is the one this sentinel carries, and it is a PLAIN
+/// `java.io.IOException` — `sun.net.www.protocol.https.HttpsClient
+/// .checkURLSpoofing` ends with `throw new IOException(formatMsg("Wrong HTTPS
+/// hostname%s", ...))` (SOURCE-VERIFIED against `$JAVA_HOME/lib/src.zip`),
+/// having already closed the socket and invalidated the session. It is NOT an
+/// `SSLPeerUnverifiedException`: that type is what `checkURLSpoofing` CATCHES
+/// and swallows on its way to consulting the verifier, not what it throws
+/// afterwards. Code that catches `IOException` is unaffected either way; code
+/// that switches on the type — which is the shape a pinning test has — was
+/// being told the peer could not be authenticated when what actually happened
+/// is that its own verifier said no.
+///
+/// The `none` and `throws` rows are NOT served by this sentinel and remain
+/// divergent; both are NOMINATED in G31-1 because neither can be fixed in this
+/// file (one is a rustls-layer handshake message, the other needs `perform`'s
+/// `Result<_, String>` to carry a pending Java exception).
+///
+/// `perform_with_retry` must not retry this, for the same reason it must not
+/// retry [`TLS_PEER_UNVERIFIED_SENTINEL`]: a verifier's verdict on the same
+/// certificate is deterministic. It does not, because its retry arm matches two
+/// specific strings and this is neither.
+const TLS_HOSTNAME_REFUSED_SENTINEL: &str = "__cratonvm_tls_hostname_refused__: ";
 
 /// Prefix on an error string returned by [`perform`] when its TCP connect
 /// phase failed with `ConnectionRefused` specifically. `huc_real_perform`
@@ -2192,13 +2578,49 @@ fn huc_hostname_verifier(
 ///     once `f6028ba50` started honouring the stored verifier, and is the
 ///     defect this predicate exists to prevent.
 ///
-/// `None` (a receiver whose class cannot be named) is folded in here too: with
-/// no identifiable verifier there is nothing to consult, and real JSSE treats
-/// a null verifier as the default for the same reason.
+/// **`None` IS NOT ONE OF THEM, AND THAT WAS THE BUG.** This predicate used to
+/// fold `None` in, on the reasoning that *"with no identifiable verifier there
+/// is nothing to consult, and real JSSE treats a null verifier as the default
+/// for the same reason"*. The premise is true of a NULL verifier and false of
+/// the `None` this argument actually carries: the caller has already handled a
+/// null with its own `let ... else`, so by the time `None` reaches here a
+/// verifier object EXISTS and it is only its CLASS NAME that could not be
+/// resolved. Those are different facts, and the second one is a statement about
+/// this VM, not about the application.
+///
+/// MEASURED 2026-08-17 against HotSpot 25.0.3+9-LTS on a live TLS 1.3 loopback
+/// handshake (`scratchpad/g31/HvFamily.java`, `HvCase.java`, `HvLambda.java`;
+/// certificate carries a `localhost` dNSName SAN and deliberately no iPAddress
+/// SAN, so the URL `https://127.0.0.1:<port>/` fails the built-in check and the
+/// verifier is reached). Two verifiers, same connection shape, same request:
+///
+/// ```text
+///                                     HotSpot      CratonVM (before)
+///   named class  HvFamily$Rec          calls=1      calls=1   verifier=Some("HvFamily$Rec")
+///   lambda       (h,s) -> true         calls=1      calls=0   verifier=None
+/// ```
+///
+/// A lambda's runtime class is a hidden class; `class_name_of_id` answers
+/// `None` for it, this predicate read that as "the JDK's own default is
+/// installed", and the request was refused with `SSLPeerUnverifiedException`.
+/// Every `HostnameVerifier` written the way applications actually write them —
+/// and the one `RSslLiveSession.verifier` installs — took that path.
+///
+/// The alternative diagnosis, that the per-connection field read simply fails
+/// for a lambda, is RULED OUT rather than argued away. `HvLambda decide`
+/// installs a NAMED verifier process-wide via `setDefaultHostnameVerifier` AND
+/// a lambda on the connection: if the instance read had returned nothing,
+/// [`huc_hostname_verifier`]'s static fallback would have found the named one
+/// and called it. MEASURED on CratonVM: `namedDefault.calls = 0`. The instance
+/// read returned the lambda; only the naming failed.
+///
+/// So the two entries that remain are the only two that are genuinely "no
+/// application verifier is installed", and both are named by a class this VM
+/// can always resolve.
 fn is_default_hostname_verifier(name: Option<&str>) -> bool {
     matches!(
         name,
-        None | Some("javax/net/ssl/HostnameVerifier")
+        Some("javax/net/ssl/HostnameVerifier")
             | Some("javax/net/ssl/HttpsURLConnection$DefaultHostnameVerifier")
     )
 }
@@ -2226,6 +2648,44 @@ fn huc_builtin_endpoint_identification(host: &str, chain: &[Vec<u8>]) -> Result<
     let leaf = crate::x509_manager::parse_certificate(leaf_der)
         .map_err(|e| format!("peer certificate could not be parsed: {e}"))?;
     crate::x509_manager::verify_hostname(&leaf, host).map_err(|e| e.to_string())
+}
+
+/// rustls's own spelling of a negotiated suite, translated to the name JSSE
+/// reports — which is what `SSLSession.getCipherSuite()` and
+/// `HttpsURLConnection.getCipherSuite()` are contracted to return.
+///
+/// The two agree on every TLS 1.2 suite (both use the IANA registry name, e.g.
+/// `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`) and disagree on every TLS 1.3 one:
+/// rustls's `CipherSuite` enum spells them `TLS13_AES_256_GCM_SHA384`
+/// (`rustls/src/enums.rs`, the `enum_builder!` variant names, which is what
+/// `format!("{:?}", cs.suite())` prints), while the registry — and therefore
+/// JSSE — spells the same suite `TLS_AES_256_GCM_SHA384`. Measured on this host
+/// rather than assumed (`scratchpad/c12/C12Probe.java`, HotSpot 25.0.3+9-LTS):
+///
+/// ```text
+/// JSSE supports TLS_AES_256_GCM_SHA384 = true
+/// JSSE has any TLS13_* name            = false
+/// ```
+///
+/// TLS 1.3 is this client's default, so without this every `getCipherSuite()`
+/// answer on the ordinary path would carry a name no JSSE program has ever seen
+/// — and `t27_tls::java_cipher_name_to_suite`, the VM's own reverse mapping,
+/// only accepts the JSSE spelling, so the round trip did not close either.
+///
+/// Prefix-only, deliberately: it is exactly the five `TLS13_*` variants, and a
+/// name that does not carry the prefix is already the registry's.
+///
+/// `pub(crate)` because `t27_tls.rs` has the other producers of a rustls suite
+/// name and reaches this rewrite through `suite_to_java_cipher_name`'s
+/// fall-through arm — that typed helper is the one entry point both files call,
+/// and `suite_to_java_cipher_name_pub` is how THIS file calls it (see the https
+/// branch below)
+/// — see `docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md`.
+pub(crate) fn jsse_cipher_suite_name(rustls_name: &str) -> String {
+    match rustls_name.strip_prefix("TLS13_") {
+        Some(rest) => format!("TLS_{rest}"),
+        None => rustls_name.to_string(),
+    }
 }
 
 /// Endpoint identification for a completed client handshake, run immediately
@@ -2261,10 +2721,49 @@ fn huc_verify_hostname(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
     host: &str,
+    port: u16,
     protocol: &str,
     cipher: &str,
     peer_chain_der: Vec<Vec<u8>>,
 ) -> Result<(), String> {
+    // STEP 0 — record the negotiated session against the carrier, BEFORE
+    // anything that can return.
+    //
+    // `HttpsURLConnection.getCipherSuite()` / `getServerCertificates()` /
+    // `getLocalCertificates()` / `getPeerPrincipal()` / `getLocalPrincipal()` /
+    // `getSSLSession()` (registered in `net_phase_e::register_https_session_accessors`)
+    // answer from this table and from nothing else; with no entry they answer
+    // `IllegalStateException: connection not yet open`, which is HotSpot's own
+    // answer for an unhandshaken connection — a missing ANSWER, never a wrong
+    // one. This function is the only place in the VM holding the carrier, the
+    // protocol, the cipher suite and the peer chain at the same instant.
+    //
+    // THE PLACEMENT IS THE WHOLE POINT, not a stylistic choice. STEP 1 below
+    // ends in `if builtin.is_ok() { return Ok(()); }`, and that early return is
+    // the path EVERY SUCCESSFUL REQUEST TAKES — the endpoint-identification
+    // check passing is the normal case. A capture written anywhere after it
+    // would record a session only for connections whose built-in name check
+    // FAILED: green under any probe that deliberately breaks verification, and
+    // dead in production. Do not move this below STEP 1.
+    //
+    // Recorded even when identification later fails, exactly as the real JDK
+    // does: the session exists once the handshake completes, and whether the
+    // peer is ACCEPTED is a separate question, answered by this function's
+    // `Err` and the exception the caller raises from it. A caller that catches
+    // that exception and then asks what was negotiated gets the same answer
+    // HotSpot gives.
+    if let Some(conn) = connection {
+        crate::net_phase_e::record_https_carrier_session(
+            ctx,
+            conn,
+            protocol,
+            cipher,
+            &peer_chain_der,
+            host,
+            port,
+        );
+    }
+
     // STEP 1 — the built-in check, always first and always on its own.
     let builtin = huc_builtin_endpoint_identification(host, &peer_chain_der);
     if crate::nbflags().dbg_tls_auth_ok {
@@ -2289,7 +2788,19 @@ fn huc_verify_hostname(
         None => None,
     };
     if crate::nbflags().dbg_tls_auth_ok {
-        eprintln!("[dbg-tls-auth] huc_verify_hostname verifier={verifier_class:?}");
+        // The two `None`s are printed DIFFERENTLY, and that is not cosmetic.
+        // This line used to render `verifier_class` alone, so "no verifier
+        // object was found" and "a verifier object was found whose class this
+        // VM cannot name" both printed `verifier=None` — and the second is the
+        // lambda defect [`is_default_hostname_verifier`] documents. A debug
+        // line that cannot separate a missing thing from an unnameable one is
+        // how that defect stayed hidden behind a trace that was already on.
+        let shown = match (verifier0, verifier_class.as_deref()) {
+            (None, _) => "<none installed>".to_string(),
+            (Some(_), Some(n)) => n.to_string(),
+            (Some(_), None) => "<installed, class name unresolvable>".to_string(),
+        };
+        eprintln!("[dbg-tls-auth] huc_verify_hostname verifier={shown}");
     }
     let Some(verifier0) = verifier0 else {
         return Err(huc_unverified_peer_message(host));
@@ -2307,21 +2818,144 @@ fn huc_verify_hostname(
     let verifier_pin = ctx.pin_native_root(verifier0);
     let host_s0 = ctx.create_string(host);
     let host_pin = ctx.pin_native_root(host_s0);
+
+    // G44 N1 — HAND THE VERIFIER **THE** SESSION, NOT A SECOND ONE.
+    //
+    // MEASURED, `RSslLiveSession` on `9ae371468`:
+    //
+    // ```text
+    // CK RSslLiveSession verifier.sameObjectAsGetSSLSession = false  WANT true
+    // ```
+    //
+    // HotSpot hands `HostnameVerifier.verify` the same `SSLSession` object
+    // that `HttpsURLConnection.getSSLSession()` returns afterwards. This call
+    // site used to mint its OWN — the same four `set_field` calls that
+    // `net_phase_e::https_session_object` makes, deliberately sharing
+    // `HTTPS_CLIENT_SESSION_MARKER` so the two could not drift — and two
+    // minters cannot produce one object however identical their writes are.
+    //
+    // `https_carrier_session_object` is that one minter behind its one
+    // per-carrier cache. STEP 0 above ran `record_https_carrier_session` on
+    // this very connection BEFORE the built-in check's early return, so by the
+    // time control reaches here the entry always exists and this is the fast
+    // path; the local mint below survives only for the two states in which it
+    // does not:
+    //
+    //   * `None`      — no carrier at all (`connection` is `None`, which is how
+    //                   `perform` calls this for a request with no
+    //                   `HttpsURLConnection` object behind it), or no recorded
+    //                   handshake. NOT an error; see the exposed function's
+    //                   own doc.
+    //   * `Some(Err)` — the `javax/net/ssl/SSLSession` allocation was refused.
+    //
+    // Keeping the fallback rather than propagating is deliberate: an installed
+    // verifier that is not consulted is a SECURITY change, and this lane is
+    // fixing an identity row, not the decision the verifier makes.
+    let carrier_session =
+        match connection.and_then(|c| crate::net_phase_e::https_carrier_session_object(ctx, c)) {
+            Some(Ok(session)) => Some(session),
+            _ => None,
+        };
+    let session0 = match carrier_session {
+        Some(session) => session,
+        None => match huc_mint_verifier_session(ctx, protocol, cipher, peer_chain_der, host, port) {
+            Ok(session) => session,
+            // The pins taken above are released on THIS exit too. The
+            // `map_err(..)?` this replaces returned straight out of the
+            // function with `verifier_pin` and `host_pin` still on the pin
+            // stack — a leak on the one path that already had nothing to
+            // hand back.
+            Err(message) => {
+                ctx.unpin_native_roots(verifier_pin);
+                return Err(message);
+            }
+        },
+    };
+    let session_pin = ctx.pin_native_root(session0);
+
+    let verifier = ctx.read_native_pin(verifier_pin, verifier0);
+    let host_s = ctx.read_native_pin(host_pin, host_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    let outcome = ctx.invoke_virtual(
+        verifier,
+        "verify",
+        "(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z",
+        &[Value::Object(Some(host_s)), Value::Object(Some(session))],
+    );
+    ctx.unpin_native_roots(verifier_pin);
+
+    match outcome {
+        Ok(Some(v)) if v.as_int().unwrap_or(0) != 0 => Ok(()),
+        // The verifier was consulted and DECLINED. MEASURED on HotSpot: a plain
+        // `java.io.IOException` carrying `Wrong HTTPS hostname: should be
+        // <host>` — a different class and a different sentence from the
+        // "nothing was installed" exit below, which this arm used to share. See
+        // [`TLS_HOSTNAME_REFUSED_SENTINEL`] for the transcript.
+        Ok(_) => Err(huc_verifier_declined_message(host)),
+        Err(_) => Err(format!(
+            "{TLS_PEER_UNVERIFIED_SENTINEL}the installed HostnameVerifier threw while \
+             verifying <{host}>; treating the peer as unverified"
+        )),
+    }
+}
+
+/// The private `SSLSession` [`huc_verify_hostname`] used to mint on EVERY
+/// verified connection, kept as the fallback for the two states in which the
+/// one per-carrier session is not available (see the G44 N1 comment at that
+/// call site).
+///
+/// The four writes are unchanged and deliberately still the same four
+/// `net_phase_e::https_session_object` makes, sharing
+/// [`net_phase_e::HTTPS_CLIENT_SESSION_MARKER`] so the two shapes cannot drift.
+/// What changed is how OFTEN this runs: it is now the exception rather than the
+/// rule, and a session minted here is by construction NOT the one
+/// `getSSLSession()` will answer with — which is exactly the row N1 closes, and
+/// is why every state that can reach the carrier's session must reach it
+/// instead of coming here.
+///
+/// Slot 2 must not carry the "never negotiated" sentinel `-1`: this session
+/// comes from the far side of a handshake that COMPLETED — `verify()` decides
+/// whether to ACCEPT the peer, a separate question from whether anything was
+/// negotiated — and `t27_tls::session_has_negotiated` reads exactly this slot,
+/// so a verifier that asks `session.isValid()` or `session.getId()` would
+/// otherwise be told the handshake it was invoked to vet had not happened.
+///
+/// GC: every allocated value has to survive the allocations that follow it, so
+/// each is pinned and re-read. The batch is released from THIS function's own
+/// base before returning, which truncates only the pins taken here — the
+/// caller's `verifier_pin`/`host_pin` sit below it and are untouched. There is
+/// no allocation between the final `read_native_pin` and the `return`, so the
+/// address handed back is current.
+fn huc_mint_verifier_session(
+    ctx: &mut dyn NativeContext,
+    protocol: &str,
+    cipher: &str,
+    peer_chain_der: Vec<Vec<u8>>,
+    peer_host: &str,
+    peer_port: u16,
+) -> Result<ObjectRef, String> {
     let proto_s0 = ctx.create_string(protocol);
     let proto_pin = ctx.pin_native_root(proto_s0);
     let cipher_s0 = ctx.create_string(cipher);
     let cipher_pin = ctx.pin_native_root(cipher_s0);
-    // The 3-field client `SSLSession` shape (`new13_alloc_ssl_session`'s), so
-    // the layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
+    // The client `SSLSession` shape (`new13_alloc_ssl_session`'s — 4 fields
+    // since E42; the width is `NEW13_SSL_SESS_FIELDS` and must stay that
+    // constant, because `t27_tls`'s slot rules are keyed on it), so the
+    // layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
     // read it correctly: `getProtocol`/`getCipherSuite` from these slots,
     // `getPeerCertificates` from the side table populated just below. A
     // pinning verifier calls exactly that pair.
-    let session0 = try_alloc_concurrent_synthetic(
+    let session0 = match try_alloc_concurrent_synthetic(
         ctx,
         "javax/net/ssl/SSLSession",
         crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
-    )
-    .map_err(|_| "--jdk-only refused javax/net/ssl/SSLSession".to_string())?;
+    ) {
+        Ok(session) => session,
+        Err(_) => {
+            ctx.unpin_native_roots(proto_pin);
+            return Err("--jdk-only refused javax/net/ssl/SSLSession".to_string());
+        }
+    };
     let session_pin = ctx.pin_native_root(session0);
 
     let proto_s = ctx.read_native_pin(proto_pin, proto_s0);
@@ -2338,44 +2972,68 @@ fn huc_verify_hostname(
         crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
         Value::Object(Some(cipher_s)),
     );
-    // -1: this connection owns its rustls state inside `perform` and is never
-    // registered in the `servlet` TLS id space, so there is no id to record.
-    // Every accessor that would consult it already tolerates a miss.
     ctx.set_field(
         session,
         crate::phases_late::ssl_security::NEW13_SESS_TLSID,
-        Value::Int(-1),
+        Value::Int(crate::net_phase_e::HTTPS_CLIENT_SESSION_MARKER),
     );
     let session = ctx.read_native_pin(session_pin, session0);
     crate::t27_tls::record_client_peer_chain(ctx, session, peer_chain_der);
-
-    let verifier = ctx.read_native_pin(verifier_pin, verifier0);
-    let host_s = ctx.read_native_pin(host_pin, host_s0);
+    // G51-1 N1, the fallback half. This session is by construction NOT the one
+    // `getSSLSession()` answers with, so no row on `RSslLiveSession` reaches
+    // it — but a verifier that asks the session it was handed where the peer
+    // is must not get `null`/`-1` just because the carrier was unavailable.
+    // Same source as the carrier path: the host and port the URL NAMED.
     let session = ctx.read_native_pin(session_pin, session0);
-    let outcome = ctx.invoke_virtual(
-        verifier,
-        "verify",
-        "(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z",
-        &[Value::Object(Some(host_s)), Value::Object(Some(session))],
-    );
-    ctx.unpin_native_roots(verifier_pin);
-
-    match outcome {
-        Ok(Some(v)) if v.as_int().unwrap_or(0) != 0 => Ok(()),
-        Ok(_) => Err(huc_unverified_peer_message(host)),
-        Err(_) => Err(format!(
-            "{TLS_PEER_UNVERIFIED_SENTINEL}the installed HostnameVerifier threw while \
-             verifying <{host}>; treating the peer as unverified"
-        )),
-    }
+    crate::t27_tls::record_session_peer_endpoint(ctx, session, peer_host, i32::from(peer_port));
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.unpin_native_roots(proto_pin);
+    Ok(session)
 }
 
-/// The one rejection message for a failed endpoint identification, shared by
-/// every exit in `huc_verify_hostname` so the three ways to get there (no
-/// verifier installed, a default stand-in, an app verifier that declined)
-/// cannot describe the same outcome three different ways. Wording follows real
-/// JSSE's `checkURLSpoofing` ("should be <host>"), which likewise reports the
-/// hostname mismatch rather than naming the verifier.
+/// HotSpot's refusal when an application `HostnameVerifier` was consulted and
+/// answered `false`, transcribed rather than composed.
+///
+/// The wording is `HttpsClient.checkURLSpoofing`'s own — `formatMsg("Wrong
+/// HTTPS hostname%s", filterNonSocketInfo(url.getHost()).prefixWith(": should
+/// be <").suffixWith(">"))`, which renders as
+/// `Wrong HTTPS hostname: should be <127.0.0.1>` (MEASURED on this host, and
+/// the source line is in `$JAVA_HOME/lib/src.zip`). Note it names ONLY the
+/// host: no certificate, no subject alternative names, no mention of the
+/// verifier. That is the whole message, and the difference from
+/// [`huc_unverified_peer_message`] is deliberate on HotSpot's part — one says
+/// the certificate did not match, the other says the application refused it.
+fn huc_verifier_declined_message(host: &str) -> String {
+    format!("{TLS_HOSTNAME_REFUSED_SENTINEL}Wrong HTTPS hostname: should be <{host}>")
+}
+
+/// The rejection message for a failed endpoint identification with NO
+/// application verifier to fall back on — either none was installed, or the one
+/// installed is a JDK/VM default stand-in.
+///
+/// **It is no longer shared with the "an app verifier declined" exit, and the
+/// note that used to justify sharing it was wrong.** That note said the three
+/// ways to reach a failed identification "cannot describe the same outcome
+/// three different ways". MEASURED (see [`TLS_HOSTNAME_REFUSED_SENTINEL`]),
+/// HotSpot describes them as three DIFFERENT outcomes with three different
+/// exception classes, because they are three different facts: the certificate
+/// did not match; the application refused it; the application's verifier blew
+/// up. Collapsing them was a decision about tidiness taken where a measurement
+/// was available and had not been made.
+///
+/// This exit's own HotSpot answer is still divergent and deliberately left so:
+/// on HotSpot nothing reaches here at all, because with only the default
+/// verifier installed JSSE performs endpoint identification INSIDE the
+/// handshake (`setEndpointIdentificationAlgorithm("HTTPS")`) and the connection
+/// fails as `SSLHandshakeException: (certificate_unknown) No subject
+/// alternative names matching IP address 127.0.0.1 found`. CratonVM cannot
+/// raise that here — it is a rustls-layer handshake abort, and this VM
+/// deliberately re-derives endpoint identification AFTER the handshake because
+/// rustls skips it whenever the application supplied Java `TrustManager`s (see
+/// [`huc_builtin_endpoint_identification`]). NOMINATED in G31-1 against the TLS
+/// layer rather than papered over here: the message can be copied, the
+/// TIMING — failing before any application code sees a connected socket —
+/// cannot.
 fn huc_unverified_peer_message(host: &str) -> String {
     format!(
         "{TLS_PEER_UNVERIFIED_SENTINEL}Certificate for <{host}> does not match any of the \
@@ -2866,6 +3524,10 @@ fn perform(
                     ctx,
                     connection,
                     &parsed.host,
+                    // The RESOLVED port — `parse_url` fills the scheme default
+                    // when the URL named none, so a plain `https://h/p` records
+                    // 443, which is the port this connection dialled. G51-1 N1.
+                    parsed.port,
                     protocol,
                     &cipher,
                     peer_chain_der,
@@ -3407,6 +4069,15 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
                 e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
             ));
         }
+        // See the matching arm in `huc_real_perform`: a verifier that answered
+        // `false` is a plain `IOException`. Registered on this path too so
+        // `connect()` and `getResponseCode()` cannot disagree about the type.
+        Err(ref e) if e.starts_with(TLS_HOSTNAME_REFUSED_SENTINEL) => {
+            return Err(ioex(
+                e.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL)
+                    .to_string(),
+            ));
+        }
         Err(e) => return Err(ioex(format!("HttpURLConnection.connect failed: {e}"))),
     };
 
@@ -3609,7 +4280,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 huc_real_perform(ctx, this, &full)?;
                 let body = huc_real_body(ctx, this);
                 let truncated = huc_real_truncated(ctx, this);
-                return make_response_input_stream(ctx, &body, truncated);
+                return make_response_input_stream(ctx, &body, truncated, Some(this));
             }
             return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
         }
@@ -3641,7 +4312,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         }
     }
-    make_response_input_stream(ctx, &body_bytes, truncated)
+    make_response_input_stream(ctx, &body_bytes, truncated, Some(this))
 }
 
 fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3655,7 +4326,7 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
             let body = huc_real_body(ctx, this);
             let truncated = huc_real_truncated(ctx, this);
-            return make_response_input_stream(ctx, &body, truncated);
+            return make_response_input_stream(ctx, &body, truncated, Some(this));
         }
     }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
@@ -3968,6 +4639,12 @@ pub(crate) fn huc_get_content_length_long(
 
 fn huc_disconnect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // MEASURED, HotSpot (`G7-1` §1d): after `disconnect()` every one of the six
+    // `HttpsURLConnection` session accessors throws `IllegalStateException:
+    // connection not yet open` again. Before both carrier shapes are handled
+    // below, because the session tables are keyed on the carrier's identity and
+    // are the same tables for both.
+    https_recycle_carrier(ctx, this);
     // Real carrier: clear identity-keyed side-table state, never write synthetic
     // slots (they alias real fields on a real-JDK object).
     if is_real_carrier(ctx, this) {
@@ -4486,6 +5163,13 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
 
 pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
     install_baos_event_hook(huc_live_baos_event);
+    // The input-side mirror. `native-io` has dispatched `BaisEvent` since
+    // a1cfdb122 and nothing consumed it; this is the consumer that closes the
+    // four `drain.conn.*` rows. Installing a hook is not a native
+    // registration, so `bridge-ratchet.sh` and the baselines under `scripts/`
+    // do not move — see `BaisEvent`'s "This adds no registration" note for the
+    // designs that were rejected because they would have.
+    cratonvm_native_api::registry::install_bais_event_hook(huc_live_bais_event);
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // The legacy `sun.net.www.protocol.http.HttpURLConnection` is the bulk of
@@ -4513,6 +5197,434 @@ mod http_url_connection_tests {
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+
+    /// **Which of the two `register_https_session_accessors` functions owns
+    /// each of the six names.**
+    ///
+    /// G7. There are two functions with that name — this file's and
+    /// `net_phase_e`'s — registering the same six triples on the same two
+    /// classes, and `lib.rs` calls net_phase_e's first (18688) and this file's
+    /// second (18805), both inside `register_essential_natives_with_shims`.
+    /// Registration is last-write-wins, so this file's five bodies are live and
+    /// net_phase_e's five are dead, while `getSSLSession` — the one name this
+    /// file does not register — stays net_phase_e's.
+    ///
+    /// net_phase_e's own comment reasons the opposite way and rules the
+    /// overwrite out by checking only `register_one`. That is exactly the trap
+    /// HANDOFF-20260814 §5 names: a correct body silently shadowed by a later
+    /// registrar. This test makes the SPLIT itself executable, so that:
+    ///
+    ///   * adding `getSSLSession` here fails, instead of silently killing
+    ///     net_phase_e's copy (the only one with a body for it); and
+    ///   * removing any of the five here fails, instead of silently reviving
+    ///     net_phase_e's — which reads a different table.
+    ///
+    /// Asserted on `register_http_url_connection_real` ALONE, which is what
+    /// makes it a statement about this file rather than about a call order it
+    /// cannot see.
+    #[test]
+    fn this_files_registrar_owns_five_of_the_six_https_session_accessors() {
+        use cratonvm_native_api::NativeMethodRegistry;
+        let mut r = NativeMethodRegistry::new();
+        super::register_http_url_connection_real(&mut r);
+
+        for cls in [
+            "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+            "javax/net/ssl/HttpsURLConnection",
+        ] {
+            for (name, desc) in [
+                ("getServerCertificates", "()[Ljava/security/cert/Certificate;"),
+                ("getLocalCertificates", "()[Ljava/security/cert/Certificate;"),
+                ("getCipherSuite", "()Ljava/lang/String;"),
+                ("getPeerPrincipal", "()Ljava/security/Principal;"),
+                ("getLocalPrincipal", "()Ljava/security/Principal;"),
+            ] {
+                assert!(
+                    r.find(cls, name, desc).is_some(),
+                    "{cls}.{name}{desc} must be registered by THIS file. \
+                     lib.rs runs this registrar after net_phase_e's, so \
+                     dropping it here does not restore the abstract \
+                     declaration — it silently hands the door back to \
+                     net_phase_e's copy, which answers from a different table \
+                     (`https_carrier_session`, not `https_peer_info`)."
+                );
+            }
+            assert!(
+                r.find(cls, "getSSLSession", "()Ljava/util/Optional;").is_none(),
+                "{cls}.getSSLSession()Ljava/util/Optional; must NOT be \
+                 registered here. net_phase_e owns it precisely because this \
+                 file leaves it alone; registering it here would run last and \
+                 make net_phase_e's the dead copy. If you need to serve it \
+                 from this file, move the whole family — do not split it \
+                 further. See G7-1."
+            );
+        }
+    }
+
+    /// rustls's TLS 1.3 spelling is not JSSE's, and `getCipherSuite()` is
+    /// contracted to answer JSSE's. Both directions asserted: the five
+    /// `TLS13_*` variants are rewritten, and a TLS 1.2 name — where the two
+    /// already agree — must pass through untouched. Oracle for the expected
+    /// strings: `scratchpad/c12/C12Probe.java` §B on HotSpot 25.
+    #[test]
+    fn tls13_suite_names_are_reported_with_jsse_spelling() {
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_AES_256_GCM_SHA384"),
+            "TLS_AES_256_GCM_SHA384"
+        );
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_AES_128_GCM_SHA256"),
+            "TLS_AES_128_GCM_SHA256"
+        );
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_CHACHA20_POLY1305_SHA256"),
+            "TLS_CHACHA20_POLY1305_SHA256"
+        );
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_AES_128_CCM_8_SHA256"),
+            "TLS_AES_128_CCM_8_SHA256"
+        );
+        // TLS 1.2: already the registry name on both sides.
+        assert_eq!(
+            jsse_cipher_suite_name("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"),
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        );
+        // Not a blanket "TLS" rewrite: only the prefix, and only when present.
+        assert_eq!(jsse_cipher_suite_name("UNKNOWN"), "UNKNOWN");
+    }
+
+    /// SOURCE WITNESS — the session capture must stay ABOVE the early return.
+    ///
+    /// `huc_verify_hostname` ends STEP 1 with `if builtin.is_ok() { return
+    /// Ok(()); }`, and that return is the path EVERY SUCCESSFUL REQUEST TAKES.
+    /// A `record_https_carrier_session` call below it would record a session
+    /// only for connections whose built-in hostname check FAILED — i.e. it
+    /// would pass any probe that deliberately breaks verification and capture
+    /// nothing in production, leaving all six `HttpsURLConnection` session
+    /// accessors answering `IllegalStateException: connection not yet open`
+    /// forever. No behavioural test can see that difference without a live TLS
+    /// peer, so the ordering is asserted against the source.
+    ///
+    /// Reads the WORKING TREE rather than an `include_str!` snapshot, so it
+    /// tracks the file someone is editing, and skips rather than fails if the
+    /// source is not on disk (a packaged build). Line endings are normalised
+    /// because this repository is edited from both Windows and Linux.
+    #[test]
+    fn the_session_capture_precedes_the_success_path_early_return() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("http_url_connection.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("http_url_connection.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn huc_verify_hostname("))
+            .expect("huc_verify_hostname must still exist");
+        // The function body ends at the next top-level `}`.
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("huc_verify_hostname must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        let capture = body
+            .iter()
+            .position(|l| l.contains("record_https_carrier_session("))
+            .expect(
+                "huc_verify_hostname must record the negotiated session; without it every \
+                 HttpsURLConnection session accessor answers \"connection not yet open\"",
+            );
+        let early_return = body
+            .iter()
+            .position(|l| l.trim() == "if builtin.is_ok() {")
+            .expect("STEP 1's success-path early return must still be recognisable");
+
+        assert!(
+            capture < early_return,
+            "record_https_carrier_session is at body line {capture}, BELOW the \
+             `if builtin.is_ok()` early return at body line {early_return} — that is the \
+             path every successful request takes, so the capture would only ever fire for \
+             connections whose hostname check FAILED. Move it back above STEP 1."
+        );
+    }
+
+    /// SOURCE WITNESS — G44 N1: the verifier gets THE carrier's session, and
+    /// the local mint is only ever the fallback.
+    ///
+    /// MEASURED, `RSslLiveSession` on `9ae371468`:
+    /// `verifier.sameObjectAsGetSSLSession = false  WANT true`. HotSpot hands
+    /// `HostnameVerifier.verify` the same object `getSSLSession()` returns
+    /// afterwards, and two minters cannot satisfy that however identical their
+    /// field writes are — which is why the fix is a lookup and not a fifth copy
+    /// of the same four `set_field` calls.
+    ///
+    /// Asserted against the source for the same reason the witness above is:
+    /// the difference between one object and two is only observable with a live
+    /// TLS peer, so no `MockNativeContext` test can see it. What IS checkable
+    /// here is the shape — that `huc_verify_hostname` consults
+    /// `https_carrier_session_object` and that the only remaining
+    /// `try_alloc_concurrent_synthetic` of a session in this file sits inside
+    /// the fallback helper, not in the verifier path itself.
+    #[test]
+    fn the_verifier_is_handed_the_carriers_session_not_a_second_one() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("http_url_connection.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("http_url_connection.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn huc_verify_hostname("))
+            .expect("huc_verify_hostname must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("huc_verify_hostname must be terminated");
+        // CODE lines only. This function's body is more comment than code, and
+        // both assertions below would otherwise be satisfied — or broken — by
+        // prose that merely names the function.
+        let body: Vec<&str> = lines[fn_start..fn_end]
+            .iter()
+            .copied()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+
+        assert!(
+            body.iter()
+                .any(|l| l.contains("https_carrier_session_object(")),
+            "huc_verify_hostname must ask net_phase_e for THE session this carrier already \
+             handed out. Minting a private one here is what made \
+             `verifier.sameObjectAsGetSSLSession` answer false."
+        );
+        assert!(
+            !body
+                .iter()
+                .any(|l| l.contains("try_alloc_concurrent_synthetic(")),
+            "huc_verify_hostname must not allocate an SSLSession itself — the fallback lives \
+             in huc_mint_verifier_session, so that the carrier's session is the DEFAULT and \
+             the private mint is the exception."
+        );
+    }
+
+    /// `disconnect()` tears down the connection-level view of BOTH https
+    /// session tables — and leaves this file's row in place rather than
+    /// deleting it.
+    ///
+    /// MEASURED, HotSpot (`G7-1` §1d): after `disconnect()` all six accessors
+    /// throw `IllegalStateException: connection not yet open` again, the same
+    /// exception a never-handshaked connection throws. Two halves are asserted
+    /// here because each is a separate way to get this wrong:
+    ///
+    ///   * the row must SURVIVE, flagged. Removing it would put
+    ///     `https_ensure_exchanged` back on its "never handshaked" path, and
+    ///     the very next accessor would re-issue the HTTPS request over the
+    ///     network and answer from the fresh entry — a wrong answer AND a
+    ///     second request;
+    ///   * `net_phase_e`'s carrier session must go, because `getSSLSession` is
+    ///     the one of the six that reads THAT table (`G7-1` §5.1). Recycling
+    ///     one table and not the other leaves the six disagreeing about whether
+    ///     the connection is open.
+    /// G51-1 N2 — draining the response body recycles the connection's view,
+    /// the way HotSpot's `KeepAliveCache` does at the same instant.
+    ///
+    /// Drives the observer directly rather than through `native-io`: the
+    /// dispatch sites are that crate's and already have their own tests
+    /// (`native-io/src/lib.rs`, the `BaisEvent` recorder). What is this file's
+    /// to prove is that the observer maps a stream back to its carrier, that
+    /// it recycles exactly once, and that an unregistered stream is inert.
+    #[test]
+    fn draining_the_response_body_recycles_the_carrier() {
+        use cratonvm_native_api::registry::BaisEvent;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let carrier = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let stream = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let key = ctx.identity_hash_code(carrier) as u32 as u64;
+        let chain = vec![vec![0x30u8, 0x01, 0x02]];
+
+        record_https_peer_info(&ctx, Some(carrier), &chain, "TLS_AES_256_GCM_SHA384");
+        note_response_stream(&ctx, stream, Some(carrier));
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "a completed exchange starts OPEN"
+        );
+
+        huc_live_bais_event(&mut ctx, stream, BaisEvent::Eof).expect("the observer must not fail");
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| i.recycled),
+            "at body EOF the CONNECTION-level view is torn down — every accessor throws              IllegalStateException: connection not yet open again"
+        );
+        assert!(
+            https_peer_info().lock().unwrap().contains_key(&key),
+            "the ROW must survive: https_ensure_exchanged reads a missing entry as              \"never handshaked\" and would re-issue the request over the network"
+        );
+
+        // Eof fires on EVERY exhausted read and a closed stream produces Close
+        // as well, so the second and third events must find nothing to do.
+        assert!(
+            https_response_streams()
+                .lock()
+                .unwrap()
+                .get(&(ctx.identity_hash_code(stream) as u32 as u64))
+                .is_none(),
+            "the association is consumed by the first event"
+        );
+        huc_live_bais_event(&mut ctx, stream, BaisEvent::Close).expect("idempotent");
+    }
+
+    /// A stream that was never associated with an `https` carrier must be
+    /// inert. Every `ByteArrayInputStream` in the process reaches this
+    /// observer — a plain `http:` body, an application's own buffer, a
+    /// resource read through `URLClassLoader` — and recycling anything for
+    /// those would tear down state they have nothing to do with.
+    #[test]
+    fn an_unassociated_stream_recycles_nothing() {
+        use cratonvm_native_api::registry::BaisEvent;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let carrier = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let stranger = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let key = ctx.identity_hash_code(carrier) as u32 as u64;
+
+        record_https_peer_info(&ctx, Some(carrier), &[vec![0x30u8]], "TLS_AES_128_GCM_SHA256");
+        // Deliberately NOT noted, and noted with no carrier — both are the
+        // shapes an ordinary BAIS arrives in.
+        note_response_stream(&ctx, stranger, None);
+        huc_live_bais_event(&mut ctx, stranger, BaisEvent::Eof).expect("inert");
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "an unrelated stream's EOF must not recycle a live connection"
+        );
+    }
+
+    #[test]
+    fn disconnect_recycles_both_https_session_tables() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let carrier = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let key = ctx.identity_hash_code(carrier) as u32 as u64;
+        let chain = vec![vec![0x30u8, 0x01, 0x02]];
+
+        record_https_peer_info(&ctx, Some(carrier), &chain, "TLS_AES_256_GCM_SHA384");
+        crate::net_phase_e::record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384",
+            &chain,
+            "example.test",
+            443,
+        );
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "a completed exchange starts OPEN"
+        );
+
+        https_recycle_carrier(&mut ctx, carrier);
+
+        let table = https_peer_info().lock().unwrap();
+        let info = table
+            .get(&key)
+            .expect("the row must survive the recycle — see this test's doc comment");
+        assert!(info.recycled, "the row must be flagged, not merely present");
+        assert_eq!(
+            info.cipher, "TLS_AES_256_GCM_SHA384",
+            "recycling reports the connection closed; it does not forge the handshake's data"
+        );
+        drop(table);
+        assert!(
+            crate::net_phase_e::https_carrier_session_object(&mut ctx, carrier).is_none(),
+            "getSSLSession's table must have been evicted too, or five accessors report \
+             `connection not yet open` while the sixth still hands out a session"
+        );
+
+        // Idempotent: `disconnect()` is documented as callable twice, and the
+        // second call must not release a global root a second time.
+        https_recycle_carrier(&mut ctx, carrier);
+
+        // A connection that genuinely re-handshakes is OPEN again — the flag is
+        // cleared by the recorder, not sticky on the carrier's identity.
+        record_https_peer_info(&ctx, Some(carrier), &chain, "TLS_AES_128_GCM_SHA256");
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "re-recording a handshake must clear the recycled flag"
+        );
+        https_peer_info().lock().unwrap().remove(&key);
+    }
+
+    /// SOURCE WITNESS — `https_ensure_exchanged`'s early return must stay a
+    /// presence test, not a liveness test.
+    ///
+    /// It is the one line that keeps a recycled carrier from re-issuing its
+    /// HTTPS request: "no entry" means "never handshaked, go and handshake". A
+    /// later change that made this read `.get(..).is_some_and(|i| !i.recycled)`
+    /// — which is exactly the shape the three ACCESSORS were just given, so it
+    /// looks like consistency — would drive a second network request from the
+    /// next accessor call and repopulate the table with a live entry.
+    #[test]
+    fn the_lazy_exchange_guard_is_a_presence_test_not_a_liveness_test() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("http_url_connection.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("http_url_connection.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn https_ensure_exchanged("))
+            .expect("https_ensure_exchanged must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("https_ensure_exchanged must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        assert!(
+            body.iter().any(|l| l.contains("contains_key(")),
+            "https_ensure_exchanged's guard must be a plain presence test"
+        );
+        assert!(
+            !body.iter().any(|l| l.contains("recycled")),
+            "https_ensure_exchanged must NOT skip recycled rows — treating a recycled row as \
+             absent makes the next accessor re-issue the HTTPS request and answer from the \
+             fresh entry. The flag is read by the accessors, never by this guard."
+        );
+    }
 
     /// A pooled keep-alive connection must actually be CLOSED once it is past
     /// `POOL_IDLE_WINDOW`, not merely become ineligible for reuse.
@@ -5173,5 +6285,95 @@ mod http_url_connection_tests {
             .map(|b| b.len())
             .unwrap_or(0);
         assert_eq!(len, POOL_MAX_PER_KEY);
+    }
+
+    // -----------------------------------------------------------------------
+    // G31 — the per-connection `HostnameVerifier` that was never asked
+    //
+    // Rows measured 2026-08-17 against HotSpot 25.0.3+9-LTS over a live
+    // loopback TLS 1.3 handshake (`scratchpad/g31/HvFamily.java`,
+    // `HvCase.java`, `HvLambda.java`), one case per process.
+    // -----------------------------------------------------------------------
+
+    /// THE REGRESSION GUARD. `None` means "a verifier object exists whose class
+    /// this VM could not name" by the time it reaches this predicate — the
+    /// caller has already dealt with "no verifier at all" — and a lambda is
+    /// exactly that. Reading it as "the JDK default is installed" refused every
+    /// connection whose application verifier was written as a lambda.
+    ///
+    /// MEASURED, same connection shape, same request, HotSpot vs CratonVM:
+    /// a named-class verifier was called on both (`calls=1`); a lambda was
+    /// called on HotSpot and NOT on CratonVM (`calls=0`).
+    #[test]
+    fn an_unnameable_verifier_is_not_a_default_stand_in() {
+        assert!(
+            !is_default_hostname_verifier(None),
+            "a verifier whose class name could not be resolved is an APPLICATION \
+             verifier (a lambda), not a JDK default — MEASURED: HotSpot calls it"
+        );
+    }
+
+    /// The two entries that are genuinely "nothing application-specific is
+    /// installed", and a sample of the shapes that are not. Both survivors are
+    /// named by classes this VM always resolves, which is why the predicate can
+    /// afford to be a name match at all.
+    #[test]
+    fn the_two_default_stand_ins_are_the_only_ones() {
+        assert!(is_default_hostname_verifier(Some(
+            "javax/net/ssl/HttpsURLConnection$DefaultHostnameVerifier"
+        )));
+        assert!(is_default_hostname_verifier(Some(
+            "javax/net/ssl/HostnameVerifier"
+        )));
+        // MEASURED: `HvFamily$Rec` is consulted on both VMs.
+        assert!(!is_default_hostname_verifier(Some("HvFamily$Rec")));
+        // A third-party permissive verifier must still be consulted.
+        assert!(!is_default_hostname_verifier(Some(
+            "org/apache/http/conn/ssl/NoopHostnameVerifier"
+        )));
+    }
+
+    /// A verifier that DECLINED and a certificate that never matched are two
+    /// different facts, and HotSpot reports them with two different exception
+    /// classes and two different sentences. The messages are transcribed, so
+    /// they are asserted character for character.
+    #[test]
+    fn a_declined_verifier_and_an_unmatched_certificate_read_differently() {
+        let declined = huc_verifier_declined_message("127.0.0.1");
+        // MEASURED: java.io.IOException | Wrong HTTPS hostname: should be <127.0.0.1>
+        assert_eq!(
+            declined.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL),
+            "Wrong HTTPS hostname: should be <127.0.0.1>"
+        );
+        assert!(
+            declined.starts_with(TLS_HOSTNAME_REFUSED_SENTINEL),
+            "the declined exit must route to the plain-IOException sentinel, not the \
+             SSLPeerUnverifiedException one"
+        );
+        let unmatched = huc_unverified_peer_message("127.0.0.1");
+        assert!(unmatched.starts_with(TLS_PEER_UNVERIFIED_SENTINEL));
+        assert_ne!(
+            declined.trim_start_matches(TLS_HOSTNAME_REFUSED_SENTINEL),
+            unmatched.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
+            "MEASURED: HotSpot gives these two exits different messages"
+        );
+    }
+
+    /// The two sentinels must stay distinguishable by prefix, or the arm that
+    /// picks the exception class would match the wrong one. They share no
+    /// prefix relation in either direction.
+    #[test]
+    fn the_tls_sentinels_do_not_shadow_each_other() {
+        for (a, b) in [
+            (TLS_HOSTNAME_REFUSED_SENTINEL, TLS_PEER_UNVERIFIED_SENTINEL),
+            (
+                TLS_HOSTNAME_REFUSED_SENTINEL,
+                TLS_HANDSHAKE_FAILURE_SENTINEL,
+            ),
+            (TLS_HOSTNAME_REFUSED_SENTINEL, CONNECT_REFUSED_SENTINEL),
+        ] {
+            assert!(!a.starts_with(b), "{a} must not start with {b}");
+            assert!(!b.starts_with(a), "{b} must not start with {a}");
+        }
     }
 }

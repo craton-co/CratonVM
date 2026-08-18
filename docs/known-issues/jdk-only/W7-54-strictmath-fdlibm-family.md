@@ -1,5 +1,157 @@
 # W7-54 — `StrictMath` was the platform's libm, on every function, not just `log`
 
+> # RETIRED 2026-08-12 (lane B8) — RUN, and bit-exact on 29 of 29 values.
+>
+> Every prior pass on this record, including the RE-VERIFIED one below, says in
+> its own words that nothing was built or run on CratonVM. It has now been run.
+> Binary `/c/craton/jdkonly-wave2-target/release/cratonvm.exe --jdk-only`,
+> oracle Temurin `jdk-25.0.3.9-hotspot`, one class file on both arms, every
+> value printed as `Double.doubleToRawLongBits` so a 1-ulp drift cannot hide in
+> decimal:
+>
+> ```
+> $ diff hsm.txt cvm.txt && echo IDENTICAL
+> IDENTICAL
+> ```
+>
+> 29 values: the eighteen fdlibm-backed transcendentals
+> (`sin cos tan asin acos atan atan2 log log10 exp pow cbrt hypot log1p expm1
+> sinh cosh tanh`), `sqrt`, five `IEEEremainder` inputs, and the six
+> `Math`/`StrictMath` `min`/`max` NaN and `-0.0` cases. Sample:
+>
+> ```
+> sin=4605754516372524270 (0.8414709848078965)
+> rem_MAX_MINNORM=0 (0.0)
+> Math.min_1_NaN=9221120237041090560 (NaN)
+> Math.min_-0_0=-9223372036854775808 (-0.0)
+> ```
+>
+> **§4's correction is confirmed by measurement, and it was the right call to
+> make it.** The probe uses the discriminating half-integers §4 identifies, not
+> the one it caught itself using:
+>
+> | input | measured | what it proves |
+> |---|---|---|
+> | `IEEEremainder(1.5, 1.0)` | `-0.5` | agrees under BOTH rules — **cannot discriminate**, exactly as §4 says |
+> | `IEEEremainder(2.5, 1.0)` | `0.5` | ties-to-even (`2.5→2`); the ties-away body would give `-0.5` |
+> | `IEEEremainder(0.5, 1.0)` | `0.5` | ties-to-even (`0.5→0`) |
+> | `IEEEremainder(4.5, 1.0)` | `0.5` | ties-to-even (`4.5→4`) |
+> | `IEEEremainder(MAX_VALUE, MIN_NORMAL)` | `0.0` | **not** `-Infinity` — the recorded broken value is gone |
+>
+> Three independent half-integers land on the ties-to-even answer, so the
+> fdlibm body is live on the running path and the libm body is not reachable
+> from it. §4's warning that a `!Double.isNaN(r)` guard would have **admitted**
+> the broken `-Infinity` is also confirmed as sound: the repaired value is
+> `0.0`, and only an exact-bits assertion separates the two.
+>
+> **Scheduling: the vector is real and it runs.** `--jdk-only` is the mode this
+> record is filed under and the values above came from it. §12's alternative
+> repair — de-register the eighteen strict triples in real-JDK mode and let the
+> image's own `java.lang.FdLibm` bytecode run — is **not** taken and is not
+> needed for correctness; it remains a throughput/architecture question for
+> docs/architecture/natives-over-real-jdk-classes.md §1, not a defect. Retiring
+> this record does not close that.
+
+> ## RE-VERIFIED 2026-08-12 (lane A14). The port is in the tree and reaches the running path. It now has a SCHEDULED vector, and §4's two worked examples are WRONG.
+>
+> Nothing was built or run on CratonVM in this pass either. What was done is
+> read against today's source, and measured against Microsoft OpenJDK 25.0.3.9
+> (`javap -version` → 25.0.3), which is this host's `java.home`.
+>
+> **1. The split is in the tree and it is complete.**
+> `lang_math.rs::register_math_natives` takes `class` and branches on
+> `let strict = class == "java/lang/StrictMath";`. The strict arm registers
+> eighteen fdlibm-backed bodies — `pow sin cos tan asin acos atan atan2 log
+> log10 exp cbrt hypot log1p expm1 sinh cosh tanh` — through the
+> `strict_math_unary!` / `strict_math_binary!` macros, whose expansion is
+> `cratonvm_types::fdlibm::$fn`. The `else` arm keeps the `native_math_*`
+> libm bodies. `sqrt` and `IEEEremainder` are registered once, outside the
+> branch, and shared; `types/src/fdlibm.rs` carries all nineteen `pub fn`s.
+> Registered from `register_essential_natives_with_shims` (the real-JDK arm,
+> so both `--real-jdk` and `--jdk-only`) and again from
+> `register_synthetic_overrides`.
+>
+> **2. New, and it is the question this record never asked: does the JIT
+> bypass the fix?** It does not. `jit/src/lib.rs::try_resolve_intrinsic` opens
+> with `if class == "java/lang/Math" || class == "java/lang/StrictMath"`, which
+> is exactly the shape that would reinstate libm above the natives — a
+> "JIT thin direct helper reimplements the native" defect. Its match arms were
+> read in full: `sqrt floor ceil rint abs fma min max multiplyHigh
+> unsignedMultiplyHigh`. **Not one transcendental is in the list**, so no
+> compiled call site can route around the fdlibm bodies. `jit-cuda`'s
+> `analyzer.rs` names `StrictMath` only for `sqrt`/`abs`/`fma`. Every function
+> in that combined list is either correctly-rounded by IEEE 754 or exact, so
+> the intrinsics are admissible for `StrictMath` as well as `Math`.
+>
+> **3. New: in JDK 25 `StrictMath`'s transcendentals are NOT `native`.**
+> `javap -p java.lang.StrictMath` shows `public static double sin(double);`
+> with no `native` modifier — JDK 21 moved fdlibm into Java, so the real image
+> already carries bit-exact bytecode over `java.lang.FdLibm`. CratonVM's
+> registrations are therefore **shadows over correct real JDK bytecode**, and
+> they win: the ambient kind at that block is `NativeKind::Intrinsic`, and
+> `synthetic_stub_kind_should_yield_to_real_bytecode` returns early unless the
+> kind is `SyntheticStub`. That makes the Rust port necessary *given the
+> registrations stay*, and it also means there is a second, cheaper repair this
+> record never considered — de-register the eighteen strict triples in
+> real-JDK mode and let the image's own `FdLibm` run, which is free
+> correctness and the direction
+> docs/architecture/natives-over-real-jdk-classes.md §1 exists to push. Not
+> taken here: it is a registration change with a throughput cost on a hot
+> surface and it needs the build this lane does not have. Filed in §12.
+>
+> **4. §4's two worked examples do not hold. Measured, not re-read.** The
+> defect class is real and the fix is right; the two numbers cited to
+> illustrate it are both wrong, and one of them cannot fail:
+>
+> | §4 claims | measured on JDK 25 | verdict |
+> |---|---|---|
+> | `IEEEremainder(1.5, 1.0)` returned `0.5`, answer is `-0.5` | fdlibm gives `-0.5` **and so does the ties-away body** | **cannot discriminate** — `1.5` rounds to `2` under ties-to-even and ties-away alike |
+> | `IEEEremainder(MAX_VALUE, MIN_NORMAL)`: "the quotient is `+inf` and `a - inf*b` is NaN" | the broken body returns **`-Infinity`**, not NaN | wrong value; defect real |
+>
+> The half-integer quotients that actually separate the two rules are the ones
+> whose ties-to-even target is the **lower** even integer — `2.5 → 2`,
+> `0.5 → 0`, `4.5 → 4`. §4 picked the one half-integer that agrees. This was
+> established by re-implementing the recorded pre-fix body
+> (`a - (a/b).round() * b`) in Java and replaying it beside `StrictMath`; the
+> transcript is in §11's mutation table. It matters beyond the prose: a lane
+> writing a vector from §4 as given would have shipped a test that passes on
+> the defect.
+>
+> The `-Infinity` correction also has a teeth consequence. A guard written as
+> `!Double.isNaN(r)` — the obvious reading of §4 — **admits the broken
+> answer**, because an infinity is not a NaN. The assertion has to be
+> `Double.isFinite(r)`.
+>
+> **5. The coverage gap this record left open is now closed.** §10 said
+> "nothing was re-measured end-to-end on a CratonVM binary" and §11 listed the
+> steps. The reason it stayed open is structural rather than clerical: this
+> record's evidence was 24 `cargo test` unit tests over the ported *routines*
+> plus `probes/StrictMathOracleDumpProbe` and `probes/StrictMathVectorProbe` —
+> and **`probes/` is never run by `regression-suite/run.sh` at any `SUITE=`
+> value**, while the unit tests never go through the registry. So no scheduled
+> artefact ever exercised the *registered natives*. A `grep -rl StrictMath
+> regression-suite/` returned **nothing**: there was zero StrictMath coverage
+> in the suite.
+>
+> `regression-suite/src/RJdkStrictMath.java` is new and is that artefact —
+> 662 checks over 557 golden vectors on all twenty functions, asserted by
+> `Double.doubleToRawLongBits`, measured on Microsoft OpenJDK 25.0.3.9. It is
+> a **shared** vector (§3 above is why: one expectation for HotSpot,
+> `--real-jdk` and `--jdk-only`). It is registered by nomination, not by this
+> lane — see §11.
+>
+> **6. It was proven able to fail.** Green on the HotSpot oracle
+> (`PASS RJdkStrictMath (662 checks)`, no `javac -Xlint:all` warnings), and
+> RED under three separate mutations — see §11. A golden table never seen to
+> fail is the trap this directory keeps paying for, and `atan`'s vacuous
+> green in §6 is the same shape one level down.
+>
+> **Still not established, and this lane could not:** that the tree compiles,
+> that the registered natives return these bits on either CratonVM arm, or
+> that `Random.nextGaussian` now matches. Those need the build. What changed
+> is that confirming them is now one scheduled suite run rather than a probe
+> somebody has to remember to invoke.
+
 **Status: SOURCE LANDED, NOT RE-MEASURED.** No CratonVM binary was built from this branch —
 this lane does not run `cargo build`. Every number below is measured, but on the two arms
 that can be measured without one: HotSpot (jdk-25.0.3.9-hotspot, Windows x86-64) and the
@@ -443,3 +595,108 @@ The steps that would close this record properly, in order:
    assertions. Each expected value was measured against the actual backing before being
    asserted, so these should pass unchanged — but they are assertions that were loosened
    once already, and the point of tightening them is that they now can fail.
+
+Step 4 is the one this record could not supply, and it is the one that is now
+scheduled rather than remembered — see §11 below.
+
+---
+
+## 11. The scheduled vector: `RJdkStrictMath` (added 2026-08-12)
+
+`regression-suite/src/RJdkStrictMath.java`. **557 golden vectors, 662 checks,
+20 functions**, every expectation measured on Microsoft OpenJDK 25.0.3.9 and
+written as raw bit patterns on both sides — Java has no hex float literal, and a
+decimal transcription is one more place for a last-ULP mistake to enter.
+
+Why a suite vector and not another probe: §10's "not re-measured end to end" was
+not an oversight, it was unreachable with the artefacts this record shipped. The
+24 unit tests call the ported routines directly and never touch the registry —
+the same wrong-side-of-the-boundary shape §7 catalogues, where a bit-exact test
+in `native-collections` was green for months against a body the VM does not run.
+The two probes do go through the VM, but `probes/` is **never** run by
+`regression-suite/run.sh` at any `SUITE=` value. `RJdkStrictMath` is the first
+artefact that is both on the running path and scheduled.
+
+**It is a shared vector.** In JDK 25 `StrictMath.sin` and friends are not
+`native` (see the header block, §3), so HotSpot's answer IS fdlibm's and is a
+sound oracle; CratonVM's `Intrinsic`-kind natives do not yield to real bytecode,
+so both CratonVM arms reach the Rust port. One expectation, three arms, no mode
+divergence to encode — unlike `RJdkStrict`, this belongs in the shared list.
+
+Design choices worth not re-litigating:
+
+* **Bits, never a tolerance.** A tolerance passes on platform libm and therefore
+  proves nothing — §6's whole argument, applied to the suite.
+* **NaN results are asserted as `isNaN`, not as raw bits.** Which NaN a routine
+  produces is unspecified; `0.0/0.0` on x86 yields a QNaN with the sign bit SET,
+  which is what the oracle recorded. Freezing that would lock a divergence in
+  rather than detect one — the failure mode
+  docs/known-issues/jdk-only/W6-5-vacuous-tests.md warns about from the other
+  side. Signed **zero** is specified (`sin(-0.0) == -0.0`) and stays under the
+  raw-bit comparison.
+* **A `switch` on an int code, not a method reference.** A lambda-linkage
+  failure inside a numeric vector would read as a `StrictMath` failure, and
+  lambda dispatch is this tree's most expensive shape.
+* **Nothing computed is printed.** Every `CK` line carries a fixed count,
+  because `run.sh` diffs the two runs' `CK` lines in one session.
+* **Each table carries a lower-bound row-count assertion**, so a table that
+  silently empties out fails loudly instead of passing vacuously — §6's rule.
+
+### Proving it can fail
+
+Green on the oracle, and RED under three mutations. Green-on-the-tree alone is
+what §6 already showed to be worth nothing for `atan`.
+
+| arm | result |
+|---|---|
+| HotSpot 25.0.3.9, `javac -Xlint:all` clean | `PASS RJdkStrictMath (662 checks)` |
+| **MUT A** — the recorded pre-fix `IEEEremainder` body restored | **RED** at `IEEEremainder(2.5, 1.0)`: expected `0x3fe0…`, got `0xbfe0…` |
+| **MUT B** — `cbrt` shifted by one ULP (`Math.nextUp`) | **RED** at the first row; a tolerance-based test passes this |
+| **MUT C** — `atan2`'s two arguments transposed | **RED** at `atan2(+0.0, 1.0)`: expected `0x0`, got `0x3ff921fb54442d18` |
+
+MUT A is the one that found the §4 error: with the table skipped it fails the
+*named* discriminators too, and it fails at `2.5`, not at the `1.5` §4 cites.
+MUT C is worth keeping because a transposed `atan2` is a defect no accuracy test
+can see — `atan2(y,x)` and `atan2(x,y)` are both plausible angles and only the
+quadrant is wrong — which is why the sign/zero/infinity matrix sits at the head
+of that table.
+
+### Honest limit on the sampled half
+
+The boundary vectors are hand-chosen and are the half that matters; the sampled
+half can only catch a function whose deviation rate is not tiny. Against the
+MSVC CRT those rates ran from `cbrt` 30.98% to `atan` 0.009% (§2), so these
+tables are near-certain to catch `cbrt`/`cosh`/`sinh` and **will not catch
+`atan` by sampling at all** — `atan`'s coverage here is its four branch
+boundaries (`7/16, 11/16, 19/16, 39/16`) and nothing else. That is the same hole
+§6 found in the unit tables and fixed by pinning nine oracle-derived inputs; the
+suite vector does not have those nine, because finding them needs the Rust-side
+replay this lane cannot run. **Named residual**, §12.
+
+### Registration
+
+The `run.sh` line is a **nomination**, not an edit — this lane does not own
+`run.sh`. `RJdkStrictMath` goes on the shared class list, not `JDKONLY_CLASSES`
+(which is the mode-divergent list `RJdkStrict` belongs to).
+
+---
+
+## 12. Residuals opened by this pass
+
+1. **The nine `atan` oracle-derived inputs are not in the suite vector.**
+   §6 pins them in `types/src/fdlibm.rs`; reproducing them for `RJdkStrictMath`
+   needs a replay of the oracle against the platform libm, which is a Rust
+   program. Until then `atan` is boundary-covered only, and this is stated at
+   the site rather than left for a reader to infer.
+2. **The de-registration alternative (header §3) is unevaluated.** JDK 25 ships
+   bit-exact `FdLibm` bytecode for all eighteen; CratonVM shadows it with
+   `Intrinsic`-kind natives that do not yield. Dropping the eighteen strict
+   triples in real-JDK mode would be free correctness and one fewer shadow, at
+   an unmeasured throughput cost on a hot surface. Needs a build and an owner.
+   Note this would NOT remove the need for the Rust port: synthetic mode has no
+   `FdLibm` bytecode to fall back to.
+3. **The oracle is still one platform.** All rates in §2 are MSVC CRT on Windows
+   x86-64. The *port* is platform-independent by construction and the new golden
+   tables are too — they are fdlibm's answers, not this host's — so a Linux run
+   should produce identical `CK` lines. That is an assertion this vector now
+   makes checkable rather than one it assumes.

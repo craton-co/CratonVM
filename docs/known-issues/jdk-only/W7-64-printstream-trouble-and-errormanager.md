@@ -1,5 +1,130 @@
 # W7-64 — the absorbed error had a designated destination, and we dropped it
 
+> **RUN 2026-08-12, IN ALL THREE ARMS INCLUDING `--synthetic-jdk`. This record's
+> closing instruction — "the next lane with a build should run
+> `probes/CloseFlushSwallowProbe.java` under `--real-jdk` and `--synthetic-jdk`
+> and expect `RESULT ok` in both" — is now executed. It is not `ok` in either,
+> and two rows this record reports as FIXED are measurably not.**
+>
+> Binaries: a default-feature release build dated 2026-08-12 15:27 for
+> `--real-jdk`/`--jdk-only`, and a `--features synthetic-jdk` release build from
+> clean `HEAD 2dbb9d451` (`/c/craton/synjdk-target`, built by the P4-B lane) for
+> `--synthetic-jdk`. HotSpot 25.0.3+9 is `RESULT ok`.
+>
+> | arm | result |
+> |---|---|
+> | HotSpot 25.0.3+9 | `RESULT ok` |
+> | CratonVM `--real-jdk` | `RESULT FAIL count=4` |
+> | CratonVM `--jdk-only` | `RESULT FAIL count=3` |
+> | CratonVM `--synthetic-jdk` | **the probe dies before its first check** |
+>
+> ```text
+> --real-jdk   FAIL filterOutFlushFailureWins           expected <java.lang.Error: flush-boom> got <none>
+> --real-jdk   FAIL streamHandlerHasADefaultErrorManager expected <true> got <false>
+> --real-jdk   FAIL printStreamDeleteBlockedWhileOpen   expected <true> got <false>
+> --real-jdk   FAIL printStreamCloseIoSinkTrace         expected <flush,close> got <flush,close,flush>
+> --jdk-only   the same three, WITHOUT streamHandlerHasADefaultErrorManager
+> ```
+>
+> ### 1. `Handler.errorManager` is STILL null in Compatible mode — the fix is inert
+>
+> This record states the null `errorManager` was "Fixed by reconstructing the
+> third initializer". Measured, reading the field itself through
+> `--add-opens java.logging/java.util.logging=ALL-UNNAMED`:
+>
+> | receiver | HotSpot | CratonVM `--real-jdk` | CratonVM `--jdk-only` |
+> |---|---|---|---|
+> | a user-defined `extends Handler` | `ErrorManager@…` | **null** | `ErrorManager@10a` |
+> | `new StreamHandler()` | `ErrorManager@…` | **null** | `ErrorManager@10b` |
+>
+> The mode split is the diagnosis and it is decisive. `java/util/logging/Handler.<init>()V`
+> is in `RETIRED_SHADOW_TRIPLES` (`native-api/src/retired_shadow.rs:334`), so
+> under `--jdk-only` the refusal lets the **real constructor** run and the field
+> comes out non-null — this VM demonstrably builds the right state when the
+> shadow is out of the way. Under `--real-jdk` the native `<init>` runs and the
+> reconstruction block does not fire.
+>
+> Two things checked so the next lane does not re-check them:
+> **only one registrar holds the triple** (`reflect_annotations.rs:300`; grepped
+> across all crates, no duplicate, so this is not a shadowed-loser), and
+> **`resolve_field_index_by_class_id` does walk the hierarchy**
+> (`vm/src/vm/vm_exec.rs:3695`, subclass → super), so the
+> `has_error_manager_field` guard is not failing for the obvious reason that the
+> receiver is a subclass. `new java.util.logging.ErrorManager()` from bytecode
+> works in this arm. The remaining candidates are the guard's second half —
+> `matches!(ctx.get_field_by_name(*this, "errorManager"), Value::Object(None))`,
+> which is false for any zero-slot representation that is not literally
+> `Object(None)` — and `ctx.new_object` returning a shape the `if let` drops.
+> **Every one of those failure modes is silent**, which is why a source read
+> concluded the fix had landed. NOMINATION 4 makes it not silent.
+>
+> ### 2. `--synthetic-jdk` runs at last, and cannot reach three of the five findings
+>
+> The **"Which arm COMPILES this"** section is right that three findings live
+> only in the feature build, and its consequence — that no shipping-binary run
+> discharges them — is confirmed. What it could not know is that the feature
+> build does not discharge them either, because the probe dies first:
+>
+> ```text
+> NoSuchMethodError java/io/PrintWriter.<init>(Ljava/io/Writer;)V
+>   [class not found on any classpath entry — synthetic stub, add the missing jar]
+>   caller="CloseFlushSwallowProbe.printWriterCloseIsNarrow()V @pc=25"
+> ```
+>
+> That is this record's own observation about `PrintStream` — "`synthetic_stub_ctor_methods`
+> mints only the two constructors" — biting on `PrintWriter`. `printWriterCloseIsNarrow`
+> is the section carrying `printWriterCheckErrorAfterAbsorb`, i.e. the row the
+> whole `PrintWriter.flush`/`close` recording finding rests on. **So finding 5
+> (`PrintWriter.flush`/`close` recording) and finding 4 (the `StreamHandler`
+> `ErrorManager` reports) are still unadjudicated — not for want of a build, but
+> for want of a constructor.** Recorded precisely, because "never run" was the
+> old blocker and it is no longer the true one.
+>
+> **Finding 3 IS adjudicated, and it is CLOSED.** `checkError`/`setError`/`clearError`
+> raising `NoSuchMethodError` in synthetic mode is fixed: measured
+> `System.out.checkError()` → `false` under `--synthetic-jdk`, matching HotSpot,
+> and `System.err.checkError()` returns without throwing. The registrations at
+> `native-builtins/src/lib.rs:23007`–`:23009` are live in that arm.
+>
+> **Finding 4's read side is measurably still missing**, by a probe that does not
+> need `PrintWriter`: `new StreamHandler().getErrorManager()` under
+> `--synthetic-jdk` raises
+> `NoSuchMethodError: java.util.logging.StreamHandler.getErrorManager()Ljava/util/logging/ErrorManager;`.
+> So `register_p61_handler_error_manager` registering `Handler.getErrorManager`
+> does not serve a `StreamHandler` receiver in that arm. That is a registration-
+> shape question (interface/superclass key vs. receiver class), not a missing
+> body, and it is the next thing to look at there.
+>
+> ### 3. The modes fail on DISJOINT sets — do not generalise any row across them
+>
+> `filterOutFlushFailureWins` is **correct under `--synthetic-jdk`**
+> (`java.lang.Error: flush-boom` propagates) and **wrong in both shipping
+> modes** (`none`). That is the same disjointness the P4-B lane found campaign-
+> wide. Concretely for this record: the "Run it in BOTH modes" table's per-finding
+> arm column is necessary but not sufficient — a row can be green in the arm the
+> table points at and red in the arm it does not.
+>
+> ### 4. Two open items confirmed still open, one of them now with a measurement
+>
+> * **"An `Error` on the write paths is still absorbed."** Confirmed, and it is
+>   the *flush* path that the probe catches: `filterOutFlushFailureWins` expects
+>   the `Error` and gets `none` in both shipping modes.
+> * **`printStreamCloseIoSinkTrace expected <flush,close> got <flush,close,flush>`**
+>   — an extra flush after close, in both shipping modes. This is the shape of
+>   the last open item ("`checkError()` will flush, absorb, record") landing on
+>   the `PrintStream` close path rather than only on `PrintWriter`. W7-70 gave
+>   `PrintStream` a `closing` latch; whatever consults it is not consulting it
+>   here.
+> * `printStreamDeleteBlockedWhileOpen expected <true> got <false>` in both
+>   shipping modes — the probe's file is deletable while the `PrintStream` over
+>   it is open, where HotSpot on Windows refuses. Adjacent to W7-70's close work
+>   and not previously recorded here; the mechanism was not investigated, so it
+>   is stated as the observation and nothing more.
+>
+> Nothing above was rebuilt either; every claim in this block is a run of an
+> existing binary or a read of the tree, and the two are kept apart as this
+> record's own preamble asks.
+
 **Status: source landed, UNVERIFIED against a VM.** Nothing here has been
 built (this lane writes code and docs; the orchestrator builds). What is
 stated as measured was measured — on HotSpot 25.0.3.9 (Eclipse Adoptium), by

@@ -1439,6 +1439,120 @@ fn fis_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
 /// Tries, in order: the `FileDescriptor` object's `fd`/`handle` fields,
 /// a raw int in instance slot 0, then the `fd+1` encoding in slot 1
 /// (canonical `System.in`).
+/// The `java.io.IOException` a `FileInputStream`/`FileOutputStream` raises for
+/// any operation attempted after `close()`.
+///
+/// **Transcribed, not derived.** Measured on Eclipse Adoptium
+/// 25.0.3+9-LTS (2026-08-16), a real `FileInputStream`/`FileOutputStream` on
+/// Windows:
+///
+/// ```text
+/// fos.write(65)  after close -> java.io.IOException: Stream Closed
+/// fis.read()     after close -> java.io.IOException: Stream Closed
+/// fis.read(b)    after close -> java.io.IOException: Stream Closed
+/// fis.available() after close -> java.io.IOException: Stream Closed
+/// fis.skip(1)    after close -> java.io.IOException: Stream Closed
+/// ```
+///
+/// Note the capital `C`. The `Writer` side of `java.io` says `"Stream closed"`
+/// with a lower-case `c` (measured on `BufferedWriter` and
+/// `OutputStreamWriter` in the same run), so this string cannot be shared
+/// between the two families and must not be "tidied up" into one constant.
+fn io_stream_closed() -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: "Stream Closed".to_string(),
+    }
+    .into()
+}
+
+/// Does this `FileInputStream`/`FileOutputStream` carry a POSITIVE marker that
+/// it has been closed?
+///
+/// This is the discriminator that makes the after-close refusals safe. Every
+/// read/write/available/skip body below resolves its descriptor with
+/// `fis_get_fd`/`fos_get_fd`, and those return `None` for **two different
+/// reasons**: the stream was closed (the close natives latch `fd = -1` /
+/// `handle = -1` on the `FileDescriptor`, or `Int(-1)` in slot 0 for the legacy
+/// synthetic layout), or the receiver simply never carried a descriptor this
+/// crate understands. Only the FIRST is an `IOException`; turning every `None`
+/// into a throw would be exactly the blanket widening the campaign's records
+/// keep warning about, and it would fire on receivers no measurement covers.
+///
+/// So the refusal is gated on a marker that is only ever written by a close:
+/// `fd` **and** `handle` both negative on the `FileDescriptor`, or `Int(v < 0)`
+/// in instance slot 0. Anything else keeps the previous answer unchanged.
+///
+/// Both close natives write both fields — `native_fd_close0` (the real-JDK
+/// route, via `FileDescriptor.closeAll`) and `native_fis_close`/
+/// `native_fos_close` (the fallback bodies) — so the marker is present however
+/// the close was dispatched.
+fn io_stream_is_closed(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    fd_obj: Option<ObjectRef>,
+) -> bool {
+    if let Some(fd_obj) = fd_obj {
+        let fd_negative = matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v < 0);
+        let handle_negative =
+            matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v < 0);
+        if fd_negative && handle_negative {
+            return true;
+        }
+    }
+    matches!(ctx.get_field(this, 0), Value::Int(v) if v < 0)
+}
+
+/// Does a bulk `read`/`write` of ZERO bytes answer without ever consulting the
+/// stream's closed state?
+///
+/// **Yes, on both sides of the family, and it is MEASURED rather than derived.**
+/// Eclipse Adoptium 25.0.3+9-LTS, Windows, 2026-08-17, on streams that had
+/// already been `close()`d:
+///
+/// ```text
+/// fis.read(new byte[4], 0, 0)  after close -> 0        (no throw)
+/// fis.read(new byte[0])        after close -> 0        (no throw)
+/// fos.write(new byte[4], 0, 0) after close -> void     (no throw)
+/// fos.write(new byte[0])       after close -> void     (no throw)
+/// ```
+///
+/// The reason is structural, not incidental: HotSpot's `io_util.c` `readBytes`
+/// and `writeBytes` both do their `NULL` check, then their bounds check, then
+/// `if (len == 0) return 0;` / `return;`, and only *after* that read the
+/// descriptor and raise `"Stream Closed"` for `fd == -1`. So the full precedence
+/// on both sides is
+///
+/// > **null array -> bounds -> zero length -> closed**
+///
+/// and every one of those four steps was measured in that order (a closed
+/// stream still answers `NullPointerException` for a null array and
+/// `IndexOutOfBoundsException` for `(b, -1, 2)`, `(b, 0, 99)` and `(b, 2, -1)`).
+///
+/// This exists because the after-close refusals landed by
+/// `G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md` did not
+/// have this row of the oracle available and put the closed check FIRST on the
+/// output side. A `write(b, 0, 0)` on a closed stream therefore threw where
+/// HotSpot returns quietly — an over-correction in the opposite direction from
+/// the defect being repaired, which is the failure mode every record in this
+/// directory pairs its fixes against. Named once here and cited at all five
+/// call sites rather than re-derived at each.
+///
+/// The single-byte `read()`/`write(int)` forms have no such shortcut, and
+/// neither does `skip` — see `native_fis_skip`.
+fn is_empty_transfer(len: i32) -> bool {
+    len == 0
+}
+
+/// `io_stream_is_closed` for a `FileInputStream` receiver.
+fn fis_is_closed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    io_stream_is_closed(ctx, this, fis_fd_object(ctx, this))
+}
+
+/// `io_stream_is_closed` for a `FileOutputStream` receiver.
+fn fos_is_closed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    io_stream_is_closed(ctx, this, fos_fd_object(ctx, this))
+}
+
 fn fis_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         match ctx.get_field_by_name(fd_obj, "fd") {
@@ -1611,6 +1725,15 @@ fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // `-1` is END OF FILE, and it is the value every copy loop in the world
+        // stops on. Answering it for a stream that has been CLOSED told the
+        // caller the file had been read to the end; a
+        // `while ((n = in.read()) != -1)` over a stream another thread closed
+        // exited cleanly and the copy came out silently truncated. HotSpot
+        // throws (measured: `java.io.IOException: Stream Closed`). Only a
+        // positively-marked close is refused — see `io_stream_is_closed`.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(-1))),
     };
     // FileInputStream also backs System.in and subprocess stdout/stderr.
@@ -1655,13 +1778,17 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }),
         )));
     }
-    let off = off as usize;
-    let len = len as usize;
-    if len == 0 {
+    // Zero-length transfers answer before the closed check — see
+    // `is_empty_transfer` for the measurement and the full precedence order.
+    if is_empty_transfer(len) {
         return Ok(Some(Value::Int(0)));
     }
+    let off = off as usize;
+    let len = len as usize;
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fis_read`: a closed stream is an `IOException`, not EOF.
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
@@ -1701,8 +1828,18 @@ fn native_fis_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(Some(Value::Int(-1))),
     };
     let len = ctx.array_length(arr);
+    // `read(new byte[0])` is `0` on HotSpot — on an OPEN stream as well as a
+    // closed one — and this body answered `-1` for BOTH, because a zero-length
+    // `read_bytes` returns `Ok(0)` and the `n == 0` arm below maps that onto
+    // EOF. So the empty-array read reported end-of-stream on a stream that had
+    // not been read at all. See `is_empty_transfer`.
+    if is_empty_transfer(len as i32) {
+        return Ok(Some(Value::Int(0)));
+    }
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fis_read`: a closed stream is an `IOException`, not EOF.
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
@@ -1730,8 +1867,21 @@ fn native_fis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // `available()` on a closed stream is `IOException: Stream Closed`
+        // (measured), not `0`. `0` is indistinguishable from "nothing buffered
+        // right now", which is a legal answer callers poll on.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(0))),
     };
+    // The trailing `unwrap_or(0)` is a second, smaller fabrication on this same
+    // line and is DELIBERATELY LEFT ALONE. `FdTable::available` ends in
+    // `_ => Err(...)` for every entry kind that is not a file read or a child
+    // pipe, so propagating it here would start throwing on receivers no
+    // measurement in this lane covers, and `0` is a legal answer for
+    // `available()` in a way that `-1` is not for `read()`. Recorded, not
+    // widened — see the "What this lane did NOT do" section of
+    // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md.
     let n = ctx.fd_table().available(fd).unwrap_or(0);
     Ok(Some(Value::Int(n as i32)))
 }
@@ -1800,13 +1950,42 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    // ORDER IS LOAD-BEARING: the closed check comes FIRST, before the
+    // non-positive-count shortcut, and that is measured rather than assumed.
+    //
+    // `skip` has no zero-length escape hatch — unlike the bulk `read`/`write`
+    // pair, where `len == 0` answers before the descriptor is ever consulted
+    // (see `is_empty_transfer`). HotSpot's `skip0` reads the descriptor as its
+    // first act and raises `"Stream Closed"` for `fd == -1`; the `toSkip` value
+    // is not looked at until after. Measured on Eclipse Adoptium 25.0.3+9-LTS,
+    // Windows, 2026-08-17, on a stream that had already been closed:
+    //
+    // ```text
+    // fis.skip(0)  after close -> java.io.IOException: Stream Closed
+    // fis.skip(-5) after close -> java.io.IOException: Stream Closed
+    // fis.skip(1)  after close -> java.io.IOException: Stream Closed
+    // ```
+    //
+    // With the `n <= 0` shortcut first, `skip(0)` — which is exactly what a
+    // "have I got anything left" poll spells — answered `0` on a closed stream,
+    // i.e. the same fabricated success this family is being swept for, reached
+    // by the argument value rather than by the descriptor.
+    let fd = match fis_get_fd(ctx, this) {
+        Some(fd) => fd,
+        // `skip` on a closed stream is `IOException: Stream Closed` (measured),
+        // not a `0` that reads as "nothing left to skip".
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
+        None => return Ok(Some(Value::Long(0))),
+    };
+    // An OPEN stream keeps its previous answer for a non-positive count: HotSpot
+    // `skip(0)` is `0` (measured), and a negative count seeks BACKWARD there,
+    // which this forward-only reader has no counterpart for. Deliberately not
+    // widened — the repair above is about WHEN the descriptor is consulted, not
+    // about growing a backward seek.
     if n <= 0 {
         return Ok(Some(Value::Long(0)));
     }
-    let fd = match fis_get_fd(ctx, this) {
-        Some(fd) => fd,
-        None => return Ok(Some(Value::Long(0))),
-    };
     // Read and discard up to `n` bytes. `read_bytes` is not guaranteed
     // to fill the whole buffer in a single call (and we cap the scratch
     // buffer at a sane chunk size to bound memory), so loop until `n`
@@ -1855,16 +2034,68 @@ fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             _ => None,
         },
     };
-    if let Some(fd) = fd {
+    // W7-70's residual, SECOND site. `native_fos_close` is the fallback body;
+    // THIS is the one the shipping Compatible/real-JDK arm reaches, because the
+    // real `FileOutputStream.close()` bytecode routes through
+    // `FileDescriptor.closeAll` -> `close()` -> `close0()`. Repairing only the
+    // fallback would have left the default mode swallowing and taken the row
+    // off the census anyway — the shape W7-53 refused for the Windows pipe
+    // write.
+    //
+    // BOTH halves are propagated here as of 2026-08-17, so this body now agrees
+    // with its sibling `native_fos_close` instead of being half of it:
+    //
+    //   * the flush is the byte delivery (writer entries are `BufWriter`s), so
+    //     dropping it is lost data reported as success. Its blast radius
+    //     outside buffered file writers is provably empty: `FdTable::flush`
+    //     ends in `_ => Ok(())` for every non-writable entry, so a read-side
+    //     `FileInputStream.close()` cannot start throwing.
+    //   * the CLOSE half is now propagated too. It was left open on the stated
+    //     ground that "this body is registered for three different receivers,
+    //     one of which is a socket dispatcher", so a close error there would be
+    //     fd release rather than data loss. **The dump refutes the premise.**
+    //     `--dump-native-registry` in `--jdk-only` on this tree (2026-08-17)
+    //     reports the `sun/nio/ch/UnixDispatcher.close0` registration made
+    //     twenty lines below this function's own registration with
+    //     `owns_slot: false` — `native-io/src/net.rs:4188`'s registration of the
+    //     same triple runs later and wins. So this body serves exactly ONE
+    //     triple, `java/io/FileDescriptor.close0()V` (`owns_slot: true`), whose
+    //     receivers are file-stream descriptors. There is no socket on the
+    //     other end of it.
+    //
+    //     With the premise gone the blast radius is the same provably-empty one
+    //     the flush half already argued: `FdTable::close` answers `Ok(())` for
+    //     `fd < 3` outright, and for every entry kind that is not `FileWrite`
+    //     or `ChildStdinPipe` its match ends in `_ => Ok(())`. A read-side
+    //     `FileInputStream.close()` therefore cannot begin to throw; only a
+    //     buffered writer whose final flush fails can, which is precisely the
+    //     disk-full-at-close that `java.io.FileOutputStream.close()` declares
+    //     `throws IOException` for and that HotSpot lets out.
+    //
+    //     The flush failure WINS over the close failure, matching the sibling
+    //     `native_fos_close` twenty lines further down and the `finally`
+    //     semantics of the JDK's `closeAll`: the descriptor is released on the
+    //     failing path either way, and only the first failure is reported.
+    //     W7-70-printstream-close-noop.md's residual is closed here.
+    let host_result = if let Some(fd) = fd {
         // stdin/stdout/stderr (0..=2) are process-lifetime streams — never
         // release them or a later console write/read would hit a dead fd.
         if fd > 2 {
-            let _ = ctx.fd_table().flush(fd);
-            let _ = ctx.fd_table().close(fd);
+            let flushed = ctx.fd_table().flush(fd);
+            let closed = ctx.fd_table().close(fd);
+            flushed.and(closed)
+        } else {
+            Ok(())
         }
-    }
+    } else {
+        Ok(())
+    };
+    // The descriptor is marked closed BEFORE the failure is raised — HotSpot's
+    // `closeAll` latches `closed = true` before running the delegate, so a
+    // retry after a failing close does not re-close.
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    host_result.map_err(io_err)?;
     Ok(None)
 }
 
@@ -1877,7 +2108,31 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(fd) => fd,
         None => return Ok(None),
     };
-    let _ = ctx.fd_table().close(fd);
+    // W7-70-printstream-close-noop.md's third and last named residual in this
+    // family. `java.io.FileInputStream.close()` declares `throws IOException`
+    // and catches nothing, so HotSpot lets a close failure out; this was
+    // `let _ = …`.
+    //
+    // The blast radius is not merely small, it is **provably empty on the read
+    // side**: `FdTable::close` returns `Err` only from the `FileWrite` and
+    // `ChildStdinPipe` arms (a `BufWriter`/pipe flush), and its match ends in
+    // `_ => Ok(())` for `FileRead`, `FileReadWrite` and every socket kind. A
+    // `FileInputStream` resolves to a `FileRead` entry, so this `?` cannot fire
+    // for the receiver the triple is registered on. It is landed anyway because
+    // (a) a body that discards a `Result` reads as a decision and this one was
+    // not one, and (b) `fis_get_fd` also answers for the legacy synthetic
+    // slot-0 layout, where nothing constrains which entry kind is on the other
+    // end.
+    //
+    // Where the failure would otherwise be lost is `native_fd_close0` above —
+    // the route the real-JDK `close()` bytecode takes — and that is repaired
+    // there. This triple has NO `--jdk-only` reach at all: its registration
+    // sits inside the `NativeKind::SyntheticStub` block in
+    // `register_io_natives`, which strict mode drops, and
+    // `--dump-native-registry --jdk-only` on this tree accordingly lists no
+    // `java/io/FileInputStream.close()V` row. Compatible and `--synthetic-jdk`
+    // only, and this comment says so rather than letting the census infer it.
+    let close_result = ctx.fd_table().close(fd);
     // Mark the descriptor closed so a double-close / post-close read is a
     // clean EOF rather than reusing a recycled fd id.
     //
@@ -1899,6 +2154,11 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     } else {
         ctx.set_field(this, 0, Value::Int(-1));
     }
+    // Raised AFTER the closed marker is written, for the reason HotSpot's
+    // `FileDescriptor.closeAll` latches `closed = true` before it runs the
+    // delegate: a retry after a failing close must not re-close, and the
+    // double-close must stay the clean `void` the oracle reports.
+    close_result.map_err(io_err)?;
     Ok(None)
 }
 
@@ -2085,6 +2345,13 @@ fn native_fos_write_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // The purest member of this species: a `void` write that returns having
+        // written nothing. `out.write(b)` on a CLOSED `FileOutputStream`
+        // reported success and dropped the byte; HotSpot throws (measured:
+        // `java.io.IOException: Stream Closed`). Only a positively-marked close
+        // is refused — see `io_stream_is_closed`.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     ctx.fd_table().write_byte(fd, b).map_err(io_err)?;
@@ -2123,10 +2390,18 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             }),
         )));
     }
+    // Zero-length transfers answer before the closed check — see
+    // `is_empty_transfer` for the measurement and the full precedence order.
+    if is_empty_transfer(len) {
+        return Ok(None);
+    }
     let off = off as usize;
     let len = len as usize;
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`: a write to a closed stream is an
+        // `IOException`, not a silent no-op.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
@@ -2150,8 +2425,15 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
+    // `write(new byte[0])` on a closed stream is `void` on HotSpot — see
+    // `is_empty_transfer`.
+    if is_empty_transfer(len as i32) {
+        return Ok(None);
+    }
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
@@ -2177,6 +2459,10 @@ fn native_fos_write_byte_ignore_append(
     };
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`. This is the JDK 25 descriptor the real
+        // `FileOutputStream.write(int)` bytecode calls, so it is the one the
+        // shipping modes reach.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     ctx.fd_table().write_byte(fd, b).map_err(io_err)?;
@@ -2208,10 +2494,20 @@ fn native_fos_write_bytes_ignore_append(
     // Bounds-check caller-supplied off/len against the array before
     // handing them to the bulk-read intrinsic (mirrors JDK FOS.writeBytes).
     check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    // Zero-length transfers answer before the closed check — see
+    // `is_empty_transfer`. This is the descriptor the real JDK 25
+    // `FileOutputStream.write(byte[],int,int)` bytecode calls, so it is the one
+    // the SHIPPING modes reach: `--jdk-only` included.
+    if is_empty_transfer(len_i) {
+        return Ok(None);
+    }
     let off = off_i as usize;
     let len = len_i as usize;
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`. This is the JDK 25 descriptor the real
+        // `FileOutputStream.write(byte[],int,int)` bytecode calls.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
@@ -2243,13 +2539,53 @@ fn native_fos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(fd) => fd,
         None => return Ok(None),
     };
-    let _ = ctx.fd_table().flush(fd);
-    let _ = ctx.fd_table().close(fd);
-    // Mark the descriptor closed so a double-close is a clean no-op.
+    // W7-70-printstream-close-noop.md's named residual, and W7-57's shape one
+    // layer below the delegated-Java-call sites it swept: both host calls used
+    // to be `let _ =`, so a disk-full / quota / device failure at close was
+    // reported as success. `java.io.FileOutputStream.close()` declares
+    // `throws IOException`, runs `fd.closeAll(() -> close0())` and catches
+    // nothing, so HotSpot lets that failure out. Two further reasons this is
+    // not merely tidiness:
+    //
+    //   * the FLUSH here is this VM's byte delivery. `FdTable`'s writer entries
+    //     are `BufWriter`s; HotSpot's `FileOutputStream` is unbuffered and has
+    //     no equivalent step, so dropping our flush is lost data reported as
+    //     success — the exact fault shape W7-57 exists for.
+    //   * its own neighbour already propagates. `native_fos_flush` twelve lines
+    //     up is `ctx.fd_table().flush(fd).map_err(io_err)?`, so this body was
+    //     the odd one out rather than a considered policy.
+    //
+    // fd < 3 keeps the swallow, deliberately and not out of caution:
+    // `FdTable::close` answers `Ok(())` for fd < 3 outright (it refuses to
+    // release the process console), so the close half could never report
+    // anything there; and the flush half on fd 1/2 flushes the PROCESS console
+    // buffer this VM shares between every writer, which HotSpot's unbuffered
+    // `FileOutputStream` has no counterpart for — turning a broken pipe on
+    // stdout into an `IOException` out of an unrelated stream's `close()` would
+    // be a divergence invented here, not parity. Same boundary
+    // `native_printstream_close`'s console branch and `FdTable::close` itself
+    // already draw.
+    let host_result = if fd >= 3 {
+        let flushed = ctx.fd_table().flush(fd);
+        let closed = ctx.fd_table().close(fd);
+        // The flush failure WINS — it is the byte delivery — but the close is
+        // attempted either way, which is the `finally` semantics of the JDK's
+        // `closeAll`: the descriptor is released on the failing path too.
+        flushed.and(closed)
+    } else {
+        let _ = ctx.fd_table().flush(fd);
+        let _ = ctx.fd_table().close(fd);
+        Ok(())
+    };
+    // Mark the descriptor closed so a double-close is a clean no-op. Done
+    // BEFORE the failure is raised, for the reason HotSpot does the same:
+    // `FileDescriptor.closeAll` sets `closed = true` before it runs the
+    // delegate, so a retry after a failing close does not re-close.
     if let Some(fd_obj) = fos_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
     }
+    host_result.map_err(io_err)?;
     Ok(None)
 }
 
@@ -3173,6 +3509,17 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Int(-1))),
     };
     if pos >= count {
+        // EOF. The one instant at which the application is observably done
+        // reading this buffer — see `BaisEvent`'s doc for why a bridge that
+        // handed Java a `ByteArrayInputStream` needs it, and why the observer
+        // cannot change what this returns. `-1` is emitted either way, on
+        // every path, and an observer's `Err` is a genuine internal failure
+        // rather than a Java-level condition.
+        cratonvm_native_api::registry::dispatch_bais_event(
+            ctx,
+            this,
+            cratonvm_native_api::registry::BaisEvent::Eof,
+        )?;
         return Ok(Some(Value::Int(-1)));
     }
     let byte_val = match ctx.get_array_element(data, pos as usize) {
@@ -3399,6 +3746,19 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // ever calls `read()` -- that is the `!has_bais_layout` branch above.
     // Do not "unify" the two.
     if pos >= count {
+        // The same EOF instant as `native_bais_read`'s, reached through the
+        // bulk shape. `read([B)I` delegates here by virtual dispatch, so these
+        // two sites cover all three read descriptors and no fourth is needed.
+        //
+        // This dispatch sits INSIDE the `pos >= count` arm and therefore
+        // BELOW the ordering note above: it must not be hoisted above the
+        // EOF test to "cover the zero-length case too". A `read(b, off, 0)`
+        // on a stream that is not yet exhausted returns 0 and is not an EOF.
+        cratonvm_native_api::registry::dispatch_bais_event(
+            ctx,
+            this,
+            cratonvm_native_api::registry::BaisEvent::Eof,
+        )?;
         return Ok(Some(Value::Int(-1)));
     }
     if len == 0 {
@@ -3546,8 +3906,29 @@ fn native_bais_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
-fn native_bais_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // no-op
+/// `ByteArrayInputStream.close()` / `InputStream.close()`.
+///
+/// **Still a no-op for the stream itself**, and that is the JDK contract:
+/// `ByteArrayInputStream.close()` has no effect and cannot throw. The only
+/// thing added here is the `BaisEvent::Close` observation, which cannot
+/// change that — see `cratonvm_native_api::registry::BaisEventHook`'s doc for
+/// why the observer returns `()` and not a "consumed" flag.
+///
+/// A drained-then-closed stream produces `Eof` (possibly repeatedly) *and*
+/// `Close`, so an observer has to be idempotent; that is stated on
+/// `BaisEvent::Eof` and is not a property either site may quietly rely on the
+/// other to provide.
+fn native_bais_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    cratonvm_native_api::registry::dispatch_bais_event(
+        ctx,
+        this,
+        cratonvm_native_api::registry::BaisEvent::Close,
+    )?;
+    Ok(None) // the stream itself: no-op, as in the real JDK
 }
 
 // ---------------------------------------------------------------------------
@@ -7674,11 +8055,355 @@ fn buf_metadata(ctx: &dyn NativeContext, this: ObjectRef) -> (i32, i32, i32) {
     )
 }
 
-fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
+/// `Unsafe.ARRAY_BYTE_BASE_OFFSET` as this VM publishes it — the value real
+/// `HeapByteBuffer`'s ctor adds to its array-base `offset` to form
+/// `Buffer.address`. `native-builtins/src/servlet.rs` declares the same
+/// constant under the same name for the same reason; the two must agree,
+/// because [`bb_resolve_direct_address`] and `s2_bb_direct_addr` both screen
+/// `address` values and both use `16` as the heap sentinel. `pub` so
+/// `servlet.rs` can define its same-named const AS this one rather than beside
+/// it — the crate dependency runs `cratonvm-native-builtins` →
+/// `cratonvm-native-io` and not the reverse.
+pub const ARRAY_BYTE_BASE_OFFSET: i64 = 16;
+
+/// The window a DERIVED heap buffer occupies inside its source's backing
+/// array: exactly the five arguments real `HeapByteBuffer`'s package-private
+/// constructor takes, in the same units.
+///
+/// `offset` is the ELEMENT index of the derived buffer's logical element 0
+/// inside the shared array — the real-JDK `ByteBuffer.offset` field, which
+/// [`bb_resolve_heap_offset`] reads and every accessor in this file already
+/// honours through [`BbStorage::Heap`]'s `offset`. It is what makes a derived
+/// buffer an ALIAS rather than a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferWindow {
+    /// `ByteBuffer.offset` — element index of logical element 0 in the array.
+    pub offset: usize,
+    pub pos: i32,
+    pub lim: i32,
+    pub cap: i32,
+    /// `-1` for "no mark", the JDK's own sentinel.
+    pub mark: i32,
+}
+
+/// `slice()`'s window — JDK 25 `HeapByteBuffer.slice()`:
+///
+/// ```java
+/// int pos = this.position();
+/// int lim = this.limit();
+/// int rem = (pos <= lim ? lim - pos : 0);
+/// return new HeapByteBuffer(hb, -1, 0, rem, rem, pos + offset, segment);
+/// ```
+///
+/// Three things a copying implementation cannot express and this can:
+/// `offset` COMPOSES (`pos + offset`, so a slice of a slice lands at the sum),
+/// `cap` is the remaining count (not the source's), and the mark is DROPPED.
+///
+/// MEASURED, jdk-25.0.3+9 (`scratchpad/f26/F26AliasProbe.java`):
+/// `allocate(8).position(2).slice()` → `pos/lim/cap = 0/6/6`,
+/// `array() == ` the SOURCE array by identity, `arrayOffset() == 2`, and
+/// `slice().slice(1,2).arrayOffset() == 3`. A buffer minted by copying can
+/// only ever answer `arrayOffset() == 0` and can never satisfy the `==`.
+/// `allocate(4).position(4).slice().arrayOffset()` is `4` even though the
+/// slice is EMPTY, which is why `offset` is computed from `pos` unconditionally
+/// and not only when something remains.
+#[inline]
+pub fn slice_window(src_offset: usize, src_pos: i32, src_lim: i32) -> BufferWindow {
+    let pos = src_pos.max(0);
+    let rem = if pos <= src_lim { src_lim - pos } else { 0 };
+    BufferWindow {
+        offset: src_offset.saturating_add(pos as usize),
+        pos: 0,
+        lim: rem,
+        cap: rem,
+        mark: -1,
+    }
+}
+
+/// `slice(int index, int length)`'s window — JDK 25
+/// `HeapByteBuffer.slice(int,int)`:
+///
+/// ```java
+/// Objects.checkFromIndexSize(index, length, limit());
+/// return new HeapByteBuffer(hb, -1, 0, length, length, index + offset, segment);
+/// ```
+///
+/// Absolute-indexed: `index` is a LIMIT-space index and the source's
+/// `position` plays no part. The bounds check is the caller's
+/// ([`buffer_check_from_index_size`]) because it must run before anything is
+/// allocated. MEASURED: `allocate(8).position(2).slice(3,4)` → `0/4/4`,
+/// `arrayOffset() == 3` — 3, not 5, so `position` really is ignored.
+#[inline]
+pub fn slice_range_window(src_offset: usize, index: i32, length: i32) -> BufferWindow {
+    let index = index.max(0);
+    let length = length.max(0);
+    BufferWindow {
+        offset: src_offset.saturating_add(index as usize),
+        pos: 0,
+        lim: length,
+        cap: length,
+        mark: -1,
+    }
+}
+
+/// `duplicate()` / `asReadOnlyBuffer()`'s window — JDK 25
+/// `HeapByteBuffer.duplicate()`:
+///
+/// ```java
+/// return new HeapByteBuffer(hb, this.markValue(), this.position(),
+///                           this.limit(), this.capacity(), offset, segment);
+/// ```
+///
+/// **`offset` is carried across unchanged, and that is the half this crate was
+/// missing.** F21 taught `native_bb_duplicate` to share the source's array but
+/// left `offset` at whatever the fresh allocation contained, i.e. `0`. That is
+/// harmless only while nothing in the VM can produce a source with a non-zero
+/// `offset` — and `native-builtins/src/servlet.rs`'s `ByteBuffer.slice(int,int)`
+/// and `asReadOnlyBuffer()` already can (they call `s2_bb_new_heap_view`, which
+/// writes `offset` by name), and neither of those two descriptors is registered
+/// by `register_nio_natives`, so neither is shadowed. So
+/// `bb.slice(2,4).duplicate().get(0)` read the array from index 0 instead of 2:
+/// a silent WRONG VALUE, not an exception.
+///
+/// MEASURED: `wrap(raw,2,4).slice().duplicate().arrayOffset()` is `2` and its
+/// `get(0)` equals `raw[2]`. `duplicate()` also KEEPS the mark where
+/// [`slice_window`] drops it (`duplicate` then `reset()` → position 3;
+/// `slice` then `reset()` → `InvalidMarkException`).
+#[inline]
+pub fn duplicate_window(
+    src_offset: usize,
+    src_pos: i32,
+    src_lim: i32,
+    src_cap: i32,
+    src_mark: i32,
+) -> BufferWindow {
+    BufferWindow {
+        offset: src_offset,
+        pos: src_pos,
+        lim: src_lim,
+        cap: src_cap,
+        mark: src_mark,
+    }
+}
+
+/// `Buffer.address` for a heap buffer whose array-base offset is `offset` —
+/// real `HeapByteBuffer`'s `this.address = ARRAY_BASE_OFFSET + off *
+/// ARRAY_INDEX_SCALE`, with `ARRAY_INDEX_SCALE == 1` for `byte`.
+///
+/// Not a bare `16`: an aliasing view's address is base + offset, and
+/// `ScopedMemoryAccess`/`Unsafe.copyMemory` read it as an array-relative
+/// offset. `servlet.rs::s2_bb_new_heap_view` computes the same value.
+#[inline]
+pub fn heap_buffer_address(offset: usize) -> i64 {
+    ARRAY_BYTE_BASE_OFFSET.saturating_add(offset as i64)
+}
+
+/// [`heap_buffer_address`] for a TYPED heap buffer, where `offset` is in
+/// ELEMENTS and the address is in BYTES.
+///
+/// Real `HeapIntBuffer`'s protected constructor
+/// (`jdk25src/java.base/java/nio/HeapIntBuffer.java:111`):
+///
+/// ```java
+/// this.address = ARRAY_BASE_OFFSET + off * ARRAY_INDEX_SCALE;
+/// ```
+///
+/// **This is the whole reason the `ByteBuffer` repair does not generalise by
+/// itself, and it is a one-line difference that a family fix loses if it is
+/// written once.** `ByteBuffer`'s `ARRAY_INDEX_SCALE` is 1, so
+/// [`heap_buffer_address`] can add `offset` directly; a `LongBuffer` view at
+/// element offset 3 has `address == 16 + 24`, not `16 + 3`. Getting it wrong
+/// does not throw — it hands `ScopedMemoryAccess` / `Unsafe.copyMemory` an
+/// array-relative offset that is short by a factor of the element width, and
+/// every bulk transfer through the view reads the wrong elements silently.
+///
+/// This VM publishes 16 as the base offset of EVERY primitive array
+/// (`alloc_typed_buffer`'s own comment: "every primitive array's base offset
+/// is 16 here, matching `unsafe_array_read_bytes`'s `ABASE`"), so the base
+/// term is [`ARRAY_BYTE_BASE_OFFSET`] for all seven families and only the
+/// scale differs.
+///
+/// `saturating_mul` then `saturating_add`: an offset large enough to overflow
+/// is not reachable from a real array, and a wrapped negative address would be
+/// handed to [`is_plausible_native_addr`], where a large positive wrap would
+/// be ACCEPTED as a process pointer. Saturating pins the failure mode to "an
+/// address so large nothing maps there", which the screen also accepts —
+/// hence [`typed_view_address_stays_below_the_native_pointer_floor`], which
+/// pins the bound rather than the arithmetic.
+#[inline]
+pub fn typed_buffer_address(offset: usize, elem_width: usize) -> i64 {
+    ARRAY_BYTE_BASE_OFFSET.saturating_add((offset as i64).saturating_mul(elem_width as i64))
+}
+
+/// The `address` a DIRECT typed view must carry: the source block's address
+/// advanced by the window's start, in BYTES.
+///
+/// `rel_start` is in ELEMENTS and relative to the SOURCE's own logical element
+/// 0 — the same unit and origin `tb_read_elem`'s `index` uses — so the scale
+/// applies here for exactly the reason it applies in [`typed_buffer_address`].
+/// A direct view has no `offset` field and no backing array; the advanced
+/// address IS its offset, which is why this arm has no representability
+/// question and never falls back to a copy.
+///
+/// MEASURED, jdk-25.0.3+9: `ByteBuffer.allocateDirect(64).asIntBuffer()` is a
+/// `java.nio.DirectIntBufferS`, and its `slice()`, `duplicate()` and
+/// `asReadOnlyBuffer()` are ALL still `isDirect() == true` and still share
+/// content (`direct.view.slice.get(0)` reads back the 21 written through the
+/// source view). A derived buffer minted as a heap COPY answers `false` to
+/// `isDirect()` and shares nothing — two wrong answers from one wrong storage
+/// decision.
+#[inline]
+pub fn typed_direct_view_address(addr: i64, rel_start: usize, elem_width: usize) -> i64 {
+    addr.saturating_add((rel_start as i64).saturating_mul(elem_width as i64))
+}
+
+/// Mint a bare `java/nio/ByteBuffer` instance with the byte-order fields
+/// seeded, and NO storage installed.
+///
+/// Extracted from [`alloc_byte_buffer`] so the aliasing constructor
+/// [`alloc_byte_buffer_over`] cannot drift from it — in particular so it
+/// cannot forget the `bigEndian` seed, whose absence made `order()` answer
+/// LITTLE_ENDIAN (see the long note in [`alloc_byte_buffer`]).
+fn alloc_bb_object(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
     };
+    seed_buffer_byte_order(ctx, obj);
+    obj
+}
+
+/// Seed the two byte-order fields `java.nio.ByteBuffer`'s FIELD INITIALISERS
+/// would have set, on a buffer this VM minted with a raw `alloc_object` and no
+/// constructor.
+///
+/// ```java
+/// boolean bigEndian = true;
+/// boolean nativeByteOrder = (ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN);
+/// ```
+///
+/// javac compiles both writes into every `ByteBuffer` constructor and nothing
+/// else writes them, so a constructor-less mint leaves them at the Java default
+/// `false` — and `ByteBuffer.order()` is
+/// `return bigEndian ? BIG_ENDIAN : LITTLE_ENDIAN`, `final`, reading the field
+/// directly, so no per-subclass native can correct it afterwards. Without this
+/// seed a real-JDK-mode `ByteBuffer.allocate(n)` answers LITTLE_ENDIAN where
+/// HotSpot answers BIG_ENDIAN, and **every typed read through it is byteswapped
+/// relative to HotSpot** — a wrong value, not an exception.
+///
+/// **W7-76 §8.2, converged for the two files this lane owns.** That residual
+/// named FIVE sites seeding this same pair with nothing to make them agree:
+/// `native-io/src/lib.rs::alloc_byte_buffer`,
+/// `native-builtins/src/servlet.rs::bb_write_hb`,
+/// `native-io/src/direct_buffer.rs::dbb_allocate_direct0`,
+/// `native-builtins/src/charset.rs:246` and `native-builtins/src/lib.rs:5685`.
+/// The first two now delegate here and cannot drift; the other three are
+/// NOMINATIONS in F26-1 §6, with exact text, because they are not this lane's
+/// files. `pub` for exactly the reason [`buffer_is_read_only`] and
+/// [`buffer_array_access`] are: `cratonvm-native-builtins` depends on
+/// `cratonvm-native-io` and not the reverse, so this is the only one of the
+/// copies the others can import.
+///
+/// `nativeByteOrder` is `bigEndian == (native order is big)`, i.e. `false` on
+/// every little-endian target — the same value as the Java default. Written
+/// anyway so the pair cannot drift if a big-endian target ever appears.
+#[inline]
+pub fn seed_buffer_byte_order(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+    ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
+    ctx.set_field_by_name(
+        obj,
+        "nativeByteOrder",
+        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
+    );
+}
+
+/// Record `window.offset` on `buf` and report whether the layout could carry
+/// it.
+///
+/// **This is a round-trip probe, not a layout assumption, and that is
+/// deliberate.** Aliasing at a non-zero base is representable only when the
+/// receiver has a real `ByteBuffer.offset` field: in real-JDK mode
+/// `java.nio.ByteBuffer` declares `final int offset` (VERIFIED with `javap -p
+/// java.nio.ByteBuffer` on 25.0.3+9 — the declared set is `hb, offset,
+/// isReadOnly, bigEndian, nativeByteOrder`), and `ctx.alloc_object` clamps the
+/// requested width UP to the declared field count, so the by-name write lands.
+/// In synthetic-JDK mode there is no such field, the write is a no-op, and
+/// [`bb_resolve_heap_offset`] would answer `0` for a view that needs a
+/// non-zero base — silently reading the WRONG BYTES.
+///
+/// Reading the value back and comparing is the only test that cannot be wrong
+/// about which mode it is in. `servlet.rs` answers the same question with
+/// `s2_bb_synthetic_layout` (a slot-width heuristic); this is the same
+/// decision taken from the field itself.
+///
+/// An offset of `0` always round-trips by definition — every layout represents
+/// base 0, and `bb_resolve_heap_offset` answers `0` when the field is absent —
+/// so it is reported representable without writing anything.
+fn buf_try_set_heap_offset(ctx: &mut dyn NativeContext, buf: ObjectRef, offset: usize) -> bool {
+    if offset == 0 {
+        return true;
+    }
+    let Ok(as_i32) = i32::try_from(offset) else {
+        return false;
+    };
+    ctx.set_field_by_name(buf, "offset", Value::Int(as_i32));
+    matches!(ctx.get_field_by_name(buf, "offset"), Value::Int(v) if v == as_i32)
+}
+
+/// Mint an ALIASING heap `ByteBuffer` over `arr` at `window`.
+///
+/// `None` when the layout cannot carry `window.offset` (see
+/// [`buf_try_set_heap_offset`]); callers fall back to copying, which is
+/// data-correct and is what the whole family did before.
+///
+/// Both spellings of the backing array are written for the same reason
+/// [`alloc_byte_buffer`] writes both: real heap-buffer subclasses read `hb`,
+/// the synthetic layout reads slot 0, and [`bb_resolve_heap_array`] prefers
+/// whichever resolves.
+///
+/// **`arr` is PINNED across the allocation, and that is load-bearing.** Every
+/// caller resolves `arr` BEFORE calling — from `bb_storage_view` for the
+/// derived views, from `args[0]` for `wrap` — and `alloc_bb_object` allocates,
+/// which can trigger a collection that RELOCATES it. Storing the stale
+/// `ObjectRef` afterwards installs a dangling backing array. The pre-existing
+/// `native_bb_duplicate` was safe only by accident of ordering (it read the
+/// array field *after* its allocation); routing the array in as a parameter
+/// removes that accident, so the pin replaces it. Same idiom, same reason, as
+/// `servlet.rs`'s `chars_arr_pin` in the `asCharBuffer` transcode path.
+fn alloc_byte_buffer_over(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    window: BufferWindow,
+) -> Option<ObjectRef> {
+    let arr_pin = ctx.pin_native_root(arr);
+    let obj = alloc_bb_object(ctx);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
+    if !buf_try_set_heap_offset(ctx, obj, window.offset) {
+        return None;
+    }
+    ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(arr)));
+    ctx.set_field_by_name(obj, "hb", Value::Object(Some(arr)));
+    buf_write_metadata(ctx, obj, window.pos, window.lim, window.cap, window.mark);
+    // AFTER `buf_write_metadata`: `buf_set_mark` saves and restores whatever
+    // `address` it finds, so a write issued before it would survive — but it
+    // would survive as the SAVED value, and the ordering that does not depend
+    // on that subtlety is this one.
+    ctx.set_field_by_name(
+        obj,
+        "address",
+        Value::Long(heap_buffer_address(window.offset)),
+    );
+    Some(obj)
+}
+
+fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
+    // Mint + byte-order seed via `alloc_bb_object` (W7-76 §8.2 convergence —
+    // see `seed_buffer_byte_order`). The seed used to sit at the BOTTOM of this
+    // function; moving it to the top is safe because nothing between the two
+    // points reads or writes `bigEndian`/`nativeByteOrder` (`buf_set_mark`
+    // saves and restores `address` only).
+    let obj = alloc_bb_object(ctx);
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
     // Real JDK Heap*Buffer backing array is named `hb`.
@@ -7686,55 +8411,16 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
     // Real HeapByteBuffer.address is ARRAY_BYTE_BASE_OFFSET + offset. Bulk
     // copy bytecode relies on this value when ScopedMemoryAccess hands the
-    // backing byte[] and offset to Unsafe.copyMemory.
-    ctx.set_field_by_name(obj, "address", Value::Long(16));
-    // W7-76 — HotSpot parity, and the one behaviour change in that lane.
-    //
-    // `java.nio.ByteBuffer` declares `boolean bigEndian = true` as a FIELD
-    // INITIALISER (checked in `lib/src.zip` on 25.0.3.9), so javac compiles
-    // the write into every `ByteBuffer` constructor and nothing else writes
-    // it. This allocator mints the object with a raw `alloc_object` and runs
-    // no constructor, so without the two writes below the field stays at the
-    // Java default `false`. Real `ByteBuffer.order()` is
-    //
-    //     public final ByteOrder order() {
-    //         return bigEndian ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
-    //     }
-    //
-    // — `final`, reading the field directly — so no per-subclass native can
-    // correct it after the fact. HotSpot answers BIG_ENDIAN for
-    // `ByteBuffer.allocate(n)` at every size
-    // (`probes/DirectByteBufferStateProbe.java`, `fresh.allocate8.order`,
-    // measured on Eclipse Adoptium 25.0.3.9).
-    //
-    // This is NOT synthetic-only, which is why it is a parity fix rather than
-    // a synthetic-mode tidy-up. `register_nio_natives` — the registrar for
-    // `ByteBuffer.allocate`/`wrap`/`slice`/`duplicate`, all of which land here
-    // — is gated off the real-JDK arm, but `stream_decoder.rs`'s
-    // `Channels.newReader` branch calls this allocator too and
-    // `register_stream_decoder_natives` is registered unconditionally. So a
-    // Compatible-mode run mints these buffers over the real 11-field
-    // `java/nio/ByteBuffer`, where `bigEndian` resolves BY NAME, reads back
-    // `Int(0)`, and `native-builtins`' `s2_bb_order` decodes that as
-    // LITTLE_ENDIAN. s2 owns `ByteBuffer.order()` in both modes — native-io
-    // registers `order` for the six typed classes and never for ByteBuffer —
-    // so it is the reader that sees this.
-    //
-    // Same two writes for the same reason as `native-builtins/src/servlet.rs`'s
-    // `bb_write_hb` and `native-io/src/direct_buffer.rs`'s
-    // `dbb_allocate_direct0`; a third divergent copy of this seed is exactly
-    // what a shared helper would prevent, and is noted in
-    // W7-76-bytebuffer-alias-residuals.md rather than fixed here.
-    //
-    // `nativeByteOrder` is `bigEndian == (native order is big)`, i.e. false on
-    // every little-endian target — the same value as the default. Written
-    // anyway so the pair cannot drift if a big-endian target ever appears.
-    ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
-    ctx.set_field_by_name(
-        obj,
-        "nativeByteOrder",
-        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
-    );
+    // backing byte[] and offset to Unsafe.copyMemory. A fresh allocation's
+    // array-base offset is 0, so this is `ARRAY_BYTE_BASE_OFFSET` — spelled
+    // through [`heap_buffer_address`] so the literal `16` lives in one place.
+    ctx.set_field_by_name(obj, "address", Value::Long(heap_buffer_address(0)));
+    // W7-76's `bigEndian`/`nativeByteOrder` parity seed used to be transcribed
+    // here in full. It moved to [`seed_buffer_byte_order`] (called by
+    // `alloc_bb_object` at the top of this function), which carries the whole
+    // argument — including W7-76's own §8.2 note that a divergent copy of this
+    // seed "is exactly what a shared helper would prevent". This lane built
+    // that helper for the two files it owns.
     obj
 }
 
@@ -8095,6 +8781,338 @@ struct BbView {
     pos: i32,
     lim: i32,
     cap: i32,
+}
+
+/// The THREE states `hasArray()` / `array()` / `arrayOffset()` distinguish —
+/// and the reason none of them can be written as one "is the array
+/// accessible?" branch.
+///
+/// JDK 25, `java.base/java/nio/ByteBuffer.java` L1490 / L1513 / L1541, and the
+/// byte-for-byte identical bodies in `CharBuffer.java` at the SAME three line
+/// numbers (one contract, generated per element type from
+/// `X-Buffer.java.template`):
+///
+/// ```java
+/// public final boolean hasArray() { return (hb != null) && !isReadOnly; }
+///
+/// public final byte[] array() {
+///     if (hb == null)  throw new UnsupportedOperationException();
+///     if (isReadOnly)  throw new ReadOnlyBufferException();
+///     return hb;
+/// }
+///
+/// public final int arrayOffset() {          // the identical split
+///     if (hb == null)  throw new UnsupportedOperationException();
+///     if (isReadOnly)  throw new ReadOnlyBufferException();
+///     return offset;
+/// }
+/// ```
+///
+/// So `hasArray() == false` covers **two** states, and the exception classes
+/// are NOT interchangeable to a caller that reads the class name. MEASURED on
+/// `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)` via
+/// `probes/BufferAccessibleArrayProbe` and this lane's supplement (the probe
+/// covers byte/char/int; long/float/double/short were measured separately and
+/// answer identically, which is what "generated from one template" predicts):
+///
+/// | receiver | `hasArray()` | `array()` / `arrayOffset()` |
+/// |---|---|---|
+/// | `HeapByteBuffer` (`allocate(8)`) | `true` | the array / `0` |
+/// | `HeapByteBufferR` (`.asReadOnlyBuffer()`) | `false` | `ReadOnlyBufferException` |
+/// | `DirectByteBuffer` (`allocateDirect(8)`) | `false` | `UnsupportedOperationException` |
+/// | `DirectByteBufferR` — read-only AND array-less | `false` | `UnsupportedOperationException` |
+/// | `ByteBufferAsIntBufferB` — WRITABLE and array-less | `false` | `UnsupportedOperationException` |
+/// | `HeapLongBufferR` / `HeapFloatBufferR` / `HeapDoubleBufferR` / `HeapShortBufferR` | `false` | `ReadOnlyBufferException` |
+///
+/// The last two rows are why this is not a "read-only versus not" test: a
+/// writable view answers `UnsupportedOperation`, and a read-only heap buffer
+/// answers `ReadOnlyBuffer`. The ORDER is load-bearing and is why this is a
+/// function rather than two booleans repeated at each site: `DirectByteBufferR`
+/// is read-only AND array-less at once and the JDK asks "array-less?" FIRST, so
+/// it answers `UnsupportedOperation`. A read-only-first implementation gets
+/// that one cell wrong and every other cell right.
+///
+/// **A `catch` cannot recover the distinction.** MEASURED, same JDK:
+/// `java.nio.ReadOnlyBufferException.class.getSuperclass()` is
+/// `java.lang.UnsupportedOperationException` — ROBE *is* a UOE (JDK 25
+/// `java.base/java/nio/ReadOnlyBufferException.java:40`). So a subtype-shaped
+/// assertion passes when the two are swapped in one direction and fails in the
+/// other; only an exact-class comparison discriminates. (The F5-1 record says
+/// the two "share no supertype below `RuntimeException`" — that is wrong, and
+/// wrong in the direction that makes a test look stricter than it is.)
+///
+/// Transcribed from `native-builtins/src/phases_late/charset_buffers.rs`'s
+/// `cb_array_access`, which a sibling lane wrote for the CharBuffer half of the
+/// same contract. It is not `use`d from there because the dependency runs the
+/// other way — `cratonvm-native-builtins` depends on `cratonvm-native-io`, not
+/// the reverse — so this copy is `pub` and is the one the other two registrars
+/// can converge onto without a new crate. See the record's NOMINATIONS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferArrayAccess {
+    /// Array-backed and writable: hand the array over.
+    Accessible,
+    /// Array-backed but read-only: `java.nio.ReadOnlyBufferException`.
+    ReadOnly,
+    /// No backing array at all (direct, or a typed view): raise
+    /// `java.lang.UnsupportedOperationException`.
+    Absent,
+}
+
+/// [`BufferArrayAccess`] from the two inputs the JDK bodies read, in the JDK's
+/// order. Split out from the four natives that need it so the ordering has one
+/// definition and one test instead of four transcriptions that can drift — the
+/// way the ByteBuffer and CharBuffer halves of this family already did.
+#[inline]
+pub fn buffer_array_access(has_hb: bool, read_only: bool) -> BufferArrayAccess {
+    if !has_hb {
+        // FIRST, per the JDK body. Not `else if`-after-read-only.
+        BufferArrayAccess::Absent
+    } else if read_only {
+        BufferArrayAccess::ReadOnly
+    } else {
+        BufferArrayAccess::Accessible
+    }
+}
+
+/// True when the buffer's `isReadOnly` FIELD is set.
+///
+/// The field, not the `isReadOnly()` METHOD, because that is what the JDK's own
+/// `hasArray`/`array`/`arrayOffset` bodies read. The two can legitimately
+/// disagree: `ByteBufferAsIntBufferRB` &c. override the method to return `true`
+/// and never write the field. That is not a hazard here — those classes carry
+/// no `hb` either, so the `Absent` arm answers first and this is never
+/// consulted (MEASURED: `ByteBuffer.allocate(8).asReadOnlyBuffer().asIntBuffer()`
+/// answers `isReadOnly() == true` and `array()` throws
+/// **UnsupportedOperationException**, not `ReadOnlyBufferException`).
+///
+/// Byte-identical in shape to `native-builtins/src/servlet.rs`'s
+/// `s2_bb_is_read_only` and `charset_buffers.rs`'s `cb_is_read_only`, so the
+/// three cannot drift. A layout with no such field answers a non-`Int` and
+/// lands on `false`, which is right for every buffer this crate mints: the only
+/// writer is the typed `$ro_fn` macro arm, which sets `isReadOnly = 1` by name.
+///
+/// `pub` for the same reason [`buffer_array_access`] is: F14-1's N1 named this
+/// as one of THREE byte-identical transcriptions
+/// (`servlet.rs::s2_bb_is_read_only`, `charset_buffers.rs::cb_is_read_only`,
+/// this) and `cratonvm-native-builtins` depends on `cratonvm-native-io` and not
+/// the reverse, so this is the only one of the three the other two can import.
+/// The other two are now one-line delegations to it and the set cannot drift.
+#[inline]
+pub fn buffer_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    matches!(ctx.get_field_by_name(buf, "isReadOnly"), Value::Int(v) if v != 0)
+}
+
+/// Which of the two shapes a view-producing buffer method has, for the purpose
+/// of the derived buffer's `isReadOnly` flag.
+///
+/// **Read-only-ness is CONTAGIOUS in the JDK and `asReadOnlyBuffer()` is
+/// one-way.** Both halves MEASURED on `openjdk 25.0.3 2026-04-21 LTS
+/// (25.0.3+9-LTS)`, all seven buffer families (byte/char/int/long/float/
+/// double/short), `scratchpad/f21/F21ViewContagionProbe.java`:
+///
+/// ```text
+/// <fam>.ro.dup.isReadOnly        OK true      <- duplicate()
+/// <fam>.ro.slice.isReadOnly      OK true      <- slice()
+/// <fam>.ro.slice(1,2).isReadOnly OK true      <- slice(int,int)
+/// <fam>.ro.aro.isReadOnly        OK true      <- asReadOnlyBuffer()
+/// <fam>.w.dup.isReadOnly         OK false     <- and NOT contagious upward
+/// <fam>.w.slice.isReadOnly       OK false
+/// <fam>.w.aro.isReadOnly         OK true      <- unconditional
+/// <fam>.ro.dup.aro.isReadOnly    OK true      <- no route back to writable
+/// ```
+///
+/// The six typed families' transcripts are byte-identical to one another and
+/// differ from `byte`'s in exactly one column (`order`, which is `BIG_ENDIAN`
+/// for ByteBuffer and `ByteOrder.nativeOrder()` for the typed heap families) —
+/// verified by mechanical diff, not by the "one template" argument.
+///
+/// The JDK also has no operation anywhere that clears the flag: there is no
+/// `asWritableBuffer`, and `duplicate()` of a read-only buffer re-enters
+/// `HeapByteBufferR`'s constructor with `isReadOnly = true` again. So `Inherit`
+/// really is inheritance and not a copy that some other path can undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferDerivation {
+    /// `duplicate()`, `slice()`, `slice(int,int)`: the derived buffer's
+    /// read-only-ness is exactly the source's.
+    Inherit,
+    /// `asReadOnlyBuffer()`: read-only whatever the source was.
+    ForceReadOnly,
+}
+
+/// The derived buffer's `isReadOnly` flag, from the derivation shape and the
+/// source's flag.
+///
+/// A function rather than two `if`s at each of the eleven view-producing
+/// natives in this file, for the same reason [`buffer_array_access`] is one:
+/// eleven transcriptions of a two-line rule is how [`buffer_array_access`]'s
+/// own contract came to exist in three drifted copies.
+///
+/// **The severity, and why this is not merely a wrong flag.** F14-1 closed the
+/// hole where `hasArray()` → `array()` handed a caller a mutable alias to
+/// read-only storage. Without this propagation the same capability re-opens one
+/// call later: `readOnlyBuffer.duplicate()` came back with `isReadOnly` unset,
+/// so `hasArray()` answered `true` again, `array()` handed the array over
+/// again, and every write through it corrupted the read-only buffer with no
+/// exception anywhere — reached by following the documented protocol, on a
+/// receiver the caller obtained from a read-only one.
+#[inline]
+pub fn buffer_view_read_only(derivation: BufferDerivation, source_read_only: bool) -> bool {
+    match derivation {
+        BufferDerivation::Inherit => source_read_only,
+        BufferDerivation::ForceReadOnly => true,
+    }
+}
+
+/// Stamp `derived` — a buffer just minted from `src` by `derivation` — with the
+/// `isReadOnly` flag [`buffer_view_read_only`] says it must have.
+///
+/// Writes the flag on BOTH outcomes rather than only when it is set. Neither
+/// [`alloc_byte_buffer`] nor [`alloc_typed_buffer`] writes `isReadOnly` at all,
+/// so an unwritten flag is whatever the allocation left in the slot; the
+/// explicit `0` is what makes "writable source ⇒ writable view" a decision this
+/// file makes rather than a default it inherits.
+#[inline]
+fn buf_stamp_read_only(
+    ctx: &mut dyn NativeContext,
+    src: ObjectRef,
+    derived: ObjectRef,
+    derivation: BufferDerivation,
+) {
+    // The read is BOUND before the call rather than nested inside it, and that
+    // is a borrowck requirement, not a style choice: `buf_write_read_only`
+    // takes `ctx` as `&mut dyn` and `buffer_is_read_only` takes it as `&dyn`,
+    // so as sibling arguments to one expression the two borrows overlap
+    // (E0502). Rust already evaluates arguments left to right, so this binding
+    // does not MOVE the read — it happened before the callee's body either
+    // way; it only ends the shared borrow before the mutable one starts.
+    let src_read_only = buffer_is_read_only(ctx, src);
+    buf_write_read_only(ctx, derived, derivation, src_read_only);
+}
+
+/// [`buf_stamp_read_only`] for a caller that has ALREADY read the source's
+/// flag — the two arguments in the other order, one of them a `bool` instead
+/// of an `ObjectRef`.
+///
+/// Not a convenience. `slice()` and `duplicate()` allocate between reading the
+/// source and stamping the result, and an allocation can trigger a collection
+/// that RELOCATES the source; passing the `ObjectRef` across that gap and
+/// dereferencing it afterwards is the hazard `alloc_byte_buffer_over`'s pin
+/// exists for. Reading the flag first turns the thing carried across the
+/// allocation into a `bool`, which no collector can move — cheaper than a pin
+/// and impossible to get wrong.
+#[inline]
+fn buf_write_read_only(
+    ctx: &mut dyn NativeContext,
+    derived: ObjectRef,
+    derivation: BufferDerivation,
+    source_read_only: bool,
+) {
+    let ro = buffer_view_read_only(derivation, source_read_only);
+    ctx.set_field_by_name(derived, "isReadOnly", Value::Int(i32::from(ro)));
+}
+
+/// `throw new UnsupportedOperationException()` — the NO-ARGUMENT constructor,
+/// so `getMessage()` is null exactly as HotSpot's is (MEASURED: all four of
+/// `DirectByteBuffer.array()`, `DirectByteBuffer.arrayOffset()`,
+/// `asCharBuffer().array()` and `CharBuffer.wrap(String).array()` report
+/// `getMessage() == null`). The EMPTY string is the documented spelling for
+/// that in `types/src/error.rs`, which maps `""` to `None` so the `()V` ctor is
+/// used; `Some("")` would set a non-null empty detail message.
+///
+/// This replaced a `"ByteBuffer has no backing array"` detail message, which
+/// was the same defect this lane fixes in `servlet.rs` (record N3).
+///
+/// `pub` for the same reason [`buffer_array_access`] and
+/// [`buffer_is_read_only`] are: `servlet.rs::s2_bb_no_backing_array` and
+/// `charset_buffers.rs::cb_no_backing_array` were the other two copies of this
+/// three-line body, and only this one is importable by the other two. Both are
+/// now one-line delegations. The EMPTY-string spelling is the whole point of
+/// sharing it — a `Some("")` here would give `getMessage()` a non-null empty
+/// string, and a test written as `matches!(.., UnsupportedOperationException { .. })`
+/// is blind to that by construction, which is how the wrong message survived a
+/// prior repair of this same family.
+#[inline]
+pub fn buffer_no_backing_array() -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: String::new(),
+    }
+    .into()
+}
+
+/// Refuse a WRITE through a read-only buffer — the guard every `put*` /
+/// `compact` native in this file must run FIRST.
+///
+/// **This is the most severe defect class this codebase triages: a wrong
+/// CAPABILITY, silent.** Before this, `ByteBuffer.allocate(8)
+/// .asReadOnlyBuffer().put(0, (byte) 1)` SUCCEEDED and the byte landed in the
+/// source's backing array — with no exception at any point, reached by
+/// following the documented protocol on a receiver whose entire contract is
+/// that it cannot be written. F14-1 closed the `array()` route to the same
+/// storage and F21-1 closed the `duplicate()`-of-a-read-only route; the direct
+/// route, `put` itself, was never checked by anything in this crate.
+///
+/// MEASURED on `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)`
+/// (`scratchpad/f37/F37TypedAliasProbe.java`, 691 rows). Every write path of
+/// every family answers `java.nio.ReadOnlyBufferException` with a **null**
+/// detail message, on every read-only receiver shape:
+///
+/// ```text
+/// bb.ro.put(b) / put(i,b) / put(byte[]) / put(byte[],0,2) / put(ByteBuffer)
+/// bb.ro.putInt / putInt(0,i) / putShort / putChar / putLong / putFloat / putDouble
+/// bb.ro.compact()
+/// bb.ro.duplicate().put(b)          <- and through every derived buffer
+/// bb.ro.slice().put(b)
+/// bb.roDirect.put(b)                <- DirectByteBufferR, same class
+/// <fam>.ro.put(x) / put(i,x) / put(arr) / put(arr,0,2) / put(buf) / compact()
+/// <fam>.roView.put(x) …             <- ByteBufferAs<T>BufferRB
+/// <fam>.roDirectView.put(x)         <- Direct<T>BufferRS
+/// Char.ro.put(String) / append(CharSequence)
+/// CharBuffer.wrap(String).put(c)    <- StringCharBuffer, isReadOnly() true
+/// ```
+///
+/// **`ReadOnlyBufferException`, NOT `UnsupportedOperationException`, and the
+/// distinction is measured rather than reasoned.** [`buffer_array_access`]'s
+/// contract is that the ARRAY-LESS check runs first, so `array()` /
+/// `arrayOffset()` on a `ByteBufferAsIntBufferRB` answer
+/// `UnsupportedOperationException` even though the receiver is read-only. That
+/// ordering is specific to those two accessors: JDK 25's
+/// `ByteBufferAsIntBufferRB.put(int)` is a bare `throw new
+/// ReadOnlyBufferException();` (`jdk25src/java.base/java/nio/
+/// ByteBufferAsIntBufferRB.java:166`), and so is `HeapIntBufferR`'s, and the
+/// transcript above confirms it for the array-LESS read-only view too. So the
+/// answer here is `ReadOnlyBufferException` on every shape and there is no
+/// second arm to write.
+///
+/// `ReadOnlyBufferException` **extends** `UnsupportedOperationException`
+/// (`jdk25src/java.base/java/nio/ReadOnlyBufferException.java:40`; MEASURED
+/// `ROBE.getSuperclass() == java.lang.UnsupportedOperationException`,
+/// `ROBE instanceof UOE == true`, `UOE instanceof ROBE == false`), so an
+/// `instanceof`-shaped or `matches!`-shaped assertion on this pair
+/// discriminates in ONE direction only and would let a
+/// `buffer_no_backing_array` mutant live. Every test for this compares an
+/// exact class name.
+///
+/// **The negative control is the reason this reads the FIELD.** A writable
+/// buffer must still write: `bb.w.put(b)` and `bb.w.compact()` both succeed on
+/// HotSpot (MEASURED), and `alloc_byte_buffer` / `alloc_typed_buffer` never
+/// write `isReadOnly` at all, so a freshly minted buffer's flag is the
+/// allocation's zero and this guard is inert for it. The only writers of a `1`
+/// are `buf_write_read_only`'s `ForceReadOnly` arm and the `Inherit` arm on a
+/// read-only source — i.e. the flag is set exactly when the JDK sets it.
+#[inline]
+pub fn buffer_check_writable(
+    ctx: &dyn NativeContext,
+    buf: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if buffer_is_read_only(ctx, buf) {
+        // `RuntimeError::ReadOnlyBufferException` is a unit variant that maps
+        // to the no-argument constructor, so `getMessage()` is null exactly as
+        // HotSpot's is on all 40+ ROBE rows measured. Spelling a detail
+        // message here would be the same defect `buffer_no_backing_array`
+        // records ("direct buffer has no backing array" surviving a repair).
+        return Err(RuntimeError::ReadOnlyBufferException.into());
+    }
+    Ok(())
 }
 
 /// Element-indexed view returned by [`bb_state`]: `pos`/`lim`/`cap` are in
@@ -8572,8 +9590,10 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
     // `HeapCharBuffer`) has no closer override to resolve to, so the
     // interpreter's abstract-method dispatch walks all the way up to
     // `Buffer.isReadOnly()` (no Code) and throws AbstractMethodError unless
-    // something is registered here. Mirrors `native_bb_is_read_only`'s
-    // "heap-backed, never read-only" default used for ByteBuffer.
+    // something is registered here. `native_bb_is_read_only` used to be a flat
+    // "never read-only" default; it now reads the `isReadOnly` FIELD, the same
+    // one `hasArray`/`array`/`arrayOffset` consult, so this catch-all and the
+    // three accessors cannot disagree about one receiver.
     registry.register(buf, "isReadOnly", "()Z", native_bb_is_read_only);
     registry.register(buf, "isDirect", "()Z", native_bb_is_direct);
 
@@ -8653,6 +9673,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "array", "()[C", native_tb_array);
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
+        // `arrayOffset` — F14-1 N3. `array` and `hasArray` were registered
+        // for all six typed families and `arrayOffset` for NEITHER, so in
+        // `--features synthetic-jdk` mode `IntBuffer.arrayOffset()` resolved
+        // to the Code-less `java/nio/Buffer` declaration and threw
+        // AbstractMethodError. Same native as ByteBuffer's: the JDK body is
+        // generated from one template and MEASURED identical for all seven
+        // families (`*.heap.arrayOffset OK 0`, `*.ro.arrayOffset` ->
+        // ReadOnlyBufferException, `*.view.arrayOffset` ->
+        // UnsupportedOperationException, jdk-25.0.3+9).
+        registry.register(c, "arrayOffset", "()I", native_bb_array_offset);
         registry.register(c, "toString", "()Ljava/lang/String;", native_cb_to_string);
         registry.register(c, "length", "()I", native_bb_remaining);
         registry.register(c, "charAt", "(I)C", native_cb_char_at);
@@ -8699,6 +9729,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "put", "(II)Ljava/nio/IntBuffer;", native_tb_put_int_abs);
         registry.register(c, "array", "()[I", native_tb_array);
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
+        // `arrayOffset` — F14-1 N3. `array` and `hasArray` were registered
+        // for all six typed families and `arrayOffset` for NEITHER, so in
+        // `--features synthetic-jdk` mode `IntBuffer.arrayOffset()` resolved
+        // to the Code-less `java/nio/Buffer` declaration and threw
+        // AbstractMethodError. Same native as ByteBuffer's: the JDK body is
+        // generated from one template and MEASURED identical for all seven
+        // families (`*.heap.arrayOffset OK 0`, `*.ro.arrayOffset` ->
+        // ReadOnlyBufferException, `*.view.arrayOffset` ->
+        // UnsupportedOperationException, jdk-25.0.3+9).
+        registry.register(c, "arrayOffset", "()I", native_bb_array_offset);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/IntBuffer;", native_tb_compact);
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_ib_order);
@@ -8753,6 +9793,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "array", "()[J", native_tb_array);
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
+        // `arrayOffset` — F14-1 N3. `array` and `hasArray` were registered
+        // for all six typed families and `arrayOffset` for NEITHER, so in
+        // `--features synthetic-jdk` mode `IntBuffer.arrayOffset()` resolved
+        // to the Code-less `java/nio/Buffer` declaration and threw
+        // AbstractMethodError. Same native as ByteBuffer's: the JDK body is
+        // generated from one template and MEASURED identical for all seven
+        // families (`*.heap.arrayOffset OK 0`, `*.ro.arrayOffset` ->
+        // ReadOnlyBufferException, `*.view.arrayOffset` ->
+        // UnsupportedOperationException, jdk-25.0.3+9).
+        registry.register(c, "arrayOffset", "()I", native_bb_array_offset);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/LongBuffer;", native_tb_compact);
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_lb_order);
@@ -8807,6 +9857,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "array", "()[F", native_tb_array);
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
+        // `arrayOffset` — F14-1 N3. `array` and `hasArray` were registered
+        // for all six typed families and `arrayOffset` for NEITHER, so in
+        // `--features synthetic-jdk` mode `IntBuffer.arrayOffset()` resolved
+        // to the Code-less `java/nio/Buffer` declaration and threw
+        // AbstractMethodError. Same native as ByteBuffer's: the JDK body is
+        // generated from one template and MEASURED identical for all seven
+        // families (`*.heap.arrayOffset OK 0`, `*.ro.arrayOffset` ->
+        // ReadOnlyBufferException, `*.view.arrayOffset` ->
+        // UnsupportedOperationException, jdk-25.0.3+9).
+        registry.register(c, "arrayOffset", "()I", native_bb_array_offset);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/FloatBuffer;", native_tb_compact);
         // `order()` is ALSO registered directly on the literal
@@ -8872,6 +9932,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "array", "()[D", native_tb_array);
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
+        // `arrayOffset` — F14-1 N3. `array` and `hasArray` were registered
+        // for all six typed families and `arrayOffset` for NEITHER, so in
+        // `--features synthetic-jdk` mode `IntBuffer.arrayOffset()` resolved
+        // to the Code-less `java/nio/Buffer` declaration and threw
+        // AbstractMethodError. Same native as ByteBuffer's: the JDK body is
+        // generated from one template and MEASURED identical for all seven
+        // families (`*.heap.arrayOffset OK 0`, `*.ro.arrayOffset` ->
+        // ReadOnlyBufferException, `*.view.arrayOffset` ->
+        // UnsupportedOperationException, jdk-25.0.3+9).
+        registry.register(c, "arrayOffset", "()I", native_bb_array_offset);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/DoubleBuffer;", native_tb_compact);
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_db_order);
@@ -8926,6 +9996,16 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "array", "()[S", native_tb_array);
         registry.register(c, "hasArray", "()Z", native_bb_has_array);
+        // `arrayOffset` — F14-1 N3. `array` and `hasArray` were registered
+        // for all six typed families and `arrayOffset` for NEITHER, so in
+        // `--features synthetic-jdk` mode `IntBuffer.arrayOffset()` resolved
+        // to the Code-less `java/nio/Buffer` declaration and threw
+        // AbstractMethodError. Same native as ByteBuffer's: the JDK body is
+        // generated from one template and MEASURED identical for all seven
+        // families (`*.heap.arrayOffset OK 0`, `*.ro.arrayOffset` ->
+        // ReadOnlyBufferException, `*.view.arrayOffset` ->
+        // UnsupportedOperationException, jdk-25.0.3+9).
+        registry.register(c, "arrayOffset", "()I", native_bb_array_offset);
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/ShortBuffer;", native_tb_compact);
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_sb_order);
@@ -8958,53 +10038,107 @@ fn native_bb_allocate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Object(Some(bb))))
 }
 
+/// `ByteBuffer.wrap(byte[])` — **an ALIAS of the caller's array, not a copy.**
+///
+/// This copied every byte into a fresh array, which breaks the one property
+/// `wrap` exists for. `ByteBuffer.wrap(bytes)` is how a caller says "give me a
+/// buffer view OF THESE BYTES"; HotSpot's `wrap` is literally
+/// `new HeapByteBuffer(array, array.length, null)` and installs the reference.
+///
+/// MEASURED, jdk-25.0.3+9 (`scratchpad/f26/W.java`):
+///
+/// ```text
+/// wrap(arr).array()==arr : true          <- identity, not equality
+/// put(0,0x7F) -> raw[0]  : 127           <- writes reach the caller's array
+/// raw[1]=0x11 -> get(1)  : 17            <- and are seen in the other direction
+/// wrap(arr).arrayOffset() : 0
+/// wrap(arr).pos/lim/cap   : 0/8/8
+/// ```
+///
+/// Both directions were broken by the copy, and both are silent: a caller that
+/// wraps a scratch array, fills the buffer and then reads the ARRAY got zeros;
+/// a caller that mutates the array and reads through the buffer got stale
+/// bytes. Neither raises anything.
+///
+/// `offset` is `0` here — `wrap` does not shift the base — so this aliases in
+/// BOTH jdk modes: [`buf_try_set_heap_offset`] reports base 0 representable
+/// unconditionally, because every layout expresses it.
 fn native_bb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let len = ctx.array_length(src);
-    let bb = alloc_byte_buffer(ctx, len);
-    // STRUCTURALLY HEAP-ONLY: the receiver is the buffer `alloc_byte_buffer`
-    // just minted two lines up, which always installs a `byte[]` in both `hb`
-    // and slot 0. It is never a caller-supplied buffer, so the direct arm is
-    // unreachable here — but the write still goes through `tb_write_elem` so
-    // this site cannot become a straggler if that ever stops being true.
-    let view = bb_state(ctx, bb)?;
-    for i in 0..len {
-        let v = ctx.get_array_element(src, i);
-        tb_write_elem(ctx, view, i, v)?;
+    let len = i32::try_from(ctx.array_length(src)).unwrap_or(i32::MAX);
+    let window = BufferWindow {
+        offset: 0,
+        pos: 0,
+        lim: len,
+        cap: len,
+        mark: -1,
+    };
+    // `offset == 0` always round-trips, so this cannot be `None`; the `?`-free
+    // fallback exists so a future non-zero-offset caller cannot get a silent
+    // wrong answer out of this site.
+    match alloc_byte_buffer_over(ctx, src, window) {
+        Some(bb) => Ok(Some(Value::Object(Some(bb)))),
+        None => Ok(Some(Value::Object(Some(alloc_byte_buffer(
+            ctx,
+            len.max(0) as usize,
+        ))))),
     }
-    buf_set_position(ctx, bb, 0);
-    buf_set_limit(ctx, bb, len as i32);
-    Ok(Some(Value::Object(Some(bb))))
 }
 
+/// `ByteBuffer.wrap(byte[], int offset, int length)` — the same alias, plus
+/// the range check it never had.
+///
+/// HotSpot's geometry, MEASURED: `wrap(raw,2,3)` gives `pos/lim/cap = 2/5/8`,
+/// `array() == raw` and `arrayOffset() == 0`. So `offset`/`length` move
+/// POSITION and LIMIT; the capacity stays the whole array and the array-base
+/// `offset` stays `0`. The old body already had that geometry right — what it
+/// had wrong was the array (copied) and the absence of any bounds check.
+///
+/// **The bounds check is not scope creep; it is what makes the aliasing
+/// safe.** `ByteBuffer.wrap(array, off, len)` is
+/// `try { new HeapByteBuffer(array, off, len, null) } catch
+/// (IllegalArgumentException x) { throw new IndexOutOfBoundsException(); }`,
+/// and MEASURED both `wrap(raw,0,9)` and `wrap(raw,-1,2)` raise
+/// `java.lang.IndexOutOfBoundsException` with a NULL message — hence
+/// [`RuntimeError::ioobe_no_message`], the same spelling `servlet.rs`'s copy of
+/// this method uses. While the body copied, an out-of-range `length` merely
+/// produced a limit past the end of a private array; now that the array is the
+/// caller's, an unchecked limit would index past the end of a REAL array on
+/// every subsequent read.
 fn native_bb_wrap_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Object(None))),
     };
     let offset = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let length = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let arr_len = ctx.array_length(src);
-    let bb = alloc_byte_buffer(ctx, arr_len);
-    // STRUCTURALLY HEAP-ONLY, same as `native_bb_wrap` above: the receiver is
-    // the freshly minted buffer, not the caller's.
-    let view = bb_state(ctx, bb)?;
-    for i in 0..arr_len {
-        let v = ctx.get_array_element(src, i);
-        tb_write_elem(ctx, view, i, v)?;
+    let arr_len = i32::try_from(ctx.array_length(src)).unwrap_or(i32::MAX);
+    if offset < 0 || length < 0 || i64::from(offset) + i64::from(length) > i64::from(arr_len) {
+        return Err(RuntimeError::ioobe_no_message().into());
     }
-    buf_set_position(ctx, bb, offset as i32);
-    buf_set_limit(ctx, bb, (offset + length) as i32);
-    Ok(Some(Value::Object(Some(bb))))
+    let window = BufferWindow {
+        offset: 0,
+        pos: offset,
+        lim: offset + length,
+        cap: arr_len,
+        mark: -1,
+    };
+    match alloc_byte_buffer_over(ctx, src, window) {
+        Some(bb) => Ok(Some(Value::Object(Some(bb)))),
+        None => Ok(Some(Value::Object(Some(alloc_byte_buffer(
+            ctx,
+            arr_len.max(0) as usize,
+        ))))),
+    }
 }
 
 // --- Position / limit / capacity ---
@@ -9197,6 +10331,7 @@ fn native_bb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let view = bb_storage_view(ctx, this)?;
     let pos = view.pos;
     let lim = view.lim;
@@ -9298,6 +10433,7 @@ fn native_bb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let byte = args.get(1).copied().unwrap_or(Value::Int(0));
     let view = bb_storage_view(ctx, this)?;
     let pos = view.pos;
@@ -9317,6 +10453,7 @@ fn native_bb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let index = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -9336,6 +10473,7 @@ fn native_bb_put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let src = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Object(Some(this)))),
@@ -9378,6 +10516,7 @@ fn native_bb_put_bb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let src = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(Some(this)))),
@@ -9458,6 +10597,7 @@ fn native_bb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -9481,6 +10621,7 @@ fn native_bb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let index = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -9524,6 +10665,7 @@ fn native_bb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -9567,6 +10709,7 @@ fn native_bb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = match args.get(1) {
         Some(Value::Int(v)) => *v as i16,
         _ => 0,
@@ -9598,6 +10741,7 @@ fn native_bb_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = match args.get(1) {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -9621,6 +10765,7 @@ fn native_bb_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = match args.get(1) {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -9645,44 +10790,83 @@ fn native_bb_put_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 // --- Misc ---
 
+/// `ByteBuffer.array()[B` — the JDK's three-way split, not a two-way
+/// storage classification.
+///
+/// This asked only "Heap or Direct?" and **never consulted `isReadOnly`**, so a
+/// read-only heap buffer got its backing `byte[]` handed straight out where
+/// HotSpot raises `ReadOnlyBufferException`. Paired with the same omission in
+/// [`native_bb_has_array`] that was not a wrong ANSWER but a wrong
+/// **CAPABILITY**: a caller following the documented `hasArray()` → `array()`
+/// protocol was told `true` and then given a mutable alias to storage the JDK
+/// refuses to expose, and every write through it corrupted a read-only buffer
+/// with no exception anywhere. See [`buffer_array_access`] for the measured
+/// table and the ordering argument.
 fn native_bb_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    match bb_storage_view(ctx, this)?.storage {
-        BbStorage::Heap { arr, .. } => Ok(Some(Value::Object(Some(arr)))),
-        BbStorage::Direct { .. } => Err(RuntimeError::UnsupportedOperationException {
-            message: "ByteBuffer has no backing array".into(),
-        }
-        .into()),
+    // `bb_resolve_heap_array` rather than `bb_storage_view`, for the same
+    // reason `native_tb_array` uses it: this native's question is literally
+    // `hb == null`, and `bb_storage_view` answers a THREE-valued
+    // heap/direct/InternalError where the JDK has two. A storage-less receiver
+    // used to raise the internal "ByteBuffer missing backing storage"
+    // diagnostic here; HotSpot raises `UnsupportedOperationException`, which is
+    // what the array-less arm below now gives it. The diagnostic is not lost —
+    // every get/put on the same receiver still goes through `bb_state` /
+    // `bb_storage_view` and still reports it, at a site where a missing
+    // backing store really is a VM inconsistency rather than a legal Java
+    // state. `bb_resolve_heap_array` is `bb_storage_view`'s own first step, so
+    // the heap arm and its slot-5 kind screen are unchanged.
+    let arr = bb_resolve_heap_array(ctx, this);
+    match buffer_array_access(arr.is_some(), buffer_is_read_only(ctx, this)) {
+        BufferArrayAccess::Absent => Err(buffer_no_backing_array()),
+        BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+        BufferArrayAccess::Accessible => Ok(Some(Value::Object(arr))),
     }
 }
 
+/// `ByteBuffer.hasArray()Z` — `(hb != null) && !isReadOnly`.
+///
+/// The `&& !isReadOnly` half was absent: a `HeapByteBufferR` answered `true`.
+/// Also registered on the six typed families (Char/Int/Long/Float/Double/Short
+/// Buffer), whose read-only siblings measure `false` identically.
 fn native_bb_has_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(
-        match bb_storage_view(ctx, this)?.storage {
-            BbStorage::Heap { .. } => 1,
-            BbStorage::Direct { .. } => 0,
-        },
-    )))
+    // `hasArray()` NEVER throws on HotSpot — it is one `&&` over two fields.
+    // Routing it through `bb_storage_view` gave it an error path (a
+    // storage-less receiver raised the internal "missing backing storage"
+    // diagnostic where the JDK answers a plain `false`), which is why this
+    // reads `hb` directly like the other three accessors do.
+    let has_hb = bb_resolve_heap_array(ctx, this).is_some();
+    Ok(Some(Value::Int(matches!(
+        buffer_array_access(has_hb, buffer_is_read_only(ctx, this)),
+        BufferArrayAccess::Accessible
+    ) as i32)))
 }
 
+/// `ByteBuffer.arrayOffset()I` — the SAME two refusals as [`native_bb_array`],
+/// and it had only one of them. A read-only heap receiver answered a plain
+/// integer, which is indistinguishable from a legitimate offset.
 fn native_bb_array_offset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    match bb_storage_view(ctx, this)?.storage {
-        BbStorage::Heap { offset, .. } => Ok(Some(Value::Int(offset as i32))),
-        BbStorage::Direct { .. } => Err(RuntimeError::UnsupportedOperationException {
-            message: "ByteBuffer has no backing array".into(),
+    // Same resolution as `native_bb_array` — see its comment. The offset comes
+    // from `bb_resolve_heap_offset`, which is the field `bb_storage_view`'s
+    // `Heap` arm was carrying, so the happy path is byte-for-byte what it was.
+    let has_hb = bb_resolve_heap_array(ctx, this).is_some();
+    match buffer_array_access(has_hb, buffer_is_read_only(ctx, this)) {
+        BufferArrayAccess::Absent => Err(buffer_no_backing_array()),
+        BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+        BufferArrayAccess::Accessible => {
+            Ok(Some(Value::Int(bb_resolve_heap_offset(ctx, this) as i32)))
         }
-        .into()),
     }
 }
 
@@ -9699,67 +10883,248 @@ fn native_bb_is_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     )))
 }
 
-fn native_bb_is_read_only(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+/// `Buffer.isReadOnly()Z` — the flag, not a constant.
+///
+/// This was a flat `Ok(Int(0))`: every buffer in this registrar answered
+/// "writable", including the ones the typed `$ro_fn` macro arm had just marked
+/// `isReadOnly = 1` by name. Left alone it now CONTRADICTS its own siblings:
+/// after the three-way split landed in [`native_bb_has_array`] a read-only heap
+/// buffer answers `hasArray() == false` and `array()` throws
+/// `ReadOnlyBufferException`, while this said the buffer was writable — a state
+/// no real receiver can be in, and one that steers a caller which branches on
+/// `isReadOnly()` (rather than on `hasArray()`) straight into the throw.
+///
+/// MEASURED, jdk-25.0.3+9: `ByteBuffer.allocate(8).isReadOnly()` is `false`,
+/// `.asReadOnlyBuffer().isReadOnly()` is `true`, and the same pair holds for
+/// all six typed families (`HeapLongBufferR` &c.).
+///
+/// Reads the same FIELD [`buffer_is_read_only`] does, so the four accessors agree
+/// by construction. A layout with no such field still answers `false`, which is
+/// the previous behaviour for every receiver that had it — so nothing that was
+/// right before changes.
+fn native_bb_is_read_only(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(buffer_is_read_only(ctx, this) as i32)))
 }
 
+/// `ByteBuffer.duplicate()` — and the `isReadOnly` flag it never carried.
+///
+/// This copied pos/lim/cap/mark and pointed the result at the source's backing
+/// array, and wrote NOTHING to `isReadOnly`. So `readOnlyBuffer.duplicate()`
+/// came back writable, which re-opens the wrong CAPABILITY F14-1 closed one
+/// call further along: the duplicate answers `hasArray() == true`, `array()`
+/// hands its backing store over, and it is the SAME array — writes through it
+/// land in the read-only buffer, with no exception at any point.
+///
+/// MEASURED, jdk-25.0.3+9 (`scratchpad/f21/F21ViewContagionProbe.java`):
+/// `ByteBuffer.allocate(8).asReadOnlyBuffer().duplicate()` is a
+/// `java.nio.HeapByteBufferR` with `isReadOnly() == true`,
+/// `hasArray() == false` and `array()` → `ReadOnlyBufferException`. See
+/// [`BufferDerivation`] for the whole seven-family table.
+/// **TWO residuals of that repair closed here (F26-1).**
+///
+/// 1. **`offset` was dropped.** F21 taught this to share the source's array
+///    but wrote nothing to `ByteBuffer.offset`, so the duplicate inherited the
+///    fresh allocation's `0`. That is invisible only while nothing can produce
+///    a source with a non-zero `offset` — and `servlet.rs`'s
+///    `ByteBuffer.slice(int,int)` and `asReadOnlyBuffer()` already could
+///    (`s2_bb_new_heap_view` writes `offset` by name), and NEITHER descriptor
+///    is registered by `register_nio_natives`, so neither is shadowed. So
+///    `bb.slice(2,4).duplicate().get(0)` read the array from index 0 instead
+///    of 2 — a wrong VALUE, silently. MEASURED on HotSpot:
+///    `wrap(raw,2,4).slice().duplicate().arrayOffset()` is `2` and its
+///    `get(0)` equals `raw[2]`.
+/// 2. **A DIRECT source was turned into a heap COPY.** The `else` arm fired
+///    for every `allocateDirect(n)` receiver (they have no `hb`), so the
+///    duplicate was a heap buffer holding a snapshot: `isDirect()` flipped
+///    `true` → `false`, and writes stopped being shared. MEASURED:
+///    `allocateDirect(8).duplicate()` is a `java.nio.DirectByteBuffer`,
+///    `isDirect() == true`, and a write through it is `SHARED`.
+///
+/// Both now go through [`bb_derive_view`], which is also what `slice()` uses,
+/// so the two cannot drift on the storage question again. The geometry is
+/// [`duplicate_window`]: `offset`, `capacity` and the MARK are all carried
+/// across, which is the entire difference from [`slice_window`].
 fn native_bb_duplicate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     let view = bb_storage_view(ctx, this)?;
-    let pos = view.pos;
-    let lim = view.lim;
-    let cap = view.cap;
-    let mark = buf_read_mark(ctx, this);
-    let dup = alloc_byte_buffer(ctx, cap as usize);
-    // `duplicate()` SHARES content with the original — "changes to this
-    // buffer's content will be visible in the new buffer, and vice versa"
-    // (java.nio.ByteBuffer). This used to allocate a fresh array and COPY the
-    // bytes into it, so a write through either buffer was invisible to the
-    // other; only the independent position/limit/mark half of the contract
-    // held. Point the duplicate at the original's backing array instead.
-    //
-    // Both spellings are set for the same reason `alloc_byte_buffer` sets
-    // both: real heap-buffer subclasses read `hb`, the synthetic layout reads
-    // slot 0, and `bb_state` prefers `hb` when it resolves.
-    if let Value::Object(Some(shared_array)) = ctx.get_field(this, BB_FIELD_ARRAY) {
-        ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(shared_array)));
-        ctx.set_field_by_name(dup, "hb", Value::Object(Some(shared_array)));
-    } else if let Value::Object(Some(shared_array)) = ctx.get_field_by_name(this, "hb") {
-        ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(shared_array)));
-        ctx.set_field_by_name(dup, "hb", Value::Object(Some(shared_array)));
-    } else {
-        // No resolvable backing array (a direct buffer, say): fall back to the
-        // copy so the duplicate is at least readable.
-        let dup_view = bb_storage_view(ctx, dup)?;
-        for i in 0..cap as usize {
-            let b = bb_read_byte(ctx, view, i)?;
-            bb_write_byte(ctx, dup_view, i, b)?;
-        }
-    }
-    buf_write_metadata(ctx, dup, pos, lim, cap, mark);
+    let src_offset = match view.storage {
+        BbStorage::Heap { offset, .. } => offset,
+        BbStorage::Direct { .. } => 0,
+    };
+    let window = duplicate_window(
+        src_offset,
+        view.pos,
+        view.lim,
+        view.cap,
+        buf_read_mark(ctx, this),
+    );
+    // Read the flag BEFORE deriving — see [`buf_write_read_only`].
+    let src_ro = buffer_is_read_only(ctx, this);
+    let dup = bb_derive_view(ctx, view, window)?;
+    // The `duplicate()` half of the read-only contagion — see this function's
+    // doc comment. It goes LAST because `bb_derive_view` writes `hb` and
+    // `offset` by name, and on a real-JDK-shaped receiver that is the same
+    // by-name field machinery this write uses.
+    buf_write_read_only(ctx, dup, BufferDerivation::Inherit, src_ro);
     Ok(Some(Value::Object(Some(dup))))
 }
 
+/// `ByteBuffer.slice()` — the same missing `isReadOnly` propagation as
+/// [`native_bb_duplicate`].
+///
+/// MEASURED, jdk-25.0.3+9: `allocate(8).asReadOnlyBuffer().position(1).slice()`
+/// is a `java.nio.HeapByteBufferR`, `isReadOnly() == true`, `hasArray()` false,
+/// `array()`/`arrayOffset()` → `ReadOnlyBufferException`.
+///
+/// **THE STORAGE MODEL, repaired (F26-1).** This body used to COPY the
+/// remaining bytes into a fresh buffer. That is not a cosmetic difference from
+/// HotSpot; it is a WRONG CAPABILITY of the same species F14-1 and F21-1
+/// closed one call earlier. `slice()` exists to hand out a second view of the
+/// SAME bytes — "changes to this buffer's content will be visible in the new
+/// buffer, and vice versa" (`java.nio.ByteBuffer`) — so a program that slices a
+/// buffer, hands the slice to a decoder and reads the result back through the
+/// original silently LOSES every write, with no exception anywhere. That is
+/// the quiet kind of wrong.
+///
+/// MEASURED, jdk-25.0.3+9, `scratchpad/f26/F26AliasProbe.java`:
+///
+/// | expression | HotSpot | the copying body |
+/// |---|---|---|
+/// | `hbb.position(2).slice().array()` | the SOURCE array, by `==` | a fresh 6-byte array |
+/// | `hbb.position(2).slice().arrayOffset()` | `2` | `0`, unreachably |
+/// | write through slice, read through source | `SHARED` | `ISOLATED` |
+/// | `hbb.slice().slice(1,2).arrayOffset()` | `3` (offsets compose) | `0` |
+/// | `allocate(4).position(4).slice().arrayOffset()` | `4` (empty slice, offset still moves) | `0` |
+///
+/// The three storage kinds and what each now does:
+///
+/// * **heap, `offset` representable** — share `hb`, record
+///   [`slice_window`]'s composed `offset`. This is real
+///   `HeapByteBuffer.slice()`, argument for argument.
+/// * **direct** — share the native `address`, advanced by `pos`. A direct
+///   slice was previously turned into a HEAP copy, which also flipped
+///   `isDirect()` from `true` to `false`.
+/// * **heap, `offset` NOT representable** (synthetic-JDK mode: no
+///   `ByteBuffer.offset` field to write) — keep the copy. Aliasing at a
+///   non-zero base is not expressible in that layout, and a wrong `offset`
+///   reads the wrong bytes, which is worse than a copy. `servlet.rs` takes the
+///   same fallback for the same reason. See [`buf_try_set_heap_offset`].
+///
+/// Why this repair had to land HERE and not in `servlet.rs`, where an aliasing
+/// implementation of this exact descriptor already existed: `register_io_natives`
+/// runs AFTER `register_essential_natives_with_shims` in both `vm_init`
+/// real-JDK arms (VERIFIED, `vm/src/vm/vm_init.rs` L2055 < L2252 and L2593 <
+/// L2788) and registration is last-write-wins, so `servlet.rs`'s version of
+/// `slice()` is shadowed and never ran.
 fn native_bb_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     let view = bb_storage_view(ctx, this)?;
-    let pos = view.pos;
-    let lim = view.lim;
-    let remaining = (lim - pos) as usize;
-    // Create a new buffer with a copy of the remaining bytes
-    let new_bb = alloc_byte_buffer(ctx, remaining);
-    let new_view = bb_storage_view(ctx, new_bb)?;
-    for i in 0..remaining {
-        let v = bb_read_byte(ctx, view, pos as usize + i)?;
-        bb_write_byte(ctx, new_view, i, v)?;
+    let src_offset = match view.storage {
+        BbStorage::Heap { offset, .. } => offset,
+        BbStorage::Direct { .. } => 0,
+    };
+    let window = slice_window(src_offset, view.pos, view.lim);
+    // Read the flag BEFORE deriving — `bb_derive_view` allocates and `this`
+    // must not be dereferenced afterwards. See [`buf_write_read_only`].
+    let src_ro = buffer_is_read_only(ctx, this);
+    let derived = bb_derive_view(ctx, view, window)?;
+    buf_write_read_only(ctx, derived, BufferDerivation::Inherit, src_ro);
+    Ok(Some(Value::Object(Some(derived))))
+}
+
+/// Mint the buffer a view-producing native must return for `window` over
+/// `src`'s storage — ALIASING where the storage model can express it, copying
+/// where it cannot.
+///
+/// One function rather than one per view-producing native, for the reason
+/// [`buffer_array_access`] is one: the copying/aliasing decision has three
+/// arms and a fallback, and three transcriptions of it is how this family's
+/// `hasArray`/`array`/`arrayOffset` rule came to exist in three drifted
+/// copies.
+///
+/// `window.offset` is in the same units as `BbStorage::Heap`'s `offset` and as
+/// the direct arm's byte advance, i.e. BYTES — this is the `ByteBuffer` family
+/// only. The typed families scale by element width and are NOT routed here
+/// (see the record's nomination list).
+fn bb_derive_view(
+    ctx: &mut dyn NativeContext,
+    src: BbView,
+    window: BufferWindow,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // `window.offset` is ABSOLUTE in the backing array; `bb_read_byte` indexes
+    // RELATIVE to the source's own logical element 0 (it adds the source's
+    // `offset` itself). The difference is the window's start in the source's
+    // own index space — `pos` for a slice, `0` for a duplicate — and getting
+    // this wrong double-counts the source's offset, which is exactly the
+    // silent wrong-bytes read this whole record is about.
+    let src_offset = match src.storage {
+        BbStorage::Heap { offset, .. } => offset,
+        BbStorage::Direct { .. } => 0,
+    };
+    let rel_start = window.offset.saturating_sub(src_offset);
+
+    if let BbStorage::Direct { addr } = src.storage {
+        // A direct view shares the native memory, advanced to the window's
+        // byte 0. Nothing to allocate and no `offset` field involved: the
+        // advanced `address` IS the offset, which is why the direct arm has
+        // no representability question and never falls back.
+        let obj = alloc_bb_object(ctx);
+        buf_write_metadata(ctx, obj, window.pos, window.lim, window.cap, window.mark);
+        ctx.set_field_by_name(
+            obj,
+            "address",
+            Value::Long(addr.saturating_add(rel_start as i64)),
+        );
+        return Ok(obj);
     }
-    Ok(Some(Value::Object(Some(new_bb))))
+    if let BbStorage::Heap { arr, .. } = src.storage {
+        if let Some(obj) = alloc_byte_buffer_over(ctx, arr, window) {
+            return Ok(obj);
+        }
+    }
+    // Fallback: the layout cannot carry a non-zero `offset`, so copy. Content
+    // is right; aliasing is not representable and `arrayOffset()` answers 0.
+    let cap = window.cap.max(0) as usize;
+    // `alloc_byte_buffer` allocates twice (the object and its array) and can
+    // relocate the SOURCE's backing array, which `src` holds as a bare
+    // `ObjectRef` resolved before this call. Pin it across the allocation and
+    // rebuild the view from the post-GC reference. The direct arm has already
+    // returned above, so the only storage kind reaching here is `Heap`.
+    let (copy, src) = match src.storage {
+        BbStorage::Heap { arr, offset } => {
+            let pin = ctx.pin_native_root(arr);
+            let copy = alloc_byte_buffer(ctx, cap);
+            let arr = ctx.read_native_pin(pin, arr);
+            ctx.unpin_native_roots(pin);
+            (
+                copy,
+                BbView {
+                    storage: BbStorage::Heap { arr, offset },
+                    pos: src.pos,
+                    lim: src.lim,
+                    cap: src.cap,
+                },
+            )
+        }
+        BbStorage::Direct { .. } => (alloc_byte_buffer(ctx, cap), src),
+    };
+    let copy_view = bb_storage_view(ctx, copy)?;
+    for i in 0..cap {
+        let b = bb_read_byte(ctx, src, rel_start + i)?;
+        bb_write_byte(ctx, copy_view, i, b)?;
+    }
+    buf_write_metadata(ctx, copy, window.pos, window.lim, window.cap, window.mark);
+    Ok(copy)
 }
 
 fn native_bb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9782,8 +11147,154 @@ fn native_bb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 // --- FileChannel ---
 
+/// The access a `FileChannel.open(Path, OpenOption...)` call asks for.
+///
+/// Separated from the native so the JDK's option ALGEBRA — which is four
+/// rules and two refusals, not a switch — can be tested without a receiver.
+/// See [`file_channel_open_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileChannelOpenMode {
+    pub read: bool,
+    pub write: bool,
+    pub append: bool,
+    pub create: bool,
+    pub truncate: bool,
+}
+
+/// `FileChannel.open`'s option algebra, from already-normalised option names
+/// (see `normalize_afc_open_option_name`: the simple name, upper-cased).
+///
+/// MEASURED on `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)`
+/// (`scratchpad/f37/FcOpen.java`), every row a pasted transcript:
+///
+/// ```text
+/// open(p)                            -> READ; size()==5; write() throws
+///                                       java.nio.channels.NonWritableChannelException
+/// open(p, READ, APPEND)              -> java.lang.IllegalArgumentException:
+///                                       READ + APPEND not allowed
+/// open(p, APPEND, TRUNCATE_EXISTING) -> java.lang.IllegalArgumentException:
+///                                       APPEND + TRUNCATE_EXISTING not allowed
+/// open(missing, WRITE)               -> java.nio.file.NoSuchFileException
+/// open(missing, WRITE, CREATE)       -> ok, size()==0
+/// open(p, WRITE) then write(1 byte)  -> file length still 5
+/// ```
+///
+/// That last row is the one a plausible implementation gets wrong: **`WRITE`
+/// alone does NOT truncate**, and it does NOT create. Only
+/// `TRUNCATE_EXISTING` truncates and only `CREATE`/`CREATE_NEW` creates. This
+/// matters here because `FileDescriptorTable::open_write` is
+/// `.create(true).truncate(!append)`, i.e. it does BOTH unconditionally — so
+/// the naive "writable ⇒ `open_write`" mapping would silently destroy the
+/// contents of a file opened `WRITE` with no other option.
+///
+/// The two refusals carry the JDK's exact detail messages, quoted above; a
+/// `matches!(.., IllegalArgumentException { .. })` assertion cannot see a
+/// wrong one, which is why they are string constants here and compared as
+/// strings in the tests.
+///
+/// Unrecognised names are IGNORED rather than refused, and that is deliberate
+/// and different from `parse_afc_open_options`'s policy next door.
+/// `AsynchronousFileChannel.open` really does reject an option it cannot
+/// honour; `FileChannel.open` accepts `SPARSE`, `SYNC`, `DSYNC`,
+/// `DELETE_ON_CLOSE` and provider-specific `ExtendedOpenOption`s, and this VM
+/// honours none of them. Refusing them would turn a working open into a
+/// failure; ignoring them opens the file with the access the caller asked for
+/// and loses only the durability/lifecycle hint. Losing a hint is the smaller
+/// wrong answer, and it is the one this function makes deliberately.
+pub fn file_channel_open_mode(names: &[&str]) -> Result<FileChannelOpenMode, &'static str> {
+    let mut read_opt = false;
+    let mut write_opt = false;
+    let mut append = false;
+    let mut create = false;
+    let mut truncate = false;
+    for name in names {
+        match *name {
+            "READ" => read_opt = true,
+            "WRITE" => write_opt = true,
+            "APPEND" => append = true,
+            "CREATE" | "CREATE_NEW" => create = true,
+            "TRUNCATE_EXISTING" => truncate = true,
+            _ => {}
+        }
+    }
+    if read_opt && append {
+        return Err(FC_OPEN_READ_PLUS_APPEND);
+    }
+    if append && truncate {
+        return Err(FC_OPEN_APPEND_PLUS_TRUNCATE);
+    }
+    let write = write_opt || append;
+    Ok(FileChannelOpenMode {
+        // "If no options are present then this method works as if the READ
+        // option is present" (JDK 25 `FileChannel.open` javadoc) — and the
+        // implementation's actual rule is broader than "no options": READ is
+        // implied whenever no ACCESS option (READ/WRITE/APPEND) is present, so
+        // `open(p, CREATE)` is a read. Written as `!write` rather than
+        // `names.is_empty()` for that reason.
+        read: read_opt || !write,
+        write,
+        append,
+        create,
+        truncate,
+    })
+}
+
+/// MEASURED detail message, jdk-25.0.3+9. Named constants so the native and
+/// its test compare the SAME string and a typo cannot pass both.
+const FC_OPEN_READ_PLUS_APPEND: &str = "READ + APPEND not allowed";
+const FC_OPEN_APPEND_PLUS_TRUNCATE: &str = "APPEND + TRUNCATE_EXISTING not allowed";
+
+/// `FileChannel.open(Path, OpenOption...)`.
+///
+/// **The `OpenOption[]` used to be discarded** — the parameter was documented
+/// as "(ignored)" and the body carried `// Simplified: open for read (a full
+/// impl would check OpenOptions)`, calling `open_read` unconditionally. So
+/// `FileChannel.open(p, WRITE, CREATE)` handed back a READ-ONLY fd, and the
+/// first `write()` through it failed at the fd layer with a "bad fd"-shaped
+/// `IOException` naming nothing the caller had done wrong. A method whose
+/// entire second parameter selects the capability, answering with one fixed
+/// capability, is the constant-where-state shape at its widest.
+///
+/// **This native is NOT shadowed** — unlike `size()`/`position()`/`read()`/
+/// `write()`/`close()`, which `register_phase57_nio_file` re-registers,
+/// `("java/nio/channels/FileChannel", "open",
+/// "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/nio/channels/FileChannel;")`
+/// is registered HERE and nowhere else (VERIFIED by grepping every
+/// `register(fc_cls, …)` in `native-builtins/src/phases_late/nio_file.rs`:
+/// `size`, `position` ×2, `close`, `isOpen`, `write`, `read` — no `open`). So
+/// this body is the live one in every mode.
+///
+/// The option algebra and its two refusals are [`file_channel_open_mode`],
+/// measured. The mapping from that mode onto `FileDescriptorTable` is below
+/// and is where this repair stops being exact; the residuals are named rather
+/// than hidden, because a silent approximation is what was here before:
+///
+/// * **APPEND** → `open_write(path, true)`, which is
+///   `.write(true).create(true).append(true)`. Right for `APPEND`+`CREATE`;
+///   for a bare `APPEND` on a missing file HotSpot raises `NoSuchFileException`
+///   and this creates it.
+/// * **TRUNCATE_EXISTING** (with WRITE) → `open_write(path, false)`, i.e.
+///   `.create(true).truncate(true)`. Right for `WRITE`+`CREATE`+
+///   `TRUNCATE_EXISTING` — the `Files.newOutputStream` default set and by far
+///   the common case; same over-eager create on a missing file without CREATE.
+/// * **any other writable combination** → `open_read_write(path, create)`,
+///   `.read(true).write(true).create(create)` — no truncate, and `create`
+///   exactly as asked, which is the row the measurement above pins.
+/// * **read-only** → `open_read(path)`, unchanged.
+///
+/// Both residuals are the same one: `fd_table` has no "open for write without
+/// creating" entry point and `native-api/src/fd_table.rs` is not this lane's
+/// file. Nominated in the record.
+///
+/// A writable channel is opened `.read(true)` as well, so
+/// `NonWritableChannelException` / `NonReadableChannelException` are still not
+/// enforced (MEASURED: `FileChannel.open(p).write(..)` raises
+/// `java.nio.channels.NonWritableChannelException`). That is a missing
+/// capability this change neither adds nor worsens — before it, EVERY channel
+/// was read-only and `write()` failed on all of them.
 fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Simplified: args[0] = Path (1-field synthetic, field 0 = String path), args[1] = OpenOption[] (ignored)
+    // args[0] = Path (1-field synthetic, field 0 = String path),
+    // args[1] = OpenOption[] — decoded below, not ignored.
     let path_obj = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -9797,16 +11308,53 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         })
         .unwrap_or_default();
 
-    // Simplified: open for read (a full impl would check OpenOptions)
-    //
+    // Decode the `OpenOption[]`. Names are read through the same two helpers
+    // `AsynchronousFileChannel.open` uses (`read_afc_open_option_name` /
+    // `normalize_afc_open_option_name`), so a `StandardOpenOption` enum
+    // constant resolves identically for the two entry points — the shape that
+    // drifts otherwise is two spellings of "which field holds an enum's name".
+    let mut option_names: Vec<String> = Vec::new();
+    if let Some(Value::Object(Some(arr))) = args.get(1) {
+        for i in 0..ctx.array_length(*arr) {
+            if let Value::Object(Some(option)) = ctx.get_array_element(*arr, i) {
+                if let Some(raw) = read_afc_open_option_name(ctx, option) {
+                    option_names.push(normalize_afc_open_option_name(&raw));
+                }
+            }
+        }
+    }
+    let borrowed: Vec<&str> = option_names.iter().map(String::as_str).collect();
+    let mode = file_channel_open_mode(&borrowed).map_err(|message| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IllegalArgumentException {
+            message: message.to_string(),
+        }))
+    })?;
+
     // Real `FileChannel.open` throws `java.nio.file.NoSuchFileException` (not
     // `FileNotFoundException`) when the target is missing — callers like
     // `FileSystemResource.readableChannel()` explicitly catch
     // `NoSuchFileException` and translate it to `FileNotFoundException`
     // (ResourceTests#resourceCreateRelativeUnknown). Mapping every open
     // failure to a generic `IOException` (as before) made that catch miss,
-    // so the raw `IOException` propagated instead.
-    let fd_id = ctx.fd_table().open_read(&path_str).map_err(|e| {
+    // so the raw `IOException` propagated instead. Unchanged by this lane and
+    // it now covers the writable arms too: `open(missing, WRITE)` without
+    // `CREATE` is a `NoSuchFileException` on HotSpot (MEASURED).
+    // The `fd_table()` borrow is scoped to this block: `ctx` is `&mut dyn` and
+    // is used mutably again below (`ensure_class_initialized`, `alloc_object`),
+    // and a `&FileDescriptorTable` held across those is E0502.
+    let opened = {
+        let table = ctx.fd_table();
+        if mode.append {
+            table.open_write(&path_str, true)
+        } else if mode.write && mode.truncate {
+            table.open_write(&path_str, false)
+        } else if mode.write {
+            table.open_read_write(&path_str, mode.create)
+        } else {
+            table.open_read(&path_str)
+        }
+    };
+    let fd_id = opened.map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NoSuchFileException {
                 path: path_str.clone(),
@@ -9943,6 +11491,45 @@ fn native_fc_set_position(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `FileChannel.size()` — the file's length, from the fd.
+///
+/// **This used to resolve the fd and then discard it** (`let _ = fd_id;`) and
+/// return a flat `Ok(Some(Value::Long(0)))`, with the comment "Simplified:
+/// return 0 (a full impl would query the underlying file)". That is the
+/// constant-where-the-JDK-reads-state shape, and it is the quiet kind: real
+/// `FileChannelImpl.size()` fstats, callers size their reads and their `map()`
+/// regions from the answer, and a `0` makes every one of them see an EMPTY
+/// file with no exception at any point.
+///
+/// The instrument it needed already existed one crate away:
+/// `FileDescriptorTable::file_size` (`native-api/src/fd_table.rs`), whose own
+/// doc comment names `FileChannel.size()` as its caller and which handles all
+/// three file entry kinds (`FileRead`, `FileWrite` — flushing first so
+/// buffered-but-unwritten bytes count — and `FileReadWrite`), saving and
+/// restoring the cursor in each. So the repair is to call it.
+///
+/// **Reachability, stated rather than assumed.** `java/nio/channels/FileChannel
+/// .size()J` is registered TWICE: here, and by
+/// `native-builtins::phases_late::nio_file::register_phase57_nio_file` as
+/// `p57_fc_size`, which already fstats. `register()` is last-write-wins, and
+/// VERIFIED in `vm/src/vm/vm_init.rs`:
+///
+/// * real-JDK arms — `register_io_natives` at L2252 / L2834, then
+///   `register_phase57_nio_file` at L2339 / L2904. **p57 wins**, so the flat
+///   `0` was DEAD in the shipping modes.
+/// * synthetic-jdk arm — `register_builtins` at L1934 (which reaches phase 57
+///   through `register_synthetic_overrides`), then `register_io_natives` at
+///   L1935. **This body wins**, so the flat `0` was live there.
+///
+/// One live mode is still a mode, and "correct in the other arm" is exactly
+/// the shape `[2cfgs]` keeps costing. Both bodies now answer from the same
+/// `file_size`, so the outcome no longer depends on which registrar ran last.
+///
+/// The error mapping matches `p57_fc_size`'s: an `IOException` carrying the
+/// underlying error's text. The two `Long(0)` early returns are kept — a
+/// missing receiver or an unset `fd` slot is a synthetic FileChannel that was
+/// never opened, which has no file to measure, and inventing an `IOException`
+/// for it would be a different answer from the one this VM gives today.
 fn native_fc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -9952,9 +11539,13 @@ fn native_fc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),
     };
-    // Simplified: return 0 (a full impl would query the underlying file)
-    let _ = fd_id;
-    Ok(Some(Value::Long(0)))
+    let size = ctx
+        .fd_table()
+        .file_size(fd_id)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("FileChannel.size: {e}"),
+        })?;
+    Ok(Some(Value::Long(size as i64)))
 }
 
 fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15493,6 +17084,271 @@ fn native_pos_init_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // Position/limit/capacity/mark/flip/clear/rewind/hasRemaining/remaining all reuse
 // the ByteBuffer implementations since they only touch fields 1-4.
 
+/// Which storage encoding a typed-buffer receiver uses — the per-receiver
+/// question F26-1 §9.1 said had to be asked before any of this family could
+/// alias, and the reason "land one and call the family fixed" is the failure
+/// mode here.
+///
+/// **Three encodings live behind one `java/nio/IntBuffer` stamp**, and only
+/// two of them can be aliased by this crate:
+///
+/// | receiver | storage | this crate |
+/// |---|---|---|
+/// | `alloc_typed_buffer`-minted (`IntBuffer.allocate`/`wrap`) | `hb` + `offset` in ELEMENTS | [`Self::Heap`] |
+/// | a DIRECT view (`allocateDirect(n).asIntBuffer()`) | `address`, bytes | [`Self::Direct`] |
+/// | an s2 heap view (`allocate(n).asIntBuffer()`) | `native-builtins`' `BB_SEGMENT_SLOT` array + a byte start encoded as `-(bs+1)` in the MARK slot | [`Self::Refuse`] |
+///
+/// The third is the one that must refuse. Its array is the source
+/// `ByteBuffer`'s `byte[]`, so `bb_state` reports `elem == Byte` for what is
+/// stamped an `IntBuffer`, and its window start is not in `offset` at all —
+/// aliasing it through `hb` + `offset` would produce a view reading from
+/// element 0 of a byte array with int-shaped accessors. Refusing keeps the
+/// existing COPY, which is what that receiver got before this change and is
+/// data-correct for it.
+///
+/// **Refusing rather than guessing is the whole design.** F26-1 §9.1 asked for
+/// "a `tb_derive_view` that refuses (falls back to the copy) rather than
+/// guessing when the receiver's encoding is not one it knows", and the reason
+/// is that a wrong guess here reads the WRONG BYTES silently, where a copy
+/// merely loses aliasing — which is the defect that already existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TbAlias {
+    /// `hb` resolves BY NAME to an array of the family's own element type, so
+    /// `offset` is an element index into it and means what this crate thinks.
+    Heap { arr: ObjectRef },
+    /// No array; a plausible native block whose element width the receiver's
+    /// class name agrees with.
+    Direct { addr: i64 },
+    /// Some other encoding. Copy.
+    Refuse,
+}
+
+/// [`TbAlias`] for `this`, given the view [`bb_state`] already resolved.
+///
+/// Three screens, each of which a wrong receiver fails:
+///
+/// 1. **`hb` BY NAME, not `bb_resolve_heap_array`.** That function's second arm
+///    reads `BB_SEGMENT_SLOT`, which is exactly the s2-view encoding this must
+///    refuse, and its third reads slot 0. Asking for the field by name is what
+///    distinguishes "a real-layout typed buffer whose `offset` field is the
+///    window" from "something else that also has an array somewhere".
+/// 2. **The array's element type equals the family's.** A `java/nio/IntBuffer`
+///    holding a `byte[]` is an s2 view that reached `hb` some other way; a
+///    mismatch here is precisely the case where `offset`-as-elements is wrong.
+///    This is also what makes `alloc_typed_buffer_over`'s later
+///    `set_array_element` type-correct.
+/// 3. **The resolved storage agrees.** If `bb_state` classified the receiver
+///    DIRECT, the `hb` arm cannot apply and vice versa — the two must not be
+///    read from different places, or the derived buffer's window would be
+///    computed against one storage and installed over the other.
+fn tb_alias_source(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    view: TbView,
+    elem: ArrayElementType,
+) -> TbAlias {
+    match view.storage {
+        BbStorage::Heap { arr: resolved, .. } => {
+            let Value::Object(Some(named)) = ctx.get_field_by_name(this, "hb") else {
+                return TbAlias::Refuse;
+            };
+            if named != resolved
+                || ctx.heap_kind_of(named) != ObjectKind::Array
+                || ctx.heap_element_type_of(named) != elem
+            {
+                return TbAlias::Refuse;
+            }
+            TbAlias::Heap { arr: named }
+        }
+        BbStorage::Direct { addr } => {
+            if view.elem != elem {
+                return TbAlias::Refuse;
+            }
+            TbAlias::Direct { addr }
+        }
+    }
+}
+
+/// Mint an ALIASING typed heap buffer over `arr` at `window` — real
+/// `HeapIntBuffer`'s protected constructor, argument for argument.
+///
+/// `None` when the layout cannot carry `window.offset`
+/// ([`buf_try_set_heap_offset`]'s round-trip probe: in synthetic-JDK mode
+/// there is no `offset` field, the write is a no-op, and
+/// [`bb_resolve_heap_offset`] would answer 0 for a view that needs a non-zero
+/// base — reading the wrong ELEMENTS). Callers fall back to copying.
+///
+/// `arr` is PINNED across the allocation for the reason
+/// [`alloc_byte_buffer_over`]'s doc gives at length: `alloc_typed_object`
+/// allocates, a collection can RELOCATE the array the caller resolved before
+/// the call, and storing the stale `ObjectRef` installs a dangling backing
+/// array.
+///
+/// The write ORDER is [`alloc_byte_buffer_over`]'s and is load-bearing:
+/// `address` goes AFTER `buf_write_metadata`, because [`buf_set_mark`] saves
+/// and restores whatever `address` it finds and an earlier write would survive
+/// only as the SAVED value.
+fn alloc_typed_buffer_over(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    arr: ObjectRef,
+    window: BufferWindow,
+    elem_width: usize,
+) -> Option<ObjectRef> {
+    let arr_pin = ctx.pin_native_root(arr);
+    let obj = alloc_typed_object(ctx, class_name);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
+    if !buf_try_set_heap_offset(ctx, obj, window.offset) {
+        // Nothing has been installed on `obj` yet, so the abandoned object is
+        // inert and unreferenced. Same shape as `alloc_byte_buffer_over`.
+        return None;
+    }
+    ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(arr)));
+    ctx.set_field_by_name(obj, "hb", Value::Object(Some(arr)));
+    buf_write_metadata(ctx, obj, window.pos, window.lim, window.cap, window.mark);
+    ctx.set_field_by_name(
+        obj,
+        "address",
+        Value::Long(typed_buffer_address(window.offset, elem_width)),
+    );
+    Some(obj)
+}
+
+/// Mint an ALIASING typed DIRECT view over the native block at `addr`,
+/// advanced to the window's element 0.
+///
+/// No array is installed, deliberately: with `hb` null, `BB_SEGMENT_SLOT`
+/// null and slot 0 carrying `buf_write_metadata`'s `mark`,
+/// [`bb_resolve_heap_array`] finds nothing and [`bb_resolve_direct_address`]
+/// answers — so the derived buffer resolves DIRECT, which is what it is.
+/// Infallible: a direct view's window lives entirely in its `address`, so
+/// there is no layout question to fail.
+fn alloc_typed_direct_view(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    addr: i64,
+    rel_start: usize,
+    window: BufferWindow,
+    elem_width: usize,
+) -> ObjectRef {
+    let obj = alloc_typed_object(ctx, class_name);
+    buf_write_metadata(ctx, obj, window.pos, window.lim, window.cap, window.mark);
+    ctx.set_field_by_name(
+        obj,
+        "address",
+        Value::Long(typed_direct_view_address(addr, rel_start, elem_width)),
+    );
+    obj
+}
+
+/// The typed families' [`bb_derive_view`]: mint the buffer a view-producing
+/// native must return for `window` over `this`'s storage, ALIASING where the
+/// encoding is one this crate can express and answering `None` where it is
+/// not.
+///
+/// `window.offset` is in ELEMENTS here, not bytes — that is the whole
+/// difference from `bb_derive_view`, and it is why [`slice_window`] /
+/// [`slice_range_window`] / [`duplicate_window`] are reused UNCHANGED: their
+/// arithmetic is `index + offset` in whatever unit the caller supplies, and
+/// real `HeapIntBuffer.slice()` is `new HeapIntBuffer(hb, -1, 0, rem, rem,
+/// pos + offset, segment)` — the same five arguments as `HeapByteBuffer`'s,
+/// with `offset` counted in elements. Only [`typed_buffer_address`] needs the
+/// width.
+///
+/// `rel_start` is the window's start in the SOURCE's own index space
+/// (`pos` for a slice, `index` for `slice(int,int)`, `0` for a duplicate),
+/// which is what the direct arm advances by and what the copy fallback indexes
+/// with. Deriving it as `window.offset - src_offset` rather than passing it
+/// separately keeps the two in step: getting it wrong double-counts the
+/// source's own offset, which is the silent wrong-bytes read this whole family
+/// is about.
+fn tb_derive_view(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    view: TbView,
+    window: BufferWindow,
+    class_name: &str,
+    elem: ArrayElementType,
+) -> Option<ObjectRef> {
+    let src_offset = match view.storage {
+        BbStorage::Heap { offset, .. } => offset,
+        BbStorage::Direct { .. } => 0,
+    };
+    let rel_start = window.offset.saturating_sub(src_offset);
+    let width = tb_elem_width(elem);
+    // The encoding question is asked BEFORE anything allocates, so `this` is
+    // not dereferenced after a collection could have moved it.
+    match tb_alias_source(ctx, this, view, elem) {
+        TbAlias::Heap { arr } => alloc_typed_buffer_over(ctx, class_name, arr, window, width),
+        TbAlias::Direct { addr } => Some(alloc_typed_direct_view(
+            ctx, class_name, addr, rel_start, window, width,
+        )),
+        TbAlias::Refuse => None,
+    }
+}
+
+/// Allocate the COPY a refused derivation falls back to, with the source's
+/// backing array pinned across the allocation, and hand back a view rebuilt
+/// from the post-GC reference.
+///
+/// **The pin is a fix, not a precaution.** `alloc_typed_buffer` allocates
+/// TWICE (the object and its array) and the copy loop then reads through a
+/// `TbView` captured *before* those allocations — so a collection landing in
+/// between left `BbStorage::Heap { arr }` pointing at a relocated array and
+/// every subsequent `tb_read_elem` read through a stale reference. The
+/// `ByteBuffer` half of this family already pins here (`bb_derive_view`'s
+/// fallback); the typed half never did.
+fn tb_alloc_copy_target(
+    ctx: &mut dyn NativeContext,
+    src: TbView,
+    class_name: &str,
+    elem: ArrayElementType,
+    capacity: usize,
+) -> (ObjectRef, TbView) {
+    match src.storage {
+        BbStorage::Heap { arr, offset } => {
+            let pin = ctx.pin_native_root(arr);
+            let copy = alloc_typed_buffer(ctx, class_name, elem, capacity);
+            let arr = ctx.read_native_pin(pin, arr);
+            ctx.unpin_native_roots(pin);
+            (
+                copy,
+                TbView {
+                    storage: BbStorage::Heap { arr, offset },
+                    ..src
+                },
+            )
+        }
+        // A native block is not moved by any collector, so the direct arm has
+        // nothing to pin and its view survives the allocation unchanged.
+        BbStorage::Direct { .. } => (alloc_typed_buffer(ctx, class_name, elem, capacity), src),
+    }
+}
+
+/// Mint a bare typed-buffer instance with NO storage installed — the object
+/// half of [`alloc_typed_buffer`].
+///
+/// Extracted so the ALIASING constructors ([`alloc_typed_buffer_over`],
+/// [`alloc_typed_direct_view`]) cannot drift from the allocating one in the
+/// width decision, which is the part that is easy to get wrong: "the larger of
+/// `BB_NUM_FIELDS` and the real class's declared fields", so a real-JDK
+/// `java.nio.IntBuffer` receiver has room for `hb`/`offset`/`isReadOnly` and a
+/// synthetic one still has its 5 slots. `alloc_object` clamps UP anyway
+/// (`vm/src/vm/vm_exec.rs`, "Layout-mismatch guard"); the `max` is what makes
+/// the SYNTHETIC direction right.
+///
+/// Same relationship as [`alloc_bb_object`] to [`alloc_byte_buffer`].
+fn alloc_typed_object(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+    match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => {
+            let n = BB_NUM_FIELDS.max(ctx.class_num_total_fields(cid));
+            ctx.alloc_object(cid, n)
+        }
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
+    }
+}
+
 fn alloc_typed_buffer(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -15501,18 +17357,10 @@ fn alloc_typed_buffer(
 ) -> ObjectRef {
     // Pick the larger of BB_NUM_FIELDS and the real class's declared fields
     // so real-JDK-loaded types have room for their full layout.
-    let (obj, n) = match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => {
-            let real = ctx.class_num_total_fields(cid);
-            let n = BB_NUM_FIELDS.max(real);
-            (ctx.alloc_object(cid, n), n)
-        }
-        Err(_) => (
-            ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
-            BB_NUM_FIELDS,
-        ),
-    };
-    let _ = n;
+    // (The width decision moved to `alloc_typed_object`, which the aliasing
+    // constructors share; the dead `let _ = n;` that used to sit here went
+    // with it.)
+    let obj = alloc_typed_object(ctx, class_name);
     let array = ctx.new_array(elem_type, capacity);
     // Synthetic slot
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -15568,6 +17416,44 @@ fn tb_static_object(
 /// fixed-suite-bugs/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode-FIXED.md.
 macro_rules! tb_abstract_view_fns {
     ($slice_fn:ident, $slice2_fn:ident, $dup_fn:ident, $ro_fn:ident, $order_fn:ident, $cls:literal, $elem:expr, $suffix:literal) => {
+        /// `slice()` — F37-1 §2, landing F26-1 §9.1 for the typed families.
+        ///
+        /// **This COPIED, and a copy cannot express three properties HotSpot
+        /// guarantees.** MEASURED, jdk-25.0.3+9, identical in all six families
+        /// (`scratchpad/f37/F37TypedAliasProbe.java`, 691 rows mechanically
+        /// diffed as structurally identical after normalising the family name
+        /// and the element width):
+        ///
+        /// ```text
+        /// <fam>.w.pos(2).slice class          java.nio.Heap<fam>Buffer
+        /// <fam>.w.pos(2).slice geom           0/6/6
+        /// <fam>.w.pos(2).slice array()==src   true    <- IDENTITY, not equality
+        /// <fam>.w.pos(2).slice arrayOffset    2
+        /// <fam> slice write seen by src       99      <- SHARED, both directions
+        /// <fam> src write seen by slice       77
+        /// <fam>.w.slice(3,4) arrayOffset      3       <- position IGNORED
+        /// <fam>.w.slice().slice(1,2).arrayOffset  3   <- offsets COMPOSE
+        /// <fam>.allocate(4).pos(4).slice().arrayOffset  4  <- EMPTY slice, offset still moves
+        /// <fam>.direct.view.slice isDirect    true
+        /// <fam>.direct.view.slice.get(0)      21      <- direct stays SHARED too
+        /// ```
+        ///
+        /// `arrayOffset() == 2` is not merely wrong from a copy, it is
+        /// UNREACHABLE from one: a fresh buffer's offset can only be 0. And the
+        /// lost write is the quiet kind — a program that slices a buffer, hands
+        /// the slice to a decoder and reads the result back through the
+        /// original got the ORIGINAL elements, with no exception anywhere.
+        ///
+        /// The window arithmetic is [`slice_window`], REUSED UNCHANGED from the
+        /// `ByteBuffer` repair: real `HeapIntBuffer.slice()` is
+        /// `new HeapIntBuffer(hb, -1, 0, rem, rem, pos + offset, segment)` —
+        /// the same five arguments as `HeapByteBuffer`'s, with `offset` counted
+        /// in ELEMENTS instead of bytes. Only the `address` seed needs the
+        /// element width ([`typed_buffer_address`]).
+        ///
+        /// Which receivers alias and which still copy is [`tb_alias_source`],
+        /// and the copy fallback below is byte-for-byte the behaviour that was
+        /// here before — plus the pin [`tb_alloc_copy_target`] adds.
         fn $slice_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
@@ -15579,13 +17465,36 @@ macro_rules! tb_abstract_view_fns {
             // own view is structurally heap; it still goes through the same
             // element accessor so the two halves cannot drift apart.
             let view = bb_state(ctx, this)?;
-            let remaining = (view.lim - view.pos).max(0) as usize;
-            let new_buf = alloc_typed_buffer(ctx, $cls, $elem, remaining);
+            let src_offset = match view.storage {
+                BbStorage::Heap { offset, .. } => offset,
+                BbStorage::Direct { .. } => 0,
+            };
+            let window = slice_window(src_offset, view.pos, view.lim);
+            // Read the flag BEFORE deriving: everything below allocates, and
+            // `this` must not be dereferenced afterwards. This is the hazard
+            // `buf_write_read_only` exists for, and the old body had it — it
+            // called `buf_stamp_read_only(ctx, this, …)` AFTER
+            // `alloc_typed_buffer`, i.e. it read a field off a reference that
+            // two allocations could have invalidated.
+            let src_ro = buffer_is_read_only(ctx, this);
+            if let Some(aliased) = tb_derive_view(ctx, this, view, window, $cls, $elem) {
+                buf_write_read_only(ctx, aliased, BufferDerivation::Inherit, src_ro);
+                return Ok(Some(Value::Object(Some(aliased))));
+            }
+            let remaining = window.cap.max(0) as usize;
+            let rel_start = window.offset.saturating_sub(src_offset);
+            let (new_buf, view) = tb_alloc_copy_target(ctx, view, $cls, $elem, remaining);
             let new_view = bb_state(ctx, new_buf)?;
             for i in 0..remaining {
-                let v = tb_read_elem(ctx, view, view.pos as usize + i)?;
+                let v = tb_read_elem(ctx, view, rel_start + i)?;
                 tb_write_elem(ctx, new_view, i, v)?;
             }
+            buf_write_metadata(ctx, new_buf, window.pos, window.lim, window.cap, window.mark);
+            // Read-only is CONTAGIOUS — see [`BufferDerivation`]. All three of
+            // `$slice_fn`/`$slice2_fn`/`$dup_fn` wrote nothing to `isReadOnly`,
+            // so every one of the six typed families handed a WRITABLE view
+            // back from a read-only source.
+            buf_write_read_only(ctx, new_buf, BufferDerivation::Inherit, src_ro);
             Ok(Some(Value::Object(Some(new_buf))))
         }
 
@@ -15604,13 +17513,35 @@ macro_rules! tb_abstract_view_fns {
             };
             // MIGRATED — same reasoning as `$slice_fn` above.
             let view = bb_state(ctx, this)?;
+            // The bounds check runs BEFORE anything is allocated, and against
+            // `limit()` — `Objects.checkFromIndexSize(index, length, limit())`
+            // in the JDK body. Unchanged; only the storage decision below is.
             buffer_check_from_index_size(index, length, view.cap)?;
-            let new_buf = alloc_typed_buffer(ctx, $cls, $elem, length as usize);
+            let src_offset = match view.storage {
+                BbStorage::Heap { offset, .. } => offset,
+                BbStorage::Direct { .. } => 0,
+            };
+            // ABSOLUTE-indexed: `index` is a limit-space index and the source's
+            // `position` plays no part. MEASURED:
+            // `<fam>.allocate(8).position(2).slice(3,4)` has `arrayOffset()==3`,
+            // not 5 — so `position` really is ignored, and a window computed
+            // from `pos + index` would be wrong by the position on every call.
+            let window = slice_range_window(src_offset, index, length);
+            let src_ro = buffer_is_read_only(ctx, this);
+            if let Some(aliased) = tb_derive_view(ctx, this, view, window, $cls, $elem) {
+                buf_write_read_only(ctx, aliased, BufferDerivation::Inherit, src_ro);
+                return Ok(Some(Value::Object(Some(aliased))));
+            }
+            let count = window.cap.max(0) as usize;
+            let rel_start = window.offset.saturating_sub(src_offset);
+            let (new_buf, view) = tb_alloc_copy_target(ctx, view, $cls, $elem, count);
             let new_view = bb_state(ctx, new_buf)?;
-            for i in 0..length as usize {
-                let v = tb_read_elem(ctx, view, index as usize + i)?;
+            for i in 0..count {
+                let v = tb_read_elem(ctx, view, rel_start + i)?;
                 tb_write_elem(ctx, new_view, i, v)?;
             }
+            buf_write_metadata(ctx, new_buf, window.pos, window.lim, window.cap, window.mark);
+            buf_write_read_only(ctx, new_buf, BufferDerivation::Inherit, src_ro);
             Ok(Some(Value::Object(Some(new_buf))))
         }
 
@@ -15622,21 +17553,55 @@ macro_rules! tb_abstract_view_fns {
             // MIGRATED — receiver is caller-supplied and may be direct.
             let view = bb_state(ctx, this)?;
             let mark = buf_read_mark(ctx, this);
-            let cap_usize = view.cap.max(0) as usize;
-            let new_buf = alloc_typed_buffer(ctx, $cls, $elem, cap_usize);
+            let src_offset = match view.storage {
+                BbStorage::Heap { offset, .. } => offset,
+                BbStorage::Direct { .. } => 0,
+            };
+            // `duplicate()` carries the source's `offset` ACROSS UNCHANGED, and
+            // that is the half F21 left out of the ByteBuffer twin and F26-1 §3
+            // then found live on dev: a duplicate that shares the array but
+            // resets `offset` to a fresh allocation's 0 reads from the wrong
+            // element with no exception. MEASURED here for the typed families:
+            // `<fam>.w.slice().duplicate().arrayOffset()` is `2`, and
+            // `<fam>.w.duplicate()` keeps `2/8/8` where `slice()` gives
+            // `0/6/6`. `duplicate` also KEEPS the mark where `slice` drops it.
+            let window = duplicate_window(src_offset, view.pos, view.lim, view.cap, mark);
+            let src_ro = buffer_is_read_only(ctx, this);
+            if let Some(aliased) = tb_derive_view(ctx, this, view, window, $cls, $elem) {
+                buf_write_read_only(ctx, aliased, BufferDerivation::Inherit, src_ro);
+                return Ok(Some(Value::Object(Some(aliased))));
+            }
+            let cap_usize = window.cap.max(0) as usize;
+            let (new_buf, view) = tb_alloc_copy_target(ctx, view, $cls, $elem, cap_usize);
             let new_view = bb_state(ctx, new_buf)?;
             for i in 0..cap_usize {
                 let v = tb_read_elem(ctx, view, i)?;
                 tb_write_elem(ctx, new_view, i, v)?;
             }
-            buf_write_metadata(ctx, new_buf, view.pos, view.lim, view.cap, mark);
+            buf_write_metadata(ctx, new_buf, window.pos, window.lim, window.cap, window.mark);
+            buf_write_read_only(ctx, new_buf, BufferDerivation::Inherit, src_ro);
             Ok(Some(Value::Object(Some(new_buf))))
         }
 
+        /// `asReadOnlyBuffer()` — `$dup_fn` plus the ONE-WAY stamp.
+        ///
+        /// The `Int(1)` this used to write by hand was right, and stayed right
+        /// once `$dup_fn` began propagating: `ForceReadOnly` is unconditional,
+        /// so it overrides `$dup_fn`'s `Inherit` in the writable-source case
+        /// and agrees with it in the read-only-source case. Routed through
+        /// [`buffer_view_read_only`] anyway so the one-way-ness is a decision
+        /// the shared function makes and a test can pin, rather than a literal
+        /// at six expansion sites. MEASURED: no JDK operation clears the flag —
+        /// `ro.duplicate().asReadOnlyBuffer().isReadOnly()` is `true` and there
+        /// is no `asWritableBuffer`.
         fn $ro_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let src = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return $dup_fn(ctx, args),
+            };
             let result = $dup_fn(ctx, args)?;
             if let Some(Value::Object(Some(o))) = result {
-                ctx.set_field_by_name(o, "isReadOnly", Value::Int(1));
+                buf_stamp_read_only(ctx, src, o, BufferDerivation::ForceReadOnly);
             }
             Ok(result)
         }
@@ -15835,6 +17800,7 @@ fn native_cb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let ch = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -15853,6 +17819,7 @@ fn native_cb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -15875,6 +17842,7 @@ fn native_cb_put_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(Some(this)))),
@@ -15928,6 +17896,7 @@ fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let view = bb_state(ctx, this)?;
     let (pos, lim, cap) = (view.pos, view.lim, view.cap);
     let remaining = lim - pos;
@@ -15956,25 +17925,29 @@ fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// "@throws UnsupportedOperationException If this buffer is not backed by an
 /// accessible array").
 ///
-/// The storage-less case keeps its historic benign null rather than becoming
-/// an error: `native-builtins`' typed views can legitimately arrive here with
-/// neither array nor address, and turning that into a throw is a behaviour
-/// change this lane has no vector to measure.
+/// The storage-less case USED TO keep a "historic benign null", excused as a
+/// behaviour change with no vector to measure. There is now a vector, and the
+/// null was not benign: a `null` returned through a `()[I` descriptor reaches
+/// the caller's `arraylength` as a `NullPointerException` at some unrelated
+/// site, where HotSpot raises `UnsupportedOperationException` at the call
+/// itself. MEASURED, jdk-25.0.3+9: `ByteBuffer.allocate(8).asIntBuffer()` —
+/// the exact "neither array nor address" shape `native-builtins`' typed views
+/// arrive in — answers `hasArray() == false`, `array()` →
+/// `UnsupportedOperationException` (`getMessage()` null), `arrayOffset()` →
+/// `UnsupportedOperationException`. Direct and storage-less are ONE arm here
+/// because HotSpot gives them one answer; the split that matters is the
+/// read-only one, which this had none of. See [`buffer_array_access`].
 fn native_tb_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
-        return Ok(Some(Value::Object(Some(arr))));
+    let arr = bb_resolve_heap_array(ctx, this);
+    match buffer_array_access(arr.is_some(), buffer_is_read_only(ctx, this)) {
+        BufferArrayAccess::Absent => Err(buffer_no_backing_array()),
+        BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+        BufferArrayAccess::Accessible => Ok(Some(Value::Object(arr))),
     }
-    if bb_resolve_direct_address(ctx, this).is_some() {
-        return Err(RuntimeError::UnsupportedOperationException {
-            message: "direct buffer has no backing array".into(),
-        }
-        .into());
-    }
-    Ok(Some(Value::Object(None)))
 }
 
 fn native_tb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15992,6 +17965,7 @@ fn native_tb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let view = bb_state(ctx, this)?;
     let (pos, lim, cap) = (view.pos, view.lim, view.cap);
     let remaining = lim - pos;
@@ -16068,6 +18042,7 @@ fn native_tb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = args.get(1).cloned().unwrap_or(Value::Int(0));
     let view = bb_state(ctx, this)?;
     let (pos, lim) = (view.pos, view.lim);
@@ -16083,6 +18058,7 @@ fn native_tb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -16160,6 +18136,7 @@ fn native_tb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = args.get(1).cloned().unwrap_or(Value::Long(0));
     let view = bb_state(ctx, this)?;
     let (pos, lim) = (view.pos, view.lim);
@@ -16175,6 +18152,7 @@ fn native_tb_put_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -16252,6 +18230,7 @@ fn native_tb_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = args.get(1).cloned().unwrap_or(Value::Float(0.0));
     let view = bb_state(ctx, this)?;
     let (pos, lim) = (view.pos, view.lim);
@@ -16267,6 +18246,7 @@ fn native_tb_put_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -16344,6 +18324,7 @@ fn native_tb_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = args.get(1).cloned().unwrap_or(Value::Double(0.0));
     let view = bb_state(ctx, this)?;
     let (pos, lim) = (view.pos, view.lim);
@@ -16359,6 +18340,7 @@ fn native_tb_put_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -16436,6 +18418,7 @@ fn native_tb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let val = args.get(1).cloned().unwrap_or(Value::Int(0));
     let view = bb_state(ctx, this)?;
     let (pos, lim) = (view.pos, view.lim);
@@ -16451,6 +18434,7 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    buffer_check_writable(ctx, this)?; // F37-1 §3
     let idx = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -17852,11 +19836,61 @@ fn make_path_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(stream))))
 }
 
+/// The refusal `Files.list` / `Files.walk` owe a path that is not there.
+///
+/// **WHICH BODY RUNS — read this before editing either of the two.** The triples
+/// `java/nio/file/Files.list(Path)Stream` and
+/// `java/nio/file/Files.walk(Path,[FileVisitOption)Stream` are registered
+/// TWICE, here and in
+/// `native-builtins/src/phases_late/nio_file.rs::register_phase57_nio_file`,
+/// and `register()` is last-write-wins, so the winner differs BY MODE:
+///
+/// | arm (`vm/src/vm/vm_init.rs`) | order | winner |
+/// |---|---|---|
+/// | `--synthetic-jdk` | `register_builtins` then `register_io_natives` | **this file** |
+/// | feature build, real-JDK | `register_io_natives`, then `register_phase57_nio_file` LATER in the same arm | `nio_file.rs` |
+/// | shipping `cratonvm-cli` (`--jdk-only` / `--real-jdk`) | same | `nio_file.rs` |
+///
+/// That contradicts W7-8 §9.1's "`register_io_natives` is last in all three":
+/// it is last among the calls that record enumerated, but both real-JDK arms
+/// call `register_phase57_nio_file` (and `register_phase57_file`) AFTER it.
+/// Verified on this tree, `vm_init.rs`: `:2267` then `:2354`, and `:2849` then
+/// `:2919`.
+///
+/// So this body is the `--synthetic-jdk` half of a pair, and the two must be
+/// repaired together or the fix lands in whichever half the reader happened to
+/// open. Both halves used to answer a MISSING directory with an EMPTY Stream —
+/// `collect_dir_entries_inner`'s `Err(e) => return` swallows the `read_dir`
+/// failure — and HotSpot throws (measured on Adoptium 25.0.3+9, 2026-08-16:
+/// `Files.list(<missing>)` and `Files.walk(<missing>)` both raise
+/// `NoSuchFileException` at CONSTRUCTION, before any terminal operation).
+///
+/// The `<regular file>` case is NOT repaired here: HotSpot answers
+/// `NotDirectoryException` and `cratonvm_types::error::RuntimeError` has no
+/// such variant, which is a change to `types/src/error.rs` and therefore a
+/// nomination rather than an edit. `nio_file.rs`'s half — the one the shipping
+/// modes run — does raise the typed `NotDirectoryException`, via
+/// `p57_not_directory`.
+/// G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+fn files_listing_missing_refusal(dir: &str) -> Option<MethodCallFailed> {
+    if fs::symlink_metadata(dir).is_ok() {
+        return None;
+    }
+    Some(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::NoSuchFileException {
+            path: dir.to_string(),
+        },
+    )))
+}
+
 /// Files.walk(Path, FileVisitOption...) -> Stream<Path>
 fn native_files_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let dir = files_path_str(ctx, args);
     if dir.is_empty() {
         return make_path_stream(ctx, &[]);
+    }
+    if let Some(refused) = files_listing_missing_refusal(&dir) {
+        return Err(refused);
     }
     // Include the root directory itself
     let root = alloc_path(ctx, &dir);
@@ -17871,6 +19905,9 @@ fn native_files_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let dir = files_path_str(ctx, args);
     if dir.is_empty() {
         return make_path_stream(ctx, &[]);
+    }
+    if let Some(refused) = files_listing_missing_refusal(&dir) {
+        return Err(refused);
     }
     let elements = collect_dir_entries(ctx, &dir, false);
     make_path_stream(ctx, &elements)
@@ -18005,7 +20042,7 @@ const AFC_FIELD_OPEN: usize = 2;
 const AFC_NUM_FIELDS: usize = 3;
 
 /// Opt-in `AsynchronousFileChannel` tracing (`CRATONVM_DBG_AIO=1`), added
-/// 2026-08-16 for the hibernate-reactive `WrongCredentialsTest` investigation.
+/// 2026-08-16 for the hibernate `WrongCredentialsTest` investigation.
 ///
 /// The Windows Docker transport (`docker-java`'s `NamedPipeSocket`) drives
 /// `\.\pipe\docker_engine` entirely through this family, so a hang there is
@@ -18219,6 +20256,65 @@ fn afc_unsupported_option(message: impl Into<String>) -> MethodCallFailed {
         message: message.into(),
     }
     .into()
+}
+
+/// The refusal every `AsynchronousFileChannel` operation owes a CLOSED channel.
+///
+/// `java.nio.channels.ClosedChannelException`, not a bare `java.io.IOException`.
+/// The JDK reaches it through `AsynchronousFileChannelImpl.begin()`
+/// (`sun/nio/ch/AsynchronousFileChannelImpl.java`: `if (closed) throw new
+/// ClosedChannelException();`), which `size()`, `truncate()` and `force()` all
+/// run first, and the javadoc of each says `@throws ClosedChannelException`.
+/// A bare `IOException` reports the failure with a type
+/// `catch (ClosedChannelException)` does not match — the failure IS visible, it
+/// is just wearing the supertype, which is why no fixture ever caught it.
+///
+/// `ClosedChannelException extends IOException`, so tightening this can never
+/// break a handler that already compiled.
+///
+/// `pub` because `native-builtins`' `force(Z)V` registration — the sole
+/// registrant of that triple, in the other crate — needs the same refusal.
+pub fn afc_closed_channel_error(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object("java/nio/channels/ClosedChannelException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let _ = ctx.invoke(
+                "java/nio/channels/ClosedChannelException",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(exc))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        // Only reached when the class cannot be built at all (a mock context,
+        // or a JDK image without it). Falling back to the supertype keeps the
+        // failure loud rather than turning it into a success.
+        _ => RuntimeError::IOException {
+            message: "AsynchronousFileChannel is closed".into(),
+        }
+        .into(),
+    }
+}
+
+/// `java.nio.channels.NonWritableChannelException` for an operation that needs
+/// write access on a channel that was not opened for writing. Same construction
+/// as `afc_closed_channel_error`; extracted so the `truncate` and `lock` paths
+/// cannot drift apart in what they raise.
+fn afc_non_writable_error(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object("java/nio/channels/NonWritableChannelException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let _ = ctx.invoke(
+                "java/nio/channels/NonWritableChannelException",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(exc))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IOException {
+            message: "channel was not opened for writing".into(),
+        }
+        .into(),
+    }
 }
 
 fn afc_position_arg(args: &[Value], index: usize) -> Result<u64, MethodCallFailed> {
@@ -18501,6 +20597,47 @@ fn afc_truncate_at(id: u32, new_len: u64) -> io::Result<()> {
         entry.file.set_len(new_len)?;
     }
     Ok(())
+}
+
+/// `AsynchronousFileChannel.force(boolean metaData)`: fsync **this channel's
+/// own handle**, out of `afc_files()`, exactly the way `afc_truncate_at` finds
+/// the handle for `truncate`.
+///
+/// Why the handle and not the path. The only caller of this before 2026-08-12
+/// (`native-builtins/src/phases_late/net_channels.rs`, the sole registrant of
+/// `force(Z)V`) opened the path a SECOND time with `OpenOptions::new().write(true)`
+/// and fsynced that descriptor. A second descriptor carries none of this
+/// channel's buffered writes, so the barrier flushed nothing that the caller
+/// had written — and on a channel opened READ-only the second open fails
+/// outright, so the barrier silently did not happen at all. A durability
+/// barrier that does nothing and reports nothing is the worst shape available:
+/// the corruption only shows up after a crash.
+///
+/// Polarity, from `AsynchronousFileChannel.force(boolean metaData)`'s javadoc:
+/// `true` means force **content AND metadata**, i.e. `sync_all`; `false` means
+/// content only, i.e. `sync_data`. The previous caller had this backwards.
+///
+/// A non-writable channel is a deliberate `Ok(())`. It has no content changes
+/// of its own to force, and this matches the JDK's observable behaviour on both
+/// platforms this VM ships on: on Windows `FileDispatcherImpl.force0` swallows
+/// `ERROR_ACCESS_DENIED` from `FlushFileBuffers` (which is what a read-only
+/// handle produces) rather than throwing, and on Linux `fsync` on an `O_RDONLY`
+/// descriptor succeeds as a no-op. Returning an `Err` here would invent an
+/// `IOException` that neither platform's JDK raises.
+pub fn afc_sync_at(id: u32, metadata: bool) -> io::Result<()> {
+    // No `.lock()`: the 2026-08-17 dev merge took dev's `AfcFileEntry =
+    // Arc<AfcFileHandle>`, which dropped the per-handle `Mutex` this function
+    // was written against. `sync_all`/`sync_data` take `&self` and `writable` is
+    // read-only, so the handle is usable straight through the `Arc`.
+    let handle = afc_file_entry(id)?;
+    if !handle.writable {
+        return Ok(());
+    }
+    if metadata {
+        handle.file.sync_all()
+    } else {
+        handle.file.sync_data()
+    }
 }
 
 /// WatchService layout: 3 fields
@@ -19015,6 +21152,29 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
         "(JJZ)Ljava/nio/channels/FileLock;",
         native_afc_try_lock,
     );
+    // lock() / lock(long, long, boolean) -> Future<FileLock>.
+    //
+    // Registered HERE, in the crate that ALLOCATES the channel, and the
+    // `net_channels.rs` registration of `lock()` was deleted in the same
+    // change. That body minted a real `java.util.concurrent.FutureTask` at a
+    // two-slot synthetic width and wrote `state`/`callable` by index, so its
+    // future's `get()` parked forever -- see `native_afc_lock`'s doc comment.
+    // The abstract `(JJZ)` form had no registrant anywhere, which is an
+    // AbstractMethodError for any caller that does not go through the `final`
+    // no-arg `lock()`; both forms are registered so neither shipping mode
+    // depends on which of the two the application spells.
+    r.register(
+        afc,
+        "lock",
+        "()Ljava/util/concurrent/Future;",
+        native_afc_lock,
+    );
+    r.register(
+        afc,
+        "lock",
+        "(JJZ)Ljava/util/concurrent/Future;",
+        native_afc_lock,
+    );
     // truncate(long) -> AsynchronousFileChannel. Previously unregistered
     // here, so native-builtins' no-op passthrough (`|_, args| Ok(args[0])`)
     // was the only registrant -- it never checked writability, letting
@@ -19080,11 +21240,11 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
 fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
 
+    // `@throws ClosedChannelException If this channel is closed` --
+    // AsynchronousFileChannel.tryLock(long,long,boolean). Was a bare
+    // IOException here; see `afc_closed_channel_error`.
     if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "AsynchronousFileChannel is closed".into(),
-        }
-        .into());
+        return Err(afc_closed_channel_error(ctx));
     }
 
     let position = afc_position_arg(args, 1)? as i64;
@@ -19127,14 +21287,129 @@ fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(lock))))
 }
 
+/// `AsynchronousFileChannel.lock()` and `lock(long, long, boolean)`.
+///
+/// **What was here before, and why it hung.** The only registrant of
+/// `lock()Ljava/util/concurrent/Future;` was
+/// `native-builtins/src/phases_late/net_channels.rs`, and its body minted
+/// `try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)`
+/// and wrote two slots by index. `java.util.concurrent.FutureTask` is a REAL
+/// `java.base` class: slot 0 is `state:int` and slot 1 is `callable`. The
+/// `Object(None)` written into the int slot coerces to `Int(0)` — which is
+/// `FutureTask.NEW` — and the `Int(1)` meant as "done" lands on `callable` and
+/// degrades to null. Real `FutureTask.get()` then sees `state <= COMPLETING`,
+/// enters the UNTIMED `awaitDone`, and parks forever; `isDone()` is false for
+/// the life of the process. The abstract `lock(JJZ)` triple was registered by
+/// nobody at all, so a caller reaching it directly got `AbstractMethodError`.
+///
+/// **Why this is not the one-line `CompletableFuture.completedFuture(null)`
+/// swap.** That swap is correct for a `Future<Integer>` carrying a byte count;
+/// for `Future<FileLock>` it hands the caller a future that completes with
+/// `null`, and the very next thing a caller does with a `FileLock` is
+/// dereference it. That trades a hang for an NPE at a site with no connection
+/// to the cause. The channel's own `tryLock(JJZ)` already builds a real
+/// `sun/nio/ch/FileLockImpl` against this same receiver, so `lock` delegates to
+/// it and wraps the RESULT — one implementation, no second lock model to drift.
+///
+/// Defaults for the no-arg form are the JDK's own: `lock()` is
+/// `lock(0L, Long.MAX_VALUE, false)` (`AsynchronousFileChannel.java`), i.e. the
+/// whole file, exclusive.
+fn native_afc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+
+    // WHICH RECEIVER IS THIS. `lock()` is `final` on the abstract class, so
+    // unlike the abstract triples registered beside it this registration is
+    // also the resolved method for a receiver this crate did NOT allocate.
+    // Today there is no route to one -- both `AsynchronousFileChannel.open`
+    // overloads and `FileSystemProvider.newAsynchronousFileChannel` are
+    // registered above and all three answer `alloc_afc_channel` -- but that is
+    // a premise about the registrations, not a property of the class, so it is
+    // checked rather than assumed. The predicate is `t16_afc_uses_real_handle`'s:
+    // our channels are >= 3 slots with an Int handle id in slot 0.
+    if ctx.object_num_fields(this) < AFC_NUM_FIELDS
+        || !matches!(ctx.get_field(this, AFC_FIELD_FD), Value::Int(_))
+    {
+        return Err(RuntimeError::IOException {
+            message: "AsynchronousFileChannel.lock: receiver was not opened by this VM's \
+                      asynchronous file channel implementation"
+                .into(),
+        }
+        .into());
+    }
+
+    // args are [this] for `lock()` and [this, position, size, shared] for
+    // `lock(long,long,boolean)`. Read the arity rather than trusting
+    // `afc_position_arg`'s "missing means 0" default for `size`, because a
+    // `size` of 0 is not the same request as Long.MAX_VALUE.
+    let (position, size, shared) = if args.len() >= 4 {
+        (
+            afc_position_arg(args, 1)? as i64,
+            match args.get(2) {
+                Some(Value::Long(v)) => *v,
+                Some(Value::Int(v)) => *v as i64,
+                _ => i64::MAX,
+            },
+            args.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0,
+        )
+    } else {
+        (0i64, i64::MAX, false)
+    };
+
+    // An exclusive lock on a channel that was not opened for writing is
+    // NonWritableChannelException, thrown by the call itself and not delivered
+    // through the future -- `SimpleAsynchronousFileChannelImpl.implLock` checks
+    // `if (!shared && !writing) throw new NonWritableChannelException();` before
+    // it builds any future at all. Without this, `lock()` on a read-only
+    // channel would report an exclusive lock it does not hold.
+    if !shared {
+        let writable = match ctx.get_field(this, AFC_FIELD_FD) {
+            Value::Int(v) if v > 0 => afc_file_writable(v as u32),
+            _ => false,
+        };
+        if !writable {
+            // A closed channel must answer ClosedChannelException, not
+            // NonWritableChannelException: `native_afc_close` removes the
+            // handle from `afc_files()`, so `afc_file_writable` answers false
+            // for a closed channel too and the order of these two refusals
+            // decides which type the caller sees.
+            if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+                return Err(afc_closed_channel_error(ctx));
+            }
+            return Err(afc_non_writable_error(ctx));
+        }
+    }
+
+    let lock = native_afc_try_lock(
+        ctx,
+        &[
+            Value::Object(Some(this)),
+            Value::Long(position),
+            Value::Long(size),
+            Value::Int(if shared { 1 } else { 0 }),
+        ],
+    )?;
+
+    match lock {
+        Some(v @ Value::Object(Some(_))) => Ok(Some(wrap_completed_future(ctx, v)?)),
+        // `native_afc_try_lock` answers Object(None) only when
+        // `sun/nio/ch/FileLockImpl` could not be constructed at all. Completing
+        // the future with that null is the quiet failure this whole function
+        // exists to avoid, so it is raised instead.
+        _ => Err(RuntimeError::IOException {
+            message: "AsynchronousFileChannel.lock: could not construct a FileLock".into(),
+        }
+        .into()),
+    }
+}
+
 fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
 
+    // `@throws ClosedChannelException If this channel is closed` --
+    // AsynchronousFileChannel.truncate(long). The JDK reaches it through
+    // AsynchronousFileChannelImpl.begin(); see `afc_closed_channel_error`.
     if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "AsynchronousFileChannel is closed".into(),
-        }
-        .into());
+        return Err(afc_closed_channel_error(ctx));
     }
 
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
@@ -19143,30 +21418,32 @@ fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
 
     if !afc_file_writable(handle_id) {
-        return match ctx.new_object("java/nio/channels/NonWritableChannelException") {
-            Ok(Some(Value::Object(Some(exc)))) => {
-                let _ = ctx.invoke(
-                    "java/nio/channels/NonWritableChannelException",
-                    "<init>",
-                    "()V",
-                    &[Value::Object(Some(exc))],
-                );
-                Err(MethodCallFailed::ExceptionThrown(exc))
-            }
-            _ => Err(RuntimeError::IOException {
-                message: "channel was not opened for writing".into(),
-            }
-            .into()),
-        };
+        return Err(afc_non_writable_error(ctx));
     }
 
     // `AsynchronousFileChannel.truncate(long)` carries the same clause as its
     // synchronous twin: "@throws IllegalArgumentException If the new size is
-    // negative". Note where this check has to sit — AFTER the closed and
-    // not-writable refusals above, because the JDK checks those first and a
-    // caller distinguishing the three by type would otherwise see the wrong
-    // one. `(*v).max(0)` truncated the file to EMPTY for a negative size and
-    // returned the channel as though that had been the request.
+    // negative". `(*v).max(0)` truncated the file to EMPTY for a negative size
+    // and returned the channel as though that had been the request.
+    //
+    // ORDER, corrected 2026-08-12 against the JDK source rather than a guess.
+    // The comment here used to claim the JDK checks closed and not-writable
+    // FIRST. It does not: `SimpleAsynchronousFileChannelImpl.truncate` is
+    //
+    //     if (size < 0L) throw new IllegalArgumentException("Negative size");
+    //     if (!writing)  throw new NonWritableChannelException();
+    //     ... begin();   // -> ClosedChannelException
+    //
+    // i.e. negative, then not-writable, then closed — the exact reverse of the
+    // order below. This is left as it stands rather than reordered, and the
+    // reason is a real limitation, not taste: `writing` is a static property of
+    // the open options on the JDK side, whereas `afc_file_writable` here reads
+    // the live handle, which `native_afc_close` has already removed from
+    // `afc_files()`. Reordering would therefore answer
+    // NonWritableChannelException for a CLOSED read-write channel, which is
+    // worse than the one case the current order gets wrong (a negative size on
+    // an already-closed channel: ClosedChannelException here, IAE on HotSpot).
+    // Making both right needs the open options carried on the channel.
     let new_len = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -19314,6 +21591,23 @@ fn native_afc_provider_open(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let boxed = afc_read_boxed(ctx, args)?;
+    Ok(Some(wrap_completed_future(ctx, boxed)?))
+}
+
+/// The whole of `AsynchronousFileChannel.read(ByteBuffer, long)` EXCEPT the
+/// `Future` wrapper: returns the byte count already boxed as a
+/// `java.lang.Integer`.
+///
+/// Split out of `native_afc_read` so that the `CompletionHandler` overload can
+/// reach the result WITHOUT reading slot 0 of the returned future. That peek
+/// (`ctx.get_field(f, 0)`) was safe only while the future was this file's own
+/// two-slot `CompletedFuture`; now that `wrap_completed_future` returns a real
+/// `java.util.concurrent.CompletableFuture`, slot 0 is that class's real
+/// `result` field and reading it would be a layout assumption about `java.base`
+/// — including its private `NIL`/`AltResult` encodings. The value is produced
+/// once and used directly instead.
+fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
     let position = afc_position_arg(args, 2)?;
@@ -19329,13 +21623,10 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(v) if v > 0 => v as u32,
         // Future<Integer>.get() real bytecode does checkcast Integer on
         // this return value -- a bare Value::Int here (as opposed to
-        // going through wrap_completed_future+afc_box_integer like every
-        // other exit point) crashes the VM instead of raising. Box +
-        // wrap like the rest of this function.
-        _ => {
-            let boxed = afc_box_integer(ctx, -1)?;
-            return Ok(Some(wrap_completed_future(ctx, boxed)?));
-        }
+        // going through afc_box_integer like every other exit point)
+        // crashes the VM instead of raising. Box like the rest of this
+        // function.
+        _ => return afc_box_integer(ctx, -1),
     };
 
     let view = bb_storage_view(ctx, bb)?;
@@ -19343,8 +21634,7 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        let boxed = afc_box_integer(ctx, 0)?;
-        return Ok(Some(wrap_completed_future(ctx, boxed)?));
+        return afc_box_integer(ctx, 0);
     }
 
     let mut buf = vec![0u8; remaining];
@@ -19396,8 +21686,15 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
     if n == 0 {
         afc_trace!("read   id={handle_id} pos={position} want={remaining} EOF -> -1");
-        let boxed = afc_box_integer(ctx, -1)?;
-        return Ok(Some(wrap_completed_future(ctx, boxed)?));
+        // The dev side of this 2026-08-17 merge conflict wrapped the EOF
+        // result in `wrap_completed_future` here. That belongs to the native
+        // ENTRY POINT, not to this helper: `afc_read_boxed` hands back the boxed
+        // `Integer` and its caller wraps once. Wrapping here wrapped twice, and
+        // `RJdkAsyncChannel` caught it as
+        // `ClassCastException: CompletableFuture cannot be cast to Integer` at
+        // `checkCompletedFuture`. Every other exit point of this function returns
+        // `afc_box_integer(..)` unwrapped, which is the tell.
+        return afc_box_integer(ctx, -1);
     }
 
     let view = bb_storage_view(ctx, bb)?;
@@ -19437,11 +21734,17 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // proper Integer. The sibling CompletionHandler-based overloads
     // below already box via afc_box_integer -- this just brings the
     // plain Future overload in line with that established pattern.
-    let boxed = afc_box_integer(ctx, n as i32)?;
-    Ok(Some(wrap_completed_future(ctx, boxed)?))
+    afc_box_integer(ctx, n as i32)
 }
 
 fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let boxed = afc_write_boxed(ctx, args)?;
+    Ok(Some(wrap_completed_future(ctx, boxed)?))
+}
+
+/// `AsynchronousFileChannel.write(ByteBuffer, long)` without the `Future`
+/// wrapper — see [`afc_read_boxed`] for why the split exists.
+fn afc_write_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
     let position = afc_position_arg(args, 2)?;
@@ -19455,12 +21758,9 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
-        // See the matching arm in native_afc_read: must be a boxed
+        // See the matching arm in afc_read_boxed: must be a boxed
         // Integer inside a real completed Future, not a bare Value::Int.
-        _ => {
-            let boxed = afc_box_integer(ctx, -1)?;
-            return Ok(Some(wrap_completed_future(ctx, boxed)?));
-        }
+        _ => return afc_box_integer(ctx, -1),
     };
 
     // Real AsynchronousFileChannel.write() contract: throws
@@ -19474,21 +21774,7 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // the same contract already enforced for the plain (non-async)
     // FileChannel path.
     if !afc_file_writable(handle_id) {
-        return match ctx.new_object("java/nio/channels/NonWritableChannelException") {
-            Ok(Some(Value::Object(Some(exc)))) => {
-                let _ = ctx.invoke(
-                    "java/nio/channels/NonWritableChannelException",
-                    "<init>",
-                    "()V",
-                    &[Value::Object(Some(exc))],
-                );
-                Err(MethodCallFailed::ExceptionThrown(exc))
-            }
-            _ => Err(RuntimeError::IOException {
-                message: "channel was not opened for writing".into(),
-            }
-            .into()),
-        };
+        return Err(afc_non_writable_error(ctx));
     }
 
     let view = bb_storage_view(ctx, bb)?;
@@ -19496,8 +21782,7 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        let boxed = afc_box_integer(ctx, 0)?;
-        return Ok(Some(wrap_completed_future(ctx, boxed)?));
+        return afc_box_integer(ctx, 0);
     }
 
     let mut data = vec![0u8; remaining];
@@ -19535,11 +21820,10 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
 
     buf_set_position(ctx, bb, pos + n as i32);
-    // See native_afc_read above for the full rationale: box before
+    // See afc_read_boxed above for the full rationale: box before
     // wrapping, matching the CompletionHandler overloads' afc_box_integer
     // usage, so Future<Integer>.get()'s checkcast Integer succeeds.
-    let boxed = afc_box_integer(ctx, n as i32)?;
-    Ok(Some(wrap_completed_future(ctx, boxed)?))
+    afc_box_integer(ctx, n as i32)
 }
 
 /// Raise `java.nio.channels.AsynchronousCloseException`.
@@ -19582,28 +21866,23 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let attachment = args.get(3).copied().unwrap_or(Value::Object(None));
     let handler = obj_arg92(args, 4)?;
 
-    // Perform the read synchronously (real async would use thread pool)
+    // Perform the read synchronously (real async would use thread pool).
+    // Call the unwrapped body: `CompletionHandler.completed` takes the value,
+    // not a Future, so building one and then reading slot 0 back out of it was
+    // both wasted work and a layout assumption about `CompletableFuture`
+    // (see `afc_read_boxed`).
     let read_args = vec![
         Value::Object(Some(this)),
         Value::Object(Some(bb)),
         Value::Long(position as i64),
     ];
-    let result = native_afc_read(ctx, &read_args);
+    let result = afc_read_boxed(ctx, &read_args);
 
     match result {
-        Ok(Some(future_val)) => {
-            // Extract the result from the future wrapper
-            let bytes_read = if let Value::Object(Some(f)) = future_val {
-                ctx.get_field(f, 0)
-            } else {
-                Value::Int(-1)
-            };
-            // CompletionHandler.completed erases to (Object,Object); box the
-            // byte count just like HotSpot's AsynchronousFileChannel does.
-            let completed_arg = match bytes_read {
-                Value::Int(n) => afc_box_integer(ctx, n)?,
-                other => other,
-            };
+        Ok(completed_arg) => {
+            // CompletionHandler.completed erases to (Object,Object); the byte
+            // count arrives already boxed as a java.lang.Integer, just like
+            // HotSpot's AsynchronousFileChannel hands it over.
             let _ = ctx.invoke_virtual(
                 handler,
                 "completed",
@@ -19622,7 +21901,6 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 &[Value::Object(Some(exc)), attachment],
             );
         }
-        _ => {}
     }
     Ok(None)
 }
@@ -19640,19 +21918,11 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Value::Object(Some(bb)),
         Value::Long(position as i64),
     ];
-    let result = native_afc_write(ctx, &write_args);
+    // Unwrapped body — see the matching comment in native_afc_read_handler.
+    let result = afc_write_boxed(ctx, &write_args);
 
     match result {
-        Ok(Some(future_val)) => {
-            let bytes_written = if let Value::Object(Some(f)) = future_val {
-                ctx.get_field(f, 0)
-            } else {
-                Value::Int(0)
-            };
-            let completed_arg = match bytes_written {
-                Value::Int(n) => afc_box_integer(ctx, n)?,
-                other => other,
-            };
+        Ok(completed_arg) => {
             let _ = ctx.invoke_virtual(
                 handler,
                 "completed",
@@ -19670,13 +21940,28 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                 &[Value::Object(Some(exc)), attachment],
             );
         }
-        _ => {}
     }
     Ok(None)
 }
 
 pub(crate) fn native_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
+
+    // The refusal has to be HERE, ahead of the handle lookup, and it has to be
+    // typed. `native_afc_close` clears AFC_FIELD_OPEN but deliberately leaves
+    // AFC_FIELD_FD holding the id it just removed from `afc_files()` (that is
+    // what keeps `t16_afc_size`'s `t16_afc_uses_real_handle` routing a CLOSED
+    // channel here rather than into its path-string arm). So without this
+    // check the flow was: positive fd -> `afc_file_size` fails to look it up ->
+    // the NotFound is mapped to `IOException("size: bad asynchronous file
+    // handle N")`. The failure was reported, wearing a type
+    // `catch (ClosedChannelException)` does not match, with a message about an
+    // internal handle id. HotSpot raises ClosedChannelException from
+    // AsynchronousFileChannelImpl.begin(), which `size()` runs first.
+    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+        return Err(afc_closed_channel_error(ctx));
+    }
+
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),
@@ -19707,16 +21992,91 @@ pub(crate) fn native_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Int(if open { 1 } else { 0 })))
 }
 
-/// Wrap a value in a "CompletedFuture" synthetic object.
-/// CompletedFuture layout: [0] = result value, [1] = done (always 1)
+/// A **completed `Future`** for this file's synchronous "async" channel ops.
+///
+/// Returns a real `java.util.concurrent.CompletableFuture.completedFuture(v)`.
+/// `AsynchronousFileChannel.read/write` are declared to return `Future<Integer>`
+/// and `CompletableFuture` implements it, so the static type is satisfied and
+/// the caller gets `get()` / `get(timeout, unit)` / `isDone()` / `isCancelled()`
+/// / `cancel(..)` from real `java.base` bytecode rather than from five constant
+/// natives.
+///
+/// **This used to be a bare
+/// `try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2)?`, and
+/// that is a `--jdk-only` defect of the "essential native outlives its
+/// receiver" shape.** `java/util/concurrent/CompletedFuture` is a name **no JDK
+/// image declares** — it is listed in `native-api`'s `NO_IMAGE_JDK_RECEIVERS`,
+/// so (a) its five natives are re-tagged `SyntheticStub` centrally and are
+/// therefore REFUSED in strict mode, and (b) `try_ensure_synthetic_class`
+/// refuses to mint the class. Meanwhile every `AsynchronousFileChannel`
+/// registration in this file is `Bridge` (see `register_phase92_io_completeness`)
+/// and so survives strict mode. The refusal is correct; the surviving caller
+/// was the bug, and it surfaced as the application seeing
+/// `NoClassDefFoundError: java/util/concurrent/CompletedFuture` at
+/// `ch.write(buf, 0).get()` — measured 2026-08-12 on `--jdk-only`, where
+/// HotSpot 25 runs the identical program cleanly. H2's `FileAsync.write` /
+/// `TestFileSystem.testConcurrent` on the `async:` filesystem is the corpus
+/// vector.
+///
+/// This is the same remedy `native-builtins`' `aio_completed_future` (the DF07
+/// fix, `phases_late/concurrent.rs`) already applies to the
+/// `AsynchronousSocketChannel` twin, and it is deliberately the *static factory*
+/// rather than `new CompletableFuture()` + `complete(v)`: `completedFuture` has
+/// no native shim registered on it in real-JDK mode (the shims in
+/// `util_concurrent_ext` / `phases_late::concurrent` live inside
+/// `register_synthetic_overrides`), so real bytecode runs, and it encodes a
+/// null result via the private `NIL` sentinel the way the rest of the class
+/// expects. A synthetic `FutureTask` does NOT work here for the reason that
+/// helper records: its real `get()` bytecode reads the real `state` field,
+/// which is stuck at `NEW`.
+///
+/// The synthetic mint stays as a **fallback**, not as the primary: in
+/// `--synthetic-jdk` builds `completedFuture` is answered by the shim above and
+/// still yields a two-slot future with a name a caller can hold, so the fallback
+/// is only reached if `CompletableFuture` is unavailable in *both* shapes.
+/// Laundering a policy refusal into a `NoClassDefFoundError` at the
+/// application's call site is the worst available outcome, so it is the last
+/// resort rather than the first.
 fn wrap_completed_future(
     ctx: &mut dyn NativeContext,
     value: Value,
 ) -> Result<Value, MethodCallFailed> {
-    let future = try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2)?;
-    ctx.set_field(future, 0, value);
-    ctx.set_field(future, 1, Value::Int(1)); // done
-    Ok(Value::Object(Some(future)))
+    // `value` is used again on the fallback path below, and BOTH the attempt
+    // and the fallback allocation run code that can collect — a moving young GC
+    // there would relocate it (the native stale-local family). Pin across the
+    // whole body and re-read at the point of use, exactly as
+    // `completed_executor_future` does for its result.
+    let value_obj = match value {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let value_pin = value_obj.map(|o| ctx.pin_native_root(o));
+    let real = ctx.invoke(
+        "java/util/concurrent/CompletableFuture",
+        "completedFuture",
+        "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+        &[value],
+    );
+    let outcome = match real {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(v),
+        // Fallback only — see the doc comment. Layout: [0] = result, [1] = done.
+        _ => match try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2) {
+            Ok(future) => {
+                let value = match (value_pin, value_obj) {
+                    (Some(pin), Some(o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+                    _ => value,
+                };
+                ctx.set_field(future, 0, value);
+                ctx.set_field(future, 1, Value::Int(1)); // done
+                Ok(Value::Object(Some(future)))
+            }
+            Err(e) => Err(e),
+        },
+    };
+    if let Some(pin) = value_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    outcome
 }
 
 fn native_completed_future_cancel(
@@ -19990,12 +22350,33 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
-    // StandardWatchEventKinds constants. `watch_event_kind_object` prefers the
-    // REAL static constant when the class is present, so `event.kind() ==
-    // StandardWatchEventKinds.ENTRY_CREATE` (an identity comparison — these are
-    // singletons) holds instead of silently failing against a fresh synthetic
-    // stand-in.
-    let kinds = "java/nio/file/StandardWatchEventKinds";
+    // NO `StandardWatchEventKinds` CONSTANTS ARE REGISTERED HERE, and none can
+    // usefully be (E40-1 §2, answering E36-1 N5).
+    //
+    // What stood here until 2026-08-13 was a comment describing four
+    // registrations plus a `let kinds = "java/nio/file/StandardWatchEventKinds";`
+    // binding that nothing read — the mirror of E21-1 §2d's defect. That one
+    // claimed a removal that had not happened; this one claimed a presence that
+    // no longer existed, and cost the same reader-hour.
+    //
+    // The four rows the comment described live in
+    // `native-builtins/src/phases_late/nio_file.rs` (`register_p66_watch_service`),
+    // are field-shaped (`Ljava/nio/file/WatchEvent$Kind;` in the descriptor
+    // slot), and are dead: `getstatic` never consults the native registry in
+    // this VM, and `StandardWatchEventKinds.ENTRY_CREATE` compiles to a real
+    // `getstatic` (measured). They are also type-wrong — each body answers a
+    // `java/lang/String`. E36-1 §4d's verdict on them is DELETE.
+    //
+    // The reader of the constants is `watch_event_kind_object` below, and it
+    // does not go through the registry at all: it reads the class's STATIC
+    // (`static_field_index_by_name` + `get_static_field`), so in real-JDK mode
+    // `event.kind() == StandardWatchEventKinds.ENTRY_CREATE` is an identity
+    // comparison against the JDK's own
+    // `StandardWatchEventKinds$StdWatchEventKind` singleton. Only when that
+    // read comes back empty does it fall back to a synthetic one-field `Kind`
+    // carrying the `EVENT_*` bit. `watch_event_kind_bit` accepts all three
+    // shapes; `watch_event_kind_bit_translates_all_three_kind_shapes` and
+    // `watch_event_kind_object_round_trips_through_the_bit` pin that.
     r.set_category(__prev_cat);
 }
 
@@ -23730,6 +26111,27 @@ mod io_tests {
             other => panic!("expected future object, got {other:?}"),
         };
 
+        // The REAL `java.util.concurrent.CompletableFuture` is tried first, and
+        // the five registrations above are the fallback for the configurations
+        // that cannot answer it. This mock's `invoke` answers `Ok(None)` for
+        // everything, so `future` above IS that fallback and the assertions
+        // below exercise only it — the recorded call is the only trace the
+        // primary path leaves here. Without this assertion the whole test passes
+        // unchanged on the pre-fix body, which minted the no-image
+        // `CompletedFuture` unconditionally and died as
+        // `NoClassDefFoundError` under `--jdk-only`.
+        assert!(
+            ctx.recorded_calls().iter().any(|c| {
+                c.declared_class.as_deref() == Some("java/util/concurrent/CompletableFuture")
+                    && c.method_name == "completedFuture"
+                    && c.descriptor
+                        == "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;"
+            }),
+            "wrap_completed_future must try the real CompletableFuture before \
+             minting the synthetic fallback: {:?}",
+            ctx.recorded_calls()
+        );
+
         assert_eq!(
             get(&mut ctx, &[Value::Object(Some(future))]).unwrap(),
             Some(Value::Int(123))
@@ -24008,6 +26410,91 @@ mod io_tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // WatchEvent.Kind translation (E40-1, replacing `vm/src/vm/tests.rs`'s
+    // deleted `watch_event_kinds_p66`).
+    //
+    // The three tests above measure the `notify` crate, not this VM. Nothing
+    // in this tree exercised the Kind translation itself, and the test that
+    // *claimed* to — `watch_event_kinds_p66` — drove four dead field-shaped
+    // registrations in another crate and asserted that a `WatchEvent$Kind`
+    // reads back as the java.lang.String "ENTRY_CREATE". Measured on the
+    // oracle (JDK 25.0.3+9-LTS):
+    //
+    //     StandardWatchEventKinds.ENTRY_CREATE.getClass().getName()
+    //       = java.nio.file.StandardWatchEventKinds$StdWatchEventKind
+    //     .name() = "ENTRY_CREATE"   .type() = interface java.nio.file.Path
+    //     (ENTRY_CREATE instanceof String) = false
+    //
+    // so the constant's `name()` — NOT its identity as a String — is the
+    // JDK-guaranteed handle, and `watch_event_kind_bit` is the code that
+    // consumes it.
+    // -------------------------------------------------------------------
+
+    /// All three `Kind` shapes `watch_event_kind_bit` must accept, and the
+    /// one it must reject.
+    #[test]
+    fn watch_event_kind_bit_translates_all_three_kind_shapes() {
+        let mut ctx = MockNativeContext::new();
+
+        // 1. Synthetic one-field Kind: the bit lives in slot 0.
+        let synth = ctx.alloc_object(1);
+        ctx.set_field(synth, 0, Value::Int(EVENT_MODIFY));
+        assert_eq!(
+            watch_event_kind_bit(&mut ctx, synth),
+            EVENT_MODIFY,
+            "synthetic Kind's slot-0 bit was not read; this is the decode that \
+             once yielded mask 0 and filtered out every event forever"
+        );
+
+        // 2. Real JDK `StdWatchEventKind`: no readable instance fields, and
+        //    `name()` is what identifies it. Quoted off the oracle above.
+        let real = ctx.alloc_object(0);
+        let name = ctx.create_string("ENTRY_CREATE");
+        ctx.script(
+            "name",
+            "()Ljava/lang/String;",
+            Ok(Some(Value::Object(Some(name)))),
+        );
+        assert_eq!(
+            watch_event_kind_bit(&mut ctx, real),
+            EVENT_CREATE,
+            "a real Kind must be identified by name(), not by being a String"
+        );
+
+        // 3. Legacy bare-String Kind (the shape the dead
+        //    `StandardWatchEventKinds` rows in `phases_late/nio_file.rs`
+        //    hand out). Accepted, but only via the `read_string` fallback.
+        let legacy = ctx.create_string("ENTRY_DELETE");
+        assert_eq!(watch_event_kind_bit(&mut ctx, legacy), EVENT_DELETE);
+
+        // 4. OVERFLOW is not one of the three entry kinds this VM surfaces,
+        //    so it must translate to 0 rather than to some entry bit.
+        let overflow = ctx.create_string("OVERFLOW");
+        assert_eq!(watch_event_kind_bit(&mut ctx, overflow), 0);
+    }
+
+    /// `watch_event_kind_object` -> `watch_event_kind_bit` is the round trip
+    /// `Path.register` and `detect_events` sit on either side of.
+    #[test]
+    fn watch_event_kind_object_round_trips_through_the_bit() {
+        // The mock's `static_field_index_by_name` answers `None`, so this
+        // exercises the SYNTHETIC arm — the one that runs whenever the real
+        // `StandardWatchEventKinds` statics are unreadable.
+        for bit in [EVENT_CREATE, EVENT_DELETE, EVENT_MODIFY] {
+            let mut ctx = MockNativeContext::new();
+            let obj = match watch_event_kind_object(&mut ctx, bit).unwrap() {
+                Value::Object(Some(o)) => o,
+                other => panic!("kind object for bit {bit} was {other:?}"),
+            };
+            assert_eq!(
+                watch_event_kind_bit(&mut ctx, obj),
+                bit,
+                "kind object for bit {bit} did not translate back"
+            );
+        }
+    }
+
     // ===================================================================
     // Phase 92.3: DatagramChannel (UDP) Tests
     // ===================================================================
@@ -24160,6 +26647,282 @@ mod io_tests {
             table.close(*fd).unwrap();
         }
         table.close(sender).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // G39-1 — the after-close precedence order, and the two close halves.
+    //
+    // Every expected value below was MEASURED on Eclipse Adoptium
+    // 25.0.3+9-LTS, Windows, 2026-08-17. See
+    // docs/known-issues/jdk-only/G39-1-the-close-family-closed-20260817.md.
+    //
+    // Each refusal test is PAIRED with the non-refusal on the same body, so
+    // neither direction can regress silently: a test that only asserted the
+    // throw would pass on a body that threw for everything, which is the
+    // over-correction these fixes are repairing.
+    // -----------------------------------------------------------------------
+
+    /// Build a `FileInputStream`/`FileOutputStream`-shaped receiver whose
+    /// `FileDescriptor` carries the marker a close writes (`fd == -1` AND
+    /// `handle == -1`), which is what `io_stream_is_closed` keys on.
+    fn closed_stream_receiver(ctx: &mut MockNativeContext) -> ObjectRef {
+        let fd_obj = ctx.alloc_object(2);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+        let stream = ctx.alloc_object(2);
+        ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+        stream
+    }
+
+    #[test]
+    fn is_empty_transfer_is_zero_only() {
+        assert!(is_empty_transfer(0));
+        assert!(!is_empty_transfer(1));
+        assert!(!is_empty_transfer(-1));
+    }
+
+    /// `fis.read(b, 0, 0)` after close is `0`, not `IOException`.
+    /// Measured: `CLOSED fis.read(b,0,0) | RET [0]`.
+    #[test]
+    fn fis_read_bytes_zero_length_answers_zero_on_a_closed_stream() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Byte, 4);
+        let zero = native_fis_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        assert_eq!(
+            zero.unwrap(),
+            Some(Value::Int(0)),
+            "a zero-length read must answer 0 before the closed check"
+        );
+        // The pair: a NON-zero-length read on the same receiver still refuses.
+        let refused = native_fis_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(4),
+            ],
+        );
+        assert!(
+            refused.is_err(),
+            "a non-empty read on a closed stream must still raise Stream Closed"
+        );
+    }
+
+    /// `fis.read(new byte[0])` is `0` — on an OPEN stream too, where this body
+    /// used to answer `-1` because a zero-byte `read_bytes` looks like EOF.
+    #[test]
+    fn fis_read_empty_array_answers_zero_not_eof() {
+        let mut ctx = MockNativeContext::new();
+        // No descriptor at all and no closed marker: the "unknown receiver"
+        // case, which must NOT be a refusal and must not be EOF either.
+        let stream = ctx.alloc_object(2);
+        let empty = ctx.new_array(ArrayElementType::Byte, 0);
+        let got = native_fis_read_byte_array(
+            &mut ctx,
+            &[Value::Object(Some(stream)), Value::Object(Some(empty))],
+        );
+        assert_eq!(
+            got.unwrap(),
+            Some(Value::Int(0)),
+            "read(new byte[0]) is 0, never -1"
+        );
+    }
+
+    /// `fos.write(b, 0, 0)` after close is `void`, not `IOException` — on both
+    /// the legacy `write([BII)V` body and the JDK 25 `writeBytes([BIIZ)V` one
+    /// that the SHIPPING modes reach.
+    #[test]
+    fn fos_write_bytes_zero_length_is_void_on_a_closed_stream() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Byte, 4);
+
+        let legacy = native_fos_write_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        assert_eq!(legacy.unwrap(), None, "write([BII) of 0 bytes must be void");
+
+        let shipping = native_fos_write_bytes_ignore_append(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        );
+        assert_eq!(
+            shipping.unwrap(),
+            None,
+            "writeBytes([BIIZ) of 0 bytes must be void"
+        );
+
+        // The pair: a real write on the same receiver still refuses, on both.
+        assert!(
+            native_fos_write_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(stream)),
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(4),
+                ],
+            )
+            .is_err(),
+            "a non-empty write([BII) on a closed stream must still refuse"
+        );
+        assert!(
+            native_fos_write_bytes_ignore_append(
+                &mut ctx,
+                &[
+                    Value::Object(Some(stream)),
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(4),
+                    Value::Int(0),
+                ],
+            )
+            .is_err(),
+            "a non-empty writeBytes([BIIZ) on a closed stream must still refuse"
+        );
+    }
+
+    /// `fos.write(new byte[0])` after close is `void`.
+    #[test]
+    fn fos_write_empty_array_is_void_on_a_closed_stream() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        let empty = ctx.new_array(ArrayElementType::Byte, 0);
+        assert_eq!(
+            native_fos_write_byte_array(
+                &mut ctx,
+                &[Value::Object(Some(stream)), Value::Object(Some(empty))],
+            )
+            .unwrap(),
+            None,
+        );
+        // The pair: a one-byte array on the same receiver refuses.
+        let one = ctx.new_array(ArrayElementType::Byte, 1);
+        assert!(native_fos_write_byte_array(
+            &mut ctx,
+            &[Value::Object(Some(stream)), Value::Object(Some(one))],
+        )
+        .is_err());
+    }
+
+    /// `skip` has NO zero-length escape hatch: `skip(0)` and `skip(-5)` on a
+    /// closed stream both raise. Measured:
+    /// `CLOSED fis.skip(0) | THROW java.io.IOException msg=[Stream Closed]`.
+    #[test]
+    fn fis_skip_consults_the_descriptor_before_the_count() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        for n in [0i64, -5, 1] {
+            assert!(
+                native_fis_skip(&mut ctx, &[Value::Object(Some(stream)), Value::Long(n)]).is_err(),
+                "skip({n}) on a closed stream must raise Stream Closed"
+            );
+        }
+        // The pair: an UNKNOWN receiver (no descriptor, no closed marker) keeps
+        // its previous quiet `0` for a non-positive count — the refusal is
+        // gated on the close marker, not on `fis_get_fd` answering `None`.
+        let unknown = ctx.alloc_object(2);
+        assert_eq!(
+            native_fis_skip(&mut ctx, &[Value::Object(Some(unknown)), Value::Long(0)]).unwrap(),
+            Some(Value::Long(0)),
+        );
+    }
+
+    /// `native_fd_close0` writes the closed marker and stays quiet for a
+    /// descriptor whose fd is not in the table — the double-close row
+    /// (`fos.close(); fos.close(); -> void, void`).
+    #[test]
+    fn fd_close0_marks_closed_and_a_second_close_is_quiet() {
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(2);
+        // A high fd that was never opened: `FdTable::close` removes nothing and
+        // answers `Ok(())`, which is the "already released" case HotSpot also
+        // reports as a clean void.
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(9_001));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(9_001));
+        assert_eq!(
+            native_fd_close0(&mut ctx, &[Value::Object(Some(fd_obj))]).unwrap(),
+            None,
+        );
+        assert_eq!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(-1));
+        // Second close: the marker is already there, so no fd is resolved and
+        // nothing is released. Must still be a clean void.
+        assert_eq!(
+            native_fd_close0(&mut ctx, &[Value::Object(Some(fd_obj))]).unwrap(),
+            None,
+        );
+        // And the marker now makes the after-close family refuse.
+        let stream = ctx.alloc_object(2);
+        ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+        assert!(
+            fos_is_closed(&ctx, stream),
+            "the marker native_fd_close0 writes must be the one io_stream_is_closed reads"
+        );
+        assert!(fis_is_closed(&ctx, stream));
+    }
+
+    /// `native_fis_close` writes the marker and propagates its host close. The
+    /// propagation cannot fire on a `FileRead` entry (`FdTable::close` answers
+    /// `Ok(())` for it), so the observable here is the marker plus the clean
+    /// double close.
+    #[test]
+    fn fis_close_marks_closed_and_is_idempotent() {
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(2);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(9_002));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(9_002));
+        let stream = ctx.alloc_object(2);
+        ctx.set_field_by_name(stream, "fd", Value::Object(Some(fd_obj)));
+        assert_eq!(
+            native_fis_close(&mut ctx, &[Value::Object(Some(stream))]).unwrap(),
+            None,
+        );
+        assert!(fis_is_closed(&ctx, stream));
+        assert_eq!(
+            native_fis_close(&mut ctx, &[Value::Object(Some(stream))]).unwrap(),
+            None,
+            "a double close must stay a clean void"
+        );
+        // And now the read side refuses rather than answering EOF.
+        assert!(native_fis_read(&mut ctx, &[Value::Object(Some(stream))]).is_err());
+        assert!(native_fis_available(&mut ctx, &[Value::Object(Some(stream))]).is_err());
+    }
+
+    /// `fos.flush()` after close is `void` on HotSpot while `bw.flush()` and
+    /// `osw.flush()` throw. The control row: this body must NOT grow a refusal
+    /// when its neighbours did.
+    #[test]
+    fn fos_flush_after_close_stays_quiet() {
+        let mut ctx = MockNativeContext::new();
+        let stream = closed_stream_receiver(&mut ctx);
+        assert_eq!(
+            native_fos_flush(&mut ctx, &[Value::Object(Some(stream))]).unwrap(),
+            None,
+            "FileOutputStream.flush() after close does NOT throw (measured)"
+        );
     }
 }
 
@@ -24876,6 +27639,205 @@ mod bais_layout_tests {
         assert_eq!(ctx.get_field(this, BAIS_FIELD_MARK), Value::Int(3));
         assert_eq!(ctx.get_field(this, BAIS_FIELD_COUNT), Value::Int(7));
     }
+
+    // -----------------------------------------------------------------------
+    // The BAIS lifetime hook (G48-1) — the input-side twin of the BAOS one.
+    //
+    // The observer is a process-wide `OnceLock`, so a test that installs a
+    // hook installs it for EVERY test in this binary. The recorder below is
+    // therefore armed per THREAD: unarmed threads take a `None` branch and
+    // record nothing, which is what keeps this from perturbing the ~dozen
+    // other tests in this module that drain a stream to EOF. Installing is
+    // idempotent through `install_once`, because `OnceLock::set` silently
+    // fails on the second call and a second hook would never be seen.
+    // -----------------------------------------------------------------------
+
+    use cratonvm_native_api::registry::BaisEvent;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RECORDED: RefCell<Option<Vec<(ObjectRef, BaisEvent)>>> =
+            const { RefCell::new(None) };
+    }
+
+    fn recording_hook(
+        _ctx: &mut dyn NativeContext,
+        stream: ObjectRef,
+        event: BaisEvent,
+    ) -> Result<(), MethodCallFailed> {
+        RECORDED.with(|c| {
+            if let Some(log) = c.borrow_mut().as_mut() {
+                log.push((stream, event));
+            }
+        });
+        Ok(())
+    }
+
+    /// Arm recording on THIS thread and install the process hook if no test
+    /// has yet. Returns the events seen while `body` ran.
+    fn with_recorder(body: impl FnOnce()) -> Vec<(ObjectRef, BaisEvent)> {
+        cratonvm_native_api::registry::install_bais_event_hook(recording_hook);
+        RECORDED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        body();
+        RECORDED.with(|c| c.borrow_mut().take()).unwrap_or_default()
+    }
+
+    #[test]
+    fn eof_and_close_reach_the_observer_and_do_not_change_what_they_return() {
+        let events = with_recorder(|| {
+            let mut ctx = MockNativeContext::new();
+            let (this, _) = make_bais(&mut ctx, b"ok");
+
+            // Two payload bytes: no EOF yet, so no event yet.
+            for want in [b'o' as i32, b'k' as i32] {
+                let got = native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap();
+                assert_eq!(got, Some(Value::Int(want)));
+            }
+            assert!(
+                RECORDED.with(|c| c.borrow().as_ref().unwrap().is_empty()),
+                "a read that returned a byte is not an EOF and must not fire"
+            );
+
+            // The EOF read still answers -1, with an observer installed.
+            let eof = native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap();
+            assert_eq!(eof, Some(Value::Int(-1)), "the observer must not edit EOF");
+
+            // close() is still a no-op returning no value.
+            let closed = native_bais_close(&mut ctx, &[Value::Object(Some(this))]).unwrap();
+            assert_eq!(closed, None, "BAIS.close() has no effect and no return");
+
+            RECORDED.with(|c| {
+                let log = c.borrow();
+                let log = log.as_ref().unwrap();
+                assert_eq!(
+                    log.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+                    vec![BaisEvent::Eof, BaisEvent::Close],
+                    "the drain sequence this vector performs, in order"
+                );
+                assert!(
+                    log.iter().all(|(s, _)| *s == this),
+                    "every event must name the stream it came from — the observer \
+                     maps that object back to its carrier and has nothing else to key on"
+                );
+            });
+        });
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn every_exhausted_read_fires_not_only_the_first() {
+        // The contract `BaisEvent::Eof` states, asserted rather than trusted:
+        // the transition into EOF is not observable from inside the read body
+        // (a stream constructed empty is at `pos >= count` on its first read),
+        // so the event fires on every exhausted read and observers MUST be
+        // idempotent. A future "optimisation" that fires only once would make
+        // the empty-body case silent.
+        let events = with_recorder(|| {
+            let mut ctx = MockNativeContext::new();
+            let (empty, _) = make_bais(&mut ctx, b"");
+            for _ in 0..3 {
+                assert_eq!(
+                    native_bais_read(&mut ctx, &[Value::Object(Some(empty))]).unwrap(),
+                    Some(Value::Int(-1))
+                );
+            }
+        });
+        assert_eq!(
+            events.iter().filter(|(_, e)| *e == BaisEvent::Eof).count(),
+            3,
+            "an empty stream is at EOF from its first read; all three must fire"
+        );
+    }
+
+    #[test]
+    fn the_bulk_read_fires_the_same_eof_and_a_zero_length_read_does_not() {
+        let events = with_recorder(|| {
+            let mut ctx = MockNativeContext::new();
+            let (this, _) = make_bais(&mut ctx, b"ok");
+            let dst = ctx.new_array(ArrayElementType::Byte, 8);
+
+            // A zero-length read on a stream that is NOT exhausted returns 0
+            // and is not an EOF. This pins the dispatch BELOW the `pos >=
+            // count` test, which is where the existing ordering comment says
+            // the EOF decision has to be made.
+            let zero = native_bais_read_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(dst)),
+                    Value::Int(0),
+                    Value::Int(0),
+                ],
+            )
+            .unwrap();
+            assert_eq!(zero, Some(Value::Int(0)));
+            assert!(
+                RECORDED.with(|c| c.borrow().as_ref().unwrap().is_empty()),
+                "read(b, 0, 0) on a live stream is not an EOF"
+            );
+
+            // Drain, then hit EOF through the bulk shape.
+            let n = native_bais_read_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(dst)),
+                    Value::Int(0),
+                    Value::Int(8),
+                ],
+            )
+            .unwrap();
+            assert_eq!(n, Some(Value::Int(2)));
+            let eof = native_bais_read_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(dst)),
+                    Value::Int(0),
+                    Value::Int(8),
+                ],
+            )
+            .unwrap();
+            assert_eq!(eof, Some(Value::Int(-1)));
+        });
+        assert_eq!(
+            events.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+            vec![BaisEvent::Eof],
+            "exactly one EOF, from the exhausted bulk read"
+        );
+    }
+
+    #[test]
+    fn an_unarmed_thread_sees_the_pre_hook_behaviour_exactly() {
+        // The conservatism witness. With no observer recording, every value
+        // this change touches is what it was before: -1 at EOF, `None` from
+        // close(), payload bytes unchanged. `native-builtins` depends on this
+        // crate and nothing installs a hook until the nominated consumer
+        // lands, so this is the state the whole tree is in today.
+        let mut ctx = MockNativeContext::new();
+        let (this, _) = make_bais(&mut ctx, b"ok");
+        assert_eq!(
+            native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            Some(Value::Int(b'o' as i32))
+        );
+        assert_eq!(
+            native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            Some(Value::Int(b'k' as i32))
+        );
+        assert_eq!(
+            native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            Some(Value::Int(-1))
+        );
+        assert_eq!(
+            native_bais_close(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            None
+        );
+        // A null receiver still returns quietly rather than dispatching.
+        assert_eq!(
+            native_bais_close(&mut ctx, &[Value::Object(None)]).unwrap(),
+            None
+        );
+    }
 }
 
 // ===========================================================================
@@ -25049,6 +28011,679 @@ mod buffer_bounds_tests {
             Some(Value::Object(Some(arr))) => assert_eq!(ctx.array_length(arr), 3),
             other => panic!("heap array() must return the backing array, got {other:?}"),
         }
+    }
+
+    // ---- the hasArray/array/arrayOffset three-way split (F14) ---------------
+    //
+    // These pin `buffer_array_access`, NOT a receiver. Deliberate:
+    // `MockNativeContext` resolves field NAMES through a slot fallback, so a
+    // receiver-shaped assertion about `isReadOnly` here would be measuring the
+    // mock's name-to-slot table rather than the ordering rule. The four
+    // natives' own storage classification is covered by the receiver tests
+    // above; what could silently regress is the ORDER, and the order is here.
+
+    /// The truth table, transcribed from the JDK body. MEASURED on
+    /// jdk-25.0.3+9 (`probes/BufferAccessibleArrayProbe`): `HeapByteBuffer`
+    /// hands the array over, `HeapByteBufferR` throws `ReadOnlyBuffer`,
+    /// `DirectByteBuffer` and `ByteBufferAsIntBufferB` throw
+    /// `UnsupportedOperation`.
+    #[test]
+    fn buffer_array_access_is_the_jdk_three_way_table() {
+        assert_eq!(
+            buffer_array_access(true, false),
+            BufferArrayAccess::Accessible,
+            "array-backed and writable is the ONLY state that hands the array over"
+        );
+        assert_eq!(
+            buffer_array_access(true, true),
+            BufferArrayAccess::ReadOnly,
+            "HeapByteBufferR: hb non-null, isReadOnly set -> ReadOnlyBufferException"
+        );
+        assert_eq!(
+            buffer_array_access(false, false),
+            BufferArrayAccess::Absent,
+            "ByteBufferAsIntBufferB is WRITABLE and array-less -> UnsupportedOperation, \
+             which is why this is not a read-only-versus-not test"
+        );
+    }
+
+    /// The one cell a read-only-first implementation gets wrong, and the reason
+    /// this is a function instead of two booleans at each call site.
+    /// `DirectByteBufferR` (and `CharBuffer.wrap(String))` is read-only AND
+    /// array-less; MEASURED answer is `UnsupportedOperationException`.
+    #[test]
+    fn buffer_array_access_checks_absent_before_read_only() {
+        assert_eq!(
+            buffer_array_access(false, true),
+            BufferArrayAccess::Absent,
+            "hb == null is checked FIRST; a read-only-first implementation answers \
+             ReadOnly here and is right about every other cell"
+        );
+    }
+
+    /// Exactly one of the four states may hand the array out. The wrong
+    /// CAPABILITY this fix removes was a second one doing so.
+    #[test]
+    fn buffer_array_access_hands_the_array_out_for_exactly_one_state() {
+        let all = [
+            buffer_array_access(false, false),
+            buffer_array_access(false, true),
+            buffer_array_access(true, false),
+            buffer_array_access(true, true),
+        ];
+        assert_eq!(
+            all.iter()
+                .filter(|s| **s == BufferArrayAccess::Accessible)
+                .count(),
+            1
+        );
+    }
+
+    /// `buffer_no_backing_array` must use the NO-ARGUMENT constructor. The empty
+    /// string is the spelling `types/src/error.rs` maps to `None`, i.e. a null
+    /// `getMessage()`; MEASURED, HotSpot's is null on all four UOE arms.
+    /// A non-empty message here would be invisible to every `catch` and to any
+    /// class-name assertion — only a message-exact differential sees it.
+    #[test]
+    fn bb_no_backing_array_carries_no_detail_message() {
+        match buffer_no_backing_array() {
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::UnsupportedOperationException { message },
+            )) => assert!(
+                message.is_empty(),
+                "the EMPTY message is the ()V-constructor spelling; \
+                 \"direct buffer has no backing array\" would give getMessage() a \
+                 non-null value HotSpot does not have, and no catch would ever see it. \
+                 Got {message:?}"
+            ),
+            other => panic!("must be UnsupportedOperationException, got {other:?}"),
+        }
+    }
+
+    // ---- read-only contagion across derived views (F21) ---------------------
+    //
+    // Same discipline as the block above: these pin `buffer_view_read_only`,
+    // the pure decision, and NOT a receiver. `MockNativeContext` resolves field
+    // NAMES through a slot fallback, so a receiver-shaped assertion about
+    // `isReadOnly` measures the mock's name-to-slot table, not the rule.
+    //
+    // Every row below is a pasted cell from
+    // `scratchpad/f21/F21ViewContagionProbe.java` on jdk-25.0.3+9, and every
+    // negative row is what a SPECIFIC wrong implementation answers — never a
+    // negated condition.
+
+    /// `duplicate()` / `slice()` / `slice(int,int)` INHERIT the source's flag,
+    /// in both directions.
+    ///
+    /// MEASURED, all seven families, byte-identical transcripts:
+    /// `<fam>.ro.dup.isReadOnly OK true`, `<fam>.ro.slice.isReadOnly OK true`,
+    /// `<fam>.ro.slice(1,2).isReadOnly OK true`, and the writable source's
+    /// three counterparts `OK false`.
+    #[test]
+    fn derived_views_inherit_read_only_in_both_directions() {
+        assert!(
+            buffer_view_read_only(BufferDerivation::Inherit, true),
+            "readOnlyBuffer.duplicate() is a HeapByteBufferR. The PRE-FIX \
+             `native_bb_duplicate` wrote nothing to isReadOnly, so it answered \
+             false here and re-opened the mutable alias F14-1 closed"
+        );
+        assert!(
+            !buffer_view_read_only(BufferDerivation::Inherit, false),
+            "and it is not contagious UPWARD: hcb.duplicate().isReadOnly() is \
+             false. An implementation that stamped every derived view read-only \
+             would pass the row above and fail this one"
+        );
+    }
+
+    /// `asReadOnlyBuffer()` is UNCONDITIONAL, which is what makes it one-way.
+    ///
+    /// MEASURED: `<fam>.w.aro.isReadOnly OK true`, `<fam>.ro.aro.isReadOnly OK
+    /// true`, and `<fam>.ro.dup.aro.isReadOnly OK true` — no composition of JDK
+    /// buffer operations returns to writable, and there is no
+    /// `asWritableBuffer` to try.
+    #[test]
+    fn as_read_only_buffer_is_unconditional_and_therefore_one_way() {
+        assert!(buffer_view_read_only(BufferDerivation::ForceReadOnly, false));
+        assert!(buffer_view_read_only(BufferDerivation::ForceReadOnly, true));
+        // The mutant: `$ro_fn` implemented as a plain `$dup_fn` alias, which is
+        // exactly what `servlet.rs`'s typed-view `$ro` still is. It agrees with
+        // the read-only-source row and disagrees with the writable-source one,
+        // so a test that only exercised a read-only source would let it live.
+        assert_ne!(
+            buffer_view_read_only(BufferDerivation::ForceReadOnly, false),
+            buffer_view_read_only(BufferDerivation::Inherit, false),
+            "asReadOnlyBuffer() is not duplicate(); the two differ on exactly \
+             one of the four cells and that cell is the whole method"
+        );
+    }
+
+    /// Three of the four cells are read-only, and the one writable cell is the
+    /// one an `Inherit` op applied to a writable source produces.
+    ///
+    /// The counting shape is deliberate. An implementation that dropped the
+    /// flag on `Inherit` (the pre-fix state) gives two writable cells; one that
+    /// forced it everywhere gives zero. Both are caught here without the test
+    /// naming either.
+    #[test]
+    fn exactly_one_of_the_four_derivation_cells_is_writable() {
+        let all = [
+            buffer_view_read_only(BufferDerivation::Inherit, false),
+            buffer_view_read_only(BufferDerivation::Inherit, true),
+            buffer_view_read_only(BufferDerivation::ForceReadOnly, false),
+            buffer_view_read_only(BufferDerivation::ForceReadOnly, true),
+        ];
+        assert_eq!(all.iter().filter(|ro| !**ro).count(), 1);
+    }
+
+    /// The CONTROL, and the reason the rows above compare booleans rather than
+    /// exception hierarchies.
+    ///
+    /// `java.nio.ReadOnlyBufferException` **extends**
+    /// `java.lang.UnsupportedOperationException` (MEASURED:
+    /// `ROBE.super OK java.lang.UnsupportedOperationException`, and
+    /// `jdk25src/java.base/java/nio/ReadOnlyBufferException.java:40`). So an
+    /// `instanceof`-shaped or variant-shaped assertion that a read-only
+    /// receiver "throws UnsupportedOperationException" PASSES when the
+    /// implementation wrongly throws `ReadOnlyBufferException`, and only fails
+    /// in the other direction. That is why `buffer_array_access` returns a
+    /// three-valued enum compared with `assert_eq!` instead of the natives
+    /// being tested through a `matches!` on the error variant — and why this
+    /// lane's fixture NOMINATIONS compare exact class NAMES.
+    ///
+    /// F5-1 §1 states these two "share no supertype below `RuntimeException`".
+    /// That is false. Its conclusion survives on the ORDER of the two checks,
+    /// not on the hierarchy; a later lane that checks the hierarchy claim,
+    /// finds it false, and concludes the distinction does not matter would be
+    /// wrong about something F5-1 got right.
+    #[test]
+    fn the_two_refusals_are_distinct_states_even_though_one_subclasses_the_other() {
+        assert_ne!(
+            buffer_array_access(true, true),
+            buffer_array_access(false, true),
+            "ReadOnly and Absent must stay distinct HERE, because they are NOT \
+             distinguishable by a catch or an instanceof once they become \
+             exceptions: ReadOnlyBufferException IS an \
+             UnsupportedOperationException"
+        );
+    }
+
+    // =====================================================================
+    // F26-1 — the ALIASING contract of the derived-buffer methods.
+    //
+    // These pin the three pure window functions and `heap_buffer_address`,
+    // NOT a receiver, and deliberately so: `MockNativeContext`'s name-to-slot
+    // fallback would make an assertion about `arrayOffset()` a measurement of
+    // the mock's field table rather than of the geometry. Every expected value
+    // is a transcript line from `scratchpad/f26/F26AliasProbe.java` /
+    // `scratchpad/f26/W.java` on `openjdk 25.0.3 2026-04-21 LTS
+    // (25.0.3+9-LTS)`, and each assertion names the wrong implementation it
+    // kills.
+    // =====================================================================
+
+    /// `slice()`'s window, MEASURED: `allocate(8).position(2).slice()` gives
+    /// `pos/lim/cap = 0/6/6` and `arrayOffset() == 2`.
+    #[test]
+    fn slice_window_is_the_jdk_heap_byte_buffer_slice_constructor_call() {
+        assert_eq!(
+            slice_window(0, 2, 8),
+            BufferWindow {
+                offset: 2,
+                pos: 0,
+                lim: 6,
+                cap: 6,
+                mark: -1
+            }
+        );
+    }
+
+    /// **The mutant that a copying implementation IS.** A copy can only ever
+    /// present `offset == 0`; the JDK presents `pos + offset`. Two rows,
+    /// because a single-source test cannot tell "forgot `offset`" from
+    /// "forgot `pos`".
+    #[test]
+    fn slice_window_offset_composes_and_neither_term_may_be_dropped() {
+        // MEASURED: `hbb.slice().slice(1,2).arrayOffset()` is 3 — the outer
+        // slice's offset 2 plus the inner index 1. A body that dropped the
+        // source's own offset would answer 1 here.
+        assert_eq!(slice_range_window(2, 1, 2).offset, 3);
+        // MEASURED: `wrap(raw,2,4).slice().arrayOffset()` is 2. `wrap` leaves
+        // `offset` at 0 and puts the 2 in POSITION, so a body that dropped the
+        // position term would answer 0 — which is also exactly what the
+        // copying implementation answered.
+        assert_eq!(slice_window(0, 2, 6).offset, 2);
+        // Both terms present at once: neither mutant survives this row.
+        assert_eq!(slice_window(4, 3, 9).offset, 7);
+    }
+
+    /// MEASURED: `allocate(4).position(4).slice().arrayOffset()` is `4` even
+    /// though the slice is EMPTY. So `offset` moves with `position`
+    /// unconditionally — a body that computed it only when something remained
+    /// would answer 0 and pass every non-empty row above.
+    #[test]
+    fn slice_window_moves_the_offset_even_when_nothing_remains() {
+        let w = slice_window(0, 4, 4);
+        assert_eq!(w.cap, 0, "the empty slice really is empty");
+        assert_eq!(w.offset, 4, "and its offset still moved");
+    }
+
+    /// `slice()` DISCARDS the mark and re-bases position; `duplicate()` keeps
+    /// both. MEASURED: `dup` then `reset()` → position 3; `slice` then
+    /// `reset()` → `java.nio.InvalidMarkException`.
+    ///
+    /// The mutant this kills is the natural refactor: implementing `slice` by
+    /// calling `duplicate_window` and overwriting `cap`. That leaves the mark
+    /// and the position behind.
+    #[test]
+    fn slice_drops_the_mark_and_position_where_duplicate_keeps_them() {
+        let s = slice_window(0, 5, 8);
+        assert_eq!((s.pos, s.mark), (0, -1));
+        let d = duplicate_window(0, 5, 8, 8, 3);
+        assert_eq!((d.pos, d.mark), (5, 3));
+        assert_ne!(
+            (s.pos, s.mark),
+            (d.pos, d.mark),
+            "slice() and duplicate() are not the same window; a shared \
+             implementation that differed only in `cap` would tie these"
+        );
+    }
+
+    /// `slice(int,int)` is ABSOLUTE — `position` plays no part.
+    ///
+    /// MEASURED: `allocate(8).position(2).slice(3,4)` gives `0/4/4` and
+    /// `arrayOffset() == 3`. **Three, not five.** A body that reused
+    /// `slice_window`'s `pos + offset` would answer 5, and would agree with the
+    /// relative form on every receiver whose position happens to be 0 — which
+    /// is most of them.
+    #[test]
+    fn slice_range_window_ignores_position_and_that_is_the_whole_difference() {
+        assert_eq!(
+            slice_range_window(0, 3, 4),
+            BufferWindow {
+                offset: 3,
+                pos: 0,
+                lim: 4,
+                cap: 4,
+                mark: -1
+            }
+        );
+        assert_ne!(
+            slice_range_window(0, 3, 4).offset,
+            slice_window(0, 2, 8).offset + 3,
+            "slice(index,length) must not fold in the source position"
+        );
+    }
+
+    /// **THE LIVE BUG this record closes.** `duplicate()` carries `offset`
+    /// across unchanged; the shipped body left it at the fresh allocation's
+    /// `0` while sharing the array, so every read came from the wrong end of
+    /// the array.
+    ///
+    /// MEASURED: `wrap(raw,2,4).slice().duplicate().arrayOffset()` is `2`, and
+    /// its `get(0)` equals `raw[2]`.
+    #[test]
+    fn duplicate_window_carries_the_source_offset() {
+        assert_eq!(duplicate_window(2, 0, 4, 4, -1).offset, 2);
+        assert_ne!(
+            duplicate_window(2, 0, 4, 4, -1).offset,
+            0,
+            "the mutant is the shipped body: share the array, drop the offset"
+        );
+    }
+
+    /// `duplicate()` keeps the source's CAPACITY, not its limit — MEASURED
+    /// `allocate(8).position(2).duplicate()` is `2/8/8`, not `2/8/6`.
+    #[test]
+    fn duplicate_window_keeps_capacity_not_limit() {
+        let d = duplicate_window(0, 2, 6, 8, -1);
+        assert_eq!((d.pos, d.lim, d.cap), (2, 6, 8));
+        assert_ne!(d.cap, d.lim, "a body that passed `lim` as `cap` truncates");
+    }
+
+    /// The three windows are pairwise distinct on the SAME source, which is
+    /// the property that stops one of them being implemented as another.
+    ///
+    /// Source: `offset = 1`, `pos = 2`, `lim = 6`, `cap = 8`, `mark = 3`.
+    #[test]
+    fn the_three_derivation_windows_are_pairwise_distinct() {
+        let s = slice_window(1, 2, 6);
+        let s2 = slice_range_window(1, 2, 6);
+        let d = duplicate_window(1, 2, 6, 8, 3);
+        assert_ne!(s, s2);
+        assert_ne!(s, d);
+        assert_ne!(s2, d);
+        // And the two slices, which DO share `pos`/`mark`, differ on the pair
+        // that matters: `slice()` measures from `pos` to `lim` (4 elements),
+        // `slice(2,6)` takes 6 from index 2.
+        assert_eq!((s.offset, s.cap), (3, 4));
+        assert_eq!((s2.offset, s2.cap), (3, 6));
+    }
+
+    /// A negative or nonsensical source position must not underflow the
+    /// `usize` offset. `slice_window(0, -4, 8)` on an `i32`-to-`usize` cast
+    /// would give an offset near `usize::MAX`, i.e. an unbounded array index.
+    #[test]
+    fn slice_window_clamps_a_negative_position_instead_of_wrapping() {
+        let w = slice_window(0, -4, 8);
+        assert_eq!(w.offset, 0);
+        assert_eq!(w.cap, 8);
+    }
+
+    /// `limit < position` yields an EMPTY window, never a negative capacity —
+    /// the JDK's own `(pos <= lim ? lim - pos : 0)`.
+    #[test]
+    fn slice_window_of_an_inverted_range_is_empty_not_negative() {
+        let w = slice_window(0, 6, 2);
+        assert_eq!(w.cap, 0);
+        assert_eq!(w.lim, 0);
+        assert_eq!(w.offset, 6, "the offset still moves to the position");
+    }
+
+    /// `Buffer.address` for a heap buffer is `ARRAY_BYTE_BASE_OFFSET + offset`,
+    /// not a bare 16 — real `HeapByteBuffer` computes
+    /// `ARRAY_BASE_OFFSET + off * ARRAY_INDEX_SCALE` and `ARRAY_INDEX_SCALE` is
+    /// 1 for `byte` (`jdk25src/java.base/java/nio/HeapByteBuffer.java`).
+    #[test]
+    fn heap_buffer_address_adds_the_array_base_offset_to_the_window_offset() {
+        assert_eq!(heap_buffer_address(0), 16);
+        assert_eq!(heap_buffer_address(2), 18);
+        assert_ne!(
+            heap_buffer_address(2),
+            heap_buffer_address(0),
+            "the mutant is the pre-fix literal `16`, which is right for a fresh \
+             allocation and wrong for every aliasing view"
+        );
+    }
+
+    // =====================================================================
+    // F37-1 §2 — the TYPED families' aliasing geometry.
+    //
+    // These pin the two things that differ from the `ByteBuffer` half:
+    // the window arithmetic is UNIT-AGNOSTIC (so F26's three functions are
+    // reused unchanged, in ELEMENTS), and the `address` seed is the ONE
+    // place the element width enters. Executed under `rustc --test` as
+    // `scratchpad/f37/geom.rs`: 21 pass, 20 mutants all die (§7 of the
+    // record).
+    // =====================================================================
+
+    /// The same composition as `slice_window_offset_composes_and_neither_term
+    /// _may_be_dropped`, but through `slice()` TWICE and with a NON-ZERO
+    /// source offset in the first call.
+    ///
+    /// This row exists because the mutation run found a gap: every other
+    /// `slice_window` fixture passes `src_offset == 0`, where `pos` and
+    /// `src_offset + pos` are the same number, so a body that dropped the
+    /// source's offset entirely passed all of them. A fixture set is only as
+    /// strong as its non-degenerate inputs.
+    ///
+    /// MEASURED, jdk-25.0.3+9, all six typed families identical:
+    /// `<fam>.allocate(8).position(2).slice().slice(1,2).arrayOffset()` is
+    /// `3`, and `<fam>.w.slice().duplicate().arrayOffset()` is `2`.
+    #[test]
+    fn a_typed_slice_of_a_slice_adds_both_offsets() {
+        let first = slice_window(0, 2, 8);
+        let second = slice_window(first.offset, 1, 6);
+        assert_eq!(second.offset, 3, "2 + 1 == 3 ELEMENTS, not 1");
+        assert_eq!((second.pos, second.lim, second.cap), (0, 5, 5));
+        let third = duplicate_window(second.offset, 0, 5, 5, -1);
+        assert_eq!(third.offset, 3, "and duplicate() carries all of it");
+    }
+
+    /// Real `HeapIntBuffer`'s protected constructor
+    /// (`jdk25src/java.base/java/nio/HeapIntBuffer.java:111`):
+    /// `this.address = ARRAY_BASE_OFFSET + off * ARRAY_INDEX_SCALE;`
+    ///
+    /// Every width is a separate row, because the failure this catches is a
+    /// single-width implementation that passes one family and silently
+    /// mis-strides the other five — which is exactly what reusing
+    /// [`heap_buffer_address`] here would be.
+    #[test]
+    fn typed_buffer_address_scales_the_offset_by_the_element_width() {
+        assert_eq!(typed_buffer_address(0, 4), 16, "a fresh buffer is the base");
+        assert_eq!(typed_buffer_address(3, 1), 19);
+        assert_eq!(typed_buffer_address(3, 2), 22);
+        assert_eq!(typed_buffer_address(3, 4), 28);
+        assert_eq!(typed_buffer_address(3, 8), 40);
+    }
+
+    /// The byte-width case must keep answering exactly what
+    /// [`heap_buffer_address`] answers, or the two seeds have drifted — the
+    /// failure this codebase keeps re-finding in families that grew a second
+    /// copy of one rule.
+    #[test]
+    fn the_byte_element_width_agrees_with_the_byte_buffer_address_seed() {
+        for offset in [0usize, 1, 2, 7, 4096] {
+            assert_eq!(
+                typed_buffer_address(offset, tb_elem_width(ArrayElementType::Byte)),
+                heap_buffer_address(offset),
+                "width-1 must be the ByteBuffer seed at offset {offset}"
+            );
+        }
+    }
+
+    /// A DIRECT typed view has no `offset` field and no backing array: its
+    /// advanced `address` IS its window, and the advance is in BYTES from an
+    /// ELEMENT count.
+    ///
+    /// The `rel_start == 0` row is `duplicate()` and the rest are `slice()`.
+    /// The mutant that answers `addr` unconditionally — which is what
+    /// `native-builtins`' `s2_*_dup` does, correctly, for a duplicate — is
+    /// wrong for every slice, and that is the one this row kills.
+    #[test]
+    fn typed_direct_view_address_advances_by_elements_times_width() {
+        let base = 0x7f00_0000_0000i64;
+        assert_eq!(typed_direct_view_address(base, 0, 4), base);
+        assert_eq!(typed_direct_view_address(base, 1, 4), base + 4);
+        assert_eq!(typed_direct_view_address(base, 2, 8), base + 16);
+        assert_eq!(typed_direct_view_address(base, 5, 2), base + 10);
+    }
+
+    /// F26-1 §9.3's bound, restated for the typed widths — which make it
+    /// STRICTER, and that is the finding.
+    ///
+    /// [`is_plausible_native_addr`]'s floor is 65 536 and a heap view's
+    /// `address` is `16 + offset * width`. A `byte` view needs an offset of
+    /// 65 520 to present an address the native-pointer screen ACCEPTS; a
+    /// `double` view needs only 8 190 — an 8 190-element array is ordinary.
+    /// The overlap is inert only because [`bb_state`] resolves the heap array
+    /// FIRST and an aliasing view always has one. This is a test rather than a
+    /// sentence so a future reordering of those two checks fails here instead
+    /// of dereferencing an array index as a pointer.
+    #[test]
+    fn typed_view_address_stays_below_the_native_pointer_floor() {
+        assert!(!is_plausible_native_addr(typed_buffer_address(8_189, 8)));
+        assert!(
+            is_plausible_native_addr(typed_buffer_address(8_190, 8)),
+            "a double view crosses the floor at 8_190 elements, not 65_520"
+        );
+        assert!(!is_plausible_native_addr(typed_buffer_address(65_519, 1)));
+        assert!(
+            is_plausible_native_addr(typed_buffer_address(65_520, 1)),
+            "the byte bound F26-1 §9.3 recorded, unchanged"
+        );
+    }
+
+    /// Saturating, not wrapping. A wrapped product can land as a large
+    /// POSITIVE value, which [`is_plausible_native_addr`] would accept as a
+    /// process pointer — so the overflow mode is a safety property here, not a
+    /// stylistic one.
+    ///
+    /// `usize::MAX` is deliberately NOT the input: `usize::MAX as i64` is -1,
+    /// for which saturating and wrapping agree, so it cannot discriminate.
+    #[test]
+    fn a_pathological_typed_offset_saturates_rather_than_wrapping() {
+        let big = (i64::MAX / 4) as usize;
+        let a = typed_buffer_address(big, 8);
+        assert_eq!(a, i64::MAX, "saturates at the top, not part way");
+        assert!(typed_direct_view_address(1024, big, 8) > 0);
+    }
+
+    // =====================================================================
+    // F37-1 §5 — `FileChannel.open`'s option algebra.
+    //
+    // Every expectation is a pasted transcript from jdk-25.0.3+9
+    // (`scratchpad/f37/FcOpen.java`).
+    // =====================================================================
+
+    /// MEASURED: `FileChannel.open(p)` reads (`size()` answers 5 on a 5-byte
+    /// file) and its `write()` raises `NonWritableChannelException`.
+    #[test]
+    fn file_channel_open_with_no_options_is_a_read() {
+        let m = file_channel_open_mode(&[]).unwrap();
+        assert!(m.read);
+        assert!(!m.write);
+        assert!(!m.create, "and it does NOT create");
+        assert!(!m.truncate);
+    }
+
+    /// The implied-READ rule is "no ACCESS option present", not "no options at
+    /// all": `open(p, CREATE)` is still a read. An implementation written as
+    /// `names.is_empty()` passes the row above and fails this one.
+    #[test]
+    fn a_non_access_option_alone_still_implies_read() {
+        let m = file_channel_open_mode(&["CREATE"]).unwrap();
+        assert!(m.read && !m.write && m.create);
+    }
+
+    /// **The row that stops the naive mapping onto
+    /// `FileDescriptorTable::open_write`**, which is
+    /// `.create(true).truncate(!append)` — it does BOTH unconditionally.
+    ///
+    /// MEASURED: `open(p, WRITE)` followed by a one-byte write leaves the file
+    /// at its original 5 bytes, and `open(missing, WRITE)` raises
+    /// `java.nio.file.NoSuchFileException`. So WRITE alone neither truncates
+    /// nor creates.
+    #[test]
+    fn write_alone_neither_creates_nor_truncates() {
+        let m = file_channel_open_mode(&["WRITE"]).unwrap();
+        assert!(m.write);
+        assert!(!m.create, "no CREATE ⇒ NoSuchFileException on a missing file");
+        assert!(!m.truncate, "no TRUNCATE_EXISTING ⇒ the contents survive");
+        assert!(!m.append);
+    }
+
+    #[test]
+    fn append_implies_write_and_does_not_imply_read() {
+        let m = file_channel_open_mode(&["APPEND"]).unwrap();
+        assert!(m.append && m.write);
+        assert!(!m.read);
+    }
+
+    #[test]
+    fn create_new_counts_as_create() {
+        assert!(file_channel_open_mode(&["WRITE", "CREATE_NEW"])
+            .unwrap()
+            .create);
+    }
+
+    /// MEASURED, and the messages are compared EXACTLY:
+    ///
+    /// ```text
+    /// open(p, READ, APPEND)              java.lang.IllegalArgumentException: READ + APPEND not allowed
+    /// open(p, APPEND, TRUNCATE_EXISTING) java.lang.IllegalArgumentException: APPEND + TRUNCATE_EXISTING not allowed
+    /// ```
+    ///
+    /// A `matches!(…, IllegalArgumentException { .. })` assertion is blind to a
+    /// wrong message by construction — which is how
+    /// `"direct buffer has no backing array"` survived a prior repair of the
+    /// sibling buffer family. The swapped-messages mutant dies here and
+    /// nowhere else.
+    #[test]
+    fn the_two_illegal_option_combinations_carry_the_jdks_exact_messages() {
+        assert_eq!(
+            file_channel_open_mode(&["READ", "APPEND"]).unwrap_err(),
+            "READ + APPEND not allowed"
+        );
+        assert_eq!(
+            file_channel_open_mode(&["APPEND", "TRUNCATE_EXISTING"]).unwrap_err(),
+            "APPEND + TRUNCATE_EXISTING not allowed"
+        );
+    }
+
+    /// The two refusals are INDEPENDENT and order-free in the option array,
+    /// and the two legal near-misses are legal. An implementation that checked
+    /// only one refusal passes one row of the test above.
+    #[test]
+    fn the_open_option_refusals_are_independent_and_order_free() {
+        assert!(file_channel_open_mode(&["APPEND", "READ"]).is_err());
+        assert!(file_channel_open_mode(&["TRUNCATE_EXISTING", "APPEND"]).is_err());
+        assert!(
+            file_channel_open_mode(&["READ", "TRUNCATE_EXISTING"]).is_ok(),
+            "READ + TRUNCATE_EXISTING is not one of the refusals"
+        );
+        assert!(
+            file_channel_open_mode(&["WRITE", "APPEND"]).is_ok(),
+            "WRITE + APPEND is legal; only READ + APPEND is not"
+        );
+    }
+
+    /// Unrecognised options are IGNORED, not refused — the deliberate policy
+    /// difference from `parse_afc_open_options` next door, argued at
+    /// [`file_channel_open_mode`]. Refusing them would turn a working
+    /// `open(p, WRITE, SPARSE)` into a failure.
+    #[test]
+    fn unrecognised_open_options_are_ignored_rather_than_refused() {
+        let m = file_channel_open_mode(&["WRITE", "SPARSE", "DSYNC", "DIRECT"]).unwrap();
+        assert!(m.write && !m.create);
+    }
+
+    /// `Files.newOutputStream`'s default set — the common writable call, and
+    /// the one whose mapping onto `open_write(path, false)` is exact.
+    #[test]
+    fn the_output_stream_option_set_resolves_to_create_plus_truncate() {
+        let m = file_channel_open_mode(&["WRITE", "CREATE", "TRUNCATE_EXISTING"]).unwrap();
+        assert!(m.write && m.create && m.truncate && !m.append);
+    }
+
+    /// The CONTROL for [`is_plausible_native_addr`], and the reason a heap
+    /// buffer's `address` cannot be mistaken for a native pointer at any
+    /// offset a real buffer reaches: the screen's floor is the first mappable
+    /// page, so `16 + offset` stays refused until the offset alone exceeds
+    /// 64 KiB.
+    ///
+    /// This is a KNOWN, BOUNDED gap and not a claim of safety: an aliasing view
+    /// at an offset of 65 520 or more presents an `address` the screen accepts.
+    /// It is inert today because `bb_storage_view` asks `bb_resolve_heap_array`
+    /// FIRST and only consults `address` when no `hb` resolves — and an
+    /// aliasing view always has an `hb`. Recorded here rather than in prose so
+    /// a future reordering of those two checks fails a test instead of
+    /// dereferencing an array index as a pointer.
+    #[test]
+    fn a_heap_view_address_stays_below_the_native_pointer_floor_for_ordinary_offsets() {
+        assert!(!is_plausible_native_addr(heap_buffer_address(0)));
+        assert!(!is_plausible_native_addr(heap_buffer_address(65_519)));
+        assert!(
+            is_plausible_native_addr(heap_buffer_address(65_520)),
+            "the bound is real and this test states where it is; the heap arm \
+             of `bb_storage_view` is what keeps it inert"
+        );
+    }
+
+    /// `ByteBuffer.wrap(array, offset, length)`'s geometry, MEASURED:
+    /// `wrap(raw16, 4, 8)` is `pos/lim/cap = 4/12/16` with `arrayOffset() == 0`.
+    ///
+    /// So `offset`/`length` move POSITION and LIMIT and the array-base offset
+    /// stays 0 — the opposite of `slice()`. A body that put the 4 into the
+    /// array-base `offset` would read the right bytes at position 0 and the
+    /// WRONG bytes at every absolute index, and would answer `arrayOffset() == 4`
+    /// where HotSpot answers 0.
+    #[test]
+    fn wrap_range_moves_position_and_limit_and_never_the_array_base_offset() {
+        // The window `native_bb_wrap_range` builds, restated.
+        let (arr_len, off, len) = (16i32, 4i32, 8i32);
+        let w = BufferWindow {
+            offset: 0,
+            pos: off,
+            lim: off + len,
+            cap: arr_len,
+            mark: -1,
+        };
+        assert_eq!((w.offset, w.pos, w.lim, w.cap), (0, 4, 12, 16));
+        assert_ne!(
+            w.offset,
+            slice_window(0, off, arr_len).offset,
+            "wrap(a,off,len) and slice() put the same number in DIFFERENT \
+             places; conflating them is the mutant"
+        );
     }
 
     #[test]
