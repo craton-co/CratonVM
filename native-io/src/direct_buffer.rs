@@ -2022,6 +2022,54 @@ fn dbb_commit_position(ctx: &mut dyn NativeContext, this: ObjectRef, new_positio
 /// Register the WP3.5 DirectByteBuffer + Cleaner natives.  Idempotent:
 /// safe to call multiple times.  See module docs for FQN list and
 /// caveats around partial WP1.10 Cleaner integration.
+/// Define and register the twelve wide absolute accessors.
+///
+/// The registry stores a bare `fn` pointer, so each triple needs its own
+/// monomorphic function — a closure capturing `name`/`descriptor` (which the
+/// bail path needs to reach the class-file body) cannot coerce to one. The
+/// macro writes those twelve functions so the table and the registrations
+/// cannot drift apart.
+macro_rules! dbb_wide_accessors {
+    (
+        get { $($gfn:ident => ($gname:literal, $gdesc:literal, $gkind:expr)),* $(,)? }
+        put { $($pfn:ident => ($pname:literal, $pdesc:literal, $pkind:expr)),* $(,)? }
+    ) => {
+        $(
+            fn $gfn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                dbb_wide_get(ctx, args, $gkind, $gname, $gdesc)
+            }
+        )*
+        $(
+            fn $pfn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                dbb_wide_put(ctx, args, $pkind, $pname, $pdesc)
+            }
+        )*
+        fn dbb_register_wide(r: &mut NativeMethodRegistry) {
+            $( r.register("java/nio/DirectByteBuffer", $gname, $gdesc, $gfn); )*
+            $( r.register("java/nio/DirectByteBuffer", $pname, $pdesc, $pfn); )*
+        }
+    };
+}
+
+dbb_wide_accessors! {
+    get {
+        dbb_get_short_abs  => ("getShort",  "(I)S", WideKind::Short),
+        dbb_get_char_abs   => ("getChar",   "(I)C", WideKind::Char),
+        dbb_get_int_abs    => ("getInt",    "(I)I", WideKind::Int),
+        dbb_get_long_abs   => ("getLong",   "(I)J", WideKind::Long),
+        dbb_get_float_abs  => ("getFloat",  "(I)F", WideKind::Float),
+        dbb_get_double_abs => ("getDouble", "(I)D", WideKind::Double),
+    }
+    put {
+        dbb_put_short_abs  => ("putShort",  "(IS)Ljava/nio/ByteBuffer;", WideKind::Short),
+        dbb_put_char_abs   => ("putChar",   "(IC)Ljava/nio/ByteBuffer;", WideKind::Char),
+        dbb_put_int_abs    => ("putInt",    "(II)Ljava/nio/ByteBuffer;", WideKind::Int),
+        dbb_put_long_abs   => ("putLong",   "(IJ)Ljava/nio/ByteBuffer;", WideKind::Long),
+        dbb_put_float_abs  => ("putFloat",  "(IF)Ljava/nio/ByteBuffer;", WideKind::Float),
+        dbb_put_double_abs => ("putDouble", "(ID)Ljava/nio/ByteBuffer;", WideKind::Double),
+    }
+}
+
 pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -2167,36 +2215,12 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     // receiver-class reasoning as the byte pair above: registered on
     // `DirectByteBuffer` only, because `DirectByteBufferR` declares its own
     // throwing `put*` bodies and inherits the getters.
-    for (name, descriptor, kind) in [
-        ("getShort", "(I)S", WideKind::Short),
-        ("getChar", "(I)C", WideKind::Char),
-        ("getInt", "(I)I", WideKind::Int),
-        ("getLong", "(I)J", WideKind::Long),
-        ("getFloat", "(I)F", WideKind::Float),
-        ("getDouble", "(I)D", WideKind::Double),
-    ] {
-        r.register(
-            "java/nio/DirectByteBuffer",
-            name,
-            descriptor,
-            move |ctx, args| dbb_wide_get(ctx, args, kind, name, descriptor),
-        );
-    }
-    for (name, descriptor, kind) in [
-        ("putShort", "(IS)Ljava/nio/ByteBuffer;", WideKind::Short),
-        ("putChar", "(IC)Ljava/nio/ByteBuffer;", WideKind::Char),
-        ("putInt", "(II)Ljava/nio/ByteBuffer;", WideKind::Int),
-        ("putLong", "(IJ)Ljava/nio/ByteBuffer;", WideKind::Long),
-        ("putFloat", "(IF)Ljava/nio/ByteBuffer;", WideKind::Float),
-        ("putDouble", "(ID)Ljava/nio/ByteBuffer;", WideKind::Double),
-    ] {
-        r.register(
-            "java/nio/DirectByteBuffer",
-            name,
-            descriptor,
-            move |ctx, args| dbb_wide_put(ctx, args, kind, name, descriptor),
-        );
-    }
+    //
+    // One named `fn` per triple rather than a loop over a table: the registry
+    // takes a bare `fn` pointer, so a closure that captured the name and the
+    // descriptor cannot be registered — and those two are exactly what the
+    // bail path needs to reach the class-file body.
+    dbb_register_wide(r);
     r.register("java/nio/DirectByteBuffer", "get", "()B", dbb_get_rel);
     r.register(
         "java/nio/DirectByteBuffer",
