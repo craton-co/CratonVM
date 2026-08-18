@@ -924,6 +924,32 @@ pub fn jit_lambda_tierup() -> bool {
         }
     })
 }
+/// `CRATONVM_JIT_LAMBDA_ADAPTER` — let a SAM call site keep an inline-cache
+/// entry of its own.
+///
+/// A lambda receiver was the one receiver the monomorphic inline cache could
+/// not hold, and the obstacle was an argument shuffle rather than anything
+/// about caching: the cascade passes `(proxy, samArgs…)` and a non-capturing
+/// lambda's impl wants `(samArgs…)`. With this on, a small thunk performs the
+/// shuffle and tail-jumps to the impl, and the slot holds the thunk — so the
+/// dispatch happens in machine code with no Rust on the path, exactly as it
+/// does for a named class.
+///
+/// Default ON. `CRATONVM_JIT_LAMBDA_ADAPTER=0` keeps the Rust fast path
+/// (`try_lambda_site_direct_call`) and is the kill switch a same-binary A/B of
+/// the thunk needs; `CRATONVM_JIT_LAMBDA_SITE=0` disables that arm too, and
+/// `CRATONVM_JIT_LAMBDA_TIERUP=0` disables the whole feature.
+#[inline]
+pub fn jit_lambda_adapter() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_ADAPTER") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).
