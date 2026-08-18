@@ -375,6 +375,16 @@ pub mod harness_exit_shim {
     }
 }
 
+/// Final tally for G1's live-region memo (`CRATONVM_DBG_G1_LIVE_MEMO`).
+///
+/// Re-exported here because `cratonvm-cli` depends on this crate and not on
+/// `cratonvm-gc`, and because the counter belongs beside the site-cache dump in
+/// the CLI's shutdown reporting: both exist to say whether a lever fired before
+/// anyone quotes a timing number for it.
+pub fn dump_g1_live_region_memo_stats() {
+    cratonvm_gc::g1::live_region_memo::stats::dump();
+}
+
 #[cfg(test)]
 #[allow(unexpected_cfgs)]
 mod harness_exit_shim_tests {

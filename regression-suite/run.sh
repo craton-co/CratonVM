@@ -166,7 +166,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # addition this branch had never scheduled. Dropping either side would
 # silently unschedule working coverage, which is the defect several of the
 # guards further down exist to catch.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitMultiArrayClass RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -327,7 +327,15 @@ prune_missing() {
   done
   PRUNED="${PRUNED# }"
 }
-prune_missing "$CORE_CLASSES";    CORE_CLASSES="$PRUNED"
+prune_missing "$CORE_CLASSES";    # RJitMultiArrayClass landed 2026-08-17 with the multianewarray class-identity
+# fix: the x64 lowering allocated every level of `new String[a][b]` with
+# ClassId(0), so the compiled tier answered `[Ljava.lang.Object;` where the
+# interpreter answered `[[Ljava.lang.String;`. It is a CORE vector because
+# nothing about it is mode-specific, and it is a two-tier fixture because
+# reading each shape once measures only the tier that was already right.
+# MEASURED: red on the pre-fix binary (`CCE` at s16, `[Ljava.lang.Object;`
+# at s00), green on the fixed one and green under --nojit on both.
+CORE_CLASSES="$PRUNED"
 prune_missing "$JDKONLY_CLASSES"; JDKONLY_CLASSES="$PRUNED"
 
 # `--jdk-only` in CRATONVM_ARGS implies the JDK-only corpus. The trailing space

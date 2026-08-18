@@ -13934,3 +13934,370 @@ fn test_branch_target_mid_instruction_bails() {
         "branch into the middle of an instruction must bail, not compile"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `dup2_x2` (0x5E) — all four JVMS forms, executed.
+//
+// This opcode was admitted by `jit_scan` and lowered by neither x64 backend
+// from the first day both existed, so every method containing one reached the
+// dispatch loop's `_ =>` catch-all and stayed interpreted for the life of the
+// process — the refusal attributed to an arm that names nothing. See
+// fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
+//
+// Each case below RUNS the compiled body and checks a value that a
+// wrong-width shuffle cannot produce, because the failure mode this opcode
+// invites is not a crash: it is duplicating an unrelated slot. `.expect(...)`
+// alone would pass against a shuffle that compiles and computes nonsense.
+//
+// Local numbering follows this harness's convention (see
+// `test_compile_math_min_max_long_intrinsic`): every parameter, `long`
+// included, is ONE local slot.
+// ---------------------------------------------------------------------------
+
+/// FORM 4 — `[v2, v1] -> [v1, v2, v1]`, both operands category-2. Two entries
+/// in this backend's one-entry-per-value model, structurally `dup_x1`.
+///
+/// `long f(long a, long b) { ... }` computing `a + 2b`: any shuffle that
+/// duplicated two entries instead of one, or inserted the copy at the wrong
+/// depth, gives a different sum.
+#[test]
+fn dup2_x2_form4_two_category_2_operands() {
+    // 0: lload_0     [a]
+    // 1: lload_1     [a, b]
+    // 2: dup2_x2     [b, a, b]
+    // 3: ladd        [b, a+b]
+    // 4: ladd        [a+2b]
+    // 5: lreturn
+    let code = [0x1e, 0x1f, 0x5e, 0x61, 0x61, 0xad];
+    let compiled = compile_probe_method(&code, 2, 2)
+        .expect("FORM-4 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[3, 5]).expect("test JIT call") };
+    assert_eq!(r, 3 + 2 * 5, "a + 2b for a=3 b=5");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[-7, 11]).expect("test JIT call") };
+    assert_eq!(r, -7 + 2 * 11, "a + 2b for a=-7 b=11");
+}
+
+/// FORM 2 — `[v3, v2, v1] -> [v1, v3, v2, v1]`, a category-2 top over two
+/// category-1 values. Three entries; structurally `dup_x2`.
+///
+/// This is the form javac actually emits: `longArr[i] = otherArr[j] = v`
+/// leaves `[arrayref, index, longvalue]` and has to slide the value under the
+/// two category-1 slots.
+#[test]
+fn dup2_x2_form2_category_2_over_two_category_1() {
+    // 0: iload_1     [i]
+    // 1: iload_2     [i, j]
+    // 2: lload_0     [i, j, a]
+    // 3: dup2_x2     [a, i, j, a]
+    // 4: l2i         [a, i, j, (int)a]
+    // 5: iadd        [a, i, j+(int)a]
+    // 6: iadd        [a, i+j+(int)a]
+    // 7: i2l         [a, (long)(i+j+(int)a)]
+    // 8: ladd        [2a+i+j]
+    // 9: lreturn
+    let code = [0x1b, 0x1c, 0x1e, 0x5e, 0x88, 0x60, 0x60, 0x85, 0x61, 0xad];
+    let compiled = compile_probe_method(&code, 3, 3)
+        .expect("FORM-2 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 2 * 10 + 3 + 4, "2a + i + j for a=10 i=3 j=4");
+}
+
+/// FORM 3 — `[v3, v2, v1] -> [v2, v1, v3, v2, v1]`, two category-1 values
+/// duplicated over one category-2. Three entries; the copy goes three deep,
+/// not four, because those four JVM slots are a single entry here.
+#[test]
+fn dup2_x2_form3_two_category_1_over_a_category_2() {
+    //  0: lload_0    [a]
+    //  1: iload_1    [a, i]
+    //  2: iload_2    [a, i, j]
+    //  3: dup2_x2    [i, j, a, i, j]
+    //  4: iadd       [i, j, a, i+j]
+    //  5: i2l        [i, j, a, (long)(i+j)]
+    //  6: ladd       [i, j, a+i+j]
+    //  7: lstore_3   [i, j]
+    //  8: iadd       [i+j]
+    //  9: i2l        [(long)(i+j)]
+    // 10: lload_3    [(long)(i+j), a+i+j]
+    // 11: ladd       [a+2i+2j]
+    // 12: lreturn
+    let code = [
+        0x1e, 0x1b, 0x1c, 0x5e, 0x60, 0x85, 0x61, 0x42, 0x60, 0x85, 0x21, 0x61, 0xad,
+    ];
+    let compiled = compile_probe_method(&code, 3, 4)
+        .expect("FORM-3 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 10 + 2 * 3 + 2 * 4, "a + 2i + 2j for a=10 i=3 j=4");
+}
+
+/// FORM 1 — `[v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]`, all four
+/// category-1. The only form aarch64's unconditional four-pop arm ever
+/// handled correctly, and the deepest of the four.
+#[test]
+fn dup2_x2_form1_four_category_1_operands() {
+    // 0: iload_0   [a]
+    // 1: iload_1   [a,b]
+    // 2: iload_2   [a,b,c]
+    // 3: iload_3   [a,b,c,d]
+    // 4: dup2_x2   [c,d,a,b,c,d]
+    // 5: iadd      [c,d,a,b,c+d]
+    // 6: iadd      [c,d,a,b+c+d]
+    // 7: iadd      [c,d,a+b+c+d]
+    // 8: iadd      [c,a+b+c+2d]
+    // 9: iadd      [a+b+2c+2d]
+    // 10: ireturn
+    let code = [
+        0x1a, 0x1b, 0x1c, 0x1d, 0x5e, 0x60, 0x60, 0x60, 0x60, 0x60, 0xac,
+    ];
+    let compiled = compile_probe_method(&code, 4, 4)
+        .expect("FORM-1 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[1, 2, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 1 + 2 + 2 * 3 + 2 * 4, "a + b + 2c + 2d for 1,2,3,4");
+}
+
+/// The conservative half of the contract: when the width analysis cannot type
+/// the entries under the dup, the method stays interpreted and says so under
+/// its own name — not under whatever opcode the walk reached afterwards.
+///
+/// `dup2_x2` at pc 0 has no operands at all, so no oracle can answer.
+#[test]
+fn dup2_x2_without_a_provable_form_bails_under_its_own_name() {
+    let code = [0x5e, 0xac]; // dup2_x2; ireturn
+    let _ = crate::take_jit_bail_site(); // clear anything a prior test left
+    assert!(compile_probe_method(&code, 0, 1).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(site, "singlepass-codegen/dup2_x2-unprovable-form");
+}
+
+/// The catch-all is no longer anonymous. `wide` (0xC4) is unlowered in this
+/// walk; `jit_scan` also rejects it, so in production it never gets this far,
+/// but `compile` does not re-run the scan — which is exactly what lets this
+/// test drive the walk onto the catch-all and pin the reason string it now
+/// records. Before, every opcode that landed here reported the bare
+/// `singlepass-codegen` site, naming nothing.
+#[test]
+fn the_unlowered_opcode_catch_all_names_itself() {
+    let code = [0xc4, 0x15, 0x00, 0x01, 0xac]; // wide iload 1; ireturn
+    let _ = crate::take_jit_bail_site();
+    assert!(compile_probe_method(&code, 0, 2).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(
+        site, "singlepass-codegen/opcode-scan-admitted-but-unlowered",
+        "the catch-all must name itself rather than claim it cannot happen"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The opcode-coverage guard.
+//
+// `jit_scan` (admission) and the single-pass dispatch loop (codegen) are two
+// hand-maintained match statements over the same 202 opcode values, and until
+// this test nothing forced them to agree. An opcode the scanner advances past
+// but the walk has no arm for does not fail loudly: it falls into the walk's
+// catch-all and the method is bail-listed for the life of the process, with
+// the refusal attributed to an arm that names nothing.
+//
+// That gap has now cost three opcodes — `pop2` (0x58) and `dup2_x1` (0x5D),
+// found by the commons-math throughput work, and `dup2_x2` (0x5E), found by
+// hand-enumerating the arms of all four walkers. Each had been asserted away
+// for years by the comment "should not happen — jit_scan should have caught
+// this". A "should not happen" arm is a CLAIM, and claims about opcode
+// coverage are checkable.
+// ---------------------------------------------------------------------------
+
+/// Opcodes `jit_scan` admits on purpose despite the single-pass walk having
+/// no arm for them, each with the reason it is not the `dup2_x2` shape.
+///
+/// The bar for an entry here is a SECOND HOME: some other backend must lower
+/// the opcode, so admitting it buys a compilation the scanner would otherwise
+/// refuse. "Nobody lowers it anywhere" is the `dup2_x2` shape and belongs in
+/// an arm, not on this list.
+const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[
+    (
+        0x72,
+        "frem — the optimizing IR backend lowers it via a call to the jit_frem \
+         fmod helper, so admitting it lets the IR pipeline see the method",
+    ),
+    (
+        0x73,
+        "drem — same as frem, via jit_drem",
+    ),
+];
+
+/// Every opcode value the top-level dispatch `match op` in `bytecode_walk.rs`
+/// has an arm for.
+///
+/// Parsed from the source at COMPILE time (`include_str!`), because the set is
+/// a property of that match statement and nothing else — there is no runtime
+/// handle on it. Only arms at the match's own brace depth count, so the
+/// nested `match op` statements inside the branch arms (which re-dispatch on
+/// the same variable to pick a condition code) cannot forge coverage.
+fn single_pass_dispatch_arms() -> std::collections::BTreeSet<u8> {
+    let src = include_str!("bytecode_walk.rs");
+    // The dispatch loop's own `match op {`. Anchored on the two lines that
+    // immediately precede it so a nested `match op {` cannot be picked up.
+    let anchor = "self.dbg_last_op = op;\n            match op {\n";
+    let start = src
+        .find(anchor)
+        .expect("the single-pass dispatch `match op` must be findable")
+        + anchor.len();
+
+    let mut arms = std::collections::BTreeSet::new();
+    let mut depth = 0i32; // brace depth relative to the match body
+    for line in src[start..].lines() {
+        if depth == 0 {
+            if let Some(set) = parse_opcode_arm(line) {
+                arms.extend(set);
+            }
+            // The catch-all closes the enumeration.
+            if line.trim_start().starts_with("_ => {") {
+                break;
+            }
+        }
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth < 0 {
+            break; // the match's own closing brace
+        }
+    }
+    arms
+}
+
+/// `0x5e => {`, `0xC2 | 0xC3 => {`, `0x1a..=0x1d => {` — and nothing else.
+/// Returns `None` for any line that is not an opcode match arm, including
+/// comments and emitted byte literals.
+fn parse_opcode_arm(line: &str) -> Option<Vec<u8>> {
+    let t = line.trim();
+    if t.starts_with("//") {
+        return None;
+    }
+    let head = t.split("=>").next()?;
+    if head == t {
+        return None; // no `=>` on this line
+    }
+    let head = head.trim();
+    if head.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for alt in head.split('|') {
+        let alt = alt.trim();
+        let bytes: Vec<u8> = if let Some((lo, hi)) = alt.split_once("..=") {
+            let lo = parse_hex_byte(lo.trim())?;
+            let hi = parse_hex_byte(hi.trim())?;
+            (lo..=hi).collect()
+        } else {
+            vec![parse_hex_byte(alt)?]
+        };
+        out.extend(bytes);
+    }
+    Some(out)
+}
+
+fn parse_hex_byte(tok: &str) -> Option<u8> {
+    let hex = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X"))?;
+    if hex.len() != 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// The parser must actually find the dispatch arms — a `single_pass_dispatch_arms`
+/// that silently returned an empty set would make the guard below vacuously
+/// green, which is precisely how the `dup2_x2` gap survived so long.
+#[test]
+fn the_dispatch_arm_parser_reads_the_real_match() {
+    let arms = single_pass_dispatch_arms();
+    assert!(
+        arms.len() > 150,
+        "the single-pass walk lowers most of the opcode space; parsed only {}",
+        arms.len()
+    );
+    // Spot checks across the shapes the parser has to handle.
+    for (op, what) in [
+        (0x00u8, "nop, a bare single arm"),
+        (0x5eu8, "dup2_x2, the arm this guard was written for"),
+        (0x1bu8, "iload_1, inside a `..=` range arm"),
+        (0xc2u8, "monitorenter, inside an alternation arm"),
+        (0xacu8, "ireturn"),
+    ] {
+        assert!(arms.contains(&op), "dispatch arm for 0x{op:02x} ({what})");
+    }
+    // And it must not invent coverage for opcodes nobody lowers here.
+    for (op, what) in [
+        (0xa8u8, "jsr — unlowered in both walkers"),
+        (0xc4u8, "wide — unlowered in both walkers"),
+        (0x72u8, "frem — deliberately IR-only"),
+    ] {
+        assert!(
+            !arms.contains(&op),
+            "0x{op:02x} ({what}) must not read as lowered"
+        );
+    }
+}
+
+/// The guard itself: no opcode may be admitted by `jit_scan` and lowered by
+/// nothing.
+///
+/// Admission is probed BEHAVIOURALLY — a one-instruction body per opcode,
+/// handed to the real `jit_scan` — so the scanner's own table is never
+/// transcribed here and cannot drift from what it actually does.
+#[test]
+fn scan_admitted_opcodes_are_lowered_or_declared() {
+    let arms = single_pass_dispatch_arms();
+    let declared: std::collections::BTreeMap<u8, &str> = SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM
+        .iter()
+        .copied()
+        .collect();
+
+    let mut offenders = Vec::new();
+    for op in 0x00u8..=0xc9u8 {
+        // A body of just this opcode plus operand padding and a `return`. The
+        // scanner walks opcode widths and never simulates the stack, so this
+        // is enough to ask it the only question that matters: does it advance
+        // past this opcode, or refuse the method?
+        let mut code = vec![op, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        code.push(0xb1); // return
+        let admitted = super::bytecode_compat::jit_scan(&code, code.len(), "()V").is_some();
+        if !admitted || arms.contains(&op) {
+            continue;
+        }
+        if declared.contains_key(&op) {
+            continue;
+        }
+        offenders.push(op);
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these opcodes are admitted by `jit_scan` and lowered by no single-pass \
+         arm, so every method containing one silently never compiles: {}. \
+         Either add an arm in `bytecode_walk.rs`, stop admitting them in \
+         `jit_scan`, or — only if some OTHER backend lowers them — add them to \
+         SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM with the reason.",
+        offenders
+            .iter()
+            .map(|op| format!("0x{op:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // The allowlist is a ratchet in both directions: an entry that has since
+    // grown an arm must be removed, or it hides the next real gap behind a
+    // stale exemption.
+    for (op, reason) in SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM {
+        assert!(
+            !arms.contains(op),
+            "0x{op:02x} now HAS a single-pass arm; drop its exemption ({reason})"
+        );
+    }
+}

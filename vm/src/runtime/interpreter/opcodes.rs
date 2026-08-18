@@ -15,6 +15,69 @@
 //! here is the decode-and-do.
 
 use super::*;
+use super::site_cache::{site_stats, ClassSiteCache, ResolvedNewSite};
+
+/// `CRATONVM_JIT_NO_NEW_SITE_CACHE=1` — withdraw the per-thread `new`-site
+/// cache, so one binary can be A/B'd against its own pre-change behaviour.
+/// Comparing against a separately built branch would confound this with
+/// everything else that landed.
+///
+/// Default-ON, unlike its field and method siblings. Those are off because
+/// their hit rate does not generalise — a Spring Boot class measured 52%, and a
+/// miss there still leaves the authoritative path to run. This one is on for a
+/// different reason: what a `new` site miss re-derives is not a revalidation
+/// but a `String` allocation plus a full class resolution plus four
+/// `class_manager` read acquisitions, and a `new` executed once is a `new`
+/// whose class was just loaded — the very case whose resolution cost the most.
+/// `CRATONVM_DBG=field-site` reports `new: hit/miss/fill/reject_loader` beside
+/// the other two arms; read it before quoting a timing number.
+/// Also withdrawn whenever one of the `new`-arm traces is armed. A hit skips
+/// the class-name derivation those three print from, so leaving the cache on
+/// would make each of them report a SUBSET of the `new` sites it is being asked
+/// about — an instrument that silently under-reports is worse than none, and
+/// these three exist precisely to answer loader- and class-identity questions
+/// where a missing line reads as an absent event. They are debug gates, so a
+/// run that sets one is not a run whose throughput anybody is measuring.
+fn new_site_cache_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NEW_SITE_CACHE").is_none()
+            && !crate::runtime::env_cache::dbg_h2trace()
+            && !crate::runtime::env_cache::dbg_loader_trace()
+            && !crate::runtime::env_cache::nsee_trace()
+    })
+}
+
+/// Does this referencing class resolve constant-pool class names in a loader
+/// namespace of its own?
+///
+/// The admission test for [`ClassSiteCache`]. `true` means
+/// `resolve_class_loader_aware` may consult the initiating-resolution memo or
+/// drive a user `loadClass`, and the site is refused. `false` means the answer
+/// comes from the global name → `ClassId` mapping, which the entry's two epochs
+/// cover completely.
+///
+/// Both halves are immutable for a class: a defining loader is fixed when the
+/// class is defined, and the class-manager loader id it is cross-checked
+/// against never becomes `UserDefined` afterwards. That is what lets the fill
+/// site be the only place this is asked — a hit needs no re-check.
+///
+/// The side-table probe comes first because it is lock-free; the
+/// `class_manager` read behind it runs once per site, on the miss that fills it.
+fn referencing_class_has_loader_namespace(shared: &SharedVm, class_id: ClassId) -> bool {
+    if cratonvm_native_builtins::classloader::defining_loader_for(
+        shared.vm_identity,
+        class_id.as_u32(),
+    )
+    .is_some()
+    {
+        return true;
+    }
+    matches!(
+        shared.classes.class_manager.read().get_loader_id(class_id),
+        Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Deoptimisation and OSR-exit frame reconstruction
@@ -2508,6 +2571,48 @@ pub(super) fn execute_instruction(
         // -- Object creation --
         Instruction::New(index) => {
             let referencing_class_id = thread.frames[frame_idx].class_id;
+            // ---- Resolved constant pool: per-thread `new`-site cache --------
+            //
+            // Everything between here and `gc_alloc_object` below is
+            // re-derivation: a `String` for the class name, a full
+            // `resolve_class_loader_aware`, the JVMS 5.4.4 access check, the
+            // initialization check and the field count — four separate
+            // `class_manager` read acquisitions and one heap allocation, on
+            // EVERY execution of a `new`. A hit answers all of it with an array
+            // index and four integer compares.
+            //
+            // See `site_cache::ClassSiteCache` for which sites are admissible
+            // (loader-blind referencing classes only, a property immutable per
+            // class) and why a hit may skip the access and initialization
+            // checks. `maybe_gc` at the end of this arm still runs on both
+            // paths, so the cache changes what is COMPUTED, never when a
+            // collection can happen.
+            let new_site_epochs = if new_site_cache_enabled() {
+                if let Some(hit) = thread.class_sites.get(referencing_class_id, *index) {
+                    let hit = *hit;
+                    site_stats::bump(site_stats::NEW_HIT);
+                    let obj_ref = gc_alloc_object(
+                        shared,
+                        thread,
+                        hit.class_id,
+                        // Widening: u32 → usize
+                        hit.num_fields as usize,
+                    )?;
+                    if remap_trace_on() {
+                        push_prov_record(obj_ref.as_ptr() as usize, "new");
+                    }
+                    thread.frames[frame_idx]
+                        .stack
+                        .push(Value::Object(Some(obj_ref)))?;
+                    maybe_gc(shared, thread);
+                    return Ok(InstructionResult::Continue);
+                }
+                site_stats::bump(site_stats::NEW_MISS);
+                // Read BEFORE resolving; see `SiteCache::put`.
+                Some(ClassSiteCache::epochs_now())
+            } else {
+                None
+            };
             let class_name = {
                 let cm = shared.classes.class_manager.read();
                 let class =
@@ -2600,6 +2705,48 @@ pub(super) fn execute_instruction(
                 .get_class(target_class_id)
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
+            // Offer the site now that resolution, the access check and
+            // initialization have all succeeded. Refused for a referencing
+            // class with a loader namespace, and for an array name — `new` on
+            // an array type is not legal bytecode, but the resolver's `[` arm
+            // is loader-faithful in its own way and nothing here should be the
+            // first to assume otherwise.
+            if let Some(epochs_at_entry) = new_site_epochs {
+                // The initialization state must be `Initialized`, not merely
+                // "`ensure_class_initialized_shared` returned Ok". Those differ
+                // in exactly one window: that call also answers Ok for a class
+                // THIS thread is already initializing, i.e. a `new C()` reached
+                // from C's own `<clinit>`. If that `<clinit>` then fails, C is
+                // Erroneous and every later `new C()` must throw
+                // NoClassDefFoundError — which an entry filled from inside the
+                // window would silently allocate past. Both real states are
+                // terminal, so filling only from `Initialized` is what makes
+                // the hit path's skip sound rather than nearly sound.
+                if !crate::vm::is_class_initialized_via_manager(shared, target_class_id) {
+                    site_stats::bump(site_stats::NEW_REJECT_LOADER);
+                } else if class_name.starts_with('[') || referencing_class_has_loader_namespace(
+                    shared,
+                    referencing_class_id,
+                ) {
+                    site_stats::bump(site_stats::NEW_REJECT_LOADER);
+                } else {
+                    thread.class_sites.put(
+                        referencing_class_id,
+                        *index,
+                        epochs_at_entry,
+                        ResolvedNewSite {
+                            class_id: target_class_id,
+                            // Narrowing: a class-file field table is u16-sized,
+                            // so this is unreachable for a verified class; the
+                            // saturating form keeps a corrupt synthetic caller
+                            // out of a panic on the allocation path, exactly as
+                            // `init_object_header` does with the same value.
+                            num_fields: u32::try_from(num_fields).unwrap_or(u32::MAX),
+                        },
+                    );
+                    site_stats::bump(site_stats::NEW_FILL);
+                }
+            }
             let obj_ref = gc_alloc_object(shared, thread, target_class_id, num_fields)?;
             // SPORTME-NSEE-TRACE: print full Java stack when NoSuchElementException is constructed.
             if class_name == "java/util/NoSuchElementException"
@@ -2777,134 +2924,20 @@ pub(super) fn execute_instruction(
             }
             sizes.reverse();
 
-            // Resolve the leaf element type AND total array depth from the
-            // array class descriptor. The `dimensions` operand may be less
-            // than the total `[` count, in which case the unspecified inner
-            // dimensions stay null and the deepest *allocated* array must
-            // hold references (not the leaf type) — see `alloc_multi_array`.
+            // Descriptor parse, the JVMS §4.9.1 bracket-count guard, the
+            // per-level component-class resolution and the allocation itself
+            // all live in `multianewarray_alloc`, which the JIT's
+            // `jit_multianewarray_2d` helper calls too. Keeping one body is the
+            // point: when this arm and the JIT helper were separate
+            // transcriptions, only this one resolved component classes, and a
+            // JIT-compiled `new String[a][b]` came back as `[Ljava.lang.Object;`.
             let referencing_class_id = thread.frames[frame_idx].class_id;
-            let (leaf_et, total_array_depth, leaf_desc) = {
-                let cm = shared.classes.class_manager.read();
-                let class =
-                    cm.get_class(referencing_class_id)
-                        .ok_or_else(|| VmError::Internal {
-                            message: "current class not found".to_string(),
-                        })?;
-                let array_class_name =
-                    class.constant_pool.get_class_name(*index).ok_or_else(|| {
-                        VmError::Internal {
-                            message: format!("invalid class ref at cp#{index}"),
-                        }
-                    })?;
-                // Strip leading '[' to find the leaf type descriptor; the
-                // count of stripped `[`s is the total array depth.
-                let total_depth = array_class_name
-                    .as_bytes()
-                    .iter()
-                    .take_while(|&&b| b == b'[')
-                    .count();
-                let leaf = &array_class_name.as_bytes()[total_depth..];
-                let et = match leaf.first() {
-                    Some(b'I') => ArrayElementType::Int,
-                    Some(b'J') => ArrayElementType::Long,
-                    Some(b'F') => ArrayElementType::Float,
-                    Some(b'D') => ArrayElementType::Double,
-                    Some(b'B') => ArrayElementType::Byte,
-                    Some(b'C') => ArrayElementType::Char,
-                    Some(b'S') => ArrayElementType::Short,
-                    Some(b'Z') => ArrayElementType::Boolean,
-                    _ => ArrayElementType::Reference,
-                };
-                (et, total_depth, array_class_name[total_depth..].to_string())
-            };
-
-            // JVMS §4.9.1 static constraint: `dimensions` must not exceed the
-            // number of leading `[` in the referenced array class.
-            //
-            // SECURITY (defense-in-depth, same policy as `execute_ldc`'s
-            // `ClassFormatError` conversion): the type-state verifier does
-            // enforce this (`verify_insn.rs`, `Instruction::Multianewarray`),
-            // but that pass does NOT run for every class. Pass 3 is deferred
-            // wholesale for any class defined by a user-defined loader while
-            // `loader_aware_resolution()` is on — which is the default, and
-            // covers every Spring / WildFly / H2 application class — and the
-            // structural-only substitute (`verifier::verify_method_structural`)
-            // never looks at this operand. `-Xverify:none` removes it too.
-            //
-            // Without this guard `total_array_depth - d - 1` below underflows:
-            // in a release build (overflow-checks off) it wraps to `usize::MAX`,
-            // and `"[".repeat(usize::MAX)` then asks the allocator for
-            // `usize::MAX` bytes, which aborts the process rather than raising
-            // anything Java can catch.
-            if sizes.len() > total_array_depth {
-                let (cls, mname) = {
-                    let f = &thread.frames[frame_idx];
-                    (f.class_name().to_string(), f.method_name().to_string())
-                };
-                return Err(crate::runtime::exceptions::throw_linkage_error(
-                    shared,
-                    thread,
-                    LinkageError::VerifyError {
-                        class_name: cls,
-                        method_name: mname,
-                        message: format!(
-                            "multianewarray: dimensions {} exceeds array bracket count {} \
-                             of type at cp#{index}",
-                            sizes.len(),
-                            total_array_depth
-                        ),
-                    },
-                ));
-            }
-
-            // Resolve the *component* class id for each allocated array level so
-            // the array objects carry their precise class (e.g. the outer level
-            // of `new String[8][8]` is a `[[Ljava/lang/String;` whose component
-            // is `[Ljava/lang/String;`). Without this every multi-dim array was
-            // allocated with `ClassId(0)` and `getClass().getName()` collapsed
-            // to `[Ljava/lang/Object;`. Each level d's component descriptor is
-            // `[`×(total_depth-d-1) followed by the leaf descriptor; a primitive
-            // leaf (`I`, `C`, …) needs no class (the element type drives naming).
-            let mut component_ids: Vec<ClassId> = Vec::with_capacity(sizes.len());
-            for d in 0..sizes.len() {
-                let comp_brackets = total_array_depth - d - 1;
-                let cid = if comp_brackets > 0 {
-                    // Component is itself an array class — resolve `[…`.
-                    //
-                    // JVMS §5.3.3: that inner array class is defined by the
-                    // defining loader of ITS component, so it must be resolved
-                    // loader-faithfully. This `ClassId` is stamped into the
-                    // allocated array object's header and is what a later
-                    // `getClass()` / `getComponentType()` reads back, so
-                    // collapsing two loaders' `[Lp/X;` here would make
-                    // `new p.X[2][2]` report the wrong loader's element type.
-                    let comp_desc = format!("{}{}", "[".repeat(comp_brackets), leaf_desc);
-                    resolve_class_or_array_loader_aware(
-                        shared,
-                        thread,
-                        referencing_class_id,
-                        &comp_desc,
-                    )
-                    .unwrap_or(ClassId::new(0))
-                } else if leaf_desc.starts_with('L') && leaf_desc.ends_with(';') {
-                    // Reference leaf — component is the element class itself.
-                    let comp_name = &leaf_desc[1..leaf_desc.len() - 1];
-                    resolve_class_loader_aware(shared, thread, referencing_class_id, comp_name)
-                        .unwrap_or(ClassId::new(0))
-                } else {
-                    // Primitive leaf: element type carries the descriptor.
-                    ClassId::new(0)
-                };
-                component_ids.push(cid);
-            }
-
-            let arr = alloc_multi_array(
+            let arr = crate::runtime::interpreter::multianewarray_alloc(
                 shared,
+                thread,
+                referencing_class_id,
+                *index,
                 &sizes,
-                0,
-                leaf_et,
-                total_array_depth,
-                &component_ids,
             )?;
             thread.frames[frame_idx]
                 .stack

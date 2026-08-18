@@ -2921,7 +2921,31 @@ fn rsa_oaep_hash(pad: RsaCipherPadding, data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// MGF1 mask generation (RFC 8017 Appendix B.2.1) over the OAEP digest.
+/// The digest MGF1 uses, which is NOT the OAEP message digest.
+///
+/// `OAEPWith<md>AndMGF1Padding` names only `<md>`, and SunJCE reads the rest
+/// from `OAEPParameterSpec`'s default rather than from the name: MGF1 is
+/// **SHA-1** whatever `<md>` is. That is a documented JDK quirk and it is
+/// interop-visible, because a peer that defaults MGF1 to `<md>` instead
+/// produces ciphertext this engine cannot read and vice versa.
+///
+/// Measured on jdk-25: ciphertext from SunJCE's
+/// `OAEPWithSHA-256AndMGF1Padding` decrypts under BouncyCastle only when BC is
+/// given `MGF1ParameterSpec.SHA1`, and refuses `MGF1ParameterSpec.SHA256`.
+/// This engine answers as SunJCE, so it has to make SunJCE's choice —
+/// `RSATest.oaepCompatibilityTest`, which encrypts with SunJCE and decrypts
+/// with BC, failed `BadBlockException: unable to decrypt block` for every
+/// digest but SHA-1, where the two happen to coincide.
+///
+/// NOTE: an explicit `OAEPParameterSpec` is still ignored by the `Cipher`
+/// registrations (the digest is taken from the transformation string), so this
+/// matches SunJCE's DEFAULT only. Honouring a caller-supplied MGF1 digest needs
+/// the spec to be read at `init` first.
+const OAEP_MGF1_DIGEST: RsaCipherPadding = RsaCipherPadding::OaepSha1;
+
+/// MGF1 mask generation (RFC 8017 Appendix B.2.1). `pad` selects the MGF1
+/// digest, which callers pass as [`OAEP_MGF1_DIGEST`] — not the padding's own
+/// message digest.
 fn rsa_mgf1(pad: RsaCipherPadding, seed: &[u8], len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len + pad.hlen());
     let mut counter: u32 = 0;
@@ -3106,9 +3130,9 @@ fn rsa_oaep_pad(pad: RsaCipherPadding, msg: &[u8], k: usize) -> Result<Vec<u8>, 
     db.extend_from_slice(msg);
     let mut seed = vec![0u8; hlen];
     SecureRandom::new().next_bytes(&mut seed);
-    let db_mask = rsa_mgf1(pad, &seed, k - hlen - 1);
+    let db_mask = rsa_mgf1(OAEP_MGF1_DIGEST, &seed, k - hlen - 1);
     let masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
-    let seed_mask = rsa_mgf1(pad, &masked_db, hlen);
+    let seed_mask = rsa_mgf1(OAEP_MGF1_DIGEST, &masked_db, hlen);
     let masked_seed: Vec<u8> = seed
         .iter()
         .zip(seed_mask.iter())
@@ -3140,13 +3164,13 @@ fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
     }
     let masked_seed = &em[1..1 + hlen];
     let masked_db = &em[1 + hlen..];
-    let seed_mask = rsa_mgf1(pad, masked_db, hlen);
+    let seed_mask = rsa_mgf1(OAEP_MGF1_DIGEST, masked_db, hlen);
     let seed: Vec<u8> = masked_seed
         .iter()
         .zip(seed_mask.iter())
         .map(|(a, b)| a ^ b)
         .collect();
-    let db_mask = rsa_mgf1(pad, &seed, masked_db.len());
+    let db_mask = rsa_mgf1(OAEP_MGF1_DIGEST, &seed, masked_db.len());
     let db: Vec<u8> = masked_db
         .iter()
         .zip(db_mask.iter())
