@@ -165,5 +165,7 @@ Generational arm do that ZGC does not, and who is holding a pointer across it?*
 - `docs/internal/retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md`
   — the page this was found underneath. Its own closing warning ("the fix might
   just move the failure") was correct, and this is where the failure moved to.
-- `docs/known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.md`
-  — the other finding from the same re-measurement. Unrelated, still open.
+- `docs/known-issues/perf/quartz-stackwalker-walk-is-38x-hotspot-20260818.md`
+  — the other finding from the same re-measurement (renamed from
+  `known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.md`
+  on `dev` while this was in flight). Unrelated, still open.
