@@ -13,7 +13,8 @@ Harness: `/data/bc53-shard.sh` on the Azure host, `-Xmx 1g`, JIT ON
 |---|---|
 | CratonVM, start of the first pass | 39 PASS, 6 not green |
 | CratonVM, after the first pass | 42 PASS, 3 FAIL |
-| **CratonVM, after the second pass below** | **42 PASS, 3 FAIL** |
+| CratonVM, after the second pass below | 42 PASS, 3 FAIL |
+| **CratonVM, after the `Provider` map fix** | **43 PASS, 2 FAIL** |
 | HotSpot 25, same harness, same heap | 44 PASS, 1 FAIL (`pkix.test`) |
 
 The class count is unchanged across the second pass and that is not a stall —
@@ -129,9 +130,12 @@ component instead of asking it**.
 
 | class | what is left | shape |
 |---|---|---|
-| `jce.provider.test` | `CipherStreamTest2` (flaky), `Serialisation` | GC root gap; and a `dev` defect, below |
-| `jcajce.provider` | `BouncyCastleProviderTest.testRegisteredClasses` | `Provider`'s Map view |
+| `jce.provider.test` | `Serialisation`, plus the `CipherStreamTest2` flake | `readClassDescriptor` stub; GC root gap |
 | `pkix` | nothing CratonVM-only — **at parity with HotSpot** | — |
+
+`jcajce.provider` is CLOSED — `OK (80 tests)`. That leaves exactly ONE
+CratonVM-only defect across the 45 in-scope classes: the `readClassDescriptor`
+stub below.
 
 `Serialisation` fails `NullPointerException` in
 `ObjectInputStream.readNonProxyDesc` and **fails identically on pristine
@@ -163,44 +167,66 @@ JCA change without running the same binary several times.
 The same shape very likely explains `BlockCipherTest`'s residual
 `Threefish-256/EAX` flake (about one run in four).
 
-### `jcajce.provider` — `Provider`'s Map view is not the map
+### CLOSED: `Provider` had three disagreeing views of its own contents
 
-`Provider.put` is intercepted and stores into a Rust side table; the Java map
-view never sees it. Measured on `new BouncyCastleProvider()`:
+`java.security.Provider` IS a `Properties`, and applications read it as one.
+Three stores answered three different questions, and nothing errored:
 
-| | HotSpot | CratonVM |
-|---|---|---|
-| `keySet().size()` | 5153 | 4 |
-| `get("Provider.id name")` | `X` | `null` |
-| `get(k)` for a key just `put` | value | value |
-| `keySet().contains(k)` after that `put` | true | **true** |
-| `size()` / `entrySet().size()` after it | 5 | **4** |
+* `put` / `parseLegacyPut` / `putService` recorded into two Rust side tables —
+  `provider_properties` (name-keyed, holds the values) and
+  `provider_instance_keys` (identity-keyed, holds membership) — and
+  `get` / `containsKey` read those;
+* `size`, `isEmpty`, `keySet`, `entrySet`, `values`, `keys` and `elements` were
+  **never registered**, so they fell through to the inherited `Properties` map,
+  which only `putId`'s four `Provider.id *` rows had ever reached —
+  `super.put` is an `invokespecial` and bypasses the `put` native entirely.
 
-So `size()`/`entrySet()` read the real `Properties` map (holding only the four
-`Provider.id *` entries `putId` wrote through `super.put`), `get()`/
-`getProperty()` read the side table, and `keySet().contains` answers from a
-third view that disagrees with `keySet().size()`. `testRegisteredClasses` walks
-`keySet()` and asserts every value is a String, collecting four `AssertionError`s
-with null messages — the two unmessaged `assertTrue(... instanceof String)`
-calls.
+Measured on `new BouncyCastleProvider()` (`ProvViews` probe, jdk-25 control):
 
-**The split is exactly which methods were intercepted.** In
-`jca/provider_chain.rs` the registrar projects the side table for `put`,
-`parseLegacyPut`, `putService`, `getService`, `getServices`, `containsKey`,
-`get` and `getProperty` — and stops there. `size`, `isEmpty`, `keySet`,
-`entrySet`, `values`, `keys` and `elements` are NOT registered, so they fall
-through to the inherited `Hashtable` bytecode operating on a map that only
-`putId` ever wrote to. That is the whole defect, and it names the fix: either
-project the same table through the Map views too, or have `put` write through
-to the real map.
+| | HotSpot | before | after |
+|---|---|---|---|
+| `size()` | 5153 | 4 | 5153 |
+| `keySet()` / `entrySet()` / `values()` | 5153 | 4 | 5153 |
+| `keys()` / `elements()` | 5153 | 4 | 5153 |
+| of those keys, `containsKey` | all | **0** | all |
+| `entrySet` pairs matching `get()` | all | **0/4** | all |
+| `get("Provider.id name")` | `BC` | `null` | `BC` |
 
-This is worth fixing beyond this test. `for (Object k : provider.keySet())` is
-an ordinary idiom, and today it sees 4 entries where a real JDK shows 5153 —
-silently, with no error anywhere.
+The four rows `keySet()` did show were not even usable: their keys and values
+came back as non-Strings. That is exactly the unmessaged
+`assertTrue(... instanceof String)` that `testRegisteredClasses` was collecting
+four `AssertionError`s from. The class is now **`OK (80 tests)`** — including
+the walk that instantiates every registered `org.bouncycastle.*` class, which
+this page previously flagged as the next wall. It is not one.
 
-Note what a faithful map view then exposes rather than resolves: the test goes
-on to instantiate every registered `org.bouncycastle.*` class, ~2000 of them.
-The map view is the START of that work.
+**The scoping is load-bearing.** Projecting the name-keyed table (so the views
+would match `get`) was tried first and broke provider construction outright.
+BouncyCastle's `addAlgorithm` is:
+
+```java
+if (containsKey(key)) {
+    throw new IllegalStateException("duplicate provider key (" + key + ") found");
+}
+```
+
+so a process-global `containsKey` makes the SECOND `new BouncyCastleProvider()`
+throw on its first registration —
+`cannot create instance of ...GOST3411$Mappings : duplicate provider key
+(MessageDigest.GOST3411) found`. On HotSpot each instance owns its own map and
+sees none of the first instance's keys. The projection is therefore
+instance-scoped, and `ProvViews` now carries a second-instance arm and an
+isolation arm so that regression stays caught rather than rediscovered.
+
+One documented exception: an instance that has put NOTHING falls back to the
+rows registered under its name. `make_provider` mints a fresh synthetic
+`Provider` per call, which never runs a `put` and would otherwise present an
+empty map.
+
+`putId` is registered so its four rows land in the same store as everything
+else. It deliberately does NOT reproduce the `super.put` calls: routing them
+back through `Properties.put` threw inside `Provider.<init>` — the synthetic
+`Provider` layout carries no usable `Properties` backing map — and with every
+Map view registered there is no longer a reader for the inherited one.
 
 ### `Serialisation` — `readClassDescriptor()` returns a stub and reads nothing
 
