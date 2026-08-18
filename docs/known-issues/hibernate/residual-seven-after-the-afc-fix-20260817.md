@@ -523,3 +523,84 @@ That is still an unlanded candidate — it needs an invalidation story (a native
 CAN be registered later, and redefine exists), and this page's whole history is
 that plausible-looking one-liners do not convert. But it is now a question with
 a bounded answer rather than a profile share.
+
+## 8. The negative memo: the invalidation problem is already solved, and the memo already exists
+
+Started 2026-08-18 as "design a negative cache with an invalidation story".
+Both halves turned out to be built already. Recording what was established, so
+the remaining work is the small part rather than the design.
+
+### 8.1 A negative cannot go stale, and the primitive that proves it exists
+
+Three facts, each checked rather than assumed:
+
+1. **The registry is frozen after VM init.** `register` / `register_with_kind`
+   take `&mut self`, and `natives.native_methods` is a plain
+   `NativeMethodRegistry` field (`vm/src/vm/realms/native_realm.rs:16`) built in
+   `vm_init` and then owned by an `Arc<SharedVm>`. JNI `RegisterNatives` does
+   NOT go here — it has its own `jni_native_methods: RwLock<HashMap<u64, usize>>`
+   beside it. `classes_with_natives`'s own doc confirms the direction:
+   *"Registrations are never removed, so the set never needs to shrink."*
+2. **The one piece of runtime mutability cannot invalidate a negative.**
+   `netty_tcnative_muted` is an `AtomicBool` on the otherwise-immutable struct,
+   and its field doc says *"Only ever set, never cleared."* Muting makes `find`
+   return `None` more often, so it can turn a positive into a negative and
+   never the reverse.
+3. **A generation counter already exists**, and is exactly the right shape:
+   `NativeMethodRegistry::generation()` is `registry_epoch + slots.len()`. It
+   moves whenever a slot is appended, and `registry_epoch` is handed out in
+   `1 << 20`-wide bands per registry instance, so a memo taken against one
+   registry can never be redeemed against another (the multi-VM-in-one-process
+   case).
+
+So the invalidation story is: **key the memo on `generation()`**. Registration
+changes it; a different VM has a different band; nothing else can move the
+answer.
+
+### 8.2 …and that memo is `NativeCallSite`, which already does this
+
+`native-api/src/native_id.rs` already implements precisely it — a one-word
+`AtomicU64` laid out as `(generation << 32) | (slot + 1)`, where the low half
+being zero encodes "resolved to NO native". Its own doc gives the reasoning
+this section set out to derive:
+
+> Keying the memo on the registry generation (which changes whenever a
+> genuinely new native slot is appended) makes a stale negative self-heal at
+> the cost of one `u32` compare, so the mechanism is correct at every point in
+> the VM's lifetime, not just after boot.
+
+It also names the failure mode a naive `OnceLock<Option<NativeCallback>>` has —
+a `None` memoized before the lazy `register_*` passes run is *wrong forever* —
+and it enforces its one-cell-one-triple contract with a `debug_assert!` on a
+triple digest that costs nothing in release.
+
+`CachedBytecodeMethod` already carries the cell
+(`native_callback_cache: OnceLock<NativeCallSite>`) with two accessors:
+`native_call_site()` and `native_dispatch()`, the latter being the JDK-only-
+correct form that also keeps the `NativeKind` and counts the dispatch. Live
+callers today: `dispatch_virtual.rs:794` and `:1977`, and
+`native_override.rs:6411`.
+
+### 8.3 So the remaining work is wiring, not design
+
+§7.1 measured `CompletableFuture.uniApplyStage` and `.uniComposeStage` at
+**exactly 2.0000 registry misses per stage each**, 96.9% of all lookups. The
+memo that would collapse those to one atomic load and a `u32` compare is built,
+reviewed, and already used three places. The open question is only **which call
+sites issue those two probes** and whether each has a `CachedBytecodeMethod` in
+hand (use its cell) or needs its own `static NativeCallSite` (the shape
+`MATCHER_LEAF_SITES` in `jit/helpers.rs` uses for constant triples).
+
+The honest next step is a counter that attributes the misses to a call site.
+`perf` cannot: dwarf unwinding through these frames yields bogus return
+addresses. The `[native-lookups] miss` tally added in §7.1 names the *triple*
+but not the *caller*, and that is the gap to close next — a `#[track_caller]`
+or a per-call-site census kind on the handful of `find` call sites in
+`invoke.rs` and `native_override.rs`.
+
+**Not attempted here**, deliberately: two of the three `find` call-site clusters
+in `native_override.rs` re-target the class name (the `java/lang/ClassLoader`
+rewrite `native_dispatch`'s contract explicitly excludes), so "route them all
+through the cached cell" is wrong for at least some of them. Which is exactly
+the kind of detail that turns a one-line change into a defect, and the reason
+this section stops at a verified design rather than a patch.
