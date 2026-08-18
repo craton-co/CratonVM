@@ -100,7 +100,7 @@ pub(super) fn execute_instruction(
     instruction: &Instruction,
     saved_pc: usize,
 ) -> Result<InstructionResult, MethodCallFailed> {
-    hotpath_counts::bump(&hotpath_counts::TOTAL_INSTRUCTIONS);
+    hotpath_counts::bump(&hotpath_counts::DECODED_INSTRUCTIONS);
     match instruction {
         // -- Constants (T10.9.D direct CompactValue push) --
         Instruction::Nop => {}
@@ -1183,12 +1183,9 @@ pub(super) fn execute_instruction(
         }
         Instruction::Lookupswitch(ls) => {
             let key = thread.frames[frame_idx].stack.pop_int()?;
-            let offset = ls
-                .pairs
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, off)| *off)
-                .unwrap_or(ls.default);
+            // Binary search over the JVMS-mandated sorted key table, with a
+            // linear fallback for unverified bytecode — see `LookupSwitch::target`.
+            let offset = ls.target(key);
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize;
             // Widening: index conversion
@@ -2856,9 +2853,16 @@ pub(super) fn execute_instruction(
             // instead of re-acquiring the `class_manager` RwLock on every
             // `arraylength` opcode. `frame.class_name()` returns exactly the
             // same value as `class_manager.get_class(class_id).name`.
-            let current_class_name = thread.frames[frame_idx].class_name().to_string();
-            let mname = thread.frames[frame_idx].method_name().to_string();
-            let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
+            // The three names below feed ONE format string, in the non-JEP-358
+            // branch of a closure that runs only when the array reference is
+            // null. Building them eagerly cost three `String` allocations on
+            // every executed `arraylength` — invisible while the raw-bytecode
+            // arm handles the opcode, but this handler IS the arraylength path
+            // under `-Xverify:none`. Clone the frame's `Arc<str>` names (one
+            // atomic bump each, no copy) and format inside the closure.
+            let current_class_name = thread.frames[frame_idx].class_name_arc();
+            let mname = thread.frames[frame_idx].method_name_arc();
+            let mdesc = thread.frames[frame_idx].method_descriptor_arc();
             // JEP 358 increment 2: `Cannot read the array length because
             // "<expr>" is null`. The array ref is at the top of the operand
             // stack (depth 0).

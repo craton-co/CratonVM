@@ -97,6 +97,6 @@ characterized; worth its own doc once isolated.
 - `loggingsetuprecorder-nosuchmethoderror-at-classpath-scale-20260817.md` —
   the prior blocker in the same bootstrap chain (turned out to be a 5-day
   stale binary, not a live defect).
-- `docs/internal/fixed-suite-bugs/wildfly/wildfly-jboss-logmanager-geteffectivelevel-null-loggernode.md` —
+- `internal/fixed-suite-bugs/wildfly/wildfly-jboss-logmanager-geteffectivelevel-null-loggernode.md` —
   an earlier, different jboss-logmanager native-shim gap in the same file
   family.

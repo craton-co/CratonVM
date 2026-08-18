@@ -290,10 +290,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "capval", on_key: Some("CRATONVM_DBG_CAPVAL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "catalina", on_key: Some("CRATONVM_DBG_CATALINA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cause", on_key: Some("CRATONVM_DBG_CAUSE"), off_key: None, off_word: None },
+    // The native-invocation census. Already read through `flags::runtime_var_os`
+    // in `vm_exec.rs`; it was simply never declared, so `CRATONVM_DBG=census-    // exact-invocations` could not reach it.
+    E { group: Group::DBG, token: "census-exact-invocations", on_key: Some("CRATONVM_CENSUS_EXACT_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce", on_key: Some("CRATONVM_DBG_CCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce-bt", on_key: Some("CRATONVM_DBG_CCE_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccecache", on_key: Some("CRATONVM_DBG_CCECACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccsprobe", on_key: Some("CRATONVM_DBG_CCSPROBE"), off_key: None, off_word: None },
+    // The per-occurrence, backtrace-carrying arm of the descriptor-coercion
+    // guard. The `gc::guard` WARN text tells operators to set this by name, so
+    // an undeclared spelling of it was a live diagnostic that the grouped form
+    // could not reach.
+    E { group: Group::DBG, token: "coercion", on_key: Some("CRATONVM_DBG_COERCION"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cellcorrupt", on_key: Some("CRATONVM_DBG_CELLCORRUPT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "charset", on_key: Some("CRATONVM_DBG_CHARSET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "class-resource", on_key: Some("CRATONVM_DBG_CLASS_RESOURCE"), off_key: None, off_word: None },
@@ -835,6 +843,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "dup-x1", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X1"), off_word: None },
     E { group: Group::JIT, token: "dup-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X2"), off_word: None },
     E { group: Group::JIT, token: "dup2-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP2_X2"), off_word: None },
+    E { group: Group::JIT, token: "trusted-oop-getfield", on_key: None, off_key: Some("CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD"), off_word: None },
     E { group: Group::JIT, token: "dupx", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUPX"), off_word: None },
     E { group: Group::JIT, token: "dupx-eager-canon", on_key: Some("CRATONVM_JIT_DUPX_EAGER_CANON"), off_key: None, off_word: None },
     // Transitive eager callee compilation, so a body compiled bottom-up binds its
@@ -1158,6 +1167,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "g1-eager-humongous", on_key: Some("CRATONVM_G1_EAGER_HUMONGOUS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "g1-young-pause-target", on_key: Some("CRATONVM_G1_YOUNG_PAUSE_TARGET"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-scrub-free", on_key: Some("CRATONVM_G1_SCRUB_FREE"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-rset-source-cap", on_key: Some("CRATONVM_G1_RSET_SOURCE_CAP"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-verify-budget", on_key: Some("CRATONVM_G1_VERIFY_BUDGET"), off_key: None, off_word: None },
@@ -1370,6 +1380,10 @@ pub const INVENTORY: &[E] = &[
     // Tri-state, like `jit/verify-ir`: unset follows the build profile (armed
     // under `debug_assertions`), any other value arms it, and `0`/`false`/`off`
     // stands it down even in a debug build.
+    // The bound on joining shutdown hooks. Carries a value in milliseconds;
+    // `=0` selects HotSpot's unbounded wait rather than disabling the knob,
+    // which is why there is no `off_word`.
+    E { group: Group::THREADS, token: "shutdown-hook-timeout-ms", on_key: Some("CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "stress-thread-states", on_key: Some("CRATONVM_STRESS_THREAD_STATES"), off_key: None, off_word: Some("0") },
     // `types::striped_counter` — per-thread stripes instead of one shared
     // counter, the sibling A/B of `jit/activation-global-mutex`. THREADS rather

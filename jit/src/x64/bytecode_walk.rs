@@ -4531,6 +4531,7 @@ impl Compiler {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            crate::metrics::note_getfield_arm(1);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
                         }
@@ -4676,6 +4677,7 @@ impl Compiler {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            crate::metrics::note_getfield_arm(2);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
                         }
@@ -4708,6 +4710,7 @@ impl Compiler {
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+                        crate::metrics::note_getfield_arm(3);
                         self.emit_call_absolute(self.helpers.getfield);
                         // See the inlined-callee getfield site above: the checked
                         // helper's `i64::MIN` sentinel must be caught here, before
@@ -4732,6 +4735,7 @@ impl Compiler {
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], 0); // Cast: x86-64 immediate encoding
+                        crate::metrics::note_getfield_arm(4);
                         self.emit_call_absolute(self.helpers.getfield);
                         self.emit_post_invoke_exception_check(b'J');
                         self.push_from_rax();
@@ -5902,14 +5906,57 @@ impl Compiler {
                             // max_stack >= 5). They are scratch-only:
                             // arraycopy pushes nothing, so the next bytecode
                             // re-allocates spill slots from the same base.
-                            if !self.spill_range_fits(self.next_spill_offset, 5) {
+                            //
+                            // The base is pushed BELOW every operand's own
+                            // frame home, so the five stores below cannot land
+                            // on a slot one of them still lives in.
+                            //
+                            // The overlap is real and this is where it comes
+                            // from: `pop_stack` reclaims a Frame slot that sits
+                            // at the top of the spill region, so the five pops
+                            // just above rewound `next_spill_offset` back OVER
+                            // the very homes `flush_scratch_registers` spilled
+                            // the oop operands into. Taking the base from
+                            // `next_spill_offset` therefore aliases them by
+                            // construction.
+                            //
+                            // The emitter used to work around that for its OWN
+                            // reads only, by loading all five into distinct
+                            // GPRs before storing any (kept below — it costs
+                            // nothing and defends the ordering directly). But
+                            // the aliasing has a SECOND consumer that the
+                            // workaround does not reach: the deopt snapshot
+                            // taken above names each operand's ORIGINAL frame
+                            // home, and reads it when the bail actually fires —
+                            // long after `s_src_pos`'s store has overwritten
+                            // `dst`'s home with srcPos. A reference-array
+                            // `arraycopy` (which always bails here, by design)
+                            // then resumed in the interpreter with `Object(1)`
+                            // — the literal srcPos — where `dst` belonged: not
+                            // a plausible heap pointer, degraded to null by
+                            // `CompactValue::to_value`, and `System.arraycopy`
+                            // threw NullPointerException. `RMethodSiteCache`'s
+                            // `mixedRefAndPrimitive` is the witness; the bogus
+                            // payload tracks srcPos exactly (`srcPos=2` gives
+                            // `Object(2)`).
+                            //
+                            // Removing the overlap fixes both consumers at
+                            // once, which is why it is done here rather than by
+                            // teaching the snapshot about the scratch homes.
+                            let mut scratch_base = self.next_spill_offset;
+                            for slot in [src_slot, src_pos_slot, dst_slot, dst_pos_slot, len_slot] {
+                                if let crate::x64::StackSlot::Frame(off) = slot {
+                                    scratch_base = scratch_base.max(off.saturating_add(8));
+                                }
+                            }
+                            if !self.spill_range_fits(scratch_base, 5) {
                                 return false;
                             }
-                            let s_src = self.next_spill_offset;
-                            let s_src_pos = self.next_spill_offset + 8;
-                            let s_dst = self.next_spill_offset + 16;
-                            let s_dst_pos = self.next_spill_offset + 24;
-                            let s_len = self.next_spill_offset + 32;
+                            let s_src = scratch_base;
+                            let s_src_pos = scratch_base + 8;
+                            let s_dst = scratch_base + 16;
+                            let s_dst_pos = scratch_base + 24;
+                            let s_len = scratch_base + 32;
                             // ALIASING HAZARD: these scratch homes can overlap
                             // the operands' OWN frame homes. `flush_scratch_
                             // registers()` above spills any CalleeSaved *oop*

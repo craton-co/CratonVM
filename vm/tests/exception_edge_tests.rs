@@ -370,6 +370,43 @@ fn test_refs_equal_both_null() {
     assert!(test_refs_equal(&a, &b), "both null should be equal");
 }
 
+/// `if_acmpeq` on two JNI-smuggled null handles.
+///
+/// A `jobject` null crossing the operand stack as raw bits arrives as
+/// `Value::Long(0)`. `ref_operand_is_null` calls that the null reference, and
+/// `refs_equal` already answered `true` for the MIXED pair
+/// (`Long(0)` vs `Object(None)`) — but the pair where BOTH sides are the
+/// smuggled form had no arm, so `if_acmpeq(nullHandle, nullHandle)` answered
+/// `false` while `if_acmpeq(nullHandle, null)` answered `true` and
+/// `ifnull(nullHandle)` answered `true`. Reference equality has to be
+/// reflexive on the value that all three agree is null.
+///
+/// Delete the `(Value::Long(0), Value::Long(0))` arm of `refs_equal` and the
+/// first assertion below fails.
+#[test]
+fn test_refs_equal_jni_null_handle_is_reflexive() {
+    use cratonvm_vm::runtime::interpreter::test_refs_equal;
+    let handle = Value::Long(0);
+    assert!(
+        test_refs_equal(&handle, &handle),
+        "a JNI null handle must equal itself"
+    );
+    assert!(
+        test_refs_equal(&Value::Long(0), &Value::Object(None)),
+        "a JNI null handle must equal a plain null (pre-existing contract)"
+    );
+    assert!(
+        test_refs_equal(&Value::Object(None), &Value::Long(0)),
+        "and symmetrically"
+    );
+    // A non-zero long is a live jobject pointer or an honest long -- never the
+    // null reference, so two different ones must not collapse to equal.
+    assert!(
+        !test_refs_equal(&Value::Long(0), &Value::Long(8)),
+        "null handle vs non-null handle"
+    );
+}
+
 #[test]
 fn test_refs_equal_null_vs_nonnull() {
     use cratonvm_vm::runtime::interpreter::test_refs_equal;
