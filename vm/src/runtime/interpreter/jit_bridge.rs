@@ -4026,6 +4026,13 @@ pub(super) fn try_jit_upgrade_with_gate(
             cp_class,
             name,
             desc,
+            // No direct-bind resolver on the guarded-virtual path: the
+            // closure that owns it is declared further down this function, and
+            // a spliced body reached through a receiver guard is planned before
+            // it exists. The consequence is a REFUSAL, never a downgrade — a
+            // call-carrying body with nothing to bind to is not admitted at all
+            // (see the admission rule in `resolve_inline_site_from`).
+            None,
         )
     };
     // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
@@ -4508,7 +4515,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             // spliced behind it. See `resolve_receiver_inline_site`.
             let c_receiver_inline_resolver =
                 |cid: u32, cp_class: &str, name: &str, desc: &str| {
-                    resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc)
+                    resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
                 };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
@@ -4781,6 +4788,12 @@ pub(super) fn try_jit_upgrade_with_gate(
             callee_class,
             callee_method,
             callee_desc,
+            // The calls INSIDE the body about to be spliced get the same
+            // direct-bind treatment this method's own call sites get. Without
+            // it a spliced call falls to the blind dispatch helper, which is a
+            // measured 3.5x loss on an already-direct-bound chain — see
+            // `jit_inline_call_dispatch`.
+            Some(&callee_compiler),
         )
     };
     // Main-path small-method inlining is GATED default-OFF behind
@@ -5842,6 +5855,13 @@ pub(super) fn try_jit_compile_callee_slow(
             cp_class,
             name,
             desc,
+            // No direct-bind resolver on the guarded-virtual path: the
+            // closure that owns it is declared further down this function, and
+            // a spliced body reached through a receiver guard is planned before
+            // it exists. The consequence is a REFUSAL, never a downgrade — a
+            // call-carrying body with nothing to bind to is not admitted at all
+            // (see the admission rule in `resolve_inline_site_from`).
+            None,
         )
     };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
@@ -5934,20 +5954,6 @@ pub(super) fn try_jit_compile_callee_slow(
         shared.jit.profile_store.get_profile(&profile_key)
     };
     let helpers = crate::jit::helpers::build_helpers_for(shared);
-
-    // Build inline resolver for method inlining (Session 31)
-    let inline_resolver = |callee_class: &str,
-                           callee_method: &str,
-                           callee_desc: &str|
-     -> Option<cratonvm_jit::InlineSite> {
-        resolve_inline_site(
-            shared,
-            cached.declaring_class_id,
-            callee_class,
-            callee_method,
-            callee_desc,
-        )
-    };
 
     // Resolve java/lang/String's field layout for the JIT String call-site
     // intrinsics (see `resolve_string_field_layout`).
@@ -6187,6 +6193,27 @@ pub(super) fn try_jit_compile_callee_slow(
             .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
     };
     
+    // Build inline resolver for method inlining (Session 31).
+    //
+    // Declared HERE rather than beside the other resolvers above because it
+    // borrows `direct_callee_lookup`: the calls inside a body about to be
+    // spliced get the same lookup-only direct binding this method's own call
+    // sites get, and a spliced call that falls to the blind dispatch helper
+    // instead is a measured 3.5x loss (see `jit_inline_call_dispatch`).
+    let inline_resolver = |callee_class: &str,
+                           callee_method: &str,
+                           callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
+        resolve_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+            Some(&direct_callee_lookup),
+        )
+    };
+
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
@@ -6863,12 +6890,24 @@ pub fn jit_panic_to_exception(
 /// Resolution starts at the CONSTANT-POOL class, which is the right answer for
 /// `invokestatic`/`invokespecial` and the wrong one for a guarded virtual or
 /// interface site — see [`resolve_receiver_inline_site`].
+/// The plan-time direct-bind resolver an inline site consults for the calls
+/// inside the body it is about to splice.
+///
+/// Exactly the closure shape the top-level `direct_calls` planning already uses
+/// — `callee_compiler` on the mutator door, `direct_callee_lookup` on the
+/// background one — so a spliced call inherits every one of their refusal gates
+/// unchanged: FJP blocklist, native shadow, callee exception table,
+/// `synchronized`, JVMS §5.5 static-init, indy trap, and the eager-callee-chain
+/// depth / cycle / fan-out bounds. Answers `(compiled entry, needs context)`.
+pub(super) type InlineDirectBind<'a> = &'a dyn Fn(&str, &str, &str) -> Option<(usize, bool)>;
+
 pub(super) fn resolve_inline_site(
     shared: &SharedVm,
     requesting_class_id: ClassId,
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     resolve_inline_site_from(
         shared,
@@ -6878,6 +6917,7 @@ pub(super) fn resolve_inline_site(
         callee_method,
         callee_desc,
         0,
+        direct_bind,
     )
 }
 
@@ -6913,6 +6953,7 @@ pub(super) fn resolve_receiver_inline_site(
     cp_class: &str,
     callee_method: &str,
     callee_desc: &str,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     resolve_inline_site_from(
         shared,
@@ -6922,6 +6963,7 @@ pub(super) fn resolve_receiver_inline_site(
         callee_method,
         callee_desc,
         0,
+        direct_bind,
     )
 }
 
@@ -6945,6 +6987,7 @@ fn resolve_inline_site_from(
     callee_method: &str,
     callee_desc: &str,
     nest_depth: usize,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
@@ -7324,6 +7367,11 @@ fn resolve_inline_site_from(
                 return_type: cratonvm_jit::return_type(target_desc),
                 invoke_kind,
                 declaring_class_id: declaring_id.as_u32(),
+                // Resolved below, once `cm` is dropped: the direct-bind
+                // resolver takes `class_manager` itself (and may COMPILE the
+                // callee), so calling it under this read guard is the same
+                // self-deadlock the field-resolution phase is split out for.
+                direct_entry: None,
             },
         ));
     }
@@ -7542,6 +7590,7 @@ fn resolve_inline_site_from(
                 &target.method_name,
                 &target.descriptor,
                 nest_depth + 1,
+                direct_bind,
             ) {
                 nested_sites.push((*ipc, nested));
             }
@@ -7563,12 +7612,62 @@ fn resolve_inline_site_from(
     // during emission bails the enclosing splice instead of quietly becoming a
     // dispatch. Refusing costs the site its inline; admitting it costs 3.5x.
     let mut invoke_targets = invoke_targets;
-    if !invoke_targets.is_empty() && !crate::runtime::env_cache::jit_inline_call_dispatch() {
+
+    // Direct-bind whatever the same resolver the TOP LEVEL uses will bind.
+    //
+    // Runs after `drop(cm)` and after the nested resolution, and it must:
+    // `callee_compiler` / `direct_callee_lookup` take `class_manager` for
+    // reading and may transitively COMPILE the callee, which takes it for
+    // writing. Both bounds that recursion themselves (depth, cycle, fan-out),
+    // which is why reusing them is better than writing a lookup here.
+    //
+    // Skipped for a pc that is already NESTED — a spliced body beats a call,
+    // and asking would compile a callee whose code this site is not going to
+    // emit. Skipped for virtual/interface kinds: a direct bind names one body,
+    // and those select on the runtime receiver (that is what
+    // `resolve_receiver_inline_site` and the guarded-virtual path are for).
+    if let Some(bind) = direct_bind {
         let nested_pcs: Vec<usize> = nested_sites.iter().map(|(pc, _)| *pc).collect();
-        if invoke_targets.iter().any(|(pc, _)| !nested_pcs.contains(pc)) {
+        for (ipc, target) in invoke_targets.iter_mut() {
+            if nested_pcs.contains(ipc) {
+                continue;
+            }
+            if target.invoke_kind != 1 && target.invoke_kind != 3 {
+                continue;
+            }
+            target.direct_entry =
+                bind(&target.class_name, &target.method_name, &target.descriptor);
+        }
+    }
+
+    // A spliced call must not be WORSE than the call it replaced.
+    //
+    // Measured 2026-08-18 (see `jit_inline_call_dispatch`): the chain this
+    // whole line of work targets is already direct-bound, so emitting an
+    // admitted call through the blind dispatch helper traded a ~4 ns raw CALL
+    // for a ~175 ns name resolution — `assertFull` 47 -> 163-266 ns/iter, with
+    // `disp_calls` going from 3 870 to 2 003 361 over 2 000 000 iterations.
+    // Splicing away one frame does not pay for downgrading the call inside it.
+    //
+    // So unless the fallback is explicitly re-enabled, every call in the body
+    // must be either SPLICED IN TURN or DIRECT-BOUND; a site with one that is
+    // neither is refused whole. Refusing costs the site its inline; admitting
+    // it costs 3.5x.
+    if !crate::runtime::env_cache::jit_inline_call_dispatch() {
+        let nested_pcs: Vec<usize> = nested_sites.iter().map(|(pc, _)| *pc).collect();
+        if invoke_targets
+            .iter()
+            .any(|(pc, t)| t.direct_entry.is_none() && !nested_pcs.contains(pc))
+        {
             return None;
         }
-        invoke_targets.clear();
+        // Drop the entries the emitter must NOT be able to fall back on: a pc
+        // that is nested and has no direct bind. Leaving it would let a nested
+        // splice that bails at emission time degrade to the helper, which is
+        // the thing this rule exists to prevent. A nested pc that IS also
+        // direct-bound keeps its entry — falling back to a raw CALL is not a
+        // downgrade, and it beats bailing the enclosing splice.
+        invoke_targets.retain(|(_, t)| t.direct_entry.is_some());
     }
 
     Some(cratonvm_jit::InlineSite {

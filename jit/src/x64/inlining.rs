@@ -1502,8 +1502,10 @@ impl Compiler {
                         }
                     }
 
-                    let Some(&(_, info_addr)) =
-                        site.resolved_invoke_infos.iter().find(|(p, _)| *p == cpc)
+                    let Some(&resolved) = site
+                        .resolved_invoke_infos
+                        .iter()
+                        .find(|r| r.callee_pc == cpc)
                     else {
                         // No resolved target: either the gate is off (the
                         // resolver refused the site and this is unreachable) or
@@ -1513,7 +1515,7 @@ impl Compiler {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     };
-                    if !self.emit_inline_invoke(info_addr) {
+                    if !self.emit_inline_invoke(&resolved) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1610,14 +1612,15 @@ impl Compiler {
     /// site in the enclosing method, and the enclosing method's exception table
     /// is the one that must be searched. The already-shipped spliced `getfield`
     /// / `getstatic` / `arraycopy` sites rely on exactly the same thing.
-    fn emit_inline_invoke(&mut self, info_addr: usize) -> bool {
+    fn emit_inline_invoke(&mut self, resolved: &crate::ResolvedInlineInvoke) -> bool {
         // SAFETY: see the doc comment — the pointee is owned by this compile's
         // `_jit_invoke_infos` arena and outlives the code being emitted.
-        let info = info_addr as *const crate::JitInvokeInfo;
-        let (num_args, return_type) = {
-            let info_ref = unsafe { &*info };
-            (info_ref.num_jit_args, info_ref.return_type)
-        };
+        let info = resolved.info_addr as *const crate::JitInvokeInfo;
+        if info.is_null() {
+            return false;
+        }
+        let num_args = resolved.num_jit_args;
+        let return_type = resolved.return_type;
 
         // A call boundary: no caller-live value may sit in a scratch GPR or an
         // XMM temporary across it. Same reason `try_emit_inline_body` flushes
@@ -1644,7 +1647,106 @@ impl Compiler {
         arg_slots.reverse();
         let post_pop_spill = self.next_spill_offset;
 
-        let args_base_offset = pre_pop_spill;
+        if resolved.direct_entry != 0 {
+            if !self.emit_inline_direct_call(resolved, info, &arg_slots, pre_pop_spill) {
+                return false;
+            }
+        } else if !self.emit_inline_dispatch_call(info, &arg_slots, pre_pop_spill) {
+            return false;
+        }
+        self.emit_post_invoke_exception_check(return_type);
+        self.next_spill_offset = post_pop_spill;
+
+        if return_type != b'V' {
+            if matches!(return_type, b'D' | b'F') {
+                self.push_from_rax_as_xmm0();
+            } else {
+                self.push_from_rax();
+                if return_type == b'L' || return_type == b'[' {
+                    self.mark_top_as_oop();
+                }
+            }
+        }
+        true
+    }
+
+    /// The spliced call as a raw `CALL` to the callee's compiled entry — the
+    /// same sequence the top-level `direct_calls` arm emits, and the thing that
+    /// makes a call-carrying splice worth doing at all.
+    ///
+    /// Every piece here has a reason the top-level arm already documents, and
+    /// two of them are the difference between this and the dispatch form:
+    ///
+    ///  * **the service copy.** A baked direct call has no dispatch-helper
+    ///    frame to recover its arguments from when the callee deopts, so the
+    ///    arguments are copied into a contiguous frame range ABOVE the argument
+    ///    slots (`reserve_direct_call_service_slots` refuses an overlap — copy
+    ///    into the range it is reading and the callee gets arg0 in every slot)
+    ///    and `emit_inline_callee_deopt_check` recovers them from there. A
+    ///    direct call to a Java callee without one is a compile failure at the
+    ///    top level and is refused here too, rather than emitted unserviced.
+    ///  * **`emit_post_call_rbp_republish`.** The callee may have re-entered
+    ///    the VM and moved the frame record.
+    ///
+    /// The keep-alive for `resolved.direct_entry` is registered at INTERNING
+    /// time (`intern_inline_invoke_targets` -> `_direct_callee_entries`), not
+    /// here — the emitter must not be the only thing that knows an address was
+    /// baked, because a rolled-back splice would then leave a pin nothing
+    /// removes, and a bailed compile would leave one nothing adds.
+    fn emit_inline_direct_call(
+        &mut self,
+        resolved: &crate::ResolvedInlineInvoke,
+        info: *const crate::JitInvokeInfo,
+        arg_slots: &[super::StackSlot],
+        args_frame_top: i32,
+    ) -> bool {
+        let Some(service_args_base) =
+            self.reserve_direct_call_service_slots(args_frame_top, arg_slots)
+        else {
+            // No room for the deopt-service copy. Refusing the splice is the
+            // only safe answer: an unserviced direct call to a Java callee
+            // cannot recover its arguments if the callee deopts.
+            return false;
+        };
+        for (i, slot) in arg_slots.iter().enumerate() {
+            self.load_slot_to_reg(R11, *slot);
+            let off = service_args_base + ((arg_slots.len() - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
+            self.emit_store_local(off, R11);
+        }
+        let total_sub = self.emit_stack_arg_setup(arg_slots, resolved.direct_needs_context);
+        self.emit_pre_safepoint_spill();
+        self.emit_call_absolute(resolved.direct_entry);
+        self.emit_post_call_rbp_republish();
+        // A direct call to a compiled callee is still a safepoint: the callee
+        // may allocate and trigger GC transitively. The caller's operand stack
+        // below the splice is covered precisely by its oop marks; the callee
+        // locals this splice reserved live in the frame's spill area and are
+        // covered by the same conservative frame sweep as every other spill
+        // slot — over-approximate, hence pinned by a moving collector.
+        self.emit_oop_map_for_safepoint();
+        self.emit_stack_arg_cleanup(total_sub);
+        self.emit_inline_callee_deopt_check(info, arg_slots.len(), service_args_base);
+        true
+    }
+
+    /// The spliced call through the blind `jit_invoke_dispatch` helper.
+    ///
+    /// Only reachable with `CRATONVM_JIT_INLINE_CALL_DISPATCH` on: measured
+    /// 2026-08-18, emitting an admitted call this way took the JUnit assertion
+    /// chain from 47 to 163-266 ns/iter (`disp_calls` 3 870 -> 2 003 361 over
+    /// 2 000 000 iterations), because the call it replaced was already
+    /// direct-bound. Kept because it is the arm that reproduces that result.
+    ///
+    /// Mirrors the top-level `invokestatic` dispatch site: contiguous args
+    /// buffer built at the pre-pop spill cursor, four-argument helper call, oop
+    /// map for the safepoint.
+    fn emit_inline_dispatch_call(
+        &mut self,
+        info: *const crate::JitInvokeInfo,
+        arg_slots: &[super::StackSlot],
+        args_base_offset: i32,
+    ) -> bool {
+        let num_args = arg_slots.len();
         if num_args > 0 {
             let Some(args_end) = self.checked_spill_range_end(args_base_offset, num_args) else {
                 return false;
@@ -1670,27 +1772,7 @@ impl Compiler {
         self.emit_mov_imm32_sx(ARG_REGS[3], num_args as i32); // Cast: x86-64 immediate encoding
         self.emit_pre_safepoint_spill();
         self.emit_call_absolute(self.helpers.invoke_dispatch);
-        // A dispatched callee can allocate, so this is a full safepoint. The
-        // caller's operand stack below `caller_base_depth` is covered
-        // precisely by its oop marks; the CALLEE's locals live in this frame's
-        // spill area, below `next_spill_offset`, and are covered by the same
-        // conservative frame sweep (`scan_one_frame_precise`) that already
-        // covers every other spill slot — over-approximate, hence pinned by a
-        // moving collector, which is the fail-closed direction.
         self.emit_oop_map_for_safepoint();
-        self.emit_post_invoke_exception_check(return_type);
-        self.next_spill_offset = post_pop_spill;
-
-        if return_type != b'V' {
-            if matches!(return_type, b'D' | b'F') {
-                self.push_from_rax_as_xmm0();
-            } else {
-                self.push_from_rax();
-                if return_type == b'L' || return_type == b'[' {
-                    self.mark_top_as_oop();
-                }
-            }
-        }
         true
     }
 
