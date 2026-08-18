@@ -288,11 +288,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "callee-probe", on_key: Some("CRATONVM_DBG_CALLEE_PROBE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "caller", on_key: Some("CRATONVM_DBG_CALLER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "capval", on_key: Some("CRATONVM_DBG_CAPVAL"), off_key: None, off_word: None },
-    // `misplaced_launcher_flags`'s warning, stated positively as the E docs
-    // require: the knob is the warning (default ON) and the legacy variable is
-    // its opt-out, for a Java program that genuinely takes one of those names
-    // as its own argument.
-    E { group: Group::DBG, token: "misplaced-flag-warning", on_key: None, off_key: Some("CRATONVM_NO_MISPLACED_FLAG_WARNING"), off_word: None },
     E { group: Group::DBG, token: "catalina", on_key: Some("CRATONVM_DBG_CATALINA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cause", on_key: Some("CRATONVM_DBG_CAUSE"), off_key: None, off_word: None },
     // The native-invocation census. Already read through `flags::runtime_var_os`

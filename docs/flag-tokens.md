@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-459 tokens.
+458 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -112,7 +112,6 @@ export inherited from a parent shell.
 | `callee-probe` | `CRATONVM_DBG_CALLEE_PROBE` |
 | `caller` | `CRATONVM_DBG_CALLER` |
 | `capval` | `CRATONVM_DBG_CAPVAL` |
-| `misplaced-flag-warning` | `CRATONVM_NO_MISPLACED_FLAG_WARNING` |
 | `catalina` | `CRATONVM_DBG_CATALINA` |
 | `cause` | `CRATONVM_DBG_CAUSE` |
 | `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
