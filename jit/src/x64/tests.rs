@@ -12120,7 +12120,11 @@ fn a_nested_splice_replaces_the_call_entirely() {
     // outer splice. The next test relies on exactly this.
     callee.resolved_invoke_infos =
         vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
-    callee.nested_sites = vec![(3, inner)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: 0,
+        site: inner,
+    }];
 
     let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
     let mut sites = HashMap::new();
@@ -12163,7 +12167,11 @@ fn a_nested_splice_that_bails_falls_back_to_the_call() {
     let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
     callee.resolved_invoke_infos =
         vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
-    callee.nested_sites = vec![(3, inner)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: 0,
+        site: inner,
+    }];
 
     let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
     let mut sites = HashMap::new();
@@ -12179,6 +12187,128 @@ fn a_nested_splice_that_bails_falls_back_to_the_call() {
     let (_, _, _, args) =
         take_last_dispatch().expect("the fallback dispatch must have run");
     assert_eq!(args, vec![5, 10], "with the same arguments the nested body would have had");
+}
+
+/// DEVIRTUALISATION INSIDE A SPLICE. Both edges of the receiver guard, from one
+/// compiled body.
+///
+/// The hot edge is a spliced body that returns 42; the cold edge is the
+/// ordinary call, which this harness answers with the argument sum. So the
+/// SAME machine code returns 42 for a receiver whose class id matches the
+/// guard and takes the dispatch for one that does not — which is the only way
+/// to show that the guard is a guard and not a constant.
+///
+/// What each assertion would catch:
+///   * hit returning something other than 42 — the guard fell through to the
+///     call, or the spliced body was never emitted;
+///   * a recorded dispatch on the hit path — the JMP over the miss edge is
+///     missing, so both arms run;
+///   * miss NOT recording a dispatch — the guard is never false, i.e. the
+///     class-id compare is against the wrong operand or the wrong offset;
+///   * the miss dispatch seeing arguments other than `[receiver, 10]` — the
+///     miss arm did not pop what the hit arm popped, which is the operand-stack
+///     disagreement the emitter restores its symbolic state to prevent.
+#[test]
+fn a_guarded_nested_splice_takes_the_body_on_a_hit_and_the_call_on_a_miss() {
+    const GUARD_CLASS_ID: u32 = 0x4242;
+
+    // The devirtualised target: `int m(int) { return 42; }` — a constant, so
+    // the returned value alone says which arm ran.
+    let inner = make_inline_site(&[0x10, 0x2a, 0xac], 2, 2, false, b'I');
+
+    // The spliced body: `static int leaf(Object o) { return o.m(10); }`
+    //   0: aload_0
+    //   1: bipush 10
+    //   3: invokevirtual #3
+    //   6: ireturn
+    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
+    // A guarded pc KEEPS its dispatch entry: the miss edge has to go
+    // somewhere, and a virtual site has no direct bind to send it to.
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: GUARD_CLASS_ID,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x2a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a guarded nested splice must compile");
+
+    // Two receivers, one compiled body. Class id lives in the first four bytes
+    // of the object header, which is what `CMP [rax+0], imm32` reads.
+    let mut hit = Box::new([0u64; 8]);
+    let mut miss = Box::new([0u64; 8]);
+    hit[0] = GUARD_CLASS_ID as u64;
+    miss[0] = (GUARD_CLASS_ID + 1) as u64;
+    let hit_addr = hit.as_mut_ptr() as i64; // Cast: receiver address
+    let miss_addr = miss.as_mut_ptr() as i64; // Cast: receiver address
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // receiver is a live 64-byte buffer shaped like an object header, and the
+    // only helper reachable is `stub_invoke_dispatch`, which reads the argument
+    // buffer and nothing else.
+    let got_hit = unsafe { compiled.call_with_heap(0, &[hit_addr]) };
+    assert_eq!(got_hit, 42, "a guard hit must run the spliced body");
+    assert!(
+        take_last_dispatch().is_none(),
+        "and must not also fall into the miss edge",
+    );
+
+    // SAFETY: as above.
+    let got_miss = unsafe { compiled.call_with_heap(0, &[miss_addr]) };
+    let (_, _, _, args) =
+        take_last_dispatch().expect("a guard miss must take the ordinary call");
+    assert_eq!(
+        args,
+        vec![miss_addr, 10],
+        "the miss arm must pop exactly the operands the hit arm popped",
+    );
+    assert_eq!(
+        got_miss,
+        miss_addr.wrapping_add(10),
+        "and its result must be the call's, not the body's",
+    );
+}
+
+/// A null receiver fails the guard rather than dereferencing it.
+///
+/// `CMP DWORD [RAX+0], guard` on a null receiver is a segfault, so the null
+/// test has to come FIRST and branch to the same miss edge. Nothing else in
+/// this construct would catch that: a null receiver is exactly the case a
+/// profile never records, and the ordinary call reproduces the NPE correctly.
+#[test]
+fn a_null_receiver_takes_the_guarded_splices_miss_edge() {
+    const GUARD_CLASS_ID: u32 = 0x4242;
+    let inner = make_inline_site(&[0x10, 0x2a, 0xac], 2, 2, false, b'I');
+    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: GUARD_CLASS_ID,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x2a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a guarded nested splice must compile");
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode; a null receiver must not
+    // be dereferenced by the guard, which is the property under test.
+    let got = unsafe { compiled.call_with_heap(0, &[0]) };
+    let (_, _, _, args) = take_last_dispatch()
+        .expect("a null receiver must reach the ordinary call, not the body");
+    assert_eq!(args, vec![0, 10]);
+    assert_eq!(got, 10);
 }
 
 /// The interning pass fills `resolved_invoke_infos` from `invoke_targets`, for
@@ -12219,7 +12349,11 @@ fn interning_reaches_nested_bodies_too() {
             direct_entry: Some((0xfeed_0000, true)),
         },
     )];
-    outer.nested_sites = vec![(0, inner)];
+    outer.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 0,
+        guard_class_id: 0,
+        site: inner,
+    }];
     // Stale pointers from a hypothetical earlier compile must be REPLACED, not
     // appended to: an `InlineSite` can be cloned out of a cached plan.
     outer.resolved_invoke_infos = vec![crate::ResolvedInlineInvoke {
@@ -12235,7 +12369,7 @@ fn interning_reaches_nested_bodies_too() {
 
     assert_eq!(outer.resolved_invoke_infos.len(), 1);
     assert_eq!(outer.resolved_invoke_infos[0].callee_pc, 0);
-    let deep = &outer.nested_sites[0].1;
+    let deep = &outer.nested_sites[0].site;
     assert_eq!(
         deep.resolved_invoke_infos.len(),
         1,

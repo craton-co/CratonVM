@@ -7574,25 +7574,93 @@ fn resolve_inline_site_from(
     // A nested site is ADDITIVE: the pc keeps its `invoke_targets` entry too,
     // so a nested splice that bails mid-body inside the emitter falls back to
     // the ordinary call rather than failing the outer splice.
-    let mut nested_sites: Vec<(usize, cratonvm_jit::InlineSite)> = Vec::new();
+    let mut nested_sites: Vec<cratonvm_jit::NestedInlineSite> = Vec::new();
     if nest_depth + 1 < cratonvm_jit::MAX_INLINE_NEST_DEPTH
         && crate::runtime::env_cache::jit_inline_nest()
     {
+        // The CALLEE's own receiver profile, fetched once for the whole body.
+        //
+        // This is the piece that makes devirtualising inside a splice possible
+        // at all, and it needed no new profiling: receiver types are recorded
+        // against the bci of the method that is EXECUTING, so a virtual call
+        // inside `objectsAreEqual` is already profiled under
+        // `objectsAreEqual`'s own `MethodKey` at its own bci — exactly the
+        // (method, pc) pair a nested site names. The enclosing method's profile
+        // never had this and never could, which is why re-keying it by
+        // (caller pc, callee pc) was the wrong shape to reach for.
+        let callee_profile = if crate::runtime::env_cache::jit_inline_splice_devirt() {
+            shared
+                .jit
+                .profile_store
+                .get_profile(&crate::jit::profile::MethodKey {
+                    class_id: declaring_id.as_u32(),
+                    method_name: Arc::from(callee_method),
+                    descriptor: Arc::from(callee_desc),
+                })
+        } else {
+            None
+        };
         for (ipc, target) in &invoke_targets {
-            if target.invoke_kind != 1 && target.invoke_kind != 3 {
-                continue;
-            }
-            if let Some(nested) = resolve_inline_site_from(
-                shared,
-                declaring_id,
-                None,
-                &target.class_name,
-                &target.method_name,
-                &target.descriptor,
-                nest_depth + 1,
-                direct_bind,
-            ) {
-                nested_sites.push((*ipc, nested));
+            match target.invoke_kind {
+                // Statically bound: one body, no guard.
+                1 | 3 => {
+                    if let Some(nested) = resolve_inline_site_from(
+                        shared,
+                        declaring_id,
+                        None,
+                        &target.class_name,
+                        &target.method_name,
+                        &target.descriptor,
+                        nest_depth + 1,
+                        direct_bind,
+                    ) {
+                        nested_sites.push(cratonvm_jit::NestedInlineSite {
+                            callee_pc: *ipc,
+                            guard_class_id: 0,
+                            site: nested,
+                        });
+                    }
+                }
+                // Virtual / interface: one body per receiver class, so a splice
+                // needs a guard and the profile has to name the class.
+                0 | 2 => {
+                    let Some(profile) = callee_profile.as_ref() else {
+                        continue;
+                    };
+                    let Some(counts) = profile.receivers.get(ipc) else {
+                        continue;
+                    };
+                    // Same 80% dominance bar the top-level guarded-virtual
+                    // planner uses. Below it the guard misses often enough that
+                    // the cold edge — a blind dispatch — is what the site
+                    // actually costs.
+                    let Some(dom) = crate::jit::profile::dominant_receiver(counts, 80) else {
+                        continue;
+                    };
+                    // Resolve the body that receiver ACTUALLY dispatches to,
+                    // not the constant-pool one: the guard certifies the
+                    // subclass, so splicing the superclass's method behind it
+                    // is silent wrong code at every overriding site. This is
+                    // the same contract `resolve_receiver_inline_site`
+                    // documents, and it applies verbatim one level down.
+                    if let Some(nested) = resolve_inline_site_from(
+                        shared,
+                        declaring_id,
+                        Some(ClassId::new(dom)),
+                        &target.class_name,
+                        &target.method_name,
+                        &target.descriptor,
+                        nest_depth + 1,
+                        direct_bind,
+                    ) {
+                        nested_sites.push(cratonvm_jit::NestedInlineSite {
+                            callee_pc: *ipc,
+                            guard_class_id: dom,
+                            site: nested,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -7627,7 +7695,7 @@ fn resolve_inline_site_from(
     // and those select on the runtime receiver (that is what
     // `resolve_receiver_inline_site` and the guarded-virtual path are for).
     if let Some(bind) = direct_bind {
-        let nested_pcs: Vec<usize> = nested_sites.iter().map(|(pc, _)| *pc).collect();
+        let nested_pcs: Vec<usize> = nested_sites.iter().map(|n| n.callee_pc).collect();
         for (ipc, target) in invoke_targets.iter_mut() {
             if nested_pcs.contains(ipc) {
                 continue;
@@ -7654,20 +7722,30 @@ fn resolve_inline_site_from(
     // neither is refused whole. Refusing costs the site its inline; admitting
     // it costs 3.5x.
     if !crate::runtime::env_cache::jit_inline_call_dispatch() {
-        let nested_pcs: Vec<usize> = nested_sites.iter().map(|(pc, _)| *pc).collect();
+        let nested_pcs: Vec<usize> = nested_sites.iter().map(|n| n.callee_pc).collect();
         if invoke_targets
             .iter()
             .any(|(pc, t)| t.direct_entry.is_none() && !nested_pcs.contains(pc))
         {
             return None;
         }
-        // Drop the entries the emitter must NOT be able to fall back on: a pc
-        // that is nested and has no direct bind. Leaving it would let a nested
-        // splice that bails at emission time degrade to the helper, which is
-        // the thing this rule exists to prevent. A nested pc that IS also
-        // direct-bound keeps its entry — falling back to a raw CALL is not a
-        // downgrade, and it beats bailing the enclosing splice.
-        invoke_targets.retain(|(_, t)| t.direct_entry.is_some());
+        // A GUARDED nested splice keeps its dispatch entry no matter what: the
+        // guard's miss edge has to go somewhere, and for a virtual site there
+        // is no direct bind to send it to. That is the same bargain PGO-02
+        // makes one level up — the cold edge pays the helper, the hot edge pays
+        // nothing — and it is only a bargain while the guard actually holds,
+        // which is what the 80% dominance bar above is for.
+        //
+        // An UNGUARDED nested pc with no direct bind loses its entry, so a
+        // nested splice that bails at emission time bails the enclosing splice
+        // rather than degrading to the helper. One that IS direct-bound keeps
+        // it: falling back to a raw CALL is not a downgrade.
+        let guarded_pcs: Vec<usize> = nested_sites
+            .iter()
+            .filter(|n| n.guard_class_id != 0)
+            .map(|n| n.callee_pc)
+            .collect();
+        invoke_targets.retain(|(pc, t)| t.direct_entry.is_some() || guarded_pcs.contains(pc));
     }
 
     Some(cratonvm_jit::InlineSite {

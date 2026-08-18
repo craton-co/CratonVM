@@ -5405,6 +5405,34 @@ pub struct ResolvedInlineInvoke {
     pub return_type: u8,
 }
 
+/// A call inside a spliced body that is spliced IN TURN rather than called.
+///
+/// `guard_class_id` is what makes this more than a recursion:
+///
+///  * `0` — the target is statically bound (`invokestatic` / `invokespecial`),
+///    so there is exactly one body and the splice is unconditional.
+///  * non-zero — the target is `invokevirtual` / `invokeinterface`, and this is
+///    the receiver class the CALLEE's own profile says dominates that site. The
+///    emitter guards the splice with an exact class-id compare and sends the
+///    miss edge to the ordinary call, exactly as PGO-02 does one level up.
+///
+/// Why the callee's OWN profile is the right source, and why this needed no
+/// re-keyed (caller pc, callee pc) profile after all: receiver types are
+/// recorded by the interpreter against the bci of the method that is EXECUTING.
+/// A call inside `objectsAreEqual` is therefore already profiled under
+/// `objectsAreEqual`'s own `MethodKey` at its own bci — which is precisely the
+/// (method, pc) pair a nested site names. The enclosing method's profile never
+/// had this information and never could.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct NestedInlineSite {
+    /// Bytecode pc in the enclosing CALLEE's code.
+    pub callee_pc: usize,
+    /// Exact receiver class the splice is guarded on, or 0 for no guard.
+    pub guard_class_id: u32,
+    /// The body to splice.
+    pub site: InlineSite,
+}
+
 /// Resolved metadata for a method eligible for inlining at a specific call site.
 ///
 /// `PartialEq`/`Debug` exist so an [`InlinePlan`] can CARRY the bodies a
@@ -5498,7 +5526,7 @@ pub struct InlineSite {
     ///
     /// Depth is bounded by the resolver (`MAX_INLINE_NEST_DEPTH`); this vector
     /// is empty at the deepest admitted level, which terminates the recursion.
-    pub nested_sites: Vec<(usize, InlineSite)>,
+    pub nested_sites: Vec<NestedInlineSite>,
 }
 
 /// How many levels of splice-inside-a-splice the resolver will plan.
@@ -5583,9 +5611,9 @@ pub(crate) fn intern_inline_invoke_targets(
     }
     // A nested body's calls need the same treatment; the resolver bounds
     // the depth (`MAX_INLINE_NEST_DEPTH`), so this terminates.
-    for (_, nested) in site.nested_sites.iter_mut() {
+    for nested in site.nested_sites.iter_mut() {
         intern_inline_invoke_targets(
-            nested,
+            &mut nested.site,
             owned_strings,
             owned_invoke_infos,
             direct_callee_entries,
@@ -5649,7 +5677,7 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
     // Charged per NON-nested call only. A nested call's cost arrives through
     // `nested_expansion` below, which is the nested body's own estimate; adding
     // both would double-charge the same call site.
-    let nested_pcs: Vec<usize> = site.nested_sites.iter().map(|(pc, _)| *pc).collect();
+    let nested_pcs: Vec<usize> = site.nested_sites.iter().map(|n| n.callee_pc).collect();
     let dispatch_cost = site
         .invoke_targets
         .iter()
@@ -5665,9 +5693,14 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
     let nested_expansion = site
         .nested_sites
         .iter()
-        .map(|(_, nested)| {
-            inline_site_expansion_cost_tiered(nested, site_is_hot)
+        .map(|nested| {
+            // A guarded nested splice also emits the compare, the null check
+            // and the miss-edge jump; 8 is the same order the guarded-virtual
+            // planner charges one level up.
+            let guard_cost = if nested.guard_class_id != 0 { 8 } else { 0 };
+            inline_site_expansion_cost_tiered(&nested.site, site_is_hot)
                 .unwrap_or(MAX_INLINE_EXPANSION_COST_HOT)
+                .saturating_add(guard_cost)
         })
         .fold(0usize, |a, b| a.saturating_add(b));
     let cost = site

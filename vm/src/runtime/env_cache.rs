@@ -485,6 +485,39 @@ pub fn jit_inline_calls() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` — devirtualise a `invokevirtual` /
+/// `invokeinterface` INSIDE a spliced body, behind a receiver class-id guard.
+/// **Default: OFF.**
+///
+/// Nesting on its own reaches only statically bound calls, which is why it
+/// recovered the step-4 regression without beating the baseline: the JUnit
+/// chain's terminal `UNKNOWN.equals(k)` is an `invokevirtual`, and so are
+/// `HttpStatusClass.valueOf`'s five `contains` calls.
+///
+/// The profile this needs already existed and nobody had looked for it there.
+/// Receiver types are recorded by the interpreter against the bci of the method
+/// that is EXECUTING, so a call inside `objectsAreEqual` is profiled under
+/// `objectsAreEqual`'s own [`MethodKey`](crate::jit::profile::MethodKey) at its
+/// own bci — exactly the (method, pc) pair a nested site names. Re-keying the
+/// ENCLOSING method's profile by (caller pc, callee pc), which is what the
+/// netty pages predicted would be needed, would have been the wrong shape: that
+/// profile never had the information.
+///
+/// Same 80% dominance bar as the top-level guarded-virtual planner, and the
+/// same bargain — the hot edge is a spliced body, the cold edge is the ordinary
+/// call. It is only a bargain while the guard holds, which is what the bar is
+/// for. Requires [`jit_inline_nest`]. Read once and cached.
+#[inline]
+pub fn jit_inline_splice_devirt() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_SPLICE_DEVIRT"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
 /// `CRATONVM_JIT_INLINE_CALL_DISPATCH` — let a call inside a spliced body fall
 /// back to the blind `jit_invoke_dispatch` helper. **Default: OFF, and the
 /// default is a MEASURED one.**

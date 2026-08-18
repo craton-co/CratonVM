@@ -1213,6 +1213,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_INLINE_CALLS` | JIT | `CRATONVM_JIT=inline-calls` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_NEST` | JIT | `CRATONVM_JIT=inline-nest` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_CALL_DISPATCH` | JIT | `CRATONVM_JIT=inline-call-dispatch` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` | JIT | `CRATONVM_JIT=inline-splice-devirt` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` | JIT | `CRATONVM_JIT=osr-seed-frame-slots` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_SINGLE_PC` | JIT | `CRATONVM_JIT=osr-single-pc` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` | JIT | `CRATONVM_JIT=osr-strip-all-high-halves` | opt-in | off | behaviour | snapshot | jit |
