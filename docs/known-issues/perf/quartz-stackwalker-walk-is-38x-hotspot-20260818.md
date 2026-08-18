@@ -1,10 +1,12 @@
-# `QuartzEndpointWebIntegrationTests` issues ~24,000 HTTP requests where `--nojit` issues ~22 — a JIT-only spin loop, OOM-killed as a side effect
+# `QuartzEndpointWebIntegrationTests` hangs because `StackWalker.walk` is ~38x HotSpot — Mockito builds one per mock call
 
-**Status: OPEN, reproduced 2026-08-18 on `dev` `24a5d4528` (Azure Linux). Not
-fixed. The root cause is NOT isolated, but it is now correctly framed: this is a
-poll loop that never observes its condition under the JIT, not a memory leak.
-Four hypotheses tested and refuted, three JIT kill switches tried and cleared —
-all recorded below so nobody re-runs them.**
+**Status: ROOT-CAUSED 2026-08-18 on `dev` `24a5d4528` (Azure Linux). Not yet
+fixed. It is not a spin loop, not a leak and not an admission gap: every mock
+invocation makes Mockito build a `LocationImpl`, which runs a
+`StackWalker.walk`, and each walk pays a GC root-snapshot deposit plus a
+conservative stack scan. The walk terminates correctly — it is just far too
+slow, and slower with the JIT on than with `--nojit`, which is why `--nojit`
+finishes the class and the default does not.**
 
 Found re-measuring the four classes on
 retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md. That
@@ -102,6 +104,87 @@ threads — the `WebTestClient`'s own Netty event loops — are `blocked=true` i
 server side keeps executing. Whatever is iterating is on the server, not a
 client retry loop.
 
+## ROOT CAUSE, 2026-08-18: `StackWalker.walk` throughput
+
+The request thread is `RUNNABLE` and making progress, in the same place in two
+watchdog dumps three seconds apart:
+
+```
+org.mockito.internal.debugging.LocationImpl.lambda$getStackFrame$2(LocationImpl.java:96)
+org.mockito.internal.debugging.LocationImpl.stackWalk(LocationImpl.java:134)
+org.mockito.internal.debugging.LocationImpl.getStackFrame(LocationImpl.java:90)
+org.mockito.internal.debugging.LocationImpl.<init>(LocationImpl.java:65)
+org.mockito.internal.debugging.LocationFactory$DefaultLocationFactory.create
+org.mockito.internal.creation.bytebuddy.access.MockMethodInterceptor.doIntercept
+org.mockito.internal.creation.bytebuddy.codegen.Scheduler$MockitoMock.getJobDetail
+org.springframework.boot.quartz.actuate.endpoint.QuartzEndpoint.triggerQuartzJob
+```
+
+Mockito records a `Location` for **every invocation on a mock**, and building
+one runs a `StackWalker.walk`. Meanwhile `main` sits in
+`reactor.core.publisher.Mono.block` inside `WebTestClient.exchange` — waiting
+for a response the server has not finished producing. Nothing is looping;
+the server is grinding.
+
+### Measured, isolated
+
+`probes/StackWalkerTerminationProbe.java` — a walk per iteration at depth 40,
+with arms for `count`, a matching `findFirst`, a `findFirst` that matches
+nothing, and a `skip` past the end of the stack. **All arms terminate correctly
+on all three VMs**, so this is throughput, not a non-terminating stream:
+
+| | HotSpot 25 | CratonVM `--nojit` | CratonVM JIT |
+|---|---:|---:|---:|
+| per `StackWalker.walk` | **61 µs** | 1,461 µs | **2,327 µs** |
+| vs HotSpot | 1x | 24x | **38x** |
+
+**The JIT arm is slower than the interpreter arm.** That inverts the usual
+picture and is exactly why `--nojit` completes this class and the shipped
+default does not — it is not that `--nojit` avoids a bug, it is that `--nojit`
+is *faster* on the operation the workload is bottlenecked on.
+
+### Where the time goes
+
+`perf record -F 1999 -g --call-graph fp` on the isolated probe:
+
+| symbol | share |
+|---|---:|
+| `jit::conservative_roots::native_stack_has_jit_frame` | **17.9%** |
+| `ZObjectStarts::contains` | 9.1% |
+| `Frame::scan_local_objects_inner` | 7.0% |
+| `NativeContextImpl::deposit_root_snapshot_inner` | 6.9% |
+| `VmHeap::is_object_address` | 4.9% |
+| `drop_glue::<Vec<StackTraceEntry>>` | 4.4% |
+| `Frame::scan_locals_conservative` | 4.3% |
+
+**Roughly half the cost is GC root machinery, not stack walking.** Each walk
+pays a root-snapshot deposit and a conservative scan of the frame's locals, and
+the single largest symbol is `native_stack_has_jit_frame` — the raw word scan
+over the stack band above the registered JIT entry chain. That is the same A5
+probe the retired moving-young page measured at an **87% false-positive rate**,
+here showing up as throughput rather than as a fallback reason. It scans more
+when there are compiled frames to scan, which is the mechanism behind the JIT
+arm being the slow one.
+
+The memory growth this page originally reported follows from the same place:
+`Vec<StackTraceEntry>` per walk, at ~24,000 walks, is the 22 GB.
+
+### What would fix it
+
+Not attempted here — it is core GC-root code and wants its own session.
+
+1. **Do not re-derive the JIT-frame answer per native call.** `native_stack_has_jit_frame`
+   is a stack-shape question that cannot change between two native calls made
+   from the same frame at the same depth. The suite already sets
+   `CRATONVM_JIT=rootsnap-cache`, so a cache exists on this path — the first
+   thing to check is whether it engages for this call shape at all, with a
+   counter beside the number rather than by reading the code.
+2. **Make the deposit proportional to the walk, not to the frames.** One walk
+   currently pays per-frame conservative scanning; the walk itself only needs
+   the frames' metadata, not their object roots.
+3. Only then look at `StackWalker` itself; at 61 µs HotSpot is not fast either,
+   and Mockito calling it per mock invocation is the workload's own choice.
+
 ## NAMED, 2026-08-18: `quartzTriggerJobWithUnknownJobKey`, the WebMvc variant only
 
 `@WebEndpointTest` is a parameterized template — 15 methods x 3 web-server
@@ -183,30 +266,6 @@ WebMvc-only failure (Jersey and WebFlux consume the entity), the body-carrying
 POST, and the 404-without-reading-the-body path. Next step: drive that exact
 shape — POST with `Content-Length`, handler returns without reading — against a
 socket and check whether the leftover bytes are drained.
-
-## The shape to look for
-
-A spin/poll loop whose condition is written by one thread and read by another:
-the request runs on `http-nio-auto-N`, the assertion waits on `main`. The
-classic compiled-code failure for that shape is a **non-volatile field read
-hoisted out of the loop** (or otherwise cached in a register), so the waiter
-never observes the writer's store. That is consistent with every observation
-here — JIT-only, collector-independent, no exception, unbounded iterations —
-but it is **not confirmed**, and the loop that spins has not been identified in
-the Java source yet.
-
-Finding which of the 45 tests spins is harder than it looks and one route is
-already closed: `@WebEndpointTest` is a parameterized *template* (15 methods x 3
-web-server variants = 45 tests), and `DiscoverySelectors.selectMethod(fqcn,
-name)` does not address a template — `SbRunnerMethod` returns
-`tests=0 containersFailed=1` for every one of them. The next pass needs either
-a `MethodSource`-aware selector (the parameter type must be in the selector) or
-a JUnit `TestExecutionListener` that prints each test's start and finish, so the
-last one to start can be named.
-
-With the test named, the remaining question is what its server-side handler
-iterates on — and the client being idle in `select` says the answer is on the
-server.
 
 ## Refuted — do not re-run these
 
