@@ -13992,22 +13992,28 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 /// holds the callee and the emitted cascade never re-enters Rust
 /// (`mic_calls=1` across 2 200 000 dispatches, `CRATONVM_DBG=mic-prof`). The
 /// only thing keeping a lambda out of that slot was an argument shuffle — the
-/// call site has `(proxy, samArgs…)` and a non-capturing lambda's impl wants
-/// `(samArgs…)` — so `lambda_adapter` emits a thunk that performs the shuffle
-/// and tail-jumps, and the slot holds THAT.
+/// call site has `(proxy, samArgs…)` and the impl wants `(captures…, samArgs…)`
+/// — so `lambda_adapter` emits a thunk that performs the shuffle, reads any
+/// captures out of the proxy, and tail-jumps; the slot holds THAT.
 ///
-/// Installed only for shapes the thunk can serve without touching memory:
+/// Two questions are asked here, and the rest belong to the emitter:
 ///
-/// * **no captures** — reading a captured field from a hand-emitted thunk would
-///   mean reproducing the compact/legacy body-layout branch (`GC_FLAG_COMPACT`)
-///   and every per-type width the `getfield` arms handle. A capturing lambda
-///   keeps the Rust arm.
 /// * **no `checkcast`** — a generic call site's cast is a class-hierarchy
 ///   question, not a register move.
-/// * **a static impl**, which "no captures" already implies for javac's output;
-///   asserted rather than assumed because the thunk drops the receiver outright.
-/// * **an arity the register ABI can carry**, receiver and context included —
-///   `lambda_adapter_entry` refuses the rest.
+/// * **a static impl**, asserted rather than assumed because the thunk drops the
+///   receiver outright and nothing downstream would notice if it mattered.
+///
+/// Whether the captures' types, the proxy's layout, the arity, and the
+/// collector's read-barrier state permit an emission is `lambda_adapter_entry`'s
+/// to decide — it is what would have to emit them. A `None` from it leaves this
+/// site on the Rust arm for good, because the install is claimed before the
+/// attempt rather than after it. Every refusal but one is a property of the
+/// site, so that costs nothing; the exception is a reference capture refused
+/// because ZGC's read barrier happened to be armed at this instant, which gives
+/// up a thunk that a later attempt could have had. Claiming after the attempt
+/// would trade that for re-asking — a lock and a layout lookup — on every
+/// dispatch a refused site ever serves, which is the shape of the 202 000
+/// re-installs `LambdaJitSite::adapter_installed` exists to prevent.
 ///
 /// Both slots are written, because the emitted cascade prefers the PIC when the
 /// codegen allocated one and never consults the MIC in that case.
@@ -14029,16 +14035,23 @@ unsafe fn install_lambda_inline_cache(
     if !crate::runtime::env_cache::jit_lambda_adapter() {
         return;
     }
-    if site.num_captures() != 0 || site.has_checkcasts() || !site.is_static_impl() {
+    if site.num_captures() != 0 && !crate::runtime::env_cache::jit_lambda_capture_adapter() {
+        return;
+    }
+    if site.has_checkcasts() || !site.is_static_impl() {
         return;
     }
     if !site.claim_adapter_install() {
         return;
     }
+    // `total_args` is captures plus SAM arguments; the emitter wants them apart,
+    // because only the SAM arguments arrive in registers.
+    let sam_args = site.total_args() - site.num_captures();
     let Some(entry) = cratonvm_jit::lambda_adapter::lambda_adapter_entry(
         receiver_class_id.as_u32(),
         code.arc(),
-        site.total_args(),
+        site.capture_descs(),
+        sam_args,
     ) else {
         return;
     };
@@ -14058,12 +14071,12 @@ unsafe fn install_lambda_inline_cache(
         installed = true;
     }
     if installed {
-        crate::runtime::interpreter::lambda_site_bump_adapter();
+        crate::runtime::interpreter::lambda_site_bump_adapter(site.num_captures());
         if mic_prof::enabled() {
             eprintln!(
                 "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
-                 sam_args={} entry={entry:#x} impl={}",
-                site.total_args(),
+                 captures={} sam_args={sam_args} entry={entry:#x} impl={}",
+                site.num_captures(),
                 class_name,
             );
         }
