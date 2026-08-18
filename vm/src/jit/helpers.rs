@@ -6224,9 +6224,186 @@ unsafe fn jit_field_cell_ptr(
 pub static JIT_GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `CRATONVM_DBG_GETFIELD_RECEIVERS=1` — classify every helper receiver into
+/// [`JIT_GETFIELD_RECEIVER_SHAPE`]. Off by default: the classification re-reads
+/// the bounds table and the object header on a path taken tens of millions of
+/// times, so it must not be in the measured configuration.
+fn getfield_receiver_census_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
+    })
+}
+
 /// Snapshot of [`JIT_GETFIELD_HELPER_CALLS`] for the shutdown diagnostic.
 pub fn jit_getfield_helper_calls() -> u64 {
     JIT_GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Why each helper call arrived: the receiver's own shape, counted at
+/// EXECUTION.
+///
+/// Every previous attempt on this page counted EMISSIONS — which arms emitted a
+/// `CALL`, how many sites declined to inline — and emission counts cannot
+/// answer "which branch runs". Four hypotheses died that way. These four
+/// counters are on the one path every fall-through must cross, so their sum is
+/// exactly [`JIT_GETFIELD_HELPER_CALLS`] and no site can hide from them.
+///
+/// The clauses are the inline guards, in the order both backends emit them:
+///
+///   0. `implausible` — null, unaligned, or not a plausible heap pointer.
+///      Both backends' clause 1/2.
+///   1. `out-of-bounds` — plausible, but outside every published
+///      `JIT_REGION_BOUNDS` region. Both backends' clause 3, and the clause the
+///      page's title blamed. On a backend that publishes nothing this is every
+///      receiver; the page already showed it is NOT what separates the arms.
+///   2. `legacy-layout` — in bounds, but `GC_FLAG_COMPACT` is CLEAR, so the
+///      object is a uniform 16-byte-cell instance. **The single-pass arm reads
+///      this inline; the IR arm sends it to the helper.** That asymmetry is
+///      documented in `ir_lower::emit_inline_compact_getfield` as "the one
+///      simplification against the single-pass version" and is invisible to
+///      every collector A/B, because per-object compactness is not a collector
+///      property.
+///   3. `compact-eligible` — passed all three, i.e. a receiver the inline path
+///      *should* have read without calling anyone. A non-zero count here means
+///      a guard is genuinely misbehaving; a zero means every call has a reason.
+pub static JIT_GETFIELD_RECEIVER_SHAPE: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`JIT_GETFIELD_RECEIVER_SHAPE`], index-parallel.
+pub const JIT_GETFIELD_RECEIVER_SHAPE_NAMES: [&str; 4] = [
+    "implausible-or-null",
+    "outside-published-bounds",
+    "legacy-layout-receiver",
+    "compact-eligible",
+];
+
+/// `(name, count)` for every receiver shape seen at least once.
+pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
+    JIT_GETFIELD_RECEIVER_SHAPE_NAMES
+        .iter()
+        .zip(JIT_GETFIELD_RECEIVER_SHAPE.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .collect()
+}
+
+/// Classify the receiver of one helper call into
+/// [`JIT_GETFIELD_RECEIVER_SHAPE`].
+///
+/// Deliberately re-derives each clause from the same words the emitted guards
+/// compare against, rather than from anything the helper has already computed:
+/// the point is to answer what the INLINE code decided, and the helper's own
+/// validation is a different (stricter) test.
+///
+/// SAFETY: only dereferences `obj_ptr` after `plausible_heap_pointer` and a
+/// published-bounds containment test have both passed, which is the same
+/// precondition the emitted inline code satisfies before its own header read.
+#[inline(never)]
+#[cold]
+unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
+    use std::sync::atomic::Ordering;
+    let bump = |i: usize| {
+        JIT_GETFIELD_RECEIVER_SHAPE[i].fetch_add(1, Ordering::Relaxed);
+    };
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        bump(0);
+        return;
+    }
+    let base = cratonvm_gc::jit_region_bounds_addr();
+    let word = |i: usize| -> usize {
+        // SAFETY: `jit_region_bounds_addr` returns the address of the
+        // process-global six-`AtomicUsize` `JIT_REGION_BOUNDS` static, which
+        // lives for the program's lifetime.
+        let w = &*((base + i * 8) as *const std::sync::atomic::AtomicUsize);
+        w.load(Ordering::Acquire)
+    };
+    let addr = obj_ptr as usize;
+    let contained = (0..3).any(|r| {
+        let (b, e) = (word(r * 2), word(r * 2 + 1));
+        // An all-zero pair matches nothing, which is the documented state for a
+        // backend that never publishes.
+        b != 0 && addr >= b && addr < e
+    });
+    if !contained {
+        bump(1);
+        return;
+    }
+    let flags = *((addr + cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8);
+    if flags & cratonvm_types::GC_FLAG_COMPACT == 0 {
+        bump(2);
+        note_legacy_receiver_class(addr);
+    } else {
+        bump(3);
+    }
+}
+
+/// Per-class tally of the receivers that reached the helper with
+/// `GC_FLAG_COMPACT` clear.
+///
+/// "The receivers are legacy" is a shape, not a diagnosis — the actionable
+/// question is WHICH class allocates legacy on a path this hot, because
+/// `CRATONVM_DBG_COMPACT_LEGACY`'s allocation-side census answers a different
+/// one (it names classes with no matching layout, and a class can be absent
+/// there and still be the receiver here).
+///
+/// Sixteen slots, linear scan, first-come. Small and fixed on purpose: this
+/// runs under the same off-by-default flag as its caller and must not allocate
+/// or lock on a path taken tens of millions of times.
+static LEGACY_RECEIVER_CLASSES: [(std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU64);
+    16] = [
+    const {
+        (
+            std::sync::atomic::AtomicU32::new(u32::MAX),
+            std::sync::atomic::AtomicU64::new(0),
+        )
+    };
+    16
+];
+
+/// Record one legacy receiver against its class id. `addr` must already have
+/// passed the plausibility and containment tests.
+unsafe fn note_legacy_receiver_class(addr: usize) {
+    use std::sync::atomic::Ordering;
+    let header = &*(addr as *const cratonvm_types::ObjectHeader);
+    let cid = header.class_id.as_u32();
+    for (slot_cid, count) in LEGACY_RECEIVER_CLASSES.iter() {
+        let cur = slot_cid.load(Ordering::Relaxed);
+        if cur == cid {
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if cur == u32::MAX
+            && slot_cid
+                .compare_exchange(u32::MAX, cid, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// `(class name, class id, count)` for every class seen as a legacy receiver.
+pub fn jit_getfield_legacy_receiver_classes() -> Vec<(String, u32, u64)> {
+    use std::sync::atomic::Ordering;
+    LEGACY_RECEIVER_CLASSES
+        .iter()
+        .filter_map(|(cid, count)| {
+            let cid = cid.load(Ordering::Relaxed);
+            if cid == u32::MAX {
+                return None;
+            }
+            let n = count.load(Ordering::Relaxed);
+            let name = cratonvm_gc::gc::resolve_class_info(cid)
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            Some((name, cid, n))
+        })
+        .collect()
 }
 
 /// First few helper calls, dumped with the receiver AND the live bounds table.
@@ -6264,6 +6441,9 @@ fn dump_getfield_guard_failure(obj_ptr: i64) {
 
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
     JIT_GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if getfield_receiver_census_enabled() {
+        note_getfield_receiver_shape(obj_ptr);
+    }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
         dump_getfield_guard_failure(obj_ptr);
     }

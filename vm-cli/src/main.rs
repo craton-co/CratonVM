@@ -155,6 +155,30 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // The RECEIVER-SHAPE census: which guard clause each helper call
+        // actually failed, counted at EXECUTION on the one path every
+        // fall-through crosses. The two lines above count EMISSIONS, which is
+        // the question that cost this page four dead hypotheses. Needs
+        // `CRATONVM_DBG_GETFIELD_RECEIVERS=1`; all-zero means it was not on.
+        eprintln!(
+            "[cratonvm] getfield receiver shapes: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_receiver_shapes()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let legacy_classes = cratonvm_vm::jit::helpers::jit_getfield_legacy_receiver_classes();
+        if !legacy_classes.is_empty() {
+            eprintln!(
+                "[cratonvm] getfield legacy receivers by class: {}",
+                legacy_classes
+                    .iter()
+                    .map(|(n, id, c)| format!("{n}(id={id})={c}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
         eprintln!(
             "[cratonvm] IR-tier inline-getfield refusals: {}",
             cratonvm_jit::metrics::ir_getfield_declines()
