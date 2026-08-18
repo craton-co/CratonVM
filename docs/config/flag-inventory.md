@@ -721,6 +721,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_FIELDADDR` | DBG | `CRATONVM_DBG=fieldaddr` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_FIELD_GET` | DBG | `CRATONVM_DBG=field-get` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_FIELD_SITE` | DBG | `CRATONVM_DBG=field-site` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_G1_LIVE_MEMO` | DBG | `CRATONVM_DBG=g1-live-memo` | opt-in | off | diag | snapshot | gc |
 | `CRATONVM_DBG_FIELD_WATCH` | DBG | `CRATONVM_DBG=field-watch` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_FORCE_MOVING` | DBG | `CRATONVM_DBG=force-moving` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_FSP` | DBG | `CRATONVM_DBG=fsp` | opt-in | off | diag | snapshot | types |

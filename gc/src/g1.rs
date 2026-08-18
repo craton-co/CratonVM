@@ -11746,7 +11746,7 @@ pub fn select_evacuation_candidates(
 /// was going to be taken anyway. `CRATONVM_G1_NO_LIVE_REGION_MEMO=1` withdraws
 /// the memo entirely so one binary can be A/B'd against its own pre-change
 /// behaviour.
-mod live_region_memo {
+pub mod live_region_memo {
     /// Entries per thread. Small and fixed: a stack scan walks one or two
     /// regions (the current Eden, plus whatever survivors it points into), and
     /// a linear walk of four is cheaper than any hashing.
@@ -11789,6 +11789,51 @@ mod live_region_memo {
         })
     }
 
+    /// `CRATONVM_DBG_G1_LIVE_MEMO=1` — hit/miss, printed at VM shutdown.
+    ///
+    /// A `hit` here is one `regions.lock()` acquire/release that did not
+    /// happen. It exists because the alternative instrument does not work on
+    /// this hardware and barely works on this host: the shared Azure box has no
+    /// PMU (`perf stat -e instructions` answers `<not supported>`), and its load
+    /// average swings between 6 and 33 within an hour, which is far more than
+    /// the effect. A count is neither. Read this before quoting any timing
+    /// number for the memo — an inert gate shows up as `hit=0`, which is a fact
+    /// about the build rather than about the host.
+    pub(crate) mod stats {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+
+        pub(super) static HITS: AtomicU64 = AtomicU64::new(0);
+        pub(super) static MISSES: AtomicU64 = AtomicU64::new(0);
+
+        pub(super) fn on() -> bool {
+            static ON: OnceLock<bool> = OnceLock::new();
+            *ON.get_or_init(|| {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_G1_LIVE_MEMO").is_some()
+            })
+        }
+
+        /// Final tally. Called from the VM's shutdown reporting alongside the
+        /// site-cache dump.
+        pub fn dump() {
+            if !on() {
+                return;
+            }
+            let h = HITS.load(Ordering::Relaxed);
+            let m = MISSES.load(Ordering::Relaxed);
+            let total = h + m;
+            let pct = if total == 0 {
+                0.0
+            } else {
+                // Widening: u64 counts to f64 for a percentage.
+                (h as f64) * 100.0 / (total as f64)
+            };
+            eprintln!(
+                "[g1-live-memo] FINAL hit={h} miss={m} hit_rate={pct:.1}%                  (a hit is one regions.lock() that did not happen)"
+            );
+        }
+    }
+
     /// Is `addr` inside a span this thread has already proved live, in a region
     /// incarnation `epoch` says is still current?
     #[inline]
@@ -11796,7 +11841,7 @@ mod live_region_memo {
         if !enabled() {
             return false;
         }
-        ENTRIES.with(|c| {
+        let answered = ENTRIES.with(|c| {
             let entries = c.get();
             for e in entries.iter() {
                 if e.region_idx == region_idx
@@ -11809,7 +11854,12 @@ mod live_region_memo {
                 }
             }
             false
-        })
+        });
+        if stats::on() {
+            let counter = if answered { &stats::HITS } else { &stats::MISSES };
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        answered
     }
 
     /// Record the span the authoritative path just accepted from.

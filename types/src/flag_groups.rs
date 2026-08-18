@@ -459,6 +459,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-ldc", on_key: Some("CRATONVM_DBG_JIT_LDC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loop-work", on_key: Some("CRATONVM_DBG_LOOP_WORK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-site", on_key: Some("CRATONVM_DBG_FIELD_SITE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "g1-live-memo", on_key: Some("CRATONVM_DBG_G1_LIVE_MEMO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-method-stats", on_key: Some("CRATONVM_DBG_JIT_METHOD_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },

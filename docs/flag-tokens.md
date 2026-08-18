@@ -266,6 +266,7 @@ export inherited from a parent shell.
 | `jit-ldc` | `CRATONVM_DBG_JIT_LDC` |
 | `loop-work` | `CRATONVM_DBG_LOOP_WORK` |
 | `field-site` | `CRATONVM_DBG_FIELD_SITE` |
+| `g1-live-memo` | `CRATONVM_DBG_G1_LIVE_MEMO` |
 | `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
