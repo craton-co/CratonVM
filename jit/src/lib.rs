@@ -15001,6 +15001,124 @@ fn precise_virtual_invokes_enabled() -> bool {
     })
 }
 
+/// Does this method contain an **inline trapping bytecode inside a protected
+/// range** that the optimizing tier lowers to a *deopt it cannot resume*, with
+/// a side effect in the same range that a whole-method replay would repeat?
+///
+/// Returns the offending `(pc, opcode)`, or `None` when the optimizing tier may
+/// take the method.
+///
+/// ## What goes wrong without this
+///
+/// The IR tier lowers an array access, an `arraylength`, a field access and a
+/// division to **deopt guards** (`emit_array_null_bounds_guards`,
+/// `emit_deopt_if_zero`), on the stated promise that "the interpreter
+/// re-executes the opcode and throws the exact NPE / AIOOBE with full
+/// semantics (including any in-method handler)". Re-executing needs a precise
+/// resume — and `can_deopt_resume` is only ever set on the IR path in the
+/// narrow scalar-replacement case (`ir_lower.rs`, guarded by
+/// `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`), so on a production
+/// artifact it is **false**. The interpreter then has to fall back to replaying
+/// the whole method, refuses because that would re-run the side effects already
+/// committed, and raises a hard `InternalError`.
+///
+/// The single-pass backend has no such problem: its bounds check calls
+/// `jit_throw_aioobe` and returns the sentinel through the epilogue, and the
+/// interpreter routes the exception through the method's own exception table
+/// without resuming anything. So declining here is not "stay interpreted" — it
+/// is "use the backend that handles this shape", at single-pass code quality.
+///
+/// ## Why it is this narrow
+///
+/// `docs/internal/fixed-bugs/unresumable-unconditional-trap-mvmap-FIXED-20260802.md`
+/// warns in as many words: *"Do not apply the publish-side rule blind... the
+/// naive form would refuse every trap-carrying artifact, including the many
+/// whose re-run-from-entry fallback works fine."* Two narrowing terms keep that
+/// from happening:
+///
+/// 1. **only the deopt-guarded opcodes.** Invokes, `new`, `ldc`, `checkcast`
+///    and the monitor ops all leave through the `i64::MIN` sentinel and the
+///    exception-routing path, which needs no resume. They are not listed.
+/// 2. **only when the range also commits a side effect.** A read-only
+///    `try { return a[i]; } catch (...)` replays harmlessly, so the refusal
+///    would buy nothing and cost the compile. `advance()` — the reported
+///    witness — stores two fields on every iteration *before* the trapping
+///    `baload`, which is exactly what makes its replay observably wrong.
+///
+/// The side-effect scan is deliberately whole-range rather than
+/// "before the trap in pc order": the witness is a **loop**, where a store at a
+/// lower pc executes on the iteration *after* the one that traps. Pc order is
+/// not execution order, and the cheap conservative answer is the correct one.
+fn ir_unresumable_protected_trap(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> Option<(usize, u8)> {
+    if exception_table.is_empty() {
+        return None;
+    }
+    let covered = |pc: usize| {
+        exception_table
+            .iter()
+            .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
+    };
+    // The opcodes whose IR lowering is a deopt guard. Kept in step with
+    // `ir_lower.rs`: array element access and `arraylength` go through
+    // `emit_array_null_bounds_guards` / `emit_deopt_if_zero`, `getfield` /
+    // `putfield` through the inline null check, and the integer divisions
+    // through the div-by-zero guard.
+    let deopt_guarded = |op: u8| {
+        matches!(
+            op,
+            0x2e..=0x35 // array loads
+                | 0x4f..=0x56 // array stores
+                | 0x6c | 0x6d | 0x70 | 0x71 // idiv / irem / ldiv / lrem
+                | 0xb4 | 0xb5 // getfield / putfield
+                | 0xbe // arraylength
+        )
+    };
+    // What makes a replay observably wrong. Stores and calls only — a pure
+    // computation can be re-run.
+    let side_effecting = |op: u8| {
+        matches!(
+            op,
+            0x4f..=0x56 // array stores
+                | 0xb3 | 0xb5 // putstatic / putfield
+                | 0xb6..=0xba // the invokes
+                | 0xc2 | 0xc3 // monitorenter / monitorexit
+        )
+    };
+
+    let mut trap: Option<(usize, u8)> = None;
+    let mut has_side_effect = false;
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        if covered(pc) {
+            if trap.is_none() && deopt_guarded(op) {
+                trap = Some((pc, op));
+            }
+            if side_effecting(op) {
+                has_side_effect = true;
+            }
+        }
+        // Same walk `first_unsupported_precise_frame_site` uses; a length of 0
+        // or one that runs off the end means the scan lost sync, and the
+        // conservative answer to "I can no longer read this code" is to
+        // decline the tier rather than guess.
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return trap.or(Some((pc, op)));
+        }
+        pc += len;
+    }
+    if has_side_effect {
+        trap
+    } else {
+        None
+    }
+}
+
 /// Thin `bool` wrapper over [`first_unsupported_precise_frame_site`], kept for
 /// the call sites that only need the verdict.
 #[cfg(target_arch = "x86_64")]
@@ -15626,6 +15744,14 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
+        } else if let Some((pc, op)) =
+            ir_unresumable_protected_trap(code, code_len, &cached.exception_table)
+        {
+            format!(
+                "an inline trap this tier deopts on (pc={pc}, opcode={op:#04x}) sits in a \
+                 protected range that also commits a side effect; the deopt could not be \
+                 resumed, so the single-pass backend takes it"
+            )
         } else if let Some(k) = single_pass_only_lowering_for(code, code_len, cached) {
             format!(
                 "the single-pass backend has {} here and the IR tier has no equivalent",
@@ -15784,6 +15910,11 @@ fn try_compile_inner(
         // that landed — and as an escape hatch if a workload ever regresses.
         && !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
         && !precise_exception_frames
+        // An inline trap inside a protected range that this tier lowers to an
+        // unresumable deopt — see `ir_unresumable_protected_trap`. Falls
+        // through to the single-pass backend, which throws and routes through
+        // the exception table instead of deopting.
+        && ir_unresumable_protected_trap(code, code_len, &cached.exception_table).is_none()
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it
@@ -20451,6 +20582,111 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The optimizing tier must decline exactly the shape that crashed
+    /// `SparseRealVectorTest`, and nothing broader.
+    ///
+    /// Both directions matter and they fail differently. Refusing too much is
+    /// silent — the method drops to single-pass and only a benchmark notices,
+    /// which is why the measured reach is pinned here as well as the witness.
+    /// Refusing too little is a hard `InternalError` on the first trap.
+    #[test]
+    fn ir_declines_an_unresumable_protected_trap_and_only_that() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        fn range(start: u16, end: u16) -> Vec<ExceptionTableEntry> {
+            vec![ExceptionTableEntry {
+                start_pc: start,
+                end_pc: end,
+                handler_pc: end,
+                catch_type: 1,
+            }]
+        }
+
+        // `OpenIntToDoubleHashMap$Iterator.advance()` in miniature: a putfield
+        // (side effect) and a baload (deopt-guarded trap) inside one range.
+        //   0: aload_0        (0x2a)
+        //   1: aload_0        (0x2a)
+        //   2: getfield  #1   (0xb4 0x00 0x01)
+        //   5: putfield  #2   (0xb5 0x00 0x02)
+        //   8: aload_0        (0x2a)
+        //   9: iconst_0       (0x03)
+        //  10: baload         (0x33)
+        //  11: return         (0xb1)
+        let advance_like = [
+            0x2a, 0x2a, 0xb4, 0x00, 0x01, 0xb5, 0x00, 0x02, 0x2a, 0x03, 0x33, 0xb1,
+        ];
+        let site = ir_unresumable_protected_trap(&advance_like, advance_like.len(), &range(0, 11));
+        assert!(site.is_some(), "the witness shape must be declined");
+
+        // No exception table at all: the trap propagates out, nothing to route.
+        assert_eq!(
+            ir_unresumable_protected_trap(&advance_like, advance_like.len(), &[]),
+            None,
+            "an unprotected trap is not this gate's business"
+        );
+
+        // The trap is OUTSIDE the protected range.
+        assert_eq!(
+            ir_unresumable_protected_trap(&advance_like, advance_like.len(), &range(0, 2)),
+            None,
+            "a range that does not cover the trap must not be declined"
+        );
+
+        // Read-only range: a baload with nothing committed before it. Replaying
+        // from entry is harmless here, so declining would cost a compile and
+        // buy nothing — the narrowing term the H2 precedent asks for.
+        //   0: aload_0, 1: iconst_0, 2: baload, 3: ireturn
+        let read_only = [0x2a, 0x03, 0x33, 0xac];
+        assert_eq!(
+            ir_unresumable_protected_trap(&read_only, read_only.len(), &range(0, 3)),
+            None,
+            "a side-effect-free protected trap must still compile"
+        );
+
+        // A protected range whose only throwing site is an invoke: those exit
+        // through the sentinel + exception routing, which needs no resume.
+        //   0: aload_0, 1: invokevirtual #3, 4: return
+        let invoke_only = [0x2a, 0xb6, 0x00, 0x03, 0xb1];
+        assert_eq!(
+            ir_unresumable_protected_trap(&invoke_only, invoke_only.len(), &range(0, 4)),
+            None,
+            "an invoke is not a deopt-guarded inline trap"
+        );
+
+        // Side effect present but no deopt-guarded trap: putstatic only.
+        //   0: iconst_0, 1: putstatic #4, 4: return
+        let store_only = [0x03, 0xb3, 0x00, 0x04, 0xb1];
+        assert_eq!(
+            ir_unresumable_protected_trap(&store_only, store_only.len(), &range(0, 4)),
+            None,
+            "a side effect with no trap has nothing to deopt on"
+        );
+
+        // Every opcode family the IR tier lowers to a deopt guard must be
+        // recognised — this is the list that has to stay in step with
+        // `ir_lower.rs`, and the one that silently rots if nobody pins it.
+        for (op, label) in [
+            (0x2eu8, "iaload"),
+            (0x33u8, "baload"),
+            (0x4fu8, "iastore"),
+            (0x54u8, "bastore"),
+            (0x6cu8, "idiv"),
+            (0x70u8, "irem"),
+            (0xb4u8, "getfield"),
+            (0xbeu8, "arraylength"),
+        ] {
+            // `putstatic` supplies the side effect so the trap is the variable
+            // under test; two-byte operands for the field ops.
+            let code = [0x03, 0xb3, 0x00, 0x04, op, 0x00, 0x01, 0xb1];
+            let len = if matches!(op, 0xb4 | 0xb5) { 8 } else { 6 };
+            assert!(
+                ir_unresumable_protected_trap(&code[..len], len, &range(0, (len - 1) as u16))
+                    .is_some(),
+                "{label} must be recognised as a deopt-guarded trap"
+            );
+        }
+    }
 
     /// RBC.6's admission list must match what the lowerings actually publish.
     ///
