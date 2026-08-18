@@ -943,7 +943,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None },
-    E { group: Group::JIT, token: "unreg-memo-range-invalidate", on_key: Some("CRATONVM_JIT_UNREG_MEMO_RANGE_INVALIDATE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "licm", on_key: Some("CRATONVM_JIT_LICM"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "local-liveness", on_key: None, off_key: Some("CRATONVM_NO_LOCAL_LIVENESS"), off_word: None },
     E { group: Group::JIT, token: "local-regs", on_key: Some("CRATONVM_JIT_LOCAL_REGS"), off_key: None, off_word: None },

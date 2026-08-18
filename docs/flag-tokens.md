@@ -671,7 +671,6 @@ export inherited from a parent shell.
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
 | `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |
-| `unreg-memo-range-invalidate` | `CRATONVM_JIT_UNREG_MEMO_RANGE_INVALIDATE` |
 | `field-site-cache-loader` | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` |
 | `field-site-slots` | `CRATONVM_JIT_FIELD_SITE_SLOTS` |
 | `method-site-cache` | `CRATONVM_JIT_METHOD_SITE_CACHE` |
