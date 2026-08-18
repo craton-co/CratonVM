@@ -381,6 +381,7 @@ fn test_helpers() -> JitRuntimeHelpers {
         multianewarray_2d: sentinel,
         arraylength: sentinel,
         getfield: stub_getfield as *const () as usize, // Cast: address arithmetic
+        getfield_trusted_ref: sentinel,
         putfield_int: stub_putfield_int as *const () as usize, // Cast: address arithmetic
         putfield_long: stub_putfield_long as *const () as usize, // Cast: address arithmetic
         putfield_float: stub_putfield_float as *const () as usize, // Cast: address arithmetic

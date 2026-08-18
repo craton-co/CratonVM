@@ -6672,7 +6672,73 @@ fn dump_getfield_guard_failure(obj_ptr: i64) {
     );
 }
 
+/// `getfield` for a receiver the compiler has already PROVEN is an oop.
+///
+/// Byte-identical to [`jit_getfield`] except that it does not run the
+/// `is_object_address` heap-membership walk. Everything else — the pending-NPE
+/// contract, the slot bounds check, the compact/legacy layout split, the read
+/// and the reference decode — is the same code, so this carries no new
+/// colouring or layout exposure. It is purely "skip one validation".
+///
+/// # Why skipping it is sound
+///
+/// The walk defends against a stale or garbage receiver arriving from a
+/// miscompiled frame. The caller emits this only where the IR's type lattice
+/// types the base node `IrType::Ref`, which is the SAME proof the primitive
+/// trusted-oop arm already relies on — and that arm does a raw inline load off
+/// the receiver, which is a strictly stronger use of the same trust than
+/// handing it to this function. `plausible_heap_pointer` still runs, so null
+/// and unaligned/out-of-range bits are still refused.
+///
+/// # Why it exists
+///
+/// On ZGC the walk is the largest single cost of a field-dense compiled run:
+/// `ZObjectStarts::contains` 11.1% + `ZgcRealHeap::is_object_address` 9.5%,
+/// measured on `dev` @800d17cc8. `contains` is already a tight bitmap probe —
+/// the cost is one cache-missing random probe per field access, ~49 M of them,
+/// so the fix is to not ask rather than to ask faster.
+///
+/// # Safety
+/// Same contract as [`jit_getfield`], minus the membership check: `vm_ptr` must
+/// be a valid `SharedVm`, and `obj_ptr` must be null or a live heap object.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_getfield_trusted_ref(
+    vm_ptr: i64,
+    obj_ptr: i64,
+    field_index: i64,
+) -> i64 {
+    JIT_GETFIELD_TRUSTED_REF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    jit_getfield_impl(vm_ptr, obj_ptr, field_index, false)
+}
+
+/// Calls served by [`jit_getfield_trusted_ref`] — the engagement counter for
+/// the trusted-reference arm, printed beside the `jit_getfield` total so
+/// "adopted" and "helped" stay separable.
+pub static JIT_GETFIELD_TRUSTED_REF_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_GETFIELD_TRUSTED_REF_CALLS`].
+pub fn jit_getfield_trusted_ref_calls() -> u64 {
+    JIT_GETFIELD_TRUSTED_REF_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
+    jit_getfield_impl(vm_ptr, obj_ptr, field_index, true)
+}
+
+/// Shared body of [`jit_getfield`] and [`jit_getfield_trusted_ref`].
+///
+/// `validate_membership` is the ONLY difference between them. Kept as one
+/// function so the two entry points cannot drift in the read, the layout
+/// split or the NPE contract — the drift this repository has been bitten by
+/// every time a "fast" copy of a helper was maintained separately.
+#[inline]
+unsafe fn jit_getfield_impl(
+    vm_ptr: i64,
+    obj_ptr: i64,
+    field_index: i64,
+    validate_membership: bool,
+) -> i64 {
     // ENGAGEMENT COUNTER for the guarded inline `getfield` fast path.
     //
     // Reaching this function AT ALL means the inline guard
@@ -6723,10 +6789,11 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         return i64::MIN;
     }
     let vm = &*(vm_ptr as *const SharedVm);
-    if vm.mem.heap.is_object_address(obj_ptr as usize).is_none() {
+    if validate_membership && vm.mem.heap.is_object_address(obj_ptr as usize).is_none() {
         set_jit_pending_npe();
         return i64::MIN;
     }
+    let _ = &vm;
     // B2 fix (audit `vm-runtime.md`): bounds-check the field slot against the
     // receiver's declared `num_slots` BEFORE the raw read, mirroring the
     // symmetric `jit_putfield_slot_in_bounds` guard on every `jit_putfield_*`
@@ -18936,6 +19003,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         multianewarray_2d: jit_multianewarray_2d as *const () as usize,
         arraylength: jit_arraylength as *const () as usize,
         getfield: jit_getfield as *const () as usize,
+        getfield_trusted_ref: jit_getfield_trusted_ref as *const () as usize,
         putfield_int: jit_putfield_int as *const () as usize,
         putfield_long: jit_putfield_long as *const () as usize,
         putfield_float: jit_putfield_float as *const () as usize,

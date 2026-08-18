@@ -131,6 +131,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         // with itself. These two implement exactly the layout `make_object`
         // writes, so the comparison is now real.
         getfield: legacy_getfield as *const () as usize,
+        getfield_trusted_ref: legacy_getfield as *const () as usize,
         putfield_int: legacy_putfield_int as *const () as usize,
         putfield_long: s,
         putfield_float: s,

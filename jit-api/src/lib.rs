@@ -758,6 +758,21 @@ pub struct JitRuntimeHelpers {
     pub multianewarray_2d: usize,
     pub arraylength: usize,
     pub getfield: usize,
+    /// `getfield` for a receiver the compiler has ALREADY proven is an oop.
+    ///
+    /// Identical to [`Self::getfield`] except that it skips the
+    /// `is_object_address` heap-membership walk. That walk is validation, not
+    /// correctness: it defends against a stale/garbage receiver from a
+    /// miscompiled frame. Where the IR's own type lattice types the base node
+    /// `IrType::Ref` — the same proof the primitive trusted-oop arm already
+    /// relies on, and which also dereferences the receiver — the walk is
+    /// redundant, and on ZGC it is the single largest cost in a field-dense
+    /// run (`ZObjectStarts::contains` 11.1% + `is_object_address` 9.5%, a
+    /// random bitmap probe per access that misses cache).
+    ///
+    /// Nullable: a table that leaves it 0 simply keeps using
+    /// [`Self::getfield`], so no emitter is obliged to adopt it.
+    pub getfield_trusted_ref: usize,
     pub putfield_int: usize,
     pub putfield_long: usize,
     pub putfield_float: usize,

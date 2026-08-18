@@ -738,6 +738,7 @@ helper_field_table! {
     (multianewarray_2d,              Function, true),
     (arraylength,                    Function, true),
     (getfield,                       Function, true),
+    (getfield_trusted_ref,           Function, false),
     (putfield_int,                   Function, true),
     (putfield_long,                  Function, true),
     (putfield_float,                 Function, true),
