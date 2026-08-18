@@ -6301,6 +6301,72 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
         .collect()
 }
 
+/// Among the calls that failed the CONTAINMENT clause, how many read a
+/// REFERENCE field and how many a primitive. Index 0 = primitive, 1 = reference.
+///
+/// This is the fork that decides whether anything further is reachable on ZGC
+/// and G1. Those two collectors publish no region bounds by design — the empty
+/// `JIT_REGION_BOUNDS` is the interlock that keeps inline reference STORES
+/// unreachable there (`audits/g1-audit.md` §8.1) — so containment can only be
+/// bypassed by a receiver check that does not need it. The IR tier now has one
+/// (`emit_trusted_oop_receiver_check`, primitives only), and the single-pass
+/// arm has always had one.
+///
+///   * a REFERENCE-heavy remainder means the rest is blocked on the ZGC JIT
+///     load barrier (`feature-designs/zgc-jit-load-barrier.md`), because a
+///     compact reference slot there may hold `Z_COLORED_TAG | colour | offset`
+///     and inlining its load is the use-after-free that design exists to stop.
+///     Nothing to fix in the getfield arms.
+///   * a PRIMITIVE-heavy remainder means some arm is failing to take a shortcut
+///     it is already entitled to, and that is an ordinary bug.
+pub static JIT_GETFIELD_OOB_FIELD_KIND: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// `(name, count)` for [`JIT_GETFIELD_OOB_FIELD_KIND`].
+pub fn jit_getfield_oob_field_kinds() -> Vec<(&'static str, u64)> {
+    use std::sync::atomic::Ordering;
+    vec![
+        (
+            "primitive",
+            JIT_GETFIELD_OOB_FIELD_KIND[0].load(Ordering::Relaxed),
+        ),
+        (
+            "reference",
+            JIT_GETFIELD_OOB_FIELD_KIND[1].load(Ordering::Relaxed),
+        ),
+    ]
+}
+
+/// Is the field at `field_index` of the object at `addr` a reference?
+///
+/// Asks the object's OWN layout, the same way the helper's read does: a compact
+/// object through the registered layout's storage kind, a legacy one through
+/// the 16-byte `Value` cell's tag byte. Anything it cannot resolve counts as a
+/// primitive, which is the conservative direction here — it under-reports the
+/// reference bucket rather than inventing one.
+///
+/// SAFETY: `addr` must have passed `plausible_heap_pointer` and point at a live
+/// object header whose body covers `field_index`.
+unsafe fn getfield_field_is_reference(addr: usize, field_index: i64) -> bool {
+    let Ok(idx) = usize::try_from(field_index) else {
+        return false;
+    };
+    let header = &*(addr as *const cratonvm_types::ObjectHeader);
+    if idx >= header.num_slots() as usize {
+        return false;
+    }
+    if let Some((_, storage)) = jit_compact_field_slot(addr as i64, field_index) {
+        return storage == cratonvm_types::FieldStorageKind::Reference;
+    }
+    let tag = *((addr
+        + cratonvm_types::HEADER_SIZE
+        + idx * cratonvm_types::SLOT_SIZE
+        + cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u8);
+    tag == cratonvm_types::VTAG_OBJECT || tag == cratonvm_types::VTAG_NULL
+}
+
 /// Classify the receiver of one helper call into
 /// [`JIT_GETFIELD_RECEIVER_SHAPE`].
 ///
@@ -6314,7 +6380,7 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
 /// precondition the emitted inline code satisfies before its own header read.
 #[inline(never)]
 #[cold]
-unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
+unsafe fn note_getfield_receiver_shape(obj_ptr: i64, field_index: i64) {
     use std::sync::atomic::Ordering;
     let bump = |i: usize| {
         JIT_GETFIELD_RECEIVER_SHAPE[i].fetch_add(1, Ordering::Relaxed);
@@ -6340,6 +6406,13 @@ unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
     });
     if !contained {
         bump(1);
+        // Split the containment failures by field kind — see
+        // `JIT_GETFIELD_OOB_FIELD_KIND`. The receiver is plausible and its
+        // header is readable, which is all this needs; it is NOT inside a
+        // published region, but on ZGC/G1 no region is ever published, so that
+        // says nothing about whether the memory is mapped.
+        let is_ref = getfield_field_is_reference(addr, field_index);
+        JIT_GETFIELD_OOB_FIELD_KIND[usize::from(is_ref)].fetch_add(1, Ordering::Relaxed);
         return;
     }
     let flags = *((addr + cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8);
@@ -6509,7 +6582,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // measured `receiverFieldTax` is 8.2 ns, and this is not visible in it.
     GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if getfield_receiver_census_enabled() {
-        note_getfield_receiver_shape(obj_ptr);
+        note_getfield_receiver_shape(obj_ptr, field_index);
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
         dump_getfield_guard_failure(obj_ptr);

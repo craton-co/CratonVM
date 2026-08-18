@@ -1,10 +1,16 @@
 # Every JIT `getfield` takes the checked helper — TWO independent guard clauses fail, one per collector family
 
 ## Status
-**PARTLY FIXED 2026-08-18.** The Generational defect is closed: 68 722 450
-helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). The ZGC/G1 defect is a
-different clause of the same guard, is now diagnosed and partly mitigated, and
-its proper fix is specified under "What is still open".
+**PARTLY FIXED 2026-08-18, and fully diagnosed.** The Generational defect is
+closed: 68 722 450 helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). On all
+three collectors the inline path is now engaged for **every primitive field
+read** — 0 primitive misses, measured two independent ways — and the entire
+remainder is **reference** reads. On ZGC those are blocked on the JIT load
+barrier (a compact reference slot there is a colored word, not a pointer) and
+this page is finished. On **G1** they are blocked by nothing: no colored
+pointers, plain-pointer reference fields, 56.9M pure containment failures. That
+is the one actionable item left, and it narrows item 2 from "the general
+containment fix" to "a G1 fix".
 
 This title has now been wrong twice. The original blamed the containment check;
 the first correction concluded it was "NOT because the guarded inline check
@@ -439,14 +445,78 @@ Partial, and named as such.
    names — so what is left is not a guard to repair but the load barrier to
    build. That makes item 2 below (a read-side bounds table) the real successor
    to this page, not a fourth sub-problem here.
+
+   **The third collector, and the reason item 2 survives this.** The same
+   question asked as an EXECUTION census — `jit_getfield` bucketing every
+   `outside-published-bounds` call by whether the field read is a reference —
+   agrees on all of the above and adds G1, which the timings above do not
+   cover. `SHA256Digest` x200 000, one binary, counts only:
+
+   | collector | helper calls | primitive | reference |
+   |---|---:|---:|---:|
+   | ZGC (default) | 56 932 090 | **0** | 56 932 090 |
+   | G1 | 56 930 831 | **0** | 56 930 831 |
+   | Generational | 0 | 0 | 0 |
+
+   G1's residual is the same size and the same shape as ZGC's — and G1 has **no
+   colored pointers**. A reference field there is a plain pointer, so those
+   56.9M are pure containment failures with no soundness obstacle behind them
+   at all. ZGC must wait for the load barrier; **G1 could be fixed today**, and
+   that makes item 2 a G1 fix rather than the general containment fix it was
+   written up as.
 2. **The proper fix for containment under a non-publishing collector is a
-   separate READ-SIDE bounds table.** `JIT_REGION_BOUNDS` cannot be filled (see
-   above), but nothing stops a second table carrying each collector's mapped
-   envelope — ZGC's `conservative_addr_span()` is exactly `[arena_base,
-   arena_end)`, documented as lock-free and fixed for the collector's lifetime —
-   consulted *only* by the getfield receiver check, leaving the store-side
-   interlock untouched. Reference loads would still need the ZGC colored-word
-   gate. This is a design, not a bug fix, and deserves its own page.
+   separate READ-SIDE bounds table.** This is a design, not a bug fix, and
+   deserves its own page — but the shape is settled enough to write down, so
+   the next person does not have to re-derive why the obvious thing is wrong.
+
+   *Why a second table and not the existing one.* `JIT_REGION_BOUNDS` is doing
+   two jobs at once. Its documented job is "is this address mapped, so a raw
+   load cannot fault" — a READ-side question. Its actual load-bearing job,
+   since G1-2, is "may an inline reference STORE skip the collector's write
+   barrier" — and G1/ZGC answer that by leaving the table empty. One table,
+   two questions, opposite answers. Filling it to fix loads breaks stores.
+
+   *The shape.* A `JIT_READ_BOUNDS` sibling, same six-word layout so the
+   emitted containment sequence is byte-identical and only the baked address
+   changes, published by every collector with its mapped envelope:
+
+   | collector | source | property relied on |
+   |---|---|---|
+   | Generational | the three arenas, as today | already refreshed at GC start/end |
+   | ZGC | `ZgcRealHeap::conservative_addr_span()` → `[arena_base, arena_end)` | "allocated once in `with_capacity` and never grown", read without the arena lock |
+   | G1 | the reserved heap range | needs checking — G1 has N regions and the table has 3 slots, so this is the one that may not fit |
+
+   `region_bounds_are_live` keeps reading the OLD table and keeps gating the
+   store paths; only `emit_guarded_getfield_receiver_check` and
+   `ir_lower`'s copy of it move to the new one.
+
+   *The ZGC obligation that comes with it.* Publishing read bounds makes the
+   inline path reachable for REFERENCE fields under ZGC, where a compact
+   reference slot may hold `Z_COLORED_TAG | colour | offset`. That is the
+   use-after-free `heap.rs::read_prim_element` panics on by design. So the
+   read-side table must land together with a per-field-kind gate that keeps
+   reference loads on the helper under ZGC — the same restriction the
+   trusted-oop shortcut already carries, applied to the containment path too.
+   `zgc_codegen_honours_read_barrier()`'s doc comment states the obligation
+   from the other side and must be revisited in the same change: it returns a
+   constant `true` and says so **only** while no inline reference emission
+   happens under an armed barrier.
+
+   *What it is worth, now that item 1 is measured.* **G1 only, and there it is
+   worth all 56.9M.** The split came back 100% reference / 0% primitive, so:
+
+   * on **ZGC** the table buys nothing on its own — the reads it would admit
+     are exactly the ones the colored-pointer representation forbids inlining,
+     so the real gate is the ZGC JIT load barrier and this table must not land
+     ahead of it;
+   * on **G1** there is no colored-pointer obstacle at all, and the entire
+     residual is containment failures on plain pointers. A read-side table is
+     the whole fix.
+
+   That inverts the original priority: this was written up as the general
+   containment fix and it is really a G1 fix. Scope it that way — Generational
+   already publishes, ZGC must wait for the barrier, and only G1 is left
+   paying for a table it could fill today.
 3. **`init_object_header` should honour the compact layout.** Defect 2 was fixed
    on the *reader* side, which is right and enough for `getfield` — but the
    underlying fact remains that ~99% of allocations ignore a registered compact
