@@ -57,7 +57,7 @@ fn test_lambda_one_shot_actually_engages() {
     // binary — nothing else can be reading the environment concurrently.
     std::env::set_var("CRATONVM_DBG_LAMBDA_JIT", "1");
     // Compile on the mutator at the threshold rather than racing a worker, so
-    // "the body is compiled well before 400 000 iterations are done" is a fact.
+    // "the body is compiled well before 800 000 dispatches are done" is a fact.
     // SAFETY: as above.
     std::env::set_var("CRATONVM_BG_COMPILE", "0");
     // ...and the JIT-side arm OFF, so the interpreted one-shot is what serves.
@@ -71,8 +71,10 @@ fn test_lambda_one_shot_actually_engages() {
         return;
     };
     let result = vm.invoke("cratonvm/LambdaJitTierUp", "warmChecksum", "()I", &[]);
-    // 400 000 iterations of `v -> v + 3` over `i & 0xFF`.
-    let expected: i32 = (0..400_000).map(|i| (i & 0xFF) + 3).sum();
+    // 800 000 dispatches: 400 000 iterations x two call shapes.
+    // Two calls per iteration — one through the compiled `step` hop, one
+    // direct — so both call shapes are exercised.
+    let expected: i32 = (0..400_000i32).map(|i| ((i & 0xFF) + 3) * 2).sum();
     assert_eq!(result.ok().flatten(), Some(Value::Int(expected)));
 
     let (fast_returns, site_direct, nominations) = lambda_jit_engagement();
@@ -94,6 +96,6 @@ fn test_lambda_one_shot_actually_engages() {
     // assertion in `lambda_jit_engagement_tests`.
     assert!(
         fast_returns > 100_000,
-        "only {fast_returns} of 400 000 dispatches took the interpreted one-shot          (the JIT-side arm took {site_direct}) — lambda_jit_oneshot_tests would          then be testing the JIT-side arm twice and the one-shot not at all"
+        "only {fast_returns} of 800 000 dispatches took the interpreted one-shot          (the JIT-side arm took {site_direct}) — lambda_jit_oneshot_tests would          then be testing the JIT-side arm twice and the one-shot not at all"
     );
 }

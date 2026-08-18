@@ -121,21 +121,21 @@ fn checksum(method: &str) -> i32 {
 fn test_plain_lambda() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("plainChecksum"), -1_474_736_480);
+    assert_eq!(checksum("plainChecksum"), 1_345_494_336);
 }
 
 #[test]
 fn test_capturing_lambda() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("capturingChecksum"), -1_473_536_480);
+    assert_eq!(checksum("capturingChecksum"), 1_347_894_336);
 }
 
 #[test]
 fn test_method_reference() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("methodRefChecksum"), -1_474_736_480);
+    assert_eq!(checksum("methodRefChecksum"), 1_345_494_336);
 }
 
 /// The section 5.3 crash, pinned: a compiled lambda body throwing from a cold
@@ -145,14 +145,14 @@ fn test_method_reference() {
 fn test_throwing_lambda_body() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("throwingChecksum"), 1_337_293_578);
+    assert_eq!(checksum("throwingChecksum"), -1_620_381_380);
 }
 
 #[test]
 fn test_default_method_through_lambda() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("composedChecksum"), 1_385_094_336);
+    assert_eq!(checksum("composedChecksum"), -1_524_778_624);
 }
 
 /// Every arm of the one-shot's return-value conversion: `J`, `D`, `L`, and
@@ -162,7 +162,7 @@ fn test_default_method_through_lambda() {
 fn test_return_shapes() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("returnShapesChecksum"), 1_203_530);
+    assert_eq!(checksum("returnShapesChecksum"), 2_407_060);
 }
 
 /// `sig.arithmetic` — divide-by-zero raised inside the compiled body, which
@@ -171,7 +171,7 @@ fn test_return_shapes() {
 fn test_arithmetic_exception_from_body() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("arithmeticChecksum"), 2_639_200);
+    assert_eq!(checksum("arithmeticChecksum"), 5_266_000);
 }
 
 /// `sig.npe` — the same, for an implicit null dereference.
@@ -179,7 +179,7 @@ fn test_arithmetic_exception_from_body() {
 fn test_npe_from_body() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("npeChecksum"), 611_200);
+    assert_eq!(checksum("npeChecksum"), 1_210_000);
 }
 
 /// `sig.aioobe` — the same, for an out-of-range array index.
@@ -197,14 +197,14 @@ fn test_array_index_exception_from_body() {
 fn test_self_catching_body_declines_fast_path() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("selfCatchingChecksum"), -37_154_898);
+    assert_eq!(checksum("selfCatchingChecksum"), -74_309_796);
 }
 
 #[test]
 fn test_nested_lambda_dispatch() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("nestedChecksum"), 1_345_294_336);
+    assert_eq!(checksum("nestedChecksum"), -1_604_378_624);
 }
 
 /// An exception thrown by a warm lambda body and caught two Java frames out:
@@ -214,5 +214,5 @@ fn test_nested_lambda_dispatch() {
 fn test_exception_propagates_through_two_frames() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("propagationChecksum"), 1_337_293_578);
+    assert_eq!(checksum("propagationChecksum"), -1_620_381_380);
 }

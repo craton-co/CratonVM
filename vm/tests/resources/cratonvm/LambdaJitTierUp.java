@@ -70,6 +70,26 @@ public final class LambdaJitTierUp {
         return op.applyAsInt(v);
     }
 
+    private static long stepLong(LongUnaryOperator op, long v) {
+        return op.applyAsLong(v);
+    }
+
+    private static double stepDouble(DoubleUnaryOperator op, double v) {
+        return op.applyAsDouble(v);
+    }
+
+    private static String stepObj(IntFunction<String> op, int v) {
+        return op.apply(v);
+    }
+
+    private static void stepVoid(IntConsumer op, int v) {
+        op.accept(v);
+    }
+
+    private static int stepFn(Function<String, Integer> op, String v) {
+        return op.apply(v);
+    }
+
     private static int addOne(int x) {
         return x + 1;
     }
@@ -109,7 +129,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator plus1 = v -> v + 1;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += step(plus1, i);
+            sum += step(plus1, i) + plus1.applyAsInt(i);
         }
         return sum;
     }
@@ -120,7 +140,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator capAdd = v -> v + k;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += step(capAdd, i);
+            sum += step(capAdd, i) + capAdd.applyAsInt(i);
         }
         return sum;
     }
@@ -130,7 +150,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator mref = LambdaJitTierUp::addOne;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += step(mref, i);
+            sum += step(mref, i) + mref.applyAsInt(i);
         }
         return sum;
     }
@@ -146,7 +166,7 @@ public final class LambdaJitTierUp {
         for (int i = 0; i < N; i++) {
             int v = (i > 2000 && i % 5000 == 0) ? 999 : i;
             try {
-                sum += step(MAYBE_THROW, v);
+                sum += step(MAYBE_THROW, v) + MAYBE_THROW.applyAsInt(v);
             } catch (RuntimeException e) {
                 caught++;
             }
@@ -160,7 +180,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator composed = base.andThen(v -> v * 2);
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += step(composed, i);
+            sum += step(composed, i) + composed.applyAsInt(i);
         }
         return sum;
     }
@@ -177,15 +197,16 @@ public final class LambdaJitTierUp {
         double dsum = 0;
         int ssum = 0;
         for (int i = 0; i < N; i++) {
-            lsum += lop.applyAsLong(i % 7);
-            dsum += dop.applyAsDouble(i % 11);
-            ssum += sop.apply(i).length();
+            lsum += lop.applyAsLong(i % 7) + stepLong(lop, i % 7);
+            dsum += dop.applyAsDouble(i % 11) + stepDouble(dop, i % 11);
+            ssum += sop.apply(i).length() + stepObj(sop, i).length();
             lsum %= 1_000_003;
         }
         int[] sink = new int[1];
         IntConsumer voidOp = v -> sink[0] += v;
         for (int i = 0; i < N; i++) {
             voidOp.accept(i % 5);
+            stepVoid(voidOp, i % 5);
         }
         return (int) (lsum % 1_000_003) + (int) (dsum % 1_000_003) + ssum + sink[0];
     }
@@ -196,7 +217,7 @@ public final class LambdaJitTierUp {
         int caught = 0;
         for (int i = 0; i < N; i++) {
             try {
-                sum += step(DIVIDER, i + 1);
+                sum += step(DIVIDER, i + 1) + DIVIDER.applyAsInt(i + 1);
             } catch (ArithmeticException e) {
                 caught++;
             }
@@ -212,7 +233,7 @@ public final class LambdaJitTierUp {
         for (int i = 0; i < N; i++) {
             String s = (i % 500 == 499) ? null : "abc";
             try {
-                sum += lengthOf.apply(s);
+                sum += lengthOf.apply(s) + stepFn(lengthOf, s);
             } catch (NullPointerException e) {
                 caught++;
             }
@@ -226,7 +247,7 @@ public final class LambdaJitTierUp {
         int caught = 0;
         for (int i = 0; i < N; i++) {
             try {
-                sum += step(INDEXER, i);
+                sum += step(INDEXER, i) + INDEXER.applyAsInt(i);
             } catch (ArrayIndexOutOfBoundsException e) {
                 caught++;
             }
@@ -238,7 +259,7 @@ public final class LambdaJitTierUp {
     public static int selfCatchingChecksum() {
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += step(SELF_CATCHING, i);
+            sum += step(SELF_CATCHING, i) + SELF_CATCHING.applyAsInt(i);
         }
         return sum;
     }
@@ -249,7 +270,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator outer = v -> inner.applyAsInt(v) + 1;
         int sum = 0;
         for (int i = 0; i < N; i++) {
-            sum += step(outer, i);
+            sum += step(outer, i) + outer.applyAsInt(i);
         }
         return sum;
     }
@@ -264,7 +285,8 @@ public final class LambdaJitTierUp {
         int sum = 0;
         for (int i = 0; i < N; i++) {
             try {
-                sum += indirect(MAYBE_THROW, (i > 3000 && i % 5000 == 0) ? 999 : i);
+                int arg = (i > 3000 && i % 5000 == 0) ? 999 : i;
+                sum += indirect(MAYBE_THROW, arg) + MAYBE_THROW.applyAsInt(arg);
             } catch (RuntimeException e) {
                 caught++;
             }
@@ -287,7 +309,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator plus1 = v -> v + 3;
         int sum = 0;
         for (int i = 0; i < 400_000; i++) {
-            sum += step(plus1, i & 0xFF);
+            sum += step(plus1, i & 0xFF) + plus1.applyAsInt(i & 0xFF);
         }
         return sum;
     }
