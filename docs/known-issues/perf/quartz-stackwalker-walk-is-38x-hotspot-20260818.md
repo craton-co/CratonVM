@@ -274,6 +274,40 @@ per-call tax that one memo can remove — it is per-frame work, spread across
 with no member big enough to matter alone. That is why four separate attempts to
 remove one member each measured zero.
 
+### MEASURED 2026-08-18: attempt 1 changed a call site that never runs
+
+`CRATONVM_DBG=a5-engagement` (added with this, declared in all four flag files)
+counts, per call of the coverage probe, what the memo would have answered.
+On `probes/StackWalkerTerminationProbe`:
+
+```
+[a5-engagement] calls=0 (probe never ran)
+```
+
+**Zero.** `refresh_moving_young_coverage_for_current_thread`'s
+`native_stack_has_jit_frame` call — the one `UnregMemo`'s doc comment names as
+dominating, and the one attempt 1 memoized — **does not execute on this
+workload at all.** The 17.9% comes from the OTHER caller, the detection scan
+inside the root-snapshot deposit, which already has the memo.
+
+So attempt 1 was inert because it changed code that never ran, not because
+memoizing does not help. It was judged from a profile that did not move, and a
+profile cannot distinguish "changed the wrong site" from "the change does not
+help" — which is exactly what an engagement counter is for, and why this
+codebase's own rule is to print one beside the number. Four attempts were
+judged without one.
+
+That leaves a specific, un-refuted hypothesis for the site that DOES run: its
+band is `[scanner_sp.max(cover_hi), stack_high)`, and with an empty JIT entry
+chain `cover_hi == scanner_sp`, so it scans the whole native stack above the
+scanner. `UnregMemo::mark_clean` sets `hiwater = search_lo` on every clean
+verdict, so a stack that OSCILLATES — recurse, return, recurse, which is what
+every Java workload does and what this probe does 500 times — re-scans instead
+of reusing the verdict. That is testable with the same counter: a workload with
+a flat stack should show `memo_clean` climbing and an oscillating one should
+show `full_rescan` or `memo_banded` dominating. **Measure that before writing
+the fifth attempt.**
+
 **The arithmetic that should have come first.**
 `native_stack_has_jit_frame` is ~17.9% of this workload, so deleting it
 *entirely* buys **1.2x against a 38x gap**. No amount of memoizing that symbol
