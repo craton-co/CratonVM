@@ -14,6 +14,44 @@
 
 use super::*;
 
+/// Record what a branch leaves at its target, or check it against what an
+/// earlier branch to the same target already left.
+///
+/// Returns `false` on a disagreement, which refuses the splice. Verified
+/// bytecode cannot produce one — the JVM's own verifier requires every path to
+/// a merge to agree on stack depth and types — so this is a ratchet against the
+/// walk having mis-modelled something, not a case that is expected to fire.
+fn record_merge_state(
+    states: &mut [Option<(usize, Vec<bool>)>],
+    target: usize,
+    depth: usize,
+    marks: &[bool],
+) -> bool {
+    match states.get_mut(target) {
+        None => false,
+        Some(slot) => match slot {
+            Some((recorded_depth, recorded_marks)) => {
+                *recorded_depth == depth && recorded_marks.as_slice() == marks
+            }
+            None => {
+                *slot = Some((depth, marks.to_vec()));
+                true
+            }
+        },
+    }
+}
+
+/// How deep the CALLEE's operand stack may be at a branch or a merge point.
+///
+/// Each live value costs one reserved frame slot for the whole splice plus a
+/// load/store pair per incoming path, so this is a real cost and not just a
+/// safety bound. Java's own expression stack at a merge is almost always 1 —
+/// the `cond ? a : b` diamond and the null-guard shape
+/// (`iconst_1; goto L; iconst_0; L: ireturn`) both merge exactly one value.
+/// Four leaves room for nested conditionals without letting an unusual body
+/// reserve an unbounded region.
+const MAX_INLINE_MERGE_DEPTH: usize = 4;
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Object headers, fields, allocation, string layout
@@ -300,6 +338,21 @@ impl Compiler {
         // Map callee PC → native offset for branch targets
         let mut callee_pc_to_native: Vec<i64> = vec![-1; callee_len + 1];
 
+        // The canonical home for values live across a branch. Reserved BELOW
+        // the callee's operand area (`save_spill`, taken immediately after), so
+        // storing into it can never alias the operand slot being read from.
+        // Costs `MAX_INLINE_MERGE_DEPTH` slots for the whole splice whether or
+        // not the body branches; that is the price of not having to know
+        // whether it does before walking it.
+        let Some(merge_base) = self.reserve_spill_slots(MAX_INLINE_MERGE_DEPTH) else {
+            self.next_spill_offset = callee_local_base;
+            return false;
+        };
+        // What each branch target's incoming paths agreed on: `(depth, marks)`.
+        // Every branch in a spliced body is FORWARD (`target <= cpc` bails), so
+        // a target's entry is always written before the walk arrives at it.
+        let mut merge_states: Vec<Option<(usize, Vec<bool>)>> = vec![None; callee_len + 1];
+
         let mut cpc: usize = 0;
         let save_spill = self.next_spill_offset;
         // Operand-stack depth belonging to the CALLER; the callee's operands
@@ -319,25 +372,64 @@ impl Compiler {
         let mut prev_was_terminator = false;
 
         while cpc < callee_len {
-            callee_pc_to_native[cpc] = self.buf.pos() as i64; // Cast: address arithmetic
             let op = callee_code[cpc];
 
-            // Merge-point handling: at a branch target the callee operand
-            // stack must be the canonical empty state (caller_base_depth). A
-            // live path arriving with a value is a value-producing merge the
-            // spill-slot model can't represent soundly -> bail. A dead fall-
-            // through (previous instr was a terminator) only left stale slots;
-            // reset them so the target starts from the empty state every
-            // branch into it also guarantees (branches require empty stack).
+            // Merge-point handling.
+            //
+            // A live path arriving with a value used to REFUSE the splice: two
+            // paths put the same value in different places and the symbolic
+            // model can only name one. Now both sides store to the merge region
+            // and the target reads from there, so a value-producing merge is
+            // representable and the `iconst_1; goto L; iconst_0; L: ireturn`
+            // diamond splices.
+            //
+            // ORDER IS LOAD-BEARING. The fall-through's spill is emitted BEFORE
+            // `callee_pc_to_native[cpc]` records the label. Emitted after, the
+            // taken branch — which already stored its own values on its way
+            // here — would land on the label and re-run the fall-through's
+            // stores over slots holding whatever that path last left there.
+            // Silent wrong values on exactly one of the two paths, which is the
+            // failure this whole construct exists to avoid.
             if callee_branch_targets.get(cpc).copied().unwrap_or(false) {
-                if !prev_was_terminator && self.stack.len() != caller_base_depth {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                let recorded = merge_states[cpc].clone();
+                if prev_was_terminator {
+                    // A dead fall-through: nothing arrives here except the
+                    // branches, so adopt what they agreed on and emit nothing.
+                    match recorded {
+                        Some((depth, marks)) => {
+                            self.adopt_merge_slots(caller_base_depth, merge_base, depth, &marks)
+                        }
+                        None => {
+                            self.stack.truncate(caller_base_depth);
+                            self.stack_oop_marks.truncate(caller_base_depth);
+                        }
+                    }
+                } else {
+                    let Some((depth, marks)) = self.spill_callee_stack_to_merge_slots(
+                        caller_base_depth,
+                        merge_base,
+                        R11,
+                    ) else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    // The paths must agree on how many values are live and on
+                    // which of them are references. Verified bytecode
+                    // guarantees both, so a disagreement means this walk has
+                    // mis-modelled something — refuse rather than pick one.
+                    // Marks in particular: calling a non-reference an oop hands
+                    // a moving collector a word it will try to relocate.
+                    if let Some((rec_depth, rec_marks)) = &recorded {
+                        if *rec_depth != depth || *rec_marks != marks {
+                            self.next_spill_offset = callee_local_base;
+                            return false;
+                        }
+                    }
+                    self.adopt_merge_slots(caller_base_depth, merge_base, depth, &marks);
                 }
-                self.stack.truncate(caller_base_depth);
-                self.stack_oop_marks.truncate(caller_base_depth);
                 self.next_spill_offset = save_spill;
             }
+            callee_pc_to_native[cpc] = self.buf.pos() as i64; // Cast: address arithmetic
 
             match op {
                 // nop
@@ -1031,7 +1123,22 @@ impl Compiler {
                         return false;
                     }
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1068,7 +1175,22 @@ impl Compiler {
                     }
                     let top = self.pop_stack();
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1103,7 +1225,22 @@ impl Compiler {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1421,7 +1558,22 @@ impl Compiler {
                     }
                     let top = self.pop_stack();
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1450,7 +1602,22 @@ impl Compiler {
                         return false;
                     }
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1603,6 +1770,74 @@ impl Compiler {
         self.next_spill_offset = next_spill;
 
         true
+    }
+
+    /// Spill the CALLEE's live operand stack into the merge region, so a
+    /// branch and its target agree on where those values live.
+    ///
+    /// The inline emitter models the operand stack symbolically: a value may be
+    /// in a frame slot, a scratch GPR or an XMM register, and WHICH depends on
+    /// the path taken to get there. At a merge point two paths arrive with the
+    /// same values in different places, and the model can only name one — which
+    /// is why `try_emit_inline_body` refused a branch with a non-empty callee
+    /// stack outright (419a6f5, the `iconst_1; goto L; iconst_0; L: ireturn`
+    /// diamond).
+    ///
+    /// The fix is the standard one: give every merge a CANONICAL home. Each
+    /// path stores its values to `merge_base + i*8` before transferring
+    /// control, and the target's model reads them from exactly there. The
+    /// region is reserved BELOW the callee's operand area, so a store into it
+    /// can never alias the slot it is reading from.
+    ///
+    /// `scratch` must be a register the caller is not holding a live value in.
+    /// The conditional-branch arms have already loaded their comparison
+    /// operands into RAX (and RCX), so they pass R11.
+    ///
+    /// Returns `(depth, oop marks)` — what the target must agree with — or
+    /// `None` when the stack is deeper than the reserved region, which refuses
+    /// the splice rather than writing past it. Does NOT change the model: the
+    /// branching path is about to leave, and the fall-through continues with
+    /// its values where they already are.
+    fn spill_callee_stack_to_merge_slots(
+        &mut self,
+        caller_base_depth: usize,
+        merge_base: i32,
+        scratch: u8,
+    ) -> Option<(usize, Vec<bool>)> {
+        let depth = self.stack.len().checked_sub(caller_base_depth)?;
+        if depth > MAX_INLINE_MERGE_DEPTH {
+            return None;
+        }
+        for i in 0..depth {
+            let slot = self.stack[caller_base_depth + i];
+            self.load_slot_to_reg(scratch, slot);
+            self.emit_store_local(merge_base + (i as i32) * 8, scratch); // Cast: x86-64 immediate encoding
+        }
+        let marks = self.stack_oop_marks[caller_base_depth..].to_vec();
+        Some((depth, marks))
+    }
+
+    /// Point the model at the merge region — the other half of
+    /// [`Self::spill_callee_stack_to_merge_slots`].
+    ///
+    /// Called at the target once every incoming path has stored its values
+    /// there, so from here on the emitter reads them from one place regardless
+    /// of which path an execution actually took.
+    fn adopt_merge_slots(
+        &mut self,
+        caller_base_depth: usize,
+        merge_base: i32,
+        depth: usize,
+        marks: &[bool],
+    ) {
+        self.stack.truncate(caller_base_depth);
+        self.stack_oop_marks.truncate(caller_base_depth);
+        for i in 0..depth {
+            self.stack
+                .push(StackSlot::Frame(merge_base + (i as i32) * 8)); // Cast: x86-64 immediate encoding
+            self.stack_oop_marks
+                .push(marks.get(i).copied().unwrap_or(false));
+        }
     }
 
     /// Emit a call the SPLICED body makes, as the ordinary
