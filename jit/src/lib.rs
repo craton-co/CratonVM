@@ -5460,6 +5460,61 @@ pub struct InlineSite {
 /// `objectsAreEqual`), which is the shape that motivated nesting.
 pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 
+/// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
+/// `*const JitInvokeInfo`s its emitter can bake, interning the names into the
+/// arenas `owned_strings` / `owned_invoke_infos` — which `try_compile_inner`
+/// moves into the `CompiledMethod`, so the pointees outlive the code that
+/// references them and are freed with it.
+///
+/// Module-scope rather than a closure inside `try_compile_inner` so a test can
+/// assert the one property that has no visible symptom: a nested body whose
+/// calls are left uninterned degrades silently to a dispatch.
+pub(crate) fn intern_inline_invoke_targets(
+    site: &mut InlineSite,
+    owned_strings: &mut Vec<Box<str>>,
+    owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
+) {
+    // Wholesale, never additive: an `InlineSite` may have been CLONED from
+    // a cached plan that already carries pointers from an earlier compile,
+    // and those point into an arena this compile does not own.
+    site.resolved_invoke_infos.clear();
+    for (callee_pc, target) in site.invoke_targets.iter() {
+        let class_box: Box<str> = target.class_name.clone().into_boxed_str();
+        let method_box: Box<str> = target.method_name.clone().into_boxed_str();
+        let desc_box: Box<str> = target.descriptor.clone().into_boxed_str();
+        let class_ref = &*class_box as *const str;
+        let method_ref = &*method_box as *const str;
+        let desc_ref = &*desc_box as *const str;
+        owned_strings.push(class_box);
+        owned_strings.push(method_box);
+        owned_strings.push(desc_box);
+        // SAFETY: the three boxed strs were just moved into `owned_strings`,
+        // which `try_compile_inner` moves into `compiled._jit_strings`; a
+        // `Box<str>`'s payload does not move when the Box does, so these
+        // pointers stay valid for as long as the `CompiledMethod` lives —
+        // the identical argument the top-level `invoke_info` construction
+        // makes a few hundred lines above.
+        let info = Box::new(JitInvokeInfo {
+            class_name: unsafe { &*class_ref },
+            method_name: unsafe { &*method_ref },
+            descriptor: unsafe { &*desc_ref },
+            num_jit_args: target.num_jit_args,
+            return_type: target.return_type,
+            invoke_kind: target.invoke_kind,
+            declaring_class_id: target.declaring_class_id,
+        });
+        let info_ptr: *const JitInvokeInfo = &*info;
+        owned_invoke_infos.push(info);
+        site.resolved_invoke_infos
+            .push((*callee_pc, info_ptr as usize)); // Cast: pointer parked in a Send-able plan; deref only inside this compile
+    }
+    // A nested body's calls need the same treatment; the resolver bounds
+    // the depth (`MAX_INLINE_NEST_DEPTH`), so this terminates.
+    for (_, nested) in site.nested_sites.iter_mut() {
+        intern_inline_invoke_targets(nested, owned_strings, owned_invoke_infos);
+    }
+}
+
 /// Estimate the native-code expansion charged to the compilation's inline
 /// budget. The estimate deliberately stays cheap and deterministic: planning
 /// happens before backend emission and must not resolve or compile anything
@@ -20047,51 +20102,6 @@ fn try_compile_inner(
     //
     // Done HERE, after `precise_exception_frames` has had its chance to
     // `inline_sites.clear()`, so a cleared plan interns nothing at all.
-    fn intern_inline_invoke_targets(
-        site: &mut InlineSite,
-        owned_strings: &mut Vec<Box<str>>,
-        owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
-    ) {
-        // Wholesale, never additive: an `InlineSite` may have been CLONED from
-        // a cached plan that already carries pointers from an earlier compile,
-        // and those point into an arena this compile does not own.
-        site.resolved_invoke_infos.clear();
-        for (callee_pc, target) in site.invoke_targets.iter() {
-            let class_box: Box<str> = target.class_name.clone().into_boxed_str();
-            let method_box: Box<str> = target.method_name.clone().into_boxed_str();
-            let desc_box: Box<str> = target.descriptor.clone().into_boxed_str();
-            let class_ref = &*class_box as *const str;
-            let method_ref = &*method_box as *const str;
-            let desc_ref = &*desc_box as *const str;
-            owned_strings.push(class_box);
-            owned_strings.push(method_box);
-            owned_strings.push(desc_box);
-            // SAFETY: the three boxed strs were just moved into `owned_strings`,
-            // which `try_compile_inner` moves into `compiled._jit_strings`; a
-            // `Box<str>`'s payload does not move when the Box does, so these
-            // pointers stay valid for as long as the `CompiledMethod` lives —
-            // the identical argument the top-level `invoke_info` construction
-            // makes a few hundred lines above.
-            let info = Box::new(JitInvokeInfo {
-                class_name: unsafe { &*class_ref },
-                method_name: unsafe { &*method_ref },
-                descriptor: unsafe { &*desc_ref },
-                num_jit_args: target.num_jit_args,
-                return_type: target.return_type,
-                invoke_kind: target.invoke_kind,
-                declaring_class_id: target.declaring_class_id,
-            });
-            let info_ptr: *const JitInvokeInfo = &*info;
-            owned_invoke_infos.push(info);
-            site.resolved_invoke_infos
-                .push((*callee_pc, info_ptr as usize)); // Cast: pointer parked in a Send-able plan; deref only inside this compile
-        }
-        // A nested body's calls need the same treatment; the resolver bounds
-        // the depth (`MAX_INLINE_NEST_DEPTH`), so this terminates.
-        for (_, nested) in site.nested_sites.iter_mut() {
-            intern_inline_invoke_targets(nested, owned_strings, owned_invoke_infos);
-        }
-    }
     for site in inline_sites.values_mut() {
         intern_inline_invoke_targets(site, &mut owned_strings, &mut owned_invoke_infos);
     }
