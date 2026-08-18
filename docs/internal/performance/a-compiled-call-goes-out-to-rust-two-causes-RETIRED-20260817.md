@@ -165,23 +165,85 @@ in both.
 callees whose return register carries no value, which is exactly where a void
 exception-table callee would have gone unserviced.
 
-### Honest scope: this is a per-call win, not a per-workload one, on THIS class
+### The class the page was written about is the wrong place to size this
 
 On `BigEndianHeapByteBufTest` the change moves 18 336 calls out of 6.37 M
 (`mic_rust_cache` 18 336 → 0, the counter for calls the bar pushed onto the Rust
-entry cache). At ~110 ns each that is ~2 ms of a 33 s run. The 8.7x above is a
-per-call ratio on a probe built to isolate the shape; it is not a claim about
-this class, and the page's own warning applies — size it with the counter.
+entry cache). At ~110 ns each that is ~2 ms of a 33 s run — nothing. The 8.7x is
+a per-call ratio on a probe built to isolate the shape; it is not a claim about
+this class, and the page's own warning applies: size it with the counter first.
 
-Where it is worth more is where that counter is large. `mic_rust_cache` in a
-pre-fix binary is the targeting instrument for finding those workloads, and it is
-printed by `CRATONVM_DBG=mic-prof` on any run.
+**The counter IS the targeting instrument.** `mic_rust_cache` in `[DISP_CENSUS]`
+(`CRATONVM_DBG=mic-prof`) counts exactly the calls the bar pushes onto the Rust
+route, so scanning it over a workload finds where lifting the bar can matter
+before spending a single timed run. 24 netty classes, pre-fix binary:
+
+| class | `mic_rust_cache` | class ms |
+| --- | ---: | ---: |
+| `util.concurrent.NonStickyEventExecutorGroupTest` | **1 321 227** | 13 226 |
+| `handler.codec.http2.Http2MultiplexCodecTest` | **497 278** | 11 726 |
+| `handler.codec.compression.ZstdDecoderTest` | 29 790 | 3 524 |
+| `buffer.SimpleLeakAwareByteBufTest` | 18 378 | 26 237 |
+| `handler.codec.http.DefaultHttpRequestTest` | 6 910 | 19 652 |
+| 15 of the 24 | **0** | — |
+
+### And on the two classes where it does fire
+
+ABBA on ONE binary, three interleaved rounds each, `A` = published (the new
+default), `B` = `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=0`. Process CPU (`%U user`),
+which is the figure that survives a shared host:
+
+| class | A user (s) | B user (s) | ΔCPU | rounds A won |
+| --- | --- | --- | ---: | :---: |
+| `NonStickyEventExecutorGroupTest` (1.32 M barred) | 54.91 / 56.81 / 53.64 | 61.78 / 59.54 / 58.76 | **−8.2%** | 3/3 |
+| `Http2MultiplexCodecTest` (497 K barred) | 11.58 / 10.36 / 10.19 | 11.84 / 10.57 / 10.49 | **−2.4%** | 3/3 |
+
+Every paired round favours A on CPU, on wall and on the runner's own class clock,
+and the two deltas rank in the same order as their barred-call counts. 10/10 and
+63/63 in every arm.
+
+Engagement, same binary, same class — the number beside the number:
+`mic_rust_cache` **1 293 963 → 0**.
 
 **A counter that read zero and meant nothing.** `MIC_PROF`'s `pub_barred` reads
-`0` on both arms of this class, which looks like "the bar never fired". It is
-bumped at only one of the two publish sites in `jit_invoke_virtual_mic`; the
-other one published 18 336 barred entries into the Rust cache without touching
-it. Use `mic_rust_cache` from `[DISP_CENSUS]`, not `pub_barred`.
+`0` on both arms of every class here, which looks like "the bar never fired". It
+is bumped at only one of the two publish sites in `jit_invoke_virtual_mic`; the
+other published every one of those 1.29 M barred entries into the Rust cache
+without touching it. Use `mic_rust_cache` from `[DISP_CENSUS]`, never
+`pub_barred`.
+
+### Regression evidence
+
+65 `io.netty.buffer.*` classes, one fork per class, flat 300 s cap, three arms:
+pristine `dev`, the fix, and the fix with the direct-door lever below also on.
+
+|  | classes | started | ok | failed | timed out |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| pristine `dev` | 65 | 11 119 | 8 941 | 1 | 7 |
+| fix | 65 | 11 130 | 8 952 | 1 | 7 |
+| fix + direct-door lever | 65 | 11 130 | 8 952 | 1 | 7 |
+
+The last two arms are **byte-identical per class**. Against `dev` exactly two
+classes differ, and they swap: `AdaptiveBigEndianDirectByteBufTest` timed out on
+the fix arm and passed on `dev`, `AdvancedLeakAwareByteBufTest` did the reverse.
+Both belong to the `Adaptive*`/leak-aware family that is over the cap on this
+host regardless (all 7 timeouts are in it), and the load average moved between
+8 and 30 during the run. The one failing class,
+`io.netty.buffer.search.SearchProcessorTest`, fails identically in all three.
+
+Rust unit tests, Linux release: `cratonvm-types` 1991/1991, `cratonvm-jit`
+572/572, `cratonvm-vm --lib` 2555 passed / 3 failed,
+`jit_local_exception_handler_tests` 19/19. All three failures are outside this
+change and shown to be so rather than assumed: the two
+`runtime::resolve::guard` allowlist tests are pure source scans of
+`vm/src/runtime/interpreter/constants.rs`, which is byte-identical to
+`origin/dev` here (5 `.resolution_cache` sites on both, allowlist says 2), so
+they are red on `dev` too; `runtime::soak_test::tests::test_fd_leak_opens_closes_pair_check`
+passes 3/3 run alone and is a parallel-execution flake on a process-global
+counter.
+
+Platform: everything above is Linux/x86-64 on the Azure build host, which is
+where the page's own numbers were taken.
 
 ---
 
@@ -203,7 +265,7 @@ rule on this class: all 49 unserviced direct calls carry `info=false` — inline
 intrinsics and thin native helpers, which have no `JitInvokeInfo` and no way to
 stash a frame — so none is a Java callee and nothing there fails.
 
-Effect on the class, one binary:
+Effect on `BigEndianHeapByteBufTest`, one binary:
 
 | counter | lever off | lever on |
 | --- | ---: | ---: |
@@ -212,6 +274,25 @@ Effect on the class, one binary:
 | `kind_special` | 285 521 | 254 941 |
 | `out_dcache` | 369 233 | 342 430 |
 | result | 414/414 | 414/414 |
+
+**It stays default-OFF, and the reason is a measurement, not caution.** The
+counters move and the clock does not. ABBA on one binary, three interleaved
+rounds, process CPU in seconds:
+
+| class | lever ON | lever OFF |
+| --- | --- | --- |
+| `BigEndianHeapByteBufTest` | 41.43 / 41.00 / 41.15 | 41.69 / 37.12 / **32.38** |
+| `NonStickyEventExecutorGroupTest` | 42.92 / 50.80 / 41.73 | 51.50 / 47.03 / 44.45 |
+
+Read the `32.38` next to the `41.69` in the same arm of the same class on the
+same binary: the instrument's own spread is wider than any effect 16 call sites
+could produce, which is the page's measurement note restated. So this is not
+"measured neutral" — it is **below the noise floor of the only instrument
+available**, on the only classes measured, and 16 refused sites is too small a
+population to expect otherwise. The lever exists, it is correctness-verified
+(the third sweep arm above is byte-identical to the second across 65 classes and
+8 952 tests), and the next person can default it on from a workload where the
+`callee-exception-table` row is large — which the refusal census now prints.
 
 ---
 
