@@ -2393,7 +2393,7 @@ struct PassthroughServerCertVerifier {
     /// straight back into an engine native. Deferring it costs the property
     /// below in the other direction — see
     /// `testHandshakeFailureOnlyFireExceptionOnce` in
-    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`,
+    /// the openssl-key-material-and-engine-residuals write-up (now retired),
     /// where the client sends its `Finished` for a chain its own TrustManager
     /// rejected. The
     /// identity check is not: it is a pure comparison of the presented chain
@@ -9615,7 +9615,7 @@ mod tests {
     /// reads `DecryptError` instead of the alert.)
     ///
     /// If this ever starts failing, section B of
-    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`
+    /// the openssl-key-material-and-engine-residuals write-up (now retired)
     /// has lost its destination and the plan needs rethinking before any more of
     /// it is built.
     /// Drive a client/server `EngineState` pair whose client verifier either
