@@ -5355,6 +5355,27 @@ fn execute_frame_from_index(
                     );
                 }
             }
+            // Normalize the operand-stack overflow BEFORE throwing, exactly as
+            // the decoded path's conversion does further down.
+            //
+            // That site calls itself "the only point that converts runtime
+            // errors into Java exceptions". It is not, and has not been for as
+            // long as the invoke fast paths have routed through here: this arm
+            // converts too. `ValueStack` reports an overflow as
+            // `NotImplemented { feature: "operand stack overflow" }`, which
+            // `throw_runtime_error` maps to an *uncatchable* internal error, so
+            // a stack overflow arriving through a fast-path arm hard-unwound
+            // the whole call stack instead of surfacing as a catchable
+            // `java.lang.StackOverflowError` that an in-method
+            // `catch (StackOverflowError)` / `catch (Throwable)` can observe.
+            // Two conversion points that disagree is one conversion point too
+            // many; until they are merged they must at least agree.
+            let re = match re {
+                RuntimeError::NotImplemented { feature } if feature == "operand stack overflow" => {
+                    RuntimeError::StackOverflowError
+                }
+                other => other,
+            };
             let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
             match exc_result {
                 MethodCallFailed::ExceptionThrown(exc) => {
@@ -7594,6 +7615,114 @@ fn execute_frame_from_index(
                         frame.stack.push_with_kind_unchecked(v1, k1);
                     }
                     frame.pc = saved_pc + 1;
+                    continue;
+                }
+                // ── Constant-pool and object opcodes ──────────────────────
+                //
+                // These had no arm, so each paid the quickened `resolve(pc)`,
+                // the frame-pointer hoist and its `code_ptr` compare, a
+                // non-inlined call into `execute_instruction`, the ~200-variant
+                // `Instruction` match and the post-call diagnostic checks —
+                // all before its body ran.
+                //
+                // The bodies are NOT copied here. Each lives in exactly one
+                // `opcodes::op_*` function and BOTH paths call it, so there is
+                // still one implementation per opcode. Two copies of an opcode
+                // is precisely the shape `difftest`'s `interp-decoded` axis
+                // exists to catch — `getfield` alone is 450 lines, and a fix
+                // landing in one copy and not the other is the failure that
+                // axis was built after.
+                //
+                // `pc` is advanced BEFORE the call because the decoded path
+                // does (it writes `next_pc` ahead of dispatch) and several of
+                // these bodies read `frame.pc` back — `monitorenter` and
+                // `monitorexit` snapshot it, and the diagnostic blocks print
+                // it. Advancing after the call would change what they observe.
+                0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xbb | 0xc0 | 0xc1 => {
+                    let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
+                    let _ = frame;
+                    thread.frames[frame_idx].pc = saved_pc + 3;
+                    let outcome = match opcode {
+                        0xb2 => op_getstatic(shared, thread, frame_idx, cp_index),
+                        0xb3 => op_putstatic(shared, thread, frame_idx, cp_index),
+                        0xb4 => op_getfield(shared, thread, frame_idx, cp_index),
+                        0xb5 => op_putfield(shared, thread, frame_idx, cp_index),
+                        0xbb => op_new(shared, thread, frame_idx, cp_index),
+                        0xc0 => op_checkcast(shared, thread, frame_idx, cp_index),
+                        // 0xc1
+                        _ => op_instanceof(shared, thread, frame_idx, cp_index),
+                    };
+                    if let Err(e) = outcome {
+                        // Same classifier the invoke fast paths use: it performs
+                        // the Runtime/Linkage conversions the slow path's
+                        // per-opcode guard would otherwise have done, which is
+                        // the step those arms once skipped and killed the
+                        // process over.
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
+                    continue;
+                }
+                // monitorenter / monitorexit — single-byte, so `pc` advances by
+                // one rather than three; otherwise identical to the arm above.
+                0xc2 | 0xc3 => {
+                    let _ = frame;
+                    thread.frames[frame_idx].pc = saved_pc + 1;
+                    let outcome = if opcode == 0xc2 {
+                        op_monitorenter(shared, thread, frame_idx)
+                    } else {
+                        op_monitorexit(shared, thread, frame_idx)
+                    };
+                    if let Err(e) = outcome {
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
+                    continue;
+                }
+                // ldc (0x12, 1-byte index) / ldc_w (0x13) / ldc2_w (0x14).
+                // `execute_ldc` / `execute_ldc2w` were already factored out, so
+                // these arms are pure dispatch removal. The `ldc` family also
+                // needs the malformed-constant-pool conversion the decoded arms
+                // apply, so it is applied here too rather than dropped.
+                0x12 | 0x13 | 0x14 => {
+                    let _ = frame;
+                    let (cp_index, width) = if opcode == 0x12 {
+                        (b1 as u16, 2) // Cast: bytecode operand decoding
+                    } else {
+                        (((b1 as u16) << 8) | (b2 as u16), 3) // Cast: bytecode operand decoding
+                    };
+                    thread.frames[frame_idx].pc = saved_pc + width;
+                    let raw = if opcode == 0x14 {
+                        execute_ldc2w(shared, thread, frame_idx, cp_index)
+                    } else {
+                        execute_ldc(shared, thread, frame_idx, cp_index)
+                    };
+                    if let Err(e) = raw {
+                        let e = convert_ldc_class_format_error(shared, thread, e);
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
                     continue;
                 }
                 _ => { /* fall through to slow path */ }
