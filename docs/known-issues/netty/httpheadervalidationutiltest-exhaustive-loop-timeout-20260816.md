@@ -150,7 +150,10 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    first thing in this line of work that made anything faster**: six
    interleaved rounds, 6/6 faster, 45.1 -> 39.1 ns/iter on the assertion chain
    (-13%), with `disp_calls` back to ~3 870 in every arm. On the sibling class
-   it turned an opaque `HANG` with `started=0` into `13 started, 12 ok`.
+   it turned an opaque `HANG` with `started=0` into `13 started, 12 ok` — real
+   but MARGINAL, at 171 s against a 180 s wall, and a later build put it back
+   over. The ns/iter number is the robust result; the class crossing the wall is
+   a boundary effect on top of it.
 
    Devirtualising inside a splice also landed and is **inert**, which the
    engagement counters say outright (`nested-splice-guarded=0`, and
@@ -159,8 +162,14 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    still EMPTY at the sites that matter, because the eager-callee-chain compiles
    those methods before they run their virtual calls interpreted. The next lever
    is therefore a data problem: read the already-compiled callee's MIC/PIC slot,
-   which holds the receiver class the profile never recorded. Details and the
-   full trace are on the sibling page.
+   which holds the receiver class the profile never recorded. That landed
+   2026-08-18 and DOES find the target (`guard on class 1167 (from mic)`), and
+   it exposed a resolver bug worth more than the feature — the native-shadow
+   gate was refusing every override of a shadowed method, which also affects
+   PGO-02's guarded-virtual path in the default build. The guarded splice still
+   does not fire; one uninstrumented early return in
+   `resolve_inline_site_from` is all that is left between the evidence and the
+   emitter. Details and the full trace are on the sibling page.
 
    The chain's first two steps were VM work rather than compiler work: an artifact
    carrying an inlined caller scope cannot be OSR-entered at all

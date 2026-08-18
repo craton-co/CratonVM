@@ -507,6 +507,73 @@ Reading the callee artifact's inline-cache slot — real runtime evidence,
 available exactly where the profile is not — is what would make the guarded
 splice fire. The emitter half is done and tested.
 
+### Reading the devirt target out of the callee's own inline cache — 2026-08-18
+
+The profile is empty at these sites and always will be (the eager-callee-chain
+compiles before the receiver map fills), so the evidence has to come from
+somewhere else. It was one layer down the whole time: the compiled callee's own
+MIC installed the receiver on its first call and has served it ever since.
+
+It was not reachable. The compiler builds `mic_slots` as
+`(pc, *const JitMICSlot)`, the artifact keeps only
+`_jit_mic_slots: Vec<Box<JitMICSlot>>`, and the pc mapping was **discarded at
+publication**. `JitMICSlot::bci` / `JitPICSlot::bci` restore it, as TAIL fields —
+`cached_class_id` (0), `cached_entry_ptr` (8) and `cached_needs_context` (16) are
+addressed by generated code at fixed offsets. Putting the PIC's `bci` where it
+read naturally, after `misses`, moved `MEGA_CLASS_IDS_OFFSET` from 96 to 104 and
+every megamorphic-stub load with it;
+`test_jit_mega_offsets_match_generated_stub_contract` caught it.
+
+**The first dominance bar was built on counters the hot path never touches.** It
+asked for `hits + misses >= 64` at an 80% hit rate, mirroring the profile's bar.
+`record_hit` is called from the dispatch HELPER; the JIT-emitted inline MIC
+compares the class id and calls the cached entry in machine code without ever
+entering it. So a hot, well-behaved monomorphic site reads `h0:m1` — one helper
+entry to install, then silence — which is exactly what the trace showed
+(`bci16:cls1167:h0:m1`), and a hit-rate bar admits only sites thrashing THROUGH
+the helper. The rule is structural now: a populated, not-mid-installation class
+id, a NON-ZERO cached entry (a class id with entry 0 is `prepopulate`'s seed from
+profile data — a guard hint, and accepting it would launder a profile guess back
+in as runtime evidence), and misses at or below `MIC_TO_PIC_THRESHOLD`, which is
+the one thing these counters measure honestly. A PIC that has taken a miss at the
+same bci vetoes.
+
+That works: `nest-virtual java/lang/Object.equals at callee_pc=16 -> guard on
+class 1167 (from mic)`.
+
+**And it exposed a resolver bug worth more than the feature.**
+`resolve_inline_site_from` opened by testing the native table for
+`(callee_class, callee_method, callee_desc)`. For a receiver-resolved site
+`callee_class` is the DECLARED class — a supertype that may own no body at all —
+so a native registered on `java/lang/Object.equals` refused **every subclass
+override too**, including the plain bytecode the receiver actually dispatches to.
+That gate is now constant-pool-only, and the existing per-declaring-class check
+below is unconditional. It affects PGO-02's guarded-virtual path in the default
+build, not just this feature. codec-http, 93 classes: identical result sets with
+the branch's flags off and on, so no regression at either.
+
+### Still not closed, and the remaining gate is one function
+
+`nested-splice-guarded` is still 0. The evidence is found and the native-shadow
+gate no longer refuses, but resolving the receiver's `equals` body still returns
+`None` through one of `resolve_inline_site_from`'s remaining UNINSTRUMENTED
+early returns — the `?` operators around `find_method_recursive` /
+`method.code()` / `store.get`, or `receiver_resolution_is_dispatch_faithful`.
+Every *named* gate in that function now prints its reason under
+`CRATONVM_DBG_JITC` (`inline-resolve REFUSED <method> depth=N: <why>`), which is
+what turned three separate guesses into three answers today; the `?` sites are
+what is left to name.
+
+### A correction to the direct-bind result
+
+This page reported `HttpResponseStatusTest` moving from `HANG found=0 started=0`
+to `13 started, 12 ok`. That measurement is real but **marginal**: it completed
+in 171 s against the harness's 180 s wall, and a later build of the same lineage
+put it back over the wall in both arms. The **ns/iter improvement is the robust
+result** — 6 of 6 interleaved rounds, 45.1 -> 39.1 — and the class crossing the
+harness wall is a boundary effect on top of it, not a stable new state. The
+per-method JUnit `@Timeout` of 120 s was never met in any run.
+
 ## What is left, in order
 
 1. The five-step chain above, in that order — multi-frame resume, multi-frame
