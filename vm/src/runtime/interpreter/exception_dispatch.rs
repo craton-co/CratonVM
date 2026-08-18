@@ -59,6 +59,33 @@ use super::*;
 /// is pinned in `native_pin_roots` for the whole walk, and re-read from there
 /// on every iteration — a moving collector rewrites the pin slot in place, so
 /// the local copy taken before a GC is stale.
+/// The `invoke_pc` an OSR'd frame hands [`unwind_to_handler`] when it has
+/// ALREADY decided it cannot catch.
+///
+/// The unwinder's first act is to search `frames[frame_idx]`'s own exception
+/// table at `invoke_pc`. For every other producer that is exactly right —
+/// `invoke_pc` is the site that threw. For an OSR bail it is not: the pc
+/// available there is `entry_pc`, the BACK-EDGE the compiled body was ENTERED
+/// at, which has nothing to do with where the throw happened. When the loop sits
+/// inside a `try` (`try { for (..) {..} } catch`) that back-edge IS inside a
+/// protected range, so the unwinder found a handler that does not guard the
+/// throw site and entered it — on the stale pre-OSR locals, since the OSR'd body
+/// advanced its own copies and never wrote them back.
+///
+/// Measured on `probes/OsrThrowOutsideTryProbe.java`, whose `trip()` throws
+/// AFTER the `try` block: HotSpot `caught=0 escaped=1 sink=80000200000`,
+/// CratonVM `caught=1 escaped=1 sink=80018203000` — the exception taken by a
+/// handler that does not cover it, and an accumulator 18 003 000 too high from
+/// the iterations the spurious resume re-ran. Both silent.
+///
+/// `route_osr_exception_out_of_artifact` has already asked this frame's own
+/// table, with the PRECISE throw bci, and answered `Propagate`. So the
+/// unwinder must not ask again with a worse pc — it must start at the caller.
+/// A pc no `[start_pc, end_pc)` can contain says exactly that in the existing
+/// signature: the first search matches nothing, the frame pops, and `exc_pc` is
+/// then re-read from the caller's `last_instr_pc` as usual.
+pub(super) const OSR_FRAME_DECLINED_TO_CATCH: usize = usize::MAX;
+
 pub(super) fn unwind_to_handler(
     shared: &SharedVm,
     thread: &mut JvmThread,

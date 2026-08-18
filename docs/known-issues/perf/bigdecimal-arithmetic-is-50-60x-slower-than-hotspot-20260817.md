@@ -151,8 +151,11 @@ breakdown is needed.
 ## Related
 
 * `apps/commons-math/RESULTS-20260817.md` — the suite run this was found from.
-* `docs/known-issues/jit/bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-20260817.md`
-  — the other CratonVM-only "hang" from the same run; different root cause, same
-  symptom.
-* `docs/known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`
+* [`bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`](bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md)
+  — the other CratonVM-only "hang" found in the same run. It was first filed as
+  an OSR refusal; that gate was real and is now fixed, and the wall time did not
+  move. It is the SAME root cause as this page — compiled-code throughput, not
+  an admission gap — that happens to produce the same symptom (a test that never
+  finishes).
+* [`lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`](lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md)
   — why the first per-op breakdown here measured its own harness.

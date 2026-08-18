@@ -295,13 +295,105 @@ pub(super) fn compile_osr_artifact(
                     return None;
                 }
             };
-            // RBC.6 — never OSR an athrow method: the OSR bail path resumes
+            // This method's own exception table. Read ONCE, here, because both
+            // of the RBC gates below need it: RBC.6 (immediately below) admits
+            // a bare `athrow` only when it is EMPTY, and RBC.6b (further down)
+            // admits a non-empty one only when every throwing site inside a
+            // protected range publishes a precise exceptional frame.
+            let osr_exception_table = match shared.classes.class_manager.read().get_class(class_id)
+            {
+                Some(class) => class
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        &*m.name == method_name_check
+                            && &*m.descriptor == method_descriptor.as_str()
+                    })
+                    .and_then(|m| {
+                        m.attributes.iter().find_map(|a| match a.as_decoded() {
+                            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
+                                Some(ca.exception_table.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            // RBC.6 (2026-07-18; LIFTED 2026-08-17 for the no-handler case) —
+            // this door used to refuse **any** method containing a bare
+            // `athrow` (0xbf), whatever its exception table looked like, on the
+            // grounds stated in its own comment: "the OSR bail path resumes
             // interpretation at the back-edge, so an athrow lowering that ran
-            // side effects natively before throwing could see them re-applied.
-            // Method-entry compilation (which propagates cleanly through the
-            // JIT-return exception drains) remains available, so do NOT
-            // bail-list here.
-            if scan.has_athrow {
+            // side effects natively before throwing could see them re-applied".
+            // That hazard is RBC.7's silent-corruption shape and it was real
+            // when the comment was written — the athrow drain's only move was
+            // to re-stash the throwable and resume the live interpreter frame
+            // at the STALE pre-OSR back-edge pc, re-running every iteration the
+            // OSR'd code had already committed.
+            //
+            // Its blast radius was not deliberate. OSR is the ONLY door out of
+            // the interpreter for a method invoked once — which is what a
+            // `@Test` body, a `main`, and any one-shot driver is — so a `throw`
+            // anywhere in such a method, even on a path never taken, kept its
+            // hot loop interpreted for the method's whole life. Witness:
+            // `BOBYQAOptimizerTest`, whose `trsbox`/`bobyqb` (each called once
+            // per test; translated-from-Fortran numerical code that `throw`s a
+            // `MathIllegalStateException` on an internal assertion and catches
+            // nothing) turned a sub-second `optimize()` call into an unbounded
+            // hang. See the known-issue page cited from that suite's RESULTS.
+            //
+            // What makes the lift safe is not new machinery but a PRECONDITION
+            // that is checkable right here: with an EMPTY exception table, an
+            // `athrow` in this body cannot be caught by the OSR'd frame, so no
+            // drain ever has to resume that frame. `route_osr_exception_out_of_
+            // artifact` answers `Propagate` on its first line for exactly this
+            // population, and the throwable goes to the dispatch loop's
+            // unwinder as `OsrBackoffOutcome::ThrowJava`: the frame is torn
+            // down, and there is no stale resume for already-committed
+            // iterations to be re-run from. That path is not new either — it is
+            // the one the callee-throw fix already routes an unwinding
+            // exception through — and it re-checks the empty table rather than
+            // assuming it.
+            //
+            // A NON-empty table stays refused here, and the reason is NOT
+            // RBC.6b's (which, since its own 2026-08-17 lift, admits such a
+            // method whenever every throwing site inside a protected range
+            // publishes a reason-9 frame — and `athrow`'s lowering is one of
+            // the few that does not, so an `athrow` INSIDE a `try` is already
+            // refused there). The residual case is an `athrow` OUTSIDE every
+            // protected range of a method that has one elsewhere. There,
+            // `route_osr_exception_out_of_artifact` correctly answers
+            // `Propagate` — no precise frame, so the throw site is outside
+            // every range — but `OsrBackoffOutcome::ThrowJava` then hands the
+            // throwable to `unwind_to_handler` keyed on `entry_pc`, the
+            // BACK-EDGE the body was entered at, not the throw site. When that
+            // back-edge lies inside a protected range (`try { for (..) {..} }
+            // catch`), the unwinder finds a handler that does not cover the
+            // throw at all and enters it — on the stale pre-OSR locals. Until
+            // `ThrowJava` carries "this frame has already declined to catch",
+            // admitting that shape would trade a throughput bug for a silent
+            // wrong-answer bug, which is the wrong direction.
+            //
+            // Not bail-listed, for the original reason: method-entry
+            // compilation propagates cleanly through the JIT-return exception
+            // drains and stays available either way.
+            //
+            // `CRATONVM_JIT_OSR_ATHROW=0` restores the blanket refusal, so one
+            // binary can A/B the lift.
+            if scan.has_athrow
+                && (!osr_exception_table.is_empty()
+                    || !crate::runtime::env_cache::osr_athrow_allowed())
+            {
+                if crate::runtime::env_cache::dbg_jitc() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr-DENY (RBC.6 athrow, handlers={}) {}.{}{}",
+                        osr_exception_table.len(),
+                        class_name,
+                        method_name,
+                        method_descriptor
+                    );
+                }
                 return None;
             }
             // RBC.7 (jit-osr-loop-duplicate-execution, silent data corruption,
@@ -392,26 +484,8 @@ pub(super) fn compile_osr_artifact(
             //
             // `CRATONVM_JIT_OSR_EXC_TABLE=0` restores the blanket refusal, so
             // one binary can A/B the lift.
-            let osr_exception_table = match shared.classes.class_manager.read().get_class(class_id)
-            {
-                Some(class) => class
-                    .methods
-                    .iter()
-                    .find(|m| {
-                        &*m.name == method_name_check
-                            && &*m.descriptor == method_descriptor.as_str()
-                    })
-                    .and_then(|m| {
-                        m.attributes.iter().find_map(|a| match a.as_decoded() {
-                            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
-                                Some(ca.exception_table.clone())
-                            }
-                            _ => None,
-                        })
-                    })
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
+            // (`osr_exception_table` is read once, above RBC.6, which gates on
+            // the same table.)
             if !osr_exception_table.is_empty() {
                 if !crate::runtime::env_cache::osr_exception_table_allowed() {
                     if crate::runtime::env_cache::dbg_jitc() {
