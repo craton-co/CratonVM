@@ -6890,6 +6890,24 @@ pub fn jit_panic_to_exception(
 /// Resolution starts at the CONSTANT-POOL class, which is the right answer for
 /// `invokestatic`/`invokespecial` and the wrong one for a guarded virtual or
 /// interface site — see [`resolve_receiver_inline_site`].
+/// How many dispatches an inline cache must have served before its cached class
+/// counts as evidence for a devirtualised splice.
+///
+/// A site called three times says nothing about the fourth. 64 is well below
+/// the invocation counts a method reaching the inline planner has already
+/// accumulated, and well above the handful a cold path sees.
+const MIN_MIC_DEVIRT_SAMPLES: u64 = 64;
+
+/// The hit rate an inline cache must hold to count as monomorphic, matching the
+/// 80% dominance bar the top-level guarded-virtual planner applies to a
+/// receiver profile.
+///
+/// Below it the cache is thrashing and `cached_class_id` is whichever receiver
+/// happened to arrive last — the megamorphic shape a shared dispatch hop
+/// produces. Guarding on that spends a compare and a branch to reach the
+/// ordinary call anyway.
+const MIN_MIC_DEVIRT_HIT_PCT: u64 = 80;
+
 /// The plan-time direct-bind resolver an inline site consults for the calls
 /// inside the body it is about to splice.
 ///
@@ -7636,33 +7654,76 @@ fn resolve_inline_site_from(
                 // Virtual / interface: one body per receiver class, so a splice
                 // needs a guard and the profile has to name the class.
                 0 | 2 => {
-                    let Some(profile) = callee_profile.as_ref() else {
-                        if crate::runtime::env_cache::dbg_jitc() {
-                            eprintln!(
-                                "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> NO PROFILE for {}.{}{}",
-                                target.class_name, target.method_name, target.descriptor, ipc,
-                                callee_class, callee_method, callee_desc,
-                            );
+                    // TWO sources, in this order, and the second is the one
+                    // that actually answers for this workload.
+                    //
+                    //  1. the CALLEE's own receiver profile, keyed by its own
+                    //     bci. The right key — receiver types are recorded
+                    //     against the executing method — but measured
+                    //     2026-08-18 it is EMPTY at exactly these sites: the
+                    //     eager-callee-chain compiles a method like
+                    //     `objectsAreEqual` before it ever runs its
+                    //     `invokevirtual equals` interpreted, so nothing is
+                    //     recorded. It is also gated off entirely unless
+                    //     `CRATONVM_TIER_PGO` is set.
+                    //  2. the CALLEE's COMPILED ARTIFACT's inline cache at that
+                    //     bci. A method that skipped the interpreter has been
+                    //     caching its receiver on every compiled call since,
+                    //     which is the same evidence one layer down — and it is
+                    //     available precisely when (1) is not.
+                    //
+                    // Both are speculation; the class-id guard is what makes
+                    // either safe, and a wrong guess costs the miss edge.
+                    let profile_dom = callee_profile
+                        .as_ref()
+                        .and_then(|p| p.receivers.get(ipc))
+                        // Same 80% bar as the top-level guarded-virtual planner.
+                        .and_then(|counts| crate::jit::profile::dominant_receiver(counts, 80));
+                    let (dom, evidence) = match profile_dom {
+                        Some(d) => (d, "profile"),
+                        None => {
+                            let from_cache = shared
+                                .jit
+                                .jit_cache
+                                .read()
+                                .get(
+                                    &Arc::from(callee_class),
+                                    &Arc::from(callee_method),
+                                    &Arc::from(callee_desc),
+                                    declaring_id,
+                                )
+                                .and_then(|cm| {
+                                    cm.dominant_receiver_at_bci(
+                                        *ipc,
+                                        MIN_MIC_DEVIRT_SAMPLES,
+                                        MIN_MIC_DEVIRT_HIT_PCT,
+                                    )
+                                });
+                            match from_cache {
+                                Some(d) => (d, "mic"),
+                                None => {
+                                    if crate::runtime::env_cache::dbg_jitc() {
+                                        eprintln!(
+                                            "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> no evidence (profile={} mic=none)",
+                                            target.class_name,
+                                            target.method_name,
+                                            target.descriptor,
+                                            ipc,
+                                            if callee_profile.is_some() { "empty" } else { "absent" },
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
                         }
-                        continue;
                     };
-                    let Some(counts) = profile.receivers.get(ipc) else {
-                        if crate::runtime::env_cache::dbg_jitc() {
-                            eprintln!(
-                                "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> profile has no receivers at that pc (pcs: {:?})",
-                                target.class_name, target.method_name, target.descriptor, ipc,
-                                profile.receivers.keys().take(8).collect::<Vec<_>>(),
-                            );
-                        }
-                        continue;
-                    };
-                    // Same 80% dominance bar the top-level guarded-virtual
-                    // planner uses. Below it the guard misses often enough that
-                    // the cold edge — a blind dispatch — is what the site
-                    // actually costs.
-                    let Some(dom) = crate::jit::profile::dominant_receiver(counts, 80) else {
-                        continue;
-                    };
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> guard on class {} (from {})",
+                            target.class_name, target.method_name, target.descriptor, ipc, dom,
+                            evidence,
+                        );
+                    }
                     // Resolve the body that receiver ACTUALLY dispatches to,
                     // not the constant-pool one: the guard certifies the
                     // subclass, so splicing the superclass's method behind it

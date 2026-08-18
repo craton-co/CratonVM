@@ -2987,6 +2987,64 @@ impl CompiledMethod {
             .expect("call_with_heap: invalid JIT entry or arg count (use try_call_with_context for the fallible variant)")
     }
 
+    /// The receiver class this artifact's inline cache actually saw at `bci`,
+    /// when it saw it overwhelmingly.
+    ///
+    /// WHY THIS EXISTS. Devirtualising a call inside a spliced body needs to
+    /// know which body the receiver dispatches to, and the obvious source —
+    /// `MethodProfile::receivers`, keyed by the executing method's own bci — is
+    /// EMPTY at exactly the sites that matter. Measured 2026-08-18: the
+    /// eager-callee-chain compiles a method like
+    /// `AssertionUtils.objectsAreEqual` before it ever executes its
+    /// `invokevirtual equals` interpreted, so nothing is ever recorded there
+    /// (`nest-virtual java/lang/Object.equals -> profile has no receivers at
+    /// that pc (pcs: [])`). The evidence exists, one layer down: the compiled
+    /// method's own MIC has been caching that receiver on every call since.
+    ///
+    /// WHAT IT PROMISES. Nothing about the future — it is speculation, and the
+    /// consumer must guard on the class id it returns. A wrong answer costs the
+    /// guard's miss edge, never correctness.
+    ///
+    /// WHAT IT REFUSES. A slot is evidence only if it is actually monomorphic:
+    ///
+    ///  * an unpopulated or mid-publication `cached_class_id` says nothing;
+    ///  * `hits + misses` below `min_samples` is not a population, it is an
+    ///    anecdote — a site called three times tells you nothing about the
+    ///    fourth;
+    ///  * a hit RATE below `min_hit_pct` means the cache is thrashing, and the
+    ///    class it happens to hold right now is whichever receiver arrived
+    ///    last. That is the megamorphic shape a shared dispatch hop produces,
+    ///    and guarding on it would spend a compare and a branch to reach the
+    ///    ordinary call anyway.
+    pub fn dominant_receiver_at_bci(
+        &self,
+        bci: usize,
+        min_samples: u64,
+        min_hit_pct: u64,
+    ) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        for slot in &self._jit_mic_slots {
+            if slot.bci != bci {
+                continue;
+            }
+            let class_id = slot.cached_class_id.load(Ordering::Relaxed);
+            if class_id == 0 || class_id == JitMICSlot::INSTALLING_CLASS_ID {
+                continue;
+            }
+            let hits = slot.hits.load(Ordering::Relaxed);
+            let misses = slot.misses.load(Ordering::Relaxed);
+            let total = hits.saturating_add(misses);
+            if total < min_samples {
+                continue;
+            }
+            if hits.saturating_mul(100) < total.saturating_mul(min_hit_pct) {
+                continue;
+            }
+            return Some(class_id);
+        }
+        None
+    }
+
     /// True when this artifact recorded a safe OSR entry point for `entry_pc`
     /// (i.e. [`osr_enter`](Self::osr_enter) at that pc would not bail).
     /// Lets the interpreter's OSR trigger reuse a cached compile instead of
@@ -9750,6 +9808,23 @@ pub struct JitMICSlot {
     /// Keeps a compiled cache target alive while generated code can load its
     /// raw entry pointer. Native targets have no owner and leave this empty.
     compiled_owner: parking_lot::Mutex<Option<Arc<CompiledMethod>>>,
+    /// The bytecode index this slot's call site lives at, or `usize::MAX` for a
+    /// slot with no site (tests, and the loop-unroll clones that share a site
+    /// with their original).
+    ///
+    /// The compiler builds `mic_slots` as `(pc, *const JitMICSlot)` but the
+    /// artifact keeps only `_jit_mic_slots: Vec<Box<JitMICSlot>>`, so the
+    /// pc→slot mapping was DISCARDED at publication. That mapping is the only
+    /// receiver evidence that exists for a method compiled by the
+    /// eager-callee-chain before it ever ran its virtual calls interpreted —
+    /// its `MethodProfile::receivers` map is empty at exactly those pcs (see
+    /// `jit_inline_splice_devirt`). Recording it here costs one `usize` per
+    /// slot and makes [`CompiledMethod::dominant_receiver_at_bci`] possible.
+    ///
+    /// A TAIL field on purpose: `cached_class_id` (0), `cached_entry_ptr` (8)
+    /// and `cached_needs_context` (16) are read by generated code at fixed
+    /// offsets, so nothing may be inserted before them.
+    pub bci: usize,
 }
 
 impl JitMICSlot {
@@ -9759,7 +9834,7 @@ impl JitMICSlot {
     /// keeping the guard non-matching until *all* companion fields are ready
     /// makes the publication atomic from its point of view. Class ids are
     /// allocated densely from zero and never use this all-ones reservation.
-    const INSTALLING_CLASS_ID: u32 = u32::MAX;
+    pub(crate) const INSTALLING_CLASS_ID: u32 = u32::MAX;
     /// Byte offset of [`Self::cached_class_id`] from the start of the
     /// struct. JIT codegen uses this to emit
     /// `MOV eax, [mic_ptr + CACHED_CLASS_ID_OFFSET]`.
@@ -9784,6 +9859,15 @@ impl JitMICSlot {
             misses: std::sync::atomic::AtomicU64::new(0),
             cached_class_name: parking_lot::Mutex::new(None),
             compiled_owner: parking_lot::Mutex::new(None),
+            bci: usize::MAX,
+        }
+    }
+
+    /// [`Self::new`] for a slot that serves a known call site.
+    pub fn new_at(bci: usize) -> Self {
+        Self {
+            bci,
+            ..Self::new()
         }
     }
 
@@ -17617,7 +17701,7 @@ fn try_compile_inner(
                             && num_args >= 1
                             && num_args + 1 <= ir_entry_abi_reg_count()
                         {
-                            let mic = Box::new(JitMICSlot::new());
+                            let mic = Box::new(JitMICSlot::new_at(pc));
                             // Seed from the receiver-type profile exactly as the
                             // single-pass planner does: a site with a dominant
                             // receiver lands in the MIC (and, via
@@ -19966,7 +20050,10 @@ fn try_compile_inner(
             // signature that appeared in the active-cycle registry permanently
             // use blind `jit_invoke_dispatch`, including OSR bodies.
             if invoke_kind_uses_inline_cache(invoke_kind) {
-                let mic = Box::new(JitMICSlot::new());
+                // `new_at(pc)`, not `new()`: the artifact keeps only the boxes,
+                // so the bci has to travel inside the slot or it is lost at
+                // publication. See `JitMICSlot::bci`.
+                let mic = Box::new(JitMICSlot::new_at(pc));
                 if let Some(prof) = profile {
                     if let Some(receiver_counts) = prof.receivers.get(&pc) {
                         if let Some(dom_class_id) = profile::dominant_receiver(receiver_counts, 80)
@@ -30350,6 +30437,97 @@ mod code_cache_lifetime_tests {
 /// `invalidate_for_class` runs on EVERY class definition and almost never
 /// matches, so it now refuses before scanning when no published body names the
 /// class. That is only sound while the set is a true over-approximation of what
+/// Reading a devirtualisation target out of a compiled method's own inline
+/// cache — the evidence that exists when the receiver PROFILE does not.
+///
+/// Every case here is a refusal except the last, because the value of this
+/// accessor is entirely in what it declines to answer: it feeds a class-id
+/// guard, and a guard built on a thrashing cache spends a compare and a branch
+/// to reach the ordinary call anyway.
+#[cfg(test)]
+mod mic_devirt_evidence {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// One artifact carrying one MIC slot in a chosen state.
+    fn artifact_with(bci: usize, class_id: u32, hits: u64, misses: u64) -> CompiledMethod {
+        let mut cm = CompiledMethod::new(ExecutableBuffer::new(64).unwrap());
+        let slot = Box::new(JitMICSlot::new_at(bci));
+        slot.cached_class_id.store(class_id, Ordering::Relaxed);
+        slot.hits.store(hits, Ordering::Relaxed);
+        slot.misses.store(misses, Ordering::Relaxed);
+        cm._jit_mic_slots.push(slot);
+        cm
+    }
+
+    const SAMPLES: u64 = 64;
+    const HIT_PCT: u64 = 80;
+
+    #[test]
+    fn a_monomorphic_cache_with_enough_samples_is_evidence() {
+        let cm = artifact_with(16, 77, 1000, 3);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), Some(77));
+    }
+
+    /// The bci is the whole point. Before `JitMICSlot::bci` existed the
+    /// artifact kept the boxes and threw the pc mapping away, so there was no
+    /// way to ask this question at all — every slot looked like every other.
+    #[test]
+    fn a_slot_for_another_bci_does_not_answer_for_this_one() {
+        let cm = artifact_with(16, 77, 1000, 3);
+        assert_eq!(cm.dominant_receiver_at_bci(20, SAMPLES, HIT_PCT), None);
+    }
+
+    /// A site called a handful of times is an anecdote, not a population.
+    #[test]
+    fn too_few_samples_is_not_evidence() {
+        let cm = artifact_with(16, 77, 10, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), None);
+        // ...and the SAME slot answers once the population is there, so this is
+        // the threshold talking and not some other refusal.
+        let cm = artifact_with(16, 77, SAMPLES, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), Some(77));
+    }
+
+    /// A thrashing cache holds whichever receiver arrived last. That is the
+    /// megamorphic shape, and guarding on it is worse than not guarding.
+    #[test]
+    fn a_thrashing_cache_is_not_evidence() {
+        // 50% hit rate over a large population — plenty of samples, no dominance.
+        let cm = artifact_with(16, 77, 500, 500);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), None);
+        // Exactly at the bar answers; one miss below it does not.
+        let cm = artifact_with(16, 77, 80, 20);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), Some(77));
+        let cm = artifact_with(16, 77, 79, 21);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), None);
+    }
+
+    /// An unpopulated slot, and one caught mid-publication, are both "no
+    /// answer" rather than class 0 / class u32::MAX. The installing sentinel is
+    /// the one a concurrent reader can actually observe.
+    #[test]
+    fn an_empty_or_installing_slot_is_not_evidence() {
+        let cm = artifact_with(16, 0, 1000, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), None);
+        let cm = artifact_with(16, JitMICSlot::INSTALLING_CLASS_ID, 1000, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), None);
+    }
+
+    /// A slot with no site — the loop-unroll clones and every test helper —
+    /// must not answer for bci `usize::MAX` or for anything else.
+    #[test]
+    fn a_siteless_slot_answers_for_nothing() {
+        let mut cm = CompiledMethod::new(ExecutableBuffer::new(64).unwrap());
+        let slot = Box::new(JitMICSlot::new());
+        slot.cached_class_id.store(77, Ordering::Relaxed);
+        slot.hits.store(1000, Ordering::Relaxed);
+        cm._jit_mic_slots.push(slot);
+        assert_eq!(cm.dominant_receiver_at_bci(0, SAMPLES, HIT_PCT), None);
+        assert_eq!(cm.dominant_receiver_at_bci(16, SAMPLES, HIT_PCT), None);
+    }
+}
+
 /// the maps contain, and the failure mode if it is not — a real CHA
 /// invalidation silently skipped, leaving a devirtualised call bound to a
 /// method that now has a second implementor — is a miscompile, not a slowdown.
