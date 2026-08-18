@@ -26,7 +26,7 @@
 * **The box ran out of commit charge mid-run.** Between **15:12 and 15:25** three G1 classes died with `memory allocation of 2147483648 bytes failed` — exactly the `-Xmx2g` heap, with `out=0` bytes, so nothing executed — and a fourth named the cause outright: Windows error 1455, *"the paging file is too small to complete the operation"*. The same event killed G1 shard 1 outright (resumed; it then finished 160/163). Anything in that window is suspect, which is why §2 exists.
 * **One shard per backend means no repeat.** A class that is HANG on G1 and PASS on ZGC has been run **once** on each. That is not a backend difference; it is one observation per side.
 * **No HotSpot arm ran in this run** for most classes. Where this page says "HotSpot fails identically" it cites the prior records named in that section, not fresh evidence.
-* **Generational was not run.** Its `[moving-young] fallback` throughput collapse is why it was dropped here — see !dohead-family-consolidated-history-20260813.md in this directory, and springboot/moving-young-fallback-turns-four-classes-red-20260810.md.
+* **Generational was not run.** Its `[moving-young] fallback` throughput collapse is why it was dropped here — see !dohead-family-consolidated-history-20260813.md in this directory, and retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md.
 * **Two findings have FIXED records and still did not pass** — see §10.
 
 ## 2. Not a defect: host pagefile exhaustion (4 classes)
