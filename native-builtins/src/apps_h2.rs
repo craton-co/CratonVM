@@ -2668,29 +2668,46 @@ fn h2_parser_test_token_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if matches!(ctx.get_field_by_name(token, "quoted"), Value::Int(value) if value != 0) {
         return Ok(Some(Value::Int(0)));
     }
+    // `asIdentifier()` runs Java, so a collection can relocate everything this
+    // function is holding in Rust locals — where no root scan can see them.
+    // Caught by `CRATONVM_DBG_VACATED_FRAMES` on the H2 MVStore-writer repro:
+    // `load_and_forward` was handed a moved `this` from the `identifiersToUpper`
+    // read below, with the backtrace naming this function.
+    //
+    // The previous shape pinned two of the three and re-read them **inside the
+    // match arm**, so the re-read values died with the arm's scope and the
+    // stale outer `expected` was the one that reached `native_string_equals`.
+    // `this` was never pinned at all. Pin all three across the callback and
+    // re-bind the OUTER names from the pins afterwards, so there is no shadow
+    // to lose. `identifier` is pinned too: it is live across the
+    // `identifiersToUpper` read below, which can itself collect.
+    let mut this = this;
+    let mut expected = expected;
     let identifier = match ctx.get_field_by_name(token, "identifier") {
         Value::Object(Some(value)) => value,
         _ => {
+            let this_pin = ctx.pin_native_root(this);
             let expected_pin = ctx.pin_native_root(expected);
             let token_pin = ctx.pin_native_root(token);
             let token = ctx.read_native_pin(token_pin, token);
             let result = ctx.invoke_virtual(token, "asIdentifier", "()Ljava/lang/String;", &[])?;
-            let expected = ctx.read_native_pin(expected_pin, expected);
-            ctx.unpin_native_roots(token_pin);
-            ctx.unpin_native_roots(expected_pin);
+            this = ctx.read_native_pin(this_pin, this);
+            expected = ctx.read_native_pin(expected_pin, expected);
+            ctx.unpin_native_roots(this_pin);
             match result { Some(Value::Object(Some(value))) => value, _ => return Ok(Some(Value::Int(0))) }
         }
     };
-    if matches!(ctx.get_field_by_name(this, "identifiersToUpper"), Value::Int(value) if value != 0) {
-        return crate::lang_string::native_string_equals(
-            ctx,
-            &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
-        );
+    let identifier_pin = ctx.pin_native_root(identifier);
+    let expected_pin = ctx.pin_native_root(expected);
+    let upper = matches!(ctx.get_field_by_name(this, "identifiersToUpper"), Value::Int(value) if value != 0);
+    let identifier = ctx.read_native_pin(identifier_pin, identifier);
+    let expected = ctx.read_native_pin(expected_pin, expected);
+    ctx.unpin_native_roots(identifier_pin);
+    let args = [Value::Object(Some(expected)), Value::Object(Some(identifier))];
+    if upper {
+        return crate::lang_string::native_string_equals(ctx, &args);
     }
-    crate::lang_string::native_string_equals_ignore_case(
-        ctx,
-        &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
-    )
+    crate::lang_string::native_string_equals_ignore_case(ctx, &args)
 }
 
 /// Exact UTF-16-code-unit comparison used by H2's tokenizer for case-insensitive
