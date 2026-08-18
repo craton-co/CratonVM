@@ -66,9 +66,10 @@ use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use super::asn1;
 
 /// The single declared instance slot of `X500Principal` (`thisX500Name`).
-/// We repurpose it to hold the canonical RFC-4514 DN string; the DER form
-/// is re-derived from it on demand (see `get_der`) since the real JDK
-/// class has no second field to store it in.
+/// We repurpose it to hold the canonical RFC-4514 DN string. The real JDK
+/// class has no second field for the DER, so the encoding a principal was
+/// built from is kept beside the object instead (see `x500_der_table`) —
+/// re-deriving it from this string loses the ASN.1 string types.
 const FIELD_CANONICAL: usize = 0;
 
 // ---------------------------------------------------------------------------
@@ -467,7 +468,8 @@ fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 /// is never persisted as a field — `get_der` re-derives it on demand by
 /// re-encoding the canonical string, which is byte-stable for the canonical
 /// `Name` form.
-fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, _der: &[u8]) {
+fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, der: &[u8]) {
+    remember_der(ctx, this, der);
     let s = ctx.create_string(canonical);
     // Write the canonical string into the one declared instance slot.
     // `set_field_by_name` resolves `thisX500Name` to slot 0; the explicit
@@ -518,15 +520,103 @@ fn get_canonical(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String>
     None
 }
 
+/// How many principals' encodings to keep. Bounded because the table is keyed
+/// by identity hash and nothing tells us when a principal dies.
+const X500_DER_MAX_ENTRIES: usize = 4096;
+
+/// The ORIGINAL DER of principals constructed from DER, keyed by identity hash.
+///
+/// `X500Principal` declares one instance field and `populate` needs it for the
+/// canonical string, so there is nowhere on the object to keep the encoding.
+/// It nevertheless has to be kept. The canonical RFC-4514 string does not
+/// carry the ASN.1 STRING TYPE of each attribute value, so re-encoding it is
+/// NOT the identity function — and `get_der` used to do exactly that, under a
+/// comment asserting "the canonical `Name` form is byte-stable, so this
+/// round-trips exactly". It is not, and the difference is interop-visible,
+/// because RFC 5280 name matching is byte equality over the DER.
+///
+/// Measured (`IdpDbg` probe, jdk-25 as the control): BouncyCastle writes
+/// `CN=Root,O=BC` with UTF8String, tag `0c`; re-encoding the canonical string
+/// picks PrintableString, tag `13`, because the characters permit it.
+///
+/// ```text
+/// certGn  ...06035504030c04526f6f74...   from the certificate  (0c = UTF8String)
+/// expGn   ...0603550403 1304526f6f74...  rebuilt via X500Principal (13 = Printable)
+/// equals=false          -- and both print `CN=Root,O=BC,OU=Test+O=Bouncy`
+/// ```
+///
+/// So `X509CRL.getIssuerX500Principal().getEncoded()` disagreed with the CRL's
+/// own issuer bytes, and BouncyCastle's
+/// `PKIXCRLValidator.checkDistributionPointName` compared two `GeneralName`s
+/// that RENDER identically and are not equal. That is `IDPRelativeNameTest`,
+/// where the expanded distribution-point name never matched the certificate's;
+/// the reported failure named a DIFFERENT distribution point, because
+/// `checkCRLs` keeps only the LAST exception and retries with one synthesised
+/// from the issuer.
+fn x500_der_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Vec<u8>>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the encoding this principal was built from.
+fn remember_der(ctx: &mut dyn NativeContext, this: ObjectRef, der: &[u8]) {
+    if der.is_empty() {
+        return;
+    }
+    let id = ctx.identity_hash_code(this);
+    let mut t = match x500_der_table().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if t.len() >= X500_DER_MAX_ENTRIES {
+        let target = X500_DER_MAX_ENTRIES / 2;
+        let mut ids: Vec<i32> = t.keys().copied().filter(|&k| k != id).collect();
+        ids.sort_unstable();
+        let to_remove = t.len().saturating_sub(target);
+        for k in ids.into_iter().take(to_remove) {
+            t.remove(&k);
+        }
+    }
+    t.insert(id, der.to_vec());
+}
+
+/// The recorded encoding, but only if it still describes THIS principal.
+///
+/// An identity hash is not a handle: two live objects may share one, and the
+/// table outlives the principal that filled it. Handing back a stranger's DER
+/// from an identity object would be worse than re-encoding, so the entry is
+/// only used when decoding it reproduces the canonical name the object
+/// currently carries. A miss falls back to the previous behaviour.
+fn recall_der(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str) -> Option<Vec<u8>> {
+    let id = ctx.identity_hash_code(this);
+    let der = {
+        let t = match x500_der_table().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        t.get(&id).cloned()?
+    };
+    let rdns = decode_rdns(&der).ok()?;
+    if render_canonical(&rdns) == canonical {
+        Some(der)
+    } else {
+        None
+    }
+}
+
 /// Read the DER encoding of an instance.
 ///
-/// The real JDK `X500Principal` has only one instance field, so there is no
-/// slot to persist the DER bytes in — `populate` stores just the canonical
-/// RFC-4514 string.  The DER is re-derived here by re-encoding that string;
-/// the canonical `Name` form is byte-stable, so this round-trips exactly.
+/// The encoding the principal was BUILT from wins, so `new X500Principal(der)
+/// .getEncoded()` returns `der` — see [`x500_der_table`] for why re-deriving it
+/// from the canonical string is not the same thing. Re-encoding remains the
+/// fallback for principals built from a string (where it is exact, since there
+/// was no original) and for any entry that can no longer be trusted.
 fn get_der(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
-    // Re-encode from the canonical string preserved by `populate`.
     if let Some(canon) = get_canonical(ctx, this) {
+        if let Some(der) = recall_der(ctx, this, &canon) {
+            return der;
+        }
         let groups = parse_grouped_rdns(&canon);
         if !groups.is_empty() {
             return encode_grouped_rdns_to_der(&groups);

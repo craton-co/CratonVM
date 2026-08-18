@@ -775,22 +775,29 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         "keystore.type" => "PKCS12",
         "ssl.KeyManagerFactory.algorithm" => "SunX509",
         "ssl.TrustManagerFactory.algorithm" => "PKIX",
-        // Not one of this VM's four deliberate answers.
+        // Not one of this VM's four deliberate answers: ask the JDK's own
+        // `conf/security/java.security`, which is right here, rather than
+        // reporting "no such property" for the whole file.
         //
-        // The JDK's own `conf/security/java.security` is RIGHT HERE and this
-        // could read it — `java_security_file_property` below does, and it is
-        // kept for that reason. It is not wired in, because turning it on is
-        // not free: the stock file sets `keystore.type.compat=true`, which is
-        // the gate BouncyCastle's `AdaptingKeyStoreSpi` uses to probe a stream
-        // for JKS, and that path then builds a PKCS#12 MAC through
-        // `Mac.getInstance(name, providerObject)` — an overload this VM refuses
-        // for EVERY BouncyCastle name while serving the `(String, String)` form
-        // of the same name (`MacProvObj` probe; HotSpot serves both). Wiring
-        // the file in without fixing that took `cert.test` from PASS to FAIL
-        // and moved `PKCS12StoreTest` from one failure to another.
-        //
-        // So: fix the Provider-object overload first, then delete this arm.
-        _ => return Ok(Some(Value::Object(None))),
+        // This arm was written and left UNWIRED for one release cycle, because
+        // turning it on is not free: the stock file sets
+        // `keystore.type.compat=true`, the gate BouncyCastle's
+        // `AdaptingKeyStoreSpi` uses to probe a stream for JKS, and that path
+        // then builds a PKCS#12 MAC through
+        // `Mac.getInstance(name, providerObject)` — an overload that refused
+        // every BouncyCastle name. Enabling the file first took `cert.test`
+        // from PASS to FAIL. That overload is fixed now (see
+        // `phases_late::ssl_security`, the `(String, Provider)` registration),
+        // so the gate opens onto a path that works.
+        _ => {
+            return Ok(match java_security_file_property(ctx, &key) {
+                Some(v) => {
+                    let s = ctx.create_string(&v);
+                    Some(Value::Object(Some(s)))
+                }
+                None => Some(Value::Object(None)),
+            })
+        }
     };
     let s = ctx.create_string(val);
     Ok(Some(Value::Object(Some(s))))
@@ -815,7 +822,6 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Parsed once. `java.security` is `key=value` with `#` comments and no
 /// sections; a continuation-free read is enough for the lookups callers make,
 /// and a file that cannot be read leaves every key unanswered exactly as before.
-#[allow(dead_code)]
 fn java_security_file_property(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
     static FILE_PROPS: std::sync::OnceLock<
         parking_lot::Mutex<Option<std::collections::HashMap<String, String>>>,
@@ -2529,6 +2535,27 @@ fn seed_sunjce_pbe_services() {
 /// `new_object_initialized(cls, "()V", &[])` runs real provider bytecode.
 fn seed_sunjsse_services() {
     const J: &str = "SunJSSE";
+    // SunJSSE registers `KeyStore.PKCS12` in its OWN table as well as SUN's,
+    // pointing at the plain (non-dual-format) implementation. Applications ask
+    // for it by name to read a PKCS#12 written elsewhere with the platform's
+    // own store rather than the writer's — `PKCS12StoreTest`'s
+    // `checkNoDuplicateOracleTrustedCertAttribute` writes with BouncyCastle and
+    // then does exactly that:
+    //
+    // ```java
+    // KeyStore.getInstance("PKCS12", "SunJSSE")
+    // ```
+    //
+    // Without this row the provider resolved, the ownership check refused, and
+    // the call was `NoSuchAlgorithmException: no such algorithm: PKCS12 for
+    // provider SunJSSE` — a JDK provider being told it does not implement the
+    // one KeyStore it is best known for.
+    put_service(
+        J,
+        "KeyStore",
+        "PKCS12",
+        "sun.security.pkcs12.PKCS12KeyStore",
+    );
     // KeyManagerFactory
     put_service(
         J,
@@ -2624,13 +2651,32 @@ fn seed_sunjsse_services() {
     put_alias(J, "SSLContext", "SSL", "TLS");
     // `Alg.Alias.SSLContext.SSLv3 -> TLSv1` on the platform JDK — NOT to TLS.
     put_alias(J, "SSLContext", "SSLv3", "TLSv1");
-    // KeyStore lives in the SUN provider (JKS/CaseExactJKS) and PKCS12 too.
+    // KeyStore lives in the SUN provider (JKS/CaseExactJKS/PKCS12/DKS).
+    //
+    // These five rows are transcribed from the platform JDK, not from memory —
+    // every one of them was wrong before, and each wrong in a way that is
+    // invisible until something asks the exact question (`KsOwner` probe,
+    // measured on jdk-25 on this host):
+    //
+    // ```text
+    // SUN     KeyStore.PKCS12 -> sun.security.pkcs12.PKCS12KeyStore$DualFormatPKCS12
+    // SUN     KeyStore.JKS    -> sun.security.provider.JavaKeyStore$DualFormatJKS
+    // SUN     KeyStore.DKS    -> sun.security.provider.DomainKeyStore$DKS
+    // SunJSSE KeyStore.PKCS12 -> sun.security.pkcs12.PKCS12KeyStore
+    // KeyStore.getInstance("PKCS#12") -> KeyStoreException: PKCS#12 not found
+    // ```
+    //
+    // The `DualFormat*` classes are the point of the SUN rows: they are
+    // `KeyStoreDelegator`s that sniff the stream and accept EITHER format,
+    // which is what makes `keystore.type.compat` mean anything. Naming the
+    // plain `PKCS12KeyStore` under SUN quietly removed that, so a JKS stream
+    // handed to the platform default failed instead of being detected.
     const S: &str = "SUN";
     put_service(
         S,
         "KeyStore",
         "JKS",
-        "sun.security.provider.JavaKeyStore$JKS",
+        "sun.security.provider.JavaKeyStore$DualFormatJKS",
     );
     put_service(
         S,
@@ -2642,9 +2688,19 @@ fn seed_sunjsse_services() {
         S,
         "KeyStore",
         "PKCS12",
-        "sun.security.pkcs12.PKCS12KeyStore",
+        "sun.security.pkcs12.PKCS12KeyStore$DualFormatPKCS12",
     );
-    put_alias(S, "KeyStore", "PKCS#12", "PKCS12");
+    put_service(
+        S,
+        "KeyStore",
+        "DKS",
+        "sun.security.provider.DomainKeyStore$DKS",
+    );
+    // NO `PKCS#12` alias. The JDK does not register one and
+    // `KeyStore.getInstance("PKCS#12")` is a `KeyStoreException` there —
+    // measured. This VM invented the alias, so a spelling the platform refuses
+    // silently succeeded here, which is the wrong-accept direction: code that
+    // works on this VM and dies on every real JDK.
     // CertificateFactory X.509 (SUN provider) — needed by the real
     // X509CertImpl/Validator path: the SunX509 KeyManager + PKIX TrustManager
     // build/validate cert chains via `CertificateFactory.getInstance("X.509")`.
