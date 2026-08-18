@@ -1,109 +1,158 @@
-# `BigDecimal` arithmetic is 50-64x slower than HotSpot — enough to turn a 4s test into an effective hang
+# `BigDecimal` arithmetic is 50-64x slower than HotSpot — profiled 2026-08-18: the arithmetic is ~2% of the profile, and there is no single hotspot
 
-**Status: OPEN, measured 2026-08-17, root cause not isolated, no fix attempted.**
+**Status: OPEN, perf. Profiled 2026-08-18 on `dev` `64c02b7ac`; the original
+per-call-overhead hypothesis is REFUTED in the form it was written. No fix
+attempted — but the plan this page used to prescribe is now known to be the
+wrong one, and its replacement is measured rather than reasoned from shape.**
 
 Found triaging the Apache Commons Math test suite
-(`apps/commons-math/RESULTS-20260817.md`): `LegendreHighPrecisionTest` (2
-JUnit methods, computing 60-digit-precision Gauss-Legendre quadrature rules
-via `java.math.BigDecimal` Newton-Raphson root-finding) never finishes —
-still making genuine forward progress after 90s+ (confirmed via
-`--stack-dump-on-timeout`, three dumps 10s apart all show a legitimate,
-bounded ~119-frame recursion through
-`BaseRuleFactory.getRuleInternal`/`LegendreHighPrecisionRuleFactory.computeRule`,
-not a deadlock or unbounded blowup). **HotSpot runs the identical class in
-3.75s.**
+(`apps/commons-math/RESULTS-20260817.md`): `LegendreHighPrecisionTest` (2 JUnit
+methods, computing 60-digit-precision Gauss-Legendre quadrature rules via
+`java.math.BigDecimal` Newton-Raphson root-finding) never finishes — still
+making genuine forward progress after 90s+, a legitimate bounded ~119-frame
+recursion, not a deadlock. **HotSpot runs the identical class in 3.75s.**
 
-## Isolated measurement
+## The gap, re-measured on current dev
 
-The recursion depth (~60, one level per rule order 1..60) is not the
-problem — it is small and bounded, and each level's `TreeMap` cache lookup
-means every order is computed at most once (i.e. this is *not* an exponential
-recomputation bug; the algorithm's own structure is linear in the requested
-order). The cost is per-operation: `BigDecimalBench.java`, a standalone
-microbenchmark with no test-suite scaffolding —
+`probes/BigDecimalBench.java` — the repro is **a file now**. The previous
+revision described it inline and called it "trivial to recreate", which is how a
+benchmark stops being comparable: the next person retypes it slightly
+differently. It also gates on a checksum *before* timing, so a build that is
+fast because it is wrong fails instead of posting a good number.
 
-```java
-MathContext mc = new MathContext(60);
-BigDecimal a = new BigDecimal("1.23456789012345678901234567890123456789", mc);
-BigDecimal b = new BigDecimal("9.87654321098765432109876543210987654321", mc);
-BigDecimal acc = BigDecimal.ZERO;
-for (int i = 0; i < 200_000; i++) {
-    BigDecimal x = a.multiply(b, mc).add(a.divide(b, mc), mc).subtract(b, mc);
-    acc = acc.add(x, mc);
-}
-```
+| host | HotSpot 25 | CratonVM | ratio |
+|---|---:|---:|---:|
+| Windows, 32 core | 212-215 ms | 13,537-19,192 ms | **63-89x** |
+| Azure Linux, 8 core | 1,002 ms | ~12,400 ms (50k x4) | **12x** |
 
-| | HotSpot 25 | CratonVM (JIT on) |
-|---|---:|---:|
-| 200,000 iterations (`multiply`+`divide`+`add`+`subtract`+`add`, 60-digit `MathContext`) | **288 ms** | **14,898-18,484 ms** |
-| ratio | 1x | **52-64x slower** |
+Both VMs print the identical checksum, so **CratonVM is correct here, only
+slow**. The Linux ratio is smaller because that host's HotSpot is ~5x slower
+than the Windows one while CratonVM is about the same on both — worth knowing
+before quoting any single number as "the" ratio.
 
-Reproduced across two separate builds (dev `2f4b2f82c` and `29ed5d43e`),
-consistent magnitude both times. `--nojit` did not finish within a 90s cap on
-the same 200,000-iteration loop that took 14.9-18.5s with JIT on — so JIT
-compilation does help here (native `BigDecimal`/`BigInteger` methods clearly
-are being dispatched, not falling through to some untouched interpreter-only
-path), but even the JIT-assisted path is still ~50-60x slower than HotSpot on
-numbers this small (~200 bits / 60 decimal digits) — far too small for
-Karatsuba-vs-schoolbook multiplication complexity class to explain a 60x gap;
-at this size HotSpot's own `BigInteger`/`BigDecimal` also just uses schoolbook
-arithmetic.
+## What the profile actually says
 
-## Why this reads as a per-call overhead, not an algorithmic one
+`perf record -F 999 -g` on the isolated benchmark, Azure Linux. This is the step
+the previous revision asked for and could not run; the Windows dev box has no
+`perf`.
 
-`native-builtins/src/math_bignum.rs` registers real native implementations
-for `BigInteger`/`BigDecimal` arithmetic (`add`, `multiply`, `divide`, etc. —
-not a Java-bytecode fallback), so the operations themselves are not
-interpreted digit-by-digit in bytecode. The loop above makes roughly 5-6
-`BigDecimal`/`BigInteger` native calls per iteration × 200,000 iterations ≈
-1-1.2 million native calls; a **per-call fixed overhead of roughly
-12-15µs** would alone account for the full 14.9-18.5s measured. That
-magnitude and shape (a large, constant per-call tax on a native surface, not
-a complexity-class problem) matches the general pattern of several *already
-fixed* issues on this exact native-dispatch path elsewhere in the codebase —
-see `reference_the_native_funnel_touched_the_thread_state_cell_three_times.md`
-and `reference_an_exception_table_in_the_callee_costs_11x.md` in project
-memory — which is a reasonable place to start looking, though this specific
-surface (`BigInteger`/`BigDecimal` natives) has not itself been profiled here.
-**Not confirmed** — this is a hypothesis from the shape of the numbers, not a
-`perf record` trace; the next step is exactly that (this Windows host has no
-`perf`/`gdb`; the project's Azure Linux hosts do, per
-`reference_gdb_on_azure_names_a_native_sigsegv_caller_in_one_run.md` and
-`reference_perf_record_beats_counter_archaeology.md`).
+**The profile is flat. The largest single symbol is 5.06%.** There is no
+12-15µs-per-call tax sitting in one place, and so there is no single fix.
+Grouped:
+
+| group | share | biggest members |
+|---|---:|---|
+| name / metadata resolution | **~15%** | `resolve_field_index` 5.06, `__memcmp_evex_movbe` 3.31, class-by-name hash search 2.74, `resolve_field_descriptor_byte_cached` 1.67, `get_loaded_class_id` 1.53 |
+| heap address validation + allocation | **~15%** | `is_object_address` 4.50, `ZObjectStarts::contains` 3.81, `alloc_raw_tlab` 3.19, `_mi_page_malloc_zero` 1.92, `load_and_forward` 1.07 |
+| native dispatch plumbing | ~6% | `try_jit_site_cached_native_dispatch` 1.94, `safe_native_call_impl` 1.88, argument forwarding 1.96 |
+| **the bignum arithmetic itself** | **~2%** | `BigInt::to_decimal` 1.29, `bi_read_int` 0.93 |
+
+**Roughly 2% of the time is arithmetic.** The rest is VM plumbing, spread across
+three subsystems with no member above ~5%.
+
+## What was refuted, and what survives
+
+The previous revision reasoned that ~1.1M native calls x a 12-15µs fixed
+per-call tax would account for the whole runtime, that this "matches the general
+pattern of several *already fixed* issues on this exact native-dispatch path",
+and that the fix was therefore "very likely in the same family". It flagged
+itself **not confirmed**, which was the right call — it does not survive:
+
+* **Native dispatch is ~6%, not the bulk.** A fix in the family of the cited
+  dispatch-overhead bugs has a ceiling of a few percent here.
+* **There is no per-call tax on natives generally.** Controls, measured on both
+  VMs with no lambda in the timed loop:
+
+  | | HotSpot | CratonVM | ratio |
+  |---|---:|---:|---:|
+  | `Math.abs` | 20.5 ns | 26.6 ns | **1.3x** |
+  | `String.length` | 37.1 ns | 48.3 ns | **1.3x** |
+  | `BigDecimal.add` | 44.5 ns | 4843 ns | 109x |
+  | `BigInteger.add` | 23.9 ns | 1489 ns | 62x |
+
+  Non-bignum natives are within 1.3x. Whatever is expensive is specific to the
+  bignum surface, not to crossing into native code.
+
+What survives is the coarse claim that this is overhead and not complexity: at
+~200 bits both VMs use schoolbook arithmetic, and the arithmetic is 2% of the
+profile. The page was right that the cost is not algorithmic. It was wrong about
+where the overhead lives, and wrong that it is one thing.
+
+## Two hypotheses tested and killed along the way
+
+Recorded so nobody re-runs them.
+
+1. **"The `MathContext` overloads have no natives, so they run JDK bytecode."**
+   The premise is true — `math_bignum.rs` has **zero** registrations taking a
+   `MathContext`, so `add(BigDecimal, MathContext)` and friends do run the JDK's
+   own bytecode. It is still not the explanation: the MC overload costs ~2x the
+   plain one on *both* VMs (`add`: 19.3→37.4 ns HotSpot, 1927→3991 ns CratonVM),
+   so the CratonVM/HotSpot ratio is ~100x either way. The plain, fully-native
+   `add(BigDecimal)` is already 100x slower. Registering MC overloads would not
+   address this.
+2. **A first per-op breakdown that put a `Runnable` in every timed loop.** It
+   showed ~1.1µs/op *controls* and looked like a universal per-call tax. That
+   was the harness: one SAM dispatch per iteration, on a tree with an open
+   `lambda-sam-dispatch-bypasses-the-cached-invoke-path` issue. Rewritten with
+   plain monomorphic loops the controls drop to 1.3x. **A microbenchmark that
+   dials through a lambda is measuring the lambda.**
+
+## Where to actually look, in profile order
+
+Nothing below is attempted. Each carries the ceiling it can buy, so nobody
+spends a week on a 5% item expecting 60x.
+
+1. **`resolve_field_index` (5.06%, plus much of the 3.31% `memcmp`).**
+   `bd_layout` resolves `intVal` / `scale` / `precision` / `intCompact` **by name
+   on every call**, and `resolve_field_index_in_hierarchy_desc` is a linear
+   string-compare scan over every non-static field, walking the superclass chain.
+   `native_bd_add` pays that for both operands and the result, plus `bi_layout`
+   for each `BigInteger`. Memoizing the layout is contained and is the single
+   biggest coherent item — **ceiling ~8%, i.e. 1.09x, not 60x.** Note AGENTS.md
+   forbids process globals for per-VM state, so the cache must hang off the VM
+   rather than a `static`.
+2. **Heap address validation (~8%: `is_object_address` + `ZObjectStarts::contains`).**
+   Every `get_array_element` / `set_field` from a native re-validates the
+   address, and the bignum natives walk `mag:[I` element by element, so this
+   scales with digit count.
+3. **Allocation (~7%).** Each operation allocates a `BigDecimal`, a `BigInteger`
+   and an `int[]`.
+4. **`BigInt::to_decimal` at 1.29%** — a decimal *rendering* on a path that
+   should be pure limbs. Small, but it is exactly the kind of decimal round trip
+   the limb rewrite retired elsewhere, so it may be a loose end rather than a
+   cost.
+
+The honest summary for planning: **no single change here returns the 12-64x.**
+Three subsystems each cost several times what the arithmetic does, and closing
+the gap means making native→heap interaction cheap in general, not patching
+`math_bignum.rs`.
 
 ## Reproduction
 
 ```bash
-CV="<worktree>/target/release/cratonvm.exe"
-JDK="<jdk25>"
-
-# LegendreHighPrecisionTest: HotSpot 3.75s, CratonVM does not finish in 90s+
-CP="<see apps/commons-math/RESULTS-20260817.md>"
-RUNNER="<CratonRunner.java from apps/netty-suite-runner/, compiled standalone>"
-timeout 90 "$CV" --java-home "$JDK" --Xmx 1g -c "$RUNNER;$CP" CratonRunner \
-  org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionTest
-
-# Isolated microbenchmark, no test-suite dependency (see BigDecimalBench.java
-# above — trivial to recreate): 200,000 60-digit BigDecimal ops.
-# HotSpot: ~0.3s. CratonVM: ~15-18s.
-"$JDK/bin/java" -cp <dir> BigDecimalBench
-"$CV" --java-home "$JDK" --Xmx 1g -c <dir> BigDecimalBench
+javac -d <dir> probes/BigDecimalBench.java
+java -cp <dir> BigDecimalBench 200000                       # HotSpot
+<cratonvm> --java-home <jdk-25> --Xmx 1g -cp <dir> BigDecimalBench 200000
 ```
 
-## What would fix it
+Profiling needs a Linux host (`perf` is absent on the Windows dev box):
 
-Not attempted here. First step for whoever picks this up: `perf record` (or
-equivalent) on the isolated `BigDecimalBench` repro — small, self-contained,
-no JUnit/suite scaffolding, fast to iterate on — to confirm or refute the
-per-call-overhead hypothesis above before touching
-`native-builtins/src/math_bignum.rs`. If confirmed, the fix is very likely in
-the same family as the two already-fixed native-dispatch-overhead bugs cited
-above, not in the arithmetic itself.
+```bash
+perf record -F 999 -g --call-graph=fp -o bd.perf.data -- \
+  <cratonvm> --java-home <jdk-25> --Xmx 1g -cp <dir> BigDecimalBench 50000
+perf report -i bd.perf.data --stdio --no-children --percent-limit 0.5
+```
+
+Call-graph note: `--call-graph=fp` yields shallow stacks on this release build
+(`--children` attributes 18% to `osr_trampoline` and stops being informative),
+so the flat profile above is the usable view. Capture with `dwarf` if caller
+breakdown is needed.
 
 ## Related
 
 * `apps/commons-math/RESULTS-20260817.md` — the suite run this was found from.
 * `docs/known-issues/jit/bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-20260817.md`
-  — the other CratonVM-only "hang" found in the same run; a different root
-  cause (OSR refusal, not raw arithmetic cost) that happens to produce the
-  same symptom (a test that never finishes).
+  — the other CratonVM-only "hang" from the same run; different root cause, same
+  symptom.
+* `docs/known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`
+  — why the first per-op breakdown here measured its own harness.
