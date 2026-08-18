@@ -2194,23 +2194,37 @@ pub(super) fn try_osr(
     // frame's current bytecode, so there is nothing stale left to protect
     // against here. See the note in `interpreter.rs`'s compile gate.
     let frame = &thread.frames[frame_idx];
-    let class_name = frame.class_name().to_string();
-    let method_name = frame.method_name().to_string();
-    let method_descriptor = frame.method_descriptor().to_string();
+    // Six heap allocations — three `to_string()` and three `Arc::from(&str)` —
+    // used to run here, on EVERY back-edge that reaches this function, which is
+    // once per OSR entry and not once per compile. The frame already holds all
+    // three as `Arc<str>`, so `*_arc()` is a refcount bump; the `&str` views the
+    // rest of the function wants come straight off those.
+    //
+    // It matters because entries are not rare: since the RBC.6b lift a caught
+    // exception is an OSR exit plus a re-entry, so a `try`/`catch` loop takes
+    // one entry per throw — measured `osr_entered=2280923` on
+    // `probes/OsrExcRateProbe.java`, i.e. 13.7 million allocations that bought
+    // nothing. `perf record` on that arm put 8.6% of the run in
+    // `mi_malloc`/`mi_free`.
+    //
+    // `frame.code` was already an `Arc<[u8]>` clone and stays one.
+    let class_name_arc: Arc<str> = frame.class_name_arc();
+    let method_name_arc: Arc<str> = frame.method_name_arc();
+    let descriptor_arc: Arc<str> = frame.method_descriptor_arc();
+    let class_name: &str = &class_name_arc;
+    let method_name: &str = &method_name_arc;
+    let method_descriptor: &str = &descriptor_arc;
     let code = frame.code.clone();
     let max_locals = frame.max_locals as usize;
-    let class_name_arc: Arc<str> = Arc::from(class_name.as_str());
-    let method_name_arc: Arc<str> = Arc::from(method_name.as_str());
-    let descriptor_arc: Arc<str> = Arc::from(method_descriptor.as_str());
     // wire-tiered-manager Step 5: the OSR compile (or cache reuse) now lives in
     // `compile_osr_artifact`, which the background worker can also call off-thread.
     // The live-frame entry/transfer below stays on the mutator.
     let compiled = compile_osr_artifact(
         shared,
         class_id,
-        class_name.clone(),
-        method_name.clone(),
-        method_descriptor.clone(),
+        class_name.to_string(),
+        method_name.to_string(),
+        method_descriptor.to_string(),
         &code,
         max_locals,
         entry_pc,
