@@ -280,9 +280,22 @@ The order is therefore:
 
    Still to do here: the other two sinks (`build_deopt_frame_inner` and the
    OSR-exit transfer, which is item 2 below).
-2. **Multi-frame OSR-exit transfer**, and only then relax `osr_exit_policy`'s
-   `caller.is_some()` refusal. Steps 1 and 2 are what make an inlined artifact
-   usable by an OSR-only method at all.
+2. ~~Multi-frame OSR-exit transfer, then relax `osr_exit_policy`.~~ **DONE
+   2026-08-18.** `transfer_osr_exit_chain_into_live_frame` handles the two
+   halves a chain has, which are not alike: the outermost scope IS the OSR'd
+   method, so its frame already exists and is written in place, parked at the
+   SUCCESSOR of its invoke; every scope beneath it is pushed. All the fallible
+   work happens before the live frame is touched, because a partial success here
+   would leave a live frame describing one method and a pushed frame describing
+   another.
+
+   Admission relaxed exactly as far: a deopt point may carry a chain up to
+   `MAX_OSR_INLINE_RESUME_DEPTH`, defined once in the jit crate and consumed by
+   the VM so the two cannot drift. The **entry contract** keeps its blanket
+   refusal — an OSR entry pc is always an outer-scope block start, so a contract
+   naming an inlined scope is malformed rather than deep. Those were two rules
+   wearing one tag, and 08-17's pinning test caught its own drift by continuing
+   to pass for the wrong reason after the relaxation.
 3. **Inline scopes in deopt metadata** — give `FrameState::caller` a producer.
    The IR-side representation is already built and tested
    (`docs/jit/deopt-inline-scopes.md`: `InlineScopeTable`, `caller_chain_for`,

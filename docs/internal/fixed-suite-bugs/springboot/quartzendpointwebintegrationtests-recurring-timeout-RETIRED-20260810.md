@@ -54,7 +54,7 @@ mechanism, measured the same way, that kills
 > clean arm and should be re-taken, and the doc's historical `FAIL 3/45` and
 > `4/45` rows may be this defect rather than the class's own failures. The
 > re-measured numbers live in
-> [`moving-young-fallback-turns-four-classes-red-20260810.md`](../../../known-issues/springboot/moving-young-fallback-turns-four-classes-red-20260810.md),
+> [`retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md`](../../../known-issues/retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md),
 > where Quartz post-fix OOMs at 8,704s with one Spring context taking 910s to
 > initialise. The retirement verdict — recurring HANG is the fallback, not the
 > class being heavy, and no `slowClasses` entry is warranted — is unchanged.
