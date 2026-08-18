@@ -14129,6 +14129,35 @@ fn clear_jit_recursive_cycle_methods_for_test() {
     JIT_COMPILE_STACK.with(|stack| stack.borrow_mut().clear());
 }
 
+/// Pack a `multianewarray` site's `(holder_class_id, cp_idx)` into the single
+/// i64 immediate the backend hands to the `multianewarray_2d` helper.
+///
+/// Windows x64 gives a helper only four register arguments and the helper
+/// already spends three on `(vm_ptr, dim1, dim2)`, so the site description has
+/// to fit in one. `ClassId` is a `u32` and a constant-pool index is a `u16`, so
+/// both fit with room to spare: class id in the low 32 bits, cp index in the
+/// next 16.
+///
+/// The helper cannot be given a pre-resolved class instead. Resolution defines
+/// array classes and can run a user `ClassLoader.loadClass` — arbitrary Java —
+/// which a background compile thread must not do; it belongs on the executing
+/// thread at first execution, the way the `new`/`anewarray` CP-indexed helpers
+/// already work. See [`unpack_multianewarray_site`] for the inverse, and
+/// `vm::jit::helpers::jit_multianewarray_2d` for the consumer.
+#[inline]
+#[must_use]
+pub fn pack_multianewarray_site(holder_class_id: u32, cp_idx: u16) -> i64 {
+    (u64::from(holder_class_id) | (u64::from(cp_idx) << 32)) as i64
+}
+
+/// Inverse of [`pack_multianewarray_site`]: `(holder_class_id, cp_idx)`.
+#[inline]
+#[must_use]
+pub fn unpack_multianewarray_site(site: i64) -> (u32, u16) {
+    let bits = site as u64;
+    (bits as u32, (bits >> 32) as u16)
+}
+
 /// Try to JIT-compile a cached bytecode method.
 ///
 /// The `helpers` parameter provides function pointer addresses for runtime callbacks
@@ -17612,29 +17641,31 @@ fn try_compile_inner(
     // separable from "the C2 tier was never asked".
     metrics.enter_single_pass();
 
-    // Resolve multianewarray entries
+    // Resolve multianewarray entries.
+    //
+    // What travels to the backend is the site's `(holder_class_id, cp_idx)`,
+    // packed — see `pack_multianewarray_site`. The helper resolves the array
+    // class from it at run time through the same
+    // `interpreter::multianewarray_alloc` the interpreter uses, so both tiers
+    // stamp the same per-level component classes. The old shape was a leaf
+    // element-type code, which named no class at all: the helper allocated
+    // every level with `ClassId(0)` and a compiled `new String[a][b]` read back
+    // as `[Ljava.lang.Object;`, so any `checkcast` to the declared array type
+    // threw. The resolver call stays, because a CP index that does not name a
+    // class is still a whole-compile refusal.
     let mut mna_info = Vec::new();
     if !scan.multianewarray_ops.is_empty() {
         let Some(resolver) = cp_class_name_resolver else {
             jitc_bail!("cp_class_name_resolver(multianewarray)")
         };
         for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-            let Some(class_name) = resolver(cp_idx) else {
+            let Some(_class_name) = resolver(cp_idx) else {
                 jitc_bail!("multianewarray_class")
             };
-            let leaf = class_name.trim_start_matches('[');
-            let leaf_et = match leaf.as_bytes().first() {
-                Some(b'I') => 10u8,
-                Some(b'J') => 11,
-                Some(b'F') => 6,
-                Some(b'D') => 7,
-                Some(b'B') => 8,
-                Some(b'C') => 5,
-                Some(b'S') => 9,
-                Some(b'Z') => 4,
-                _ => 0,
-            };
-            mna_info.push((pc, leaf_et));
+            mna_info.push((
+                pc,
+                pack_multianewarray_site(cached.declaring_class_id.as_u32(), cp_idx),
+            ));
         }
     }
 
@@ -20451,6 +20482,120 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// `pack_multianewarray_site` must survive the round trip for every class
+    /// id and cp index a real site can carry, and must not let one field bleed
+    /// into the other.
+    ///
+    /// The packing exists only because Windows x64 gives a helper four register
+    /// arguments and three are already spent; if it ever silently truncated, the
+    /// helper would resolve the WRONG constant-pool entry and allocate an array
+    /// of the wrong class — which is precisely the defect the packed site was
+    /// introduced to fix, reappearing one layer down.
+    #[test]
+    fn multianewarray_site_packing_round_trips() {
+        for &cid in &[0u32, 1, 7, 4096, 0x0001_0000, 0x7FFF_FFFF, u32::MAX] {
+            for &cp in &[0u16, 1, 7, 255, 256, 4095, u16::MAX] {
+                let (got_cid, got_cp) =
+                    crate::unpack_multianewarray_site(crate::pack_multianewarray_site(cid, cp));
+                assert_eq!(
+                    (got_cid, got_cp),
+                    (cid, cp),
+                    "multianewarray site packing lost information for \
+                     (class_id={cid}, cp_idx={cp})"
+                );
+            }
+        }
+        // The two fields must be independent: changing only the cp index must
+        // not move the class id, and vice versa.
+        assert_ne!(
+            crate::pack_multianewarray_site(5, 1),
+            crate::pack_multianewarray_site(5, 2)
+        );
+        assert_ne!(
+            crate::pack_multianewarray_site(5, 1),
+            crate::pack_multianewarray_site(6, 1)
+        );
+    }
+
+    /// The `multianewarray` lowering must hand the helper the packed SITE, not
+    /// a pre-digested element type.
+    ///
+    /// A leaf element-type code names no class, so the helper could only
+    /// allocate with `ClassId(0)`: a JIT-compiled `new String[a][b]` came back
+    /// with `getClass() == [Ljava.lang.Object;` and every `checkcast` to the
+    /// declared array type threw. Commons Math's `DSCompiler.getCompiler`
+    /// publishes such an array through an `AtomicReference` and casts it back on
+    /// the next call — 118 of `DerivativeStructureTest`'s 124 methods failed
+    /// under the JIT and none under `--nojit`.
+    ///
+    /// This is a source witness because the alternative is a full `Vm` plus a
+    /// hand-built classfile; it is anchored on code text, not line numbers.
+    #[test]
+    fn multianewarray_lowering_passes_the_resolved_site_not_an_element_type() {
+        let src = std::fs::read_to_string(format!(
+            "{}/src/x64/bytecode_walk.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read bytecode_walk.rs");
+
+        let arm = src
+            .find("// multianewarray — allocate multi-dimensional array (2D only)")
+            .expect("the multianewarray arm must still exist");
+        let end = src[arm..]
+            .find("self.helpers.multianewarray_2d")
+            .map(|off| arm + off)
+            .expect("the arm must still call the multianewarray_2d helper");
+        let body = &src[arm..end];
+
+        assert!(
+            body.contains("multianewarray_info"),
+            "the multianewarray lowering must look its site up in \
+             `multianewarray_info`"
+        );
+        assert!(
+            !body.contains("unwrap_or(10)"),
+            "the multianewarray lowering must not fall back to a default \
+             element type: there is no default array CLASS, and a site with no \
+             resolved entry has to bail rather than allocate the wrong type"
+        );
+        assert!(
+            body.contains("emit_mov_imm64"),
+            "the packed site is a 64-bit immediate (class id + cp index); a \
+             32-bit move would truncate the cp index away"
+        );
+    }
+
+    /// The helper must resolve through the interpreter's own multianewarray
+    /// body, not carry a second transcription of JVMS §multianewarray.
+    ///
+    /// The two WERE separate copies, and only the interpreter's resolved the
+    /// per-level component classes. That is the whole defect; a second copy
+    /// reappearing is the whole regression.
+    #[test]
+    fn multianewarray_helper_calls_the_shared_interpreter_body() {
+        let helpers = std::fs::read_to_string(format!(
+            "{}/../vm/src/jit/helpers.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read vm/src/jit/helpers.rs");
+        let f = helpers
+            .find("pub unsafe extern \"C\" fn jit_multianewarray_2d(")
+            .expect("the multianewarray helper must still exist");
+        let body = &helpers[f..f + 4000];
+        assert!(
+            body.contains("multianewarray_alloc("),
+            "jit_multianewarray_2d must call `interpreter::multianewarray_alloc`; \
+             a private allocation loop here is how the JIT came to stamp \
+             `ClassId(0)` on every level"
+        );
+        assert!(
+            !body.contains("ClassId::new(0)"),
+            "jit_multianewarray_2d must not allocate any level with `ClassId(0)`: \
+             that is what made `new String[a][b]` read back as \
+             `[Ljava.lang.Object;`"
+        );
+    }
 
     /// RBC.6's admission list must match what the lowerings actually publish.
     ///
