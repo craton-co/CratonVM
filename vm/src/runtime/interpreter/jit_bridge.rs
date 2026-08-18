@@ -7682,34 +7682,50 @@ fn resolve_inline_site_from(
                     let (dom, evidence) = match profile_dom {
                         Some(d) => (d, "profile"),
                         None => {
-                            let from_cache = shared
-                                .jit
-                                .jit_cache
-                                .read()
-                                .get(
-                                    &Arc::from(callee_class),
-                                    &Arc::from(callee_method),
-                                    &Arc::from(callee_desc),
-                                    declaring_id,
+                            let artifact = shared.jit.jit_cache.read().get(
+                                &Arc::from(callee_class),
+                                &Arc::from(callee_method),
+                                &Arc::from(callee_desc),
+                                declaring_id,
+                            );
+                            let from_cache = artifact.as_ref().and_then(|cm| {
+                                cm.dominant_receiver_at_bci(
+                                    *ipc,
+                                    MIN_MIC_DEVIRT_SAMPLES,
+                                    MIN_MIC_DEVIRT_HIT_PCT,
                                 )
-                                .and_then(|cm| {
-                                    cm.dominant_receiver_at_bci(
-                                        *ipc,
-                                        MIN_MIC_DEVIRT_SAMPLES,
-                                        MIN_MIC_DEVIRT_HIT_PCT,
-                                    )
-                                });
+                            });
                             match from_cache {
                                 Some(d) => (d, "mic"),
                                 None => {
                                     if crate::runtime::env_cache::dbg_jitc() {
+                                        // Distinguish the three ways this can
+                                        // answer nothing — no artifact at all,
+                                        // an artifact with no slot at this bci,
+                                        // and a slot that failed the dominance
+                                        // bar — because they call for three
+                                        // different fixes.
+                                        let detail = match artifact.as_ref() {
+                                            None => "no-artifact".to_string(),
+                                            Some(cm) => format!(
+                                                "artifact slots=[{}]",
+                                                cm.mic_slot_census()
+                                                    .iter()
+                                                    .map(|(b, c, h, m)| format!(
+                                                        "bci{b}:cls{c}:h{h}:m{m}"
+                                                    ))
+                                                    .collect::<Vec<_>>()
+                                                    .join(",")
+                                            ),
+                                        };
                                         eprintln!(
-                                            "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> no evidence (profile={} mic=none)",
+                                            "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> no evidence (profile={} mic: {})",
                                             target.class_name,
                                             target.method_name,
                                             target.descriptor,
                                             ipc,
                                             if callee_profile.is_some() { "empty" } else { "absent" },
+                                            detail,
                                         );
                                     }
                                     continue;

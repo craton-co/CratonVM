@@ -3045,6 +3045,30 @@ impl CompiledMethod {
         None
     }
 
+    /// `(bci, cached_class_id, hits, misses)` for every MIC slot, for the
+    /// `CRATONVM_DBG_JITC` trace.
+    ///
+    /// `dominant_receiver_at_bci` returning `None` has three causes needing
+    /// three different fixes — no slot at this bci (a compile-ORDER problem), a
+    /// slot with too few samples (a WARM-UP problem), and a slot that thrashes
+    /// (not fixable, and correctly refused). A bare `None` cannot tell them
+    /// apart, and guessing which one it was is how a session spends a build
+    /// cycle on the wrong hypothesis.
+    pub fn mic_slot_census(&self) -> Vec<(usize, u32, u64, u64)> {
+        use std::sync::atomic::Ordering;
+        self._jit_mic_slots
+            .iter()
+            .map(|s| {
+                (
+                    s.bci,
+                    s.cached_class_id.load(Ordering::Relaxed),
+                    s.hits.load(Ordering::Relaxed),
+                    s.misses.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     /// True when this artifact recorded a safe OSR entry point for `entry_pc`
     /// (i.e. [`osr_enter`](Self::osr_enter) at that pc would not bail).
     /// Lets the interpreter's OSR trigger reuse a cached compile instead of
