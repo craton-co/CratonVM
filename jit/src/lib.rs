@@ -8272,15 +8272,15 @@ pub enum JitIntrinsic {
     // is local and not externally observed.
     StringEquals,    // equals(Ljava/lang/Object;)Z
     StringCompareTo, // compareTo(Ljava/lang/String;)I
-    // `indexOf(I)I` — the codegen for this variant still exists in
-    // `x64/bytecode_walk.rs`, but `try_resolve_string_intrinsic` no longer
-    // hands the entry out, so nothing reaches it. Its inline body masks the
-    // needle to `ch & 0xFFFF`, which is not what the JDK does — the gate is
-    // `Character.isValidCodePoint`, applied BEFORE any narrowing, and a
-    // supplementary `ch` is matched as a surrogate PAIR. See the retirement
-    // note in `try_resolve_string_intrinsic` for the measured rows and for
-    // what restoring the fast path would take.
-    StringIndexOfChar, // indexOf(I)I — NOT handed out; see above
+    // `indexOf(I)I` — handed out again (E27-1 N2b, 2026-08-18), but only for a
+    // call site whose needle the backend can prove is a compile-time constant
+    // in `0..=0xFFFF`. The inline body scans for one UTF-16 code unit, which is
+    // the JDK's answer on exactly that range and NOT outside it (the gate is
+    // `Character.isValidCodePoint` before any narrowing, and a supplementary
+    // `ch` matches a surrogate PAIR). The screen is
+    // `x64/bytecode_walk.rs::prev_insn_int_const`; a site that fails it is not
+    // intrinsified and dispatches normally, with no deopt involved.
+    StringIndexOfChar, // indexOf(I)I — constant BMP needles only
     StringIndexOfStr,  // indexOf(Ljava/lang/String;)I
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
@@ -9647,58 +9647,49 @@ pub fn try_resolve_string_intrinsic(
     //   * indexOf(String)     — naive O(n*m) substring search from 0; an
     //     empty needle returns 0.
     //
-    // `indexOf(I)` is deliberately NOT recognised — see the block below.
+    // `indexOf(I)` is recognised only for a constant BMP needle — see below.
     if is_string {
         let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
             ("compareTo", "(Ljava/lang/String;)I") => {
                 Some((JitIntrinsic::StringCompareTo, 1, b'I'))
             }
-            // `indexOf(I)` — RETIRED, deliberately not intrinsified here.
+            // `indexOf(I)` — intrinsified again as of E27-1 N2b (2026-08-18),
+            // but ONLY where the backend can prove the needle is a
+            // compile-time constant in `0..=0xFFFF`. That screen lives in
+            // `x64/bytecode_walk.rs` (`prev_insn_int_const`), not here: this
+            // function sees a name and a descriptor, never an operand.
             //
-            // The inline body masks the needle to `ch & 0xFFFF` and the comment
-            // that used to stand here called that "bit-identical to native
-            // `String.indexOf(int)`". Both halves were false. The JDK does not
-            // narrow `ch`: it gates on `Character.isValidCodePoint` FIRST, then
-            // scans for one code unit if `ch <= 0xFFFF` and for the SURROGATE
-            // PAIR if `ch >= 0x10000`. Measured on OpenJDK 25.0.3+9 (this
-            // lane's `scratchpad/e27/E27Probe.java`):
+            // Why the range is the whole question. The inline body scans for
+            // ONE UTF-16 code unit. The JDK does not narrow `ch` — it gates on
+            // `Character.isValidCodePoint` FIRST, then scans for one code unit
+            // if `ch <= 0xFFFF` and for the SURROGATE PAIR if `ch >= 0x10000`.
+            // Measured on OpenJDK 25.0.3+9:
             //
             //     "abc".indexOf(0x10061)   -1     masking finds 'a' at 0
             //     "￿q".indexOf(-1)    -1     masking finds U+FFFF at 0
             //     mixed.indexOf(0x10437)    3     the pair, not its low half at 1
             //
-            // The `indexOf(-1)` row is the one that rejects the plausible wrong
-            // fix: `(char) -1` IS `0xFFFF` and the receiver DOES hold `0xFFFF`,
-            // yet HotSpot answers -1 — so the rule is the validity gate, not a
-            // narrowing cast.
+            // The `indexOf(-1)` row rejects the plausible wrong fix: `(char) -1`
+            // IS `0xFFFF` and the receiver DOES hold `0xFFFF`, yet HotSpot
+            // answers -1 — so the rule is the validity gate, not a narrowing
+            // cast. Inside `0..=0xFFFF` all three rows are vacuous and the
+            // single-code-unit scan IS `code_point_needle`'s answer, including
+            // for a lone surrogate.
             //
-            // E18-1 rewrote the native side onto ONE `code_point_needle`
-            // predicate plus two shared scanners, replacing four divergent
-            // copies of this single JVMS rule. Re-implementing the gate here
-            // would make a fifth. Dropping the recognition sends the call site
-            // through ordinary dispatch to that one predicate instead, which is
-            // the only way this door can carry the rule without owning a copy
-            // of it — `jit/src/lib.rs` is below `native-builtins` in the crate
-            // graph and cannot call `code_point_needle` directly.
+            // The retirement this replaces was right to remove the unscreened
+            // form: E18-1 had reduced the rule to ONE predicate in
+            // `native-builtins`, and `jit/src/lib.rs` is below that crate in
+            // the graph and cannot call it. A screen that admits only the
+            // range where no rule is needed is not a fifth copy of it.
             //
-            // Verified before landing: ordinary dispatch reaches a CORRECT
-            // implementation in both modes. In real-JDK mode a `Bridge`-kind
-            // `java/lang/String` native is dropped at registration
-            // (`native-api/src/registry.rs`, `drop_real_layout_synthetic`), so
-            // nothing shadows the real JDK's own `String.indexOf(int)`
-            // bytecode; in synthetic-jdk mode `register_synthetic_overrides`
-            // last-write-wins with `native_string_index_of`, which is the
-            // `code_point_needle` body.
-            //
-            // This costs the inline scan on a hot method. Restoring it is a
-            // codegen change, not a recognition change: emit the fast path
-            // under a runtime screen (`ch < 0 || ch > 0xFFFF` -> deopt), which
-            // admits exactly the range where a single-code-unit scan already IS
-            // the whole answer and defers every other case to the predicate.
-            // That belongs in `x64/bytecode_walk.rs` and is nominated as N2b in
-            // `docs/known-issues/jdk-only/`
-            // `E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md`.
+            // A declined site is not deoptimised — it is simply not
+            // intrinsified, and dispatches exactly as it does today. The
+            // runtime-screen-plus-deopt design the first draft of N2b proposed
+            // would have invalidated the enclosing compiled METHOD on every
+            // out-of-range needle and then barred it from compilation; see
+            // `prev_insn_int_const` and the page's N2b section.
+            ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
             ("indexOf", "(Ljava/lang/String;)I") => Some((JitIntrinsic::StringIndexOfStr, 1, b'I')),
             _ => None,
         };
