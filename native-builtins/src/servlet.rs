@@ -3523,8 +3523,44 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectR
     // `gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
     // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
     // allocates ~76 MB buffers until the heap is gone.
-    let Some(arr) = ctx.try_new_array(ArrayElementType::Byte, cap) else {
-        return Ok(None);
+    //
+    // RECLAIM AND RETRY, not one shot (H2 `TestBenchmark`, 2026-08-18). Being
+    // *fallible* stopped the abort; it did not make the refusal honest.
+    // `try_new_array` deliberately does not collect -- see
+    // `runtime::native_oom` -- so this native reported `OutOfMemoryError` on
+    // the FIRST refusal, while the two paths that allocate an array from
+    // bytecode (`gc_alloc_array`, `jit_newarray`) both run a ladder: retire
+    // the TLAB, force a collection, retry, `last_ditch_reclaim`, retry again,
+    // and only then throw. `ByteBuffer.allocate` is shadowed by this native in
+    // real-JDK mode too, so its backing array never sees that ladder.
+    //
+    // Measured: MVStore's background writer grows a `WriteBuffer` to
+    // 10,616,832 bytes at `-Xmx1g` on ZGC. The arena has no hole that big at
+    // that instant (498 KiB largest, 348 MB free across 30k spans) and the
+    // request was refused -- with the heap 97% free once the collection nobody
+    // asked for finally ran. Repeating the identical `ByteBuffer.allocate` one
+    // Java statement later succeeded on the first attempt, and the class also
+    // passes under `--nojit`, at `-Xmx2g`, and on the generational collector:
+    // a spurious refusal, not an exhausted heap.
+    //
+    // Calling `reclaim_before_alloc_retry` is legal HERE specifically, and the
+    // precondition is the caller's to prove: this is the native's first
+    // allocation, so it holds no unpinned `ObjectRef` in a Rust local for a
+    // collection to dangle or sweep. Note that the very next allocation below
+    // must NOT do this -- `arr` is live by then, which is exactly why it is
+    // pinned across it.
+    let arr = match ctx.try_new_array(ArrayElementType::Byte, cap) {
+        Some(a) => a,
+        None => {
+            let reclaimed = ctx.reclaim_before_alloc_retry();
+            match reclaimed
+                .then(|| ctx.try_new_array(ArrayElementType::Byte, cap))
+                .flatten()
+            {
+                Some(a) => a,
+                None => return Ok(None),
+            }
+        }
     };
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `arr` (read again by
@@ -6008,8 +6044,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let cap = requested as usize;
         match s2_bb_alloc(ctx, cap)? {
             Some(buf) => Ok(Some(Value::Object(Some(buf)))),
+            // The message names the site and the size. It used to be a bare
+            // "Java heap space", which is also what the pre-allocated singleton
+            // OOME carries and what three unrelated natives throw -- so the
+            // string identified nothing. Chasing the H2 `TestBenchmark` refusal
+            // cost a run per candidate site purely to find out which of them had
+            // produced it; the two bytecode paths already name themselves
+            // ("alloc_array length N"), and this is the third allocator of
+            // caller-sized arrays.
             None => Err(RuntimeError::OutOfMemoryError {
-                message: "Java heap space".to_string(),
+                message: format!("Java heap space (ByteBuffer.allocate {cap})"),
             }
             .into()),
         }
