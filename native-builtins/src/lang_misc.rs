@@ -520,6 +520,19 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
     }
     let trace = ctx.capture_throwable_stack_trace(this);
     let depth = trace.len() as i32;
+    if crate::nbflags().dbg_sttrace {
+        // The top frames of THIS throwable's own trace, in order, on one line.
+        // Printing frames from a separate site and pairing them up afterwards
+        // is not sound — captures from several threads interleave in the log,
+        // and reading "the deepest frame" out of a merged group names a throw
+        // site that never existed. One line per throwable cannot be mispaired.
+        let top: Vec<String> = trace
+            .iter()
+            .take(4)
+            .map(|f| format!("{}.{}:{}", f.class_name, f.method_name, f.line_number))
+            .collect();
+        eprintln!("STTRACE_DBG_TOP hash={hash} depth={depth} top={}", top.join(" <- "));
+    }
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
     // park a self-reference as the non-null marker (the real frame data lives
     // in the identity-hash-keyed trace store).
