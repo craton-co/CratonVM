@@ -822,6 +822,8 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_LINKER` | DBG | `CRATONVM_DBG=linker` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_LOADCLASS` | DBG | `CRATONVM_DBG=loadclass` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_LOADER_CHAIN` | DBG | `CRATONVM_DBG=loader-chain` | opt-in | off | diag | snapshot | classloading |
+| `CRATONVM_DBG_GETFIELD_RECEIVERS` | DBG | `CRATONVM_DBG=getfield-receivers` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_JIT_BORROW_SITES` | DBG | `CRATONVM_DBG=jit-borrow-sites` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LOADER_TRACE` | DBG | `CRATONVM_DBG=loader-trace` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO` | DBG | `CRATONVM_DBG=load-transform-no-memo` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LOGPROV` | DBG | `CRATONVM_DBG=logprov` | opt-in | off | diag | snapshot | types |
@@ -1198,6 +1200,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_LONG_INTRINSICS` | JIT | `CRATONVM_JIT=long-intrinsics` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE` | JIT | `CRATONVM_JIT=mic-rust-entry-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NATIVE_SITE_CACHE` | JIT | `CRATONVM_JIT=native-site-cache` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_CAST_SITE_CACHE` | JIT | `CRATONVM_JIT=cast-site-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NEW_SITE_CACHE` | JIT | `CRATONVM_JIT=new-site-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` | JIT | `CRATONVM_JIT=precise-alloc-athrow` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` | JIT | `CRATONVM_JIT=precise-field-ops` | opt-out | on | behaviour | snapshot | jit |
