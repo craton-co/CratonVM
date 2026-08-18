@@ -158,7 +158,7 @@ struct Case {
     max_locals: usize,
     needs_heap: bool,
     inline_tlab: bool,
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     field_info: Vec<(usize, usize, u8)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
     new_info: Vec<(usize, u32, usize, bool, bool)>,
@@ -213,7 +213,7 @@ impl Case {
         self.anewarray_info = v;
         self
     }
-    fn multis(mut self, v: Vec<(usize, u8)>) -> Case {
+    fn multis(mut self, v: Vec<(usize, i64)>) -> Case {
         self.multianewarray_info = v;
         self
     }
@@ -1006,7 +1006,7 @@ fn corpus() -> Vec<Case> {
             vec![0x05, 0x06, 0xc5, 0x00, 0x07, 0x02, 0x4b, 0x2a, 0xbe, 0xac],
         )
         .heap()
-        .multis(vec![(2, 2)]),
+        .multis(vec![(2, cratonvm_jit::pack_multianewarray_site(1, 7))]),
     );
     // array sum loop (BCE / SIMD candidate)
     {

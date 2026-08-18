@@ -151,7 +151,7 @@ pub use bytecode_compat::*;
 // declared visibility, so nothing here became more public than it was.
 mod licm;
 pub use licm::*;
-mod stack_kinds;
+pub(crate) mod stack_kinds;
 // ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
 // ---------------------------------------------------------------------------
@@ -475,7 +475,7 @@ struct Compiler {
     /// Frame offset of the first XMM save slot (from RBP).
     xmm_saved_base: i32,
     /// Resolved multianewarray metadata: (bytecode_pc, leaf_element_type_code).
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     /// Resolved field access metadata: (bytecode_pc, field_index, type_tag).
     /// type_tag is b'I', b'J', b'F', b'D', b'L', or b'['.
     field_info: Vec<(usize, usize, u8)>,
@@ -889,7 +889,16 @@ struct Compiler {
     /// the pre-OSR-entry frame, silently re-executing every loop iteration
     /// the OSR-compiled code already committed
     /// (`fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
+    /// (`regalloc::live_locals_per_pc_all`) — `local_liveness[pc *
+    /// local_liveness_words + w]` covers slots `[w*64, w*64+64)`. Read through
+    /// [`Compiler::local_live_at`], never directly: a method with more than 64
+    /// locals has more than one word per pc, and indexing this by `pc` alone
+    /// silently reads window 0 of the wrong instruction.
     local_liveness: Vec<u64>,
+    /// Words per pc in [`Self::local_liveness`] — `ceil(num_locals / 64)`, and
+    /// `1` for the overwhelming majority of methods. Zero while the vector is
+    /// empty (the ungated compile), which `local_live_at` reads as "no answer".
+    local_liveness_words: usize,
     /// Parallel coverage bitmap for [`Self::local_liveness`]: `false` at a pc
     /// no basic block covers, where the liveness answer is the `0` default
     /// ("nothing live") rather than a computed result. Treating that as "every
@@ -1876,7 +1885,7 @@ impl Compiler {
         num_params: usize,
         max_stack: usize,
         needs_heap: bool,
-        multianewarray_info: Vec<(usize, u8)>,
+        multianewarray_info: Vec<(usize, i64)>,
         field_info: Vec<(usize, usize, u8)>,
         typecheck_info: Vec<(usize, *const u8, usize)>,
         static_field_info: Vec<(usize, u32, usize, u8, bool)>,
@@ -2377,6 +2386,7 @@ impl Compiler {
             local_kinds: Vec::new(),
             local_kinds_refined: AmbiguousLocalKinds::default(),
             local_liveness: Vec::new(),
+            local_liveness_words: 0,
             local_liveness_covered: Vec::new(),
             exception_ranges_dbg_len: 0,
             uses_long_float_double: false,

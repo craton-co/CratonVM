@@ -2358,48 +2358,82 @@ fn site_alias_detect_enabled() -> bool {
 }
 
 /// May a callee that declares an exception table be published into the
-/// machine-code MIC/PIC after all?
+/// machine-code MIC/PIC? **Yes, by default since 2026-08-17.**
 ///
-/// The ban exists because the inline cascade in `jit/src/x64.rs` CALLs the
+/// The ban existed because the inline cascade in `jit/src/x64.rs` CALLs the
 /// cached entry directly, so an `i64::MIN` deopt/exception sentinel from the
 /// callee had no Rust frame to notice it and route it through the *callee's*
 /// own exception table — it surfaced at the caller's epilogue as the caller's
 /// own deopt.
 ///
 /// That hole is closed. `Compiler::emit_inline_callee_deopt_check` is emitted
-/// after **every** inline direct-entry CALL (both PIC slots and the MIC arm)
-/// and hands a sentinel to `jit_service_callee_deopt`, which is a thin wrapper
-/// over the same [`handle_compiled_callee_deopt_sentinel`] every helper arm
-/// uses. It landed later, for the H2 `MVMap`/`DataType.read` case, and the ban
-/// was never revisited against it. Cost on the hit path is a `MOV imm64` +
-/// `CMP` + a not-taken `JNE`.
+/// after **every** inline direct-entry CALL (both PIC slots and the MIC arm,
+/// and the megamorphic hashed stub's `emit_callee_deopt_check` twin) and hands
+/// the sentinel to `jit_service_callee_deopt`, a thin wrapper over the same
+/// [`handle_compiled_callee_deopt_sentinel`] every helper arm uses. It landed
+/// later, for the H2 `MVMap`/`DataType.read` case, and the ban was never
+/// revisited against it.
 ///
-/// Keeping the ban is not free: nothing ever writes the MIC's class id for
-/// such a callee, so *every* call to it lands in the cache-miss arm — a
-/// compile probe, an exception-table probe and `invoke_or_native`, forever.
-/// That is the whole of doc 23's residual `LazyCsCache` gap
-/// (`probes/LazyArmVariants.java` V7 vs V8: identical delegates differing only
-/// by a never-taken `try`/`catch`, 8362 vs 45613 ns/op at ten threads).
+/// **The mechanism is measured, not assumed.** `probes/CalleeExceptionTable/// SemanticsProbe.java` drives six exception-table callees (implicit AIOOBE /
+/// NPE / divide, an explicit athrow, a table that does NOT cover what it
+/// throws, and a `finally`) through a monomorphic interface site, with every
+/// throwing call INSIDE the hot loop so it goes through the published cache.
+/// Four arms, one binary:
 ///
-/// **The ban is nevertheless kept ON by default**, because lifting it buys
-/// nothing measurable once the Rust-level cache above exists. A/B on one
-/// binary, three interleaved rounds on an idle host, ten threads
-/// (`probes/LazyArmVariants.java`, ns/op):
+/// | arm | result |
+/// |---|---|
+/// | HotSpot 25 (the oracle) | PASS |
+/// | ban kept | PASS |
+/// | ban lifted | PASS |
+/// | ban lifted + `CRATONVM_JIT_SP_IC_DEOPT_CHECK=0`, **pre-interlock binary** | **FAIL 8/8 — `ArithmeticException` escapes `Div.apply`'s own `catch` to `main`** |
+/// | the same arm on a binary carrying the interlock below | PASS 8/8 |
 ///
-/// | variant                | ban kept          | ban lifted        |
-/// |------------------------|-------------------|-------------------|
-/// | V0 real `CharsetCache` | 11545/9865/9683   | 9272/10737/9441   |
-/// | V8 delegate with `try` | 9705/9779/9855    | 8740/10229/9278   |
+/// The fourth arm is the point: deleting the sentinel check is the only way to
+/// make the lifted ban wrong, which is what says the check is what makes it
+/// right. `SP_IC_DEOPT_CHECK` is therefore an INTERLOCK below, not a separate
+/// knob — publishing while the check is suppressed is unsound, and `SkipVoid`
+/// suppresses it for exactly the void callees whose return register carries no
+/// value.
 ///
-/// Indistinguishable. Doc 23's own precedent applies: a change that carries a
-/// correctness risk for zero measured throughput does not land. What is
-/// recorded here is that the *reason* for the ban has expired, so the next
-/// person can lift it on evidence rather than re-deriving the argument —
-/// set `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1` to try.
+/// The fifth row is the interlock working, not the probe going blind, and the
+/// difference is visible as a THROUGHPUT reading rather than a claim.
+/// `NativeFunnelFloorProbe`'s try/catch rung under `MIC_EXC_TABLE_PUBLISH=1
+/// SP_IC_DEOPT_CHECK=0`: **207.04 ns/op** with the interlock (nothing was
+/// published — the banned reading) against **24.12 ns/op** without it
+/// (published with no check — the unsound state the fourth arm catches).
+/// Anyone re-running the red proof must do it on a binary that predates the
+/// interlock, or they will read a refusal as a pass.
+///
+/// **What it buys.** `probes/NativeFunnelFloorProbe.java`, ABBA on one binary,
+/// two interleaved rounds, ns/op:
+///
+/// | rung | ban kept | ban lifted |
+/// |---|---:|---:|
+/// | interface call, callee has no exception table (control) | 15.75 / 15.91 | 15.65 / 15.60 |
+/// | interface call, callee has `try`/`catch` | **125.98 / 125.94** | **14.35 / 14.56** |
+///
+/// 8.7x, with the control rung unmoved — the whole Rust helper route measured
+/// against the inline cascade the callee was barred from. The older note here
+/// recorded the opposite ("indistinguishable") from `probes/LazyArmVariants.java`
+/// at ten threads; that probe measures a ten-thread lock-contention shape where
+/// the dispatch round trip is not the limiter, so it could not see this. Do not
+/// re-derive the ban from it.
+///
+/// `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=0` restores the ban.
 fn mic_publish_exception_table_callees() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH").is_some()
+        // INTERLOCK. `emit_inline_callee_deopt_check` is the entire reason
+        // publishing is sound; if the codegen is not emitting it at every
+        // direct-entry CALL, publishing must not happen. Pairing the two here
+        // means a future reader cannot turn one off and leave the other on.
+        if cratonvm_jit::sp_ic_deopt_check_mode() != cratonvm_jit::SpIcDeoptCheck::On {
+            return false;
+        }
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
 }
 
@@ -3087,18 +3121,37 @@ unsafe fn route_implicit_exc_through_callee(
     // Re-entering at bytecode 0 replays every prefix side effect (and was the
     // source of the old finally/counter leak).
     if let Some((thread, _guard)) = jit_thread_mut() {
-        // Drop any exceptional frame the abandoned compiled attempt published
-        // BEFORE materializing the exception. `create_exception_object`
-        // allocates on the Java heap and can therefore run a young collection,
-        // and a `ReconstructedFrame` is not a GC root — its object words would
-        // survive as stale addresses. `run_jit_callee_handler` reads that frame
-        // (that is how a handler recovers its non-parameter locals), so leaving
-        // a pre-allocation frame standing here would hand it relocated
-        // pointers. Without one it applies its `handler_reads_non_param_local`
-        // guard instead and refuses rather than reconstructing a params-only
-        // frame it cannot justify — which is exactly the conservative answer
-        // for this branch.
-        cratonvm_jit::deopt::clear_exceptional_frame();
+        // The exceptional frame the compiled attempt published is KEPT across
+        // the allocation below. It used to be dropped here, and that is what
+        // made RBC.6's `getfield`/`putfield` admission a miscompile: the
+        // compiled body publishes a correct reason-9/10 frame at the trapping
+        // bci, this line threw it away, and `run_jit_callee_handler` — finding
+        // nothing — refused the handler and let the exception propagate past a
+        // `catch` that catches it.
+        //
+        // The reason it was dropped no longer holds. `create_exception_object`
+        // does allocate, and an allocation is a safepoint, but a
+        // `ReconstructedFrame` in `LAST_EXCEPTIONAL` **is** a GC root now: the
+        // scan half runs in `memory/roots.rs` §10
+        // (`for_each_stashed_deopt_object`) and the remap half in
+        // `memory/gc.rs` (`remap_stashed_deopt_objects`), paired by a debug
+        // assertion that refuses one without the other. Both land on the thread
+        // that owns the stash, which is this thread. `docs/jit/
+        // deopt-thread-local-roots.md` names THIS window as the shortest
+        // instance of the hazard it closed — a reason-9 frame published by
+        // `emit_post_invoke_exception_check` whose sink allocates the throwable
+        // before draining it — so keeping the frame here is precisely what that
+        // wiring was for.
+        //
+        // Dropping it was never the "conservative" answer its old comment
+        // claimed. Refusing to enter a handler is not a safe subset of entering
+        // it: JVMS requires the handler to run, so the refusal is a wrong
+        // answer that happens to be loud (an escaping exception) instead of
+        // quiet (zeroed locals). The three OTHER `clear_exceptional_frame`
+        // calls in this function are different and stay: each of them runs on a
+        // path where the compiled attempt is FINISHED or ABANDONED, so its
+        // frame can never be legitimately claimed and must not be left for a
+        // later drain to mis-match.
         let exc = match (aioobe, npe) {
             (Some((index, length)), _) => {
                 let msg = format!("Index {index} out of bounds for length {length}");
@@ -3278,15 +3331,27 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
     let Some((thread, _guard)) = jit_thread_mut() else {
         return i64::MIN;
     };
-    // The receiver's class id, for the callee-exception-table probe. `Object`
-    // arg 0 is the receiver for every invoke kind the inline cascade emits
-    // (virtual/interface); a non-object or absent arg 0 simply misses the
-    // probe, which then behaves as "no local handler".
-    let receiver_class_id = args_slice
-        .first()
-        .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
-        .map(|obj| vm.mem.heap.class_id_of_validated(obj))
-        .unwrap_or_else(|| ClassId::new(0));
+    // The receiver's class id, for the callee-exception-table probe.
+    //
+    // Only kinds 0/2 have one. For a statically bound site (`invokestatic` /
+    // `invokespecial`) arg 0 is an ordinary argument, and reading it as a
+    // receiver resolves the callee from whatever class that argument happens to
+    // point at — a different method with the same name and descriptor, or none.
+    // `route_implicit_exc_through_callee` and `resolve_callee_cached` both
+    // already branch on `invoke_kind` for exactly this reason; this arm did
+    // not, and the direct-call door (`x64/bytecode_walk.rs`, the
+    // `emit_inline_callee_deopt_check` after a baked `invokestatic` CALL) is a
+    // live caller of it. `ClassId::new(0)` is the "no receiver" value the
+    // callee-side probe below reads as "resolve by name".
+    let receiver_class_id = if matches!(info.invoke_kind, 0 | 2) {
+        args_slice
+            .first()
+            .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
+            .map(|obj| vm.mem.heap.class_id_of_validated(obj))
+            .unwrap_or_else(|| ClassId::new(0))
+    } else {
+        ClassId::new(0)
+    };
     match handle_compiled_callee_deopt_sentinel(vm, thread, info, receiver_class_id, args_slice) {
         Some(v) => v,
         None => {
@@ -3350,7 +3415,15 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     } else {
         usize::MAX
     };
-    let has_handler = mic_callee_has_exception_table(vm, receiver_class_id, info);
+    // Same split as `route_implicit_exc_through_callee`: resolve from the
+    // receiver for a virtual/interface site, by name for a statically bound
+    // one. Asking the receiver-based probe about an `invokestatic` callee reads
+    // arg 0 as a class, which is not one.
+    let has_handler = if matches!(info.invoke_kind, 0 | 2) {
+        mic_callee_has_exception_table(vm, receiver_class_id, info)
+    } else {
+        callee_has_exception_table(vm, info)
+    };
     if has_handler {
         if let Some(exc) = signals.exception {
             if let Ok(v) = try_run_callee_handler(
@@ -5961,13 +6034,33 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     }
 }
 
-// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
-// leaf_et encodes the inner array's element type. dim1 and dim2 are the two dimension sizes.
-// Returns a raw heap pointer to the outer reference array whose elements are inner arrays.
+/// `multianewarray` with `dimensions == 2` — the only shape the x64 scan
+/// admits (`bytecode_compat.rs`, opcode `0xc5`).
+///
+/// `site` packs the compile-time-constant description of the site:
+/// `holder_class_id` in the low 32 bits, the constant-pool index of the array
+/// class in the next 16. The emitter has both as immediates; passing them
+/// instead of a pre-digested element type is what lets this helper reach the
+/// SAME body the interpreter runs (`interpreter::multianewarray_alloc`), which
+/// resolves the per-level component classes loader-faithfully.
+///
+/// It used to take a bare `leaf_et` element-type code and allocate every level
+/// with `ClassId::new(0)`. That is a real miscompile, not a cosmetic one: the
+/// outer array of a JIT-compiled `new String[a][b]` carried no class at all, so
+/// `getClass()` read back `[Ljava.lang.Object;` and any `checkcast` to the
+/// declared array type threw `ClassCastException`. Commons Math's
+/// `DSCompiler.getCompiler` publishes such an array through an
+/// `AtomicReference` and casts it back on the next call, which turned 118 of
+/// `DerivativeStructureTest`'s 124 methods red under the JIT and none under
+/// `--nojit`.
+///
+/// # Safety
+/// Called from JIT-compiled code. `vm_ptr` must be a valid `SharedVm` pointer.
+/// `dim1`/`dim2` are the two dimension sizes (outer, inner) as JIT stack slots.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_multianewarray_2d(
     vm_ptr: i64,
-    leaf_et: i64,
+    site: i64,
     dim1: i64,
     dim2: i64,
 ) -> i64 {
@@ -5976,18 +6069,11 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
     crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
-    let heap = heap_from_vm(vm_ptr);
-    let elem_type = match leaf_et as u8 {
-        4 => ArrayElementType::Boolean,
-        5 => ArrayElementType::Char,
-        6 => ArrayElementType::Float,
-        7 => ArrayElementType::Double,
-        8 => ArrayElementType::Byte,
-        9 => ArrayElementType::Short,
-        10 => ArrayElementType::Int,
-        11 => ArrayElementType::Long,
-        _ => ArrayElementType::Reference,
-    };
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // SAFETY: vm_ptr is a valid SharedVm pointer per the caller contract.
+    let vm = &*(vm_ptr as *const SharedVm);
 
     // BUGFIX (mirrors jit_newarray / jit_anewarray_object): narrow dimensions to
     // int payload and sign-extend, defending against NaN-boxed CompactValue raw
@@ -5995,14 +6081,42 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
     let dim1 = dim1 as i32 as i64;
     let dim2 = dim2 as i32 as i64;
     if dim1 < 0 || dim2 < 0 {
-        return 0;
+        // JLS: NegativeArraySizeException, routed through the pending-exception
+        // channel + the 0/null sentinel so the `multianewarray` codegen's
+        // `emit_post_alloc_oom_check` bail hands it to the method's exception
+        // table. Returning a bare 0 (what this did before) pushed a null the
+        // compiled code then dereferenced.
+        return jit_negative_array_size(vm, if dim1 < 0 { dim1 } else { dim2 });
     }
-    let outer = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, dim1 as usize);
-    for i in 0..dim1 as usize {
-        let inner = heap.alloc_array(ClassId::new(0), elem_type, dim2 as usize);
-        let _ = heap.set_array_element(outer, i, Value::Object(Some(inner)));
+
+    let (holder_class_id, cp_index) = cratonvm_jit::unpack_multianewarray_site(site);
+    let holder_cid = ClassId::new(holder_class_id);
+
+    // Resolution can define array classes and run a user `ClassLoader`, i.e.
+    // arbitrary Java on this thread, so it needs the real thread the way
+    // `jit_resolve_cp_class` does. `emit_post_alloc_oom_check` forces
+    // `has_dispatch` on every site that reaches here, so `JIT_THREAD` is set;
+    // the `None` arm is purely defensive.
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return jit_cp_alloc_internal_error(
+            vm,
+            "JIT multianewarray: no live JIT thread to resolve the array class",
+        );
+    };
+
+    match crate::runtime::interpreter::multianewarray_alloc(
+        vm,
+        thread,
+        holder_cid,
+        cp_index,
+        &[dim1 as usize, dim2 as usize],
+    ) {
+        Ok(arr) => arr.as_ptr() as i64,
+        // The failure paths above all leave a pending Java exception on this
+        // thread (or an internal VM error already reported); the 0/null
+        // sentinel is what tells the compiled code to bail into it.
+        Err(_) => 0,
     }
-    outer.as_ptr() as i64
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
