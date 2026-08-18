@@ -706,7 +706,7 @@ struct Compiler {
     /// constant-pool tag the resolver already read; without it `x64::stack_kinds`
     /// answered `Unknown` for every numeric `ldc`, the snapshot recorded
     /// `Unsupported`, and `osr_exit_policy` then refused OSR entry for the whole
-    /// artifact. See `osr-refused-for-a-loop-inline-in-main-20260810`.
+    /// artifact. See `osr-refused-for-a-loop-inline-in-main-FIXED-20260818`.
     ldc_fp_pcs: FxHashSet<usize>,
     /// Runtime helper function pointers for JIT callbacks.
     helpers: JitRuntimeHelpers,

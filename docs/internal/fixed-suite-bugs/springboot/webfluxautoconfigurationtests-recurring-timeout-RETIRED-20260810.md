@@ -15,7 +15,7 @@ plausible mechanisms that measurement kept refuting.
 | native-shadow seal | "1,279 sealed > 1,155 at C2" | removing the seal entirely: **0** |
 | annotation/proxy path | "~1000x HotSpot per call" | **~1%** of the run |
 | lambda SAM dispatch | "220x a named-class call" | fixed, ~4x on the mechanism, **0%** here |
-| OSR-only loops | "7-16x" | **180x**, split out to `../../../known-issues/jit/osr-refused-for-a-loop-inline-in-main-20260810.md` |
+| OSR-only loops | "7-16x" | **180x**, split out to `../../fixed-bugs/osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md` |
 
 **If this class goes red again, it is a budget/throughput event, not a new
 defect** — start from the tables below rather than re-triaging. The one live
@@ -447,7 +447,7 @@ is now known, and what the next attempt should not repeat:
   3. ~~The annotation-proxy entry path.~~ **CLOSED 2026-08-10 at ~1%** (§4).
      ~300-400k dispatches at ~9.5 us = ~3 s of a 357 s run.
   4. ~~OSR-only loops at 7-16x.~~ **Split out 2026-08-10 to
-     [`known-issues/jit/osr-refused-for-a-loop-inline-in-main-20260810.md`](../../../known-issues/jit/osr-refused-for-a-loop-inline-in-main-20260810.md)**, where it is
+     [`internal/fixed-bugs/osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md`](../../fixed-bugs/osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md)**, where it is
      reproduced at **180x** (1 ns/iter for a loop in a called method against
      180 ns/iter for the identical loop inline in `main`) and the refusal is
      named: `osr-entry-unresumable-exit`, from a deopt point in the method's own

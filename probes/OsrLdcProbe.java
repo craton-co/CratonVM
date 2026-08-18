@@ -3,7 +3,7 @@
 
 /**
  * Settles the open question in
- * {@code osr-refused-for-a-loop-inline-in-main-20260810.md}: is {@code main}
+ * {@code osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md}: is {@code main}
  * special, or is the trigger the {@code ldc} that feeds the untaken call?
  *
  * <p>The refusal names {@code stack 1 (Unsupported) of 2} at the
