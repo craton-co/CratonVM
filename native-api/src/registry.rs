@@ -99,6 +99,20 @@ pub mod lookup_census {
     /// `resolve_id_with_descriptor_quirks` — the `#[cold]` rewrite arm.
     pub const QUIRKS: usize = 4;
     /// One bytecode-level invoke reaching `try_stackless_invoke`.
+    ///
+    /// **This is NOT a general per-invoke denominator, and `lookups_per_invoke`
+    /// must not be read as "registry probes per Java call".** Measured
+    /// 2026-08-18 on `probes/LambdaCompositionProbe.java` at four workload
+    /// sizes: `find` scaled perfectly linearly (151 254 / 231 254 / 391 254 /
+    /// 711 254) while this counter stayed pinned at **966 in all four runs**.
+    /// The lookups that workload generates do not come through this entry
+    /// point at all, so the printed ratio grew 162 -> 742 purely because the
+    /// numerator moved and the denominator could not.
+    ///
+    /// The reliable reading is the MARGINAL rate: run two sizes and divide the
+    /// difference in `find` by the difference in work. That gave exactly 4.0
+    /// lookups per composition stage, with a fixed ~71 k boot cost — a fact
+    /// the ratio line could not have produced at any single size.
     pub const INVOKE_STACKLESS: usize = 5;
     /// One call reaching `invoke_or_native`, the general resolver.
     pub const INVOKE_GENERAL: usize = 6;
@@ -168,6 +182,13 @@ pub mod lookup_census {
 
     /// Print the census and the ratio it exists to produce. Safe to call when
     /// disabled — it prints nothing.
+    ///
+    /// **Read `lookups_per_invoke` with the caveat on [`INVOKE_STACKLESS`].**
+    /// It is lookups over *stackless-entry invokes*, not over Java calls, and
+    /// on a workload whose lookups arrive by another path the denominator is
+    /// constant while the numerator scales — which makes the ratio grow with
+    /// the workload and mean nothing. Take two sizes and use the marginal
+    /// rate.
     pub fn report(tag: &str) {
         if !enabled() {
             return;
