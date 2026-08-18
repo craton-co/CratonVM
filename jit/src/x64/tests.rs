@@ -432,6 +432,7 @@ fn test_helpers() -> JitRuntimeHelpers {
         // with no stack guard, keeping these tests byte-identical.
         self_call_stack_guard: 0,
         region_bounds_addr: 0,
+        read_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: sentinel,
         // Unwired (0) — CRATONVM_JIT_SAFEPOINT_POLLS is off by default,
@@ -4008,7 +4009,7 @@ fn test_getfield_int() {
 }
 
 /// Guarded inline getfield (perf/throughput-20260710): with a non-zero
-/// `region_bounds_addr` the default arm emits the inline receiver guard +
+/// `read_bounds_addr` the default arm emits the inline receiver guard +
 /// raw field load, falling back to the checked helper only for receivers
 /// that fail the guard. Uses a test-local bounds table so the pass/fail
 /// routing is deterministic (the process-global table is owned by
@@ -4051,7 +4052,8 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     let field_info = vec![(1usize, 0usize, b'I')];
     let mut helpers = test_helpers();
     helpers.getfield = marker_getfield as *const () as usize;
-    helpers.region_bounds_addr = TEST_BOUNDS.as_ptr() as usize;
+    // READ side: the guarded getfield arm bakes `read_bounds_addr`.
+    helpers.read_bounds_addr = TEST_BOUNDS.as_ptr() as usize;
     let compiled = compile(
         &code,
         code_len,

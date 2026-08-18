@@ -93,6 +93,10 @@ const ALLOWED: &[(&str, &str)] = &[
          `the_scanner_only_matches_whole_string_literals` pins that.",
     ),
     (
+        "CRATONVM_DBG_FLAGREADS",
+        "kind 2: read by the flag machinery ITSELF. `types/src/flags.rs` traces          every flag read, so it consults this one with a raw          `std::env::var_os` rather than `runtime_var_os` — routing it through          the latched snapshot would mean asking the tracer to trace the read          that decides whether tracing is on. It therefore cannot be served by          `VmFlags`, which is the property every other entry in the inventory          asserts, so it is exempt rather than declared.",
+    ),
+    (
         "CRATONVM_COMPATIBILITY_JDK_ONLY",
         "kind 1: the name of a `libcratonvm` C ABI integer constant, matched \
          here only because a unit test asserts the diagnostic message names it",
@@ -101,6 +105,10 @@ const ALLOWED: &[(&str, &str)] = &[
     // deliberately *not* here: it only ever appears inside prose, which
     // `is_comment_line` already drops, and a row for it would be dead on
     // arrival under `the_allowlist_has_no_dead_rows`.
+    (
+        "CRATONVM_DBG_FLAGREADS",
+        "kind 3: the one flag that CANNOT be served from the snapshot, because          it instruments the snapshot's own reads. `types/src/flags.rs` reads it          with `std::env::var_os` directly and says why on the line above:          `reading through this module would recurse`. Declaring it would make          the flag machinery call itself to decide whether to trace a call to          itself.",
+    ),
     (
         "CRATONVM_NONEXISTENT_VAR_12345",
         "kind 2: `vm.rs`'s System.getenv coverage needs a name that is \

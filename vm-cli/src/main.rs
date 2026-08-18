@@ -136,6 +136,18 @@ fn maybe_dump_shutdown_reports() {
     // nothing incremented it.
     cratonvm_classloading::define_census::dump();
 
+    // The lambda tier-up / inline-cache-thunk census, on
+    // `CRATONVM_DBG=lambda-jit`.
+    //
+    // At exit and not merely periodically, because the periodic report fires
+    // every 200 000 eligible dispatches (or 100 000 direct calls) and no
+    // ordinary application workload comes near either: a census over 24 Tomcat
+    // JUnit classes — 129 s of real work, one of them driving 21 HTTP tests
+    // against a live connector — printed nothing whatsoever, and "no lambda
+    // activity" is not a reading that silence can support. See
+    // `runtime::interpreter::report_lambda_census_at_exit`.
+    cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The

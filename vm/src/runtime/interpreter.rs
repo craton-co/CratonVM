@@ -8323,7 +8323,8 @@ pub use field_access::*;
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod site_cache;
 pub use site_cache::{
-    ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
+    CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo,
+    ResolvedNewSite,
 };
 // ---------------------------------------------------------------------------
 // Helper: Method invocation

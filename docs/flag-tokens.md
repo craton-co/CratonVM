@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-459 tokens.
+462 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -207,6 +207,7 @@ export inherited from a parent shell.
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
 | `gcphase` | `CRATONVM_DBG_GCPHASE` |
 | `gcwrite` | `CRATONVM_DBG_GCWRITE` |
+| `getfield-receivers` | `CRATONVM_DBG_GETFIELD_RECEIVERS` |
 | `getresources` | `CRATONVM_DBG_GETRESOURCES` |
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
@@ -264,6 +265,7 @@ export inherited from a parent shell.
 | `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
 | `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
+| `jit-borrow-sites` | `CRATONVM_DBG_JIT_BORROW_SITES` |
 | `jit-gen` | `CRATONVM_DBG_JIT_GEN` |
 | `jit-ldc` | `CRATONVM_DBG_JIT_LDC` |
 | `loop-work` | `CRATONVM_DBG_LOOP_WORK` |
@@ -298,6 +300,8 @@ export inherited from a parent shell.
 | `linker` | `CRATONVM_DBG_LINKER` |
 | `loadclass` | `CRATONVM_DBG_LOADCLASS` |
 | `loader-chain` | `CRATONVM_DBG_LOADER_CHAIN` |
+| `getfield-receivers` | `CRATONVM_DBG_GETFIELD_RECEIVERS` |
+| `jit-borrow-sites` | `CRATONVM_DBG_JIT_BORROW_SITES` |
 | `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
 | `load-transform-no-memo` | `CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO` |
 | `logprov` | `CRATONVM_DBG_LOGPROV` |
@@ -526,7 +530,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-191 tokens.
+192 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -674,6 +678,7 @@ export inherited from a parent shell.
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
+| `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
 | `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |

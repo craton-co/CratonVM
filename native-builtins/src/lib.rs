@@ -37880,7 +37880,44 @@ fn native_heap_bytebuffer_allocate(
     args: &[Value],
 ) -> MethodCallResult {
     let capacity = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, capacity);
+    // Reclaim-and-retry, not one shot. `ByteBuffer.allocate` is shadowed by
+    // this native even in real-JDK mode, so the backing array does NOT go
+    // through `newarray` — it never sees the try / force-a-GC / try /
+    // last-ditch / try ladder that `gc_alloc_array` and `jit_newarray` run.
+    // It got one attempt and reported `OutOfMemoryError`.
+    //
+    // H2 `TestBenchmark` at `-Xmx1g` on ZGC is what that costs: MVStore's
+    // background writer grows a `WriteBuffer` to 10,616,832 bytes, the arena
+    // has no hole that big *at that instant* (498 KiB largest, 348 MB free and
+    // shredded across 30k spans), and the VM threw — with the heap 97% free
+    // once the collection that was never asked for finally ran. Repeating the
+    // identical `ByteBuffer.allocate` one Java statement later succeeded on the
+    // first try; the same class passes under `--nojit`, at `-Xmx2g`, and on the
+    // generational collector, which is the shape of a spurious refusal rather
+    // than an exhausted heap.
+    //
+    // Calling `reclaim_before_alloc_retry` is legal HERE specifically: this is
+    // the native's first allocation, so it holds no unpinned `ObjectRef` in a
+    // Rust local for a collection to dangle or sweep. See the trait method for
+    // why that precondition belongs to the caller. Everything allocated after
+    // this point is pinned (`bytes_pin` below), so a later failure must not
+    // reclaim — and does not.
+    let elem = cratonvm_types::ArrayElementType::Byte;
+    let bytes = match ctx.try_new_array(elem, capacity) {
+        Some(b) => b,
+        None => {
+            let retry = ctx.reclaim_before_alloc_retry();
+            match retry.then(|| ctx.try_new_array(elem, capacity)).flatten() {
+                Some(b) => b,
+                None => {
+                    return Err(RuntimeError::OutOfMemoryError {
+                        message: format!("Java heap space (ByteBuffer.allocate {capacity})"),
+                    }
+                    .into())
+                }
+            }
+        }
+    };
     let bytes_pin = ctx.pin_native_root(bytes);
     let bytes = ctx.read_native_pin(bytes_pin, bytes);
     let result = native_byte_buffer_wrap_bytes_offset_len(
@@ -47224,25 +47261,35 @@ mod throwable_ctor_single_table_witness {
 
         // Assembled, not written as one literal, so this test's own text is
         // never what a scan of these files finds.
-        let begin = format!("// THROWABLE-CTOR-{}-BEGIN", "TABLE").replace("-BEGIN", " BEGIN");
-        let end = format!("// THROWABLE-CTOR-{}-END", "TABLE").replace("-END", " END");
         let ctor = format!("\"{}\"", "<init>");
 
         // --- 1. the one table, read out of the file that owns it -------------
+        //
+        // The table used to be a marker-fenced two-column list of
+        // `("class", &[descriptors])` rows in this file, and this step used to
+        // look for those markers. It is now SPLIT: `lang_misc.rs` keeps the
+        // class-name column as `THROWABLE_FAMILY_CLASSES`, and the descriptor
+        // column moved to `cratonvm_classloading::throwable_ctor_descriptors`
+        // (which `THROWABLE_FAMILY_CLASSES`'s own doc comment points at). One
+        // table still, stored in two places — and every step below only ever
+        // used the class-name column, so this reads that.
+        let anchor = "THROWABLE_FAMILY_CLASSES: &[&str] = &[";
         let start = lang_misc
-            .find(&begin)
-            .unwrap_or_else(|| panic!("table start marker {begin:?} not found in lang_misc.rs"));
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor:?} not found in lang_misc.rs; re-point this witness"))
+            + anchor.len();
         let stop = lang_misc[start..]
-            .find(&end)
+            .find("
+];")
             .map(|i| start + i)
-            .unwrap_or_else(|| panic!("table end marker {end:?} not found in lang_misc.rs"));
+            .unwrap_or_else(|| panic!("THROWABLE_FAMILY_CLASSES has no terminator in lang_misc.rs"));
         let table: Vec<&str> = lang_misc[start..stop]
             .lines()
             .filter_map(|line| {
                 line.trim()
-                    .strip_prefix("(\"")
-                    .and_then(|rest| rest.split_once("\", &["))
-                    .map(|(class, _)| class)
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix("\","))
+                    .filter(|class| class.contains('/'))
             })
             .collect();
         assert!(

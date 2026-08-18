@@ -1864,6 +1864,38 @@ pub fn lambda_jit_capture_adapter_installs() -> u64 {
     lambda_site_prof::SITE_CAPTURE_ADAPTERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Print the lambda census ONCE at process exit, under the same
+/// `CRATONVM_DBG=lambda-jit` switch. Called from the VM's shutdown path.
+///
+/// # Why the periodic report is not enough, measured
+///
+/// `lambda_jit::maybe_report` fires every 200 000 *eligible* dispatches and
+/// `lambda_site_prof::maybe_report` every 100 000 *direct* calls. Both
+/// thresholds were chosen for a microbenchmark that does millions of one shape,
+/// and neither is reachable by an ordinary application workload: a census over
+/// 24 Tomcat JUnit classes — 129 s of real work, one of them running 21 HTTP
+/// tests against a live connector — printed **nothing at all**, and the obvious
+/// reading of that ("no lambda activity") is not one the instrument can
+/// support. It could equally have been 199 999 eligible dispatches and fifty
+/// installed thunks.
+///
+/// An instrument that is silent below a threshold no real workload crosses
+/// cannot answer "does this feature reach anything", which is the only question
+/// worth asking of a fast path. So the totals are printed once, unconditionally,
+/// at the end of every gated run.
+///
+/// Prints even when every counter is zero. That is deliberate: a zero line is
+/// the answer "nothing reached this path", and it is only worth anything if it
+/// can be told apart from the switch having been off — which the absence of a
+/// line cannot.
+pub fn report_lambda_census_at_exit() {
+    if !lambda_jit::on() {
+        return;
+    }
+    eprint!("[LAMBDA-JIT] EXIT ");
+    lambda_jit::report();
+}
+
 #[inline]
 pub(crate) fn lambda_site_bump_arity() {
     lambda_site_prof::bump(&lambda_site_prof::SITE_ARITY);
