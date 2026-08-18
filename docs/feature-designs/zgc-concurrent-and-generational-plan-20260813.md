@@ -1547,6 +1547,71 @@ share is structural**: it cannot be moved by the neighbour benchmark.
 
 ---
 
+## 3f. The sweep reductions applied to EVERY cycle — the first measured default-config gain, 2026-08-18
+
+G2e and G2f landed on 2026-08-17 ANDed with `young_cycle`, for one reason: they
+went in mid-gauntlet and a default run had to stay byte-for-byte unchanged.
+Neither argument was ever young-specific — the body is unreachable behind a zeroed
+header whatever the cycle kind, and the walk is ascending on both paths. §3d then
+showed the restriction was pointing them away from the cost:
+
+| | `sweep_us` | share of pause |
+|---|---:|---:|
+| young cycle | 6.3 ms | 5.6% |
+| **whole-heap cycle** | **170 ms** | **64%** |
+
+A default run performs *only* whole-heap cycles. The −30% was being applied to
+the 5.6%.
+
+### Measured with the restriction lifted
+
+One binary, four arms, interleaved with the order reversed on alternate reps,
+`ZgcGenProbe 400000 30000 300`, `-Xmx1200m`, **generational OFF** — i.e. the
+default configuration. 8 whole-heap sweeps per arm.
+
+| arm | mean `sweep_us` | vs off | range |
+|---|---:|---:|---|
+| both off | 711,110 | — | 568k–863k |
+| header-zero only | 535,354 | **−24.7%** | 435k–590k |
+| dead-run merge only | 256,190 | **−64.0%** | 188k–334k |
+| **both on (the default)** | **216,850** | **−69.5%** | 176k–291k |
+
+**Whole pause: 879.6 ms → 360.6 ms, −59.0%.** `BAD=0 OK` on every run.
+
+The arms do not overlap — the worst "on" run (291k) is better than the best "off"
+run (568k) by a factor of two — so the separation survives the wide wall-clock
+variance of a loaded developer machine, which is exactly why the comparison is
+one binary and interleaved.
+
+### And it explains §3d's zero
+
+On a **young** cycle the header-only zeroing measured *nothing*, and §3d's
+explanation was that G2d had already capped the memset volume: a bounded nursery
+bounds the garbage a young cycle reclaims. That prediction is now confirmed from
+the other side — on a whole-heap cycle, which has no such cap and reclaims 13.0M
+dead objects against a young cycle's 137k, the same switch is worth **−24.7%**.
+The feature was never inert; it was being measured on the arm that could not show
+it.
+
+The run merge dominates either way (−64% alone, −69.5% with the memset reduction
+on top; they overlap because both cut per-dead-object work).
+
+### What this changes
+
+**This is the first measured gain in this plan that a default run actually
+gets.** Everything else built here — concurrent marking, parallel marking,
+generational — is opt-in and has so far measured negative or neutral. Both
+switches are default-on and now apply to every cycle, so no flag has to be flipped
+to collect it.
+
+Renamed with the restriction: `CRATONVM_ZGC_GEN_HEADER_ZERO` →
+`CRATONVM_ZGC_SWEEP_HEADER_ZERO` and `CRATONVM_ZGC_GEN_DEAD_RUNS` →
+`CRATONVM_ZGC_SWEEP_DEAD_RUNS`. The `GEN_` prefix described the day they were
+young-only and would now be a lie; they are a day old and nothing depends on
+them.
+
+---
+
 ## 4. Sequencing, and what to do first
 
 ```

@@ -1427,6 +1427,64 @@ fn real_public_key_from_x509_der(ctx: &mut dyn NativeContext, der: &[u8]) -> Met
     Ok(Some(Value::Object(None)))
 }
 
+/// `BouncyCastleProvider.getPublicKey` declares `IOException` and nothing else.
+///
+/// Its body is a `try` whose `catch (RuntimeException e)` rethrows
+/// `Exceptions.ioException("malformed public key", e)` — there precisely so a
+/// structurally malformed `SubjectPublicKeyInfo` decoded from untrusted input
+/// cannot leak an unchecked exception past a declared contract. A native that
+/// replaces that body has to keep the guarantee; the same species of loss as an
+/// `init` native dropping a constraints check.
+///
+/// Measured: for `rsaEncryption` with an empty key body, BouncyCastle's own
+/// converter raises `NullPointerException: Cannot invoke
+/// RSAPublicKey.getModulus()` on HotSpot too — HotSpot reports
+/// `IOException: malformed public key` with that NPE as its cause, and this
+/// leaked the NPE itself (`MalformedKeyInfoTest`; identically under `--nojit`,
+/// so it never was a compilation problem).
+fn bc_public_key_contract(
+    ctx: &mut dyn NativeContext,
+    failed: cratonvm_types::error::MethodCallFailed,
+) -> cratonvm_types::error::MethodCallFailed {
+    use cratonvm_types::error::MethodCallFailed;
+    let MethodCallFailed::ExceptionThrown(exc) = failed else {
+        // An internal VM error is not a Java throwable and is not something
+        // this contract may relabel.
+        return failed;
+    };
+    // Already the declared type — BouncyCastle's own `catch (IOException e)`
+    // rethrows it unchanged, and so does this.
+    let mut class_id = ctx.class_id_of_object(exc);
+    loop {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
+            Some("java/io/IOException") => return MethodCallFailed::ExceptionThrown(exc),
+            Some("java/lang/Throwable") | None => break,
+            _ => {}
+        }
+        match ctx.superclass_of(class_id) {
+            Some(parent) => class_id = parent,
+            None => break,
+        }
+    }
+    let pin = ctx.pin_native_root(exc);
+    let msg = ctx.create_string("malformed public key");
+    let exc_now = ctx.read_native_pin(pin, exc);
+    let wrapped = ctx.new_object_initialized(
+        "java/io/IOException",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(msg)), Value::Object(Some(exc_now))],
+    );
+    let exc_now = ctx.read_native_pin(pin, exc);
+    ctx.unpin_native_roots(pin);
+    match wrapped {
+        Ok(Some(Value::Object(Some(wrapped)))) => MethodCallFailed::ExceptionThrown(wrapped),
+        // Could not build the wrapper: the original throwable is still the
+        // truthful answer, and swallowing it would be worse than the contract
+        // break this is repairing.
+        _ => MethodCallFailed::ExceptionThrown(exc_now),
+    }
+}
+
 /// `org.bouncycastle.jce.provider.BouncyCastleProvider.getPublicKey(SubjectPublicKeyInfo)`
 /// (static). BC's EC key-info-converter is never registered because CratonVM
 /// no-ops `EC$Mappings.configure` (to dodge the ~5-min `EC.<clinit>` curve-table
@@ -1503,7 +1561,9 @@ fn bc_provider_get_public_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         real_public_key_from_x509_der(ctx, &der)
     })();
     ctx.unpin_native_roots(pin);
-    out
+    // The whole body sits inside BouncyCastle's `try`, so the contract is
+    // applied to the whole body — see `bc_public_key_contract`.
+    out.map_err(|e| bc_public_key_contract(ctx, e))
 }
 
 /// Register a real imported RSA public key's verify material via its own X.509

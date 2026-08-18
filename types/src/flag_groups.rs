@@ -944,10 +944,20 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "metrics", on_key: Some("CRATONVM_JIT_METRICS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-out", on_key: Some("CRATONVM_JIT_METRICS_OUT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-ring", on_key: Some("CRATONVM_JIT_METRICS_RING"), off_key: None, off_word: None },
-    // The two virtual-MIC levers in `vm::jit::helpers`. `mic-exc-table-publish`
-    // is default-OFF (an expired ban the next person may lift on evidence);
-    // `mic-rust-entry-cache` is default-ON with only an opt-out spelling.
-    E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
+    // The two virtual-MIC levers in `vm::jit::helpers`. Both are default-ON.
+    // `mic-exc-table-publish` was default-OFF until 2026-08-17: the ban's stated
+    // reason had already expired (`emit_inline_callee_deopt_check` closed the
+    // hole), and lifting it is 8.7x on the exception-table rung of
+    // `probes/NativeFunnelFloorProbe.java` with the control rung unmoved. It is
+    // INTERLOCKED with `sp-ic-deopt-check`: publishing is refused outright when
+    // that check is not being emitted, so `=0` on either one is safe.
+    E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
+    // The statically-bound door's sibling of `mic-exc-table-publish`: may a
+    // baked direct CALL target a callee that declares its own exception table?
+    // Default-OFF pending its own measurement (16 refused binds on netty's
+    // BigEndianHeapByteBufTest against 736 for the native shadow), and
+    // interlocked with `sp-ic-deopt-check` the same way.
+    E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
@@ -1221,12 +1231,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-promotion-age", on_key: Some("CRATONVM_ZGC_GEN_PROMOTION_AGE"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0") },
-    // G2e/G2f (2026-08-17). Both are default-ON kill switches over the young
-    // sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
+    // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
+    // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run
     // and not a rebuild.
-    E { group: Group::GC, token: "zgc-gen-header-zero", on_key: Some("CRATONVM_ZGC_GEN_HEADER_ZERO"), off_key: None, off_word: Some("0") },
-    E { group: Group::GC, token: "zgc-gen-dead-runs", on_key: Some("CRATONVM_ZGC_GEN_DEAD_RUNS"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-sweep-header-zero", on_key: Some("CRATONVM_ZGC_SWEEP_HEADER_ZERO"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-sweep-dead-runs", on_key: Some("CRATONVM_ZGC_SWEEP_DEAD_RUNS"), off_key: None, off_word: Some("0") },
     // C5 (2026-08-18). Hand the mark coordinator the heap's own `Arc` instead of
     // a forwarding wrapper -- one fewer indirect call per marked object on the
     // parallel path. Default-on and `0` restores the wrapper, so the A/B is one
@@ -1391,6 +1401,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::SECURITY, token: "reflect-export-gate", on_key: None, off_key: Some("CRATONVM_REFLECT_NO_EXPORT_GATE"), off_word: None },
     E { group: Group::SECURITY, token: "require-policy", on_key: Some("CRATONVM_REQUIRE_POLICY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "trust-pem", on_key: Some("CRATONVM_TRUST_PEM"), off_key: None, off_word: None },
+    // Default-ON kill switch for the raw-OpenSSL client connector on the
+    // default `SSLSocket` path (Unix only — `openssl` is a Unix-scoped
+    // dependency). `0` reverts that path to `native_tls::TlsConnector`, which
+    // captures ONLY the peer's leaf certificate and cannot set the
+    // certificate security level. SECURITY rather than IO: what the switch
+    // selects is which verifier sees which chain, and at what strength floor.
+    E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },

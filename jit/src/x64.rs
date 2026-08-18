@@ -475,7 +475,7 @@ struct Compiler {
     /// Frame offset of the first XMM save slot (from RBP).
     xmm_saved_base: i32,
     /// Resolved multianewarray metadata: (bytecode_pc, leaf_element_type_code).
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     /// Resolved field access metadata: (bytecode_pc, field_index, type_tag).
     /// type_tag is b'I', b'J', b'F', b'D', b'L', or b'['.
     field_info: Vec<(usize, usize, u8)>,
@@ -1876,7 +1876,7 @@ impl Compiler {
         num_params: usize,
         max_stack: usize,
         needs_heap: bool,
-        multianewarray_info: Vec<(usize, u8)>,
+        multianewarray_info: Vec<(usize, i64)>,
         field_info: Vec<(usize, usize, u8)>,
         typecheck_info: Vec<(usize, *const u8, usize)>,
         static_field_info: Vec<(usize, u32, usize, u8, bool)>,

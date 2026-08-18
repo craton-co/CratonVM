@@ -476,20 +476,9 @@ pub(super) fn compile_osr_artifact(
                 let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(class_id)?;
                 for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-                    let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
-                    let leaf = class_name_ref.trim_start_matches('[');
-                    let leaf_et = match leaf.as_bytes().first() {
-                        Some(b'I') => 10u8,
-                        Some(b'J') => 11,
-                        Some(b'F') => 6,
-                        Some(b'D') => 7,
-                        Some(b'B') => 8,
-                        Some(b'C') => 5,
-                        Some(b'S') => 9,
-                        Some(b'Z') => 4,
-                        _ => 0,
-                    };
-                    mna_info.push((pc, leaf_et));
+                    // A malformed CP entry is still a whole-compile refusal.
+                    let _ = class.constant_pool.get_class_name(cp_idx)?;
+                    mna_info.push((pc, crate::jit::pack_multianewarray_site(class_id.as_u32(), cp_idx)));
                 }
             }
 
@@ -2194,23 +2183,37 @@ pub(super) fn try_osr(
     // frame's current bytecode, so there is nothing stale left to protect
     // against here. See the note in `interpreter.rs`'s compile gate.
     let frame = &thread.frames[frame_idx];
-    let class_name = frame.class_name().to_string();
-    let method_name = frame.method_name().to_string();
-    let method_descriptor = frame.method_descriptor().to_string();
+    // Six heap allocations — three `to_string()` and three `Arc::from(&str)` —
+    // used to run here, on EVERY back-edge that reaches this function, which is
+    // once per OSR entry and not once per compile. The frame already holds all
+    // three as `Arc<str>`, so `*_arc()` is a refcount bump; the `&str` views the
+    // rest of the function wants come straight off those.
+    //
+    // It matters because entries are not rare: since the RBC.6b lift a caught
+    // exception is an OSR exit plus a re-entry, so a `try`/`catch` loop takes
+    // one entry per throw — measured `osr_entered=2280923` on
+    // `probes/OsrExcRateProbe.java`, i.e. 13.7 million allocations that bought
+    // nothing. `perf record` on that arm put 8.6% of the run in
+    // `mi_malloc`/`mi_free`.
+    //
+    // `frame.code` was already an `Arc<[u8]>` clone and stays one.
+    let class_name_arc: Arc<str> = frame.class_name_arc();
+    let method_name_arc: Arc<str> = frame.method_name_arc();
+    let descriptor_arc: Arc<str> = frame.method_descriptor_arc();
+    let class_name: &str = &class_name_arc;
+    let method_name: &str = &method_name_arc;
+    let method_descriptor: &str = &descriptor_arc;
     let code = frame.code.clone();
     let max_locals = frame.max_locals as usize;
-    let class_name_arc: Arc<str> = Arc::from(class_name.as_str());
-    let method_name_arc: Arc<str> = Arc::from(method_name.as_str());
-    let descriptor_arc: Arc<str> = Arc::from(method_descriptor.as_str());
     // wire-tiered-manager Step 5: the OSR compile (or cache reuse) now lives in
     // `compile_osr_artifact`, which the background worker can also call off-thread.
     // The live-frame entry/transfer below stays on the mutator.
     let compiled = compile_osr_artifact(
         shared,
         class_id,
-        class_name.clone(),
-        method_name.clone(),
-        method_descriptor.clone(),
+        class_name.to_string(),
+        method_name.to_string(),
+        method_descriptor.to_string(),
         &code,
         max_locals,
         entry_pc,
@@ -4003,6 +4006,9 @@ pub(super) fn try_jit_upgrade_with_gate(
             // RFJP.1 — never JIT a callee on a class transitively extending
             // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
             if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::FjpBlocklist,
+                );
                 return None;
             }
             // S111r15 — refuse to compile a callee that has a Rust native
@@ -4022,6 +4028,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                 .find(callee_class, callee_method, callee_desc)
                 .is_some()
             {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::NativeShadow,
+                );
                 return None;
             }
             // A direct compiled entry has no interpreter boundary to route an
@@ -4039,10 +4048,15 @@ pub(super) fn try_jit_upgrade_with_gate(
                         callee_desc,
                         store,
                     ) {
+                        // Sibling of the same gate in `direct_callee_lookup`.
                         if method
                             .code()
                             .map_or(false, |code| !code.exception_table.is_empty())
+                            && !cratonvm_jit::direct_call_exc_table_publish_enabled()
                         {
+                            cratonvm_jit::note_direct_callee_bind_refusal(
+                                cratonvm_jit::DirectBindRefusal::CalleeExceptionTable,
+                            );
                             return None;
                         }
                     }
@@ -4075,6 +4089,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                     // the site on `jit_invoke_dispatch`, whose
                     // `try_resume_trapped_callee` resolves the trap in place.
                     if compiled.has_indy_trap {
+                        cratonvm_jit::note_direct_callee_bind_refusal(
+                            cratonvm_jit::DirectBindRefusal::IndyTrap,
+                        );
                         return None;
                     }
                     // Cast: object/code pointer to integer address
@@ -4096,6 +4113,9 @@ pub(super) fn try_jit_upgrade_with_gate(
             )?;
             // Direct callee compilation must share the synchronized-method gate.
             if method.is_synchronized() {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::Synchronized,
+                );
                 return None;
             }
 
@@ -4144,6 +4164,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                     .map(crate::vm::is_class_initialized_fast)
                     .unwrap_or(false);
                 if !declaring_class_initialized {
+                    cratonvm_jit::note_direct_callee_bind_refusal(
+                        cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized,
+                    );
                     return None;
                 }
             }
@@ -5820,8 +5843,15 @@ pub(super) fn try_jit_compile_callee_slow(
                                 callee_method: &str,
                                 callee_desc: &str|
      -> Option<(usize, bool)> {
+        // Each arm names its refusal TWICE on purpose: the string is for the
+        // per-site `dbg_jitc` trace, the `DirectBindRefusal` variant is for the
+        // process-wide tally the `intrinsic-stats` census prints. A bare
+        // `bind_misses` total cannot distinguish a compile-ORDER accident
+        // (re-bindable) from a standing policy refusal (not), which is the
+        // choice the two-causes page leaves open.
         macro_rules! dc_no {
-                ($why:expr) => {{
+                ($why:expr, $reason:expr) => {{
+                    cratonvm_jit::note_direct_callee_bind_refusal($reason);
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
                             "[cratonvm-jitc] bg-direct-call DECLINED {callee_class}.{callee_method}{callee_desc}: {}",
@@ -5832,7 +5862,7 @@ pub(super) fn try_jit_compile_callee_slow(
                 }};
             }
         if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
-            dc_no!("fjp-blocklist");
+            dc_no!("fjp-blocklist", cratonvm_jit::DirectBindRefusal::FjpBlocklist);
         }
         if shared
             .natives
@@ -5840,14 +5870,14 @@ pub(super) fn try_jit_compile_callee_slow(
             .find(callee_class, callee_method, callee_desc)
             .is_some()
         {
-            dc_no!("native-shadow");
+            dc_no!("native-shadow", cratonvm_jit::DirectBindRefusal::NativeShadow);
         }
         let callee_class_id = {
             let cm = shared.classes.class_manager.read();
             let Some(callee_cid) =
                 cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
             else {
-                dc_no!("callee-class-not-found");
+                dc_no!("callee-class-not-found", cratonvm_jit::DirectBindRefusal::CalleeClassNotFound);
             };
             let store = cm.class_store();
             let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
@@ -5856,16 +5886,26 @@ pub(super) fn try_jit_compile_callee_slow(
                 callee_desc,
                 store,
             ) else {
-                dc_no!("callee-method-not-found");
+                dc_no!("callee-method-not-found", cratonvm_jit::DirectBindRefusal::CalleeMethodNotFound);
             };
             if method.is_synchronized() {
-                dc_no!("synchronized");
+                dc_no!("synchronized", cratonvm_jit::DirectBindRefusal::Synchronized);
             }
-            if method
-                .code()
-                .map_or(true, |c| !c.exception_table.is_empty())
-            {
-                dc_no!("callee-exception-table");
+            // A callee with no `Code` attribute at all (`map_or(true, ..)`)
+            // is always refused — there is no body to bake a CALL to. A callee
+            // that merely DECLARES a table is refused only while
+            // `direct_call_exc_table_publish_enabled` is off; see that function
+            // for why the stated reason has expired and what it is interlocked
+            // against.
+            let callee_code_bars_direct_call = match method.code() {
+                None => true,
+                Some(c) => {
+                    !c.exception_table.is_empty()
+                        && !cratonvm_jit::direct_call_exc_table_publish_enabled()
+                }
+            };
+            if callee_code_bars_direct_call {
+                dc_no!("callee-exception-table", cratonvm_jit::DirectBindRefusal::CalleeExceptionTable);
             }
             if method.is_static()
                 && !store
@@ -5873,7 +5913,7 @@ pub(super) fn try_jit_compile_callee_slow(
                     .map(crate::vm::is_class_initialized_fast)
                     .unwrap_or(false)
             {
-                dc_no!("declaring-class-not-initialized");
+                dc_no!("declaring-class-not-initialized", cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized);
             }
             callee_cid
         };
@@ -5931,20 +5971,20 @@ pub(super) fn try_jit_compile_callee_slow(
             Some(compiled) => compiled,
             None => {
                 if !crate::runtime::env_cache::jit_eager_callee_chain() {
-                    dc_no!("callee-not-yet-compiled");
+                    dc_no!("callee-not-yet-compiled", cratonvm_jit::DirectBindRefusal::CalleeNotYetCompiled);
                 }
                 if cratonvm_jit::jit_active_compile_depth() > MAX_EAGER_CALLEE_CHAIN_DEPTH {
-                    dc_no!("eager-callee-chain-depth");
+                    dc_no!("eager-callee-chain-depth", cratonvm_jit::DirectBindRefusal::EagerChainDepth);
                 }
                 if cratonvm_jit::jit_active_compile_contains(
                     callee_class,
                     callee_method,
                     callee_desc,
                 ) {
-                    dc_no!("eager-callee-chain-cycle");
+                    dc_no!("eager-callee-chain-cycle", cratonvm_jit::DirectBindRefusal::EagerChainCycle);
                 }
                 if !eager_callee_chain_try_spend() {
-                    dc_no!("eager-callee-chain-budget");
+                    dc_no!("eager-callee-chain-budget", cratonvm_jit::DirectBindRefusal::EagerChainBudget);
                 }
                 // `optimize` is this compile's own backend selection, so a C1 body's
                 // callees are compiled at C1 and a C2 body's at C2 — the callee never
@@ -5956,13 +5996,13 @@ pub(super) fn try_jit_compile_callee_slow(
                     callee_desc,
                     optimize,
                 ) else {
-                    dc_no!("eager-callee-chain-compile-declined");
+                    dc_no!("eager-callee-chain-compile-declined", cratonvm_jit::DirectBindRefusal::EagerChainCompileDeclined);
                 };
                 body
             }
         };
         if compiled.has_indy_trap {
-            dc_no!("indy-trap");
+            dc_no!("indy-trap", cratonvm_jit::DirectBindRefusal::IndyTrap);
         }
         if crate::runtime::env_cache::dbg_jitc() {
             eprintln!(

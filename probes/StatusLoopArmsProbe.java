@@ -24,14 +24,37 @@ public final class StatusLoopArmsProbe {
     static void bare(int n)      { int s = 0; for (int c = 600; c < 600 + n; c++) { s += c; } sink += s; }
     static void getstatic(int n) { int s = 0; for (int c = 600; c < 600 + n; c++) { if (HttpStatusClass.UNKNOWN != null) { s += c; } } sink += s; }
     static void valueOf(int n)   { int s = 0; for (int c = 600; c < 600 + n; c++) { if (HttpStatusClass.valueOf(c) != null) { s += c; } } sink += s; }
+    /**
+     * The failure branch goes through a CALLEE, not a bare `throw new`.
+     *
+     * Its first draft wrote `throw new IllegalStateException()` inline, which
+     * put a `new` AND an `athrow` in the method — and RBC.6 (`has_athrow`)
+     * refuses OSR for any method that `athrow`s, so this arm ran interpreted in
+     * both directions while its four siblings compiled. Measured 2026-08-17 on
+     * the Azure host: 825.91 ns/iter for `refcheck` against 80.57 for `full`,
+     * i.e. the SUBSET arm ten times slower than the superset it is a subset of.
+     * An arm that cannot compile does not decompose the loop, it measures the
+     * interpreter, and here it did so while reading as a rung.
+     */
     static void refcheck(int n)  {
         int s = 0;
         for (int c = 600; c < 600 + n; c++) {
             HttpStatusClass k = HttpStatusClass.valueOf(c);
-            if (HttpStatusClass.UNKNOWN != k) { throw new IllegalStateException(); }
+            check(HttpStatusClass.UNKNOWN != k);
             s += c;
         }
         sink += s;
+    }
+
+    static void check(boolean bad) {
+        if (bad) {
+            fail();
+        }
+    }
+
+    /** Out of line, so neither `new` nor `athrow` appears in a measured body. */
+    static void fail() {
+        throw new IllegalStateException();
     }
     static void full(int n) {
         int s = 0;
