@@ -3531,37 +3531,86 @@ mod tests {
         // the thin lock; the second arrival must inflate to a heavyweight
         // Monitor. After both finish, the registry must contain exactly
         // one inflated monitor.
-        use std::sync::Barrier;
+        //
+        // CONTENTION IS ARRANGED, NOT TIMED. This test used to hold the lock
+        // for 20ms and have the second thread sleep 2ms before entering,
+        // trusting the 10x margin to keep the two windows overlapping. That is
+        // an assumption about the SCHEDULER, and it does not hold on a busy
+        // box: if thread 1's whole hold completes before thread 2 wakes,
+        // thread 2 takes an UNCONTENDED thin lock, nothing ever inflates, and
+        // the assertions below fail with `left: 0, right: 1`. It failed exactly
+        // that way twice on an 8-core CI host with a second cargo job running,
+        // and resisted 24 deliberate reproduction attempts afterwards — the
+        // signature of a timing assumption, not of a defect in `MonitorTable`.
+        // (`fixed-bugs/monitor-inflation-test-timed-its-contention-instead-of-`
+        // `arranging-it-FIXED-20260818`, in the internal tree.)
+        //
+        // The handshake below removes the assumption in both directions:
+        //
+        //   * thread 2 does not attempt entry until thread 1 has published
+        //     that it HOLDS the thin lock, so it can never arrive early;
+        //   * thread 1 does not release until it observes the object INFLATED,
+        //     so it can never leave early.
+        //
+        // That is deadlock-free by the documented shape of the contended path:
+        // `enter_or_contend`'s `THIN_LOCKED(other)` arm inflates FIRST and only
+        // then blocks, so thread 1's wait is satisfied by thread 2 reaching the
+        // block, not by thread 1 releasing. The deadline turns a regression
+        // that breaks that ordering into a failure with a message instead of a
+        // hung suite.
+        use std::sync::{Condvar, Mutex};
+        use std::time::{Duration, Instant};
 
         let heap = Heap::new();
         let obj = heap.alloc_object(ClassId::new(0), 0);
         let table = Arc::new(MonitorTable::new());
 
-        // Barrier to ensure both threads are running before contention starts.
-        let barrier = Arc::new(Barrier::new(2));
+        // `false` until thread 1 owns the thin lock.
+        let held = Arc::new((Mutex::new(false), Condvar::new()));
 
-        // Thread 1 takes the lock and holds it long enough that thread 2
-        // arrives and must inflate.
         let table1 = table.clone();
-        let barrier1 = barrier.clone();
+        let held1 = held.clone();
         let h1 = std::thread::spawn(move || {
             table1.enter(obj, ThreadId(1));
-            // Mark word should be THIN_LOCKED for tid 1 here -- but thread 2
-            // is about to race in and inflate it.
-            barrier1.wait();
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            {
+                let (lock, cv) = &*held1;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+            }
+            // Hold until thread 2's contended entry has actually inflated the
+            // object. This is the half that makes the test measure inflation
+            // rather than measure the scheduler.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+                if ObjectHeader::mark_state(mark) == types::MARK_INFLATED {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "thread 2 never inflated the object while thread 1 held the \
+                     thin lock: the contended `enter` path must inflate BEFORE \
+                     it blocks, or this handshake (and the fast path it \
+                     documents) is wrong"
+                );
+                std::thread::yield_now();
+            }
             table1.exit(obj, ThreadId(1)).unwrap();
         });
 
-        // Thread 2: arrives after thread 1 has the thin lock. The
-        // contended-thin-lock path inflates and then blocks on entry.
         let table2 = table.clone();
-        let barrier2 = barrier.clone();
+        let held2 = held.clone();
         let h2 = std::thread::spawn(move || {
-            barrier2.wait();
-            // Brief delay to ensure thread 1 is still inside the critical
-            // section when we attempt to enter.
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            {
+                let (lock, cv) = &*held2;
+                let mut owned = lock.lock().unwrap();
+                while !*owned {
+                    owned = cv.wait(owned).unwrap();
+                }
+            }
+            // Thread 1 provably holds the thin lock right now, so this entry
+            // is contended by construction: it inflates, then blocks until
+            // thread 1 observes the inflation and releases.
             table2.enter(obj, ThreadId(2));
             table2.exit(obj, ThreadId(2)).unwrap();
         });
