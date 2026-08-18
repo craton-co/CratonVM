@@ -204,6 +204,7 @@ impl Compiler {
             self.null_check_store_stubs
                 .truncate(null_check_store_stubs_checkpoint);
             self.deopt_points.truncate(deopt_points_checkpoint);
+            crate::metrics::note_inline_call_arm(6);
             false
         }
     }
@@ -1503,6 +1504,7 @@ impl Compiler {
                                 prev_was_terminator = false;
                                 continue;
                             }
+                            crate::metrics::note_inline_call_arm(5);
                         } else if let Some(&resolved) = site
                             .resolved_invoke_infos
                             .iter()

@@ -362,24 +362,58 @@ from the recorded call graph, are `jit::helpers::jit_invoke_virtual_mic` and
 Pre-sized to 16, which covers the real-JDK interface DAGs it walks
 (`CompletableFuture`, `Function`, the `Collection` family) without a resize.
 
-Four pinned, interleaved pairs, same binary pair throughout:
+**CORRECTED 2026-08-18, same day.** The first version of this section reported
+"4/4 pairs, 3.1%-12.1%" from a run that was **not** interleaved — it ran
+baseline-then-patched in every pair, so any systematic advantage to running
+second (page cache, frequency ramp) would land entirely on the patched arm and
+produce exactly that clean sweep. This repo's own convention is ABBA and it was
+not followed. Re-measured properly, `taskset -c 6,7`, 8 ABBA blocks = 16
+samples per arm:
 
-| shape | before | after | pairs favouring after |
+| | median | mean | blocks favouring pre-size |
 |---|---:|---:|---|
-| `thenApply` | 5 645 – 5 795 | 5 062 – 5 509 | **4 / 4** (3.1% – 12.1%) |
-| `thenCompose` | 10 520 – 10 938 | 9 869 – 10 301 | **4 / 4** (4.6% – 8.2%) |
+| `default()` | 5 580.0 | 5 542.7 | — |
+| pre-sized to 16 | 5 352.6 | 5 249.9 | **7 / 8** |
 
-**This is worth flagging against §3's own warning**, which is that two changes
-on 2026-08-13 each removed 5–10% of attributed samples and neither moved CPU.
-This one removed ~3.5% of samples and moved wall clock by more than that —
-because deleting a growing hash table also deletes the `malloc`/`free` traffic
-underneath it, which is attributed to the allocator cluster, not to the set.
-Sample share is a lower bound on what an allocation costs, not an estimate.
+**median 4.1%, mean 5.3%** — real, and smaller and noisier than the first
+number claimed. Keep the 4-5% figure, not the 12%.
 
-It is a **~5% change on a 60x gap**, and it is reported as exactly that. It
-does not touch the cause.
+**The probe is BIMODAL, which is why the first design was so easy to fool.**
+Runs land in one of two states — around 5.3 µs/stage or around 4.4 µs/stage for
+`thenApply` — and both binaries reach both (block 5 has the pre-sized arm at
+4 384 and block 6 has the baseline arm at 5 029, reversing the sign). A design
+that gives one arm a fixed position cannot separate that from a real effect.
+Anything measured on this probe needs ABBA and needs enough blocks to see both
+modes; three reps is not enough. What causes the bimodality is not known and is
+worth its own look — it is a ~1.2x swing in a VM running an identical workload.
 
-### 6.4 What is still not known
+### 6.4 A candidate found, measured, and NOT landed
+
+`force_native_over_real_jdk_bytecode_memoized`
+(`vm/src/runtime/interpreter/native_override.rs`) exists to avoid a ~55-branch
+scan. Its key is `(Box<str>, Box<str>, Box<str>)`, so **every lookup, including
+every hit, first builds that key**: three heap allocations and three copies,
+then three string comparisons inside the probe, then three frees — under a
+process-global `Mutex`. That is a memo whose hit path may well cost more than
+the miss it replaces, and it fits the evidence: `__memcmp_evex_movbe` at 2.71%
+with `should_force_registered_native_over_bytecode` among its callers, on a
+workload that does no string work of its own.
+
+The fix is mechanical, because `Box<str>: Borrow<str>` but a TUPLE of them has
+no such impl — which is exactly why the old shape had to allocate. Splitting
+the key into "hash the class, then linear-scan its methods" makes the hit path
+allocation-free, and the common case (a class in no triple) becomes one hash
+lookup returning `None`.
+
+**It was written, built, and measured, and it did not move this probe.** So it
+is described here and NOT landed. The reasoning that it is strictly less work
+is exactly the reasoning behind the two 2026-08-13 changes §3 warns about, and
+this page is not the place to add a third. Someone with a workload that
+actually stresses reflective / megamorphic dispatch — the paths the memo's own
+doc comment says it was added for, which composition is not — should pick it up
+with that as the instrument.
+
+### 6.5 What is still not known
 
 The gap is not lambda dispatch (§5 settled that), and it is not the visited set
 (§6.3 is 5%). The profile says the next place to look is the **native-registry
@@ -392,3 +426,181 @@ Unchanged from §5: any candidate fix must be A/B'd on
 run — the hibernate-reactive suite is not on the Azure host. The numbers above
 are `LambdaCompositionProbe` only, and the page's own history is that probe
 wins do not always convert.
+
+## 7. The registry cluster, measured — 4 lookups per stage and every one of them misses
+
+§6.5 pointed at the ~12.5% native-registry cluster. `CRATONVM_DBG=native-lookups`
+(the census built for exactly this question) over
+`probes/LambdaCompositionProbe.java`, four workload sizes:
+
+| chains | stages | `find` | `quirks` | `invokes(stackless)` |
+|---:|---:|---:|---:|---:|
+| 2 500 | 20 000 | 151 254 | 147 753 | 966 |
+| 5 000 | 40 000 | 231 254 | 227 756 | 966 |
+| 10 000 | 80 000 | 391 254 | 387 756 | 966 |
+| 20 000 | 160 000 | 711 254 | 707 756 | 966 |
+
+**Exactly 4.0 `find` calls per composition stage**, at every size — the deltas
+are 80 000 / 160 000 / 320 000 against 20 000 / 40 000 / 80 000 added stages,
+linear to three digits, over a fixed ~71 k boot cost.
+
+**And essentially every one of them misses.** `quirks` tracks `find` to within
+0.5%, and `resolve_id_with_descriptor_quirks` is only reached *after* the exact
+lookup has already failed. So each of those four does: a class prefilter hash,
+a slot hash, a miss, then a full byte pass over the descriptor in an arm marked
+`#[cold]` `#[inline(never)]` — which on this workload is taken ~100% of the
+time. The arm is correct to bail (it returns `None` before allocating), but
+`#[cold]` is a branch-layout hint that is simply wrong here.
+
+That is the shape behind the 2.71% `__memcmp_evex_movbe` and a good part of the
+`find` / `slot_for_exact` / `quirks` lines: not one expensive lookup, but four
+cheap ones per stage that were never going to hit.
+
+**The instrument's own headline number is misleading, and this is the trap.**
+`lookups_per_invoke` printed 162 -> 245 -> 411 -> 742 across those four rows,
+which reads like a per-call cost that worsens with load. It is not:
+`invokes(stackless)` is **constant at 966** in all four runs, so the ratio grew
+only because its denominator could not move. The lookups this workload
+generates do not arrive through `try_stackless_invoke` at all, though that
+counter's doc comment calls itself "the every-invoke entry point". Corrected at
+the source in this change; the reliable reading is the marginal rate between
+two sizes, which is what the 4.0 above is.
+
+**Not fixed here, and deliberately.** The obvious moves — a negative cache, or
+dropping `#[cold]` — are each a one-line change with an obvious story, and this
+page's history (§3, and §6.4 in this session) is that such changes do not
+convert. Whoever takes it should start from the fact above: the target is
+*four misses per stage*, so the question is which call site issues them and
+whether it can ask once, not whether each miss can be made cheaper.
+
+`perf` could not answer that: dwarf unwinding through these frames yields bogus
+return addresses (`0x1ffffffffff`, `0x3`), so `--call-graph` gives no callers
+for `find`. So the census grew a miss tally instead — and it answered in one
+run.
+
+## 7.1 The four are two triples, and the VM has no native for either
+
+`CRATONVM_DBG=native-lookups` now also reports the most-missed triples. A miss
+is `find` returning `None` after both the exact probe and the quirk rewrite
+failed:
+
+```
+miss 112001  java/util/concurrent/CompletableFuture.uniApplyStage(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;
+miss 112000  java/util/concurrent/CompletableFuture.uniComposeStage(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;
+miss   1004  java/lang/Object.setRelease(Ljava/util/concurrent/CompletableFuture;Ljava/lang/Object;)V
+miss    502  java/lang/invoke/VarHandle.setRelease(...)
+```
+
+**Two triples are 96.9% of every registry lookup this workload makes** — and
+the rate is exact, not approximate. The probe runs
+`runChains(2 000)+runCompose(2 000)` as warm-up and `runChains(5 000)+
+runCompose(5 000)` measured, so each shape sees `(2 000+5 000) x 8 = 56 000`
+stages:
+
+| triple | misses | stages | per stage |
+|---|---:|---:|---:|
+| `uniApplyStage` | 112 001 | 56 000 | **2.0000** |
+| `uniComposeStage` | 112 000 | 56 000 | **2.0000** |
+
+So every `thenApply` asks the native registry **twice** whether
+`CompletableFuture.uniApplyStage` has a native implementation, and every
+`thenCompose` asks twice for `uniComposeStage`. The answer is no, in every
+build, for both: they are private JDK internals that nothing registers. Each
+"no" costs a class-prefilter hash, a slot hash, and a full descriptor byte pass
+through the `#[cold]` quirk arm — on a 100-byte descriptor, for the generic
+`Function` signatures above.
+
+The doubling is worth noting on its own: §3 records the same shape on the SAM
+path, where the `lambda_proxies` map is probed *"up to twice — once for
+`is_lambda_proxy_receiver` and again inside `try_lambda_dispatch`"*. Asking the
+same question twice per call may be one pattern rather than two accidents.
+
+**Now the target is specific enough to fix**, which it was not two sections ago:
+it is not "the registry is 12.5%" and not "make a miss cheaper", it is *two
+known-negative triples, asked twice each, per stage*. A per-call-site or
+per-triple negative memo would delete ~97% of this workload's registry traffic.
+That is still an unlanded candidate — it needs an invalidation story (a native
+CAN be registered later, and redefine exists), and this page's whole history is
+that plausible-looking one-liners do not convert. But it is now a question with
+a bounded answer rather than a profile share.
+
+## 8. The negative memo: the invalidation problem is already solved, and the memo already exists
+
+Started 2026-08-18 as "design a negative cache with an invalidation story".
+Both halves turned out to be built already. Recording what was established, so
+the remaining work is the small part rather than the design.
+
+### 8.1 A negative cannot go stale, and the primitive that proves it exists
+
+Three facts, each checked rather than assumed:
+
+1. **The registry is frozen after VM init.** `register` / `register_with_kind`
+   take `&mut self`, and `natives.native_methods` is a plain
+   `NativeMethodRegistry` field (`vm/src/vm/realms/native_realm.rs:16`) built in
+   `vm_init` and then owned by an `Arc<SharedVm>`. JNI `RegisterNatives` does
+   NOT go here — it has its own `jni_native_methods: RwLock<HashMap<u64, usize>>`
+   beside it. `classes_with_natives`'s own doc confirms the direction:
+   *"Registrations are never removed, so the set never needs to shrink."*
+2. **The one piece of runtime mutability cannot invalidate a negative.**
+   `netty_tcnative_muted` is an `AtomicBool` on the otherwise-immutable struct,
+   and its field doc says *"Only ever set, never cleared."* Muting makes `find`
+   return `None` more often, so it can turn a positive into a negative and
+   never the reverse.
+3. **A generation counter already exists**, and is exactly the right shape:
+   `NativeMethodRegistry::generation()` is `registry_epoch + slots.len()`. It
+   moves whenever a slot is appended, and `registry_epoch` is handed out in
+   `1 << 20`-wide bands per registry instance, so a memo taken against one
+   registry can never be redeemed against another (the multi-VM-in-one-process
+   case).
+
+So the invalidation story is: **key the memo on `generation()`**. Registration
+changes it; a different VM has a different band; nothing else can move the
+answer.
+
+### 8.2 …and that memo is `NativeCallSite`, which already does this
+
+`native-api/src/native_id.rs` already implements precisely it — a one-word
+`AtomicU64` laid out as `(generation << 32) | (slot + 1)`, where the low half
+being zero encodes "resolved to NO native". Its own doc gives the reasoning
+this section set out to derive:
+
+> Keying the memo on the registry generation (which changes whenever a
+> genuinely new native slot is appended) makes a stale negative self-heal at
+> the cost of one `u32` compare, so the mechanism is correct at every point in
+> the VM's lifetime, not just after boot.
+
+It also names the failure mode a naive `OnceLock<Option<NativeCallback>>` has —
+a `None` memoized before the lazy `register_*` passes run is *wrong forever* —
+and it enforces its one-cell-one-triple contract with a `debug_assert!` on a
+triple digest that costs nothing in release.
+
+`CachedBytecodeMethod` already carries the cell
+(`native_callback_cache: OnceLock<NativeCallSite>`) with two accessors:
+`native_call_site()` and `native_dispatch()`, the latter being the JDK-only-
+correct form that also keeps the `NativeKind` and counts the dispatch. Live
+callers today: `dispatch_virtual.rs:794` and `:1977`, and
+`native_override.rs:6411`.
+
+### 8.3 So the remaining work is wiring, not design
+
+§7.1 measured `CompletableFuture.uniApplyStage` and `.uniComposeStage` at
+**exactly 2.0000 registry misses per stage each**, 96.9% of all lookups. The
+memo that would collapse those to one atomic load and a `u32` compare is built,
+reviewed, and already used three places. The open question is only **which call
+sites issue those two probes** and whether each has a `CachedBytecodeMethod` in
+hand (use its cell) or needs its own `static NativeCallSite` (the shape
+`MATCHER_LEAF_SITES` in `jit/helpers.rs` uses for constant triples).
+
+The honest next step is a counter that attributes the misses to a call site.
+`perf` cannot: dwarf unwinding through these frames yields bogus return
+addresses. The `[native-lookups] miss` tally added in §7.1 names the *triple*
+but not the *caller*, and that is the gap to close next — a `#[track_caller]`
+or a per-call-site census kind on the handful of `find` call sites in
+`invoke.rs` and `native_override.rs`.
+
+**Not attempted here**, deliberately: two of the three `find` call-site clusters
+in `native_override.rs` re-target the class name (the `java/lang/ClassLoader`
+rewrite `native_dispatch`'s contract explicitly excludes), so "route them all
+through the cached cell" is wrong for at least some of them. Which is exactly
+the kind of detail that turns a one-line change into a defect, and the reason
+this section stops at a verified design rather than a patch.

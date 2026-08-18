@@ -2744,7 +2744,9 @@ pub static GETFIELD_ARM_EMITS: [std::sync::atomic::AtomicU64; 6] = [
 /// within noise of each other, and without these there is no way to tell "the
 /// devirtualised splice did not help" from "the devirtualised splice never
 /// fired". Index-parallel with [`INLINE_CALL_ARM_NAMES`].
-pub static INLINE_CALL_ARM_EMITS: [std::sync::atomic::AtomicU64; 5] = [
+pub static INLINE_CALL_ARM_EMITS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2753,7 +2755,7 @@ pub static INLINE_CALL_ARM_EMITS: [std::sync::atomic::AtomicU64; 5] = [
 ];
 
 /// Names for [`INLINE_CALL_ARM_EMITS`], index-parallel.
-pub const INLINE_CALL_ARM_NAMES: [&str; 5] = [
+pub const INLINE_CALL_ARM_NAMES: [&str; 7] = [
     // A call inside a spliced body, emitted as a raw CALL to a compiled entry.
     "spliced-call-direct",
     // The same, emitted through the blind `jit_invoke_dispatch` helper. Should
@@ -2767,6 +2769,15 @@ pub const INLINE_CALL_ARM_NAMES: [&str; 5] = [
     // A guarded splice that was PLANNED and then refused at emission — the
     // number that distinguishes "did not help" from "could not be emitted".
     "nested-splice-guarded-refused",
+    // A statically bound nested splice that was PLANNED and bailed during
+    // emission. The counter set shipped without this, which is why a run
+    // showing `nested-splice=0` could not distinguish "no nested site was ever
+    // planned" from "every one of them was planned and then rolled back".
+    "nested-splice-refused",
+    // An OUTER splice that the planner admitted and the emitter rolled back.
+    // Everything nested inside it dies with it, so a zero in every nested arm
+    // means nothing until this number is known.
+    "outer-splice-rolled-back",
 ];
 
 /// Record that the spliced-call emitter took arm `arm`.
