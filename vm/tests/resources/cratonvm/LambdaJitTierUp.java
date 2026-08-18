@@ -314,6 +314,55 @@ public final class LambdaJitTierUp {
         return sum;
     }
 
+    // The capturing fixtures below get their OWN hop methods, and that is not
+    // tidiness.
+    //
+    // `step` is shared by every checksum in this file, so ITS call site
+    // accumulates receiver classes across the whole run — three from
+    // `captureShapesChecksum`, one from `multiCaptureChecksum`, one from
+    // `warmCapturingChecksum`, on top of everything above. The polymorphic
+    // inline cache holds four (`JIT_PIC_ENTRIES`), and the fifth receiver
+    // evicts one. Past that the site thrashes and every dispatch falls back to
+    // the Rust arm, which is exactly what `site_direct` is asserted to be small.
+    //
+    // Measured as an intermittent failure of `lambda_capture_adapter_tests` —
+    // one run in eighteen — because whether the site goes megamorphic before or
+    // after the bulk of the calls depends on when each body finishes compiling.
+    // A dedicated hop per fixture keeps each site inside the cache's four ways,
+    // and is also what an ordinary call site looks like.
+
+    private static int capStep(IntUnaryOperator op, int v) {
+        return op.applyAsInt(v);
+    }
+
+    private static int shapeStep(IntUnaryOperator op, int v) {
+        return op.applyAsInt(v);
+    }
+
+    private static long shapeStepLong(LongUnaryOperator op, long v) {
+        return op.applyAsLong(v);
+    }
+
+    private static double shapeStepDouble(DoubleUnaryOperator op, double v) {
+        return op.applyAsDouble(v);
+    }
+
+    private static String shapeStepObj(IntFunction<String> op, int v) {
+        return op.apply(v);
+    }
+
+    private static int multiStep(IntUnaryOperator op, int v) {
+        return op.applyAsInt(v);
+    }
+
+    private static long multiStepLong(LongUnaryOperator op, long v) {
+        return op.applyAsLong(v);
+    }
+
+    private static double multiStepDouble(DoubleUnaryOperator op, double v) {
+        return op.applyAsDouble(v);
+    }
+
     /**
      * {@link #warmChecksum} for a CAPTURING lambda.
      *
@@ -334,7 +383,7 @@ public final class LambdaJitTierUp {
         IntUnaryOperator capAdd = v -> v + k;
         int sum = 0;
         for (int i = 0; i < 400_000; i++) {
-            sum += step(capAdd, i & 0xFF) + capAdd.applyAsInt(i & 0xFF);
+            sum += capStep(capAdd, i & 0xFF) + capAdd.applyAsInt(i & 0xFF);
         }
         return sum;
     }
@@ -373,13 +422,13 @@ public final class LambdaJitTierUp {
         long acc = 0;
         for (int i = 0; i < N; i++) {
             int x = i & 0xFF;
-            acc += stepLong(lop, x);
-            acc += (long) (stepDouble(dop, x) * 4.0);
-            acc += (long) (stepDouble(fop, x) * 64.0);
-            acc += step(bop, x);
-            acc += step(cop, x);
-            acc += step(sop, x);
-            acc += stepObj(rop, x).length();
+            acc += shapeStepLong(lop, x);
+            acc += (long) (shapeStepDouble(dop, x) * 4.0);
+            acc += (long) (shapeStepDouble(fop, x) * 64.0);
+            acc += shapeStep(bop, x);
+            acc += shapeStep(cop, x);
+            acc += shapeStep(sop, x);
+            acc += shapeStepObj(rop, x).length();
         }
         return (int) (acc % 1_000_000_007L);
     }
@@ -415,9 +464,9 @@ public final class LambdaJitTierUp {
         long acc = 0;
         for (int i = 0; i < N; i++) {
             int x = i & 0xFF;
-            acc += stepLong(twoLongs, x);
-            acc += step(intAndRef, x);
-            acc += (long) (stepDouble(dblAndInt, x) * 2.0);
+            acc += multiStepLong(twoLongs, x);
+            acc += multiStep(intAndRef, x);
+            acc += (long) (multiStepDouble(dblAndInt, x) * 2.0);
         }
         return (int) (acc % 1_000_000_007L);
     }
