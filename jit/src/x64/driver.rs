@@ -61,7 +61,11 @@ pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
 /// `compile_with_param_slots`; it takes (clears) them. Consumed only by
 /// `find_bypassable_loop_headers`, to treat a handler that can be entered from
 /// outside a loop as an external entry into that loop's header.
-pub(crate) fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
+///
+/// `pub` (not `pub(crate)`) since 2026-08-17: the interpreter's
+/// `compile_osr_artifact` stages it too, as one of the three requests the
+/// RBC.6b lift needs. See that door's comment.
+pub fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
     PENDING_EXCEPTION_RANGES.with(|c| *c.borrow_mut() = ranges);
 }
 
