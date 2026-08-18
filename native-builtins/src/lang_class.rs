@@ -20046,10 +20046,11 @@ pub(crate) fn native_class_cast(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let target_name = mirror_class_name(ctx, this)
         .unwrap_or_default()
         .replace('/', ".");
-    let actual_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(value))
-        .unwrap_or_default()
-        .replace('/', ".");
+    // NOT `class_name_of_id(class_id_of_object(..))`: on an ARRAY that answers
+    // the COMPONENT's class (`ClassId(0)` for a primitive array), so casting an
+    // `int[]` reported "Cannot cast java.lang.Object" — G69-1's finding, and
+    // this is the one live site sweep 11 found for it out of 51 rows.
+    let actual_name = class_get_name_of(&*ctx, value);
     Err(cratonvm_types::error::RuntimeError::ClassCastException {
         message: format!("Cannot cast {actual_name} to {target_name}"),
     }

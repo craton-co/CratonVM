@@ -2770,7 +2770,35 @@ public class RJdkIntrinsics3 {
                 t == null || t.getCause() == null ? "none" : t.getCause().getClass().getName(),
                 "java.lang.NullPointerException");
 
-        sectionEnd("misc", 58);
+        // -- an array's class is not its component's --------------------------
+        // Sweep 11 (scratchpad/g76/A.java, 51 rows) audited G69-1 N1's claim
+        // that `class_id_of_object(array)` answers the COMPONENT's id. Array
+        // identity turned out to be in good shape — 50 of 51 exact, including
+        // getName/getSimpleName/getCanonicalName across dimensions, component
+        // types, assignability, forName round trips and reflect.Array. THIS is
+        // the one live site: the cast refusal named the component.
+        t = null;
+        try {
+            sinkO = Object[].class.cast(new int[] {1});
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.cast of an int[] to Object[]", t, "java.lang.ClassCastException");
+        ckS("misc:the cast refusal names the ARRAY, not its component",
+                t == null ? null : t.getMessage(), "Cannot cast [I to [Ljava.lang.Object;");
+        // The control that makes the row above mean something: a non-array
+        // receiver was always right, so the fix is about arrays specifically.
+        t = null;
+        try {
+            sinkO = Integer.class.cast("s");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a non-array cast refusal was already correct",
+                t == null ? null : t.getMessage(),
+                "Cannot cast java.lang.String to java.lang.Integer");
+
+        sectionEnd("misc", 61);
     }
 
     // ========================================================================
