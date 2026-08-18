@@ -268,3 +268,37 @@ already set — a later `-D` wins, and the argfile came last. The override was
 silently inert for the one thing this table most needs to do, which is
 indistinguishable from having no override at all. The flags now go after the
 argfile.
+
+## 5. The prediction in §3 was A/B'd, and it did not convert — the cause here is NOT lambda dispatch
+
+Added 2026-08-18 by the page §3 pointed at, now retired as
+`internal/performance/lambda-sam-dispatch-bypasses-the-cached-invoke-path-RETIRED-20260818.md`.
+It fixed the SAM-dispatch defect it named — every lambda row of
+`probes/SamHotLoopProbe.java` is 2.3x–2.8x faster, same binary, ABBA,
+non-overlapping ranges. §3 above says a win on that "should convert" here
+because "this workload IS lambda-bound". **It is not, and three measurements
+say so.**
+
+`probes/LambdaCompositionProbe.java` is `thenApply` / `thenCompose` chains —
+the shape §2.2's own profile put 55% of this workload's samples in:
+
+| | CratonVM | HotSpot | |
+|---|---:|---:|---|
+| `thenApply` | 12 286 ns/stage | 82.5 | 149x |
+| `thenCompose` | 11 943 ns/stage | 113.4 | 105x |
+
+1. **A SAM dispatch is ~190 ns**, so it cannot be more than a low single-digit
+   percentage of 12 µs. The kill-switch A/B agrees: those rows moved −1.1% and
+   −3.3%, against 2.3x–2.8x on the dispatch rows in the same run.
+2. **`--nojit` measures 11 470 / 17 443 ns/stage — the same.** A workload the
+   JIT does not change is not a workload whose cost is dispatch.
+3. The engagement census (`CRATONVM_DBG=lambda-jit`) reports `site_calls=0` on
+   that probe: composition's SAM calls come from INTERPRETED callers, so the
+   compiled-caller half of the fix never even runs here.
+
+So the ~2 µs functional-interface figure in §2.3 is real but is not what these
+five classes are spending their time on. Whatever is — the profile is flat, with
+the interpreter loop at 7%, the native registry's three lookup functions at
+~5.8% and allocation at ~3% — needs its own investigation, and the honest first
+step is a profile of `LambdaCompositionProbe` rather than another lambda fix.
+The title of this page ("five are lambda dispatch") should be read as refuted.
