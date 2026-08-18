@@ -1385,16 +1385,88 @@ no native collections" is not a state a real run is ever in.
 Not merged, deliberately. An optimisation that is on and inert reads exactly like
 a missing one, and shipping it would have made the 20–29% look addressed.
 
-### What would work
+### What works: gate on the owner's CLASS — **BUILT 2026-08-17**
 
-The question asked per object is *"is this address an overlay owner?"*, over a set
-that is non-empty but that **almost no object belongs to** — which is precisely
-the shape the skip-set filter already solves in `zgc.rs`
-(`mark_ref_skip_bloom`, `Z_SKIP_BLOOM_WORDS`, two bits per member, no false
-negatives possible). A Bloom filter over owner addresses answers nearly every
-object with two relaxed loads and no lock, and falls through to the mutex only on
-a hit. The precedent, the sizing and the correctness argument are all already in
-this tree.
+A Bloom filter over owner *addresses* was the obvious next idea and it is also
+wrong: membership is per **instance**, so a long-running app sets every bit and
+the filter degrades to "always maybe", and addresses are recycled, so removal
+cannot clear bits without risking a false negative.
+
+Gate on the **class** instead. The set of classes that can own an overlay is a
+handful of native-backed `java.util` collections; it does not grow with instance
+count, so it cannot saturate, and class ids are stable, so address reuse is
+irrelevant. `roots_for_owner` already receives the owner's current class id — it
+was added for the stale-owner identity check — so the gate needed no new
+plumbing on the GC side. A 1024-word bitmap covers 65,536 class ids in 8 KB.
+
+**It cannot produce a false negative.** Bits are only ever set, never cleared, and
+the bit is set **before** the owner is inserted into `overlay_owner_keys`. A
+reader that misses the bit therefore ran before the insert it would have been
+looking for. An owner registered with no class id sets
+`OVERLAY_OWNER_CLASS_UNKNOWN` and disables the gate wholesale — with no class to
+test, "maybe" is the only sound answer. Dropping an overlay edge frees the
+contents of a live collection, so the direction of error is the design.
+
+**Engagement, measured — and this is the number the previous attempt could not
+produce.** A real run (`GateProbe`: a 200k-node chain of an ordinary class plus 64
+live `HashMap`s, real provider registered):
+
+```
+[GC] zgc-overlay-gate: provider=native-collection-overlays hits=28805 misses=1478 disabled=false
+```
+
+**95.1% of per-object lookups answered without the mutex**, and `misses=1478` is
+the half that matters: the overlay-capable classes still fall through, so the gate
+is not gating away something it must not. `disabled=false` — the fail-safe never
+tripped. Identical shape on a second run at a different heap size.
+
+**What is NOT measured is the throughput gain.** That needs an interleaved profile
+on a quiet host; the box was at 31 GB used of 31 GB with 16 other `rustc`
+processes, and OOM-killed the build. The engagement figures above are counts, so
+they are the half that a loaded host cannot corrupt.
+
+### The leading hypothesis for the C5 gap: the parallel marker dispatches VIRTUALLY, per object
+
+Not measured as a cause yet — stated here with the evidence so the next attempt
+starts from a hypothesis rather than from the whole file.
+
+**The profile shows the shape.** `try_mark` (7.14%) and `visit_refs` (2.26%)
+appear as their *own frames* on the one-worker arm and on no other; on the serial
+arm the same work is folded into `collect_garbage` (12.62%) and
+`enumerate_references` (1.46%). A symbol that exists on one arm and is inlined
+away on the other is a dispatch difference, not a work difference.
+
+**The source says why.** `ZMarkShared` holds `ctx: Arc<dyn ZMarkContext>` and the
+drain loop takes `let ctx: &dyn ZMarkContext = &*self.shared.ctx`. So per marked
+object the parallel path pays:
+
+* a virtual `visit_refs`, which for the real heap is `ZHeapMarkBridge` — itself a
+  wrapper, so it is **two** indirect hops to reach `ZgcRealHeap::visit_refs`;
+* a virtual call **per reference**, because the child sink is
+  `f: &mut dyn FnMut(u64)`;
+* a virtual `is_in_heap` and a virtual `try_mark` per child.
+
+None of them can be inlined. The serial marker calls the concrete
+`ZgcRealHeap` methods directly and the optimiser inlines the lot — which is
+exactly why its work does not appear as separate symbols.
+
+That is a fixed per-object cost that **one worker pays in full and shares with
+nobody**, which is the property §3c's numbers demand of any explanation: a single
+worker contends with nothing and is still +98%.
+
+**The fix has a known shape**: monomorphise. `ZMarkShared`/`ZMarkWorker` become
+generic over `C: ZMarkContext` instead of holding `dyn`, and the child sink
+becomes `impl FnMut(u64)`. It is mechanical but it is not small — `mark.rs` is
+~4,600 lines and the type parameter reaches the coordinator, the controller and
+`zgc_concurrent`.
+
+**Cheap experiment first, before that refactor.** `ZHeapMarkBridge` adds a
+*second* indirect hop for no reason other than to hold a `&ZgcRealHeap` —
+`mark_with_controller_stw` builds `Arc::new(ZHeapMarkBridge { heap: self })` and
+every call goes bridge → heap. Removing that one wrapper is a small change, and if
+indirect dispatch is the cost it should move the needle measurably on its own. If
+it moves nothing, the monomorphisation hypothesis is wrong and the remaining
+suspects (the striped queues, the per-cycle pool construction) get their turn.
 
 ### And the C5 gap itself is still open
 
