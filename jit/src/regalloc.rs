@@ -1810,6 +1810,136 @@ fn build_cfg_with_handlers(
     blocks
 }
 
+/// [`live_locals_per_pc_with_handlers`] for **every** local slot, not only the
+/// first 64.
+///
+/// Everything else in this module is capped at 64 locals because its `gen` /
+/// `kill` / `live_in` / `live_out` sets are `u64`, and for REGISTER ALLOCATION
+/// that cap costs nothing: a local above slot 63 simply never receives a
+/// register and lives in its canonical frame slot, which is always correct.
+///
+/// It is not free for the deopt snapshot, which is the other consumer. There a
+/// local the analysis cannot call DEAD must be described, and a slot the
+/// whole-method kind classifier had to call [`LocalKind::Ambiguous`] — the
+/// ordinary shape of javac reusing one slot for an `int` in one region and a
+/// `double` in another — has no describable encoding, so it publishes
+/// `FrameValue::Unsupported`. One such slot makes the whole frame unresumable,
+/// and `osr_exit_policy` then refuses OSR ENTRY at every back edge of the
+/// method. Measured on Apache Commons Math's `BOBYQAOptimizer`: `trsbox`
+/// (slots 86/87/89) and `bobyqb` (slots 64/67/68) — every undescribable slot in
+/// both methods above 63 and none below it, which is the shape of a truncated
+/// mask rather than of a real analysis failure. Those slots are read a handful
+/// of times each across a 3 000-byte method, so they are dead at almost every
+/// bci a snapshot is taken at, and "dead" is an encoding the resume already has:
+/// `FrameValue::Undefined`.
+///
+/// So this runs the SAME analysis once per 64-slot WINDOW and returns one row
+/// of `words` bitsets per pc: `rows[pc * words + w]` covers slots
+/// `[w * 64, w * 64 + 64)`. Window 0 is bit-for-bit what
+/// [`live_locals_per_pc_with_handlers`] returns, so a method with 64 locals or
+/// fewer is unchanged; the cost of the extra windows is one more fixpoint per
+/// 64 slots, at compile time, for the small minority of methods that have them.
+///
+/// `covered` is shared across windows: it records instruction starts, which do
+/// not depend on which slots are being tracked.
+pub fn live_locals_per_pc_all(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    param_slots: &[usize],
+    handlers: &[(usize, usize, usize)],
+    num_locals: usize,
+) -> (Vec<u64>, Vec<bool>, usize) {
+    let words = num_locals.div_ceil(64).max(1);
+    let mut blocks = build_cfg_with_handlers(code, code_len, handlers);
+    let mut rows = vec![0u64; (code_len + 1).saturating_mul(words)];
+    let mut covered = vec![false; code_len + 1];
+    for w in 0..words {
+        let base = w * 64;
+        for block in &mut blocks {
+            block.gen = 0;
+            block.kill = 0;
+            block.live_in = 0;
+            block.live_out = 0;
+            compute_gen_kill_windowed(code, block, base);
+        }
+        solve_liveness(
+            &mut blocks,
+            param_live_in_mask_windowed(num_params, param_slots, base),
+        );
+        let handler_ranges = handler_live_in_ranges(&blocks, handlers);
+        for block in &blocks {
+            let mut pcs = Vec::new();
+            {
+                let mut pc = block.start_pc;
+                while pc < block.end_pc {
+                    pcs.push(pc);
+                    pc += bc_len(code, pc);
+                }
+            }
+            let mut live = block.live_out;
+            for &pc in pcs.iter().rev() {
+                if let Some((idx, is_use, is_def)) = local_access(code, pc) {
+                    if let Some(bit_no) = idx.checked_sub(base).filter(|b| *b < 64) {
+                        let bit = 1u64 << bit_no;
+                        if is_def && !is_use {
+                            live &= !bit;
+                        }
+                        if is_use {
+                            live |= bit;
+                        }
+                    }
+                }
+                rows[pc * words + w] = live | handler_live_mask(pc, &handler_ranges);
+                covered[pc] = true;
+            }
+        }
+    }
+    (rows, covered, words)
+}
+
+/// [`compute_gen_kill`] for the 64-slot window starting at `base`.
+///
+/// `base == 0` is [`compute_gen_kill`] exactly; the window form exists for
+/// [`live_locals_per_pc_all`], which is the only analysis in this module that
+/// needs to see a local above slot 63.
+fn compute_gen_kill_windowed(code: &[u8], block: &mut BasicBlock, base: usize) {
+    let mut pc = block.start_pc;
+    while pc < block.end_pc {
+        if let Some((idx, is_use, is_def)) = local_access(code, pc) {
+            if let Some(bit_no) = idx.checked_sub(base).filter(|b| *b < 64) {
+                let bit = 1u64 << bit_no;
+                // For iinc: use comes before def
+                if is_use && (block.kill & bit) == 0 {
+                    block.gen |= bit;
+                }
+                if is_def {
+                    block.kill |= bit;
+                }
+            }
+        }
+        pc += bc_len(code, pc);
+    }
+}
+
+/// [`param_live_in_mask`] for the 64-slot window starting at `base`.
+fn param_live_in_mask_windowed(num_params: usize, param_slots: &[usize], base: usize) -> u64 {
+    if param_slots.is_empty() {
+        // No explicit slot list: parameters occupy slots `0..num_params`.
+        let mut mask = 0u64;
+        for slot in base..base.saturating_add(64) {
+            if slot < num_params {
+                mask |= 1u64 << (slot - base);
+            }
+        }
+        return mask;
+    }
+    param_slots
+        .iter()
+        .filter_map(|&slot| slot.checked_sub(base).filter(|b| *b < 64))
+        .fold(0u64, |mask, bit_no| mask | (1u64 << bit_no))
+}
+
 fn live_locals_per_pc_inner(
     code: &[u8],
     code_len: usize,
@@ -2260,6 +2390,66 @@ mod tests {
         );
         assert_eq!(bc_len(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5, "goto_w");
         assert_eq!(bc_len(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5, "jsr_w");
+    }
+
+    /// `live_locals_per_pc_all` must be a strict SUPERSET of what the 64-local
+    /// analysis could answer: window 0 identical, and a window above it that
+    /// the old code could not express at all.
+    ///
+    /// Two assertions, and only the second one can fail without the change —
+    /// the first would pass against the old code too, which is exactly why it
+    /// is not on its own.
+    #[test]
+    fn live_locals_per_pc_all_answers_above_slot_63() {
+        // iload 70; istore 70; iload 70; return
+        //  0: 0x15 0x46   iload 70
+        //  2: 0x36 0x46   istore 70
+        //  4: 0x15 0x46   iload 70
+        //  6: 0xb1        return
+        let code = [0x15, 0x46, 0x36, 0x46, 0x15, 0x46, 0xb1];
+        let code_len = code.len();
+        let (rows, covered, words) =
+            live_locals_per_pc_all(&code, code_len, 0, &[], &[], 71);
+        assert_eq!(words, 2, "71 locals needs two 64-slot windows");
+        assert!(covered[0] && covered[2] && covered[4]);
+
+        // Window 0 is bit-for-bit the pre-existing answer, so a method with 64
+        // locals or fewer cannot have changed.
+        let (old_rows, old_covered) =
+            live_locals_per_pc_with_handlers(&code, code_len, 0, &[], &[]);
+        for pc in 0..=code_len {
+            assert_eq!(
+                rows[pc * words], old_rows[pc],
+                "window 0 must equal the 64-local analysis at pc {pc}"
+            );
+            assert_eq!(covered[pc], old_covered[pc], "coverage differs at pc {pc}");
+        }
+
+        // Slot 70 lives in window 1, bit 6. It is USED at pc 0 and pc 4 and
+        // DEFINED at pc 2, so it is live at 0 (a use), dead at 2 (a def whose
+        // old value nothing reads) and live again at 4. The old analysis could
+        // express none of this: every row was a single `u64` and slot 70 had
+        // no bit at all, so the snapshot had to assume it live everywhere.
+        let bit = 1u64 << (70 - 64);
+        assert_ne!(rows[0 * words + 1] & bit, 0, "slot 70 is live at its use");
+        assert_eq!(
+            rows[2 * words + 1] & bit,
+            0,
+            "slot 70 is dead at the store that overwrites it"
+        );
+        assert_ne!(rows[4 * words + 1] & bit, 0, "slot 70 is live at its second use");
+    }
+
+    /// The window form of the parameter seed must place a parameter slot in the
+    /// window that owns it, and nowhere else.
+    #[test]
+    fn param_live_in_mask_windowed_places_a_high_param_in_its_own_window() {
+        assert_eq!(param_live_in_mask_windowed(0, &[70], 0), 0);
+        assert_eq!(param_live_in_mask_windowed(0, &[70], 64), 1u64 << 6);
+        // The `num_params`-only form (no explicit slot list) windows the same way.
+        assert_eq!(param_live_in_mask_windowed(3, &[], 0), 0b111);
+        assert_eq!(param_live_in_mask_windowed(3, &[], 64), 0);
+        assert_eq!(param_live_in_mask_windowed(66, &[], 64), 0b11);
     }
 
     #[test]

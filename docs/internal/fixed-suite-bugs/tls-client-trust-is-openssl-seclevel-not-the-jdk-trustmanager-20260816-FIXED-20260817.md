@@ -194,11 +194,15 @@ CRATONVM_TLS_OPENSSL_CLIENT=0 <cratonvm-bin> … WeakChainProbe 9801           #
 
 ## What is still open
 
-Windows, for the same reason as the page below: `openssl` is a Unix-scoped
-dependency and the SChannel-backed path is unchanged. SChannel has no SECLEVEL,
-so the specific band on this page does not exist there; the chain half does —
-see `tls-client-windows-schannel-leaf-only-chain-20260817.md` under
-`docs/known-issues`.
+Nothing. SChannel has no SECLEVEL, so the band on this page does not exist on
+Windows at all. The chain half of the sibling page did apply there and was
+closed 2026-08-18 —
+`tls-client-windows-schannel-leaf-only-chain-20260817-FIXED-20260818.md`.
+
+The one thing neither page answers on Windows is the ANCHOR SET: this page
+moved the Unix connect path off the OS store onto the JDK's `cacerts`, and
+SChannel cannot express that replacement (only a narrowing, which would refuse
+sites the platform accepts). Unmeasured, and recorded on that page.
 
 ## Related
 * `tls-client-captures-only-the-leaf-so-a-custom-trustmanager-cannot-validate-20260816-FIXED-20260817.md`

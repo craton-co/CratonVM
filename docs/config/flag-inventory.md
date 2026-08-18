@@ -1057,6 +1057,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_DBG_ROOTCENSUS` | DBG | `CRATONVM_DBG=g1-dbg-rootcensus` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_G1_DBG_ZERO` | DBG | `CRATONVM_DBG=g1-dbg-zero` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_G1_EAGER_HUMONGOUS` | GC | `CRATONVM_GC=g1-eager-humongous` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_YOUNG_PAUSE_TARGET` | GC | `CRATONVM_GC=g1-young-pause-target` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_NO_EVAC_RETRY` | GC | `CRATONVM_GC=g1-evac-retry` | opt-out | on | behaviour | snapshot | types |
 | `CRATONVM_G1_NO_LIVE_REGION_MEMO` | GC | `CRATONVM_GC=g1-live-region-memo` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_G1_PARALLEL_EVAC` | GC | `CRATONVM_GC=g1-parallel-evac` | default-on | on | behaviour | snapshot | types |
@@ -1173,6 +1174,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` | JIT | `CRATONVM_JIT=atomic-intrinsic` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_BCE` | JIT | `CRATONVM_JIT=bce` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` | JIT | `CRATONVM_JIT=callee-oop-flush` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_DUP2_X2` | JIT | `CRATONVM_JIT=dup2-x2` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUPX` | JIT | `CRATONVM_JIT=dupx` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP_X1` | JIT | `CRATONVM_JIT=dup-x1` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP_X2` | JIT | `CRATONVM_JIT=dup-x2` | opt-out | on | behaviour | snapshot | jit |
@@ -1192,6 +1194,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_STACK_BANG` | JIT | `CRATONVM_JIT=stack-bang` | both | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN` | JIT | `CRATONVM_JIT=string-intrinsic-pin` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR` | JIT | `CRATONVM_JIT=osr` | opt-in | off | behaviour | snapshot | difftest, vm |
+| `CRATONVM_JIT_OSR_ATHROW` | JIT | `CRATONVM_JIT=osr-athrow` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_OSR_DEAD_LOCALS` | JIT | `CRATONVM_JIT=osr-dead-locals` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` | JIT | `CRATONVM_JIT=osr-dead-mask-blanket` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_EXC_TABLE` | JIT | `CRATONVM_JIT=osr-exc-table` | opt-in | off | behaviour | snapshot | vm |

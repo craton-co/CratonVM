@@ -561,6 +561,7 @@ export inherited from a parent shell.
 | `string-intrinsic-pin` | `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN` |
 | `dup-x1` | `CRATONVM_JIT_NO_DUP_X1` |
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
+| `dup2-x2` | `CRATONVM_JIT_NO_DUP2_X2` |
 | `dupx` | `CRATONVM_JIT_NO_DUPX` |
 | `dupx-eager-canon` | `CRATONVM_JIT_DUPX_EAGER_CANON` |
 | `eager-callee-chain` | `CRATONVM_JIT_EAGER_CALLEE_CHAIN` |
@@ -631,6 +632,7 @@ export inherited from a parent shell.
 | `never-free-code` | `CRATONVM_JIT_NEVER_FREE_CODE` |
 | `old-sweep-jit` | `CRATONVM_OLD_SWEEP_JIT` |
 | `osr` | `CRATONVM_JIT_OSR` |
+| `osr-athrow` | `CRATONVM_JIT_OSR_ATHROW` |
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
@@ -731,6 +733,7 @@ export inherited from a parent shell.
 | `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
+| `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
