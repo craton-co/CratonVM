@@ -32,10 +32,24 @@ public final class LdcStringIdentityProbe {
 
     public static void main(String[] args) {
         // 1. Same literal, two ldc sites in the same method.
-        System.out.println("same-method lone-high: " + ("\uD800" == "\uD800"));
-        System.out.println("same-method lone-low:  " + ("\uDC00" == "\uDC00"));
-        System.out.println("same-method pair:      " + ("\uD83D\uDE00" == "\uD83D\uDE00"));
-        System.out.println("same-method plain:     " + ("plain-ascii-literal" == "plain-ascii-literal"));
+        //
+        // Through NON-FINAL locals, deliberately. Written the obvious way, as
+        // ("\uD800" == "\uD800"), javac constant-folds the whole comparison and
+        // emits ONE ldc of the string "same-method lone-high: true" -- so the
+        // row prints true on a VM that never interned anything and never ran
+        // the opcode under test. Confirmed with javap. That is the vacuous
+        // green this probe exists to avoid, and it is worth stating because the
+        // four rows below read as the most direct test in the file and were the
+        // only ones testing nothing. A comparison between two non-final locals
+        // is not a constant expression, so both ldcs survive.
+        String h1 = "\uD800", h2 = "\uD800";
+        String l1 = "\uDC00", l2 = "\uDC00";
+        String p1 = "😀", p2 = "😀";
+        String a1 = "plain-ascii-literal", a2 = "plain-ascii-literal";
+        System.out.println("same-method lone-high: " + (h1 == h2));
+        System.out.println("same-method lone-low:  " + (l1 == l2));
+        System.out.println("same-method pair:      " + (p1 == p2));
+        System.out.println("same-method plain:     " + (a1 == a2));
 
         // 2. Literal vs the same literal ldc'd from another method (a
         //    DIFFERENT cp index reached through a different site).

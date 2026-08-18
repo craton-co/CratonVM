@@ -56,16 +56,29 @@ public class LdcConstCache {
         }
 
         // 2. Literal identity — the JVMS §5.1 contract.
-        System.out.println("id same-site plain: " + ("ldc-plain-literal" == "ldc-plain-literal"));
+        //
+        // Every row that can be written as a comparison of two compile-time
+        // constants is routed through a NON-FINAL local or a method call
+        // instead. javac folds `"a" == "a"` — and equally `STATIC_FINAL == "a"`
+        // — into a literal `true`/`false` and emits one ldc of the result, so
+        // the row would print the right answer on a VM that never interned
+        // anything and never executed the opcode. Six of the ten rows here were
+        // written that way first and tested nothing; the ones that caught the
+        // real defect were the ones going through `loneHigh()` and `.intern()`.
+        String sp1 = "ldc-plain-literal", sp2 = "ldc-plain-literal";
+        String sl1 = "\uD800", sl2 = "\uD800";
+        String slo = "\uDC00", spr = "😀", sem = "";
+        String vHigh = LONE_HIGH, vLow = LONE_LOW, vPair = PAIR, vEmpty = EMPTY;
+        System.out.println("id same-site plain: " + (sp1 == sp2));
         System.out.println("id cross-site plain: " + (PLAIN == plain()));
         System.out.println("id intern plain: " + (PLAIN == PLAIN.intern()));
-        System.out.println("id same-site lone: " + ("\uD800" == "\uD800"));
+        System.out.println("id same-site lone: " + (sl1 == sl2));
         System.out.println("id cross-site lone: " + (LONE_HIGH == loneHigh()));
         System.out.println("id intern lone: " + (LONE_HIGH == LONE_HIGH.intern()));
-        System.out.println("id lone-low: " + (LONE_LOW == "\uDC00"));
-        System.out.println("id pair: " + (PAIR == "\uD83D\uDE00"));
-        System.out.println("id empty: " + (EMPTY == ""));
-        System.out.println("distinct lone: " + (LONE_HIGH == LONE_LOW));
+        System.out.println("id lone-low: " + (vLow == slo));
+        System.out.println("id pair: " + (vPair == spr));
+        System.out.println("id empty: " + (vEmpty == sem));
+        System.out.println("distinct lone: " + (vHigh == vLow));
 
         // 3. Content must survive the identity change.
         System.out.println("content lone-high: " + (int) LONE_HIGH.charAt(0)

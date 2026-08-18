@@ -150,6 +150,31 @@ fn ldc_const_cache_enabled() -> bool {
             && !remap_trace_on()
     })
 }
+
+/// [`record_cp_constant`], but only when the `ldc` constant cache is enabled.
+///
+/// The five tags that learned to record in this change go through here rather
+/// than the raw recorder. Under `CRATONVM_JIT_NO_LDC_CONST_CACHE=1` the probe
+/// at the top of [`execute_ldc`] is skipped, so an ungated record would make
+/// every execution resolve AND take the resolution cache's WRITE lock — work
+/// the pre-change interpreter never did. The switched-off arm has to reproduce
+/// the old behaviour or the A/B measures the instrument instead of the change.
+/// This was caught by the fill counter reading `hit=0 miss=0 fill=1329806`
+/// under the kill switch, which is the shape of a cache that is not being read
+/// and is still being written.
+///
+/// `MethodType` / `MethodHandle` deliberately do NOT come through here: they
+/// recorded before this change, so the switched-off arm must keep doing it.
+fn record_cp_constant_if_enabled(
+    shared: &SharedVm,
+    class_id: ClassId,
+    cp_index: u16,
+    value: Value,
+) {
+    if ldc_const_cache_enabled() {
+        record_cp_constant(shared, class_id, cp_index, value);
+    }
+}
 pub(super) fn execute_ldc(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -347,11 +372,11 @@ pub(super) fn execute_ldc(
         // and the class_manager lock and `get_class` are skipped, which is the
         // part a constant-pool slice index cannot avoid on its own.
         LdcValue::Int(v) => {
-            record_cp_constant(shared, frame_class_id, index, Value::Int(v));
+            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Int(v));
             thread.frames[frame_idx].stack.push(Value::Int(v))?
         }
         LdcValue::Float(v) => {
-            record_cp_constant(shared, frame_class_id, index, Value::Float(v));
+            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Float(v));
             thread.frames[frame_idx].stack.push(Value::Float(v))?
         }
         LdcValue::Str(s) => {
@@ -362,7 +387,7 @@ pub(super) fn execute_ldc(
             // The pool already guarantees identity; recording it only removes
             // the work of getting back here — the lock, the `get_utf8`, the
             // owned `String` this arm allocated, and the pool's content hash.
-            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
+            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
@@ -373,7 +398,7 @@ pub(super) fn execute_ldc(
             if remap_trace_on() {
                 push_prov_record(obj_ref.as_ptr() as usize, "ldc-str");
             }
-            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
+            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
@@ -404,7 +429,7 @@ pub(super) fn execute_ldc(
             // recorded through this same store on the same key for the same
             // reason. A failed resolution is deliberately NOT recorded: the
             // error must be re-raised on each attempt.
-            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(mirror)));
+            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Object(Some(mirror)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(mirror)))?;
