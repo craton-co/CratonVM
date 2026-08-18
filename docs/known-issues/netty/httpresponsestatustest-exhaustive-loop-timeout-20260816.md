@@ -11,17 +11,29 @@ real-JDK mode, against HotSpot 25 on the same host.
 
 | | found | ok | failed | wall |
 |---|---|---|---|---|
-| CratonVM G1 (isolated), 2026-08-16 | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
-| HotSpot 25 (isolated) | 13 | 13 | 0 | 4.6s |
+| CratonVM G1 (isolated), 2026-08-16 and still 2026-08-17 | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
+| HotSpot 25 (isolated), Windows host | 13 | 13 | 0 | 4.6s |
+| **HotSpot 25 (isolated), Azure Linux host, 2026-08-17** | 13 | 13 | 0 | **1.925s** |
 
 Per-test progress instrumentation confirms the process is inside
 `testHttpStatusClassValueOf` when the cap fires, and nowhere else. On HotSpot that
-single method is **2.607 s** (`ProgressRunner`, `@@RESULT ... ms=2607`), so the
-180 s per-class wall leaves CratonVM an allowance of **~69x HotSpot** on this
-class. Contrast the sibling
+single method is **2.607 s** on the Windows host (`ProgressRunner`,
+`@@RESULT ... ms=2607`), so the 180 s per-class wall leaves CratonVM an allowance
+of **~69x HotSpot** there — and **~93x** against the 1.925 s the whole class takes
+on the Azure Linux host, which is where this page's later work runs. Either way
+the allowance is generous and the class still hangs; the budget below (42
+ns/iteration) is derived from the wall and the iteration count, so it does not
+move with the host.
+
+Contrast the sibling
 [`httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`](httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md),
-where the same wall allows only ~2.1x: the two pages are not one problem at two
-scales, and treating them as one mis-sized both.
+where the same wall allows ~5.9x (re-measured on the Azure host; that page's
+earlier ~2.1x came from a Windows control that does not transfer). The two pages
+are not one problem at two scales, and treating them as one mis-sized both. That
+page's own blocker — its two loops never compiled at all, because the OSR door
+refused any method with an exception table — was closed 2026-08-17, which does
+not touch this class: `testHttpStatusClassValueOf` has no `try`, so it compiled
+all along and its residual below is unchanged.
 
 ## The budget, exactly
 
@@ -215,9 +227,9 @@ java @common.args ProgressRunner \
 * [`httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`](httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md)
   — sized as "the same mechanism at twice the iteration count". It is not the same
   mechanism: those loops never compile at all. That page carries the correction.
-* [`../jit/osr-refuses-any-method-with-an-exception-table-20260817.md`](../jit/osr-refuses-any-method-with-an-exception-table-20260817.md)
-  — the defect the sibling page turned out to be. This loop has no `try`, which is
-  why it is compiled and merely slow.
+* `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`
+  — the defect the sibling page turned out to be, fixed 2026-08-17. This loop has
+  no `try`, which is why it is compiled and merely slow.
 * [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)
   — the per-call floor for anything reaching a registered native, which is what
   prices `Enum.ordinal`/`Object.equals` above.

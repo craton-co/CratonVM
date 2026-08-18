@@ -1907,7 +1907,7 @@ pub(super) fn compile_osr_artifact(
                 // bail that matters most — this door compiles a `@Test` method's
                 // hot loop, and a method denied here runs its whole life in the
                 // interpreter with no other diagnostic. See
-                // docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md,
+                // fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
                 // which took a six-arm shape bisect to find for exactly this reason.
                 crate::jit::mark_jit_bail_listed_with_site(
                     &class_name,

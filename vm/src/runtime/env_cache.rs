@@ -416,7 +416,7 @@ pub fn osr_newarray_allowed() -> bool {
 /// refusal, so one binary can A/B the lift — the arm that answers "did this
 /// change the answer, or only the speed?". Read once and cached.
 ///
-/// See docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md.
+/// See fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md.
 #[inline]
 pub fn osr_exception_table_allowed() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();

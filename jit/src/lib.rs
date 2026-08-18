@@ -12968,7 +12968,7 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
 /// is also the one that matters most — that door compiles a `@Test` method's hot
 /// loop, and a method denied there runs its whole life interpreted with no other
 /// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
-/// exhaustive loops (docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md).
+/// exhaustive loops (fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md).
 ///
 /// Consumes the thread-local site, like `try_compile`'s own recorder.
 pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
@@ -15056,7 +15056,7 @@ fn precise_exception_frame_sites_supported(
 /// where every throwing site in those ranges publishes one. That is exactly
 /// this predicate, so `compile_osr_artifact` calls it rather than growing a
 /// second, drifting copy of the opcode table. See
-/// `docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md`.
+/// `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`.
 #[cfg(target_arch = "x86_64")]
 pub fn first_unsupported_precise_frame_site(
     code: &[u8],
