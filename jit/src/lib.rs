@@ -110,6 +110,7 @@ pub mod osr_exit;
 // in the wrong space).
 pub mod osr_coords;
 pub mod ir_verify;
+pub mod lambda_adapter;
 pub mod loop_analysis;
 pub mod metrics;
 pub mod null_check_elim;
@@ -3838,13 +3839,31 @@ impl CompiledMethod {
             // chain"), so it still cannot be resumed. Refuse at admission
             // rather than after committing iterations. Lift this the same day
             // that transfer grows a multi-frame path.
-            if fs.caller.is_some() {
+            // An inlined caller scope used to refuse outright, because the
+            // VM's in-place OSR-exit transfer was single-frame. It is not any
+            // more (2026-08-18): `transfer_osr_exit_chain_into_live_frame`
+            // writes the outermost scope into the live frame and PUSHES the
+            // rest, so a chain is resumable up to the budget both sides share.
+            //
+            // The budget is still a refusal, and it is deliberately the VM's:
+            // admitting a chain the transfer would decline spends a whole OSR
+            // entry to reach a safe reject. `MAX_OSR_INLINE_RESUME_DEPTH` is
+            // defined once and consumed by both.
+            //
+            // Everything else about a chain is already covered without a
+            // special case: `first_unresumable_slot` below walks EVERY scope,
+            // so an undescribable caller slot refuses exactly as an
+            // undescribable innermost one does.
+            let chain_depth = deopt::caller_chain_depth(fs);
+            if chain_depth > deopt::MAX_OSR_INLINE_RESUME_DEPTH {
                 return Err(osr_refusal(
                     OSR_REFUSE_INLINED_SCOPE,
                     format!(
-                        "deopt point at bci {} has an inlined caller scope, which the \
-                         single-frame in-place OSR-exit transfer cannot resume",
-                        p.bci
+                        "deopt point at bci {} carries {chain_depth} inlined caller scope(s), \
+                         past the {}-frame budget the VM's OSR-exit transfer materialises \
+                         atomically",
+                        p.bci,
+                        deopt::MAX_OSR_INLINE_RESUME_DEPTH
                     ),
                 ));
             }
@@ -10505,6 +10524,17 @@ fn jit_entry_owners(
     JIT_ENTRY_OWNERS.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
 
+/// Register a lambda-adapter thunk as the owner of its own entry address.
+///
+/// `JitMICSlot::install` refuses to publish an entry whose owner it cannot
+/// resolve (`jit_entry_publishable`), and the owner it holds is what keeps the
+/// code alive while a slot points at it. A thunk is not a cached METHOD — it
+/// has no `MethodKey` and never appears in `JitCache` — so it registers here
+/// directly. See `lambda_adapter`.
+pub(crate) fn register_jit_entry_owner_for_adapter(entry: usize, arc: &Arc<CompiledMethod>) {
+    jit_entry_owners().lock().insert(entry, Arc::downgrade(arc));
+}
+
 fn resolve_jit_entry_owner(entry: usize) -> Option<Arc<CompiledMethod>> {
     jit_entry_owners().lock().get(&entry)?.upgrade()
 }
@@ -11635,10 +11665,20 @@ flushed at epoch {barrier}",
                     }
                 }
             }
+            // A lambda-adapter thunk bakes a direct jump to a lambda impl
+            // exactly as a compiled caller bakes a direct call, but it is not a
+            // cached METHOD and so appears in none of the maps above. Without
+            // this it would survive the eviction of the very body it jumps
+            // into, and the inline-cache slot holding it would keep dispatching
+            // to code the cache has withdrawn. See `lambda_adapter`.
+            for entry in crate::lambda_adapter::adapters_reaching(&remove_entries) {
+                remove_entries.insert(entry);
+            }
             if remove_entries.len() == before {
                 break;
             }
         }
+        crate::lambda_adapter::forget_adapters(&remove_entries);
 
         // Retarget dynamic inline caches before withdrawing ownership from the
         // cache. Readers that already hold an old caller snapshot either miss
@@ -25399,41 +25439,59 @@ mod tests {
         );
     }
 
-    /// **An OSR artifact may not contain an inlined body that publishes a deopt
-    /// point.** This is the constraint that gates the whole nesting-inliner
-    /// programme, and until now it existed only as prose.
+    /// Two different rules wear the same refusal tag, and the 2026-08-18
+    /// multi-frame transfer relaxed exactly one of them.
     ///
-    /// `osr_exit_policy` refuses any deopt point whose `frame_state.caller` is
-    /// set, because the VM's in-place OSR-exit transfer is single-frame
-    /// (`transfer_osr_exit_into_live_frame` bails on "inlined caller chain", as
-    /// do `resume_from_ir_deopt` and `build_deopt_frame_inner`). Nothing in this
-    /// crate sets `caller` today — `build_and_record_deopt_point` hard-codes
-    /// `None` and the IR-side `InlineScopeTable` has no producer — so this arm
-    /// had no test, and a future producer could have landed against it without
-    /// anything failing.
+    /// When this test was written (2026-08-17) it asserted a single rule — "a
+    /// deopt point with a caller scope refuses the OSR entry" — and it kept
+    /// passing after the relaxation, which is the drift it was pinned to catch.
+    /// It was passing for a different reason than it was written for: its
+    /// fixture put the caller scope on a point at the ENTRY bci, so the refusal
+    /// came from the entry-contract check rather than from the exit policy.
+    /// The two are now asserted apart:
     ///
-    /// Why it matters beyond tidiness, from
-    /// `netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`: the
-    /// method that needs inlining there is a `@Test` body, i.e. invoked ONCE, so
-    /// OSR is its only door out of the interpreter. An inliner that records
-    /// caller scopes would therefore make exactly the artifact that needs it
-    /// un-enterable, and the loop would run interpreted — strictly worse than
-    /// not inlining. The VM's multi-frame resume has to come first; this test is
-    /// what says so in code rather than in a design note.
-    ///
-    /// Both spellings are asserted, because they are two different gates and a
-    /// producer could satisfy one while tripping the other:
-    ///  * a point carrying a caller scope refuses at ADMISSION here;
-    ///  * a reconstructed frame carrying caller frames refuses at the EXIT
-    ///    (`resume_after_exit`, covered by
-    ///    `only_reexecute_semantics_yield_an_exact_resume_point`).
+    ///  * **The ENTRY CONTRACT may never carry a caller scope.** An OSR entry pc
+    ///    is always an outer-scope block start — `osr_pc_to_native` is indexed
+    ///    by the OUTER method's code array — so a contract naming an inlined
+    ///    scope is malformed, not deep. Unchanged, and unchangeable by the
+    ///    transfer work.
+    ///  * **A non-entry deopt point MAY carry one**, up to
+    ///    `MAX_OSR_INLINE_RESUME_DEPTH`, since
+    ///    `transfer_osr_exit_chain_into_live_frame` writes the outermost scope
+    ///    into the live frame and pushes the rest. Past the budget it refuses,
+    ///    naming the budget — and the budget is the VM's own, so admission
+    ///    cannot accept a chain the transfer would decline.
     #[test]
-    fn a_deopt_point_with_an_inlined_caller_scope_refuses_the_osr_entry() {
+    fn an_inlined_caller_scope_refuses_the_entry_contract_but_not_a_deopt_point() {
         let locals = [0x1234_5678i64, 200, 4950];
+        let scope_of_depth = |depth: usize| {
+            let mut fs = deopt::FrameState {
+                method_key: "craton/probe/OsrEntry.caller:()V".to_string(),
+                bci: 12,
+                locals: vec![deopt::FrameValue::Int(7)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            };
+            for _ in 1..depth {
+                let inner = fs.clone();
+                fs = deopt::FrameState {
+                    caller: Some(Box::new(inner)),
+                    ..deopt::FrameState {
+                        method_key: "craton/probe/OsrEntry.caller:()V".to_string(),
+                        bci: 12,
+                        locals: vec![deopt::FrameValue::Int(7)],
+                        stack: Vec::new(),
+                        monitors: Vec::new(),
+                        caller: None,
+                    }
+                };
+            }
+            fs
+        };
 
-        // Sanity: the SAME artifact without the caller scope is admitted. Without
-        // this the test could pass because the fixture is malformed some other
-        // way, which is the shape of a guard that cannot fail.
+        // Sanity: the artifact with a clean point is admitted, so nothing below
+        // can pass because the fixture is malformed some other way.
         let mut flat = osr_t_artifact(3);
         flat.deopt_points = vec![osr_t_exit_point(
             OSR_T_HEADER as u32,
@@ -25441,34 +25499,73 @@ mod tests {
             Vec::new(),
         )];
         flat.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
-            .expect("the same artifact without a caller scope must be admitted");
+            .expect("a clean artifact must be admitted");
 
-        // The caller scope is fully DESCRIBABLE — every slot resolvable, no
-        // monitors, no virtuals. The refusal is not about describability; it is
-        // that the resume path has nowhere to put a second frame.
-        let mut inlined = osr_t_artifact(3);
-        let mut point = osr_t_exit_point(
-            OSR_T_HEADER as u32,
-            osr_t_contract_locals(),
-            Vec::new(),
-        );
-        point.frame_state.caller = Some(Box::new(deopt::FrameState {
-            method_key: "craton/probe/OsrEntry.caller:()V".to_string(),
-            bci: 12,
-            locals: vec![deopt::FrameValue::Int(7)],
-            stack: Vec::new(),
-            monitors: Vec::new(),
-            caller: None,
-        }));
-        inlined.deopt_points = vec![point];
-
-        let err = inlined
+        // ── the ENTRY CONTRACT: still refused ────────────────────────────
+        let mut contract = osr_t_artifact(3);
+        let mut entry_point =
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        entry_point.frame_state.caller = Some(Box::new(scope_of_depth(1)));
+        contract.deopt_points = vec![entry_point];
+        let err = contract
             .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
-            .expect_err("a deopt point under an inlined caller scope must refuse the entry");
+            .expect_err("an entry contract with a caller scope must refuse");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_INLINED_SCOPE));
+        assert!(
+            err.to_string().contains("entry contract"),
+            "the refusal must name WHICH rule fired: {err}"
+        );
+
+        // ── a NON-entry deopt point: admitted within the budget ──────────
+        let mut inlined = osr_t_artifact(3);
+        let mut deep_point = osr_t_exit_point(40, osr_t_contract_locals(), Vec::new());
+        deep_point.frame_state.caller = Some(Box::new(scope_of_depth(1)));
+        inlined.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            deep_point,
+        ];
+        inlined
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("a describable caller scope within the budget is resumable now");
+
+        // ── and refused past it, naming the budget ───────────────────────
+        let mut too_deep = osr_t_artifact(3);
+        let mut deep_point = osr_t_exit_point(40, osr_t_contract_locals(), Vec::new());
+        deep_point.frame_state.caller = Some(Box::new(scope_of_depth(
+            deopt::MAX_OSR_INLINE_RESUME_DEPTH + 1,
+        )));
+        too_deep.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            deep_point,
+        ];
+        let err = too_deep
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("past the budget the transfer cannot materialise it atomically");
         assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_INLINED_SCOPE));
         assert!(
             osr_refusal_is_permanent(&err),
             "the point list is a pure function of the artifact, so the refusal is memoable"
+        );
+
+        // An UNDESCRIBABLE caller slot still refuses, and not via the depth
+        // rule: `first_unresumable_slot` walks every scope, so a chain needs no
+        // special case for it.
+        let mut unresumable = osr_t_artifact(3);
+        let mut bad_point = osr_t_exit_point(40, osr_t_contract_locals(), Vec::new());
+        let mut bad_scope = scope_of_depth(1);
+        bad_scope.locals = vec![deopt::FrameValue::Unsupported];
+        bad_point.frame_state.caller = Some(Box::new(bad_scope));
+        unresumable.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            bad_point,
+        ];
+        let err = unresumable
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("an undescribable caller slot must still refuse");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
+        assert!(
+            err.to_string().contains("caller-scope"),
+            "the refusal must name the SCOPE the bad slot is in: {err}"
         );
     }
 

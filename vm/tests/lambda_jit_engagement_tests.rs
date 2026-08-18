@@ -12,19 +12,16 @@
 //! So this file asserts the path was taken. It runs a fixture method long
 //! enough (400 000 dispatches) that the background compiler certainly publishes
 //! the impl body, and then reads the engagement counters
-//! (`lambda_jit_engagement`, gated on `CRATONVM_DBG_LAMBDA_JIT` — installed by
-//! `run_under_engagement_flags` BEFORE any VM exists, because the gate is read
-//! once into a `OnceLock`).
+//! (`lambda_jit_engagement`, gated on `CRATONVM_DBG_LAMBDA_JIT` — set below
+//! BEFORE any VM exists, because the gate is read once into a `OnceLock`).
 //!
 //! Its own file, and therefore its own process: the gate cannot be set after
 //! another test in the same binary has already dispatched a lambda and locked
-//! it to `false`. That is also why the override below can be process-scoped
-//! without taking a lock.
+//! it to `false`.
 //!
 //! **Prerequisites:** Java test classes are compiled automatically by
 //! `build.rs` if `javac` is on the PATH. If not, the test is skipped.
 
-use cratonvm_types::flags::with_process_overrides;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::runtime::interpreter::lambda_jit_engagement;
 use cratonvm_vm::types::Value;
@@ -55,50 +52,26 @@ fn test_lambda_tier_up_actually_engages() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
-    run_under_engagement_flags(probe_jit_side_arm);
-}
 
-/// The flags this file's measurement depends on, installed for the whole run.
-///
-/// Process-scoped rather than thread-scoped: the counters are bumped from the
-/// background JIT compile worker as well, a thread this test never created,
-/// which `override_thread` would not reach.
-///
-/// It also has to be in place before the first dispatch. `flags()` serves
-/// declared names from one process-wide snapshot latched on first read, so the
-/// `set_var` that used to sit here only landed when it won that race; and the
-/// counter gate itself (`interpreter::lambda::counters::on`) is a plain
-/// `OnceLock`, not one of the `env_cache` memo slots that installing an
-/// override invalidates, so it is read exactly once per process and never
-/// revisited.
-///
-/// No serialisation is owed despite the process scope: this is the only test in
-/// the binary (see the module docs).
-fn run_under_engagement_flags(body: fn()) {
-    with_process_overrides(
-        &[
-            ("CRATONVM_DBG_LAMBDA_JIT", Some("1")),
-            // The JIT-side arm ON. That is already the default, and the
-            // assertions below are about that half specifically; pinning it
-            // keeps an ambient `CRATONVM_JIT_LAMBDA_SITE=0` in the developer's
-            // environment from silently inverting what is measured.
-            ("CRATONVM_JIT_LAMBDA_SITE", Some("1")),
-        ],
-        body,
+    // `with_process_overrides`, not `std::env::set_var`: a declared flag is
+    // served from a snapshot latched on FIRST read, so setting the variable
+    // only takes effect if the call wins the race to initialise it — and the
+    // VM reads these from threads this test never created, which rules out
+    // the thread-scoped variant.
+    //
+    // NOT `CRATONVM_BG_COMPILE=0`. Inline compilation looks like the way to
+    // make "the body is compiled by iteration N" deterministic, and it is —
+    // but measured across this fixture it compiles about 6% of what the
+    // background worker does, because the inline `try_jit_upgrade_with_gate`
+    // route declines bodies the worker admits. Determinism bought by
+    // suppressing the thing under test is not determinism.
+    cratonvm_types::flags::with_process_overrides(
+        &[("CRATONVM_DBG_LAMBDA_JIT", Some("1")), ("CRATONVM_JIT_LAMBDA_ADAPTER", Some("0"))],
+        || run_fixture(),
     );
 }
 
-/// The measurement. See `run_under_engagement_flags` for the flags it needs.
-fn probe_jit_side_arm() {
-    // NOT `CRATONVM_BG_COMPILE=0`. Inline compilation looks like the way to
-    // make "the body is compiled by iteration N" deterministic, and it is —
-    // but measured across this fixture it compiles only ~6% of the dispatches
-    // the background worker does (`eligible=6 200 000` against
-    // `compiled_hits=398 209` on the sibling suite), because the inline
-    // `try_jit_upgrade_with_gate` route declines bodies the worker admits. A
-    // configuration that suppresses the thing under test is a worse trade than
-    // a race the counters below can see.
-
+fn run_fixture() {
     let Some(mut vm) = real_jdk_vm() else {
         eprintln!(
             "Skipping: needs a class library (CRATONVM_JAVA_HOME / JAVA_HOME / `java` on PATH)."
@@ -127,7 +100,7 @@ fn probe_jit_side_arm() {
          therefore green about a path it never took"
     );
     // And specifically the JIT-SIDE arm, which is the half this configuration
-    // (`CRATONVM_JIT_LAMBDA_SITE=1`, the default) exists to cover: the fixture's `step`
+    // (default `CRATONVM_JIT_LAMBDA_SITE`) exists to cover: the fixture's `step`
     // hop compiles at the invocation threshold, so from then on every SAM call
     // comes out of compiled code. `lambda_jit_oneshot_engagement_tests` pins the
     // other half the same way.

@@ -6301,6 +6301,72 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
         .collect()
 }
 
+/// Among the calls that failed the CONTAINMENT clause, how many read a
+/// REFERENCE field and how many a primitive. Index 0 = primitive, 1 = reference.
+///
+/// This is the fork that decides whether anything further is reachable on ZGC
+/// and G1. Those two collectors publish no region bounds by design — the empty
+/// `JIT_REGION_BOUNDS` is the interlock that keeps inline reference STORES
+/// unreachable there (`audits/g1-audit.md` §8.1) — so containment can only be
+/// bypassed by a receiver check that does not need it. The IR tier now has one
+/// (`emit_trusted_oop_receiver_check`, primitives only), and the single-pass
+/// arm has always had one.
+///
+///   * a REFERENCE-heavy remainder means the rest is blocked on the ZGC JIT
+///     load barrier (`feature-designs/zgc-jit-load-barrier.md`), because a
+///     compact reference slot there may hold `Z_COLORED_TAG | colour | offset`
+///     and inlining its load is the use-after-free that design exists to stop.
+///     Nothing to fix in the getfield arms.
+///   * a PRIMITIVE-heavy remainder means some arm is failing to take a shortcut
+///     it is already entitled to, and that is an ordinary bug.
+pub static JIT_GETFIELD_OOB_FIELD_KIND: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// `(name, count)` for [`JIT_GETFIELD_OOB_FIELD_KIND`].
+pub fn jit_getfield_oob_field_kinds() -> Vec<(&'static str, u64)> {
+    use std::sync::atomic::Ordering;
+    vec![
+        (
+            "primitive",
+            JIT_GETFIELD_OOB_FIELD_KIND[0].load(Ordering::Relaxed),
+        ),
+        (
+            "reference",
+            JIT_GETFIELD_OOB_FIELD_KIND[1].load(Ordering::Relaxed),
+        ),
+    ]
+}
+
+/// Is the field at `field_index` of the object at `addr` a reference?
+///
+/// Asks the object's OWN layout, the same way the helper's read does: a compact
+/// object through the registered layout's storage kind, a legacy one through
+/// the 16-byte `Value` cell's tag byte. Anything it cannot resolve counts as a
+/// primitive, which is the conservative direction here — it under-reports the
+/// reference bucket rather than inventing one.
+///
+/// SAFETY: `addr` must have passed `plausible_heap_pointer` and point at a live
+/// object header whose body covers `field_index`.
+unsafe fn getfield_field_is_reference(addr: usize, field_index: i64) -> bool {
+    let Ok(idx) = usize::try_from(field_index) else {
+        return false;
+    };
+    let header = &*(addr as *const cratonvm_types::ObjectHeader);
+    if idx >= header.num_slots() as usize {
+        return false;
+    }
+    if let Some((_, storage)) = jit_compact_field_slot(addr as i64, field_index) {
+        return storage == cratonvm_types::FieldStorageKind::Reference;
+    }
+    let tag = *((addr
+        + cratonvm_types::HEADER_SIZE
+        + idx * cratonvm_types::SLOT_SIZE
+        + cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u8);
+    tag == cratonvm_types::VTAG_OBJECT || tag == cratonvm_types::VTAG_NULL
+}
+
 /// Classify the receiver of one helper call into
 /// [`JIT_GETFIELD_RECEIVER_SHAPE`].
 ///
@@ -6314,7 +6380,7 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
 /// precondition the emitted inline code satisfies before its own header read.
 #[inline(never)]
 #[cold]
-unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
+unsafe fn note_getfield_receiver_shape(obj_ptr: i64, field_index: i64) {
     use std::sync::atomic::Ordering;
     let bump = |i: usize| {
         JIT_GETFIELD_RECEIVER_SHAPE[i].fetch_add(1, Ordering::Relaxed);
@@ -6340,6 +6406,13 @@ unsafe fn note_getfield_receiver_shape(obj_ptr: i64) {
     });
     if !contained {
         bump(1);
+        // Split the containment failures by field kind — see
+        // `JIT_GETFIELD_OOB_FIELD_KIND`. The receiver is plausible and its
+        // header is readable, which is all this needs; it is NOT inside a
+        // published region, but on ZGC/G1 no region is ever published, so that
+        // says nothing about whether the memory is mapped.
+        let is_ref = getfield_field_is_reference(addr, field_index);
+        JIT_GETFIELD_OOB_FIELD_KIND[usize::from(is_ref)].fetch_add(1, Ordering::Relaxed);
         return;
     }
     let flags = *((addr + cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8);
@@ -6509,7 +6582,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // measured `receiverFieldTax` is 8.2 ns, and this is not visible in it.
     GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if getfield_receiver_census_enabled() {
-        note_getfield_receiver_shape(obj_ptr);
+        note_getfield_receiver_shape(obj_ptr, field_index);
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
         dump_getfield_guard_failure(obj_ptr);
@@ -11331,6 +11404,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     info,
                     args_slice,
                     vm_ptr,
+                    // This door has no inline-cache slot to install into: it is
+                    // reached from a call site the codegen did not give one.
+                    None,
                 ) {
                     return result;
                 }
@@ -13804,6 +13880,91 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     }
 }
 
+/// Give this SAM call site an inline-cache entry of its own.
+///
+/// The Rust arm below answers a lambda dispatch in ~190 ns; a named class's
+/// call site answers one in ~12, because after its first miss the inline cache
+/// holds the callee and the emitted cascade never re-enters Rust
+/// (`mic_calls=1` across 2 200 000 dispatches, `CRATONVM_DBG=mic-prof`). The
+/// only thing keeping a lambda out of that slot was an argument shuffle — the
+/// call site has `(proxy, samArgs…)` and a non-capturing lambda's impl wants
+/// `(samArgs…)` — so `lambda_adapter` emits a thunk that performs the shuffle
+/// and tail-jumps, and the slot holds THAT.
+///
+/// Installed only for shapes the thunk can serve without touching memory:
+///
+/// * **no captures** — reading a captured field from a hand-emitted thunk would
+///   mean reproducing the compact/legacy body-layout branch (`GC_FLAG_COMPACT`)
+///   and every per-type width the `getfield` arms handle. A capturing lambda
+///   keeps the Rust arm.
+/// * **no `checkcast`** — a generic call site's cast is a class-hierarchy
+///   question, not a register move.
+/// * **a static impl**, which "no captures" already implies for javac's output;
+///   asserted rather than assumed because the thunk drops the receiver outright.
+/// * **an arity the register ABI can carry**, receiver and context included —
+///   `lambda_adapter_entry` refuses the rest.
+///
+/// Both slots are written, because the emitted cascade prefers the PIC when the
+/// codegen allocated one and never consults the MIC in that case.
+///
+/// Everything after installation is the ordinary cached-call path: the
+/// cascade's own null and `ObjectKind::Object` guards run before the call, its
+/// `i64::MIN` callee-deopt check after it, and an escaping exception is left in
+/// `jit_pending_exception` for the caller's post-invoke check. This arm
+/// participates in none of it any more, which is the point.
+#[allow(clippy::too_many_arguments)]
+unsafe fn install_lambda_inline_cache(
+    vm: &SharedVm,
+    site: &crate::runtime::interpreter::LambdaJitSite,
+    receiver_class_id: ClassId,
+    code: &cratonvm_jit::RetainedCode,
+    mic_ptr: i64,
+    pic_ptr: i64,
+) {
+    if !crate::runtime::env_cache::jit_lambda_adapter() {
+        return;
+    }
+    if site.num_captures() != 0 || site.has_checkcasts() || !site.is_static_impl() {
+        return;
+    }
+    if !site.claim_adapter_install() {
+        return;
+    }
+    let Some(entry) = cratonvm_jit::lambda_adapter::lambda_adapter_entry(
+        receiver_class_id.as_u32(),
+        code.arc(),
+        site.total_args(),
+    ) else {
+        return;
+    };
+    let class_id = receiver_class_id.as_u32();
+    let class_name = site.impl_class_name();
+    let needs_ctx = code.needs_context();
+    let jdk_only = crate::vm::dispatch_policy(vm).is_jdk_only();
+    let mut installed = false;
+    if mic_ptr != 0 {
+        let mic = &*(mic_ptr as *const JitMICSlot);
+        mic.update(class_id, class_name, entry as u64, needs_ctx, jdk_only);
+        installed = true;
+    }
+    if pic_ptr != 0 {
+        let pic = &*(pic_ptr as *const JitPICSlot);
+        pic.install(class_id, class_name, entry as u64, needs_ctx, jdk_only);
+        installed = true;
+    }
+    if installed {
+        crate::runtime::interpreter::lambda_site_bump_adapter();
+        if mic_prof::enabled() {
+            eprintln!(
+                "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
+                 sam_args={} entry={entry:#x} impl={}",
+                site.total_args(),
+                class_name,
+            );
+        }
+    }
+}
+
 /// A compiled caller's SAM call, served straight from the lambda call site's
 /// own cached target.
 ///
@@ -13840,6 +14001,7 @@ unsafe fn try_lambda_site_direct_call(
     info: &JitInvokeInfo,
     args_slice: &[i64],
     vm_ptr: i64,
+    ic_slots: Option<(i64, i64)>,
 ) -> Option<i64> {
     const MAX_DIRECT_ARGS: usize = 8;
     let site = crate::runtime::interpreter::lambda_jit_site(
@@ -13877,6 +14039,9 @@ unsafe fn try_lambda_site_direct_call(
         // `ClassCastException` it has always raised, message and all.
         crate::runtime::interpreter::lambda_site_bump_refused();
         return None;
+    }
+    if let Some((mic_ptr, pic_ptr)) = ic_slots {
+        install_lambda_inline_cache(vm, &site, receiver_class_id, &code, mic_ptr, pic_ptr);
     }
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
     crate::runtime::interpreter::lambda_jit_site_capture_args(
@@ -14512,6 +14677,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             info,
             args_slice,
             vm_ptr,
+            Some((mic_ptr, pic_ptr)),
         ) {
             return result;
         }

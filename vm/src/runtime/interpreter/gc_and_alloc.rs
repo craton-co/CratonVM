@@ -3618,6 +3618,89 @@ pub(super) fn tlab_alloc_shaped_inner(
     None
 }
 
+/// Per-class tally of TLAB allocations that produced a LEGACY header while a
+/// matching compact layout was registered.
+///
+/// The blind spot this closes: `plan_object_alloc`'s `[compact-legacy]` census
+/// reports every legacy allocation **that goes through the planner**, and this
+/// path does not go through the planner. A class could therefore allocate
+/// legacy on the hottest path in the program and be entirely absent from the
+/// only report that names legacy allocations — which is exactly what happened
+/// to `org/bouncycastle/crypto/digests/SHA256Digest`, 100% of `jit_getfield`'s
+/// receivers on Generational and nowhere in the census. See
+/// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+///
+/// Sixteen slots, linear scan, first-come, and only touched under
+/// `CRATONVM_DBG_COMPACT_LEGACY`: the registry lookup it performs is far too
+/// expensive for the allocation fast path in a measured configuration.
+static TLAB_LEGACY_CLASSES: [(
+    std::sync::atomic::AtomicU32,
+    std::sync::atomic::AtomicU64,
+    std::sync::OnceLock<String>,
+); 16] = [
+    const {
+        (
+            std::sync::atomic::AtomicU32::new(u32::MAX),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::OnceLock::new(),
+        )
+    };
+    16
+];
+
+/// `(description, class id, count)` for every class this path allocated legacy.
+pub fn tlab_legacy_object_classes() -> Vec<(String, u32, u64)> {
+    use std::sync::atomic::Ordering;
+    TLAB_LEGACY_CLASSES
+        .iter()
+        .filter_map(|(cid, count, name)| {
+            let cid = cid.load(Ordering::Relaxed);
+            if cid == u32::MAX {
+                return None;
+            }
+            Some((
+                name.get().cloned().unwrap_or_else(|| "<unnamed>".to_string()),
+                cid,
+                count.load(Ordering::Relaxed),
+            ))
+        })
+        .collect()
+}
+
+/// Record that this TLAB allocation of `class_id` produced a legacy header.
+/// Names the class and whether a compact layout existed for its field count —
+/// "a layout was registered and we ignored it" and "no layout exists" are
+/// different problems and the census must not conflate them.
+#[cold]
+#[inline(never)]
+fn note_tlab_legacy_object(class_id: ClassId, num_fields: usize) {
+    use std::sync::atomic::Ordering;
+    let cid = class_id.as_u32();
+    for (slot_cid, count, name) in TLAB_LEGACY_CLASSES.iter() {
+        let cur = slot_cid.load(Ordering::Relaxed);
+        if cur == cid {
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if cur == u32::MAX
+            && slot_cid
+                .compare_exchange(u32::MAX, cid, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let registered = cratonvm_types::class_layout(cid).map(|l| l.field_count());
+            let matches = registered == Some(num_fields);
+            let _ = name.set(format!(
+                "{} num_fields={num_fields} registered_layout_fields={registered:?}                  compact_layout_was_available={matches}",
+                cratonvm_gc::gc::resolve_class_info(cid)
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string()),
+            ));
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
 /// Initialize an object header at the given pointer.
 ///
 /// H1: `identity_hash_code` is now eagerly assigned at allocation time
@@ -3646,6 +3729,15 @@ pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: us
     );
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+    // Every header this function writes is LEGACY — `array_length = 0`, no
+    // `GC_FLAG_COMPACT` — regardless of whether the class has a registered
+    // compact layout, because this path never consults `plan_object_alloc`.
+    // That is a deliberate property of the fast path and not a defect on its
+    // own; what WAS a defect is that nothing reported it. See
+    // `note_tlab_legacy_object`.
+    if cratonvm_types::flags().gc.dbg_compact_legacy {
+        note_tlab_legacy_object(class_id, num_fields);
+    }
     // A2 breadcrumb (CRATONVM_DBG_A2): the interpreter TLAB fast path bypasses
     // gen_heap, so record the legacy-layout object header it writes here.
     cratonvm_gc::a2dbg::record(
