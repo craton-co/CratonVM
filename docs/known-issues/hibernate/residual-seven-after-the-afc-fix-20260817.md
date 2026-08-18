@@ -473,6 +473,53 @@ convert. Whoever takes it should start from the fact above: the target is
 *four misses per stage*, so the question is which call site issues them and
 whether it can ask once, not whether each miss can be made cheaper.
 
-`perf` could not answer that here: dwarf unwinding through these frames yields
-bogus return addresses (`0x1ffffffffff`, `0x3`), so `--call-graph` gives no
-callers for `find`. A counter at the call sites will be needed instead.
+`perf` could not answer that: dwarf unwinding through these frames yields bogus
+return addresses (`0x1ffffffffff`, `0x3`), so `--call-graph` gives no callers
+for `find`. So the census grew a miss tally instead — and it answered in one
+run.
+
+## 7.1 The four are two triples, and the VM has no native for either
+
+`CRATONVM_DBG=native-lookups` now also reports the most-missed triples. A miss
+is `find` returning `None` after both the exact probe and the quirk rewrite
+failed:
+
+```
+miss 112001  java/util/concurrent/CompletableFuture.uniApplyStage(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;
+miss 112000  java/util/concurrent/CompletableFuture.uniComposeStage(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;
+miss   1004  java/lang/Object.setRelease(Ljava/util/concurrent/CompletableFuture;Ljava/lang/Object;)V
+miss    502  java/lang/invoke/VarHandle.setRelease(...)
+```
+
+**Two triples are 96.9% of every registry lookup this workload makes** — and
+the rate is exact, not approximate. The probe runs
+`runChains(2 000)+runCompose(2 000)` as warm-up and `runChains(5 000)+
+runCompose(5 000)` measured, so each shape sees `(2 000+5 000) x 8 = 56 000`
+stages:
+
+| triple | misses | stages | per stage |
+|---|---:|---:|---:|
+| `uniApplyStage` | 112 001 | 56 000 | **2.0000** |
+| `uniComposeStage` | 112 000 | 56 000 | **2.0000** |
+
+So every `thenApply` asks the native registry **twice** whether
+`CompletableFuture.uniApplyStage` has a native implementation, and every
+`thenCompose` asks twice for `uniComposeStage`. The answer is no, in every
+build, for both: they are private JDK internals that nothing registers. Each
+"no" costs a class-prefilter hash, a slot hash, and a full descriptor byte pass
+through the `#[cold]` quirk arm — on a 100-byte descriptor, for the generic
+`Function` signatures above.
+
+The doubling is worth noting on its own: §3 records the same shape on the SAM
+path, where the `lambda_proxies` map is probed *"up to twice — once for
+`is_lambda_proxy_receiver` and again inside `try_lambda_dispatch`"*. Asking the
+same question twice per call may be one pattern rather than two accidents.
+
+**Now the target is specific enough to fix**, which it was not two sections ago:
+it is not "the registry is 12.5%" and not "make a miss cheaper", it is *two
+known-negative triples, asked twice each, per stage*. A per-call-site or
+per-triple negative memo would delete ~97% of this workload's registry traffic.
+That is still an unlanded candidate — it needs an invalidation story (a native
+CAN be registered later, and redefine exists), and this page's whole history is
+that plausible-looking one-liners do not convert. But it is now a question with
+a bounded answer rather than a profile share.
