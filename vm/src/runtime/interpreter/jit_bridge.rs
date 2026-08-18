@@ -6991,6 +6991,21 @@ fn resolve_inline_site_from(
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
+    // Name every refusal. This function has two dozen `return None`s and a
+    // caller that can only see "refused"; two build cycles were spent today
+    // guessing which one fired.
+    macro_rules! no {
+        ($why:expr) => {{
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] inline-resolve REFUSED {}.{}{} depth={}: {}",
+                    callee_class, callee_method, callee_desc, nest_depth, $why
+                );
+            }
+            return None;
+        }};
+    }
+
     // A registered native shadows the classfile body. Inlining that bytecode
     // would bypass the native completely, just as compiling the method itself
     // would. This must precede even the "tiny constructor" path below:
@@ -7005,7 +7020,7 @@ fn resolve_inline_site_from(
         .find(callee_class, callee_method, callee_desc)
         .is_some()
     {
-        return None;
+        no!("native-shadow");
     }
 
     // Taken BEFORE the class-manager guard. Holding two of this subsystem's
@@ -7086,15 +7101,15 @@ fn resolve_inline_site_from(
     };
 
     if method.is_synchronized() {
-        return None;
+        no!("synchronized");
     }
     let code_attr = method.code()?;
     let code_len = code_attr.code.len();
     if code_len > cratonvm_jit::MAX_INLINE_BYTECODE_SIZE {
-        return None;
+        no!("too-large");
     }
     if !code_attr.exception_table.is_empty() {
-        return None;
+        no!("callee-exception-table");
     }
     let is_static = method.is_static();
     // jit-inline-clinit-gap fix (2026-07-17): inlining a static method's
@@ -7123,7 +7138,7 @@ fn resolve_inline_site_from(
             .map(crate::vm::is_class_initialized_fast)
             .unwrap_or(false);
         if !declaring_class_initialized {
-            return None;
+            no!("static-declaring-class-not-initialized");
         }
     }
     let callee_max_locals = code_attr.max_locals as usize; // Widening: u16 to usize
@@ -7168,11 +7183,11 @@ fn resolve_inline_site_from(
     let mut invoke_sites: Vec<(usize, u16, u8)> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
-            0xaa | 0xab => return None,        // tableswitch, lookupswitch
-            0xbb | 0xbd | 0xc5 => return None, // new, anewarray, multianewarray
-            0xbf => return None,               // athrow
-            0xc0 | 0xc1 => return None,        // checkcast, instanceof
-            0xc2 | 0xc3 => return None,        // monitorenter, monitorexit
+            0xaa | 0xab => no!("tableswitch/lookupswitch"),
+            0xbb | 0xbd | 0xc5 => no!("new/anewarray/multianewarray"),
+            0xbf => no!("athrow"),
+            0xc0 | 0xc1 => no!("checkcast/instanceof"),
+            0xc2 | 0xc3 => no!("monitorenter/monitorexit"),
             // invokevirtual / invokestatic / invokeinterface inside the
             // spliced body. These used to reject the site outright — the
             // emitter had no arm for them and, more fundamentally, nothing
@@ -7210,7 +7225,7 @@ fn resolve_inline_site_from(
                 scan_pc += 3;
                 continue;
             }
-            0xba => return None, // invokedynamic
+            0xba => no!("invokedynamic"),
             // Array loads/stores + arraylength need a bounds check (and AIOOBE
             // path) that the inline codegen (`x64::try_emit_inline_body`) does
             // NOT emit — it bails on these. Rejecting them HERE keeps the
@@ -7218,9 +7233,9 @@ fn resolve_inline_site_from(
             // mid-inline instead stays on the cheaper direct-call path rather
             // than being planned, rolled back, and downgraded to the
             // dispatch-helper fallback. (Array-load inlining is a follow-up.)
-            0x2e..=0x35 => return None, // iaload..saload
-            0x4f..=0x56 => return None, // iastore..sastore
-            0xbe => return None,        // arraylength
+            0x2e..=0x35 => no!("array-load"),
+            0x4f..=0x56 => no!("array-store"),
+            0xbe => no!("arraylength"),
             0xb4 | 0xb5 => {
                 has_field_ops = true;
                 scan_pc += 3;
@@ -7804,11 +7819,14 @@ fn resolve_inline_site_from(
     // it costs 3.5x.
     if !crate::runtime::env_cache::jit_inline_call_dispatch() {
         let nested_pcs: Vec<usize> = nested_sites.iter().map(|n| n.callee_pc).collect();
-        if invoke_targets
+        if let Some((pc, t)) = invoke_targets
             .iter()
-            .any(|(pc, t)| t.direct_entry.is_none() && !nested_pcs.contains(pc))
+            .find(|(pc, t)| t.direct_entry.is_none() && !nested_pcs.contains(pc))
         {
-            return None;
+            no!(format!(
+                "call at callee_pc={} to {}.{}{} (kind {}) is neither spliced nor direct-bound",
+                pc, t.class_name, t.method_name, t.descriptor, t.invoke_kind
+            ));
         }
         // A GUARDED nested splice keeps its dispatch entry no matter what: the
         // guard's miss edge has to go somewhere, and for a virtual site there
