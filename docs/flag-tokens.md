@@ -559,6 +559,7 @@ export inherited from a parent shell.
 | `string-intrinsic-pin` | `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN` |
 | `dup-x1` | `CRATONVM_JIT_NO_DUP_X1` |
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
+| `dup2-x2` | `CRATONVM_JIT_NO_DUP2_X2` |
 | `dupx` | `CRATONVM_JIT_NO_DUPX` |
 | `dupx-eager-canon` | `CRATONVM_JIT_DUPX_EAGER_CANON` |
 | `eager-callee-chain` | `CRATONVM_JIT_EAGER_CALLEE_CHAIN` |

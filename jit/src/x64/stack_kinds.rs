@@ -85,12 +85,20 @@ impl StackKind {
     /// JVM category: `true` for `long`/`double`. `None` when unknown — the
     /// caller must poison rather than guess, because the category decides how
     /// many entries `pop2`/`dup2` touch.
-    fn is_category_2(self) -> Option<bool> {
+    pub(super) fn is_category_2(self) -> Option<bool> {
         match self {
             StackKind::Long | StackKind::Double => Some(true),
             StackKind::Int | StackKind::Float | StackKind::Ref => Some(false),
             StackKind::Unknown => None,
         }
+    }
+
+    /// Whether this kind is an object reference. `Unknown` answers `false`,
+    /// so callers that cross-check against the emitter's oop marks must gate
+    /// on [`Self::is_category_2`] answering first — an `Unknown` entry has no
+    /// opinion about ref-ness either.
+    pub(super) fn is_ref(self) -> bool {
+        matches!(self, StackKind::Ref)
     }
 }
 
@@ -492,11 +500,122 @@ fn transfer(
             let n = s.len();
             s.swap(n - 1, n - 2);
         }
-        // The remaining dup family (dup_x2, dup2, dup2_x1, dup2_x2) has
-        // category-dependent shapes that are rare outside compiler-generated
-        // code; not modelling them costs precision, guessing them costs
-        // correctness.
-        0x5b..=0x5e => return None,
+        0x5b => {
+            // dup_x2 — FORM 1 `[v3, v2, v1] -> [v1, v3, v2, v1]` (all cat-1,
+            // three entries) vs FORM 2 `[v2, v1] -> [v1, v2, v1]` (v2 cat-2,
+            // two entries). v1 is cat-1 in both forms; the entry below decides
+            // how deep the copy is inserted.
+            if s.len() < 2 {
+                return None;
+            }
+            let top = s[s.len() - 1];
+            if top.is_category_2()? {
+                return None; // not a legal dup_x2 shape
+            }
+            let below = s[s.len() - 2];
+            let depth = if below.is_category_2()? { 2 } else { 3 };
+            if s.len() < depth {
+                return None;
+            }
+            let at = s.len() - depth;
+            s.insert(at, top);
+        }
+        0x5c => {
+            // dup2 — FORM 1 `[v2, v1] -> [v2, v1, v2, v1]` (both cat-1) vs
+            // FORM 2 `[v] -> [v, v]` (v cat-2, one entry — structurally `dup`).
+            let top = *s.last()?;
+            if top.is_category_2()? {
+                push!(top);
+            } else {
+                if s.len() < 2 {
+                    return None;
+                }
+                let below = s[s.len() - 2];
+                if below.is_category_2()? {
+                    return None; // no legal dup2 form has cat-1 over cat-2
+                }
+                push!(below);
+                push!(top);
+            }
+        }
+        0x5d => {
+            // dup2_x1 — FORM 1 `[v3, v2, v1] -> [v2, v1, v3, v2, v1]` (all
+            // cat-1) vs FORM 2 `[v2, v1] -> [v1, v2, v1]` (v1 cat-2, v2 cat-1).
+            let top = *s.last()?;
+            if s.len() < 2 {
+                return None;
+            }
+            if top.is_category_2()? {
+                // FORM 2: two entries; JVMS requires v2 cat-1.
+                if s[s.len() - 2].is_category_2()? {
+                    return None;
+                }
+                let at = s.len() - 2;
+                s.insert(at, top);
+            } else {
+                // FORM 1: three cat-1 entries.
+                if s.len() < 3 {
+                    return None;
+                }
+                let v2 = s[s.len() - 2];
+                let v3 = s[s.len() - 3];
+                if v2.is_category_2()? || v3.is_category_2()? {
+                    return None;
+                }
+                let at = s.len() - 3;
+                s.insert(at, top);
+                s.insert(at, v2);
+            }
+        }
+        0x5e => {
+            // dup2_x2 — the four JVMS forms, in COMPACT entries. The top's
+            // category says how many entries are duplicated (1 for a cat-2
+            // top, 2 for a cat-1 pair); the next entry down says how deep the
+            // copy is inserted, because four JVM *slots* is either one cat-2
+            // entry or two cat-1 entries.
+            //
+            //   FORM 4  v1,v2 cat-2      [v2, v1]         -> [v1, v2, v1]
+            //   FORM 2  v1 cat-2         [v3, v2, v1]     -> [v1, v3, v2, v1]
+            //   FORM 3  v3 cat-2         [v3, v2, v1]     -> [v2, v1, v3, v2, v1]
+            //   FORM 1  all cat-1        [v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]
+            if s.len() < 2 {
+                return None;
+            }
+            let v1 = s[s.len() - 1];
+            let v2 = s[s.len() - 2];
+            if v1.is_category_2()? {
+                // FORM 4 (v2 cat-2, two entries) or FORM 2 (v2/v3 cat-1,
+                // three entries).
+                let depth = if v2.is_category_2()? { 2 } else { 3 };
+                if s.len() < depth {
+                    return None;
+                }
+                if depth == 3 && s[s.len() - 3].is_category_2()? {
+                    return None; // FORM 2 requires v3 cat-1
+                }
+                let at = s.len() - depth;
+                s.insert(at, v1);
+            } else {
+                // FORM 1 or FORM 3 — two cat-1 entries duplicated. v2 is cat-1
+                // in both.
+                if v2.is_category_2()? {
+                    return None;
+                }
+                if s.len() < 3 {
+                    return None;
+                }
+                let depth = if s[s.len() - 3].is_category_2()? { 3 } else { 4 };
+                if s.len() < depth {
+                    return None;
+                }
+                if depth == 4 && s[s.len() - 4].is_category_2()? {
+                    return None; // FORM 1 requires v4 cat-1
+                }
+                let at = s.len() - depth;
+                s.insert(at, v1);
+                s.insert(at, v2);
+            }
+        }
         // Arithmetic. Operand counts are JVMS; result kinds are the opcode's.
         0x60 | 0x64 | 0x68 | 0x6c | 0x70 => replace!(2, StackKind::Int), // i add/sub/mul/div/rem
         0x61 | 0x65 | 0x69 | 0x6d | 0x71 => replace!(2, StackKind::Long), // l add/sub/mul/div/rem

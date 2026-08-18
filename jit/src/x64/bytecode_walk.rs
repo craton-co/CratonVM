@@ -2417,6 +2417,144 @@ impl Compiler {
                     pc += 1;
                 }
 
+                // dup2_x2 — the last category-dependent stack shuffle x64
+                // did not lower. `jit_scan` has always ADMITTED it (it just
+                // advances `pc`), so before this arm existed the method reached
+                // the dispatch loop's `_ =>` catch-all and lost its compilation
+                // for the life of the process, with the refusal attributed to
+                // an arm that names nothing. See
+                // fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
+                //
+                // Four JVMS forms. In this backend's operand model — one entry
+                // per VALUE, so a category-2 long/double is ONE entry — they
+                // are four different shuffles over two, three or four entries:
+                //
+                //   FORM 4  v1,v2 cat-2   [v2, v1]         -> [v1, v2, v1]
+                //   FORM 2  v1 cat-2      [v3, v2, v1]     -> [v1, v3, v2, v1]
+                //   FORM 3  v3 cat-2      [v3, v2, v1]     -> [v2, v1, v3, v2, v1]
+                //   FORM 1  all cat-1     [v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]
+                //
+                // So the TOP entry's category decides how many entries are
+                // duplicated (one for a cat-2 top, two for a cat-1 pair) and the
+                // entry BELOW the duplicated group decides how deep the copy is
+                // inserted. `dup2_top_cat2` answers only the first question —
+                // which is why this opcode waited for a second-entry oracle.
+                // `stack_entry_categories` is it: the widths come from the
+                // `x64::stack_kinds` forward analysis, admitted only when its
+                // depth and per-entry ref-ness agree with the emitter's own
+                // model AND, for the top entry, with `dup2_top_cat2`'s wholly
+                // independent peephole answer.
+                //
+                // aarch64's arm is NOT the template: it pops four operands
+                // unconditionally, which is FORM 1 only.
+                0x5e => {
+                    let cats = self.stack_entry_categories(pc);
+                    let peephole_top = self.dup2_top_cat2(code, pc);
+                    // Resolve (entries duplicated, insertion depth in entries).
+                    let shape = cats.as_ref().and_then(|cats| {
+                        let n = cats.len();
+                        let top = (*cats.get(n.checked_sub(1)?)?)?;
+                        // Third opinion: when the peephole answers for the top,
+                        // it must agree. A disagreement means one of two
+                        // independent analyses is wrong; use neither.
+                        if matches!(peephole_top, Some(p) if p != top) {
+                            return None;
+                        }
+                        let second = (*cats.get(n.checked_sub(2)?)?)?;
+                        if top {
+                            // FORM 4 (second cat-2, two entries) or FORM 2
+                            // (second cat-1, three entries).
+                            if second {
+                                Some((1usize, 2usize))
+                            } else {
+                                // FORM 2 additionally requires v3 category-1;
+                                // verified bytecode guarantees it, and checking
+                                // costs one lookup.
+                                let third = (*cats.get(n.checked_sub(3)?)?)?;
+                                if third {
+                                    None
+                                } else {
+                                    Some((1, 3))
+                                }
+                            }
+                        } else {
+                            // Two cat-1 entries duplicated. v2 is cat-1 in both
+                            // remaining forms.
+                            if second {
+                                return None;
+                            }
+                            let third = (*cats.get(n.checked_sub(3)?)?)?;
+                            if third {
+                                Some((2, 3)) // FORM 3
+                            } else {
+                                // FORM 1 additionally requires v4 category-1.
+                                let fourth = (*cats.get(n.checked_sub(4)?)?)?;
+                                if fourth {
+                                    None
+                                } else {
+                                    Some((2, 4))
+                                }
+                            }
+                        }
+                    });
+                    let disabled = dupx_codegen_disabled() || dup2_x2_codegen_disabled();
+                    match shape {
+                        Some((dup_entries, depth)) if !disabled => {
+                            // Materialize the copies into fresh frame slots
+                            // (fresh offsets only grow, so no aliasing with the
+                            // live originals), deepest-first so the pushed pair
+                            // ends up in operand order, then rotate the top
+                            // `depth + dup_entries` MODEL entries right by
+                            // `dup_entries` to slide the copies underneath. Only
+                            // the copies cost instructions; the rotate is
+                            // bookkeeping that `canonicalize_stack` resolves as a
+                            // parallel move at the next branch/call boundary.
+                            let n0 = self.stack.len();
+                            let mut ok = true;
+                            for k in (0..dup_entries).rev() {
+                                let src = self.stack[n0 - 1 - k];
+                                let src_oop = self.stack_oop_marks[n0 - 1 - k];
+                                let before = self.stack.len();
+                                self.load_slot_to_reg(RAX, src);
+                                self.push_from_rax();
+                                // `push_from_rax` is SILENT when it cannot
+                                // reserve a spill slot: it emits nothing and does
+                                // not grow the model, and the rotate below would
+                                // then reorder the wrong entries. Same guard as
+                                // `dup_x1`/`dup2_x1`.
+                                if self.stack.len() != before + 1 {
+                                    self.fail("singlepass-codegen/dup2_x2-copy-not-pushed");
+                                    ok = false;
+                                    break;
+                                }
+                                if src_oop {
+                                    self.mark_top_as_oop();
+                                }
+                            }
+                            if ok {
+                                let n = self.stack.len();
+                                let window = depth + dup_entries;
+                                self.stack[n - window..].rotate_right(dup_entries);
+                                self.stack_oop_marks[n - window..].rotate_right(dup_entries);
+                                if dupx_eager_canon() {
+                                    self.canonicalize_stack();
+                                }
+                            }
+                        }
+                        _ => {
+                            // No provable form (or the kill switch) — stay
+                            // interpreted. Push two placeholders so downstream
+                            // handlers keep a plausible height until the
+                            // post-loop `failed` check discards this
+                            // compilation, matching `dup2`.
+                            self.fail("singlepass-codegen/dup2_x2-unprovable-form");
+                            let _ = self.push_stack();
+                            let _ = self.push_stack();
+                        }
+                    }
+                    pc += 1;
+                }
+
                 // swap
                 0x5f => {
                     // EC oop-map fix (round 2): the previous round paired the
@@ -11058,7 +11196,19 @@ impl Compiler {
                 }
 
                 _ => {
-                    // Should not happen — jit_scan should have caught this
+                    // A scan-admitted opcode with no arm here. This is NOT
+                    // unreachable — `jit_scan` and this dispatch loop are two
+                    // hand-maintained opcode tables and nothing forced them to
+                    // agree, so an opcode the scanner advances past but this
+                    // loop does not lower lands here and loses the method's
+                    // compilation for the life of the process, attributed to an
+                    // arm that names nothing. `dup2_x2` (0x5E) sat in exactly
+                    // that gap until 2026-08-18; `pop2` (0x58) and `dup2_x1`
+                    // (0x5D) did before it. The two tables are now compared by
+                    // `x64::tests::scan_admitted_opcodes_are_lowered_or_declared`,
+                    // which fails when a new one appears. Name the opcode here
+                    // so a stray one is at least legible in the bail record.
+                    self.fail("singlepass-codegen/opcode-scan-admitted-but-unlowered");
                     return false;
                 }
             }

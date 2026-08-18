@@ -13934,3 +13934,159 @@ fn test_branch_target_mid_instruction_bails() {
         "branch into the middle of an instruction must bail, not compile"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `dup2_x2` (0x5E) — all four JVMS forms, executed.
+//
+// This opcode was admitted by `jit_scan` and lowered by neither x64 backend
+// from the first day both existed, so every method containing one reached the
+// dispatch loop's `_ =>` catch-all and stayed interpreted for the life of the
+// process — the refusal attributed to an arm that names nothing. See
+// fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
+//
+// Each case below RUNS the compiled body and checks a value that a
+// wrong-width shuffle cannot produce, because the failure mode this opcode
+// invites is not a crash: it is duplicating an unrelated slot. `.expect(...)`
+// alone would pass against a shuffle that compiles and computes nonsense.
+//
+// Local numbering follows this harness's convention (see
+// `test_compile_math_min_max_long_intrinsic`): every parameter, `long`
+// included, is ONE local slot.
+// ---------------------------------------------------------------------------
+
+/// FORM 4 — `[v2, v1] -> [v1, v2, v1]`, both operands category-2. Two entries
+/// in this backend's one-entry-per-value model, structurally `dup_x1`.
+///
+/// `long f(long a, long b) { ... }` computing `a + 2b`: any shuffle that
+/// duplicated two entries instead of one, or inserted the copy at the wrong
+/// depth, gives a different sum.
+#[test]
+fn dup2_x2_form4_two_category_2_operands() {
+    // 0: lload_0     [a]
+    // 1: lload_1     [a, b]
+    // 2: dup2_x2     [b, a, b]
+    // 3: ladd        [b, a+b]
+    // 4: ladd        [a+2b]
+    // 5: lreturn
+    let code = [0x1e, 0x1f, 0x5e, 0x61, 0x61, 0xad];
+    let compiled = compile_probe_method(&code, 2, 2)
+        .expect("FORM-4 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[3, 5]).expect("test JIT call") };
+    assert_eq!(r, 3 + 2 * 5, "a + 2b for a=3 b=5");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[-7, 11]).expect("test JIT call") };
+    assert_eq!(r, -7 + 2 * 11, "a + 2b for a=-7 b=11");
+}
+
+/// FORM 2 — `[v3, v2, v1] -> [v1, v3, v2, v1]`, a category-2 top over two
+/// category-1 values. Three entries; structurally `dup_x2`.
+///
+/// This is the form javac actually emits: `longArr[i] = otherArr[j] = v`
+/// leaves `[arrayref, index, longvalue]` and has to slide the value under the
+/// two category-1 slots.
+#[test]
+fn dup2_x2_form2_category_2_over_two_category_1() {
+    // 0: iload_1     [i]
+    // 1: iload_2     [i, j]
+    // 2: lload_0     [i, j, a]
+    // 3: dup2_x2     [a, i, j, a]
+    // 4: l2i         [a, i, j, (int)a]
+    // 5: iadd        [a, i, j+(int)a]
+    // 6: iadd        [a, i+j+(int)a]
+    // 7: i2l         [a, (long)(i+j+(int)a)]
+    // 8: ladd        [2a+i+j]
+    // 9: lreturn
+    let code = [0x1b, 0x1c, 0x1e, 0x5e, 0x88, 0x60, 0x60, 0x85, 0x61, 0xad];
+    let compiled = compile_probe_method(&code, 3, 3)
+        .expect("FORM-2 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 2 * 10 + 3 + 4, "2a + i + j for a=10 i=3 j=4");
+}
+
+/// FORM 3 — `[v3, v2, v1] -> [v2, v1, v3, v2, v1]`, two category-1 values
+/// duplicated over one category-2. Three entries; the copy goes three deep,
+/// not four, because those four JVM slots are a single entry here.
+#[test]
+fn dup2_x2_form3_two_category_1_over_a_category_2() {
+    //  0: lload_0    [a]
+    //  1: iload_1    [a, i]
+    //  2: iload_2    [a, i, j]
+    //  3: dup2_x2    [i, j, a, i, j]
+    //  4: iadd       [i, j, a, i+j]
+    //  5: i2l        [i, j, a, (long)(i+j)]
+    //  6: ladd       [i, j, a+i+j]
+    //  7: lstore_3   [i, j]
+    //  8: iadd       [i+j]
+    //  9: i2l        [(long)(i+j)]
+    // 10: lload_3    [(long)(i+j), a+i+j]
+    // 11: ladd       [a+2i+2j]
+    // 12: lreturn
+    let code = [
+        0x1e, 0x1b, 0x1c, 0x5e, 0x60, 0x85, 0x61, 0x42, 0x60, 0x85, 0x21, 0x61, 0xad,
+    ];
+    let compiled = compile_probe_method(&code, 3, 4)
+        .expect("FORM-3 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 10 + 2 * 3 + 2 * 4, "a + 2i + 2j for a=10 i=3 j=4");
+}
+
+/// FORM 1 — `[v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]`, all four
+/// category-1. The only form aarch64's unconditional four-pop arm ever
+/// handled correctly, and the deepest of the four.
+#[test]
+fn dup2_x2_form1_four_category_1_operands() {
+    // 0: iload_0   [a]
+    // 1: iload_1   [a,b]
+    // 2: iload_2   [a,b,c]
+    // 3: iload_3   [a,b,c,d]
+    // 4: dup2_x2   [c,d,a,b,c,d]
+    // 5: iadd      [c,d,a,b,c+d]
+    // 6: iadd      [c,d,a,b+c+d]
+    // 7: iadd      [c,d,a+b+c+d]
+    // 8: iadd      [c,a+b+c+2d]
+    // 9: iadd      [a+b+2c+2d]
+    // 10: ireturn
+    let code = [
+        0x1a, 0x1b, 0x1c, 0x1d, 0x5e, 0x60, 0x60, 0x60, 0x60, 0x60, 0xac,
+    ];
+    let compiled = compile_probe_method(&code, 4, 4)
+        .expect("FORM-1 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[1, 2, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 1 + 2 + 2 * 3 + 2 * 4, "a + b + 2c + 2d for 1,2,3,4");
+}
+
+/// The conservative half of the contract: when the width analysis cannot type
+/// the entries under the dup, the method stays interpreted and says so under
+/// its own name — not under whatever opcode the walk reached afterwards.
+///
+/// `dup2_x2` at pc 0 has no operands at all, so no oracle can answer.
+#[test]
+fn dup2_x2_without_a_provable_form_bails_under_its_own_name() {
+    let code = [0x5e, 0xac]; // dup2_x2; ireturn
+    let _ = crate::take_jit_bail_site(); // clear anything a prior test left
+    assert!(compile_probe_method(&code, 0, 1).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(site, "singlepass-codegen/dup2_x2-unprovable-form");
+}
+
+/// The catch-all is no longer anonymous. `wide` (0xC4) is unlowered in this
+/// walk; `jit_scan` also rejects it, so in production it never gets this far,
+/// but `compile` does not re-run the scan — which is exactly what lets this
+/// test drive the walk onto the catch-all and pin the reason string it now
+/// records. Before, every opcode that landed here reported the bare
+/// `singlepass-codegen` site, naming nothing.
+#[test]
+fn the_unlowered_opcode_catch_all_names_itself() {
+    let code = [0xc4, 0x15, 0x00, 0x01, 0xac]; // wide iload 1; ireturn
+    let _ = crate::take_jit_bail_site();
+    assert!(compile_probe_method(&code, 0, 2).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(
+        site, "singlepass-codegen/opcode-scan-admitted-but-unlowered",
+        "the catch-all must name itself rather than claim it cannot happen"
+    );
+}
