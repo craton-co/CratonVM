@@ -31,10 +31,20 @@ use super::site_cache::{site_stats, ClassSiteCache, ResolvedNewSite};
 /// whose class was just loaded — the very case whose resolution cost the most.
 /// `CRATONVM_DBG=field-site` reports `new: hit/miss/fill/reject_loader` beside
 /// the other two arms; read it before quoting a timing number.
+/// Also withdrawn whenever one of the `new`-arm traces is armed. A hit skips
+/// the class-name derivation those three print from, so leaving the cache on
+/// would make each of them report a SUBSET of the `new` sites it is being asked
+/// about — an instrument that silently under-reports is worse than none, and
+/// these three exist precisely to answer loader- and class-identity questions
+/// where a missing line reads as an absent event. They are debug gates, so a
+/// run that sets one is not a run whose throughput anybody is measuring.
 fn new_site_cache_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NEW_SITE_CACHE").is_none()
+            && !crate::runtime::env_cache::dbg_h2trace()
+            && !crate::runtime::env_cache::dbg_loader_trace()
+            && !crate::runtime::env_cache::nsee_trace()
     })
 }
 
