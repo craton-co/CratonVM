@@ -56,6 +56,10 @@ fn test_lambda_tier_up_actually_engages() {
     // SAFETY: single-threaded, and the first statement of the only test in this
     // binary — nothing else can be reading the environment concurrently.
     std::env::set_var("CRATONVM_DBG_LAMBDA_JIT", "1");
+    // Compile on the mutator at the threshold rather than racing a worker, so
+    // "the body is compiled well before 400 000 iterations are done" is a fact.
+    // SAFETY: as above.
+    std::env::set_var("CRATONVM_BG_COMPILE", "0");
 
     let Some(mut vm) = real_jdk_vm() else {
         eprintln!(

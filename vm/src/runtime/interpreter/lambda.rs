@@ -1969,7 +1969,26 @@ pub(super) fn try_invoke_cached_lambda_impl(
                 let cnt = shared.jit.profile_store.increment_invocation(invoc_key);
                 let should_attempt = cnt >= threshold
                     && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
-                if should_attempt && crate::runtime::env_cache::bg_compile() {
+                if should_attempt && !crate::runtime::env_cache::bg_compile() {
+                    // `CRATONVM_BG_COMPILE=0` is the documented opt-out that
+                    // restores INLINE compilation on the mutator, and the twins
+                    // both honour it. Without this arm a lambda impl would be
+                    // nominated to a worker that is never started and stay
+                    // interpreted forever in that mode — the off-switch would
+                    // silently disable the whole feature rather than change how
+                    // it compiles. It also makes compilation SYNCHRONOUS, which
+                    // is what lets a test assert that a body really is compiled
+                    // by a known iteration instead of hoping a background
+                    // worker won the race.
+                    let gate = RedefineGate::snapshot(
+                        shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .class_redefine_generation_handle(cached.declaring_class_id),
+                    );
+                    let _ = try_jit_upgrade_with_gate(shared, &cached, gate);
+                } else if should_attempt {
                     ensure_bg_compiler_started(shared);
                     let tiered_key = crate::jit::tiered::MethodKey::new(
                         cached.class_name.as_ref(),
