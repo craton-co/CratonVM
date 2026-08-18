@@ -11018,16 +11018,14 @@ mod tests {
     /// left for the register file.
     fn lower_direct_call_with_n_args(n: usize, entry: usize, needs_ctx: bool) -> Vec<u8> {
         assert!((1..=8).contains(&n));
+        // The arguments are CONSTANTS, not this method's parameters. A caller
+        // with `n` parameters would be refused outright by `lower()` when `n`
+        // exceeds `incoming_abi_reg_capacity()` — which is exactly the case
+        // under test — and the refusal is about the PROLOGUE, a different
+        // question from the one these tests ask.
         let mut code: Vec<u8> = Vec::new();
-        for i in 0..n {
-            match i {
-                0 => code.push(0x1a), // iload_0
-                1 => code.push(0x1b),
-                2 => code.push(0x1c),
-                3 => code.push(0x1d),
-                // Cast: `i` is bounded by 8 above.
-                _ => code.extend_from_slice(&[0x15, i as u8]), // iload i
-            }
+        for _ in 0..n {
+            code.push(0x03); // iconst_0
         }
         let invoke_pc = code.len();
         code.extend_from_slice(&[0xb8, 0x00, 0x02]); // invokestatic #2
@@ -11046,8 +11044,8 @@ mod tests {
             declaring_class_id: 0,
         }));
 
-        let mut builder = IrBuilder::new(n, n);
-        builder.set_param_types(&vec![IrType::Int; n]);
+        let mut builder = IrBuilder::new(0, 1);
+        builder.set_param_types(&[]);
         let mut invoke_info = HashMap::new();
         invoke_info.insert(
             invoke_pc,
@@ -11068,8 +11066,8 @@ mod tests {
         lower_inner(
             &graph,
             &schedule,
-            n,
-            n,
+            0,
+            1,
             &helpers,
             &empty_hints,
             None,
@@ -11116,10 +11114,23 @@ mod tests {
         // SUB RSP, imm32 / ADD RSP, imm32 with the SAME immediate: the block
         // is reserved and released around one call, so an unbalanced pair
         // would leave the frame's RSP permanently low.
-        let sub_at = code
+        //
+        // The FIRST `SUB RSP, imm32` in any body is the prologue's own frame
+        // allocation, which shares this encoding — hence `skip(1)` rather than
+        // `position`. Taking the first would assert against `frame_size` and
+        // pass whether or not a stack-argument block was ever emitted.
+        let subs: Vec<usize> = code
             .windows(3)
-            .position(|w| w == [0x48, 0x81, 0xEC])
-            .expect("a stack-argument block must be reserved");
+            .enumerate()
+            .filter(|(_, w)| *w == [0x48, 0x81, 0xEC])
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            subs.len() >= 2,
+            "the prologue's frame allocation plus a stack-argument block: got {} SUB RSP",
+            subs.len()
+        );
+        let sub_at = subs[1];
         let add_at = code
             .windows(3)
             .position(|w| w == [0x48, 0x81, 0xC4])
@@ -11161,8 +11172,9 @@ mod tests {
         );
         assert_eq!(
             count_seq(&code, &[0x48, 0x81, 0xEC]),
-            0,
-            "a call whose arguments all fit registers must emit no SUB RSP"
+            1,
+            "only the prologue's own frame allocation — a call whose arguments \
+             all fit registers must add no second SUB RSP"
         );
         assert_eq!(
             count_seq(&code, &[0x48, 0x89, 0x84, 0x24]),
