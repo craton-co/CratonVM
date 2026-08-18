@@ -14946,7 +14946,7 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
 /// **Unlike `getfield`/`getstatic`, this admission is NOT bookkeeping.** Both
 /// lowerings grew a publishing exit in the same change that added them here,
 /// which is the condition
-/// `fixed-suite-bugs/rbc6-protected-field-ops-FIXED-20260802.md` states and the
+/// `fixed-bugs/rbc6-protected-field-ops-FIXED-20260802.md` states and the
 /// netty adaptive-allocator page insisted on: admitting `new` without giving
 /// its lowering a precise frame is a miscompile, not a speedup.
 ///
