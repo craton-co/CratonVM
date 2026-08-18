@@ -15,7 +15,7 @@
 //! here is the decode-and-do.
 
 use super::*;
-use super::site_cache::{site_stats, ClassSiteCache, ResolvedNewSite};
+use super::site_cache::{site_stats, CastSiteCache, ClassSiteCache, ResolvedNewSite};
 
 /// `CRATONVM_JIT_NO_NEW_SITE_CACHE=1` — withdraw the per-thread `new`-site
 /// cache, so one binary can be A/B'd against its own pre-change behaviour.
@@ -45,6 +45,23 @@ fn new_site_cache_enabled() -> bool {
             && !crate::runtime::env_cache::dbg_h2trace()
             && !crate::runtime::env_cache::dbg_loader_trace()
             && !crate::runtime::env_cache::nsee_trace()
+    })
+}
+
+/// `CRATONVM_JIT_NO_CAST_SITE_CACHE` — opt out of the per-thread resolved
+/// `checkcast`/`instanceof` target cache.
+///
+/// Default-ON, and gated the same way `new_site_cache_enabled` is, including the
+/// diagnostic exclusions: those tracers print the resolved class NAME on every
+/// execution, and a cache hit never materializes one, so a hit would silence
+/// them. A lever that quietly blinds a diagnostic is worse than one that costs
+/// a lock.
+fn cast_site_cache_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CAST_SITE_CACHE").is_none()
+            && !crate::runtime::env_cache::dbg_h2trace()
+            && !crate::runtime::env_cache::dbg_loader_trace()
     })
 }
 
@@ -2146,6 +2163,62 @@ pub(super) fn op_instanceof(
                 }
                 Value::Object(Some(mut obj_ref)) => {
                     let referencing_class_id = thread.frames[frame_idx].class_id;
+                    // ── Resolved cast site ────────────────────────────────
+                    // Everything from here to `is_subclass_of` below is
+                    // re-derivation on EVERY execution: a `String` for the
+                    // target class name, a full loader-aware
+                    // `resolve_class_loader_aware`, and two separate
+                    // `class_manager` read acquisitions. A hit answers the
+                    // RESOLUTION with an array index and two integer compares,
+                    // and then still performs the assignability test.
+                    //
+                    // Taken only for a non-array receiver, and only when
+                    // `is_subclass_of` says yes: a refusal needs the name for
+                    // the five fail-open fallbacks below, so it falls through
+                    // to the full path unchanged. See `CastSiteCache`.
+                    let cast_epochs = if cast_site_cache_enabled() {
+                        match thread.cast_sites.get(referencing_class_id, *index).copied() {
+                            Some(target_id) => {
+                                // GC-safety: this whole block is safepoint-free
+                                // — `kind_of` and `class_id_of` are object-header
+                                // reads and `is_subclass_of` is a read lock over
+                                // an id table. Nothing allocates, loads a class or
+                                // resolves anything, so `obj_ref` cannot move and
+                                // needs no `native_pin_roots` entry. The slow path
+                                // below still pins, because loader-aware
+                                // resolution there genuinely can safepoint.
+                                //
+                                // `kind_of` rather than `array_descriptor_of`: the
+                                // latter builds a `String` descriptor for an array
+                                // receiver, which this test would only discard.
+                                let mut answered = false;
+                                if shared.mem.heap.kind_of(obj_ref)
+                                    != cratonvm_types::ObjectKind::Array
+                                {
+                                    let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
+                                    answered = shared
+                                        .classes
+                                        .class_manager
+                                        .read()
+                                        .is_subclass_of(obj_class_id, target_id);
+                                }
+                                if answered {
+                                    site_stats::bump(site_stats::CAST_HIT);
+                                    thread.frames[frame_idx].stack.push(Value::Int(1))?;
+                                    return Ok(());
+                                }
+                                site_stats::bump(site_stats::CAST_UNUSABLE);
+                                None
+                            }
+                            None => {
+                                site_stats::bump(site_stats::CAST_MISS);
+                                // Read BEFORE resolving; see `SiteCache::put`.
+                                Some(CastSiteCache::epochs_now())
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let target_class_name = {
                         let cm = shared.classes.class_manager.read();
                         let class = cm.get_class(referencing_class_id).ok_or_else(|| {
@@ -2196,6 +2269,31 @@ pub(super) fn op_instanceof(
                         let target_class_id = resolved.map_err(|e| {
                             convert_class_not_found(shared, thread, &target_class_name, e)
                         })?;
+                        // Offer the resolution to the cast-site cache. Same
+                        // admissibility rule as the `new` site cache: a
+                        // loader-namespaced referencing class resolves cp class
+                        // names through its own loader, so its answer is not a
+                        // property of the (class, index) pair alone. Array
+                        // targets are excluded because the array path never
+                        // consults the cache.
+                        if let Some(epochs_at_entry) = cast_epochs {
+                            if target_class_name.starts_with('[')
+                                || referencing_class_has_loader_namespace(
+                                    shared,
+                                    referencing_class_id,
+                                )
+                            {
+                                site_stats::bump(site_stats::CAST_REJECT_LOADER);
+                            } else {
+                                thread.cast_sites.put(
+                                    referencing_class_id,
+                                    *index,
+                                    epochs_at_entry,
+                                    target_class_id,
+                                );
+                                site_stats::bump(site_stats::CAST_FILL);
+                            }
+                        }
                         let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
                         if shared
                             .classes
@@ -2253,6 +2351,64 @@ pub(super) fn op_checkcast(
                 }
                 Value::Object(Some(mut obj_ref)) => {
                     let referencing_class_id = thread.frames[frame_idx].class_id;
+                    // ── Resolved cast site ────────────────────────────────
+                    // Everything from here to `is_subclass_of` below is
+                    // re-derivation on EVERY execution: a `String` for the
+                    // target class name, a full loader-aware
+                    // `resolve_class_loader_aware`, and two separate
+                    // `class_manager` read acquisitions. A hit answers the
+                    // RESOLUTION with an array index and two integer compares,
+                    // and then still performs the assignability test.
+                    //
+                    // Taken only for a non-array receiver, and only when
+                    // `is_subclass_of` says yes: a refusal needs the name for
+                    // the five fail-open fallbacks below, so it falls through
+                    // to the full path unchanged. See `CastSiteCache`.
+                    let cast_epochs = if cast_site_cache_enabled() {
+                        match thread.cast_sites.get(referencing_class_id, *index).copied() {
+                            Some(target_id) => {
+                                // GC-safety: this whole block is safepoint-free
+                                // — `kind_of` and `class_id_of` are object-header
+                                // reads and `is_subclass_of` is a read lock over
+                                // an id table. Nothing allocates, loads a class or
+                                // resolves anything, so `obj_ref` cannot move and
+                                // needs no `native_pin_roots` entry. The slow path
+                                // below still pins, because loader-aware
+                                // resolution there genuinely can safepoint.
+                                //
+                                // `kind_of` rather than `array_descriptor_of`: the
+                                // latter builds a `String` descriptor for an array
+                                // receiver, which this test would only discard.
+                                let mut answered = false;
+                                if shared.mem.heap.kind_of(obj_ref)
+                                    != cratonvm_types::ObjectKind::Array
+                                {
+                                    let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
+                                    answered = shared
+                                        .classes
+                                        .class_manager
+                                        .read()
+                                        .is_subclass_of(obj_class_id, target_id);
+                                }
+                                if answered {
+                                    site_stats::bump(site_stats::CAST_HIT);
+                                    thread.frames[frame_idx]
+                                        .stack
+                                        .push(Value::Object(Some(obj_ref)))?;
+                                    return Ok(());
+                                }
+                                site_stats::bump(site_stats::CAST_UNUSABLE);
+                                None
+                            }
+                            None => {
+                                site_stats::bump(site_stats::CAST_MISS);
+                                // Read BEFORE resolving; see `SiteCache::put`.
+                                Some(CastSiteCache::epochs_now())
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let target_class_name = {
                         let cm = shared.classes.class_manager.read();
                         let class = cm.get_class(referencing_class_id).ok_or_else(|| {
@@ -2303,6 +2459,31 @@ pub(super) fn op_checkcast(
                         let target_class_id = resolved.map_err(|e| {
                             convert_class_not_found(shared, thread, &target_class_name, e)
                         })?;
+                        // Offer the resolution to the cast-site cache. Same
+                        // admissibility rule as the `new` site cache: a
+                        // loader-namespaced referencing class resolves cp class
+                        // names through its own loader, so its answer is not a
+                        // property of the (class, index) pair alone. Array
+                        // targets are excluded because the array path never
+                        // consults the cache.
+                        if let Some(epochs_at_entry) = cast_epochs {
+                            if target_class_name.starts_with('[')
+                                || referencing_class_has_loader_namespace(
+                                    shared,
+                                    referencing_class_id,
+                                )
+                            {
+                                site_stats::bump(site_stats::CAST_REJECT_LOADER);
+                            } else {
+                                thread.cast_sites.put(
+                                    referencing_class_id,
+                                    *index,
+                                    epochs_at_entry,
+                                    target_class_id,
+                                );
+                                site_stats::bump(site_stats::CAST_FILL);
+                            }
+                        }
                         let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
                         shared
                             .classes

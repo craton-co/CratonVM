@@ -93,6 +93,10 @@ const ALLOWED: &[(&str, &str)] = &[
          `the_scanner_only_matches_whole_string_literals` pins that.",
     ),
     (
+        "CRATONVM_DBG_FLAGREADS",
+        "kind 2: read by the flag machinery ITSELF. `types/src/flags.rs` traces          every flag read, so it consults this one with a raw          `std::env::var_os` rather than `runtime_var_os` — routing it through          the latched snapshot would mean asking the tracer to trace the read          that decides whether tracing is on. It therefore cannot be served by          `VmFlags`, which is the property every other entry in the inventory          asserts, so it is exempt rather than declared.",
+    ),
+    (
         "CRATONVM_COMPATIBILITY_JDK_ONLY",
         "kind 1: the name of a `libcratonvm` C ABI integer constant, matched \
          here only because a unit test asserts the diagnostic message names it",
