@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-453 tokens.
+454 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -520,7 +520,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-182 tokens.
+184 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -597,8 +597,8 @@ export inherited from a parent shell.
 | `ir-isel-emit` | `CRATONVM_JIT_IR_ISEL_EMIT` |
 | `ir-isel-verify` | `CRATONVM_JIT_IR_ISEL_VERIFY` |
 | `precise-field-ops` | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` |
-| `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
+| `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
@@ -711,7 +711,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-55 tokens.
+56 tokens.
 
 | Token | Expands to |
 | --- | --- |
