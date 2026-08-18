@@ -731,6 +731,33 @@ pub struct GcFlags {
     /// memory outside the collection set, so it is the first thing to rule out
     /// if a pause is suspected of losing a live humongous object.
     pub g1_eager_humongous: bool,
+    /// `CRATONVM_G1_YOUNG_PAUSE_TARGET` — let `max_gc_pause_ms` bound the
+    /// YOUNG generation, not just the old half of a mixed collection set.
+    /// Default **ON** ([`parse::on_unless_zero`]); `=0` restores the
+    /// free-pool-only trigger.
+    ///
+    /// G1's whole proposition is a configurable pause goal, and until this flag
+    /// the goal reached exactly one decision: how many OLD regions a mixed
+    /// collection set may take. The young half was unbounded — the only thing
+    /// that ever asked for a young collection was `needs_gc`, which fires when
+    /// the FREE pool falls below ~25% of the heap. So Eden grows to roughly
+    /// three quarters of `-Xmx` before the first pause, and young pause time
+    /// scales with the heap SIZE rather than with the pause goal: raising
+    /// `-Xmx` makes every pause longer, which is the opposite of what a
+    /// pause-target collector is for.
+    ///
+    /// With it on, the collector also collects once the young region count
+    /// reaches an adaptive target, shrunk after any pause that overruns
+    /// `max_gc_pause_ms` and grown back while pauses stay under half of it. The
+    /// target starts at its maximum, so a workload whose pauses already meet
+    /// the goal never sees a behaviour change; it only ever binds after a
+    /// measured overrun. An unproductive pause (nothing copied, nothing freed —
+    /// e.g. everything pinned) resets the target to the maximum, so the cap can
+    /// never turn into a storm of pauses that cannot help.
+    ///
+    /// `=0` is the bisection lever for any suspected change in collection
+    /// FREQUENCY under `-XX:+UseG1GC`.
+    pub g1_young_pause_target: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
@@ -932,6 +959,7 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
+            g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
