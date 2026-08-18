@@ -302,6 +302,35 @@ coherent (remembered-set edges recorded, precise liveness answers).
 Allocation failure escalates: young pause → synchronous full mark cycle
 → OOM.
 
+*Young sizing (2026-08-18).* `max_gc_pause_ms` used to reach exactly one
+decision — how many OLD regions a mixed collection set may take. The young
+half was bounded by the free pool alone (`needs_gc` fires below 25 % free),
+so Eden grew to roughly three quarters of `-Xmx` before the first pause and
+young pause time scaled with the heap SIZE: raising `-Xmx` made every pause
+longer, which is the opposite of what a pause-target collector is for. G1
+now also collects once the young region count reaches an adaptive target,
+shrunk after a pause that overruns the goal and grown back while pauses stay
+under half of it (floor/ceiling 5 %/60 % of regions, HotSpot's
+`G1NewSizePercent`/`G1MaxNewSizePercent`). It STARTS at the ceiling, so a
+workload already meeting its goal never leaves it; an unproductive pause
+resets it to the ceiling so the cap can never become a storm of pauses that
+cannot help. `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` restores the old trigger.
+
+*Known structural limit — the Phase-4 walk.* A young pause's reference
+fix-up (`update_references_in_regions`) walks EVERY object of every non-CSet
+region, so young pause time is O(heap) rather than O(young live set) — the
+one property G1's region design exists to buy. It is not gratuitous: the
+walk is also where the GC-internal remembered-set rebuild happens, and
+narrowing it to the CSet's remembered-set sources is sound only once every
+mutator reference store is guaranteed to have gone through
+`post_write_barrier_rset`. It is not: a JIT-compiled null→non-null
+`putfield` into a YOUNG receiver still takes an inline store with no post
+barrier (defect G1-2), which is harmless for an ordinary young source
+(every young region is in the CSet) but not for one held out of the CSet by
+a JNI pin. Closing G1-2 is a `jit/` change; until then the whole-heap walk
+is the thing standing in for the missing barrier, and
+`verify_no_dangling_into_cset` is its tripwire.
+
 **ZgcRealHeap.** One arena + free list (post-sweep coalesced) + hash-set
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with
 a post-sweep re-arm so a large live set cannot storm. The sweep prunes
