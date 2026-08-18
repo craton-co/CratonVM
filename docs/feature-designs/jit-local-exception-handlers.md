@@ -248,3 +248,26 @@ which is no longer the only fallback shape now that
 for some cases — but auditing whether it's actually safe to relax is a
 separate investigation, not bundled into this fix).
 
+## Closing note (2026-08-17): the machine-code half is not missing, only gated
+
+RBC.6 relaxed the *compile* gate for methods with local exception handlers and
+added no new codegen, which left a reasonable-sounding conclusion behind: that
+such a callee still could not be reached by a compiled caller's inline cache,
+and that the codegen to make it safe had yet to be written.
+
+It had already been written, for a different reason.
+`Compiler::emit_inline_callee_deopt_check` (`jit/src/x64/deopt_stubs.rs`) is
+emitted after every inline direct-entry `CALL` — each PIC slot, the MIC arm, the
+megamorphic hashed stub's twin, and the baked `invokestatic`/`invokespecial`
+direct calls — and hands the `i64::MIN` sentinel to `jit_service_callee_deopt`,
+which runs the CALLEE's own table. It landed for the H2 `MVMap`/`DataType.read`
+case and the exception-table ban was never revisited against it. All that was
+left was the gate.
+
+`mic_publish_exception_table_callees()` is therefore default-ON since
+2026-08-17, interlocked so it refuses to publish whenever
+`CRATONVM_JIT_SP_IC_DEOPT_CHECK` is not `On`. The acceptance test is
+`probes/CalleeExceptionTableSemanticsProbe.java`, whose fourth arm — the ban
+lifted with that check deleted — is the red proof: an `ArithmeticException`
+escapes the callee's own `catch` to `main`. Measurement and the full record are
+in `internal/performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`.

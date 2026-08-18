@@ -8442,8 +8442,8 @@ pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
 /// an exception table" is a standing policy that no amount of re-binding
 /// touches. A single number cannot be used to choose between those two fixes,
 /// which is exactly the choice
-/// `known-issues/perf/a-compiled-call-goes-out-to-rust-two-causes-20260817.md`
-/// leaves open.
+/// `internal/performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
+/// left open, and which this counter is what closed.
 ///
 /// Compile-time only: one relaxed `fetch_add` per refused site per compile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
