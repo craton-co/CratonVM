@@ -13553,6 +13553,9 @@ unsafe fn install_lambda_inline_cache(
     if site.num_captures() != 0 || site.has_checkcasts() || !site.is_static_impl() {
         return;
     }
+    if !site.claim_adapter_install() {
+        return;
+    }
     let Some(entry) = cratonvm_jit::lambda_adapter::lambda_adapter_entry(
         receiver_class_id.as_u32(),
         code.arc(),

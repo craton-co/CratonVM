@@ -1341,6 +1341,14 @@ pub(crate) struct LambdaJitSite {
     /// feature under one kill switch.
     code: std::cell::RefCell<Option<cratonvm_jit::RetainedCode>>,
     code_generation: std::cell::Cell<u64>,
+    /// Latched once this site has an inline-cache thunk.
+    ///
+    /// Without it the Rust arm re-writes the cache slot on every call it still
+    /// serves — measured at 202 000 "installs" for what should be a handful —
+    /// which is not merely wasted work: the slot's first cache line is the one
+    /// the emitted cascade loads on every dispatch from every thread, and
+    /// storing to it repeatedly is how a fast path pays for its own existence.
+    adapter_installed: std::cell::Cell<bool>,
     /// Latched the first time this site's compiled body DEOPTS.
     ///
     /// A deopt means the body did not complete, and the direct arm has no way
@@ -1365,6 +1373,12 @@ impl LambdaJitSite {
 
     pub(crate) fn total_args(&self) -> usize {
         self.total_args
+    }
+
+    /// Claim the one-time inline-cache install for this site, returning `true`
+    /// exactly once. See [`LambdaJitSite::adapter_installed`].
+    pub(crate) fn claim_adapter_install(&self) -> bool {
+        !self.adapter_installed.replace(true)
     }
 
     /// Does this site's SAM call need a `checkcast` replayed per call? A
@@ -1576,6 +1590,7 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         gate,
         code: std::cell::RefCell::new(None),
         code_generation: std::cell::Cell::new(u64::MAX),
+        adapter_installed: std::cell::Cell::new(false),
         direct_disabled: std::cell::Cell::new(false),
     }))
 }
@@ -1606,6 +1621,7 @@ pub(crate) fn lambda_jit_site_code(
             .map(cratonvm_jit::RetainedCode::new);
         *site.code.borrow_mut() = found;
         site.code_generation.set(generation);
+        site.adapter_installed.set(false);
         // A moved generation means a publication or an invalidation — including
         // the recompile that a de-speculation drives. The body being probed now
         // is not the one that deopted, so the latch that took this site off the
