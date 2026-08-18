@@ -102,6 +102,88 @@ threads — the `WebTestClient`'s own Netty event loops — are `blocked=true` i
 server side keeps executing. Whatever is iterating is on the server, not a
 client retry loop.
 
+## NAMED, 2026-08-18: `quartzTriggerJobWithUnknownJobKey`, the WebMvc variant only
+
+`@WebEndpointTest` is a parameterized template — 15 methods x 3 web-server
+variants = the 45 tests — so `DiscoverySelectors.selectMethod(fqcn, name)`
+cannot address one (it returns `tests=0 containersFailed=1` for every method).
+`sb-runner/SbRunnerTrace.java` (added with this) registers a
+`TestExecutionListener` that prints every test as it starts and finishes,
+flushed per line so a kill still leaves the last `@@START` behind:
+
+```
+@@DONE  SUCCESSFUL WebFlux
+@@START Jersey  | …[test-template:quartzTriggerJobWithUnknownJobKey(WebTestClient)]/[test-template-invocation:#1]
+@@DONE  SUCCESSFUL Jersey
+@@START WebMvc  | …[test-template:quartzTriggerJobWithUnknownJobKey(WebTestClient)]/[test-template-invocation:#2]
+                                    <- never finishes; 5 started, 4 finished
+```
+
+HotSpot runs all 45. **CratonVM hangs on the WebMvc invocation of
+`quartzTriggerJobWithUnknownJobKey`, and the WebFlux and Jersey invocations of
+the SAME method pass.**
+
+The test is four lines, and so is the server path it drives:
+
+```java
+client.post().uri("/actuator/quartz/jobs/samples/does-not-exist")
+      .contentType(MediaType.APPLICATION_JSON).bodyValue(Map.of("state","running"))
+      .exchange().expectStatus().isNotFound();
+```
+```java
+// QuartzEndpointWebExtension:97 -> QuartzEndpoint:227 -> :231
+JobDetail jobDetail = this.scheduler.getJobDetail(jobKey);   // mock -> null
+if (jobDetail == null) { return null; }                      // -> handleNull -> 404
+```
+
+So the request that spins is: **a POST carrying a JSON body, whose handler
+returns 404 without ever reading that body, under Spring MVC.**
+
+### What the counts say about the loop
+
+From the same run: `DispatcherServlet.doService` **23,683**,
+`RequestMappingHandlerAdapter.invokeHandlerMethod` **23,683**,
+`Http11Processor.service` **24,870**, `NioEndpoint$SocketProcessor.doRun`
+**24,871** — while the client's four `reactor-http-nio` event loops sit
+`blocked=true` in `NioIoHandler.select`. One client request, ~23,700 complete
+server-side dispatches. Tomcat is being handed the same socket over and over and
+parsing a request from it each time.
+
+**It is not an error dispatch.** `ErrorPageFilter`, `RequestDispatcher`,
+`ApplicationDispatcher`, `forward`, `BasicErrorController` and `/error` all
+appear **zero** times in the captured frames.
+
+**And it is not raw selector readiness.** `probes/SelectorReadinessProbe.java`
+(one client, one 5-byte write, then silence) reports
+`readableWakeups=1 reads=1 bytesTotal=5 zeroByteReads=0` identically on HotSpot,
+CratonVM+JIT and CratonVM `--nojit`. A drained non-blocking socket stops being
+reported readable, correctly, on every arm.
+
+### And the spinning thread is `main`, not a server thread
+
+`--stack-dump-on-timeout 20` reports `tid=0 name="main"` as
+`deposit=STALE — thread is RUNNING (blocked=false)`, while every
+`reactor-http-nio` client loop is `deposit=live` and parked in
+`NioIoHandler.select`. So the thread burning CPU is the **test** thread, and the
+~23,700 server dispatches are being *driven* by it, not spontaneously generated
+by Tomcat.
+
+That matters because it redirects the search: the loop is on the JUnit/
+`WebTestClient` side of `exchange()`, not inside the servlet container. The
+watchdog cannot show where — a RUNNING thread's printed chain is its last
+*blocking* site, which is stale by definition, and `--stack-sample-ms 25`
+produced no sample records on this build, so the sampler needs checking before
+it can be relied on here.
+
+The untested hypothesis that fits what is left: an **unconsumed request body**.
+Tomcat must swallow the bytes a handler never read before it can treat the
+connection as ready for the next request; if that drain does not advance, the
+leftover body is re-parsed as a new request forever. It explains the
+WebMvc-only failure (Jersey and WebFlux consume the entity), the body-carrying
+POST, and the 404-without-reading-the-body path. Next step: drive that exact
+shape — POST with `Content-Length`, handler returns without reading — against a
+socket and check whether the leftover bytes are drained.
+
 ## The shape to look for
 
 A spin/poll loop whose condition is written by one thread and read by another:
