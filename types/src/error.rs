@@ -1704,9 +1704,16 @@ impl RuntimeError {
             RuntimeError::IOException { message } => {
                 ("java/io/IOException", Some(message.as_str()))
             }
-            RuntimeError::EOFException { message } => {
-                ("java/io/EOFException", Some(message.as_str()))
-            }
+            RuntimeError::EOFException { message } => (
+                "java/io/EOFException",
+                // An EMPTY message is no message, not the empty string — the
+                // same distinction `IllegalThreadStateException` needs above.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
             RuntimeError::UnknownHostException { message } => {
                 ("java/net/UnknownHostException", Some(message.as_str()))
             }

@@ -886,17 +886,39 @@ fn io_err_nio(e: io::Error, path: &str) -> MethodCallFailed {
 /// caller-supplied `off + len` cannot overflow `usize` and wrap past the
 /// bounds check. `off`/`len` are the *raw* Java `int` values.
 fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
-    if off < 0 || len < 0 {
-        return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_index_only(if off < 0 { off } else { len }),
-        )));
+    // G76-1: this is `Objects.checkFromIndexSize(off, len, b.length)`, which the
+    // comment at the call site already said. Two things were wrong with the
+    // rendering of it:
+    //
+    //   * the TYPE. It raised `ArrayIndexOutOfBoundsException`; HotSpot raises
+    //     the base `IndexOutOfBoundsException`. `AIOOBE extends IOOBE`, so a
+    //     `catch (IndexOutOfBoundsException)` was unaffected and only code
+    //     testing the exact class could see it — which is why it survived.
+    //   * the MESSAGE. `Array index out of range: 6` names a fabricated index
+    //     (`off + len`); the JDK names the whole RANGE and the array length,
+    //     and uses ONE format for all four failure modes. Measured on
+    //     `ByteArrayInputStream.read`, `ByteArrayOutputStream.write` and
+    //     `StringReader.read`, negative and past-the-end alike:
+    //         Range [5, 5 + 1) out of bounds for length 2
+    //         Range [0, 0 + -1) out of bounds for length 2
+    //     Note the second: a negative LENGTH is printed verbatim inside the
+    //     range rather than reported on its own, so there is no special case
+    //     here even though there looks like there should be.
+    fn out_of_bounds(off: i32, len: i32, arr_len: usize) -> MethodCallFailed {
+        MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IndexOutOfBoundsException {
+                message: Some(format!(
+                    "Range [{off}, {off} + {len}) out of bounds for length {arr_len}"
+                )),
+            },
+        ))
     }
-    let end = (off as usize).checked_add(len as usize);
-    match end {
+    if off < 0 || len < 0 {
+        return Err(out_of_bounds(off, len, arr_len));
+    }
+    match (off as usize).checked_add(len as usize) {
         Some(end) if end <= arr_len => Ok(()),
-        _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_index_only(off.saturating_add(len)),
-        ))),
+        _ => Err(out_of_bounds(off, len, arr_len)),
     }
 }
 
@@ -4011,6 +4033,20 @@ fn native_baos_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A VALIDATION gap, not a message one: a negative capacity fell through to
+    // the default and the constructor SUCCEEDED, where the JDK refuses it.
+    // Same species as `G68-1`'s `createTempFile`, and the guard `*v > 0` is
+    // what hid it — it made "negative" and "unspecified" the same case.
+    if let Some(Value::Int(v)) = args.get(1) {
+        if *v < 0 {
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("Negative initial size: {v}"),
+                }
+                .into(),
+            );
+        }
+    }
     let cap = match args.get(1) {
         Some(Value::Int(v)) if *v > 0 => *v as usize,
         _ => BAOS_DEFAULT_CAPACITY,
@@ -13362,7 +13398,10 @@ fn native_dis_read_fully_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn eof_exception() -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::EOFException {
-        message: "Unexpected EOF".to_string(),
+        // HotSpot's `DataInputStream` throws the no-arg constructor: the
+        // message is NULL. "Unexpected EOF" was ours and reads like a JDK
+        // string, which is what kept it.
+        message: String::new(),
     }))
 }
 

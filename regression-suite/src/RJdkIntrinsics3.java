@@ -1,4 +1,6 @@
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.PrintStream;
 import java.lang.reflect.Field;
 import java.io.File;
@@ -2798,7 +2800,103 @@ public class RJdkIntrinsics3 {
                 t == null ? null : t.getMessage(),
                 "Cannot cast java.lang.String to java.lang.Integer");
 
-        sectionEnd("misc", 61);
+        // -- what a failed PARSE says, and what a bad RANGE says ---------------
+        // Sweep 13 (scratchpad/g78/N.java, 48 rows): 42 already exact — every
+        // Integer/Long/radix/BigInteger/BigDecimal message, stream-after-close
+        // semantics and mark/reset. These are the six that were not.
+        t = null;
+        try {
+            sinkD = Double.parseDouble("");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Double.parseDouble(\"\")", t, "java.lang.NumberFormatException");
+        ckS("misc:the float parsers say 'empty String'", t == null ? null : t.getMessage(),
+                "empty String");
+        // ...and a BLANK string is empty too — the JDK trims first.
+        t = null;
+        try {
+            sinkD = Double.parseDouble("   ");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a blank float parse is also 'empty String'",
+                t == null ? null : t.getMessage(), "empty String");
+        // The CONTROL that makes the two rows above mean something: the
+        // INTEGRAL parsers do not share the message, so it cannot be hoisted.
+        t = null;
+        try {
+            sinkI = Integer.parseInt("");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:the integral parsers do NOT say 'empty String'",
+                t == null ? null : t.getMessage(), "For input string: \"\"");
+        t = null;
+        try {
+            sinkF = Float.parseFloat(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Float.parseFloat(null)", t, "java.lang.NullPointerException");
+        ckS("misc:the null float parse names the JDK's own local",
+                t == null ? null : t.getMessage(),
+                "Cannot invoke \"String.length()\" because \"in\" is null");
+
+        // EOFException carries NO message; "Unexpected EOF" was ours and reads
+        // like a JDK string, which is what kept it.
+        t = null;
+        try {
+            sinkI = new DataInputStream(new ByteArrayInputStream(new byte[] {1})).readInt();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:DataInputStream.readInt past the end", t, "java.io.EOFException");
+        ckS("misc:EOFException has a NULL message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+
+        // Objects.checkFromIndexSize: the BASE IndexOutOfBoundsException, and
+        // one message format for every failure mode — including a negative
+        // length, which prints verbatim INSIDE the range rather than alone.
+        t = null;
+        try {
+            sinkI = new ByteArrayInputStream(new byte[] {1}).read(new byte[2], 5, 1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a bad read range is the BASE IndexOutOfBoundsException",
+                t == null ? null : t.getClass().getName(), "java.lang.IndexOutOfBoundsException");
+        ckS("misc:the range message names the range and the length",
+                t == null ? null : t.getMessage(), "Range [5, 5 + 1) out of bounds for length 2");
+        t = null;
+        try {
+            sinkI = new ByteArrayInputStream(new byte[] {1}).read(new byte[2], 0, -1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a NEGATIVE length prints inside the range, not on its own",
+                t == null ? null : t.getMessage(), "Range [0, 0 + -1) out of bounds for length 2");
+
+        // A validation gap, not a message one: this used to SUCCEED.
+        t = null;
+        try {
+            sinkO = new ByteArrayOutputStream(-1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:new ByteArrayOutputStream(-1)", t, "java.lang.IllegalArgumentException");
+        ckS("misc:negative capacity message", t == null ? null : t.getMessage(),
+                "Negative initial size: -1");
+        // Zero is LEGAL — the control that stops the guard becoming `<= 0`.
+        t = null;
+        try {
+            sinkO = new ByteArrayOutputStream(0);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:new ByteArrayOutputStream(0) is legal", t, "none");
+
+        sectionEnd("misc", 75);
     }
 
     // ========================================================================
