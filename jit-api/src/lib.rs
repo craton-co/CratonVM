@@ -745,6 +745,33 @@ pub mod npe_action {
 /// pointer, and [`HELPER_FIELDS`] to describe the layout to tooling.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
+/// Bit the JIT may set in `jit_getfield`'s `field_index` argument to say
+/// **"this receiver is already proven to be an oop"**.
+///
+/// When set, the helper skips its `is_object_address` heap-membership walk.
+/// Everything else — the pending-NPE contract, the slot bounds check, the
+/// compact/legacy layout split, the read and the reference decode — is
+/// unchanged, so this carries no new colouring or layout exposure. It is
+/// purely "skip one validation".
+///
+/// # Why a flag bit and not a second helper slot
+///
+/// `helpers_abi.rs` pins [`JitRuntimeHelpers`]'s field count, byte size and
+/// golden offsets with const assertions plus an ABI version, precisely so the
+/// offsets the JIT bakes cannot move. A one-bit argument flag needs none of
+/// that. `field_index` is a small non-negative slot index — a class-file field
+/// table is `u16`-sized — so bit 62 cannot collide with a real index.
+///
+/// # Why skipping the walk is sound
+///
+/// The walk is validation against a stale/garbage receiver from a miscompiled
+/// frame. The emitter sets this only where the IR's type lattice types the base
+/// node `IrType::Ref` — the same proof the PRIMITIVE trusted-oop arm already
+/// relies on, and that arm goes further and performs a raw inline load off this
+/// very receiver. `plausible_heap_pointer` still runs either way, so null and
+/// unaligned/out-of-range bits are still refused.
+pub const GETFIELD_RECEIVER_PROVEN_OOP: u64 = 1 << 62;
+
 pub struct JitRuntimeHelpers {
     pub newarray: usize,
     pub new_object: usize,
@@ -758,21 +785,6 @@ pub struct JitRuntimeHelpers {
     pub multianewarray_2d: usize,
     pub arraylength: usize,
     pub getfield: usize,
-    /// `getfield` for a receiver the compiler has ALREADY proven is an oop.
-    ///
-    /// Identical to [`Self::getfield`] except that it skips the
-    /// `is_object_address` heap-membership walk. That walk is validation, not
-    /// correctness: it defends against a stale/garbage receiver from a
-    /// miscompiled frame. Where the IR's own type lattice types the base node
-    /// `IrType::Ref` — the same proof the primitive trusted-oop arm already
-    /// relies on, and which also dereferences the receiver — the walk is
-    /// redundant, and on ZGC it is the single largest cost in a field-dense
-    /// run (`ZObjectStarts::contains` 11.1% + `is_object_address` 9.5%, a
-    /// random bitmap probe per access that misses cache).
-    ///
-    /// Nullable: a table that leaves it 0 simply keeps using
-    /// [`Self::getfield`], so no emitter is obliged to adopt it.
-    pub getfield_trusted_ref: usize,
     pub putfield_int: usize,
     pub putfield_long: usize,
     pub putfield_float: usize,

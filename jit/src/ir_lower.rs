@@ -449,7 +449,6 @@ struct Lowerer<'a> {
     /// inline fallback derives `HEADER_SIZE + field_index*SLOT_SIZE`, which a
     /// compact object does not obey. See [`compact_field_lowering_available`].
     getfield: usize,
-    getfield_trusted_ref: usize,
     /// Address of the `jit_putfield_int` helper — the compact-layout-correct
     /// `Op::Store` lowering, for the same reason as `getfield` above. The
     /// inline store is kept for the legacy (uniform-slot) layout, where it
@@ -1044,7 +1043,6 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
-            getfield_trusted_ref: helpers.getfield_trusted_ref,
             putfield_int: helpers.putfield_int,
             putfield_object: helpers.putfield_object,
             putfield_long: helpers.putfield_long,
@@ -2596,16 +2594,21 @@ fn reloc_emit_enabled() -> bool {
         // `contains` is already a tight bitmap probe; the cost is one
         // cache-missing random probe per access, so the fix is to stop asking,
         // not to ask faster.
+        // Carried in `field_index`, NOT a new helper slot: `helpers_abi.rs`
+        // pins the table's field count, byte size and golden offsets with const
+        // assertions and an ABI version, all of which exist to keep the layout
+        // the JIT bakes frozen. A one-bit argument flag needs none of that, and
+        // the index is a small non-negative slot number with 62 spare bits.
         let base_is_proven_oop = self.graph.nodes[base as usize].ty == IrType::Ref;
-        let slow_helper = if ref_node && base_is_proven_oop && self.getfield_trusted_ref != 0 {
-            self.getfield_trusted_ref
+        let arg2 = if ref_node && base_is_proven_oop {
+            field_index as u64 | cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP
         } else {
-            self.getfield
+            field_index as u64
         };
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
-        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as u64);
-        self.emit_mov_reg_imm64(RAX, slow_helper as u64);
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
+        self.emit_mov_reg_imm64(RAX, self.getfield as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
         self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
