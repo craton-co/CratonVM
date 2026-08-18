@@ -775,10 +775,69 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         "keystore.type" => "PKCS12",
         "ssl.KeyManagerFactory.algorithm" => "SunX509",
         "ssl.TrustManagerFactory.algorithm" => "PKIX",
-        _ => return Ok(Some(Value::Object(None))),
+        // Not one of this VM's four deliberate answers: ask the JDK's own
+        // `java.security` file rather than reporting "no such property".
+        _ => {
+            return Ok(match java_security_file_property(ctx, &key) {
+                Some(v) => {
+                    let s = ctx.create_string(&v);
+                    Some(Value::Object(Some(s)))
+                }
+                None => Some(Value::Object(None)),
+            })
+        }
     };
     let s = ctx.create_string(val);
     Ok(Some(Value::Object(Some(s))))
+}
+
+/// `Security.getProperty` for a key this VM does not answer itself, read from
+/// the configured JDK's `conf/security/java.security`.
+///
+/// The four hardcoded answers above are deliberate (an unblocking
+/// `securerandom.source`, in particular) and still win. Everything else used to
+/// be `null`, which is not "no such property" — it is a whole configuration
+/// file this VM declined to read, and library code reads it through
+/// `Security.getProperty` all the time.
+///
+/// Measured: BouncyCastle's `AdaptingKeyStoreSpi` gates its JKS-compatibility
+/// path on `Properties.isOverrideSet("keystore.type.compat")`, which resolves
+/// through `Security.getProperty` first, and the stock file says
+/// `keystore.type.compat=true`. Answering null took the PKCS12 path for a JKS
+/// stream and threw `IOException: stream does not represent a PKCS12 key
+/// store` — `PKCS12StoreTest.testJKS`, which HotSpot passes.
+///
+/// Parsed once. `java.security` is `key=value` with `#` comments and no
+/// sections; a continuation-free read is enough for the lookups callers make,
+/// and a file that cannot be read leaves every key unanswered exactly as before.
+fn java_security_file_property(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
+    static FILE_PROPS: std::sync::OnceLock<
+        parking_lot::Mutex<Option<std::collections::HashMap<String, String>>>,
+    > = std::sync::OnceLock::new();
+    let cell = FILE_PROPS.get_or_init(|| parking_lot::Mutex::new(None));
+    let mut guard = cell.lock();
+    if guard.is_none() {
+        let mut parsed = std::collections::HashMap::new();
+        if let Some(home) = ctx.get_system_property("java.home") {
+            let path = std::path::Path::new(&home)
+                .join("conf")
+                .join("security")
+                .join("java.security");
+            if let Ok(text) = std::fs::read_to_string(path) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once('=') {
+                        parsed.insert(k.trim().to_string(), v.trim().to_string());
+                    }
+                }
+            }
+        }
+        *guard = Some(parsed);
+    }
+    guard.as_ref().and_then(|m| m.get(key).cloned())
 }
 
 /// Process-wide overrides written by `Security.setProperty`.
@@ -3655,6 +3714,40 @@ pub(crate) fn chain_third_party_service_classes(type_str: &str, algo: &str) -> V
         .map(|e| e.class_name.replace('.', "/"))
         .filter(|c| !c.trim().is_empty())
         .collect()
+}
+
+/// A third-party provider that owns one of `algos` and sits AHEAD of `before`
+/// in the installed chain.
+///
+/// `getInstance(algorithm)` with no provider named is defined by chain ORDER:
+/// the first installed provider that has the service wins. This engine answers
+/// as one particular provider (`SunJCE` for `Cipher`), so serving a name it can
+/// compute is right only while nothing ahead of that provider owns the name
+/// too. An application that calls `Security.insertProviderAt(p, 2)` has said
+/// exactly that it wants `p` consulted first, and bc-java's `SlotTwoTest` does
+/// it and then asserts `decrypt.getProvider().getName()` is `BC` — it got
+/// `SunJCE`, for `DESede/ECB/PKCS7Padding`, a padding spelling SunJCE does not
+/// even register.
+///
+/// Deliberately narrow: providers at or after `before` are not consulted, so a
+/// third-party provider left at its default position (the end of the chain,
+/// where `Security.addProvider` puts it) changes nothing. Only an explicit
+/// insertion ahead of this engine's own identity does.
+pub(crate) fn third_party_owner_before(
+    type_str: &str,
+    algos: &[String],
+    before: &str,
+) -> Option<String> {
+    let names: Vec<String> = snapshot().into_iter().map(|(name, _, _)| name).collect();
+    let limit = names.iter().position(|n| n.eq_ignore_ascii_case(before))?;
+    names.into_iter().take(limit).find(|name| {
+        !NATIVELY_SERVICED_PROVIDERS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(name))
+            && algos
+                .iter()
+                .any(|algo| get_service_entry(name, type_str, algo).is_some())
+    })
 }
 
 pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String> {
