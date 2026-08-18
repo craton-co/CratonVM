@@ -304,43 +304,128 @@ The order is therefore:
    `try_emit_inline_site`'s postcondition now asks whether a published point
    *says* it came from inside a splice, rather than whether anything was
    published at all.
-4. **A real call inside a spliced body** — and the blocker here is NOT what
-   this page said it was. Measured 2026-08-18 with the per-splice trace step 3
-   added: **no splice publishes a deopt point at all, and that is structural.**
-   Precise exception frames and inlining are mutually exclusive
-   (`try_compile_inner`'s unconditional `inline_sites.clear()`, mirrored by
-   `InlineRefusal::PreciseExceptionFrames`), which rules out both precise-frame
-   producers; array ops and `invokedynamic` are rejected at the site resolver,
-   which rules out the bounds-check guard and the indy trap; and OSR exit maps
-   are emitted at the enclosing method's loop headers, not inside a splice.
+4. ~~A real call inside a spliced body.~~ **DONE 2026-08-18 — and it is a
+   PESSIMISATION on its own. Measured, not predicted.**
 
-   So the deopt-metadata postcondition was a *guard*, not the reason invokes are
-   not spliced. The real work is:
+   Both gates are open: `resolve_inline_site_from` records every
+   `invoke{virtual,static,interface}` in a candidate body and resolves it
+   against the CALLEE's constant pool into `InlineSite::invoke_targets`
+   (`InlineInvokeTarget` — name triple, receiver-included argument count,
+   return byte, dispatch kind, and the CALLEE's declaring class id, which is
+   what keeps a two-loader duplicate resolving through the right copy);
+   `try_compile_inner` interns each into this compile's own
+   `_jit_strings`/`_jit_invoke_infos` arenas; and `try_emit_inline_body` has the
+   arm. A non-elidable `invokespecial`, which used to reject the site outright
+   because elision was the only 0xb7 arm, now takes the same route.
 
-   * **write the arm.** `try_emit_inline_body` has no `0xb6`/`0xb8`/`0xb9` case
-     — they hit its catch-all bail — and `resolve_inline_site_from` rejects
-     those opcodes before a site is ever planned. Both gates have to open.
-   * **the exception-check stub's throw pc.** Outside a protected range (or with
-     precise frames off, which is every inlining compile),
-     `emit_post_invoke_exception_check` records `(patch_offset, dbg_last_pc)` on
-     `exception_check_stubs` rather than publishing a frame. Inside a spliced
-     body `dbg_last_pc` is the CALLEE's pc, and the VM routes that throw pc
-     through the ENCLOSING method's exception table — the same "callee bci in
-     the caller's frame" class of defect as the deopt one, in the exception
-     path instead. The tractable first cut is to admit a call-carrying splice
-     only where the enclosing method has no exception table, or where the splice
-     site lies outside every protected range. `testHttpStatusClassValueOf` has no
-     `try` at all, so it qualifies.
-   * **callee handlers.** `resolve_inline_site_from` already refuses a callee
-     whose own `exception_table` is non-empty; splicing one would need the
-     caller to carry its ranges. Leave that refusal in place for the first cut.
-5. **Nesting.** `InlineSite` grows a `nested_sites: HashMap<callee_pc,
-   InlineSite>`, `resolve_inline_site_from` fills it recursively under a depth
-   budget, and the emitter recurses. Statically bound callees are the tractable
-   first cut and are most of what this class needs — the assertion chain's first
-   four rungs are all `invokestatic`. `valueOf`'s five `contains` calls are
-   `invokevirtual` on static-final constants of anonymous subclasses, so they
-   additionally need devirtualisation with a guard.
+   The substantive half was, as this page said, the resolution: the top-level
+   `invoke_info` is keyed by CALLER pc and could not be reused. What this page
+   did NOT anticipate is what the emitted call costs.
+
+   | arm (one binary, three interleaved rounds, `probes/AssertChainProbe`) | `assertFull` ns/iter |
+   |---|---:|
+   | base | 47.2 / 45.3 / 47.9 |
+   | + `CRATONVM_JIT_MAIN_INLINE` | 50.3 / 79.8 / 58.9 |
+   | + `CRATONVM_JIT_INLINE_CALLS` (dispatch fallback) | **163.3 / 266.6 / 172.2** |
+   | + `CRATONVM_JIT_INLINE_NEST` | 47.3 / 59.6 / 80.2 |
+   | HotSpot | 3.15 / 2.01 / 2.57 |
+
+   `sink` is byte-identical in every arm, so this is a speed result and not a
+   correctness one. `CRATONVM_DBG=mic-prof` over 2 000 000 iterations names the
+   mechanism outright:
+
+   | | base | + inline calls |
+   |---|---:|---:|
+   | `disp_calls` | 3 870 | **2 003 361** |
+   | `cyc_disp_total` | 1.86M | **1 049M cycles** |
+
+   One blind dispatch per iteration, ~524 cycles each — which is the entire
+   163-266 ns.
+
+   **The premise this step was built on is inverted.** This page's own
+   "Three things that are NOT the cause" section already recorded
+   `disp_calls=3776`: the chain is *already direct-bound*, every rung a raw
+   `CALL` to a compiled entry. So splicing the enclosing body removes one frame
+   worth ~4 ns and converts the call inside it from that direct `CALL` into
+   `jit_invoke_dispatch`, which resolves by name on every execution, worth
+   ~175. Splicing a body is only worth doing when the call inside it does not
+   get worse — and the per-call floor table above is exactly the evidence that
+   should have predicted this, read in the other direction.
+
+   The dispatch fallback is therefore opt-in
+   (`CRATONVM_JIT_INLINE_CALL_DISPATCH`, default OFF, kept because it is the arm
+   that reproduces the table above). With it off, a callee containing a call is
+   admitted only when every one of those calls is itself spliced, and
+   `invoke_targets` is then cleared — which removes the emitter's fallback too,
+   so a nested splice that bails during emission bails the enclosing splice
+   rather than silently degrading to the helper. That makes the feature
+   monotone: with the fallback off, `CRATONVM_JIT_INLINE_CALLS` cannot make
+   anything slower than not setting it.
+
+   Deopt safety needed no new rule, and neither of the two things this page
+   previously listed as blockers is one:
+
+   * *The deopt-metadata postcondition.* Measured at step 3: no splice publishes
+     a deopt point, structurally. The invoke arm deliberately omits
+     `snapshot_pre_intrinsic_call` — it keys a point by bci, and inside a splice
+     the only bci available is the callee's, a different bytecode space from the
+     one the artifact's metadata is indexed by. So the postcondition still
+     holds, and it is now a ratchet rather than a gate.
+   * *The exception-check stub's throw pc.* `dbg_last_pc` is assigned in exactly
+     one place — the outer bytecode walk — and `try_emit_inline_body` never
+     touches it, so throughout a splice it holds the CALLER's invoke pc. That is
+     the correct attribution: an exception escaping an inlined body belongs to
+     the call site in the enclosing method, whose exception table is the one to
+     search. The already-shipped spliced `getfield` / `getstatic` / `arraycopy`
+     sites rely on the same thing.
+
+   Still refused, unchanged: a callee with a non-empty exception table of its
+   own, because splicing one would need the caller to carry its ranges.
+
+5. ~~Nesting.~~ **DONE 2026-08-18.** `InlineSite::nested_sites`,
+   `resolve_inline_site_from` recursing on its own callee's statically-bound
+   calls under `cratonvm_jit::MAX_INLINE_NEST_DEPTH` (3 — what
+   `assertEquals(int,int)` -> `assertEquals(Object,Object)` -> `objectsAreEqual`
+   needs), and `try_emit_inline_body` recursing through
+   `try_emit_nested_inline`. Nested sites are ADDITIVE with the dispatch entry
+   when the fallback is enabled, so a nested body that bails mid-emission drops
+   to the ordinary call instead of failing the outer splice.
+
+   Only statically bound calls nest. `invokevirtual`/`invokeinterface` inside a
+   spliced body cannot: selecting a body needs a runtime receiver, and the
+   receiver-type profile is keyed by the ENCLOSING method's bci, not a
+   callee-internal pc. That is why `valueOf`'s five `contains` calls
+   (`invokevirtual` on static-final constants of anonymous subclasses) are still
+   out of reach — they need per-splice devirtualisation with a guard, which is
+   PGO-02's machinery re-keyed.
+
+   Nesting recovers the step-4 regression (47.3 in round 1 against a 47.2 base)
+   but does not beat the baseline. The reason is visible in the same table: the
+   chain's first rungs collapse, and the terminal `UNKNOWN.equals(k)` —
+   `invokevirtual`, so un-nestable — keeps its frame. Removing three ~4 ns
+   direct calls out of an ~47 ns iteration is inside this probe's round-to-round
+   noise, which is itself ~±15 ns on this host.
+
+### What steps 4-5 actually bought, and what is next
+
+Not speed, yet. What they bought is that **the inliner can now nest at all**,
+and a measured statement of what the next lever has to be:
+
+* **Direct-bind a spliced call.** The top level resolves an already-compiled
+  callee to a raw `CALL` (`direct_calls` / `JitDirectCall`); a spliced call has
+  no equivalent and falls to the blind helper, which is the whole finding above.
+  Giving `emit_inline_invoke` the same treatment — resolve the target's compiled
+  entry at plan time, record the invalidation dependency, emit the register-ABI
+  call — is what would let a call-carrying splice pay for itself without needing
+  the whole chain to collapse. It is also the thing that would make the
+  `INLINE_CALL_DISPATCH` arm unnecessary rather than merely off.
+* **Devirtualise inside a splice.** Needed for `valueOf` and for the chain's
+  terminal `equals`. PGO-02 already resolves a guarded monomorphic body from a
+  receiver profile; the missing piece is a profile keyed by (caller pc, callee
+  pc) rather than caller pc alone.
+
+Neither is a correctness risk of the kind steps 1-4 were — both are refusals
+that cost reach, not wrong stacks.
 
 Steps 1-4 are correctness-critical, and their failure mode is a silent wrong
 stack rather than a slow loop. That is the honest size of "needs an inliner that

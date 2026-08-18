@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| **Status** | RETIRED — both defects it named are fixed, shipped and pinned; the residual it leaves has a mechanism, a count and a named fix class |
+| **Status** | RETIRED — both defects it named are fixed, shipped and pinned, and the residual it left (capturing lambdas) is closed too |
 | **Opened** | 2026-08-17 as `known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`; §5 added the same day |
-| **Closed by** | `fix/lambda-sam-jit-tierup-20260817` |
-| **Measured effect** | **37x** on `probes/SamHotLoopProbe.java`'s lambda row — 379 → 10.2 ns/op, against a named-class control of 10.3 — same binary, three-arm ABBA, six runs an arm. The gap this page was filed about is GONE, not narrowed |
-| **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (everything), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller Rust arm), `CRATONVM_JIT_LAMBDA_ADAPTER=0` (the inline-cache thunk) |
+| **Closed by** | `fix/lambda-sam-jit-tierup-20260817`, then `perf/lambda-mic-adapter-20260818`, then `perf/lambda-capturing-adapter-20260818` for the capturing residual |
+| **Measured effect** | **37x** on `probes/SamHotLoopProbe.java`'s lambda row — 379 → 10.2 ns/op, against a named-class control of 10.3 — same binary, three-arm ABBA, six runs an arm. The gap this page was filed about is GONE, not narrowed. The capturing row followed on 2026-08-18: **17.4x**, 125.1 → 7.2 ns/op against a control of 6.6 (see §4) |
+| **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (everything), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller Rust arm), `CRATONVM_JIT_LAMBDA_ADAPTER=0` (the inline-cache thunk), `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` (just the capturing half of it) |
 
 The page asked for one thing in its §4 — *"giving lambda call sites a cached
 invoke target of their own"* — and reported in §5 that the attempt at the other
@@ -163,10 +163,15 @@ Thirteen bytes for a one-argument SAM. Three properties keep it that small:
   cascade loads each operand-stack slot into `ARG_REGS[i]` without consulting
   its type — so no type information is needed. `LambdaAdapterProbe`'s
   double-argument arm is the check that this stays true.
-* **It touches no memory**, which is what confines it to NON-CAPTURING lambdas:
-  reading a captured field from a hand-emitted thunk would mean reproducing the
-  compact/legacy body-layout branch and every per-type width the `getfield` arms
-  handle. A capturing lambda keeps the Rust arm at ~200 ns.
+* **It touches no memory**, which is what confined it to NON-CAPTURING lambdas
+  *when this was written*: reading a captured field from a hand-emitted thunk
+  looked like it would mean reproducing the compact/legacy body-layout branch
+  and every per-type width the `getfield` arms handle. A capturing lambda kept
+  the Rust arm at ~200 ns.
+
+  **Superseded 2026-08-18.** The first half of that is not true of a lambda
+  proxy. See §4's "the one that is still open", which is now closed, and which
+  says what the obstacle actually was.
 
 Invalidation is the same commitment a JIT'd caller's baked direct call makes,
 and is registered the same way: the thunk's `_direct_callee_entries` names the
@@ -224,17 +229,200 @@ starting from a profile of `LambdaCompositionProbe` (flat: the interpreter loop
 at 7%, the native registry's three lookup functions at ~5.8%, allocation ~3%),
 and it should not be filed as a lambda problem.
 
-### The one that is still open
+### The one that was still open — closed 2026-08-18
 
-A CAPTURING lambda keeps the Rust arm and its ~200 ns, because the thunk may not
+A CAPTURING lambda kept the Rust arm and its ~200 ns, because the thunk may not
 read a captured field without reproducing the compact/legacy body-layout branch.
-That is the honest successor to this page, and unlike the residual it replaces
-it is a bounded piece of work with a known shape: emit the `GC_FLAG_COMPACT`
-test and the per-type loads the `getfield` arms already emit, or give the proxy
-a real body the ordinary compiler can handle.
+
+**Most of that premise was wrong, and it was wrong in a way worth recording,
+because it is the same mistake this page's §3 memo made: reasoning about a
+general obstacle instead of asking what the specific object looks like.**
+
+A lambda proxy's class id comes from `alloc_lambda_proxy_id`, which counts up
+from `0x8000_0000` — disjoint from every id class definition hands out. Nothing
+registers a `CompactLayout` for one, and `plan_object_alloc` sets
+`GC_FLAG_COMPACT` only when a registered layout matches the allocation's field
+count. So every lambda proxy in this VM is a uniform 16-byte-cell object, its
+capture offsets are the compile-time constants
+`HEADER_SIZE + i * SLOT_SIZE + payload`, and **the branch that was the stated
+blocker never needed emitting at all.** What remained was the small half: three
+loads cover every Java type, the same three the `getfield` legacy arm emits.
+
+That is a fact about this VM rather than a property of thunks, so
+`lambda_adapter_entry` asks `class_layout_for_fields` at build time and refuses
+if it ever answers otherwise — the feature disables itself rather than reading
+captures at the wrong offsets.
+
+The thunk therefore grew a prologue rather than a branch: save the receiver to
+`r11`, slide the SAM arguments to sit *after* the captures, load the captures
+into the registers the slide vacated, tail-jump. The arguments now move by
+`captures - 1` registers — down one for none, not at all for one, up for more —
+and the slide runs in whichever direction reads each register before the step
+that writes it.
+
+One restriction appeared to survive, about the collector rather than the layout:
+a REFERENCE capture was refused while `narrow_oops_block_inline_fields()` held —
+compressed oops on, or ZGC's read barrier armed — by analogy with the inline
+`getfield` codegen. **It was removed on the same day, because the analogy did
+not hold and the gate was inert anyway.** See "The reference-capture gate"
+below; there is now no capture shape this thunk refuses on the collector's
+account.
+
+`CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` is the kill switch, kept separate from
+`CRATONVM_JIT_LAMBDA_ADAPTER` so a same-binary A/B can hold the non-capturing
+thunk fixed while moving only this.
+
+#### The numbers
+
+Same binary throughout (`cratonvm-lamcap`, md5 `107ebef71211a5f334b96864b62fef53`),
+three arms selected by kill switch, order `A B C C B A` within each of three
+rounds so drift in the box's load falls on every arm equally. Six runs an arm,
+`probes/SamHotLoopProbe.java`, 2 000 000 ops, Azure 8-core — and unlike §3's
+table, a quiet one, which is why every absolute number here is about half of
+that table's.
+
+| row | A: both on | B: capture thunk off | C: no thunk at all |
+|---|---:|---:|---:|
+| `klass` (named class, control) | 6.6 | 6.7 | 6.6 |
+| `lambda` (non-capturing) | 6.9 | 6.9 | 122.0 |
+| `mref` | 6.9 | 6.9 | 119.7 |
+| **`cap` (capturing)** | **7.2** | **125.1** | 124.0 |
+
+**17.4x on the capturing row**, and it lands at the named-class control plus
+0.6 ns — which is about what one load off the receiver should cost. Ranges do
+not overlap: A `[7.0 … 7.3]` against B `[123.3 … 128.2]`.
+
+Three controls make that a measurement rather than a number:
+
+* `klass` is unmoved across all three arms, as it must be — nothing here
+  touches a named class's call site.
+* `lambda` and `mref` are IDENTICAL in A and B (6.9 both). The capture switch
+  moved only what it claims to; had it moved the non-capturing rows, the arms
+  would not be measuring what their names say.
+* `cap` in B ≈ `cap` in C (125.1 against 124.0). For a capturing lambda,
+  turning off the capture half alone is the same as turning off the thunk
+  entirely — which is the statement that B is a real "before".
+
+Every run of all seventy-two printed the same `sink=71449096416`.
+
+`probes/LambdaCaptureAdapterProbe.java` — seventeen capture shapes, including a
+negative `byte`, a `char` above `0x7FFF`, a `null` reference, three captures at
+once, and two instances of one lambda holding different values — is
+byte-identical to HotSpot's output on both arms, with
+`site_adapters=15 site_cap_adapters=14` printed beside it. The second number is
+the one that matters: fourteen CAPTURING sites were dispatching through a thunk
+while those lines were produced.
+
+Its engagement is modest on purpose — `site_no_code=895000` of
+`site_calls=1095000`, because 300 000 iterations across seventeen distinct impls
+does not give the background compiler time to publish them all. The probe's job
+is agreement across shapes; the fixture pair in §5 carries the engagement
+burden.
+
+Its captures go through one-line identity methods (`i32`, `i64`, …) for a
+reason worth repeating: `final int k = 7;` is a *constant variable* in the JLS
+sense and javac inlines it before desugaring the lambda, so the obvious way to
+write this file produces seventeen NON-capturing lambdas whose comments claim
+otherwise. `javap -p` on the class is the check — every `lambda$main$N` must
+take more parameters than its SAM.
+
+#### The reference-capture gate: inert AND unnecessary
+
+The capturing thunk shipped with one restriction — a REFERENCE capture was
+refused whenever `narrow_oops_block_inline_fields()` held (compressed oops on,
+or ZGC's read barrier armed), by analogy with the inline `getfield` codegen,
+which refuses under exactly that condition.
+
+Two things were wrong with it, pointing in opposite directions.
+
+**It was inert.** Compressed oops is opt-in (`CRATONVM_COMPRESSED_OOPS`) and
+ZGC's barrier never arms in a default run, so the predicate is false throughout
+and reference captures were already being thunked. Nothing about the default
+configuration changed when the gate came out, and no number below should be read
+as saying otherwise.
+
+**It was also unnecessary where it did fire.** That predicate guards the
+emission of a COMPACT slot read — a compact reference field narrows to four
+bytes under compressed oops, and it is the compact and array decode paths that
+ZGC's colouring reaches. This emitter never emits one: the compact-layout
+refusal above guarantees every capture load addresses a legacy 16-byte `Value`
+cell. A legacy cell is neither narrowed (`narrow_oop::ref_field_size` is
+documented as the width of a *compact* instance field) nor barriered — ZGC
+applies `load_barrier_slot` in `get_array_element`, while `get_field`'s legacy
+arm is a bare `std::ptr::read::<Value>`. The refusal diverted a reference
+capture to a Rust arm that reads the identical word in the identical way.
+
+`gc/tests/lambda_proxy_capture_word.rs` makes that a checked claim rather than a
+code reading: it compares the emitter's baked address and width against **each
+collector's own `get_field`**, with compressed oops on and with the ZGC barrier
+armed, having first asserted a proxy is legacy-laid-out on every backend so the
+rest cannot agree about the wrong object. Reading the wide payload at the tag
+word instead turns five of its six tests red.
+
+One binary, four arms, `A B C D D C B A` per round, three rounds, on a busier
+box than the table above — hence the wider spreads; the separation is 15x and
+the noise is 2x:
+
+| row | A: default, thunk | B: default, Rust | C: **oops on**, thunk | D: oops on, Rust |
+|---|---:|---:|---:|---:|
+| `klass` (control) | 7.9 | 8.0 | 8.8 | 9.4 |
+| `lambda` | 8.6 | 8.9 | 8.8 | 8.5 |
+| `cap` (`int` capture) | 9.1 | 154.8 | 9.2 | 156.6 |
+| **`capref` (reference capture)** | **9.9** | 150.8 | **8.7** | 148.0 |
+
+Column C is the configuration the gate used to refuse; a reference capture costs
+the same there as anywhere else. All 96 runs printed `sink=71449096416`.
+
+Engagement, from the pair that states it best — `capref` under compressed oops,
+20 000 000 dispatches:
+
+* thunk ON: **zero** `[LAMBDA-JIT]` census lines. The census prints every N
+  *direct* calls and there were none, so Rust is not on the path at all.
+* thunk OFF: `site_calls=20100000 site_direct=20100000 site_cap_adapters=0` —
+  every one of them through Rust.
+
+That asymmetry is the engagement statement here, and it is the shape
+`lambda_site_prof::SITE_ADAPTERS`'s own comment predicts: a per-call counter
+necessarily goes quiet exactly when the fast path starts working.
+`jit::lambda_adapter`'s
+`a_reference_capture_is_still_served_under_compressed_oops` pins the behaviour
+directly, since nothing in a default run can tell the two versions apart.
+
+#### What the fixture had to learn
+
+`captureShapesChecksum` covers one capture of each width, and every lambda in it
+captures exactly ONE value. A deliberate break that ignored the capture index
+and read every capture from cell 0 therefore passed the whole suite, engagement
+assertions included — the offsets were all zero anyway. `multiCaptureChecksum`
+exists for that: three lambdas holding two captures each, combined
+non-commutatively, one pair of equal width so the index is isolated from the
+load. With it, the same break fails with an access violation.
+
+A second break — emitting the int-category load zero-extending instead of
+sign-extending — passed, and that one is *correct*: an int-category parameter is
+stored to a frame local and read back 32 bits at a time, so the upper half is
+don't-care. `MOVSXD` is emitted because it is what the neighbouring code emits,
+not because anything can see it. The comment on `CaptureLoad::Int` says so.
 
 ## 5. What pins it
 
+For the capturing thunk, a PAIR:
+`vm/tests/lambda_capture_adapter_tests.rs` runs three fixtures through the
+thunk and asserts both the values and
+`lambda_jit_capture_adapter_installs() > 0`;
+`lambda_capture_adapter_off_tests.rs` runs the same three with
+`CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0`, asserts the SAME values, and asserts
+zero installs. Neither is worth much alone — the first could agree with a
+broken Rust arm, the second could pass while no thunk was ever built. Together
+they say the two independent implementations of "read the captures and call the
+impl" agree, and that both ran. The expected values are computed in Rust and
+were checked against HotSpot before being written down.
+
+`CRATONVM_DBG=lambda-jit` prints `site_cap_adapters` beside `site_adapters` for
+the same reason the pair exists: the total stays healthy on a workload full of
+non-capturing lambdas whatever happens to the capturing ones.
+
+For the original two halves:
 `vm/tests/lambda_jit_tierup_tests.rs` and `lambda_jit_oneshot_tests.rs` — the
 same twelve golden checksums from a real JDK, run against each half (the second
 sets `CRATONVM_JIT_LAMBDA_SITE=0`, which sends a compiled caller's SAM call back

@@ -188,6 +188,58 @@ unsafe fn read_num_slots(obj_ptr: *const u8) -> u32 {
     std::ptr::read(obj_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32)
 }
 
+/// Records what the last `stub_invoke_dispatch` call received.
+///
+/// A spliced call is emitted, not executed, by most of these tests — and an
+/// assertion that machine code "contains a CALL" proves very little about
+/// whether the ARGUMENTS reached it in the right buffer, in the right order.
+/// This lets a test actually run the code and read back what the helper saw.
+///
+/// Thread-local because the test harness calls compiled code on the test's own
+/// thread and several inline tests run concurrently under `cargo test`.
+thread_local! {
+    static LAST_DISPATCH: std::cell::RefCell<Option<(String, String, String, Vec<i64>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test stand-in for `jit_invoke_dispatch`.
+///
+/// The real helper's contract, and all this reproduces: read `num_jit_args`
+/// i64s from `args` (arg[0] at the LOWEST address), and return the callee's
+/// result in RAX. It returns the SUM of the arguments, which is a value a test
+/// can predict exactly and which changes if the buffer is built in the wrong
+/// order with any argument set that is not symmetric.
+///
+/// SAFETY: called from JIT-compiled code that passes the `JitInvokeInfo`
+/// pointer this compile interned and an `args` buffer of exactly `num_args`
+/// i64 slots, per `emit_inline_invoke`.
+unsafe extern "C" fn stub_invoke_dispatch(
+    _vm_ptr: i64,
+    info: *const crate::JitInvokeInfo,
+    args: *const i64,
+    num_args: i32,
+) -> i64 {
+    let mut seen = Vec::new();
+    let mut sum: i64 = 0;
+    for i in 0..num_args.max(0) {
+        let v = std::ptr::read(args.add(i as usize)); // Cast: ABI buffer index
+        seen.push(v);
+        sum = sum.wrapping_add(v);
+    }
+    let (c, m, d) = if info.is_null() {
+        (String::new(), String::new(), String::new())
+    } else {
+        let r = &*info;
+        (
+            r.class_name.to_string(),
+            r.method_name.to_string(),
+            r.descriptor.to_string(),
+        )
+    };
+    LAST_DISPATCH.with(|slot| *slot.borrow_mut() = Some((c, m, d, seen)));
+    sum
+}
+
 // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
 // and a field index that is bounds-checked within the function body before any dereference.
 unsafe extern "C" fn stub_getfield(_vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
@@ -344,7 +396,11 @@ fn test_helpers() -> JitRuntimeHelpers {
         instanceof_check: sentinel,
         throw_aioobe: sentinel,
         throw_arithmetic: sentinel,
-        invoke_dispatch: sentinel,
+        // Was `sentinel`. Nothing executed it then — a test that did would
+        // have jumped to a bogus address — so wiring a real stub changes no
+        // existing test's behaviour and lets the spliced-call tests below
+        // run the code instead of merely inspecting it.
+        invoke_dispatch: stub_invoke_dispatch as *const () as usize, // Cast: address arithmetic
         invoke_virtual_mic: sentinel,
         lambda_int_to_double: sentinel,
         write_barrier: sentinel,
@@ -11815,7 +11871,372 @@ fn make_inline_site(
         method_name: "inlined".to_string(),
         descriptor,
         elided_invoke_pcs: Vec::new(),
+        invoke_targets: Vec::new(),
+        resolved_invoke_infos: Vec::new(),
+        nested_sites: Vec::new(),
     }
+}
+
+// -----------------------------------------------------------------------
+// Steps 4 and 5 — a call inside a spliced body, and a splice inside a splice
+// -----------------------------------------------------------------------
+
+/// `compile_with_inlines` with the VM-context slot established.
+///
+/// A spliced call passes the context as `jit_invoke_dispatch`'s first
+/// argument, and with `needs_heap == false` there is no slot holding it
+/// (`heap_local_offset` is 0, i.e. the saved `rbp`). Harmless for a stub that
+/// ignores the pointer, but the tests below should exercise the shape the VM
+/// actually compiles.
+fn compile_with_inlines_heap(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    inline_sites: HashMap<usize, crate::InlineSite>,
+) -> Option<CompiledMethod> {
+    compile(
+        code,
+        code_len,
+        num_params,
+        max_locals,
+        true, // needs_heap — the dispatch helper takes the context
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        inline_sites,
+        None, // string_layout
+    )
+}
+
+/// A `JitInvokeInfo` with the lifetime the emitter's baked immediate needs.
+///
+/// `try_compile_inner` interns these into the compile's own arena; a unit test
+/// at this layer has no arena, so it leaks. One per call, deliberately: the
+/// address is what `resolved_invoke_infos` carries and two sites must not
+/// alias.
+fn leak_invoke_info(
+    class_name: &'static str,
+    method_name: &'static str,
+    descriptor: &'static str,
+    num_jit_args: usize,
+    return_type: u8,
+    invoke_kind: u8,
+) -> usize {
+    let info: &'static crate::JitInvokeInfo = Box::leak(Box::new(crate::JitInvokeInfo {
+        class_name,
+        method_name,
+        descriptor,
+        num_jit_args,
+        return_type,
+        invoke_kind,
+        declaring_class_id: 0,
+    }));
+    info as *const crate::JitInvokeInfo as usize // Cast: address parked in a Send-able plan
+}
+
+fn take_last_dispatch() -> Option<(String, String, String, Vec<i64>)> {
+    LAST_DISPATCH.with(|slot| slot.borrow_mut().take())
+}
+
+/// STEP 4. A callee that CALLS is spliceable, and the call it makes reaches the
+/// dispatch helper with the right target and the right arguments in the right
+/// order.
+///
+/// This is the whole point of the step: every `invoke*` used to reject the
+/// enclosing site outright, so a body like `leaf(a)` below was never a
+/// candidate no matter how small it was. Nothing here is about making the CALL
+/// cheaper — it is the same `jit_invoke_dispatch` an un-spliced body would use.
+///
+/// Self-proving three ways, each of which fails on a different mistake:
+///   * the return value (15) is wrong if the call is not emitted, or if its
+///     result is not pushed as the spliced body's value;
+///   * the recorded argument vector `[5, 10]` is wrong — reversed — if the
+///     args buffer is built in the wrong direction, which a symmetric argument
+///     set would hide;
+///   * the recorded name triple is wrong if the emitter baked a different
+///     `JitInvokeInfo` than `resolved_invoke_infos` named.
+#[test]
+fn a_call_inside_a_spliced_body_reaches_the_dispatch_helper() {
+    // callee: `static int leaf(int a) { return target(a, 10); }`
+    //   0: iload_0
+    //   1: bipush 10
+    //   3: invokestatic #3   -> resolved target
+    //   6: ireturn
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    callee.resolved_invoke_infos = vec![(
+        3,
+        leak_invoke_info("pkg/Target", "target", "(II)I", 2, b'I', 3),
+    )];
+
+    // caller: `static int f(int a) { return leaf(a); }`
+    //   0: iload_0
+    //   1: invokestatic #1   -> the inline site
+    //   4: ireturn
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a callee containing a call must now splice");
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // dispatch helper is `stub_invoke_dispatch`, which only reads the argument
+    // buffer the emitted code just built.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(got, 15, "the spliced call's result must be the body's value");
+
+    let (class_name, method_name, descriptor, args) =
+        take_last_dispatch().expect("the spliced body must have called the dispatch helper");
+    assert_eq!(
+        (class_name.as_str(), method_name.as_str(), descriptor.as_str()),
+        ("pkg/Target", "target", "(II)I"),
+        "the emitter must bake the JitInvokeInfo `resolved_invoke_infos` named",
+    );
+    assert_eq!(
+        args,
+        vec![5, 10],
+        "arg[0] must be at the lowest address — a reversed buffer swaps these",
+    );
+}
+
+/// A spliced call site with no resolved target must REFUSE the splice.
+///
+/// The emitter cannot invent a dispatch target: `InlineSite::invoke_targets` is
+/// resolved against the CALLEE's constant pool, and the enclosing method's
+/// `invoke_info` is keyed by CALLER pc — a different bytecode space, where the
+/// same integer names an unrelated call. Guessing there is how you get a body
+/// that calls the wrong method.
+///
+/// Same site as the test above with `resolved_invoke_infos` emptied. Refusing
+/// is not the same as failing: the compile still succeeds (the site falls back
+/// to whatever the caller's own pc resolves to, which in this harness is
+/// nothing), and what must NOT appear is a dispatch emitted against a target
+/// the emitter does not have. A splice that ran anyway would have to bake some
+/// address as `jit_invoke_dispatch`'s second argument, and every address
+/// available to it here is wrong.
+#[test]
+fn a_spliced_call_with_no_resolved_target_refuses_the_splice() {
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    // resolved_invoke_infos deliberately left empty.
+    let callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("refusing the splice must not fail the whole compile");
+    assert_eq!(
+        calls_to(&compiled, test_helpers().invoke_dispatch),
+        0,
+        "the callee's call must not be emitted against an un-interned target",
+    );
+}
+
+/// `invokeinterface` is FIVE bytes inside a spliced body, like everywhere else.
+///
+/// The other three invoke forms are three. Advancing by three over an
+/// `invokeinterface` lands the walk on its `count` operand, and a `count` of 2
+/// decodes as `iconst_m1` (0x02) — so the body would push -1, `nop` over the
+/// trailing zero, and return -1 instead of the call's result. Silent wrong
+/// answer, no bail, no diagnostic: exactly the failure mode the width guard
+/// exists for.
+#[test]
+fn an_invokeinterface_inside_a_splice_is_five_bytes_wide() {
+    // callee: `static int leaf(int a) { return iface.m(a, 10); }` — shaped so
+    // the operands are the same two the test above uses.
+    //   0: iload_0
+    //   1: bipush 10
+    //   3: invokeinterface #3, count=2, 0
+    //   8: ireturn
+    let callee_body: [u8; 9] = [0x1a, 0x10, 0x0a, 0xb9, 0x00, 0x03, 0x02, 0x00, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    callee.resolved_invoke_infos = vec![(
+        3,
+        leak_invoke_info("pkg/Iface", "m", "(II)I", 2, b'I', 2),
+    )];
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("an invokeinterface-carrying callee must splice");
+
+    let _ = take_last_dispatch();
+    // SAFETY: as above.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(
+        got, 15,
+        "a 3-byte advance would decode the count operand as iconst_m1 and return -1",
+    );
+    assert!(
+        take_last_dispatch().is_some(),
+        "the interface call must still have gone through the dispatch helper",
+    );
+}
+
+/// STEP 5. A call inside a spliced body that is itself spliced emits NO call.
+///
+/// The nested body computes `a - b`, while the dispatch stub returns `a + b`.
+/// The two disagree for the arguments used, so the returned value alone says
+/// which path ran — an arithmetic body that agreed with the stub (an `iadd`)
+/// would have made this test pass whether nesting worked or not.
+#[test]
+fn a_nested_splice_replaces_the_call_entirely() {
+    // innermost: `static int inner(int a, int b) { return a - b; }`
+    //   0: iload_0; 1: iload_1; 2: isub; 3: ireturn
+    let inner = make_inline_site(&[0x1a, 0x1b, 0x64, 0xac], 2, 2, true, b'I');
+
+    // middle: `static int leaf(int a) { return inner(a, 10); }`
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    // ADDITIVE by design: the pc carries both a nested body and a dispatch
+    // target, so a nested bail falls back to the call instead of failing the
+    // outer splice. The next test relies on exactly this.
+    callee.resolved_invoke_infos = vec![(
+        3,
+        leak_invoke_info("pkg/Inner", "inner", "(II)I", 2, b'I', 3),
+    )];
+    callee.nested_sites = vec![(3, inner)];
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a nested splice must compile");
+
+    let _ = take_last_dispatch();
+    // SAFETY: as above.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(got, -5, "5 - 10; the dispatch stub would have answered 15");
+    assert!(
+        take_last_dispatch().is_none(),
+        "a nested splice must emit no dispatch at all",
+    );
+    assert_eq!(
+        calls_to(&compiled, test_helpers().invoke_dispatch),
+        0,
+        "and no CALL to the helper may be left in the code",
+    );
+}
+
+/// A nested splice that BAILS falls back to the ordinary call.
+///
+/// This is why `nested_sites` and `resolved_invoke_infos` both carry the pc.
+/// If a nested body could only succeed or fail the outer splice, one
+/// unmodellable opcode three levels down would cost the whole chain.
+///
+/// `arraylength` (0xbe) is the bail: the inline mini-emitter has no arm for it
+/// (bounds-checked array access is refused at this layer), so the nested
+/// attempt rolls back and the pc takes its dispatch entry — answering 15 (the
+/// stub's sum) rather than the nested body's -5.
+#[test]
+fn a_nested_splice_that_bails_falls_back_to_the_call() {
+    // innermost, but unspliceable: `arraylength` has no inline arm.
+    let inner = make_inline_site(&[0x1a, 0x1b, 0xbe, 0xac], 2, 2, true, b'I');
+
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    callee.resolved_invoke_infos = vec![(
+        3,
+        leak_invoke_info("pkg/Inner", "inner", "(II)I", 2, b'I', 3),
+    )];
+    callee.nested_sites = vec![(3, inner)];
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("the outer splice must survive a nested bail");
+
+    let _ = take_last_dispatch();
+    // SAFETY: as above.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(got, 15, "the nested bail must fall back to the dispatch call");
+    let (_, _, _, args) =
+        take_last_dispatch().expect("the fallback dispatch must have run");
+    assert_eq!(args, vec![5, 10], "with the same arguments the nested body would have had");
+}
+
+/// The interning pass fills `resolved_invoke_infos` from `invoke_targets`, for
+/// nested bodies as well as the top one.
+///
+/// A nested body whose calls were left uninterned would bail at the emitter's
+/// "no resolved target" arm and quietly degrade to a dispatch — a regression
+/// that costs only speed, and so would never fail a correctness test. Asserted
+/// on the DATA rather than on emitted code, because that is where the bug
+/// would live.
+#[test]
+fn interning_reaches_nested_bodies_too() {
+    let mut inner = make_inline_site(&[0x1a, 0x1b, 0x60, 0xac], 2, 2, true, b'I');
+    inner.invoke_targets = vec![(
+        1,
+        crate::InlineInvokeTarget {
+            class_name: "pkg/Deep".to_string(),
+            method_name: "deep".to_string(),
+            descriptor: "()I".to_string(),
+            num_jit_args: 0,
+            return_type: b'I',
+            invoke_kind: 3,
+            declaring_class_id: 7,
+        },
+    )];
+    let mut outer = make_inline_site(&[0x1a, 0xac], 1, 1, true, b'I');
+    outer.invoke_targets = vec![(
+        0,
+        crate::InlineInvokeTarget {
+            class_name: "pkg/Inner".to_string(),
+            method_name: "inner".to_string(),
+            descriptor: "(II)I".to_string(),
+            num_jit_args: 2,
+            return_type: b'I',
+            invoke_kind: 3,
+            declaring_class_id: 9,
+        },
+    )];
+    outer.nested_sites = vec![(0, inner)];
+    // Stale pointers from a hypothetical earlier compile must be REPLACED, not
+    // appended to: an `InlineSite` can be cloned out of a cached plan.
+    outer.resolved_invoke_infos = vec![(999, 0xdead_beef)];
+
+    let mut strings: Vec<Box<str>> = Vec::new();
+    let mut infos: Vec<Box<crate::JitInvokeInfo>> = Vec::new();
+    crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos);
+
+    assert_eq!(outer.resolved_invoke_infos.len(), 1);
+    assert_eq!(outer.resolved_invoke_infos[0].0, 0);
+    let deep = &outer.nested_sites[0].1;
+    assert_eq!(
+        deep.resolved_invoke_infos.len(),
+        1,
+        "a nested body's own calls must be interned too",
+    );
+    // SAFETY: the pointee is `infos[1]`, alive for the rest of this test.
+    let deep_info = unsafe { &*(deep.resolved_invoke_infos[0].1 as *const crate::JitInvokeInfo) };
+    assert_eq!(deep_info.class_name, "pkg/Deep");
+    assert_eq!(deep_info.declaring_class_id, 7);
+    // Six boxed strs (two triples), two infos.
+    assert_eq!(strings.len(), 6);
+    assert_eq!(infos.len(), 2);
 }
 
 #[test]

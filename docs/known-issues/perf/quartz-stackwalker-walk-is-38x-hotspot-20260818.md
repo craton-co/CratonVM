@@ -194,6 +194,152 @@ Two changes were written, built, measured interleaved, and reverted
    4,911 / 5,009 / 5,001 ms. **Inert.** (It also means the Spring suite was
    already getting whatever this buys, which is nothing here.)
 
+4. **Make the per-frame method-slot memo thread-local.**
+   `find_method_index_memoized` takes a shared `RwLock` read once per FRAME of
+   every capture and is the largest symbol in the Quartz profile (18.1%), so it
+   looked like the thing that explains the depth scaling. Interleaved: depth 40
+   3,028 / 3,921 ms base vs 3,982 / 3,873 ms thread-local; depth 120
+   13,816 / 12,200 vs 11,969 / 15,114. **Inert** — an uncontended `parking_lot`
+   read is nanoseconds, so that 18% is the hashing and the per-hit verification,
+   not the lock. Reverted.
+
+### The mechanism, named exactly
+
+`p59_sw_walk` (`native-builtins/src/phases_late/reflect_invoke.rs:2581`):
+
+```rust
+let raw_trace = ctx.capture_stack_trace(0);
+let frames = ordered_stack_walk_frames(&raw_trace);
+let arr = ctx.new_ref_array(ClassId::new(0), frames.len());
+for (i, entry) in frames.iter().enumerate() {
+    let sf = populate_stack_frame(ctx, entry, retain_class_ref)?;  // a Java object PER FRAME
+    ...
+}
+```
+
+**Every `walk` materialises a Java `StackFrame` object for every frame on the
+stack before the caller's `Function` runs**, so the cost is
+`O(depth)` in Java allocations no matter how many frames the consumer reads.
+HotSpot fetches frames in BATCHES (8 by default) and only materialises more if
+the stream demands them — which is why its line in the table below is flat and
+ours is not, and why `findFirst` (what Mockito uses) is nearly free there and
+full price here.
+
+And `populate_stack_frame` (`reflect_invoke.rs:2456`) is not cheap per frame. It
+does, for EVERY frame:
+
+* `try_alloc_concurrent_synthetic("java/lang/StackWalker$StackFrame", 8)` — the
+  by-name class resolution funnel, per frame (the same per-allocation name
+  lookup that was worth ~6% when it was memoized out of the bignum natives);
+* **four** `create_string` calls — `class_name.replace('/', ".")` (a Rust
+  `String` too), `method_name`, `source_file`, and the internal-form class name
+  again for `toStackTraceElement()`'s fallback;
+* `get_class_mirror(cid)`, eagerly, with a comment explaining that it must be
+  eager *at population time* to avoid a by-name lookup failing later;
+* five pins, five pin re-reads, eight `set_field`s.
+
+At the Quartz stack depth (~53) that is **~200 Java string allocations per mock
+invocation**, and Mockito reads at most a couple of frames before `findFirst`
+short-circuits. HotSpot builds the strings in the getters, on demand.
+
+So there are two independent lazinesses to recover, and the second is the
+smaller change: make the frame's Strings and mirror lazy (store `class_id` /
+`method_index` / bci in the slots and build the derived values in the getter
+natives that already exist) even while keeping the eager array. That alone
+should take the common `filter(..).findFirst()` shape from `O(depth)` string
+allocations to `O(frames actually inspected)`.
+
+The full fix, and the only one on this page with the right ceiling: a
+lazy `Stream<StackFrame>` — a spliterator that pulls a batch at a time through a
+`fetchFrames(from, count)` native — instead of an eagerly populated array. It is
+a real change (a new synthetic spliterator class, a batching native, and the
+`forEach`/`getCallerClass` siblings share the same eager path) and it lands in
+the code path every exception in the VM traverses, so it wants its own task with
+its own tests rather than being bolted on at the end of this one.
+
+### The scaling, measured — and why it is not one symbol
+
+| stack depth | CratonVM | HotSpot | ratio |
+|---:|---:|---:|---:|
+| 2 | 527 ms | 57 ms | 9x |
+| 10 | 893 ms | 80 ms | 11x |
+| 40 | 3,752 ms | 108 ms | 35x |
+| 120 | 17,098 ms | 187 ms | **91x** |
+
+CratonVM's capture cost is **linear in stack depth**; HotSpot's is nearly flat
+(3.3x for 60x the depth, because its walk is lazy and `findFirst` stops at the
+first match while ours materialises every frame). So the gap is not a fixed
+per-call tax that one memo can remove — it is per-frame work, spread across
+`entry_from_frame`'s Arc clones, class lookup, memo probe and line-number scan,
+with no member big enough to matter alone. That is why four separate attempts to
+remove one member each measured zero.
+
+### MEASURED 2026-08-18: attempt 1 changed a call site that never runs
+
+`CRATONVM_DBG=a5-engagement` (added with this, declared in all four flag files)
+counts, per call of the coverage probe, what the memo would have answered.
+On `probes/StackWalkerTerminationProbe`:
+
+```
+[a5-engagement] calls=0 (probe never ran)
+```
+
+**Zero.** `refresh_moving_young_coverage_for_current_thread`'s
+`native_stack_has_jit_frame` call — the one `UnregMemo`'s doc comment names as
+dominating, and the one attempt 1 memoized — **does not execute on this
+workload at all.** The 17.9% comes from the OTHER caller, the detection scan
+inside the root-snapshot deposit, which already has the memo.
+
+So attempt 1 was inert because it changed code that never ran, not because
+memoizing does not help. It was judged from a profile that did not move, and a
+profile cannot distinguish "changed the wrong site" from "the change does not
+help" — which is exactly what an engagement counter is for, and why this
+codebase's own rule is to print one beside the number. Four attempts were
+judged without one.
+
+### And at the site that DOES run, the memo is 100% cold — by construction
+
+Same counter, moved to the detection scan inside the root-snapshot deposit:
+
+```
+depth  20:  calls= 37,976   memo_clean=0  memo_banded=0  full_rescan= 37,976   (100%)
+depth 120:  calls=188,115   memo_clean=0  memo_banded=0  full_rescan=188,115   (100%)
+```
+
+**Not one engagement in 188,115 calls.** `full_rescan` is the
+`code_ranges != self.verified_ranges` arm, and `verified_ranges` is only ever
+written by `mark_clean` — which is reached ONLY when the probe comes back with
+no hit. On a workload with compiled frames the probe hits (the retired
+moving-young page measured A5's false-positive rate at **87%**), so `mark_clean`
+never runs, `verified_ranges` keeps its initial value, and every observation
+falls through to a full rescan **forever**.
+
+That closes the whole memo route, and explains all four attempts at once:
+
+* attempt 1 memoized a call site that never runs (`calls=0`);
+* attempt 2 lifted the range-invalidation rule, but with `verified_lo` still at
+  its initial `usize::MAX` — `mark_clean` having never run — the `floor`
+  comparison still forces a full-width scan, so the lift was neutered by the
+  same cause;
+* attempts 3 and 4 were unrelated knobs on the same cold path.
+
+**The memo is not under-tuned, it is inapplicable.** It caches "this stack is
+free of return-addresses-into-JIT", and on this workload that is simply false
+most of the time. No amount of memo work fixes a cache whose predicate is
+usually false — which is why the profile never moved and why an engagement
+counter, not another profile, was the thing that settled it.
+
+The previously-suspected hypothesis for this site — its
+band is `[scanner_sp.max(cover_hi), stack_high)`, and with an empty JIT entry
+chain `cover_hi == scanner_sp`, so it scans the whole native stack above the
+scanner. `UnregMemo::mark_clean` sets `hiwater = search_lo` on every clean
+verdict, so a stack that OSCILLATES — recurse, return, recurse, which is what
+every Java workload does and what this probe does 500 times — re-scans instead
+of reusing the verdict. That is testable with the same counter: a workload with
+a flat stack should show `memo_clean` climbing and an oscillating one should
+show `full_rescan` or `memo_banded` dominating. **Measure that before writing
+the fifth attempt.**
+
 **The arithmetic that should have come first.**
 `native_stack_has_jit_frame` is ~17.9% of this workload, so deleting it
 *entirely* buys **1.2x against a 38x gap**. No amount of memoizing that symbol
@@ -386,5 +532,7 @@ CRATONVM_DBG_STTRACE=1 <cratonvm> … 2>&1 | grep -c 'QuartzEndpoint.triggerQuar
   the page this was found from. Same class, different mechanism: that one is a
   `[moving-young]` fallback spiral under Generational, and this run logs none.
   Its thesis that the JIT is what breaks these classes survives.
-- `docs/known-issues/gc/generational-young-relocation-nulls-live-string-references-20260818.md`
-  — the other finding from the same re-measurement.
+- retired/generational-young-relocation-nulls-live-string-references-RETIRED-20260818.md
+  — the other finding from the same re-measurement, RETIRED and FIXED
+  2026-08-18. It was the proxy-dispatch `Method` cache being rooted without
+  being remapped, so it says nothing about this page's spin loop.

@@ -1316,6 +1316,15 @@ pub(crate) struct LambdaJitSite {
     /// Captured values live in proxy object fields `0..num_captures`, in
     /// impl-parameter order.
     num_captures: usize,
+    /// The leading descriptor byte of each captured value, in the same order —
+    /// the impl's first `num_captures` parameter types.
+    ///
+    /// The Rust arm has no use for these: it reads `Value`s back out of the heap
+    /// and switches on the tag it finds. The inline-cache thunk does, because it
+    /// emits one typed load per capture and has no tag to consult. Decided here
+    /// with the rest of the site, so the emitter is handed facts rather than a
+    /// descriptor to re-parse on every install.
+    capture_descs: Vec<u8>,
     /// `num_captures` + the SAM's parameter count == the impl's arity.
     total_args: usize,
     /// The `checkcast` the synthetic bridge would have performed, for each SAM
@@ -1369,6 +1378,12 @@ impl LambdaJitSite {
 
     pub(crate) fn num_captures(&self) -> usize {
         self.num_captures
+    }
+
+    /// The captured values' descriptor bytes, in impl-parameter order — what
+    /// the inline-cache thunk emits one load each from.
+    pub(crate) fn capture_descs(&self) -> &[u8] {
+        &self.capture_descs
     }
 
     pub(crate) fn total_args(&self) -> usize {
@@ -1580,10 +1595,21 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
     if !cached.exception_table.is_empty() || cached.is_synchronized || !cached.is_static {
         return SiteVerdict::Never;
     }
+    // The captures are the impl's leading parameters — the same slice
+    // `lambda_jit_site_capture_args` reads out of the proxy, in the same order.
+    let capture_descs: Vec<u8> = impl_params[..num_captures]
+        .iter()
+        .filter_map(|tok| tok.as_bytes().first().copied())
+        .collect();
+    if capture_descs.len() != num_captures {
+        // An empty parameter token is malformed metadata, not a shape.
+        return SiteVerdict::Never;
+    }
     SiteVerdict::Eligible(std::rc::Rc::new(LambdaJitSite {
         sam_method_name: Arc::clone(&call_site.sam_method_name),
         sam_descriptor: Arc::clone(&call_site.sam_descriptor),
         num_captures,
+        capture_descs,
         total_args: impl_params.len(),
         checkcasts,
         cached,
@@ -1711,6 +1737,15 @@ pub(crate) mod lambda_site_prof {
     /// one is the only evidence left.
     pub(crate) static SITE_ADAPTERS: AtomicU64 = AtomicU64::new(0);
 
+    /// Of those, the ones whose lambda CAPTURES — the thunks that read the
+    /// proxy's body rather than only shuffling registers.
+    ///
+    /// Counted apart from [`SITE_ADAPTERS`] because a suite full of
+    /// non-capturing lambdas keeps that total healthy while every capturing
+    /// site quietly falls back to Rust, and "the thunk installed" would then be
+    /// true of a feature that never engaged for the shape under test.
+    pub(crate) static SITE_CAPTURE_ADAPTERS: AtomicU64 = AtomicU64::new(0);
+
     #[inline]
     pub(crate) fn bump(counter: &AtomicU64) {
         if super::lambda_jit::on() {
@@ -1735,7 +1770,8 @@ pub(crate) mod lambda_site_prof {
 
     pub(crate) fn line() -> String {
         format!(
-            "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} site_arity={} site_adapters={}",
+            "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} \
+             site_arity={} site_adapters={} site_cap_adapters={}",
             SITE_CALLS.load(Ordering::Relaxed),
             SITE_DIRECT.load(Ordering::Relaxed),
             SITE_NO_CODE.load(Ordering::Relaxed),
@@ -1743,6 +1779,11 @@ pub(crate) mod lambda_site_prof {
             SITE_DEOPTED.load(Ordering::Relaxed),
             SITE_ARITY.load(Ordering::Relaxed),
             SITE_ADAPTERS.load(Ordering::Relaxed),
+            // Beside the total, never instead of it: a run full of
+            // non-capturing lambdas keeps `site_adapters` healthy while every
+            // capturing site falls back to Rust, and a probe reading only the
+            // total cannot tell those apart.
+            SITE_CAPTURE_ADAPTERS.load(Ordering::Relaxed),
         )
     }
 }
@@ -1801,13 +1842,26 @@ pub(crate) fn lambda_site_bump_deopted() {
 /// and the number is what `lambda_jit_adapter_installs` reports to the tests
 /// that must prove the inline cache really took over.
 #[inline]
-pub(crate) fn lambda_site_bump_adapter() {
+pub(crate) fn lambda_site_bump_adapter(captures: usize) {
     lambda_site_prof::SITE_ADAPTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if captures > 0 {
+        lambda_site_prof::SITE_CAPTURE_ADAPTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// How many SAM call sites have had an inline-cache thunk installed.
 pub fn lambda_jit_adapter_installs() -> u64 {
     lambda_site_prof::SITE_ADAPTERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many of those sites belong to a CAPTURING lambda — the thunks that read
+/// captured values out of the proxy's body.
+///
+/// Separate from [`lambda_jit_adapter_installs`] on purpose: a workload with any
+/// non-capturing lambda in it keeps that total above zero whatever happens to
+/// the capturing ones, so it cannot answer "did the capture path engage".
+pub fn lambda_jit_capture_adapter_installs() -> u64 {
+    lambda_site_prof::SITE_CAPTURE_ADAPTERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[inline]

@@ -580,6 +580,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-match", on_key: Some("CRATONVM_DBG_NPE_MATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "a5-engagement", on_key: Some("CRATONVM_DBG_A5_ENGAGEMENT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "unreg-memo-audit", on_key: Some("CRATONVM_DBG_UNREG_MEMO_AUDIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "redefine-dump", on_key: Some("CRATONVM_DBG_REDEFINE_DUMP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-stack", on_key: Some("CRATONVM_DBG_NPE_STACK"), off_key: None, off_word: None },
@@ -994,6 +995,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None },
     // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
     // the contrast is the reason these two carry a comment at all.
     // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
@@ -1125,6 +1129,7 @@ pub const INVENTORY: &[E] = &[
     // Compatibility alias: `check_schedule` was split into the memory-chain and
     // arena-order lanes, and this token still seeds both when neither is set.
     E { group: Group::JIT, token: "lambda-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_ADAPTER"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-capture-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-site", on_key: Some("CRATONVM_JIT_LAMBDA_SITE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-tierup", on_key: Some("CRATONVM_JIT_LAMBDA_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },
