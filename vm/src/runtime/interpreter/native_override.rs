@@ -2384,7 +2384,18 @@ pub(crate) mod hotpath_counts {
     pub static RESOLVE_METHOD_REF_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static LOOKUP_LOADER_INITIATED_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static RETARGET_FIELD_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static TOTAL_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+    /// Bytecodes dispatched through the **decoded** handler
+    /// (`opcodes::execute_instruction`) — NOT the total executed.
+    ///
+    /// It was called `TOTAL_INSTRUCTIONS`, and it never counted one. Its only
+    /// bump site is the top of `execute_instruction`, which the raw-bytecode
+    /// fast path in `execute_frame_from_index` reaches only when it has no arm
+    /// for the opcode. Read as a total it under-reports by the fast path's
+    /// share — which is the large majority of executed bytecodes — so any
+    /// ratio taken against it (per-opcode cost, native-call frequency) came out
+    /// inflated by exactly the factor nobody had measured. The name now states
+    /// the population it actually samples.
+    pub static DECODED_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 
     pub fn bump(counter: &AtomicU64) {
         if !crate::runtime::env_cache::dbg_hotpath_counts() {
@@ -2394,12 +2405,12 @@ pub(crate) mod hotpath_counts {
         if n.is_power_of_two() || n % 1_000_000 == 0 {
             eprintln!(
                 "[hotpath-counts] force_native={} resolve_method_ref={} \
-                 lookup_loader_initiated={} retarget_field={} total_instr={}",
+                 lookup_loader_initiated={} retarget_field={} decoded_instr={}",
                 FORCE_NATIVE_CALLS.load(Ordering::Relaxed),
                 RESOLVE_METHOD_REF_CALLS.load(Ordering::Relaxed),
                 LOOKUP_LOADER_INITIATED_CALLS.load(Ordering::Relaxed),
                 RETARGET_FIELD_CALLS.load(Ordering::Relaxed),
-                TOTAL_INSTRUCTIONS.load(Ordering::Relaxed),
+                DECODED_INSTRUCTIONS.load(Ordering::Relaxed),
             );
         }
     }
