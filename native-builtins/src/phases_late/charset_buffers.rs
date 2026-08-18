@@ -1481,8 +1481,17 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 chars.push(v as u16);
             }
         }
-        let s: String = String::from_utf16_lossy(&chars);
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        // The units are already in hand; `from_utf16_lossy` + `create_string`
+        // was the only thing losing them. MEASURED on both VMs at
+        // `c77fc76a1`, `CharBuffer.wrap(new char[]{'a', 0xD800, 'b'})`:
+        //
+        //   toString()   HotSpot 61,d800,62    CratonVM 61,fffd,62
+        //
+        // `sb_string_from_units` takes the plain-text path when the units are
+        // representable, so every buffer that renders correctly today is
+        // unchanged. G63-1 N2.
+        let out = crate::lang_string::sb_string_from_units(ctx, &chars)?;
+        Ok(Some(Value::Object(Some(out))))
     }
     r.register(cb, "toString", "(II)Ljava/lang/String;", cb_to_string_range);
     // Concrete CharBuffer subclasses inherit our toString(II) only when the
