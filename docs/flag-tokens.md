@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-458 tokens.
+459 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -207,6 +207,7 @@ export inherited from a parent shell.
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
 | `gcphase` | `CRATONVM_DBG_GCPHASE` |
 | `gcwrite` | `CRATONVM_DBG_GCWRITE` |
+| `getfield-receivers` | `CRATONVM_DBG_GETFIELD_RECEIVERS` |
 | `getresources` | `CRATONVM_DBG_GETRESOURCES` |
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
@@ -524,7 +525,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-189 tokens.
+190 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -565,8 +566,8 @@ export inherited from a parent shell.
 | `dup-x1` | `CRATONVM_JIT_NO_DUP_X1` |
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
 | `dup2-x2` | `CRATONVM_JIT_NO_DUP2_X2` |
-| `dupx` | `CRATONVM_JIT_NO_DUPX` |
 | `trusted-oop-getfield` | `CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD` |
+| `dupx` | `CRATONVM_JIT_NO_DUPX` |
 | `dupx-eager-canon` | `CRATONVM_JIT_DUPX_EAGER_CANON` |
 | `eager-callee-chain` | `CRATONVM_JIT_EAGER_CALLEE_CHAIN` |
 | `enable-callee-saved-gpr-locals` | `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS` |

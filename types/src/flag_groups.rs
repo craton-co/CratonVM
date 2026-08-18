@@ -395,6 +395,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcphase", on_key: Some("CRATONVM_DBG_GCPHASE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcwrite", on_key: Some("CRATONVM_DBG_GCWRITE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "getfield-receivers", on_key: Some("CRATONVM_DBG_GETFIELD_RECEIVERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "getresources", on_key: Some("CRATONVM_DBG_GETRESOURCES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "getstatic-prof", on_key: Some("CRATONVM_DBG_GETSTATIC_PROF"), off_key: None, off_word: None },
     // Per-snapshot trace of the typed operand stack (x64::stack_kinds): what
