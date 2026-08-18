@@ -220,12 +220,26 @@ impl RememberedSet {
             return;
         }
         let mut guard = self.sources.lock();
-        if guard.contains_key(&source_region) {
-            let slot = guard.entry(source_region).or_insert(generation);
-            *slot = (*slot).max(generation);
-            return;
+        // G1AUD-9: ONE hash lookup, not two. This is the write barrier's slow
+        // path — the one the per-thread edge memo misses — and its dominant
+        // outcome is a HIT on an edge already recorded, which the previous
+        // `contains_key` + `entry` pair hashed and probed twice.
+        let len = guard.len();
+        let mut coarsen = false;
+        match guard.entry(source_region) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let slot = e.get_mut();
+                *slot = (*slot).max(generation);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                if cap != 0 && len >= cap {
+                    coarsen = true;
+                } else {
+                    e.insert(generation);
+                }
+            }
         }
-        if cap != 0 && guard.len() >= cap {
+        if coarsen {
             // Coarsen: drop the precise set and let the scan side fall back to
             // walking every plausible source. Correctness is preserved because
             // the fallback is a SUPERSET of what was recorded — the entries
@@ -234,9 +248,7 @@ impl RememberedSet {
             guard.shrink_to_fit();
             self.coarsened.store(true, Ordering::Relaxed);
             crate::gc_metrics::record_g1_rset_coarsened();
-            return;
         }
-        guard.insert(source_region, generation);
     }
 
     /// Has this rset given up naming individual sources? See the field docs.
