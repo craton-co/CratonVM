@@ -5305,12 +5305,59 @@ pub fn scalar_selfrec_ir_would_engage(code: &[u8], code_len: usize, descriptor: 
         && !method_uses_fp(code, code_len, descriptor)
 }
 
+/// A call the CALLEE's own bytecode makes, resolved against the CALLEE's
+/// constant pool.
+///
+/// Why this type exists at all: every other piece of `InlineSite` metadata
+/// (`field_info`, `static_field_info`, `ldc_info`) is keyed by CALLEE pc and
+/// resolved against the CALLEE's constant pool, because a spliced body's
+/// bytecode indices name entries in ITS class's pool, not the caller's. Invokes
+/// had no such entry — the resolver rejected every `invoke*` outright, so no
+/// call inside a spliced body was ever emittable and nothing needed resolving.
+///
+/// The top-level `invoke_info` cannot be reused for this: it is keyed by CALLER
+/// pc, a different bytecode space entirely, and a callee pc that happens to
+/// collide with a caller pc would silently select an unrelated target.
+///
+/// Owned `String`s rather than the `&'static str`s [`JitInvokeInfo`] wants,
+/// because an `InlineSite` outlives no particular compile and crosses the
+/// crate boundary by value. `try_compile_inner` interns each of these into the
+/// compile's own `_jit_strings` / `_jit_invoke_infos` arenas immediately before
+/// backend emission and records the resulting pointer in
+/// [`InlineSite::resolved_invoke_infos`].
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct InlineInvokeTarget {
+    /// Constant-pool class name of the target, as the CALLEE's pool spells it.
+    pub class_name: String,
+    /// Target method name.
+    pub method_name: String,
+    /// Target descriptor.
+    pub descriptor: String,
+    /// Operand slots the call consumes, receiver INCLUDED — the same count
+    /// `JitInvokeInfo::num_jit_args` carries and the same one the emitter pops.
+    pub num_jit_args: usize,
+    /// Descriptor return byte (`b'V'` for void).
+    pub return_type: u8,
+    /// `jit_invoke_dispatch`'s encoding: 0 = virtual, 1 = special, 2 =
+    /// interface, 3 = static. Never 4 (the IR-only self-recursive marker).
+    pub invoke_kind: u8,
+    /// `ObjectHeader` class id of the class whose constant pool named this
+    /// target — the CALLEE's declaring class, not the enclosing method's.
+    ///
+    /// Load-bearing for exactly the reason `JitInvokeInfo::declaring_class_id`
+    /// is (BUG-JIT-INVOKESPECIAL-LOADER-20260726): a class NAME is not a class
+    /// identity, and a spliced body resolved through the wrong loader's copy
+    /// picks a different method with the same name. The enclosing method's id
+    /// would be the wrong answer whenever the callee comes from another loader.
+    pub declaring_class_id: u32,
+}
+
 /// Resolved metadata for a method eligible for inlining at a specific call site.
 ///
 /// `PartialEq`/`Debug` exist so an [`InlinePlan`] can CARRY the bodies a
 /// speculative verdict resolved (see [`InlinePlan::speculative_sites`]) while
 /// staying comparable and printable like the rest of the plan.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct InlineSite {
     /// Raw callee bytecode (padded with 2 sentinel bytes, like normal methods).
     pub callee_code: Vec<u8>,
@@ -5357,6 +5404,115 @@ pub struct InlineSite {
     /// emitter pops the receiver the preceding `aload_0` pushed and emits
     /// NOTHING for these PCs; any 0xb7 NOT in this list still bails.
     pub elided_invoke_pcs: Vec<usize>,
+    /// Calls the callee body itself makes, keyed by CALLEE pc — see
+    /// [`InlineInvokeTarget`]. Empty unless the resolver's call-splicing gate
+    /// admitted the site, in which case every `invoke{virtual,static,interface}`
+    /// in the body has an entry (a site with even one unresolvable invoke is
+    /// refused whole, exactly like an unmodelled `ldc`).
+    ///
+    /// This is the RESOLVER's output. The emitter does not read it directly; it
+    /// reads [`Self::resolved_invoke_infos`], which `try_compile_inner` derives
+    /// from it.
+    pub invoke_targets: Vec<(usize, InlineInvokeTarget)>,
+    /// `(callee_pc, *const JitInvokeInfo as usize)` — the interned form of
+    /// [`Self::invoke_targets`], filled by `try_compile_inner` immediately
+    /// before backend emission and read by `try_emit_inline_body`'s invoke arm.
+    ///
+    /// A `usize` rather than a raw pointer so the struct keeps its derived
+    /// `Clone`/`Eq`/`Debug` and stays `Send`: an `InlineSite` is planning data
+    /// that may be cloned into an `InlinePlan` and moved between threads, while
+    /// the pointer is only ever dereferenced inside the one compile that
+    /// interned it. Empty on every path that does not intern (planning,
+    /// tests, and every compile with the gate off), and an empty vector makes
+    /// the emitter's invoke arm bail exactly as it did before it existed.
+    ///
+    /// SAFETY CONTRACT: the pointee lives in this compile's
+    /// `_jit_invoke_infos` arena, which `try_compile_inner` moves into the
+    /// `CompiledMethod` — so it outlives the emitted code, which bakes the
+    /// address as an immediate. An `InlineSite` that escapes that compile
+    /// (a cached plan) must not carry these; nothing repopulates them, and
+    /// `try_compile_inner` overwrites the vector wholesale on every compile.
+    pub resolved_invoke_infos: Vec<(usize, usize)>,
+    /// Calls the callee body makes that are themselves SPLICED rather than
+    /// dispatched, keyed by CALLEE pc — the nesting step.
+    ///
+    /// A pc present here is emitted by recursing into `try_emit_inline_body`
+    /// with the nested site; a pc present only in [`Self::invoke_targets`]
+    /// takes the dispatch helper. Both are populated for a nested pc, so a
+    /// nested splice that bails mid-body falls back to the ordinary call
+    /// instead of failing the whole outer splice.
+    ///
+    /// Depth is bounded by the resolver (`MAX_INLINE_NEST_DEPTH`); this vector
+    /// is empty at the deepest admitted level, which terminates the recursion.
+    pub nested_sites: Vec<(usize, InlineSite)>,
+}
+
+/// How many levels of splice-inside-a-splice the resolver will plan.
+///
+/// `1` reproduces the pre-nesting behaviour exactly (an outer body may be
+/// spliced; nothing inside it is). Each extra level multiplies the planning
+/// work and the emitted code, and the per-level expansion is already charged
+/// against the same `inline_site_expansion_cost` budget the outer site pays,
+/// so the ceiling is about bounding RESOLUTION cost, not code size.
+///
+/// Three levels is what the JUnit assert chain needs to collapse
+/// (`assertEquals(int,int)` -> `assertEquals(Object,Object)` ->
+/// `objectsAreEqual`), which is the shape that motivated nesting.
+pub const MAX_INLINE_NEST_DEPTH: usize = 3;
+
+/// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
+/// `*const JitInvokeInfo`s its emitter can bake, interning the names into the
+/// arenas `owned_strings` / `owned_invoke_infos` — which `try_compile_inner`
+/// moves into the `CompiledMethod`, so the pointees outlive the code that
+/// references them and are freed with it.
+///
+/// Module-scope rather than a closure inside `try_compile_inner` so a test can
+/// assert the one property that has no visible symptom: a nested body whose
+/// calls are left uninterned degrades silently to a dispatch.
+pub(crate) fn intern_inline_invoke_targets(
+    site: &mut InlineSite,
+    owned_strings: &mut Vec<Box<str>>,
+    owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
+) {
+    // Wholesale, never additive: an `InlineSite` may have been CLONED from
+    // a cached plan that already carries pointers from an earlier compile,
+    // and those point into an arena this compile does not own.
+    site.resolved_invoke_infos.clear();
+    for (callee_pc, target) in site.invoke_targets.iter() {
+        let class_box: Box<str> = target.class_name.clone().into_boxed_str();
+        let method_box: Box<str> = target.method_name.clone().into_boxed_str();
+        let desc_box: Box<str> = target.descriptor.clone().into_boxed_str();
+        let class_ref = &*class_box as *const str;
+        let method_ref = &*method_box as *const str;
+        let desc_ref = &*desc_box as *const str;
+        owned_strings.push(class_box);
+        owned_strings.push(method_box);
+        owned_strings.push(desc_box);
+        // SAFETY: the three boxed strs were just moved into `owned_strings`,
+        // which `try_compile_inner` moves into `compiled._jit_strings`; a
+        // `Box<str>`'s payload does not move when the Box does, so these
+        // pointers stay valid for as long as the `CompiledMethod` lives —
+        // the identical argument the top-level `invoke_info` construction
+        // makes a few hundred lines above.
+        let info = Box::new(JitInvokeInfo {
+            class_name: unsafe { &*class_ref },
+            method_name: unsafe { &*method_ref },
+            descriptor: unsafe { &*desc_ref },
+            num_jit_args: target.num_jit_args,
+            return_type: target.return_type,
+            invoke_kind: target.invoke_kind,
+            declaring_class_id: target.declaring_class_id,
+        });
+        let info_ptr: *const JitInvokeInfo = &*info;
+        owned_invoke_infos.push(info);
+        site.resolved_invoke_infos
+            .push((*callee_pc, info_ptr as usize)); // Cast: pointer parked in a Send-able plan; deref only inside this compile
+    }
+    // A nested body's calls need the same treatment; the resolver bounds
+    // the depth (`MAX_INLINE_NEST_DEPTH`), so this terminates.
+    for (_, nested) in site.nested_sites.iter_mut() {
+        intern_inline_invoke_targets(nested, owned_strings, owned_invoke_infos);
+    }
 }
 
 /// Estimate the native-code expansion charged to the compilation's inline
@@ -5404,11 +5560,45 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
     let field_cost = site.field_info.len().saturating_mul(6);
     let static_field_cost = site.static_field_info.len().saturating_mul(8);
     let context_cost = usize::from(site.needs_heap).saturating_mul(4);
+    // A call the spliced body makes is the single most expensive thing it can
+    // contain: `emit_inline_invoke` builds a contiguous argument buffer (a
+    // load+store pair per argument), loads four ABI registers, spills before
+    // the safepoint, calls, and emits the post-invoke exception check. 12 is
+    // the same order as the 8 charged for a static-field access, which is the
+    // next-largest single item, and deliberately does NOT try to be exact —
+    // the model's job is to keep a budget honest, not to predict bytes.
+    //
+    // Charged per NON-nested call only. A nested call's cost arrives through
+    // `nested_expansion` below, which is the nested body's own estimate; adding
+    // both would double-charge the same call site.
+    let nested_pcs: Vec<usize> = site.nested_sites.iter().map(|(pc, _)| *pc).collect();
+    let dispatch_cost = site
+        .invoke_targets
+        .iter()
+        .filter(|(pc, _)| !nested_pcs.contains(pc))
+        .count()
+        .saturating_mul(12);
+    // A nested splice expands into THIS site's code, so its expansion is this
+    // site's expansion. Charged at the nested body's own hot-tier estimate;
+    // a nested body the model cannot cost at all (`None` — too large for even
+    // the hot cap) is charged the flat cost cap, which reliably pushes the
+    // outer site over its own ceiling rather than letting an uncostable body
+    // in for free.
+    let nested_expansion = site
+        .nested_sites
+        .iter()
+        .map(|(_, nested)| {
+            inline_site_expansion_cost_tiered(nested, site_is_hot)
+                .unwrap_or(MAX_INLINE_EXPANSION_COST_HOT)
+        })
+        .fold(0usize, |a, b| a.saturating_add(b));
     let cost = site
         .callee_code_len
         .saturating_add(field_cost)
         .saturating_add(static_field_cost)
-        .saturating_add(context_cost);
+        .saturating_add(context_cost)
+        .saturating_add(dispatch_cost)
+        .saturating_add(nested_expansion);
     let cost_cap = if site_is_hot {
         MAX_INLINE_EXPANSION_COST_HOT
     } else {
@@ -6313,6 +6503,9 @@ mod profile_guided_inlining_tests {
             method_name: method.to_string(),
             descriptor: "()I".to_string(),
             elided_invoke_pcs: Vec::new(),
+            invoke_targets: Vec::new(),
+            resolved_invoke_infos: Vec::new(),
+            nested_sites: Vec::new(),
         }
     }
 
@@ -7086,6 +7279,9 @@ mod inline_selection_tests {
             method_name: "leaf".to_string(),
             descriptor: "()V".to_string(),
             elided_invoke_pcs: Vec::new(),
+            invoke_targets: Vec::new(),
+            resolved_invoke_infos: Vec::new(),
+            nested_sites: Vec::new(),
         }
     }
 
@@ -19892,6 +20088,29 @@ fn try_compile_inner(
                 .map(|&(pc, _, _)| pc)
                 .collect()
         });
+    // ---- intern each spliced body's own call targets -----------------------
+    //
+    // `InlineSite::invoke_targets` is owned `String` data the resolver produced
+    // against the CALLEE's constant pool. The emitter needs what every other
+    // call site needs: a `*const JitInvokeInfo` with `&'static str` names,
+    // whose address it can bake into the emitted code as an immediate. Intern
+    // them into THIS compile's arenas — the same `owned_strings` /
+    // `owned_invoke_infos` vectors that back the top-level `invoke_info` and
+    // that are moved into `compiled._jit_strings` / `_jit_invoke_infos` below,
+    // so the pointees outlive the machine code that references them and are
+    // freed with it on tier-up / invalidation.
+    //
+    // Done HERE, after `precise_exception_frames` has had its chance to
+    // `inline_sites.clear()`, so a cleared plan interns nothing at all.
+    for site in inline_sites.values_mut() {
+        intern_inline_invoke_targets(site, &mut owned_strings, &mut owned_invoke_infos);
+    }
+    for variants in inline_guard_variants.values_mut() {
+        for (_, site) in variants.iter_mut() {
+            intern_inline_invoke_targets(site, &mut owned_strings, &mut owned_invoke_infos);
+        }
+    }
+
     note_jit_pipeline_stage(JIT_STAGE_SINGLE_PASS);
     let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
