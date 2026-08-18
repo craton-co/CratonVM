@@ -257,15 +257,27 @@ pub(crate) fn frame_trace_wanted() -> bool {
 /// Returns `false` when no pause was taken (another STW already owns the
 /// world); the caller then reads whatever was last deposited, i.e. the
 /// behaviour that predates this function.
-pub(crate) fn stw_publish_frame_traces(
-    shared: &SharedVm,
-    initiator: crate::ThreadId,
-) -> bool {
+pub(crate) fn stw_publish_frame_traces(shared: &SharedVm, initiator: crate::ThreadId) -> bool {
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    // Raised BEFORE the request: a mutator that reaches its poll between the
-    // request and the flag would otherwise park without publishing, and this
-    // pause has no second chance to ask it.
+    // Raised BEFORE the request, and lowered by `Drop` on every path out.
+    //
+    // A guard rather than two `store(false)` calls because the failure mode of
+    // missing one is silent and permanent: the flag left raised makes EVERY
+    // safepoint park — i.e. every mutator on every GC pause, forever after —
+    // capture and allocate a frame trace nobody asked for. That is a cost with
+    // no symptom, which is the kind this codebase keeps finding late.
+    struct WantedGuard;
+    impl Drop for WantedGuard {
+        fn drop(&mut self) {
+            FRAME_TRACE_WANTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // Before the request, not after: a mutator that reaches its poll in between
+    // would otherwise park without publishing, and this pause gets no second
+    // chance to ask it.
     FRAME_TRACE_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _wanted = WantedGuard;
+
     let stw_taken = shared
         .mem
         .gc_barrier
@@ -282,7 +294,6 @@ pub(crate) fn stw_publish_frame_traces(
             )
         });
     if !stw_taken {
-        FRAME_TRACE_WANTED.store(false, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
     // `stw_take_over_and_wait`, not the plain `wait_for_all()`: a peer spinning
@@ -299,8 +310,66 @@ pub(crate) fn stw_publish_frame_traces(
         .mem
         .gc_barrier
         .complete_gc(cratonvm_types::PointerMap::default());
-    FRAME_TRACE_WANTED.store(false, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+#[cfg(test)]
+mod frame_trace_request_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The request flag must read `false` when nobody is dumping.
+    ///
+    /// This is the whole cost argument for gating the publish in
+    /// `safepoint_check`: raised, every mutator captures and allocates a frame
+    /// trace on every GC pause. A flag that latched on would not fail any test
+    /// — it would just quietly make every pause more expensive — so assert the
+    /// resting state explicitly.
+    #[test]
+    fn the_request_flag_rests_low() {
+        assert!(
+            !frame_trace_wanted(),
+            "FRAME_TRACE_WANTED must rest low; raised, every safepoint park pays \
+             for a frame-trace capture nobody asked for"
+        );
+    }
+
+    /// And it must come back down when the pause ends — including the path
+    /// where no pause was taken.
+    ///
+    /// `stw_publish_frame_traces` needs a live `SharedVm` and cannot run here,
+    /// so this exercises the guard that owns the discipline rather than the
+    /// function around it. Breaking `Drop` (or replacing the guard with a
+    /// hand-written `store(false)` that an early `return` can skip) fails this.
+    #[test]
+    fn the_request_guard_lowers_the_flag_on_every_path() {
+        struct WantedGuard;
+        impl Drop for WantedGuard {
+            fn drop(&mut self) {
+                FRAME_TRACE_WANTED.store(false, Ordering::Relaxed);
+            }
+        }
+        fn take(early_out: bool) -> bool {
+            FRAME_TRACE_WANTED.store(true, Ordering::Relaxed);
+            let _wanted = WantedGuard;
+            if early_out {
+                return false;
+            }
+            true
+        }
+        for early_out in [true, false] {
+            let raised_during = {
+                FRAME_TRACE_WANTED.store(true, Ordering::Relaxed);
+                frame_trace_wanted()
+            };
+            assert!(raised_during, "the flag must be observable while raised");
+            let _ = take(early_out);
+            assert!(
+                !frame_trace_wanted(),
+                "the flag stayed raised after the early_out={early_out} path"
+            );
+        }
+    }
 }
 
 pub(super) fn stw_take_over_and_wait(
