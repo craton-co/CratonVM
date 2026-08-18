@@ -302,3 +302,93 @@ the interpreter loop at 7%, the native registry's three lookup functions at
 ~5.8% and allocation at ~3% — needs its own investigation, and the honest first
 step is a profile of `LambdaCompositionProbe` rather than another lambda fix.
 The title of this page ("five are lambda dispatch") should be read as refuted.
+
+## 6. The profile §5 asked for — and the first thing it found was that §5's own number does not reproduce
+
+Added 2026-08-18. §5 closes with *"the honest first step is a profile of
+`LambdaCompositionProbe` rather than another lambda fix"*. This is that profile.
+
+### 6.1 `thenApply` measures 5.5 µs/stage, not 12.3
+
+Azure Linux, `taskset -c 6,7`, three binaries — `dev`@`1f41cb193`, the same
+plus the in-flight read-bounds branch, and current `dev`:
+
+| | §5 records | measured here (3 binaries, 3 reps) |
+|---|---:|---:|
+| `thenApply` | 12 286 ns/stage | **5 455 – 5 795** |
+| `thenCompose` | 11 943 ns/stage | 10 105 – 11 069 |
+
+`thenCompose` reproduces. `thenApply` is **2.2x off**, and all three binaries
+agree with each other to within noise, so no code change between them explains
+it. Two things make the recorded figure look like the anomalous one rather than
+this one:
+
+* the probe's own doc says `thenCompose` is *"one more lambda layer per
+  stage"*, so `thenCompose > thenApply` is the expected ordering — measured it
+  is 1.9x. §5 records them as **equal**;
+* nothing in §5 says which host it ran on. §3 names Azure Linux explicitly for
+  its table; §5 does not, and this page's whole §1 is about a Windows box that
+  behaves differently.
+
+Not asserted here that §5 is wrong — only that its `thenApply` row does not
+reproduce on Azure, and that a table which does not record its host cannot be
+checked. **Any future comparison should re-measure both rows rather than
+subtract from these.**
+
+### 6.2 The profile is flat, and the largest cluster is not lambda at all
+
+`perf record -F 999 --call-graph=dwarf`, self time, `--percent-limit 0.8`:
+
+| cluster | share | members |
+|---|---:|---|
+| **native-method registry lookup** | **~12.5%** | `NativeMethodRegistry::find` 3.80, `safe_native_call_impl` 2.87, `__memcmp_evex_movbe` 2.71, `slot_for_exact` 2.05, `resolve_id_with_descriptor_quirks` 1.09 |
+| interpreter loop | ~9.9% | `execute_frame_from_index` 6.54, `execute_invokevirtual_cached` 2.01, `execute` 1.32 |
+| GC / heap | ~6.5% | `ZObjectStarts::contains` 2.44, `is_object_address` 2.01, `alloc_raw_tlab` 1.19, `load_and_forward` 0.86 |
+| **`is_subclass_of` visited set** | **~3.5%** | `RawTable<(ClassId,())>::reserve_rehash` 2.18, `HashMap<ClassId,()>::insert` 1.32 |
+| allocator | ~4.0% | `_mi_page_malloc_zero` 1.52, `mi_theap_malloc_aligned` 1.32, `mi_free` 1.22 |
+
+§5 put "the native registry's three lookup functions at ~5.8%". With
+`safe_native_call_impl` and the `memcmp` they call, the cluster is **twice
+that** and is the single largest thing in the profile. `__memcmp_evex_movbe` at
+2.71% in a probe that does no string work of its own is registry key
+comparison.
+
+### 6.3 One of them converted — `is_subclass_of` allocated a zero-capacity set
+
+`ClassManager::is_subclass_of` built its visited set with `FxHashSet::default()`,
+which starts at **capacity 0** and rehashes as the walk inserts. The callers,
+from the recorded call graph, are `jit::helpers::jit_invoke_virtual_mic` and
+`try_jit_site_cached_native_dispatch` — the JIT invoke path, paying it per call.
+Pre-sized to 16, which covers the real-JDK interface DAGs it walks
+(`CompletableFuture`, `Function`, the `Collection` family) without a resize.
+
+Four pinned, interleaved pairs, same binary pair throughout:
+
+| shape | before | after | pairs favouring after |
+|---|---:|---:|---|
+| `thenApply` | 5 645 – 5 795 | 5 062 – 5 509 | **4 / 4** (3.1% – 12.1%) |
+| `thenCompose` | 10 520 – 10 938 | 9 869 – 10 301 | **4 / 4** (4.6% – 8.2%) |
+
+**This is worth flagging against §3's own warning**, which is that two changes
+on 2026-08-13 each removed 5–10% of attributed samples and neither moved CPU.
+This one removed ~3.5% of samples and moved wall clock by more than that —
+because deleting a growing hash table also deletes the `malloc`/`free` traffic
+underneath it, which is attributed to the allocator cluster, not to the set.
+Sample share is a lower bound on what an allocation costs, not an estimate.
+
+It is a **~5% change on a 60x gap**, and it is reported as exactly that. It
+does not touch the cause.
+
+### 6.4 What is still not known
+
+The gap is not lambda dispatch (§5 settled that), and it is not the visited set
+(§6.3 is 5%). The profile says the next place to look is the **native-registry
+lookup path at ~12.5%** — specifically why a composition-only workload with no
+string work spends 2.71% in `memcmp`, which points at the registry being keyed
+on name/descriptor bytes rather than on an interned id at these sites.
+
+Unchanged from §5: any candidate fix must be A/B'd on
+`MultithreadedInsertionTest`'s wall clock (219 s), which this session could not
+run — the hibernate-reactive suite is not on the Azure host. The numbers above
+are `LambdaCompositionProbe` only, and the page's own history is that probe
+wins do not always convert.
