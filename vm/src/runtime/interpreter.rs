@@ -5757,8 +5757,7 @@ fn execute_frame_from_index(
                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                             OsrBackoffOutcome::ContinueDispatch => continue,
                             OsrBackoffOutcome::ThrowJava(exc) => {
-                                pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                 continue;
                             }
                             OsrBackoffOutcome::Skip => {}
@@ -5805,7 +5804,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -5855,7 +5854,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -5904,7 +5903,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -5953,7 +5952,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6002,7 +6001,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6051,7 +6050,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6297,7 +6296,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6345,7 +6344,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6393,7 +6392,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6441,7 +6440,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6489,7 +6488,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6537,7 +6536,7 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
                                     pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
