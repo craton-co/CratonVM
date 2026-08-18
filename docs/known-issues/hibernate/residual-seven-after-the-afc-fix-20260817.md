@@ -302,3 +302,177 @@ the interpreter loop at 7%, the native registry's three lookup functions at
 ~5.8% and allocation at ~3% — needs its own investigation, and the honest first
 step is a profile of `LambdaCompositionProbe` rather than another lambda fix.
 The title of this page ("five are lambda dispatch") should be read as refuted.
+
+## 6. The profile §5 asked for — and the first thing it found was that §5's own number does not reproduce
+
+Added 2026-08-18. §5 closes with *"the honest first step is a profile of
+`LambdaCompositionProbe` rather than another lambda fix"*. This is that profile.
+
+### 6.1 `thenApply` measures 5.5 µs/stage, not 12.3
+
+Azure Linux, `taskset -c 6,7`, three binaries — `dev`@`1f41cb193`, the same
+plus the in-flight read-bounds branch, and current `dev`:
+
+| | §5 records | measured here (3 binaries, 3 reps) |
+|---|---:|---:|
+| `thenApply` | 12 286 ns/stage | **5 455 – 5 795** |
+| `thenCompose` | 11 943 ns/stage | 10 105 – 11 069 |
+
+`thenCompose` reproduces. `thenApply` is **2.2x off**, and all three binaries
+agree with each other to within noise, so no code change between them explains
+it. Two things make the recorded figure look like the anomalous one rather than
+this one:
+
+* the probe's own doc says `thenCompose` is *"one more lambda layer per
+  stage"*, so `thenCompose > thenApply` is the expected ordering — measured it
+  is 1.9x. §5 records them as **equal**;
+* nothing in §5 says which host it ran on. §3 names Azure Linux explicitly for
+  its table; §5 does not, and this page's whole §1 is about a Windows box that
+  behaves differently.
+
+Not asserted here that §5 is wrong — only that its `thenApply` row does not
+reproduce on Azure, and that a table which does not record its host cannot be
+checked. **Any future comparison should re-measure both rows rather than
+subtract from these.**
+
+### 6.2 The profile is flat, and the largest cluster is not lambda at all
+
+`perf record -F 999 --call-graph=dwarf`, self time, `--percent-limit 0.8`:
+
+| cluster | share | members |
+|---|---:|---|
+| **native-method registry lookup** | **~12.5%** | `NativeMethodRegistry::find` 3.80, `safe_native_call_impl` 2.87, `__memcmp_evex_movbe` 2.71, `slot_for_exact` 2.05, `resolve_id_with_descriptor_quirks` 1.09 |
+| interpreter loop | ~9.9% | `execute_frame_from_index` 6.54, `execute_invokevirtual_cached` 2.01, `execute` 1.32 |
+| GC / heap | ~6.5% | `ZObjectStarts::contains` 2.44, `is_object_address` 2.01, `alloc_raw_tlab` 1.19, `load_and_forward` 0.86 |
+| **`is_subclass_of` visited set** | **~3.5%** | `RawTable<(ClassId,())>::reserve_rehash` 2.18, `HashMap<ClassId,()>::insert` 1.32 |
+| allocator | ~4.0% | `_mi_page_malloc_zero` 1.52, `mi_theap_malloc_aligned` 1.32, `mi_free` 1.22 |
+
+§5 put "the native registry's three lookup functions at ~5.8%". With
+`safe_native_call_impl` and the `memcmp` they call, the cluster is **twice
+that** and is the single largest thing in the profile. `__memcmp_evex_movbe` at
+2.71% in a probe that does no string work of its own is registry key
+comparison.
+
+### 6.3 One of them converted — `is_subclass_of` allocated a zero-capacity set
+
+`ClassManager::is_subclass_of` built its visited set with `FxHashSet::default()`,
+which starts at **capacity 0** and rehashes as the walk inserts. The callers,
+from the recorded call graph, are `jit::helpers::jit_invoke_virtual_mic` and
+`try_jit_site_cached_native_dispatch` — the JIT invoke path, paying it per call.
+Pre-sized to 16, which covers the real-JDK interface DAGs it walks
+(`CompletableFuture`, `Function`, the `Collection` family) without a resize.
+
+**CORRECTED 2026-08-18, same day.** The first version of this section reported
+"4/4 pairs, 3.1%-12.1%" from a run that was **not** interleaved — it ran
+baseline-then-patched in every pair, so any systematic advantage to running
+second (page cache, frequency ramp) would land entirely on the patched arm and
+produce exactly that clean sweep. This repo's own convention is ABBA and it was
+not followed. Re-measured properly, `taskset -c 6,7`, 8 ABBA blocks = 16
+samples per arm:
+
+| | median | mean | blocks favouring pre-size |
+|---|---:|---:|---|
+| `default()` | 5 580.0 | 5 542.7 | — |
+| pre-sized to 16 | 5 352.6 | 5 249.9 | **7 / 8** |
+
+**median 4.1%, mean 5.3%** — real, and smaller and noisier than the first
+number claimed. Keep the 4-5% figure, not the 12%.
+
+**The probe is BIMODAL, which is why the first design was so easy to fool.**
+Runs land in one of two states — around 5.3 µs/stage or around 4.4 µs/stage for
+`thenApply` — and both binaries reach both (block 5 has the pre-sized arm at
+4 384 and block 6 has the baseline arm at 5 029, reversing the sign). A design
+that gives one arm a fixed position cannot separate that from a real effect.
+Anything measured on this probe needs ABBA and needs enough blocks to see both
+modes; three reps is not enough. What causes the bimodality is not known and is
+worth its own look — it is a ~1.2x swing in a VM running an identical workload.
+
+### 6.4 A candidate found, measured, and NOT landed
+
+`force_native_over_real_jdk_bytecode_memoized`
+(`vm/src/runtime/interpreter/native_override.rs`) exists to avoid a ~55-branch
+scan. Its key is `(Box<str>, Box<str>, Box<str>)`, so **every lookup, including
+every hit, first builds that key**: three heap allocations and three copies,
+then three string comparisons inside the probe, then three frees — under a
+process-global `Mutex`. That is a memo whose hit path may well cost more than
+the miss it replaces, and it fits the evidence: `__memcmp_evex_movbe` at 2.71%
+with `should_force_registered_native_over_bytecode` among its callers, on a
+workload that does no string work of its own.
+
+The fix is mechanical, because `Box<str>: Borrow<str>` but a TUPLE of them has
+no such impl — which is exactly why the old shape had to allocate. Splitting
+the key into "hash the class, then linear-scan its methods" makes the hit path
+allocation-free, and the common case (a class in no triple) becomes one hash
+lookup returning `None`.
+
+**It was written, built, and measured, and it did not move this probe.** So it
+is described here and NOT landed. The reasoning that it is strictly less work
+is exactly the reasoning behind the two 2026-08-13 changes §3 warns about, and
+this page is not the place to add a third. Someone with a workload that
+actually stresses reflective / megamorphic dispatch — the paths the memo's own
+doc comment says it was added for, which composition is not — should pick it up
+with that as the instrument.
+
+### 6.5 What is still not known
+
+The gap is not lambda dispatch (§5 settled that), and it is not the visited set
+(§6.3 is 5%). The profile says the next place to look is the **native-registry
+lookup path at ~12.5%** — specifically why a composition-only workload with no
+string work spends 2.71% in `memcmp`, which points at the registry being keyed
+on name/descriptor bytes rather than on an interned id at these sites.
+
+Unchanged from §5: any candidate fix must be A/B'd on
+`MultithreadedInsertionTest`'s wall clock (219 s), which this session could not
+run — the hibernate-reactive suite is not on the Azure host. The numbers above
+are `LambdaCompositionProbe` only, and the page's own history is that probe
+wins do not always convert.
+
+## 7. The registry cluster, measured — 4 lookups per stage and every one of them misses
+
+§6.5 pointed at the ~12.5% native-registry cluster. `CRATONVM_DBG=native-lookups`
+(the census built for exactly this question) over
+`probes/LambdaCompositionProbe.java`, four workload sizes:
+
+| chains | stages | `find` | `quirks` | `invokes(stackless)` |
+|---:|---:|---:|---:|---:|
+| 2 500 | 20 000 | 151 254 | 147 753 | 966 |
+| 5 000 | 40 000 | 231 254 | 227 756 | 966 |
+| 10 000 | 80 000 | 391 254 | 387 756 | 966 |
+| 20 000 | 160 000 | 711 254 | 707 756 | 966 |
+
+**Exactly 4.0 `find` calls per composition stage**, at every size — the deltas
+are 80 000 / 160 000 / 320 000 against 20 000 / 40 000 / 80 000 added stages,
+linear to three digits, over a fixed ~71 k boot cost.
+
+**And essentially every one of them misses.** `quirks` tracks `find` to within
+0.5%, and `resolve_id_with_descriptor_quirks` is only reached *after* the exact
+lookup has already failed. So each of those four does: a class prefilter hash,
+a slot hash, a miss, then a full byte pass over the descriptor in an arm marked
+`#[cold]` `#[inline(never)]` — which on this workload is taken ~100% of the
+time. The arm is correct to bail (it returns `None` before allocating), but
+`#[cold]` is a branch-layout hint that is simply wrong here.
+
+That is the shape behind the 2.71% `__memcmp_evex_movbe` and a good part of the
+`find` / `slot_for_exact` / `quirks` lines: not one expensive lookup, but four
+cheap ones per stage that were never going to hit.
+
+**The instrument's own headline number is misleading, and this is the trap.**
+`lookups_per_invoke` printed 162 -> 245 -> 411 -> 742 across those four rows,
+which reads like a per-call cost that worsens with load. It is not:
+`invokes(stackless)` is **constant at 966** in all four runs, so the ratio grew
+only because its denominator could not move. The lookups this workload
+generates do not arrive through `try_stackless_invoke` at all, though that
+counter's doc comment calls itself "the every-invoke entry point". Corrected at
+the source in this change; the reliable reading is the marginal rate between
+two sizes, which is what the 4.0 above is.
+
+**Not fixed here, and deliberately.** The obvious moves — a negative cache, or
+dropping `#[cold]` — are each a one-line change with an obvious story, and this
+page's history (§3, and §6.4 in this session) is that such changes do not
+convert. Whoever takes it should start from the fact above: the target is
+*four misses per stage*, so the question is which call site issues them and
+whether it can ask once, not whether each miss can be made cheaper.
+
+`perf` could not answer that here: dwarf unwinding through these frames yields
+bogus return addresses (`0x1ffffffffff`, `0x3`), so `--call-graph` gives no
+callers for `find`. A counter at the call sites will be needed instead.

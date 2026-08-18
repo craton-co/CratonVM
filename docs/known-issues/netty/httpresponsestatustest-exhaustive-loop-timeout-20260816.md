@@ -507,6 +507,135 @@ Reading the callee artifact's inline-cache slot — real runtime evidence,
 available exactly where the profile is not — is what would make the guarded
 splice fire. The emitter half is done and tested.
 
+### Reading the devirt target out of the callee's own inline cache — 2026-08-18
+
+The profile is empty at these sites and always will be (the eager-callee-chain
+compiles before the receiver map fills), so the evidence has to come from
+somewhere else. It was one layer down the whole time: the compiled callee's own
+MIC installed the receiver on its first call and has served it ever since.
+
+It was not reachable. The compiler builds `mic_slots` as
+`(pc, *const JitMICSlot)`, the artifact keeps only
+`_jit_mic_slots: Vec<Box<JitMICSlot>>`, and the pc mapping was **discarded at
+publication**. `JitMICSlot::bci` / `JitPICSlot::bci` restore it, as TAIL fields —
+`cached_class_id` (0), `cached_entry_ptr` (8) and `cached_needs_context` (16) are
+addressed by generated code at fixed offsets. Putting the PIC's `bci` where it
+read naturally, after `misses`, moved `MEGA_CLASS_IDS_OFFSET` from 96 to 104 and
+every megamorphic-stub load with it;
+`test_jit_mega_offsets_match_generated_stub_contract` caught it.
+
+**The first dominance bar was built on counters the hot path never touches.** It
+asked for `hits + misses >= 64` at an 80% hit rate, mirroring the profile's bar.
+`record_hit` is called from the dispatch HELPER; the JIT-emitted inline MIC
+compares the class id and calls the cached entry in machine code without ever
+entering it. So a hot, well-behaved monomorphic site reads `h0:m1` — one helper
+entry to install, then silence — which is exactly what the trace showed
+(`bci16:cls1167:h0:m1`), and a hit-rate bar admits only sites thrashing THROUGH
+the helper. The rule is structural now: a populated, not-mid-installation class
+id, a NON-ZERO cached entry (a class id with entry 0 is `prepopulate`'s seed from
+profile data — a guard hint, and accepting it would launder a profile guess back
+in as runtime evidence), and misses at or below `MIC_TO_PIC_THRESHOLD`, which is
+the one thing these counters measure honestly. A PIC that has taken a miss at the
+same bci vetoes.
+
+That works: `nest-virtual java/lang/Object.equals at callee_pc=16 -> guard on
+class 1167 (from mic)`.
+
+**And it exposed a resolver bug worth more than the feature.**
+`resolve_inline_site_from` opened by testing the native table for
+`(callee_class, callee_method, callee_desc)`. For a receiver-resolved site
+`callee_class` is the DECLARED class — a supertype that may own no body at all —
+so a native registered on `java/lang/Object.equals` refused **every subclass
+override too**, including the plain bytecode the receiver actually dispatches to.
+That gate is now constant-pool-only, and the existing per-declaring-class check
+below is unconditional. It affects PGO-02's guarded-virtual path in the default
+build, not just this feature. codec-http, 93 classes: identical result sets with
+the branch's flags off and on, so no regression at either.
+
+### The devirt chain, end to end — and the wall it actually ends at
+
+Five distinct causes stood between "the emitter is written and tested" and "the
+guarded splice fires". Four are fixed. The fifth is the real one, it is
+pre-existing, and it is now a fact rather than an inference.
+
+| # | cause | status |
+|---|---|---|
+| 1 | receiver profile EMPTY at these sites (eager-callee-chain compiles before the method runs its virtual calls interpreted) | worked around — read the compiled callee's MIC instead |
+| 2 | profiling default-OFF behind `CRATONVM_TIER_PGO` | identified |
+| 3 | the MIC's pc mapping DISCARDED at publication | fixed (`JitMICSlot::bci`, `JitPICSlot::bci`) |
+| 4 | the dominance bar built on counters the hot path never touches | fixed (structural rule) |
+| 5 | the native-shadow gate refusing every OVERRIDE of a shadowed method | fixed — and it affects PGO-02's guarded-virtual path in the DEFAULT build |
+| 6 | **the inline emitter cannot splice a body with a value-producing branch merge** | **the wall** |
+
+With 1-5 addressed the chain resolves and the planner admits it:
+
+```
+nest-virtual java/lang/Object.equals at callee_pc=16 -> guard on class 1167 (from mic)
+nest-static  AssertionUtils.objectsAreEqual at callee_pc=2 depth=1 -> SPLICED
+inline-plan  AssertionUtils.objectsAreEqual: DirectBind (cost=Some(43) budget_left=750)
+inline-planned AssertionUtils.objectsAreEqual @pc=2
+```
+
+and then the emitter throws it away:
+
+```
+inline call arms: spliced-call-direct=10 spliced-call-dispatch=0
+                  nested-splice=0 nested-splice-guarded=0
+                  nested-splice-guarded-refused=0 nested-splice-refused=0
+                  outer-splice-rolled-back=2
+```
+
+`outer-splice-rolled-back=2` with every nested arm at zero says the invoke arm
+was never reached — `try_emit_inline_body` bails before it. `javap` says why:
+
+```
+static boolean objectsAreEqual(Object, Object);
+   0: aload_0
+   1: ifnonnull 14
+   4: aload_1
+   5: ifnonnull 12
+   8: iconst_1
+   9: goto 13
+  12: iconst_0
+  13: ireturn        <-- merge point, one value live
+  14: aload_0
+  15: aload_1
+  16: invokevirtual java/lang/Object.equals
+  19: ireturn
+```
+
+pc 13 is reached from `goto 13` with `iconst_1` on the stack and by fall-through
+from `iconst_0`. `prev_was_terminator` is false and the callee operand stack is
+not empty, so the merge-point rule bails — and pc 16, the call this whole line of
+work is about, is never emitted at all. This is the literal
+`iconst_1; goto L; iconst_0; L: ireturn` diamond that `try_emit_inline_body`'s own
+comment cites as the reason for commit 419a6f5's blanket branch bail. It is not
+a regression and nothing here introduced it.
+
+**So the next lever is not more evidence, more binding, or more devirtualisation
+— it is operand-stack MERGING in the inline emitter.** Every one of the five
+causes above had to be cleared to see that, and each was named by a counter or a
+trace rather than guessed: the arm census (`spliced-call-*`, `nested-splice-*`,
+`outer-splice-rolled-back`), the resolver's per-gate refusal line
+(`inline-resolve REFUSED <method> depth=N: <why>`), and the planner's per-site
+verdict (`inline-plan <method>: <verdict> (cost=.. budget_left=..)`). Three
+separate hypotheses died to those three lines in one session; two more died to
+guesses before they existed.
+
+Until a spliced body can carry a value across a branch merge, the assertion
+chain cannot collapse, because its very first rung past `assertEquals` is
+this shape.
+
+### A correction to the direct-bind result
+
+This page reported `HttpResponseStatusTest` moving from `HANG found=0 started=0`
+to `13 started, 12 ok`. That measurement is real but **marginal**: it completed
+in 171 s against the harness's 180 s wall, and a later build of the same lineage
+put it back over the wall in both arms. The **ns/iter improvement is the robust
+result** — 6 of 6 interleaved rounds, 45.1 -> 39.1 — and the class crossing the
+harness wall is a boundary effect on top of it, not a stable new state. The
+per-method JUnit `@Timeout` of 120 s was never met in any run.
+
 ## What is left, in order
 
 1. The five-step chain above, in that order — multi-frame resume, multi-frame
