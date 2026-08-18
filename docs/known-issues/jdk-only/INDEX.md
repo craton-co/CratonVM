@@ -1029,3 +1029,16 @@ Three of those are worth reading before acting anywhere in this tree:
   left deliberately unfaked — their text names JDK internals
   (`sun.invoke.util.ValueConversions`, a module/loader-qualified
   `ClassCastException`), and inventing that is not transcription.
+* **`G74-1`** — two nominations CLOSED by measuring instead of assuming, and a
+  retraction. **`G69-1` N1** (306 sites naming an object by its class id, which
+  on an array is the COMPONENT's) is a mostly-NEGATIVE result: sweep 11, 51
+  rows, **50 already exact** — names across dimensions, component types,
+  assignability, `forName` round trips, `reflect.Array`, clone, arrays inside
+  collections. One live site, `Class.cast`, fixed. The premise was right and
+  the scale was wrong; do not re-audit 306 sites expecting a harvest.
+  **`G71-1`'s Scanner residue is DECIDED, not deferred**: its source is an
+  `Arc<str>` and the tokenizer runs a Rust regex engine over `&str`, so units
+  would need a hybrid representation — the cost is the regex boundary, not the
+  buffer. **RETRACTED: the fat-LTO build was never broken.** Four commits say a
+  release binary could not be produced on this host; that was `G72-1`'s own
+  leaked `cratonvm.exe`, and `-C lto=fat` builds clean once it is gone.
