@@ -1675,6 +1675,21 @@ pub(crate) mod lambda_site_prof {
         }
     }
 
+    /// How often to print, counted in direct calls. Small enough that a probe
+    /// run of a few hundred thousand dispatches reports several times.
+    pub(crate) const REPORT_EVERY: u64 = 100_000;
+
+    #[inline]
+    pub(crate) fn maybe_report() {
+        if !super::lambda_jit::on() {
+            return;
+        }
+        let direct = SITE_DIRECT.load(Ordering::Relaxed);
+        if direct > 0 && direct % REPORT_EVERY == 0 {
+            super::lambda_jit::report();
+        }
+    }
+
     pub(crate) fn line() -> String {
         format!(
             "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} site_arity={}",
@@ -1698,6 +1713,13 @@ pub(crate) fn lambda_site_bump_calls() {
 #[inline]
 pub(crate) fn lambda_site_bump_direct() {
     lambda_site_prof::bump(&lambda_site_prof::SITE_DIRECT);
+    // The census has to be driven from HERE as well. Once the direct arm is
+    // serving a workload, `try_invoke_cached_lambda_impl` — where the other
+    // half of these counters is reported from — is barely reached at all, so a
+    // report keyed only to that path prints nothing on exactly the runs where
+    // the fast path is working. A census that goes quiet when the thing it
+    // counts starts working is not a census.
+    lambda_site_prof::maybe_report();
 }
 #[inline]
 pub(crate) fn lambda_site_bump_no_code() {
