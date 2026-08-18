@@ -89,7 +89,7 @@ pub fn compile(
     num_params: usize,
     max_locals: usize,
     needs_heap: bool,
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     field_info: Vec<(usize, usize, u8)>,
     typecheck_info: Vec<(usize, *const u8, usize)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
@@ -292,7 +292,7 @@ pub fn compile_with_param_slots(
     num_params: usize,
     max_locals: usize,
     needs_heap: bool,
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     field_info: Vec<(usize, usize, u8)>,
     typecheck_info: Vec<(usize, *const u8, usize)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
@@ -458,6 +458,18 @@ pub fn compile_with_param_slots(
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    if crate::rbc6_emit_dbg() {
+        eprintln!(
+            "[rbc6-emit] driver took precise_exception_frames={precise_exception_frames}              exception_ranges={} protected_ranges_pending={}",
+            exception_ranges.len(),
+            PROTECTED_RANGES_REQUEST.with(|c| {
+                let v = c.take();
+                let n = v.as_ref().map(|r| r.len()).unwrap_or(0);
+                c.set(v);
+                n
+            }),
+        );
+    }
     // Same one-shot discipline as the flag above.
     let protected_ranges = PROTECTED_RANGES_REQUEST
         .with(|c| c.take())
@@ -1745,14 +1757,22 @@ pub fn compile_with_param_slots(
         // The exception table MUST be modelled: these snapshots are taken at
         // pcs inside protected ranges, and a local only the handler reads is
         // otherwise computed dead exactly there.
-        let (liveness, covered) = crate::regalloc::live_locals_per_pc_with_handlers(
+        // `_all`, not `_with_handlers`: the latter answers for slots 0..63
+        // only, and a method with more than 64 locals then cannot drop a dead
+        // local above slot 63 from the snapshot — which publishes `Unsupported`
+        // for it and costs the whole method its OSR entry. Window 0 of this is
+        // bit-for-bit the old answer, so a method with 64 locals or fewer is
+        // unchanged.
+        let (liveness, covered, words) = crate::regalloc::live_locals_per_pc_all(
             code,
             code_len,
             num_params,
             param_jvm_slots,
             &exception_ranges,
+            compiler.num_locals,
         );
         compiler.local_liveness = liveness;
+        compiler.local_liveness_words = words;
         compiler.local_liveness_covered = covered;
         compiler.exception_ranges_dbg_len = exception_ranges.len();
     }

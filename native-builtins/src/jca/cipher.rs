@@ -2132,6 +2132,13 @@ fn try_delegate_cipher_to_provider(
     try_delegate_cipher_to_named_provider(ctx, &provider, algo, cipher_obj)
 }
 
+/// The provider name this crate's own `Cipher` engine answers as.
+///
+/// Every `getProvider()` on a natively-served `Cipher` reports this, so it is
+/// also this engine's POSITION in the installed chain for the purpose of the
+/// anonymous `getInstance` — see `provider_chain::third_party_owner_before`.
+const CIPHER_NATIVE_PROVIDER: &str = "SunJCE";
+
 /// The service names `Cipher.getInstance` tries for one transformation, in the
 /// JDK's own order, each paired with the mode and padding that form still has
 /// to configure by hand.
@@ -2332,6 +2339,15 @@ fn try_delegate_cipher_to_chain(
         // one provider's problem, not the chain's — a real `ProviderList` walk
         // moves on to the next candidate — so keep looking.
         if let Ok(true) = try_delegate_cipher_to_named_provider(ctx, &provider, algo, obj) {
+            // Record WHICH provider answered. `Cipher.getProvider()` reports
+            // this engine's own identity unless told otherwise, so a chain walk
+            // that found a third-party SPI produced a working cipher that named
+            // the wrong provider — `SlotTwoTest` decrypts correctly and then
+            // fails on `decrypt.getProvider().getName()`, expecting `BC` and
+            // getting `SunJCE`. The named-provider overloads have always
+            // recorded it; the anonymous chain walk did not.
+            let obj = ctx.read_native_pin(pin, cipher_obj);
+            crate::jca::provider_chain::record_requested_provider(ctx, obj, &provider);
             ctx.unpin_native_roots(pin);
             return Ok(true);
         }
@@ -4491,6 +4507,28 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             match check_transformation_supported(ctx, &algo_str, GetInstanceForm::Anonymous) {
                 Ok(_) => {
+                    // This engine can compute the transformation, but the
+                    // anonymous overload is decided by CHAIN ORDER, and an
+                    // application may have inserted a provider ahead of the one
+                    // this engine answers as. See
+                    // `provider_chain::third_party_owner_before`.
+                    let candidates: Vec<String> = cipher_transform_candidates(&algo_str)
+                        .into_iter()
+                        .map(|(service, _, _)| service)
+                        .collect();
+                    if let Some(provider) = crate::jca::provider_chain::third_party_owner_before(
+                        "Cipher",
+                        &candidates,
+                        CIPHER_NATIVE_PROVIDER,
+                    ) {
+                        let obj = cipher_alloc(ctx, algo)?;
+                        if try_delegate_cipher_to_named_provider(ctx, &provider, &algo_str, obj)? {
+                            crate::jca::provider_chain::record_requested_provider(
+                                ctx, obj, &provider,
+                            );
+                            return Ok(Some(Value::Object(Some(obj))));
+                        }
+                    }
                     let obj = cipher_alloc(ctx, algo)?;
                     Ok(Some(Value::Object(Some(obj))))
                 }

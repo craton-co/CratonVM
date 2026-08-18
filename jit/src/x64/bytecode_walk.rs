@@ -2417,6 +2417,144 @@ impl Compiler {
                     pc += 1;
                 }
 
+                // dup2_x2 — the last category-dependent stack shuffle x64
+                // did not lower. `jit_scan` has always ADMITTED it (it just
+                // advances `pc`), so before this arm existed the method reached
+                // the dispatch loop's `_ =>` catch-all and lost its compilation
+                // for the life of the process, with the refusal attributed to
+                // an arm that names nothing. See
+                // fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
+                //
+                // Four JVMS forms. In this backend's operand model — one entry
+                // per VALUE, so a category-2 long/double is ONE entry — they
+                // are four different shuffles over two, three or four entries:
+                //
+                //   FORM 4  v1,v2 cat-2   [v2, v1]         -> [v1, v2, v1]
+                //   FORM 2  v1 cat-2      [v3, v2, v1]     -> [v1, v3, v2, v1]
+                //   FORM 3  v3 cat-2      [v3, v2, v1]     -> [v2, v1, v3, v2, v1]
+                //   FORM 1  all cat-1     [v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]
+                //
+                // So the TOP entry's category decides how many entries are
+                // duplicated (one for a cat-2 top, two for a cat-1 pair) and the
+                // entry BELOW the duplicated group decides how deep the copy is
+                // inserted. `dup2_top_cat2` answers only the first question —
+                // which is why this opcode waited for a second-entry oracle.
+                // `stack_entry_categories` is it: the widths come from the
+                // `x64::stack_kinds` forward analysis, admitted only when its
+                // depth and per-entry ref-ness agree with the emitter's own
+                // model AND, for the top entry, with `dup2_top_cat2`'s wholly
+                // independent peephole answer.
+                //
+                // aarch64's arm is NOT the template: it pops four operands
+                // unconditionally, which is FORM 1 only.
+                0x5e => {
+                    let cats = self.stack_entry_categories(pc);
+                    let peephole_top = self.dup2_top_cat2(code, pc);
+                    // Resolve (entries duplicated, insertion depth in entries).
+                    let shape = cats.as_ref().and_then(|cats| {
+                        let n = cats.len();
+                        let top = (*cats.get(n.checked_sub(1)?)?)?;
+                        // Third opinion: when the peephole answers for the top,
+                        // it must agree. A disagreement means one of two
+                        // independent analyses is wrong; use neither.
+                        if matches!(peephole_top, Some(p) if p != top) {
+                            return None;
+                        }
+                        let second = (*cats.get(n.checked_sub(2)?)?)?;
+                        if top {
+                            // FORM 4 (second cat-2, two entries) or FORM 2
+                            // (second cat-1, three entries).
+                            if second {
+                                Some((1usize, 2usize))
+                            } else {
+                                // FORM 2 additionally requires v3 category-1;
+                                // verified bytecode guarantees it, and checking
+                                // costs one lookup.
+                                let third = (*cats.get(n.checked_sub(3)?)?)?;
+                                if third {
+                                    None
+                                } else {
+                                    Some((1, 3))
+                                }
+                            }
+                        } else {
+                            // Two cat-1 entries duplicated. v2 is cat-1 in both
+                            // remaining forms.
+                            if second {
+                                return None;
+                            }
+                            let third = (*cats.get(n.checked_sub(3)?)?)?;
+                            if third {
+                                Some((2, 3)) // FORM 3
+                            } else {
+                                // FORM 1 additionally requires v4 category-1.
+                                let fourth = (*cats.get(n.checked_sub(4)?)?)?;
+                                if fourth {
+                                    None
+                                } else {
+                                    Some((2, 4))
+                                }
+                            }
+                        }
+                    });
+                    let disabled = dupx_codegen_disabled() || dup2_x2_codegen_disabled();
+                    match shape {
+                        Some((dup_entries, depth)) if !disabled => {
+                            // Materialize the copies into fresh frame slots
+                            // (fresh offsets only grow, so no aliasing with the
+                            // live originals), deepest-first so the pushed pair
+                            // ends up in operand order, then rotate the top
+                            // `depth + dup_entries` MODEL entries right by
+                            // `dup_entries` to slide the copies underneath. Only
+                            // the copies cost instructions; the rotate is
+                            // bookkeeping that `canonicalize_stack` resolves as a
+                            // parallel move at the next branch/call boundary.
+                            let n0 = self.stack.len();
+                            let mut ok = true;
+                            for k in (0..dup_entries).rev() {
+                                let src = self.stack[n0 - 1 - k];
+                                let src_oop = self.stack_oop_marks[n0 - 1 - k];
+                                let before = self.stack.len();
+                                self.load_slot_to_reg(RAX, src);
+                                self.push_from_rax();
+                                // `push_from_rax` is SILENT when it cannot
+                                // reserve a spill slot: it emits nothing and does
+                                // not grow the model, and the rotate below would
+                                // then reorder the wrong entries. Same guard as
+                                // `dup_x1`/`dup2_x1`.
+                                if self.stack.len() != before + 1 {
+                                    self.fail("singlepass-codegen/dup2_x2-copy-not-pushed");
+                                    ok = false;
+                                    break;
+                                }
+                                if src_oop {
+                                    self.mark_top_as_oop();
+                                }
+                            }
+                            if ok {
+                                let n = self.stack.len();
+                                let window = depth + dup_entries;
+                                self.stack[n - window..].rotate_right(dup_entries);
+                                self.stack_oop_marks[n - window..].rotate_right(dup_entries);
+                                if dupx_eager_canon() {
+                                    self.canonicalize_stack();
+                                }
+                            }
+                        }
+                        _ => {
+                            // No provable form (or the kill switch) — stay
+                            // interpreted. Push two placeholders so downstream
+                            // handlers keep a plausible height until the
+                            // post-loop `failed` check discards this
+                            // compilation, matching `dup2`.
+                            self.fail("singlepass-codegen/dup2_x2-unprovable-form");
+                            let _ = self.push_stack();
+                            let _ = self.push_stack();
+                        }
+                    }
+                    pc += 1;
+                }
+
                 // swap
                 0x5f => {
                     // EC oop-map fix (round 2): the previous round paired the
@@ -3962,9 +4100,53 @@ impl Compiler {
                     let throw_bci = self.orig_bci(pc);
                     self.emit_mov_imm32_sx(ARG_REGS[1], throw_bci as i32); // Cast: bci fits i32
                     self.emit_call_absolute(self.helpers.throw_exception);
-                    // Helper returned the i64::MIN sentinel in RAX —
+                    // Helper returned the i64::MIN sentinel in RAX -
                     // propagate it as the method's return value.
-                    self.emit_epilogue();
+                    //
+                    // RBC.6 `athrow` admission: inside a protected range the
+                    // sentinel alone is not enough. `jit_throw_exception` has
+                    // stashed the exception and this bci, but nothing has
+                    // recorded where this frame's non-parameter locals live, so
+                    // a handler that reads one would resume it as 0/null. Route
+                    // through the reason-9 stub instead of returning directly:
+                    // it spills the trapping registers, materializes the precise
+                    // exceptional frame from the snapshot recorded here, and
+                    // then runs exactly the epilogue this arm would have run.
+                    // The unconditional `JMP rel32` is patched by
+                    // `emit_deopt_stubs` the same way a `Jcc rel32` guard is -
+                    // both end in the same four displacement bytes.
+                    //
+                    // `flush_scratch_registers` above ran before the call, so
+                    // any local the snapshot places in a caller-saved register
+                    // has already been spilled to its frame slot; this is the
+                    // same ordering `emit_post_invoke_exception_check` relies on.
+                    //
+                    // Keyed on the EMITTER pc, never on `throw_bci`: every
+                    // `*_box_ptr_by_bci` map, `build_and_record_deopt_point`'s
+                    // analysis lookups and `emit_deopt_stubs`' stub sharing are
+                    // all in emitter coordinates, and each applies `orig_bci`
+                    // itself for the value it hands the runtime. Handing an
+                    // already-translated bci in would double-apply it under a
+                    // bytecode loop rewrite (identity, and byte-identical, on an
+                    // ordinary compile).
+                    let precise_athrow_stub =
+                        self.precise_exception_frames && self.pc_is_protected(pc);
+                    if precise_athrow_stub {
+                        if !self.exc_frame_box_ptr_by_bci.contains_key(&pc) {
+                            let box_ptr = self.build_and_record_deopt_point(
+                                pc,
+                                crate::deopt::DeoptReason::PendingException,
+                            );
+                            self.exc_frame_box_ptr_by_bci.insert(pc, box_ptr);
+                        }
+                        // JMP rel32 (E9) - patched to the reason-9 stub.
+                        self.buf.emit_byte(0xE9);
+                        let patch_offset = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((patch_offset, pc, 9));
+                    } else {
+                        self.emit_epilogue();
+                    }
                     self.reset_spills();
                     self.emitted_athrow = true;
                     dead = true;
@@ -6783,6 +6965,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws
@@ -8953,6 +9136,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws (or
@@ -10868,25 +11052,52 @@ impl Compiler {
                     let dim2_slot = self.pop_stack(); // inner dimension
                     let dim1_slot = self.pop_stack(); // outer dimension
 
-                    // Look up resolved leaf element type for this PC
-                    let leaf_et = self
+                    // The packed `(holder_class_id | cp_idx << 32)` site
+                    // descriptor for this pc. The helper resolves the array
+                    // class from it at run time, loader-faithfully, through the
+                    // same `interpreter::multianewarray_alloc` the interpreter
+                    // uses — so both tiers stamp the same component classes
+                    // into the allocated levels.
+                    //
+                    // This used to be a bare leaf element-type code, which
+                    // carried no class at all; the helper then allocated every
+                    // level with `ClassId(0)` and a compiled `new String[a][b]`
+                    // came back as `[Ljava.lang.Object;`. A site with no entry
+                    // cannot be compiled correctly at all now (there is no
+                    // "default" array class), so bail rather than emit a call
+                    // that would allocate the wrong type.
+                    let Some(&(_, site)) = self
                         .multianewarray_info
                         .iter()
                         .find(|(p, _)| *p == pc)
-                        .map(|(_, et)| *et as i32) // Cast: x86-64 immediate encoding
-                        .unwrap_or(10); // default T_INT
+                    else {
+                        return false;
+                    };
 
-                    // Call jit_multianewarray_2d(heap_ptr, leaf_et, dim1, dim2)
+                    // Call jit_multianewarray_2d(heap_ptr, site, dim1, dim2)
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    self.emit_mov_imm32_sx(ARG_REGS[1], leaf_et);
+                    self.emit_mov_imm64(ARG_REGS[1], site);
                     self.load_slot_to_reg(ARG_REGS[2], dim1_slot);
                     self.load_slot_to_reg(ARG_REGS[3], dim2_slot);
                     // Round-8 wave-3: defensive callee-saved spill
                     // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.multianewarray_2d);
+                    // Resolution can run a user `ClassLoader.loadClass`, i.e.
+                    // arbitrary Java on this thread — republish the frame
+                    // afterwards exactly as the `new`/`anewarray` CP-indexed
+                    // arms do.
+                    crate::runtime_lowering::emit_post_call_frame_republish(
+                        &mut self.buf,
+                        self.helpers.frame_record,
+                    );
                     // T1.1.2 — multianewarray is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Negative dimension / OOM / failed resolution all come back
+                    // as the 0/null sentinel with a pending exception; bail into
+                    // the method's exception table instead of pushing the null
+                    // and dereferencing it.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // The result is a reference array.
                     self.mark_top_as_oop();
@@ -11058,7 +11269,19 @@ impl Compiler {
                 }
 
                 _ => {
-                    // Should not happen — jit_scan should have caught this
+                    // A scan-admitted opcode with no arm here. This is NOT
+                    // unreachable — `jit_scan` and this dispatch loop are two
+                    // hand-maintained opcode tables and nothing forced them to
+                    // agree, so an opcode the scanner advances past but this
+                    // loop does not lower lands here and loses the method's
+                    // compilation for the life of the process, attributed to an
+                    // arm that names nothing. `dup2_x2` (0x5E) sat in exactly
+                    // that gap until 2026-08-18; `pop2` (0x58) and `dup2_x1`
+                    // (0x5D) did before it. The two tables are now compared by
+                    // `x64::tests::scan_admitted_opcodes_are_lowered_or_declared`,
+                    // which fails when a new one appears. Name the opcode here
+                    // so a stray one is at least legible in the bail record.
+                    self.fail("singlepass-codegen/opcode-scan-admitted-but-unlowered");
                     return false;
                 }
             }

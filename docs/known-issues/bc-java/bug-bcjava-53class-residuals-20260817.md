@@ -175,13 +175,51 @@ Fixing this means giving `Provider` one store. Note what that then exposes: the
 test instantiates every registered `org.bouncycastle.*` class, ~2000 of them, so
 a faithful map view is the START of that work rather than the end of it.
 
+### A `dev` REGRESSION found while closing these: Mac.getInstance(name, Provider)
+
+`Mac.getInstance(algorithm, providerObject)` refuses EVERY BouncyCastle name
+while `Mac.getInstance(algorithm, "BC")` serves the same names, and HotSpot
+serves both forms:
+
+```
+byName   1.3.14.3.2.26           -> BC          byObject 1.3.14.3.2.26           EX no such algorithm ... for provider BC
+byName   2.16.840.1.101.3.4.2.1  -> BC          byObject 2.16.840.1.101.3.4.2.1  EX no such algorithm ... for provider BC
+byName   PBEwithHmacSHA1         -> BC          byObject PBEwithHmacSHA1         EX no such algorithm ... for provider BC
+```
+
+**It is not from this work.** Bisected by building the `origin/dev` merge point
+itself, before any of the fixes above: broken there too. It costs `cert.test`,
+which went from `OK (33 tests)` to one failure — BouncyCastle's PKCS#12
+keystore builds its MAC through a helper that holds a `Provider` OBJECT, so
+`error constructing MAC: NoSuchAlgorithmException` is how it surfaces — and it
+is what `PKCS12StoreTest` now stops on.
+
+The probe is `MacProvObj`: add BC, take `Security.getProvider("BC")`, and call
+both overloads. Three lines, no suite needed.
+
+This also blocks a fix that is otherwise ready. `Security.getProperty` answers
+from a hardcoded four-entry table and returns null for every other key, though
+the JDK's own `conf/security/java.security` is right there;
+`java_security_file_property` reads it and is committed UNWIRED, because the
+stock file sets `keystore.type.compat=true`, which sends BouncyCastle's
+`AdaptingKeyStoreSpi` down exactly the path that hits the defect above. Fix the
+overload, then delete that arm.
+
 ### The other three `jce.provider.test` rows
 
-* `SlotTwo: BC provider not returned for DESede/ECB/PKCS7Padding got SunJCE` —
-  the same ownership question as defect 7 above, for the anonymous `Cipher`
-  overload: this engine claims a name ahead of the installed chain order.
-* `PKCS12Store: IOException: stream does not represent a PKCS12 key store`.
-* `RSATest: BadBlockException: unable to decrypt block`.
+* `SlotTwo` — CLOSED. `Cipher.getProvider()` reports this engine's own identity
+  unless told otherwise, and the anonymous chain walk never recorded which
+  provider actually answered: a working cipher that named the wrong provider.
+  The named overloads had always recorded it.
+* `RSATest` — CLOSED. OAEP used ONE digest for both the label hash and MGF1.
+  `OAEPWith<md>AndMGF1Padding` names only `<md>`; SunJCE takes MGF1 from
+  `OAEPParameterSpec`'s default, which is SHA-1 whatever `<md>` is. Measured:
+  SunJCE's `OAEPWithSHA-256AndMGF1Padding` ciphertext decrypts under
+  BouncyCastle only with `MGF1ParameterSpec.SHA1`. This engine answers as
+  SunJCE, so it makes SunJCE's choice.
+* `PKCS12Store` — its first wall (`IOException: stream does not represent a
+  PKCS12 key store`) is the `Security.getProperty` gap above; behind it sits the
+  `dev` regression above.
 
 ## Instruments that earned their keep
 
