@@ -80,6 +80,76 @@ pub(super) fn convert_ldc_class_format_error(
     err
 }
 
+
+/// Canonical instance for a surrogate-bearing string **literal**.
+///
+/// JVMS §5.1: every string literal is interned, so two `ldc`s of the same
+/// `CONSTANT_String` must push the identical reference and `LITERAL ==
+/// LITERAL.intern()` must hold. The ordinary literal path gets that from
+/// `create_java_string`, which pools on the Rust `String`. A literal carrying
+/// a lone surrogate (ANTLR's `_serializedATN` is the reachable case) cannot be
+/// keyed that way — a Rust `String` cannot hold one — and the wide path called
+/// `create_java_string_from_units`, which pools nothing and allocates a FRESH
+/// object per execution. So `"\uD800" == "\uD800"` answered `false` where
+/// HotSpot answers `true`, and every execution of such an `ldc` leaked another
+/// String onto the heap.
+///
+/// The table is `String.intern()`'s own surrogate pool, reached through its
+/// two published halves. It has to be that table and not a second one, or
+/// `LITERAL == LITERAL.intern()` would still answer `false`.
+///
+/// Root discipline follows `intern_unrepresentable`: the probe comes first (a
+/// hit allocates nothing at all), and a loser releases its own root rather
+/// than holding it for the life of the VM.
+fn intern_wide_string_literal(shared: &SharedVm, units: &[u16]) -> ObjectRef {
+    use cratonvm_native_builtins::lang_string::{surrogate_intern_claim, surrogate_intern_probe};
+
+    if let Some(winner) = surrogate_intern_probe(units) {
+        if let Some(obj) = shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .resolve(winner as crate::native::jni::JObject)
+        {
+            return obj;
+        }
+    }
+    let fresh = create_java_string_from_units(shared, units);
+    let handle = shared.natives.jni_global_refs.lock().add(fresh) as usize;
+    let winner = surrogate_intern_claim(units.to_vec(), handle);
+    if winner != handle {
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .remove(handle as crate::native::jni::JObject);
+    }
+    shared
+        .natives
+        .jni_global_refs
+        .lock()
+        .resolve(winner as crate::native::jni::JObject)
+        .unwrap_or(fresh)
+}
+
+/// Whether `ldc` may answer from the recorded-resolution store.
+///
+/// Default-ON; `CRATONVM_JIT_NO_LDC_CONST_CACHE=1` opts out, which is what
+/// makes the A/B a one-binary comparison rather than a cross-binary one.
+///
+/// Switched off under the three diagnostics whose output a hit would silently
+/// remove — `CRATONVM_LDC_CLASSREF_TRACE` and `CRATONVM_DBG_TOARRAY` print on
+/// the ClassRef arm, and `CRATONVM_DBG_REMAP_TRACE` records provenance there. A cache that
+/// blinds the instrument someone turned on to watch it is worse than no cache.
+fn ldc_const_cache_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LDC_CONST_CACHE").is_none()
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_LDC_CLASSREF_TRACE").is_none()
+            && !crate::runtime::env_cache::dbg_toarray()
+            && !remap_trace_on()
+    })
+}
 pub(super) fn execute_ldc(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -87,6 +157,38 @@ pub(super) fn execute_ldc(
     index: u16,
 ) -> Result<(), MethodCallFailed> {
     let frame_class_id = thread.frames[frame_idx].class_id;
+
+    // JVMS §5.4.3: a symbolic reference is resolved ONCE per constant-pool
+    // entry and the result recorded; §5.1 says the same of a string literal.
+    // The recorded value IS what this instruction pushes, so answering from
+    // the record here — BEFORE the class_manager read lock — is the whole
+    // instruction for every tag that has run once.
+    //
+    // Hoisted to the top deliberately. `CONSTANT_MethodType` /
+    // `CONSTANT_MethodHandle` already probed this store, but they did it in
+    // the second phase, after the lock had been taken and an `LdcValue` built
+    // — so they skipped the JDK factory and paid the lock anyway. Every tag
+    // now skips both.
+    //
+    // Category safety: a constant-pool index has exactly one tag, so a `Long`
+    // or `Double` entry is only ever reachable through `ldc2_w`, which does
+    // NOT probe here: it must push through `push_long`/`push_double` to keep
+    // the CompactValue tag, and its only costly tag (condy) already caches
+    // inside `resolve_condy_constant`. A category-2 condy reached by plain
+    // `ldc` is ill-formed and pushes untagged here exactly as it did before.
+    if ldc_const_cache_enabled() {
+        match cached_cp_constant(shared, frame_class_id, index) {
+            Some(cached) => {
+                super::site_cache::site_stats::bump(super::site_cache::site_stats::LDC_HIT);
+                thread.frames[frame_idx].stack.push(cached)?;
+                return Ok(());
+            }
+            None => {
+                super::site_cache::site_stats::bump(super::site_cache::site_stats::LDC_MISS)
+            }
+        }
+    }
+
     // Resolve the constant pool entry while holding the class_manager read lock.
     // For string references, we extract the string value as an owned String
     // before releasing the lock, so we can then allocate on the heap.
@@ -238,22 +340,40 @@ pub(super) fn execute_ldc(
     };
 
     match ldc_val {
-        LdcValue::Int(v) => thread.frames[frame_idx].stack.push(Value::Int(v))?,
-        LdcValue::Float(v) => thread.frames[frame_idx].stack.push(Value::Float(v))?,
+        // The primitives record too, and the reason is the probe above rather
+        // than the cost of the pool read. Left unrecorded they would MISS on
+        // every execution and then do the whole resolving path anyway — the
+        // probe would be pure added cost for them. Recorded, the probe hits
+        // and the class_manager lock and `get_class` are skipped, which is the
+        // part a constant-pool slice index cannot avoid on its own.
+        LdcValue::Int(v) => {
+            record_cp_constant(shared, frame_class_id, index, Value::Int(v));
+            thread.frames[frame_idx].stack.push(Value::Int(v))?
+        }
+        LdcValue::Float(v) => {
+            record_cp_constant(shared, frame_class_id, index, Value::Float(v));
+            thread.frames[frame_idx].stack.push(Value::Float(v))?
+        }
         LdcValue::Str(s) => {
             let obj_ref = create_java_string(shared, &s);
             if remap_trace_on() {
                 push_prov_record(obj_ref.as_ptr() as usize, "ldc-str");
             }
+            // The pool already guarantees identity; recording it only removes
+            // the work of getting back here — the lock, the `get_utf8`, the
+            // owned `String` this arm allocated, and the pool's content hash.
+            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::WideStr(units) => {
-            let obj_ref = create_java_string_from_units(shared, &units);
+            // Interned, not freshly allocated — see `intern_wide_string_literal`.
+            let obj_ref = intern_wide_string_literal(shared, &units);
             if remap_trace_on() {
                 push_prov_record(obj_ref.as_ptr() as usize, "ldc-str");
             }
+            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
@@ -274,6 +394,17 @@ pub(super) fn execute_ldc(
             if remap_trace_on() {
                 push_prov_record(mirror.as_ptr() as usize, "ldc-classref");
             }
+            // Recorded WITHOUT a loader-namespace guard, unlike the cast and
+            // `new` site caches. Those key on the referencing class to make a
+            // resolution reusable; here the key IS the constant-pool entry, and
+            // JVMS §5.4.3 says a resolved entry returns the same result on
+            // every later resolution of it — so recording is the specified
+            // behaviour rather than an optimization that needs to prove itself
+            // loader-safe. The `MethodType`/`MethodHandle` arms below have
+            // recorded through this same store on the same key for the same
+            // reason. A failed resolution is deliberately NOT recorded: the
+            // error must be re-raised on each attempt.
+            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(mirror)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(mirror)))?;
@@ -358,6 +489,7 @@ fn cached_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Op
 /// Record the result of resolving this constant-pool entry. Write half of
 /// [`cached_cp_constant`].
 fn record_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16, value: Value) {
+    super::site_cache::site_stats::bump(super::site_cache::site_stats::LDC_FILL);
     let resolver = MemberResolver::new(shared);
     let caller = resolver.scope(class_id);
     let value = resolver.scope(value);
