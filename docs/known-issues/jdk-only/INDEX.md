@@ -1064,3 +1064,16 @@ Three of those are worth reading before acting anywhere in this tree:
   `TIMEOUT=420` on every arm, and when a GC-stress vector fails intermittently,
   check the timeout before the diff — the documented answer was already written
   down and the cost of not reading it was an hour.
+* **`G76-1`** — sweep 13, a fresh axis: what a failed PARSE says and what a
+  closed or out-of-range STREAM does. 48 rows, **42 already exact** (every
+  integral/radix/BigInteger/BigDecimal message, read-after-close on four stream
+  types, mark/reset). Six defects, two of them not messages: **`new
+  ByteArrayOutputStream(-1)` succeeded** — the guard `if v > 0` made "negative"
+  and "unspecified" the same case — and a bad read range raised
+  `ArrayIndexOutOfBoundsException` where HotSpot raises the BASE
+  `IndexOutOfBoundsException`, which survived precisely because `AIOOBE extends
+  IOOBE` and every `catch` still matched. The float parsers say `empty String`
+  where the integral ones say `For input string: ""`; both are vector rows, so
+  the difference cannot be simplified away. `EOFException` carries a null
+  message — an empty message is not the empty string, the same distinction
+  `G72-1` needed.
