@@ -1489,6 +1489,49 @@ pub static UNREG_MEMO_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 /// Times the memo short-circuited a scan at all (the audit's denominator — a
 /// zero numerator is only meaningful beside a non-zero denominator).
 pub static UNREG_MEMO_SHORTCIRCUITS: AtomicUsize = AtomicUsize::new(0);
+
+/// ENGAGEMENT census for the A5 band probe, printed at exit under
+/// `CRATONVM_DBG_A5_ENGAGEMENT=1`.
+///
+/// Four earlier attempts to make this probe cheaper were judged inert from a
+/// profile that did not move. That is an inference, not a measurement: a memo
+/// that never engages and a memo that engages but saves nothing look identical
+/// in a flat profile. These say which. Counted per CALL of the coverage probe.
+pub static A5_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Calls where the memo would have answered "already clean" (no scan needed).
+pub static A5_PROBE_MEMO_CLEAN: AtomicUsize = AtomicUsize::new(0);
+/// Calls where the memo could bound the scan to an incremental band.
+pub static A5_PROBE_MEMO_BANDED: AtomicUsize = AtomicUsize::new(0);
+/// Calls that fell through to a FULL scan because the code-range set changed.
+pub static A5_PROBE_FULL_RESCAN: AtomicUsize = AtomicUsize::new(0);
+/// Total band words the probe was asked to scan (the quantity a memo shrinks).
+pub static A5_PROBE_WORDS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn a5_engagement_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_ENGAGEMENT").is_some()
+    })
+}
+
+/// Print the A5 engagement census. Called from the VM's shutdown path.
+pub fn report_a5_engagement() {
+    if !a5_engagement_enabled() {
+        return;
+    }
+    let calls = A5_PROBE_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        eprintln!("[a5-engagement] calls=0 (probe never ran)");
+        return;
+    }
+    eprintln!(
+        "[a5-engagement] calls={calls} memo_clean={} memo_banded={} full_rescan={} words={}",
+        A5_PROBE_MEMO_CLEAN.load(Ordering::Relaxed),
+        A5_PROBE_MEMO_BANDED.load(Ordering::Relaxed),
+        A5_PROBE_FULL_RESCAN.load(Ordering::Relaxed),
+        A5_PROBE_WORDS.load(Ordering::Relaxed),
+    );
+}
 /// H2-CID0 (2026-08-06) — suppressions on a scan a collector CONSUMES.
 ///
 /// The number that judges the fix. Total suppressions are dominated by
@@ -3037,6 +3080,34 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
             .unwrap_or(scanner_sp);
         let search_lo = scanner_sp.max(cover_hi);
         let high = current_thread_stack_high();
+        // OBSERVATION ONLY — ask the memo what it WOULD have said, without
+        // acting on it. Routing this call site through the memo measured inert
+        // (reverted); this says whether that is because the memo never engages
+        // or because engaging saves nothing. A flat profile cannot tell those
+        // apart, and four attempts were judged on a flat profile.
+        if a5_engagement_enabled() {
+            A5_PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
+            A5_PROBE_WORDS.fetch_add(high.saturating_sub(search_lo) / 8, Ordering::Relaxed);
+            let code_ranges = cratonvm_jit::jit_code_range_count();
+            let hiwater_on = unreg_memo_hiwater_enabled();
+            let would = UNREG_JIT_MEMO.with(|c| {
+                let mut m = c.get();
+                let d = m.observe(search_lo, code_ranges, hiwater_on);
+                // Do NOT store: this is an observer, and `observe` mutates the
+                // hiwater mark. Put the memo back exactly as it was.
+                let _ = m;
+                d
+            });
+            match would {
+                UnregScan::AlreadyClean => A5_PROBE_MEMO_CLEAN.fetch_add(1, Ordering::Relaxed),
+                UnregScan::Detect { hi: Some(_) } => {
+                    A5_PROBE_MEMO_BANDED.fetch_add(1, Ordering::Relaxed)
+                }
+                UnregScan::Detect { hi: None } => {
+                    A5_PROBE_FULL_RESCAN.fetch_add(1, Ordering::Relaxed)
+                }
+            };
+        }
         let hit = if high > search_lo {
             native_stack_has_jit_frame(search_lo, high)
         } else {
