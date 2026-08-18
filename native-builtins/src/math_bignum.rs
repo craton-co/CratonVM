@@ -14,6 +14,60 @@ fn bi_alloc_mag_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
         .unwrap_or_else(|| ctx.new_array(cratonvm_types::ArrayElementType::Int, len))
 }
 
+/// Read a `BigInteger`'s `mag:[I` payload in ONE bulk copy, big-endian order
+/// preserved.
+///
+/// PERF (2026-08-18, commons-math `LegendreHighPrecisionTest`): every read
+/// boundary here used to walk the array with `ctx.get_array_element(mag, i)`.
+/// That is a trait-object dispatch, a `Value` box, AND — on ZGC — a full
+/// `audit_access_receiver` address validation (`VmHeap::is_object_address` +
+/// `ZObjectStarts::contains`) **per word**. `perf record` on a 3M-iteration
+/// `BigInteger.multiply` loop attributed ~30% of the whole process to that
+/// per-element plumbing, against 3.6% for `BigInt::mul` — the arithmetic
+/// itself. `read_int_array_into` is one bounds check and one
+/// `copy_nonoverlapping`; the words are validated once, not `len` times.
+///
+/// The per-element loop is kept as a fallback for the cases the bulk path
+/// declines (wrong array kind, and G1's humongous `int[]`, which has no flat
+/// `array_data_ptr`) so behaviour is unchanged wherever the memcpy is not
+/// available.
+fn bi_read_mag_be(ctx: &dyn NativeContext, mag: ObjectRef, len: usize) -> Vec<u32> {
+    let mut buf = vec![0i32; len];
+    if len == 0 || ctx.read_int_array_into(mag, 0, &mut buf) == len {
+        // `u32` and `i32` have the same bit pattern; this is the same
+        // `v as u32` the element loop applied.
+        return buf.into_iter().map(|v| v as u32).collect();
+    }
+    let mut words: Vec<u32> = Vec::with_capacity(len);
+    for i in 0..len {
+        let w = match ctx.get_array_element(mag, i) {
+            Value::Int(v) => v as u32,
+            _ => 0,
+        };
+        words.push(w);
+    }
+    words
+}
+
+/// Write a big-endian magnitude into a freshly allocated `mag:[I` in ONE bulk
+/// copy — the write twin of [`bi_read_mag_be`], same rationale.
+///
+/// The array is freshly allocated by the caller and not yet reachable from any
+/// Java root, so there is no store barrier to run per element (`int[]` elements
+/// are primitives — no reference stores at all).
+fn bi_write_mag_be(ctx: &mut dyn NativeContext, mag: ObjectRef, be: &[u32]) {
+    // SAFETY of the cast: `[u32]` and `[i32]` have identical layout; the
+    // element loop below performs the same `w as i32` reinterpretation.
+    let signed: &[i32] =
+        unsafe { std::slice::from_raw_parts(be.as_ptr() as *const i32, be.len()) };
+    if ctx.write_int_array_from(mag, 0, signed) {
+        return;
+    }
+    for (i, &w) in be.iter().enumerate() {
+        ctx.set_array_element(mag, i, Value::Int(w as i32));
+    }
+}
+
 /// RBIGDEC.1 — Resolve the real-JDK BigInteger field layout if available.
 ///
 /// Returns `Some((signum_idx, mag_idx))` when the JDK class is loaded with the
@@ -21,9 +75,67 @@ fn bi_alloc_mag_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
 /// or before the class has been loaded — callers fall back to the legacy
 /// 2-field synthetic layout (`BI_FIELD_VALUE` / `BI_FIELD_SIGNUM`).
 pub(crate) fn bi_layout(ctx: &dyn NativeContext) -> Option<(usize, usize)> {
+    if let Some(cached) = bi_layout_cached(ctx.vm_identity()) {
+        return Some(cached);
+    }
     let s = ctx.resolve_field_index("java/math/BigInteger", "signum")?;
     let m = ctx.resolve_field_index("java/math/BigInteger", "mag")?;
+    bi_layout_store(ctx.vm_identity(), (s, m));
     Some((s, m))
+}
+
+// PERF (2026-08-18, commons-math `LegendreHighPrecisionTest`): `bi_layout` was
+// resolving BOTH field indices BY NAME on every single BigInteger/BigDecimal
+// native call, and every one of those `resolve_field_index` calls takes the
+// class-manager `RwLock`, hashes `"java/math/BigInteger"`, `memcmp`s it against
+// the loaded-class table, then walks the field list comparing names. A single
+// `BigDecimal.multiply(mc)` reaches it six-plus times (two operand reads, the
+// result allocation, `precision()`, …). `perf record` on a 3M-iteration
+// `BigInteger.multiply` loop put `resolve_field_index` + `get_loaded_class_id` +
+// the `loaded_classes_probe` hash search + its `memcmp` at ~12% of the whole
+// process — more than `BigInt::mul`, the actual arithmetic, at 3.6%.
+//
+// The layout of `java.math.BigInteger` / `java.math.BigDecimal` is fixed for
+// the life of a VM once the class is loaded, so it is resolved once and then
+// read from a thread-local. Two properties keep the cache honest:
+//
+//   * It is scoped by `vm_identity()` — Rust tests build several independent
+//     `Vm`s in one process, and a synthetic-JDK VM has NO such layout at all.
+//     A cache entry from another VM is never returned.
+//   * Only a **successful** resolve is stored. Before `java.math.BigInteger`
+//     is loaded the resolve legitimately answers `None`, and caching that would
+//     pin every later call to the synthetic-stub fallback.
+//
+// Thread-local rather than a shared atomic cell: this is on the per-call path
+// of every bignum native, and a `static` would put an atomic read (and, with
+// several mutator threads, cache-line ping-pong) where there is now none.
+thread_local! {
+    static BI_LAYOUT_TLS: std::cell::Cell<Option<(usize, (usize, usize))>> =
+        const { std::cell::Cell::new(None) };
+    static BD_LAYOUT_TLS: std::cell::Cell<Option<(usize, (usize, usize, usize, usize))>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn bi_layout_cached(vm: usize) -> Option<(usize, usize)> {
+    BI_LAYOUT_TLS.with(|c| match c.get() {
+        Some((owner, layout)) if owner == vm => Some(layout),
+        _ => None,
+    })
+}
+
+fn bi_layout_store(vm: usize, layout: (usize, usize)) {
+    BI_LAYOUT_TLS.with(|c| c.set(Some((vm, layout))));
+}
+
+fn bd_layout_cached(vm: usize) -> Option<(usize, usize, usize, usize)> {
+    BD_LAYOUT_TLS.with(|c| match c.get() {
+        Some((owner, layout)) if owner == vm => Some(layout),
+        _ => None,
+    })
+}
+
+fn bd_layout_store(vm: usize, layout: (usize, usize, usize, usize)) {
+    BD_LAYOUT_TLS.with(|c| c.set(Some((vm, layout))));
 }
 
 /// Read a `BigInteger` instance and return its decimal string representation.
@@ -51,14 +163,7 @@ pub(crate) fn bi_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
         if len == 0 {
             return "0".to_string();
         }
-        let mut words: Vec<u32> = Vec::with_capacity(len);
-        for i in 0..len {
-            let w = match ctx.get_array_element(mag, i) {
-                Value::Int(v) => v as u32,
-                _ => 0,
-            };
-            words.push(w);
-        }
+        let words = bi_read_mag_be(ctx, mag, len);
         let abs = mag_words_to_decimal(&words);
         if signum < 0 {
             format!("-{}", abs)
@@ -96,9 +201,7 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> Result<Objec
         let mag_words = decimal_to_mag_words(value);
         let mag_arr = bi_alloc_mag_array(ctx, mag_words.len());
         let obj = ctx.read_native_pin(h, obj);
-        for (i, w) in mag_words.iter().enumerate() {
-            ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
-        }
+        bi_write_mag_be(ctx, mag_arr, &mag_words);
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
         ctx.unpin_native_roots(h);
@@ -135,14 +238,8 @@ pub(crate) fn bi_read_int(ctx: &dyn NativeContext, this: ObjectRef) -> crate::bi
         };
         let len = ctx.array_length(mag);
         // big-endian array (index 0 = most significant) → little-endian limbs.
-        let mut words: Vec<u32> = Vec::with_capacity(len);
-        for i in (0..len).rev() {
-            let w = match ctx.get_array_element(mag, i) {
-                Value::Int(v) => v as u32,
-                _ => 0,
-            };
-            words.push(w);
-        }
+        let mut words = bi_read_mag_be(ctx, mag, len);
+        words.reverse();
         BigInt::from_le_words(signum < 0, words)
     } else {
         // Synthetic-stub fallback: parse the decimal string.
@@ -176,9 +273,8 @@ pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigIn
         let mag_arr = bi_alloc_mag_array(ctx, le.len());
         let obj = ctx.read_native_pin(h, obj);
         // little-endian limbs → big-endian array.
-        for (i, &w) in le.iter().rev().enumerate() {
-            ctx.set_array_element(mag_arr, i, Value::Int(w as i32));
-        }
+        let be: Vec<u32> = le.iter().rev().copied().collect();
+        bi_write_mag_be(ctx, mag_arr, &be);
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
         ctx.unpin_native_roots(h);
@@ -3338,10 +3434,17 @@ fn native_bi_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Returns the slot indices for `(intVal, scale, precision, intCompact)`
 /// when the JDK class is loaded.  None ⇒ synthetic-stub fallback.
 fn bd_layout(ctx: &dyn NativeContext) -> Option<(usize, usize, usize, usize)> {
+    // Same per-VM thread-local memo as `bi_layout` — see the comment there for
+    // why it is scoped by `vm_identity()` and why only a successful resolve is
+    // stored. Four name-keyed resolves per call, on every BigDecimal native.
+    if let Some(cached) = bd_layout_cached(ctx.vm_identity()) {
+        return Some(cached);
+    }
     let iv = ctx.resolve_field_index("java/math/BigDecimal", "intVal")?;
     let sc = ctx.resolve_field_index("java/math/BigDecimal", "scale")?;
     let pr = ctx.resolve_field_index("java/math/BigDecimal", "precision")?;
     let ic = ctx.resolve_field_index("java/math/BigDecimal", "intCompact")?;
+    bd_layout_store(ctx.vm_identity(), (iv, sc, pr, ic));
     Some((iv, sc, pr, ic))
 }
 
