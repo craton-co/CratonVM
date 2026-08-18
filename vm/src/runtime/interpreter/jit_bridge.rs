@@ -3618,12 +3618,24 @@ pub(super) fn try_jit_upgrade_with_gate(
     // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
     // through those two, so admitting a synchronized method here is contained.
     //
-    // The three entries that would NOT be wrapped each refuse a synchronized
-    // callee independently, and must keep doing so:
-    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`'s
-    //     `named_method_is_synchronized` gate;
+    // Every OTHER entry runs the body with no monitor at all, and each must
+    // refuse a synchronized callee independently:
+    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`, both
+    //     on its compile path (`..._slow`'s `is_synchronized` gate) AND on its
+    //     `jit_cache` fast path, which serves an already-published body and so
+    //     never reaches that gate;
+    //   * `jit_invoke_dispatch`'s own `jit_cache` arm (`vm/src/jit/helpers.rs`),
+    //     which fills `DISPATCH_CACHE` and does not go through
+    //     `try_jit_compile_callee` at all;
+    //   * the specialized `get(I)D` scalar routes in the same file — `Vector.get`
+    //     is `synchronized` in the JDK, so this one is not hypothetical;
     //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
     //   * OSR — the `is_synchronized` gate near the top of this file.
+    //
+    // The first three ask `CompiledMethod::requires_wrapped_entry`, stamped at
+    // publication, because they hold a raw entry pointer and no method handle.
+    // Listing only the compile-time gates here is what let the fast paths drift:
+    // the enumeration said "three" while `jit_cache` answered for two more.
     //
     // Why this matters: every layer Tomcat's BCEL annotation scan drives per
     // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
@@ -4678,6 +4690,12 @@ pub(super) fn try_jit_upgrade_with_gate(
                 &callee_cached.method_descriptor,
                 &mut compiled,
             );
+            // Stamp the wrapped-entry requirement before the body is shared.
+            // See `CompiledMethod::requires_wrapped_entry`: publication is the
+            // last point that still knows this is an `ACC_SYNCHRONIZED` method,
+            // and every unwrapped consumer downstream holds only a raw entry
+            // pointer.
+            compiled.requires_wrapped_entry = callee_cached.is_synchronized;
             {
                 let mut jit_cache = shared.jit.jit_cache.write();
                 jit_cache.put(
@@ -4836,6 +4854,12 @@ pub(super) fn try_jit_upgrade_with_gate(
         &cached.method_descriptor,
         &mut compiled,
     );
+    // Stamp the wrapped-entry requirement before the body is shared.
+    // See `CompiledMethod::requires_wrapped_entry`: publication is the
+    // last point that still knows this is an `ACC_SYNCHRONIZED` method,
+    // and every unwrapped consumer downstream holds only a raw entry
+    // pointer.
+    compiled.requires_wrapped_entry = cached.is_synchronized;
     let compiled_arc = {
         let mut jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(
@@ -5080,6 +5104,25 @@ pub fn try_jit_compile_callee(
         // kept a mocked class interpreted forever.
         let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
+            // A published body is not automatically a body THIS caller may
+            // enter. `try_jit_compile_callee` is the by-name entry point for
+            // the UNWRAPPED direct-call doors, and its slow path refuses an
+            // `ACC_SYNCHRONIZED` callee for a reason that does not stop being
+            // true once the body already exists: the compiled code carries no
+            // monitor prologue, so a raw CALL to it simply does not lock.
+            //
+            // The background tiering door publishes synchronized bodies on
+            // purpose — `try_jit_compile_wrapped_entry` — because
+            // `execute_jit_call` wraps them. Serving one from here handed the
+            // wrapped-entry body to a caller that supplies no monitor, which is
+            // how `RSyncMethodJit`'s `static synchronized bumpStatic` lost
+            // ~35 of 240 000 increments per run.
+            if compiled.requires_wrapped_entry {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::Synchronized,
+                );
+                return None;
+            }
             // Cast: object/code pointer to integer address
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -6272,6 +6315,12 @@ pub(super) fn try_jit_compile_callee_slow(
         &method_desc_key,
         &mut compiled,
     );
+    // Stamp the wrapped-entry requirement before the body is shared.
+    // See `CompiledMethod::requires_wrapped_entry`: publication is the
+    // last point that still knows this is an `ACC_SYNCHRONIZED` method,
+    // and every unwrapped consumer downstream holds only a raw entry
+    // pointer.
+    compiled.requires_wrapped_entry = cached.is_synchronized;
     let published = {
         let jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(

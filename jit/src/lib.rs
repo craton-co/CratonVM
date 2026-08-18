@@ -2375,6 +2375,30 @@ pub struct CompiledMethod {
     /// (possibly-freed, under `CRATONVM_JIT_FREE_CODE=1`) box. The pointed-to
     /// guard is leaked (process-lifetime), so this raw pointer is always valid.
     pub deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
+    /// This body is an `ACC_SYNCHRONIZED` method's, so entering it is only
+    /// legal through a caller that supplies the implicit monitor.
+    ///
+    /// A compiled body carries no monitor prologue/epilogue — the CALLER
+    /// supplies it. Exactly two entry points do: `execute_jit_call` and
+    /// `execute_jit_call_decoded`, which wrap the activation in a
+    /// `JitSynchronizedMonitorGuard`. Every other consumer CALLs the raw entry
+    /// pointer, and for one of those a synchronized method simply does not
+    /// lock: `RSyncMethodJit` lost ~35 of 240 000 monitor-protected increments
+    /// per run once `bumpStatic` was both published and reached from compiled
+    /// code.
+    ///
+    /// The refusal used to live only in `try_jit_compile_callee_slow`, which
+    /// is the COMPILE path. Its by-name caller `try_jit_compile_callee` serves
+    /// an already-published body straight out of `jit_cache` without re-asking,
+    /// and `jit_invoke_dispatch`'s own `jit_cache` arm never went through
+    /// either — so a body legitimately published FOR the wrapped entry (the
+    /// background tiering door passes `allow_synchronized_wrapped_entry`) was
+    /// handed to unwrapped ones. A predicate that only guards the slow path
+    /// guards nothing once the fast path can answer.
+    ///
+    /// Stamped at publication beside [`Self::owner_class_id`], so it travels
+    /// with the body to every door that holds only a raw entry pointer.
+    pub requires_wrapped_entry: bool,
     /// `ClassId` of the class this body was published under, or
     /// [`cratonvm_types::jit_activation::NO_OWNER_CLASS`] for an artifact that
     /// was never published (test fixtures, probe bodies).
@@ -2562,6 +2586,7 @@ impl CompiledMethod {
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            requires_wrapped_entry: false,
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
@@ -2633,6 +2658,7 @@ impl CompiledMethod {
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            requires_wrapped_entry: false,
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
@@ -20868,6 +20894,120 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every publication into `jit_cache` must stamp
+    /// `CompiledMethod::requires_wrapped_entry`.
+    ///
+    /// The bit is what tells an unwrapped consumer that this body is an
+    /// `ACC_SYNCHRONIZED` method's and carries no monitor prologue. A `put`
+    /// that forgets it publishes a body that every raw-entry door will happily
+    /// CALL unlocked — which is the defect, not a variant of it: `bumpStatic`
+    /// lost ~35 of 240 000 monitor-protected increments per run that way.
+    ///
+    /// A source witness because the alternative is a full `Vm` plus a
+    /// background compile thread; it is anchored on code text, not line
+    /// numbers, and on the `put` call itself, so a new publication site cannot
+    /// be added without either stamping or failing here.
+    #[test]
+    fn every_jit_cache_publication_stamps_the_wrapped_entry_requirement() {
+        let src = std::fs::read_to_string(format!(
+            "{}/../vm/src/runtime/interpreter/jit_bridge.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read jit_bridge.rs");
+
+        let puts: Vec<usize> = src.match_indices("jit_cache.put(").map(|(i, _)| i).collect();
+        assert!(
+            !puts.is_empty(),
+            "no `jit_cache.put(` sites found — retarget this witness"
+        );
+        for at in puts {
+            // The stamp is the last statement before the write lock is taken,
+            // so look back over a window comfortably wider than the
+            // `stamp_compilation_epoch` call that also sits in it.
+            let from = at.saturating_sub(900);
+            assert!(
+                src[from..at].contains("requires_wrapped_entry ="),
+                "a `jit_cache.put(` at byte {at} publishes a body without stamping \
+                 `requires_wrapped_entry`. An unstamped synchronized body is served \
+                 to the raw-entry dispatch doors and runs with no monitor."
+            );
+        }
+    }
+
+    /// The by-name callee entry point must refuse a wrapped-entry body on its
+    /// `jit_cache` FAST PATH, not only on the compile path behind it.
+    ///
+    /// This is the exact shape of the defect. `try_jit_compile_callee_slow`
+    /// refused `ACC_SYNCHRONIZED` callees all along; `try_jit_compile_callee`
+    /// answers from `jit_cache` first and never reached that refusal, so a body
+    /// the background tiering door published FOR the wrapped entry was handed
+    /// to callers that supply no monitor. A gate in front of a slow path guards
+    /// nothing once the fast path can answer.
+    #[test]
+    fn the_callee_cache_fast_path_refuses_a_wrapped_entry_body() {
+        let src = std::fs::read_to_string(format!(
+            "{}/../vm/src/runtime/interpreter/jit_bridge.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read jit_bridge.rs");
+
+        let at = src
+            .find("if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id)")
+            .expect("the callee `jit_cache` fast path must still exist");
+        let end = src[at..]
+            .find("return Some((compiled, entry, needs_ctx));")
+            .map(|off| at + off)
+            .expect("the fast path must still hand back an entry");
+        // The CODE form, not the bare identifier: this arm carries an
+        // explanatory comment that names the field, and matching that would
+        // let the witness pass against a deleted check. The sibling witness
+        // below was caught doing exactly that.
+        assert!(
+            src[at..end].contains("if compiled.requires_wrapped_entry"),
+            "`try_jit_compile_callee`'s `jit_cache` fast path hands back a compiled \
+             entry without asking `requires_wrapped_entry`. Every caller of this \
+             function CALLs that entry raw, with no monitor."
+        );
+    }
+
+    /// The dispatch helper's own `jit_cache` arm must refuse one too.
+    ///
+    /// It does not go through `try_jit_compile_callee` at all, and it CACHES
+    /// what it takes in `DISPATCH_CACHE` — so serving a synchronized body once
+    /// makes every later call at that site run unlocked as well.
+    #[test]
+    fn the_dispatch_helpers_jit_cache_arm_refuses_a_wrapped_entry_body() {
+        let src = std::fs::read_to_string(format!(
+            "{}/../vm/src/jit/helpers.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read vm/src/jit/helpers.rs");
+
+        // Anchor on the arm's own `get`, not on the `jit_cache.read()` above
+        // it: the file has an earlier reader that only inspects `has_indy_trap`
+        // and never hands out an entry, and matching that one would make this
+        // witness pass while the real arm went unguarded.
+        // Anchor on the arm that takes an `info`-keyed entry, matched without
+        // assuming a line ending: the file has an earlier `jit_cache` reader
+        // that only inspects `has_indy_trap` and never hands out an entry, and
+        // matching that one would make this witness pass while the real arm
+        // went unguarded.
+        let at = src
+            .match_indices("if let Some(compiled) = jit_cache.get(")
+            .map(|(i, _)| i)
+            .find(|&i| src[i..(i + 200).min(src.len())].contains("info.class_name"))
+            .expect("the dispatch helper's jit_cache arm must still exist");
+        let window = &src[at..(at + 1400).min(src.len())];
+        // The CODE form. Matching the bare identifier passed against a
+        // `.filter(|_c| true)` because the explanatory comment above the
+        // filter still named the field -- a probe that could not fail.
+        assert!(
+            window.contains("!compiled.requires_wrapped_entry"),
+            "`jit_invoke_dispatch`'s `jit_cache` arm fills `DISPATCH_CACHE` with a \
+             raw entry without asking `requires_wrapped_entry`"
+        );
+    }
 
     /// `pack_multianewarray_site` must survive the round trip for every class
     /// id and cp index a real site can carry, and must not let one field bleed

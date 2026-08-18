@@ -10798,7 +10798,16 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             info.method_name,
             info.descriptor,
             info_class_id,
-        ) {
+        )
+        // A raw CALL to the entry below supplies no monitor, so an
+        // `ACC_SYNCHRONIZED` body must not be served here — it would run
+        // unlocked and, worse, be cached in `DISPATCH_CACHE` so every later
+        // call at this site runs unlocked too. Falling through leaves the site
+        // on the interpreter route, whose `dispatch_static` /
+        // `dispatch_virtual` arms take the monitor. See
+        // `CompiledMethod::requires_wrapped_entry`.
+        .filter(|compiled| !compiled.requires_wrapped_entry)
+        {
             let entry = compiled.entry_ptr() as usize;
             let needs_ctx = compiled.needs_context();
             if crate::runtime::env_cache::jit_dispatch_dbg() {
@@ -13411,7 +13420,12 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     };
     let mut compiled = {
         let cache = vm.jit.jit_cache.read();
-        cache.get(&class_name, "get", "(I)D", receiver_class_id)
+        cache
+            .get(&class_name, "get", "(I)D", receiver_class_id)
+            // `java.util.Vector.get(int)` is `synchronized`, so this route is
+            // one `Vector` receiver away from calling a monitor-bearing body
+            // with no monitor. See `CompiledMethod::requires_wrapped_entry`.
+            .filter(|compiled| !compiled.requires_wrapped_entry)
     };
     if compiled.is_none() {
         // This direct scalar route bypasses the normal bytecode invocation
@@ -13517,7 +13531,10 @@ unsafe fn try_fast_lambda_int_to_double_apply(
     };
     let compiled = {
         let cache = vm.jit.jit_cache.read();
-        cache.get(&class_name, "get", "(I)D", receiver_class_id)
+        cache
+            .get(&class_name, "get", "(I)D", receiver_class_id)
+            // The `Vector.get` case again — see the sibling route above.
+            .filter(|compiled| !compiled.requires_wrapped_entry)
     };
     let Some(compiled) = compiled else {
         return Ok(None);
