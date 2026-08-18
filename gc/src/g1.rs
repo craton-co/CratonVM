@@ -5875,6 +5875,18 @@ impl G1Collector {
         // (Edges are collected and applied after the walk to keep borrows simple;
         // `add_reference` dedups.)
         let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
+        // G1AUD-9 — the `(target, holder)` pairs already emitted for the region
+        // being walked. `holder` is constant for a whole region walk and an
+        // rset is a SET, so the pair is fully determined by `target`.
+        //
+        // Without it this rebuild pushed one pair per cross-region REFERENCE
+        // SLOT: an Old region holding a 100k-element node array that points into
+        // Eden emitted 100k copies of the same edge, and the apply loop below
+        // then took that destination's rset mutex and hashed the same source
+        // 100k times. Cleared per region, so it costs one small `HashSet` and
+        // bounds the pushes by the region COUNT rather than the slot count.
+        let mut seen_targets: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         let jit_skips = self.jit_tlab_skip_spans();
         let dbg_walk = gc_flags().g1_dbg_reach;
         let mut walk_aborted = false;
@@ -5888,6 +5900,8 @@ impl G1Collector {
             let base = regions[i].data.as_mut_ptr();
             let mut offset = 0usize;
             let mut trail = WalkTrail::default();
+            // New holder — the memo above is keyed on target alone.
+            seen_targets.clear();
 
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
@@ -5969,6 +5983,7 @@ impl G1Collector {
                     obj_ptr,
                     header,
                     &mut new_rset_edges,
+                    &mut seen_targets,
                     want_census.then_some(&mut census),
                 );
                 offset += obj_size;
@@ -6010,6 +6025,7 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         out: &mut Vec<(usize, usize)>,
+        seen: &mut std::collections::HashSet<usize>,
         mut census: Option<&mut HumongousCensus>,
     ) {
         let holder_span = humongous_span_start(regions, holder).unwrap_or(holder);
@@ -6027,7 +6043,11 @@ impl G1Collector {
                     }
                 }
             } else if target != holder && is_collectable_region_type(regions[target].region_type) {
-                out.push((target, holder));
+                // G1AUD-9: emit each `(target, holder)` edge ONCE per holder
+                // region — see `seen_targets` at the caller.
+                if seen.insert(target) {
+                    out.push((target, holder));
+                }
             }
         };
 
@@ -15508,6 +15528,77 @@ mod tests {
             gc.lookup_region_for_addr(ptr as usize),
             Some(5),
             "the hint names region 5; a scan would have answered 2"
+        );
+    }
+
+    /// G1AUD-9 — Phase 4's remembered-set rebuild must emit each
+    /// `(target, holder)` edge ONCE per holder region, not once per reference
+    /// SLOT.
+    ///
+    /// An rset is a SET of source region indices and `holder` is constant for a
+    /// whole region walk, so every slot after the first that names the same
+    /// target region says nothing new — but each one used to push a pair and
+    /// then drive an `add_reference_in_generation` call that takes the
+    /// destination's rset mutex and hashes the same source again. A single old
+    /// region holding one large node array is enough to turn that into six
+    /// figures of redundant locked hash operations per pause.
+    ///
+    /// Sixteen slots all naming ONE target region must produce exactly one
+    /// edge; a second target must still produce a second.
+    #[test]
+    fn the_phase4_rset_rebuild_emits_one_edge_per_target_region() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(7), ArrayElementType::Reference, 16);
+        let arr_ptr = arr.as_ptr();
+        let holder = gc
+            .lookup_region_for_addr(arr_ptr as usize)
+            .expect("the array must live in a region");
+
+        // Two OTHER regions, typed so `is_collectable_region_type` admits them.
+        // `collect_outgoing_cross_region_edges` never dereferences a target — it
+        // only asks which region the address falls in and what type that region
+        // is — so synthetic in-region addresses are exactly what a real
+        // reference slot looks like to it.
+        let (t1, t2) = (holder + 1, holder + 2);
+        let (a1, a2) = {
+            let mut regions = gc.regions.lock();
+            regions[t1].region_type = RegionType::Eden;
+            regions[t2].region_type = RegionType::Eden;
+            (
+                regions[t1].data.as_ptr() as usize + 64,
+                regions[t2].data.as_ptr() as usize + 64,
+            )
+        };
+
+        // Fifteen slots into t1, one into t2.
+        let data = unsafe { arr_ptr.add(ARRAY_DATA_OFFSET) };
+        for k in 0..16usize {
+            let raw = if k == 15 { a2 } else { a1 + k * 8 };
+            unsafe { std::ptr::write(data.add(k * 8) as *mut u64, raw as u64) };
+        }
+
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        {
+            let regions = gc.regions.lock();
+            let header = unsafe { &*(arr_ptr as *const ObjectHeader) };
+            gc.collect_outgoing_cross_region_edges(
+                &regions,
+                holder,
+                arr_ptr,
+                header,
+                &mut out,
+                &mut seen,
+                None,
+            );
+        }
+
+        out.sort_unstable();
+        assert_eq!(
+            out,
+            vec![(t1, holder), (t2, holder)],
+            "fifteen slots naming region {t1} are ONE edge, not fifteen — and \
+             the distinct target {t2} must still be recorded"
         );
     }
 
