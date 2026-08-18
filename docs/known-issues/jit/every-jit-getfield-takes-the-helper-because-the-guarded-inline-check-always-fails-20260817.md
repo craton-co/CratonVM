@@ -92,29 +92,86 @@ A fast path that costs measurably *more* than the helper it is meant to avoid is
 a fast path that never takes its fast branch. **The inline guard is pure
 overhead today.**
 
-## What to do next
+## Step 1 is DONE — the counter, and the price (2026-08-18)
 
-1. **Instrument before fixing.** Add an engagement counter to the guarded inline
-   site — one increment on the inline branch, one on the fall-through — and
-   print both. The whole point of this page is that a fast path can be emitted,
-   measured, and still never run; a fix priced on anything but that counter is a
-   guess.
-2. **Then** decide whether ZGC should publish its arena bounds.
-   `ZgcRealHeap` holds a single contiguous `Mutex<Arena>`, so
-   `[base, base+capacity)` is available and has the same "mapped for the heap's
-   lifetime" property the Generational argument relies on.
-3. **Reference fields need separate treatment under ZGC.** A compact reference
-   slot holds `Z_COLORED_TAG | colour | offset`, not a pointer, so an inline raw
-   load of a *reference* field and handing it on is precisely the use-after-free
-   that `zgc_read_barrier_blocks_inline_fields` (stage (a) of
-   `feature-designs/zgc-jit-load-barrier.md`) exists to prevent. Primitive
-   fields need neither a load barrier nor narrow-oop decoding, and `c_is_ref` is
-   already known at the emission site — so a per-field-kind gate is available
-   and a blanket one is not.
+Both came from `probes/AccessorDispatchProbe.java`, built for
+[`../perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`](../perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md),
+whose whole 80x gap turned out to be this page.
+
+**The counter.** `jit_getfield` increments `GETFIELD_HELPER_CALLS`, printed as
+`[GETFIELD_CENSUS] helper_calls=…` on the existing `CRATONVM_DBG=mic-prof` dump.
+Reaching that function at all means the guard fell through, so the count IS the
+miss count; the probe supplies an exact denominator, because four of its arms do
+`rounds × per` field reads and nothing else:
+
+| rounds | field reads | `helper_calls` | miss rate |
+|---:|---:|---:|---:|
+| 3 | 24 000 000 | 23 993 196 | 99.972% |
+| 5 | 40 000 000 | 39 993 236 | 99.983% |
+| 8 | 64 000 000 | 63 993 131 | 99.989% |
+
+The shortfall is **constant at ~6 800, not proportional**, which says more than
+the percentage: the inline branch works for a few thousand reads at startup and
+then never again. In steady state the fast path is taken **zero** times. The
+page's central claim is now a number.
+
+**The price.** One `getfield` from compiled code is **9.7 ns** (Windows) /
+**13.2 ns** (Azure Linux), isolated by subtracting an arm that passes the array
+as an argument from one that reads it out of `this`. For scale, entering and
+leaving the whole compiled callee is 3.4 / 6.7 ns, and HotSpot reads both taxes
+at ≤ 0.06. `perf` agrees: `jit_getfield` 9.89% + `is_object_address` 6.41% +
+`ZObjectStarts::contains` 4.40% = **20.7% of the run, two-thirds of all
+VM-binary time**.
+
+## What to do next — with two of the three old candidates now refused
+
+The plan below used to have three items. Two of them have been measured and do
+not work; keeping them on the list would cost the next person the same two days.
+
+1. ~~**Decide whether ZGC should publish its arena bounds.**~~ **Refused by
+   measurement.** Generational already publishes `JIT_REGION_BOUNDS` and is
+   *slower* on the probe, not faster: `callTax` 15.2/16.4/15.8 against ZGC's
+   13.3/12.8/13.1, three reps each. Publishing bounds cannot be the fix while
+   the collector that publishes them is behind the one that does not.
+2. ~~**A per-field-KIND gate** (primitive fields load inline, reference fields
+   keep the barrier).~~ **Refused by measurement.** The probe's `primFieldGet`
+   arm reads a primitive `int` field and costs **8.7 ns — the same** as the
+   `double[]` reference read's 9.7. The reference/primitive distinction is real
+   for *soundness* (a compact reference slot holds
+   `Z_COLORED_TAG | colour | offset`, not a pointer — see
+   `zgc_read_barrier_blocks_inline_fields`, stage (a) of
+   `feature-designs/zgc-jit-load-barrier.md`), but it is not the discriminator
+   for *speed*, because primitive reads miss the guard just as completely.
+3. **The discriminator is downstream of both the collector and the region
+   table.** Same probe, same 40 000 000-read denominator, the counter under each
+   candidate:
+
+   | arm | `helper_calls` | miss rate |
+   |---|---:|---:|
+   | default (ZGC) | 39 992 012 | 99.98% |
+   | `CRATONVM_JIT_INLINE_GETFIELD=1` | 39 991 991 | 99.98% |
+   | `--XX:UseGc Generational` | 39 993 021 | 99.98% |
+
+   `INLINE_GETFIELD=1` emits the raw form — the six region compares are gone
+   from the disassembly, leaving only a null check and `test byte [rax+0Fh],4`
+   (`GC_FLAG_COMPACT`, `types/src/heap_types.rs`) — and the miss rate does not
+   move. The receiver cannot be the null case: the loop completes 10 000 000
+   successful reads per arm. So the fall-through survives removing the region
+   test *and* switching to the collector that publishes it, which leaves the
+   compact-layout tag test and the site's own admission as the two remaining
+   candidates.
+
+   Note that ZGC *does* set the flag — `zgc.rs`'s allocator calls
+   `header.add_gc_flags(GC_FLAG_COMPACT)` and its comment says "set at
+   allocation". So either these objects are not getting it, or the emitted site
+   for these fields is not a guarded-inline site at all and the disassembled
+   inline branch is unreachable by construction. Distinguishing those two is one
+   read of a `Vec` instance's header, and the instrument for it is now in place.
 
 ## The transferable part
 
-**A fast path that is emitted is not a fast path that runs.** Three separate
+**A fast path that is emitted is not a fast path that runs**, and it took a
+counter to say so: the miss rate is 99.98%. Three separate
 signals agreed the inline `getfield` was live — the gates are default-on, 35
 sites were emitted, and the codegen arm is exercised by unit tests — and all
 three are about *emission*. Only the profile and the kill-switch A/B asked
