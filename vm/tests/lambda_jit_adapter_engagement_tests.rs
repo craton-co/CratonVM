@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Proof that `lambda_jit_oneshot_tests` is testing something.
+//! Proof that a SAM call site really does end up dispatching in machine code.
 //!
 //! Those tests assert that a lambda-dense fixture produces the same numbers
 //! CratonVM and a real JDK both produce. Every one of them would ALSO pass on a
@@ -42,7 +42,7 @@ fn real_jdk_vm() -> Option<Vm> {
 }
 
 #[test]
-fn test_lambda_one_shot_actually_engages() {
+fn test_inline_cache_takes_over_the_sam_call_site() {
     if !std::path::Path::new(&format!(
         "{}/cratonvm/LambdaJitTierUp.class",
         test_resources_dir()
@@ -66,7 +66,7 @@ fn test_lambda_one_shot_actually_engages() {
     // route declines bodies the worker admits. Determinism bought by
     // suppressing the thing under test is not determinism.
     cratonvm_types::flags::with_process_overrides(
-        &[("CRATONVM_DBG_LAMBDA_JIT", Some("1")), ("CRATONVM_JIT_LAMBDA_SITE", Some("0"))],
+        &[("CRATONVM_DBG_LAMBDA_JIT", Some("1"))],
         || run_fixture(),
     );
 }
@@ -99,11 +99,20 @@ fn run_fixture() {
          compiled body — every correctness test in lambda_jit_tierup_tests is \
          therefore green about a path it never took"
     );
-    // And specifically the INTERPRETED arm, the half this configuration
-    // (`CRATONVM_JIT_LAMBDA_SITE=0`) exists to cover — the mirror of the
-    // assertion in `lambda_jit_engagement_tests`.
+    // The thunk is installed per SITE, so this counts sites and not calls —
+    // which is the point. Every dispatch after one lands never reaches Rust
+    // again, so a per-call counter necessarily goes quiet exactly when the
+    // feature starts working, and this is the number that does not.
+    let installs = cratonvm_vm::runtime::interpreter::lambda_jit_adapter_installs();
     assert!(
-        fast_returns > 100_000,
-        "only {fast_returns} of 800 000 dispatches took the interpreted one-shot          (the JIT-side arm took {site_direct}) — lambda_jit_oneshot_tests would          then be testing the JIT-side arm twice and the one-shot not at all"
+        installs > 0,
+        "no SAM call site was given an inline-cache thunk (site_direct={site_direct},          fast_returns={fast_returns}) — the call site is still answered by Rust on          every call, which is the whole defect this was built to remove"
+    );
+    // And the corollary, which is the actual claim: Rust is no longer ON the
+    // path. A handful of calls precede the install; hundreds of thousands do
+    // not follow it.
+    assert!(
+        site_direct < 10_000,
+        "{site_direct} of 800 000 dispatches still went through the Rust arm          after {installs} thunk install(s) — the inline cache is not serving the          call site it was installed into"
     );
 }

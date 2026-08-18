@@ -45,15 +45,6 @@ fn real_jdk_vm() -> Option<Vm> {
     ))
 }
 
-/// One process, one flag, set once before anything can read it.
-fn force_interpreted_half() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: runs before this binary has created any VM, and every test
-        // here goes through this function first.
-        std::env::set_var("CRATONVM_JIT_LAMBDA_SITE", "0");
-    });
-}
 
 macro_rules! require_class_library {
     () => {
@@ -75,13 +66,25 @@ macro_rules! require_class_files {
     };
 }
 
+/// Run the fixture with the JIT-side arm turned off, so the interpreted
+/// one-shot is what serves the SAM calls.
+///
+/// `with_process_overrides`, not `std::env::set_var`: a declared flag is served
+/// from a snapshot latched on FIRST read, so setting the variable only takes
+/// effect if the call happens to win the race to initialise it — and the VM
+/// reads it from threads this test never created, which is what rules out the
+/// thread-scoped variant.
 fn checksum(method: &str) -> i32 {
-    force_interpreted_half();
-    let mut vm = real_jdk_vm().expect("guarded by require_class_library!");
-    match vm.invoke("cratonvm/LambdaJitTierUp", method, "()I", &[]) {
-        Ok(Some(Value::Int(v))) => v,
-        other => panic!("{method} returned unexpected value: {other:?}"),
-    }
+    cratonvm_types::flags::with_process_overrides(
+        &[("CRATONVM_JIT_LAMBDA_SITE", Some("0"))],
+        || {
+            let mut vm = real_jdk_vm().expect("guarded by require_class_library!");
+            match vm.invoke("cratonvm/LambdaJitTierUp", method, "()I", &[]) {
+                Ok(Some(Value::Int(v))) => v,
+                other => panic!("{method} returned unexpected value: {other:?}"),
+            }
+        },
+    )
 }
 
 // Golden values below were produced by running the byte-identical

@@ -1341,6 +1341,14 @@ pub(crate) struct LambdaJitSite {
     /// feature under one kill switch.
     code: std::cell::RefCell<Option<cratonvm_jit::RetainedCode>>,
     code_generation: std::cell::Cell<u64>,
+    /// Latched once this site has an inline-cache thunk.
+    ///
+    /// Without it the Rust arm re-writes the cache slot on every call it still
+    /// serves — measured at 202 000 "installs" for what should be a handful —
+    /// which is not merely wasted work: the slot's first cache line is the one
+    /// the emitted cascade loads on every dispatch from every thread, and
+    /// storing to it repeatedly is how a fast path pays for its own existence.
+    adapter_installed: std::cell::Cell<bool>,
     /// Latched the first time this site's compiled body DEOPTS.
     ///
     /// A deopt means the body did not complete, and the direct arm has no way
@@ -1365,6 +1373,31 @@ impl LambdaJitSite {
 
     pub(crate) fn total_args(&self) -> usize {
         self.total_args
+    }
+
+    /// Claim the one-time inline-cache install for this site, returning `true`
+    /// exactly once. See [`LambdaJitSite::adapter_installed`].
+    pub(crate) fn claim_adapter_install(&self) -> bool {
+        !self.adapter_installed.replace(true)
+    }
+
+    /// Does this site's SAM call need a `checkcast` replayed per call? A
+    /// hand-emitted thunk cannot ask a class-hierarchy question.
+    pub(crate) fn has_checkcasts(&self) -> bool {
+        !self.checkcasts.is_empty()
+    }
+
+    /// Is the implementation a static method — i.e. does dropping the proxy
+    /// receiver lose nothing? Always true for a non-capturing javac lambda, and
+    /// asserted rather than assumed because the thunk drops it outright.
+    pub(crate) fn is_static_impl(&self) -> bool {
+        self.cached.is_static
+    }
+
+    /// The implementation's declaring class, for the inline cache's own
+    /// diagnostic record of what it cached.
+    pub(crate) fn impl_class_name(&self) -> &str {
+        &self.cached.class_name
     }
 
     /// May the direct compiled arm still serve this site? See
@@ -1557,6 +1590,7 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         gate,
         code: std::cell::RefCell::new(None),
         code_generation: std::cell::Cell::new(u64::MAX),
+        adapter_installed: std::cell::Cell::new(false),
         direct_disabled: std::cell::Cell::new(false),
     }))
 }
@@ -1587,6 +1621,7 @@ pub(crate) fn lambda_jit_site_code(
             .map(cratonvm_jit::RetainedCode::new);
         *site.code.borrow_mut() = found;
         site.code_generation.set(generation);
+        site.adapter_installed.set(false);
         // A moved generation means a publication or an invalidation — including
         // the recompile that a de-speculation drives. The body being probed now
         // is not the one that deopted, so the latch that took this site off the
@@ -1670,6 +1705,11 @@ pub(crate) mod lambda_site_prof {
     pub(crate) static SITE_DEOPTED: AtomicU64 = AtomicU64::new(0);
     /// Refused because the argument shape did not match the site's.
     pub(crate) static SITE_ARITY: AtomicU64 = AtomicU64::new(0);
+    /// Inline-cache thunks installed. Counts SITES, not calls — every dispatch
+    /// after one of these lands never reaches Rust at all, which is precisely
+    /// why the per-call counters go quiet when the feature is working and this
+    /// one is the only evidence left.
+    pub(crate) static SITE_ADAPTERS: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(crate) fn bump(counter: &AtomicU64) {
@@ -1695,13 +1735,14 @@ pub(crate) mod lambda_site_prof {
 
     pub(crate) fn line() -> String {
         format!(
-            "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} site_arity={}",
+            "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} site_arity={} site_adapters={}",
             SITE_CALLS.load(Ordering::Relaxed),
             SITE_DIRECT.load(Ordering::Relaxed),
             SITE_NO_CODE.load(Ordering::Relaxed),
             SITE_REFUSED.load(Ordering::Relaxed),
             SITE_DEOPTED.load(Ordering::Relaxed),
             SITE_ARITY.load(Ordering::Relaxed),
+            SITE_ADAPTERS.load(Ordering::Relaxed),
         )
     }
 }
@@ -1755,6 +1796,20 @@ pub(crate) fn lambda_site_bump_refused() {
 pub(crate) fn lambda_site_bump_deopted() {
     lambda_site_prof::bump(&lambda_site_prof::SITE_DEOPTED);
 }
+/// NOT gated on the census switch. An installed thunk is a lasting change to a
+/// call site, not a per-call event, so one relaxed increment per SITE is free
+/// and the number is what `lambda_jit_adapter_installs` reports to the tests
+/// that must prove the inline cache really took over.
+#[inline]
+pub(crate) fn lambda_site_bump_adapter() {
+    lambda_site_prof::SITE_ADAPTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many SAM call sites have had an inline-cache thunk installed.
+pub fn lambda_jit_adapter_installs() -> u64 {
+    lambda_site_prof::SITE_ADAPTERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[inline]
 pub(crate) fn lambda_site_bump_arity() {
     lambda_site_prof::bump(&lambda_site_prof::SITE_ARITY);

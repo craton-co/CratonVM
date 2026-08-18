@@ -2,13 +2,15 @@
 
 ## Status
 **PARTLY FIXED 2026-08-18, and fully diagnosed.** The Generational defect is
-closed: 68 722 450 helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). On ZGC
-and G1 the inline path is now engaged for **every primitive field read**
-(measured: 0 primitive misses on all three collectors); the entire remainder is
-**reference** reads. On ZGC those are blocked on the JIT load barrier and this
-page is finished. On G1 they are not blocked by anything and are the one
-actionable item left — see "What is still open" item 2, whose scope this
-measurement narrowed from "the general containment fix" to "a G1 fix".
+closed: 68 722 450 helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). On all
+three collectors the inline path is now engaged for **every primitive field
+read** — 0 primitive misses, measured two independent ways — and the entire
+remainder is **reference** reads. On ZGC those are blocked on the JIT load
+barrier (a compact reference slot there is a colored word, not a pointer) and
+this page is finished. On **G1** they are blocked by nothing: no colored
+pointers, plain-pointer reference fields, 56.9M pure containment failures. That
+is the one actionable item left, and it narrows item 2 from "the general
+containment fix" to "a G1 fix".
 
 This title has now been wrong twice. The original blamed the containment check;
 the first correction concluded it was "NOT because the guarded inline check
@@ -418,10 +420,37 @@ Partial, and named as such.
 
 ## What is still open
 
-1. **ANSWERED 2026-08-18: the residual is 100% reference-field reads, 0%
-   primitives.** Same binary, `SHA256Digest` x200 000, counts only (this is a
-   separate build from the timing numbers above — do not compare wall clocks
-   across them):
+1. ~~**The remaining ZGC/G1 misses are the SINGLE-PASS arm's containment
+   check**, which is not getting its trusted-oop shortcut because it requires
+   `stack_oop_marks_exact`.~~ **Answered 2026-08-18, and the premise was wrong.**
+   `stack_oop_marks_exact` is not false at these sites. A per-clause diagnostic
+   on `receiver_is_trusted_oop`'s three conjuncts (under
+   `CRATONVM_DBG_COMPACT_INLINE`, emission-time only) prints **zero** refusals
+   across `probes/AccessorDispatchProbe.java` — the single-pass arm takes its
+   shortcut everywhere.
+
+   The residual misses are the **IR/C2** arm, and they are not a bug: its
+   trusted-oop shortcut is primitives-only *by design*, and the blocking site
+   prints `getfield pc=1 off=0 ref=true`. Measured on Azure Linux, quiet host,
+   after `a6f0ecf75` + `8787edbbe`:
+
+   | field kind | ZGC | Generational |
+   |---|---:|---:|
+   | primitive `int` | **1.51 ns** | **1.51 ns** |
+   | reference `double[]` | **25.2 ns** | **0.95 ns** |
+
+   Primitive reads are fixed on both collectors and call the helper zero times.
+   A reference read is **26x** more expensive on ZGC than on Generational,
+   which is exactly the colored-pointer constraint this page's item 3 already
+   names — so what is left is not a guard to repair but the load barrier to
+   build. That makes item 2 below (a read-side bounds table) the real successor
+   to this page, not a fourth sub-problem here.
+
+   **The third collector, and the reason item 2 survives this.** The same
+   question asked as an EXECUTION census — `jit_getfield` bucketing every
+   `outside-published-bounds` call by whether the field read is a reference —
+   agrees on all of the above and adds G1, which the timings above do not
+   cover. `SHA256Digest` x200 000, one binary, counts only:
 
    | collector | helper calls | primitive | reference |
    |---|---:|---:|---:|
@@ -429,28 +458,12 @@ Partial, and named as such.
    | G1 | 56 930 831 | **0** | 56 930 831 |
    | Generational | 0 | 0 | 0 |
 
-   A zero in the primitive column on every collector settles two things at
-   once, and one of them refutes what this list said a revision ago:
-
-   * **Every arm's PRIMITIVE path is now fully engaged, on all three
-     collectors.** The "single-pass arm is failing to take a shortcut it is
-     entitled to" candidate is dead — there is no primitive miss anywhere for
-     it to explain. `stack_oop_marks_exact` is evidently not the problem it
-     was hypothesised to be, and no further work on the trusted-oop shortcut
-     is indicated.
-   * **What is left is exactly the set that must not be inlined under ZGC.** A
-     compact reference slot there may hold `Z_COLORED_TAG | colour | offset`
-     rather than a pointer; inlining its load is the use-after-free
-     `heap.rs::read_prim_element` panics on by design and
-     `feature-designs/zgc-jit-load-barrier.md` (risk J1) rates worse than a
-     clean SIGSEGV. **On ZGC this page is finished** — the remainder is
-     blocked on that load barrier, which is a designed piece of work with its
-     own page, and there is nothing left to fix in the getfield arms.
-
-   **G1 is the exception, and it is now the one actionable item.** G1 has no
-   colored pointers: a reference field there is a plain pointer, and its
-   56.9M misses are pure containment failures with no soundness obstacle
-   behind them. See item 2 — whose value is now known to be G1-only.
+   G1's residual is the same size and the same shape as ZGC's — and G1 has **no
+   colored pointers**. A reference field there is a plain pointer, so those
+   56.9M are pure containment failures with no soundness obstacle behind them
+   at all. ZGC must wait for the load barrier; **G1 could be fixed today**, and
+   that makes item 2 a G1 fix rather than the general containment fix it was
+   written up as.
 2. **The proper fix for containment under a non-publishing collector is a
    separate READ-SIDE bounds table.** This is a design, not a bug fix, and
    deserves its own page — but the shape is settled enough to write down, so
