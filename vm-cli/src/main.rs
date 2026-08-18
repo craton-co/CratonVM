@@ -6334,6 +6334,7 @@ fn main() {
             maybe_dump_shutdown_reports();
             match result {
                 Ok(()) => {
+                    cratonvm_vm::jit::conservative_roots::report_a5_engagement();
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();
                 }
