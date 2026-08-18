@@ -1850,7 +1850,14 @@ pub fn field_coercion_loss_report() -> Option<String> {
 fn coercion_loss_verbose() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_COERCION")
+        // `flags::runtime_var`, not `std::env::var`. A DECLARED name read
+        // raw is served by a live `getenv` instead of the latched snapshot,
+        // so `CRATONVM_DBG=coercion` would silently do nothing here and a
+        // test could not arrange it through `with_thread_overrides` — which
+        // matters for a diagnostic the guard's own WARN text tells operators
+        // to set. Check 4 of `tools/flag-census/check-surface.sh` names this
+        // call site as a core-crate bypass.
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_COERCION")
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false)
     })

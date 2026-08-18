@@ -1441,7 +1441,11 @@ fn misplaced_launcher_flags(argv: &[String]) -> Vec<&'static str> {
 /// "check your argument order" leaves the reader doing the work this function
 /// already did.
 fn warn_about_misplaced_launcher_flags(argv: &[String]) {
-    if std::env::var_os(MISPLACED_FLAG_WARNING_OFF).is_some() {
+    // `flags::runtime_var_os`, not `std::env::var_os`: now that the name is
+    // declared, a raw read would be served by a live `getenv` rather than the
+    // latched snapshot, so the grouped `CRATONVM_DBG=-misplaced-flag-warning`
+    // spelling would silently not reach it.
+    if cratonvm_types::flags::runtime_var_os(MISPLACED_FLAG_WARNING_OFF).is_some() {
         return;
     }
     let misplaced = misplaced_launcher_flags(argv);

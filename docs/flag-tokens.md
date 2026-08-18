@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-455 tokens.
+459 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -112,12 +112,15 @@ export inherited from a parent shell.
 | `callee-probe` | `CRATONVM_DBG_CALLEE_PROBE` |
 | `caller` | `CRATONVM_DBG_CALLER` |
 | `capval` | `CRATONVM_DBG_CAPVAL` |
+| `misplaced-flag-warning` | `CRATONVM_NO_MISPLACED_FLAG_WARNING` |
 | `catalina` | `CRATONVM_DBG_CATALINA` |
 | `cause` | `CRATONVM_DBG_CAUSE` |
+| `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |
 | `ccsprobe` | `CRATONVM_DBG_CCSPROBE` |
+| `coercion` | `CRATONVM_DBG_COERCION` |
 | `cellcorrupt` | `CRATONVM_DBG_CELLCORRUPT` |
 | `charset` | `CRATONVM_DBG_CHARSET` |
 | `class-resource` | `CRATONVM_DBG_CLASS_RESOURCE` |
@@ -522,7 +525,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-185 tokens.
+189 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -704,10 +707,10 @@ export inherited from a parent shell.
 | `vectorize` | `CRATONVM_JIT_VECTORIZE` |
 | `verify-arena-order` | `CRATONVM_JIT_VERIFY_ARENA_ORDER` |
 | `verify-frame-states` | `CRATONVM_JIT_VERIFY_FRAME_STATES` |
-| `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
-| `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-ir` | `CRATONVM_JIT_VERIFY_IR` |
 | `verify-memory-chain` | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` |
+| `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
+| `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
 | `verify-types` | `CRATONVM_JIT_VERIFY_TYPES` |
 | `virtual-tierup` | `CRATONVM_JIT_VIRTUAL_TIERUP` |
@@ -718,7 +721,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-56 tokens.
+57 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -853,7 +856,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-17 tokens.
+18 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -871,6 +874,7 @@ export inherited from a parent shell.
 | `inherit-thread-ccl` | `CRATONVM_INHERIT_THREAD_CCL` |
 | `inherit-tl-workaround` | `CRATONVM_INHERIT_TL_WORKAROUND` |
 | `lock-order-check` | `CRATONVM_LOCK_ORDER_CHECK` |
+| `shutdown-hook-timeout-ms` | `CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS` |
 | `stress-thread-states` | `CRATONVM_STRESS_THREAD_STATES` |
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
