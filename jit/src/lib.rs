@@ -15232,6 +15232,19 @@ fn precise_getstatic_checkcast_enabled() -> bool {
 ///   never built. Not cached here: `inline_getfield_enabled` does its own
 ///   `OnceLock`, and this runs per protected opcode at COMPILE time, never on
 ///   any hot path.
+/// `CRATONVM_DBG_RBC6_EMIT=1` — trace which exit each protected throwing site
+/// is given at EMIT time.
+///
+/// The `[rbc6-dbg]` family traces the RUNTIME sinks. A frame that never reaches
+/// them can be missing for two different reasons and only this says which: the
+/// site chose the shared sentinel stub (no frame was ever built), or it chose
+/// the reason-9 stub and the frame was lost between the stub and the sink.
+pub(crate) fn rbc6_emit_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6_EMIT").is_some())
+}
+
 fn precise_field_ops_enabled() -> bool {
     if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_FIELD_OPS").is_some() {
         return false;

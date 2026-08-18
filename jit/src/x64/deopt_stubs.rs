@@ -1048,6 +1048,17 @@ impl Compiler {
         // cheaper, and the stash stays quiet on straight-line invokes.
         let throw_bci = self.dbg_last_pc;
         let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if crate::rbc6_emit_dbg() {
+            eprintln!(
+                "[rbc6-emit] post_invoke_exc_check method={} bci={} ret={} precise_req={} protected={} -> {}",
+                self.method_key,
+                throw_bci,
+                ret_type as char,
+                self.precise_exception_frames,
+                self.pc_is_protected(throw_bci),
+                if precise_exc_stub { "REASON9" } else { "shared-sentinel" },
+            );
+        }
         if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
             let box_ptr = self.build_and_record_deopt_point(
                 throw_bci,

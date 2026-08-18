@@ -398,6 +398,7 @@ export inherited from a parent shell.
 | `raf-getfd` | `CRATONVM_DBG_RAF_GETFD` |
 | `raf-init` | `CRATONVM_DBG_RAF_INIT` |
 | `rbc6` | `CRATONVM_DBG_RBC6` |
+| `rbc6-emit` | `CRATONVM_DBG_RBC6_EMIT` |
 | `re5` | `CRATONVM_DBG_RE5` |
 | `refersto` | `CRATONVM_DBG_REFERSTO` |
 | `reflection-factory` | `CRATONVM_DBG_REFLECTION_FACTORY` |
