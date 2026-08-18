@@ -1202,6 +1202,69 @@ mod tests {
         VmId::from_raw(0xB)
     }
 
+    /// The constant-pool record round-trips through the entry point that
+    /// replaced `constants.rs`'s five direct reaches into
+    /// `shared.classes.resolution_cache`.
+    ///
+    /// Asserted as a DIFFERENCE — miss before the write, hit with the exact
+    /// value after — because a `probe_constant` that always answered `Miss`
+    /// would leave `ldc` correct on every first execution and only wrong from
+    /// the second, and a `record_constant` that silently dropped the write
+    /// looks identical. Both are the failure modes the migration could
+    /// introduce, and neither is visible from a single resolution.
+    #[test]
+    fn a_recorded_constant_reads_back_through_the_resolver() {
+        let shared = std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+        let resolver = MemberResolver::new(&shared);
+        let owner = resolver.scope(ClassId::new(41));
+        const CP: u16 = 13;
+
+        assert!(
+            !resolver.probe_constant(owner, CP).is_hit(),
+            "nothing has been recorded for this entry yet"
+        );
+
+        let owner = resolver.scope(ClassId::new(41));
+        resolver.record_constant(owner, CP, resolver.scope(Value::Int(4242)));
+
+        let owner = resolver.scope(ClassId::new(41));
+        let hit = resolver
+            .probe_constant(owner, CP)
+            .into_hit()
+            .expect("the value just recorded must read back");
+        assert_eq!(resolver.adopt(hit).expect("same vm"), Value::Int(4242));
+
+        // A different cp index in the same class is a different entry, not a
+        // second name for this one.
+        let owner = resolver.scope(ClassId::new(41));
+        assert!(!resolver.probe_constant(owner, CP + 1).is_hit());
+    }
+
+    /// A key from another VM must not read this VM's record. `ClassId`s are
+    /// allocated per VM, so `ClassId(41)` elsewhere is a different class, and
+    /// the collector scans this store as roots of THIS heap.
+    #[test]
+    fn a_foreign_key_neither_reads_nor_writes_the_constant_record() {
+        let shared = std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+        let resolver = MemberResolver::new(&shared);
+        const CP: u16 = 77;
+
+        let foreign = VmScoped::new(VmId::from_raw(0xDEAD), ClassId::new(41));
+        resolver.record_constant(foreign, CP, resolver.scope(Value::Int(1)));
+        let owner = resolver.scope(ClassId::new(41));
+        assert!(
+            !resolver.probe_constant(owner, CP).is_hit(),
+            "a write under a foreign key must not land in this VM's record"
+        );
+
+        resolver.record_constant(resolver.scope(ClassId::new(41)), CP, resolver.scope(Value::Int(2)));
+        let foreign = VmScoped::new(VmId::from_raw(0xDEAD), ClassId::new(41));
+        assert!(
+            !resolver.probe_constant(foreign, CP).is_hit(),
+            "a read under a foreign key must not see this VM's record"
+        );
+    }
+
     #[test]
     fn a_scoped_value_reads_back_only_in_its_own_vm() {
         let scoped = VmScoped::new(vm_a(), ClassId::new(7));
