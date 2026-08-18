@@ -258,9 +258,55 @@ method called after the mutation. Every other section touches `contains` or
 `iterator` first, and if those re-sync a stashed view then a later `size()` reads
 an already-correct field and cannot tell a retired native from a live one.
 
-`iterator`, `toArray`, `isEmpty` and `contains` are **not** retired, and the
-`ConcurrentModificationException` above is why: at least one of them is
-load-bearing, and separating which needs its own per-triple trial.
+### 2.2 CORRECTION, same day: those four were held on a misread instrument
+
+The paragraph that stood here said `iterator`, `toArray`, `isEmpty` and
+`contains` were held because "the `ConcurrentModificationException` above" showed
+at least one of them load-bearing. **That was wrong, and §2's own evidence
+contradicted it** — the CME requires the values view to BE an `ArrayList`, and §2
+says, measured over eleven carriers, that it is not.
+
+Re-running the carrier lines UNDER THE DIAL (they did not exist when the dial arm
+was first run) settles it: the carriers are identical in `--real-jdk`,
+`--jdk-only` and `--jdk-only` + dial. The real `ArrayList$Itr` came from
+somewhere else:
+
+```text
+                        HotSpot                          CratonVM, EVERY mode
+  values()              java.util.HashMap$Values         java.util.HashMap$Values
+  values().iterator()   java.util.HashMap$ValueIterator  java.util.ArrayList$Itr
+  keySet().iterator()   java.util.HashMap$KeyIterator    java.util.HashMap$KeyIterator
+```
+
+`register_interface_natives` answers `java/util/Collection.iterator` with a
+snapshot `ArrayList`, and that snapshot's `modCount` is not the map's. Arm the
+dial and real `ArrayList$Itr.next()` starts checking it. The dial was measuring
+**the interface door** — the one `retired_shadow.rs`'s "the door this table
+cannot close" section warns about — and this record attributed it to
+`java/util/ArrayList.iterator`.
+
+**All five registrations were then retired on the per-triple instrument**, which
+is the only one that can answer the question:
+
+```text
+  five triples, seven registrations, all [JDK-ONLY-REFUSED] — no inert entries
+  probes/JdkOnlyValuesViewProbe.java, 67 checks   IDENTICAL to HotSpot
+  --jdk-only  corpus   98 passed / 2 failed of 100   verdict-neutral
+  SUITE=all   corpus   93 passed / 7 failed of 100   verdict-neutral
+  registry census      7 rows bridge -> synthetic-stub, 0 added, 0 removed
+```
+
+So N1 closes on **seven** `java/util/ArrayList` triples, not two. What is still
+held is the ITERATOR CLASS (`ArrayList$Itr`), which is a different receiver with
+its own state and has had no trial.
+
+**And the door defect is real.** `map.values().iterator()` is not fail-fast in
+either mode — a structural modification mid-iteration throws
+`ConcurrentModificationException` on HotSpot and nothing here. Filed as
+`jdk-only/G63-1-the-values-view-iterator-is-not-fail-fast-20260817.md` with the
+three-arm transcript; retiring these five neither causes nor fixes it, measured
+both ways. It is the one thing in this lane that a 100-vector corpus could not
+see, and it was found only by disbelieving a measurement in this file.
 
 ## 3. N2 — `Properties.getProperty`: ASKED, ANSWERED, and NOT retired
 
@@ -401,6 +447,30 @@ diff to check, not a number to paste. A ninth kind-map row is a finding."*
 Both `owns_slot: true`, so neither is an inert entry of the kind that made
 `LogRecord.<init>(Level,String)` measure verdict-neutral for a day.
 
+### 6.1a The second wave's deltas, measured the same way
+
+§2.2's five extra triples were adjudicated on their own BEFORE/AFTER pair of
+binaries, so their delta is separate from the first wave's:
+
+| gate | BEFORE (`1d8e11741`) | AFTER the five | delta |
+|---|---|---|---|
+| `stub_ratchet` NO_MANAGEMENT | 1302 | **1308** | **+6** |
+| registry census, synthetic-stub | 1323 | **1330** | **+7** |
+| registry census, bridge | 10088 | 10081 | −7 |
+
+Seven registrations for five triples, and the pair that makes the difference
+visible is worth naming: `iterator` is registered TWICE
+(`native-builtins/src/lib.rs:16801`, `native-collections/src/lib.rs:4667`) and
+`toArray([Ljava/lang/Object;)` twice
+(`native-collections/src/lib.rs:4635`, `vm/src/vm/vm_init.rs:3244`), with the
+slot-owning registration in each pair moving alongside its superseded twin. That
+is what rules out the `LogRecord.<init>` inert-entry trap for all five. The
+hermetic ratchet counts six of the seven because
+`vm/src/vm/vm_init.rs`'s registration is outside the `native-builtins` census it
+replays.
+
+0 rows added, 0 removed, in both waves.
+
 ### 6.1 The baselines are NOT re-frozen, and that is a decision
 
 Three of them fire, and they fired **before** this change too, on the same tree
@@ -494,9 +564,11 @@ and no strict-corpus verdict should be quoted without its platform again.
 
 ## 8. What this record does NOT close
 
-* **`iterator` / `toArray` / `isEmpty` / `contains` on `ArrayList`.** The class
-  dial says at least one is load-bearing for the values view (§2.1). Four
-  per-triple trials, and this lane did not run them.
+* ~~**`iterator` / `toArray` / `isEmpty` / `contains` on `ArrayList`.**~~
+  **CLOSED, §2.2** — all five registrations retired on a per-triple trial, both
+  corpora verdict-neutral. What replaced it as open is narrower and better
+  stated: `java/util/ArrayList$Itr` itself has had no trial, and the interface
+  door behind the whole confusion is `G63-1`.
 * **The system `Properties` receiver.** §3 names the precondition and does not
   meet it. Fixing it is a change to a boot-path native in BOTH modes, which is
   not a retirement-table change.
