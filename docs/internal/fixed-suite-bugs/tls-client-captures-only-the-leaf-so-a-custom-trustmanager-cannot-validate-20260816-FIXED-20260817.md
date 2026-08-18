@@ -25,7 +25,8 @@ The residue page it blocked,
 `tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816-FIXED-20260817.md`,
 is closed by the same change.
 
-**Not closed on Windows.** See "What is still open" at the bottom.
+**Windows closed a day later**, 2026-08-18, on the same shape through
+SChannel — see "The Windows half" at the bottom.
 
 ---
 
@@ -270,15 +271,23 @@ CRATONVM_TLS_OPENSSL_CLIENT=0 <cratonvm-bin> … RealChainProbe             # 20
 `probes/EngineChainProbe.java`, `probes/WeakChainProbe.java` +
 `probes/mkweakca-witness.sh`.
 
-## What is still open
+## The Windows half — CLOSED 2026-08-18
 
-**Windows keeps the leaf-only chain.** `openssl` is a deliberately Unix-scoped
-dependency of `native-builtins` (see its `Cargo.toml`), and native-tls exposes
-no chain accessor on the SChannel backend either — so closing it there needs a
-different backend, not a different configuration. The `#[cfg(not(unix))]` arm
-is unchanged and was not measured; it is filed as its own narrow page,
-`tls-client-windows-schannel-leaf-only-chain-20260817.md` under
-`docs/known-issues`. The Windows build was compile-checked on this branch.
+This page shipped with Windows left open and, honestly, unmeasured: `openssl`
+is a deliberately Unix-scoped dependency, native-tls exposes no chain accessor
+on SChannel either, and the `#[cfg(not(unix))]` arm was unchanged. It was
+filed as its own narrow page and stated as still-broken rather than glossed.
+
+It is now measured and fixed, on a Windows box against the same Temurin
+25.0.3. The RED was exactly what the page claimed — `RealChainProbe` 0 of 20,
+every one at `chainLen=1` — and the fix is the same shape: native-tls IS
+SChannel there, its `imp/schannel.rs` is a thin wrapper, and SChannel DOES
+have the chain on the remote certificate's attached store. Naming the
+`schannel` crate directly (already in `Cargo.lock` via native-tls, so the
+Windows dependency graph is unchanged) keeps the stream in reach.
+
+Full write-up:
+`tls-client-windows-schannel-leaf-only-chain-20260817-FIXED-20260818.md`.
 
 ## Related
 * `tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816-FIXED-20260817.md`

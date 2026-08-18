@@ -284,6 +284,7 @@ export inherited from a parent shell.
 | `lambda` | `CRATONVM_DBG_LAMBDA` |
 | `lambda-dispatch` | `CRATONVM_DBG_LAMBDA_DISPATCH` |
 | `lambda-generic` | `CRATONVM_DBG_LAMBDA_GENERIC` |
+| `lambda-jit` | `CRATONVM_DBG_LAMBDA_JIT` |
 | `lambda-prof` | `CRATONVM_DBG_LAMBDA_PROF` |
 | `layout` | `CRATONVM_DBG_LAYOUT` |
 | `ldc-classref-trace` | `CRATONVM_LDC_CLASSREF_TRACE` |
@@ -703,6 +704,8 @@ export inherited from a parent shell.
 | `vectorize` | `CRATONVM_JIT_VECTORIZE` |
 | `verify-arena-order` | `CRATONVM_JIT_VERIFY_ARENA_ORDER` |
 | `verify-frame-states` | `CRATONVM_JIT_VERIFY_FRAME_STATES` |
+| `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
+| `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-ir` | `CRATONVM_JIT_VERIFY_IR` |
 | `verify-memory-chain` | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` |
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
@@ -733,6 +736,7 @@ export inherited from a parent shell.
 | `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
+| `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |

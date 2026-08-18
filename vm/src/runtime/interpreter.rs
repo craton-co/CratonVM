@@ -4361,6 +4361,25 @@ pub(crate) fn execute_prebuilt_frame(
         );
     }
     push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+    run_pushed_frame_to_completion(shared, thread, frames_depth_before_push)
+}
+
+/// The tail of [`execute_prebuilt_frame`], for a caller that has ALREADY
+/// pushed the frame it wants run.
+///
+/// `frames_depth_before_push` is the depth `thread.frames` had before that
+/// push, so the orphaned-inner-frame truncation and the final pop can restore
+/// it exactly. Split out for the deopt-resume / exception-routing sinks, which
+/// build and push their frame themselves and then need it run to completion
+/// synchronously rather than handed to the interpreter's stepping loop — see
+/// `jit_bridge::execute_jit_call_oneshot`, whose whole reason for existing is
+/// that a one-shot dispatch helper has no such loop to hand it to.
+pub(crate) fn run_pushed_frame_to_completion(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frames_depth_before_push: usize,
+) -> MethodCallResult {
+    debug_assert!(thread.frames.len() > frames_depth_before_push);
     if shared
         .mem
         .gc_barrier

@@ -480,6 +480,7 @@ pub const INVENTORY: &[E] = &[
     // Per-phase timing for `try_lambda_dispatch` (lookup / prep / target /
     // other), printed every 200k dispatches. Arms the timers; an unarmed run
     // pays one relaxed load per dispatch. See `runtime::interpreter::lambda::lambda_prof`.
+    E { group: Group::DBG, token: "lambda-jit", on_key: Some("CRATONVM_DBG_LAMBDA_JIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lambda-prof", on_key: Some("CRATONVM_DBG_LAMBDA_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "layout", on_key: Some("CRATONVM_DBG_LAYOUT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ldc-classref-trace", on_key: Some("CRATONVM_LDC_CLASSREF_TRACE"), off_key: None, off_word: None },
@@ -1114,6 +1115,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "verify-memory-chain", on_key: Some("CRATONVM_JIT_VERIFY_MEMORY_CHAIN"), off_key: None, off_word: None },
     // Compatibility alias: `check_schedule` was split into the memory-chain and
     // arena-order lanes, and this token still seeds both when neither is set.
+    E { group: Group::JIT, token: "lambda-site", on_key: Some("CRATONVM_JIT_LAMBDA_SITE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-tierup", on_key: Some("CRATONVM_JIT_LAMBDA_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-types", on_key: Some("CRATONVM_JIT_VERIFY_TYPES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "virtual-tierup", on_key: Some("CRATONVM_JIT_VIRTUAL_TIERUP"), off_key: None, off_word: None },
@@ -1154,6 +1157,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-live-region-memo", on_key: None, off_key: Some("CRATONVM_G1_NO_LIVE_REGION_MEMO"), off_word: None },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "g1-eager-humongous", on_key: Some("CRATONVM_G1_EAGER_HUMONGOUS"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "g1-young-pause-target", on_key: Some("CRATONVM_G1_YOUNG_PAUSE_TARGET"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-rset-source-cap", on_key: Some("CRATONVM_G1_RSET_SOURCE_CAP"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-verify-budget", on_key: Some("CRATONVM_G1_VERIFY_BUDGET"), off_key: None, off_word: None },

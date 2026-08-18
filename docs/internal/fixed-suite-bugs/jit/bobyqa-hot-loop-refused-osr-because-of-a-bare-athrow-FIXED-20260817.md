@@ -205,10 +205,55 @@ known-issues/perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md.
   nothing to route by. Admitting it needs the lowering to publish, which is the
   same work `first_unsupported_precise_frame_site` lists `athrow` under.
 * `local_oop_masks` carries the same 64-slot truncation this page fixed for
-  liveness. Its own comment says a slot beyond bit 63 "reads as non-oop here —
-  sound only because `can_deopt_resume` (later) gates such methods off". Not
-  touched here; worth confirming that gate still holds now that a >64-local
-  method can be OSR-entered.
+  liveness — **audited 2026-08-18, and it is SAFE, but not for the reason its
+  comment gave.** Worth recording in full, because the comment named a gate that
+  does not exist and a reader could have deleted a real one looking for it.
+
+  The truncation is worse than "a slot beyond bit 63":
+  `compute_local_oop_masks` returns **empty vectors** for `max_locals > 64`, so
+  `is_oop` reads false for EVERY local in such a method, slot 0 included.
+  Measured on `probes/HighLocalOopProbe.java` (84 locals, references at slots
+  74/75/76, OSR-entered, 100 forced collections): `oop_reached=false
+  oop_mask=0x0`.
+
+  `can_deopt_resume` is `!deopt_points.is_empty() && !has_elided_monitor` and
+  says nothing about the local count, so it is not what saves this. Three other
+  things do:
+
+  1. **`classify_local_kinds` has no 64-slot cap**, and `deopt_real_enabled()`
+     defaults ON, so `local_kinds` is populated in production and its
+     `LocalKind::Ref` arm publishes `RegisterRef`/`StackSlotRef` at any slot
+     index. In the same measured frame, locals 74/75/76 came out
+     `StackSlotRef(-600/-608/-616)` — correct — with the mask entirely dark. A
+     slot the classifier calls `Ambiguous` publishes `Unsupported`, which is
+     fail-closed. **This is the leg with no other guard behind it**, so it is
+     now pinned by
+     `x64::deopt_snapshot_tests::classify_local_kinds_types_a_reference_above_slot_63`,
+     which asserts both halves together and goes red if the classifier is ever
+     narrowed to a `u64` to match its neighbours.
+  2. **The two gates move together.** Under `CRATONVM_DEOPT_REAL=0`,
+     `local_kinds` is empty — and so is the snapshot: no deopt point is recorded
+     for the method at all (measured: zero `[excframe] FRAME` lines), and
+     `osr_exit_points` / `can_osr_exit` are empty/false, so nothing consumes one.
+  3. **The GC side refuses explicitly and observably.**
+     `moving_young_safepoint_coverage_complete` carries its own
+     `num_locals > 64 => false`, and its doc states that a false result is "a
+     correctness signal to the GC: if this frame is live here, moving-young must
+     divert to the non-moving sweep for that cycle". Under
+     `CRATONVM_MOVING_YOUNG=1` with `CRATONVM_DBG=moving-young-coverage-dbg` the
+     probe prints `[moving-young-coverage] incomplete: active frame map at
+     rbp=…` **49 times**; `probes/LowLocalOopProbe.java`, the identical shape
+     under 64 locals, prints it **0 times** and gets a real mask
+     (`oop_reached=true oop_mask=0x700000e`). The local count is the only
+     difference between the two, which is what makes that the `num_locals > 64`
+     rule firing rather than a coincidence. Separately, `color_graph` caps at 64,
+     so a local above slot 63 is always frame-resident and the conservative sweep
+     — which pins rather than relocates — sees it.
+
+  Both probes pass on CratonVM and HotSpot alike at `-Xmx 512m` and `-Xmx 96m`,
+  under default ZGC compaction and under `CRATONVM_MOVING_YOUNG=1`. No fix was
+  needed; the misleading comment at the `is_oop` site has been corrected in
+  place.
 
 ## Repro
 
