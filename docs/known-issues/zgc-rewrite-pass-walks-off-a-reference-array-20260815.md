@@ -596,7 +596,31 @@ overlapping by one header, with only one of them registered. Every audit that
 asks "is the *receiver* a registered base?" is silent on it, because the store
 is a perfectly ordinary store into whatever the writer believes it owns.
 
-## What that makes the next instrument
+## What that makes the next instrument — **BUILT 2026-08-18**
+
+`ZgcRealHeap::decode_neighbour_below` now runs inside the extent census and adds
+two fields to the line it already prints:
+
+```
+below16 = plausible=true registered=false covers=true class=1202 size=192
+below32 = plausible=false registered=false covers=false class=0 size=0
+```
+
+**`covers=true registered=false` is the second reading confirmed** — the victim
+is not being corrupted, it is *overlapped*, and the "corrupting write" is that
+object's field 0. `covers=false` on both leaves the stray-writer reading standing.
+
+The census already printed the raw words below the base (`below0` / `below1`);
+what it never did was say what they mean. That is the whole change: the fifth
+pass decoded them once, by hand, on one capture, and the answer reframed the
+defect — so it should not depend on someone thinking to do it again.
+
+The negative half is what makes it worth reading: a properly adjacent
+predecessor must report `covers=false`, or the field fires on every object in a
+healthy heap and says nothing on the run that matters. That is asserted, and
+verified by making `covers` unconditionally true.
+
+### The original description follows
 
 The fifth pass's `base - 16` probe was done once, manually, on one capture. Make
 it automatic: **when the extent census reports a victim, also decode
@@ -632,7 +656,7 @@ look, not the last.
 | **`System.arraycopy`** | **no** | per-element `set_array_element` — inside the audit |
 | **`Unsafe.copyMemory` off-heap→heap** | **no** | refuses reference arrays; bounds-checked twice |
 | a raw pointer TRANSLATED out of the arena | **untested** | `unsafe_arena_translation_stats` (fifth pass) |
-| **an unregistered object based at `victim - 16`** | **untested** | the `base - 16` decode, above |
+| **an unregistered object based at `victim - 16`** | **instrumented, unrun** | `below16=` / `below32=` on the extent census line — `covers=true registered=false` confirms it |
 
 ## Related
 
