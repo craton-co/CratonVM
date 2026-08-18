@@ -775,17 +775,22 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         "keystore.type" => "PKCS12",
         "ssl.KeyManagerFactory.algorithm" => "SunX509",
         "ssl.TrustManagerFactory.algorithm" => "PKIX",
-        // Not one of this VM's four deliberate answers: ask the JDK's own
-        // `java.security` file rather than reporting "no such property".
-        _ => {
-            return Ok(match java_security_file_property(ctx, &key) {
-                Some(v) => {
-                    let s = ctx.create_string(&v);
-                    Some(Value::Object(Some(s)))
-                }
-                None => Some(Value::Object(None)),
-            })
-        }
+        // Not one of this VM's four deliberate answers.
+        //
+        // The JDK's own `conf/security/java.security` is RIGHT HERE and this
+        // could read it — `java_security_file_property` below does, and it is
+        // kept for that reason. It is not wired in, because turning it on is
+        // not free: the stock file sets `keystore.type.compat=true`, which is
+        // the gate BouncyCastle's `AdaptingKeyStoreSpi` uses to probe a stream
+        // for JKS, and that path then builds a PKCS#12 MAC through
+        // `Mac.getInstance(name, providerObject)` — an overload this VM refuses
+        // for EVERY BouncyCastle name while serving the `(String, String)` form
+        // of the same name (`MacProvObj` probe; HotSpot serves both). Wiring
+        // the file in without fixing that took `cert.test` from PASS to FAIL
+        // and moved `PKCS12StoreTest` from one failure to another.
+        //
+        // So: fix the Provider-object overload first, then delete this arm.
+        _ => return Ok(Some(Value::Object(None))),
     };
     let s = ctx.create_string(val);
     Ok(Some(Value::Object(Some(s))))
@@ -810,6 +815,7 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Parsed once. `java.security` is `key=value` with `#` comments and no
 /// sections; a continuation-free read is enough for the lookups callers make,
 /// and a file that cannot be read leaves every key unanswered exactly as before.
+#[allow(dead_code)]
 fn java_security_file_property(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
     static FILE_PROPS: std::sync::OnceLock<
         parking_lot::Mutex<Option<std::collections::HashMap<String, String>>>,
