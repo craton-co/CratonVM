@@ -357,28 +357,52 @@ itself 152 -> 18 ms. `CRATONVM_G1_SCRUB_FREE=1` restores it, and that is
 the first thing to try if a G1 heap-corruption investigation wants the old
 "a freed region reads as zeros" world back.
 
-*Known structural limit — the Phase-4 walk.* A young pause's reference
-fix-up (`update_references_in_regions`) walks EVERY object of every non-CSet
-region, so young pause time is O(heap) rather than O(young live set) — the
-one property G1's region design exists to buy. The walk is also where the
-GC-internal remembered-set rebuild and the humongous census happen, so it is
-not gratuitous.
+*The Phase-4 walk, narrowed (2026-08-18).* A young pause's reference fix-up
+used to walk EVERY object of every non-CSet region, which is what made pause
+time O(live heap) rather than O(young live set). It now walks only the
+collection set's remembered-set sources plus every region the pause WROTE
+INTO. `CRATONVM_G1_NARROW_FIXUP=0` restores the whole-heap walk, and is the
+first lever to pull for any suspected G1 dangling-reference or lost-edge
+defect: under it the collector behaves as every G1 result before this date
+was produced.
 
-Narrowing it to the collection set's remembered-set sources requires every
-mutator reference store to be guaranteed to reach `post_write_barrier_rset`.
-That IS now true — defect G1-2 (a JIT-compiled store into a young receiver
-taking an inline path with no post barrier) was closed in `jit/` on
-2026-08-13, though the audit's own summary table went on saying "Not fixed"
-until 2026-08-18 and this paragraph repeated it. Under G1 the six-word
-`JIT_REGION_BOUNDS` table is never written (only `gen_heap` writes it), so
-`region_bounds_are_live` is false and all four inline reference-store
-emitters route to `jit_putfield_object`, which runs the full SATB + RSet
-pair.
+Why that set is sufficient: a slot needing a forwarding rewrite points at an
+evacuated object, so it lives in a root (Phase 1 rewrites those), in the CSet
+(Phase 3 scans every to-space copy), or in a non-CSet region reachable only
+through the remembered set (Phase 2 walks exactly those). The remembered set
+is complete because every mutator reference store reaches
+`post_write_barrier_rset` — the interpreter's and every native's directly,
+and every JIT-compiled one through `jit_putfield_object` since G1-2 closed.
+The walk's other job, the GC-internal edge rebuild, only concerns regions the
+pause wrote into, and those are found by diffing a pre-evacuation
+`(region_type, cursor)` snapshot rather than by asking the evacuator — so no
+allocation path, present or future, can forget to register itself. The
+humongous census still forces the wide walk, because "nothing in the heap
+references this span" is a whole-heap claim.
 
-So the blocker is gone and the remaining question is whether the walk is
-worth removing, which needs a number rather than an argument — see the
-per-phase `[GC-STAT]` breakdown (`fixup_us`, beside the `fixup_regions` /
-`fixup_bytes` it covered).
+Scope: the SERIAL young pause. Mixed pauses and the parallel evacuator still
+walk wide.
+
+Measured (single binary, one env flag, interleaved, `G1ChurnPauseProbe`): on
+a workload whose live set stays YOUNG the narrow set equals the wide one and
+nothing changes — `fixup_regions` is 116 in both arms. On one whose live set
+has settled into Old (`-Xmx512m`, 48 MiB live, 12 GiB of garbage) the walk
+drops from **60 regions / 58 MiB to 1 region / 0 MiB**, p50 27 -> 17 ms,
+total pause -12%, p99 unchanged, checksums identical. The size of the win is
+the ratio of settled old generation to young — which is the shape the
+original criticism was always about.
+
+Verification, and its limits. The unit suite CANNOT discriminate this change:
+every pre-existing test passes even when Phase 4 walks nothing, because on
+every constructible fixture the mutator barrier alone already records every
+edge. The tests that do discriminate check the narrow SET's composition. The
+consequence is checked at runtime instead — `CRATONVM_G1_DBG_RSET=1` verifies
+after each pause that every cross-region edge into a collectable region is
+named in that region's remembered set, and prints `edges=N missing=M` so a
+green result cannot hide a vacuous one. On the shape that genuinely skips 59
+of 60 regions it reports `edges=2114 missing=0`, and a unit test proves that
+checker can fail (clear every remembered set and all 2114 are reported
+missing). What is still owed is a suite-scale soak.
 
 **ZgcRealHeap.** One arena + free list (post-sweep coalesced) + hash-set
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with
