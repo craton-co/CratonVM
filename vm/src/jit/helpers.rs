@@ -6291,6 +6291,52 @@ pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
 /// [`JIT_GETFIELD_RECEIVER_SHAPE`]. Off by default: the classification re-reads
 /// the bounds table and the object header on a path taken tens of millions of
 /// times, so it must not be in the measured configuration.
+/// Is anything going to READ [`GETFIELD_HELPER_CALLS`] this run?
+///
+/// The increment is one relaxed atomic on the hottest helper in the VM, and
+/// its original comment claimed "this is not visible in it". That claim was
+/// never tested and was wrong: an ablation build measured it at ~2-3 ns of a
+/// 9 ns reference-field read, i.e. a quarter to a third of the post-fix cost.
+/// The counter is only ever printed under `CRATONVM_DBG=mic-prof` or
+/// `CRATONVM_DBG=jit-method-stats` (and it is the denominator the receiver
+/// census needs), so counting outside those buys nothing and costs the default
+/// configuration.
+///
+/// Cached, because a per-call `runtime_var_os` on this exact path is the 3.4x
+/// regression [`compact_inline_dbg`] documents.
+fn getfield_census_counting_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
+    })
+}
+
+/// Cached `CRATONVM_DBG_COMPACT_INLINE` gate for the `jit_getfield` guard-failure
+/// dump.
+///
+/// PERF (2026-08-18, the `BigDecimalBench` flag-read census): this gate was read
+/// through `runtime_var_os` on EVERY `jit_getfield` helper call, and that is not
+/// a cheap read — it hashes the name against the declared-flag set and then
+/// falls through to `std::env::var_os`. A per-key census of a 50k-iteration
+/// `BigDecimal` run counted **4,560,891 of 4,600,000 flag reads (99.1%) for this
+/// one name**, ~91 per benchmark iteration.
+///
+/// Worth noting where it sat: the comment on `GETFIELD_HELPER_CALLS` directly
+/// above the call site argues that one relaxed atomic increment is too cheap to
+/// show up in the measured 8.2 ns `receiverFieldTax` — and it is right. The
+/// uncached environment lookup on the very next line was the expensive one.
+///
+/// Same `OnceLock` idiom as [`getfield_receiver_census_enabled`] immediately
+/// below, which is the sibling gate on the same path and was always cached.
+fn compact_inline_dbg() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some()
+    })
+}
+
 fn getfield_receiver_census_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -6306,8 +6352,16 @@ fn getfield_receiver_census_enabled() -> bool {
 /// the helper stopped incrementing reading a confident `0` at shutdown, which
 /// on a page about instruments that measure the wrong thing would have been a
 /// poor way to go.
-pub fn jit_getfield_helper_calls() -> u64 {
-    GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+pub fn jit_getfield_helper_calls() -> Option<u64> {
+    if !getfield_census_counting_enabled() {
+        // NOT `Some(0)`. The counter is gated (see
+        // `getfield_census_counting_enabled`), and a gated counter reported as
+        // a number is indistinguishable from a fast path that never fell
+        // through — which is the precise misreading this whole counter exists
+        // to prevent.
+        return None;
+    }
+    Some(GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Why each helper call arrived: the receiver's own shape, counted at
@@ -6640,11 +6694,13 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // measured one. It costs one uncontended increment on a path that already
     // pays `note_jit_boundary`, `is_object_address` and a layout lookup — the
     // measured `receiverFieldTax` is 8.2 ns, and this is not visible in it.
-    GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if getfield_census_counting_enabled() {
+        GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if getfield_receiver_census_enabled() {
         note_getfield_receiver_shape(obj_ptr, field_index);
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+    if compact_inline_dbg() {
         dump_getfield_guard_failure(obj_ptr);
     }
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache

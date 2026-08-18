@@ -148,7 +148,9 @@ fn maybe_dump_shutdown_reports() {
         // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
         eprintln!(
             "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
-            cratonvm_vm::jit::helpers::jit_getfield_helper_calls(),
+            cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<not counted>".to_string()),
             cratonvm_jit::metrics::getfield_arm_emits()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
@@ -6334,6 +6336,7 @@ fn main() {
             maybe_dump_shutdown_reports();
             match result {
                 Ok(()) => {
+                    cratonvm_vm::jit::conservative_roots::report_a5_engagement();
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();
                 }

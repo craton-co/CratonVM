@@ -274,6 +274,72 @@ per-call tax that one memo can remove — it is per-frame work, spread across
 with no member big enough to matter alone. That is why four separate attempts to
 remove one member each measured zero.
 
+### MEASURED 2026-08-18: attempt 1 changed a call site that never runs
+
+`CRATONVM_DBG=a5-engagement` (added with this, declared in all four flag files)
+counts, per call of the coverage probe, what the memo would have answered.
+On `probes/StackWalkerTerminationProbe`:
+
+```
+[a5-engagement] calls=0 (probe never ran)
+```
+
+**Zero.** `refresh_moving_young_coverage_for_current_thread`'s
+`native_stack_has_jit_frame` call — the one `UnregMemo`'s doc comment names as
+dominating, and the one attempt 1 memoized — **does not execute on this
+workload at all.** The 17.9% comes from the OTHER caller, the detection scan
+inside the root-snapshot deposit, which already has the memo.
+
+So attempt 1 was inert because it changed code that never ran, not because
+memoizing does not help. It was judged from a profile that did not move, and a
+profile cannot distinguish "changed the wrong site" from "the change does not
+help" — which is exactly what an engagement counter is for, and why this
+codebase's own rule is to print one beside the number. Four attempts were
+judged without one.
+
+### And at the site that DOES run, the memo is 100% cold — by construction
+
+Same counter, moved to the detection scan inside the root-snapshot deposit:
+
+```
+depth  20:  calls= 37,976   memo_clean=0  memo_banded=0  full_rescan= 37,976   (100%)
+depth 120:  calls=188,115   memo_clean=0  memo_banded=0  full_rescan=188,115   (100%)
+```
+
+**Not one engagement in 188,115 calls.** `full_rescan` is the
+`code_ranges != self.verified_ranges` arm, and `verified_ranges` is only ever
+written by `mark_clean` — which is reached ONLY when the probe comes back with
+no hit. On a workload with compiled frames the probe hits (the retired
+moving-young page measured A5's false-positive rate at **87%**), so `mark_clean`
+never runs, `verified_ranges` keeps its initial value, and every observation
+falls through to a full rescan **forever**.
+
+That closes the whole memo route, and explains all four attempts at once:
+
+* attempt 1 memoized a call site that never runs (`calls=0`);
+* attempt 2 lifted the range-invalidation rule, but with `verified_lo` still at
+  its initial `usize::MAX` — `mark_clean` having never run — the `floor`
+  comparison still forces a full-width scan, so the lift was neutered by the
+  same cause;
+* attempts 3 and 4 were unrelated knobs on the same cold path.
+
+**The memo is not under-tuned, it is inapplicable.** It caches "this stack is
+free of return-addresses-into-JIT", and on this workload that is simply false
+most of the time. No amount of memo work fixes a cache whose predicate is
+usually false — which is why the profile never moved and why an engagement
+counter, not another profile, was the thing that settled it.
+
+The previously-suspected hypothesis for this site — its
+band is `[scanner_sp.max(cover_hi), stack_high)`, and with an empty JIT entry
+chain `cover_hi == scanner_sp`, so it scans the whole native stack above the
+scanner. `UnregMemo::mark_clean` sets `hiwater = search_lo` on every clean
+verdict, so a stack that OSCILLATES — recurse, return, recurse, which is what
+every Java workload does and what this probe does 500 times — re-scans instead
+of reusing the verdict. That is testable with the same counter: a workload with
+a flat stack should show `memo_clean` climbing and an oscillating one should
+show `full_rescan` or `memo_banded` dominating. **Measure that before writing
+the fifth attempt.**
+
 **The arithmetic that should have come first.**
 `native_stack_has_jit_frame` is ~17.9% of this workload, so deleting it
 *entirely* buys **1.2x against a 38x gap**. No amount of memoizing that symbol

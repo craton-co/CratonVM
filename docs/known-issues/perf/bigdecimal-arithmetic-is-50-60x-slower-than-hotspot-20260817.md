@@ -202,12 +202,46 @@ names into a map (order cannot change the result), and `from_process_env`
 iterates `env::vars_os()` — the source, not the map — so its documented
 first-wins duplicate semantics are untouched.
 
-**Still unfound:** the *uncached* caller of `runtime_var_os`. Making the lookup
-cheap helps every caller, but something is reading a flag per operation and
-ought to cache it instead. `dwarf` stacks put it under `alloc_raw_tlab` /
-`is_object_address` / `get_field` / `set_field`, but inlining defeated exact
-attribution, and every `runtime_var_os` call site in `zgc.rs` is either
-`OnceLock`-cached or documented read-once-per-heap — so it is somewhere else.
+**Found (2026-08-18):** the uncached caller was
+`cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")` inside
+**`jit_getfield`** (`vm/src/jit/helpers.rs`), read on every JIT getfield helper
+call purely to decide whether to print a debug dump. Now `OnceLock`-cached,
+which is the idiom the sibling gate ten lines above it
+(`getfield_receiver_census_enabled`) already used.
+
+How it was found matters more than the fix. `perf` could not name it: the flat
+profile showed `runtime_var_os` at 1.21% with no caller, and a `dwarf` capture
+attributed it to `alloc_raw_tlab` / `is_object_address` / `get_field` — the
+*callee* side of the JIT->heap boundary, which sent the first search into
+`zgc.rs` where every call site is properly cached. A **per-name census** of flag
+reads (`CRATONVM_DBG_FLAGREADS=1`, kept in `flags.rs`) named it in one run:
+
+```
+total=4,600,000
+   4,560,891  CRATONVM_DBG_COMPACT_INLINE     <- 99.1%, ~91 per iteration
+      23,086  CRATONVM_DBG_SHADOW
+       6,734  CRATONVM_DBG_EXCFRAME
+```
+
+After the fix the same run never reaches the first 200k report. **A flag read is
+supposed to be rare — every gate is expected to cache its answer — so a name in
+the millions IS the bug**, which is why counting by key beat counting by stack.
+
+Worth recording where it sat: the comment on `GETFIELD_HELPER_CALLS` directly
+above the call site argues carefully that one relaxed atomic increment is too
+cheap to appear in the measured 8.2 ns `receiverFieldTax`. That is correct. The
+uncached environment lookup on the very next line was the expensive one, and it
+had been reasoned right past.
+
+**Wall clock: not resolved, and not claimed.** Nine interleaved rounds put the
+median at 6,836 -> 6,421 ms (+6.1%) but the mean at 6,792 -> 6,831 (~0%) and the
+min at 6,155 -> 6,135 (~0%), with the fixed arm ahead in 6 of 9 paired rounds.
+Median and mean disagreeing means the distribution moved, not the centre. The
+arithmetic agrees it should be small: after the FxHash change above, each read is
+~2 Fx hashes, so 4.56M x ~25 ns is ~1-2% — inside this benchmark's noise. What is
+demonstrated is the removal of 4.6M redundant reads per 50k iterations; the
+timing benefit is not, and these two fixes overlap (this one removes the calls,
+the FxHash one made whatever remains cheap).
 
 ## What is left, and why it is not on this page
 
