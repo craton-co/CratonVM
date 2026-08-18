@@ -1232,6 +1232,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_VERIFY_ARENA_ORDER` | JIT | `CRATONVM_JIT=verify-arena-order` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_VERIFY_FRAME_STATES` | JIT | `CRATONVM_JIT=verify-frame-states` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_VERIFY_IR` | JIT | `CRATONVM_JIT=verify-ir` | default-on | on | behaviour | snapshot | jit, types |
+| `CRATONVM_JIT_LAMBDA_ADAPTER` | JIT | `CRATONVM_JIT=lambda-adapter` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_LAMBDA_SITE` | JIT | `CRATONVM_JIT=lambda-site` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_LAMBDA_TIERUP` | JIT | `CRATONVM_JIT=lambda-tierup` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` | JIT | `CRATONVM_JIT=verify-memory-chain` | opt-in | off | behaviour | snapshot | jit, types |

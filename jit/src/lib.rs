@@ -110,6 +110,7 @@ pub mod osr_exit;
 // in the wrong space).
 pub mod osr_coords;
 pub mod ir_verify;
+pub mod lambda_adapter;
 pub mod loop_analysis;
 pub mod metrics;
 pub mod null_check_elim;
@@ -10505,6 +10506,17 @@ fn jit_entry_owners(
     JIT_ENTRY_OWNERS.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
 
+/// Register a lambda-adapter thunk as the owner of its own entry address.
+///
+/// `JitMICSlot::install` refuses to publish an entry whose owner it cannot
+/// resolve (`jit_entry_publishable`), and the owner it holds is what keeps the
+/// code alive while a slot points at it. A thunk is not a cached METHOD — it
+/// has no `MethodKey` and never appears in `JitCache` — so it registers here
+/// directly. See `lambda_adapter`.
+pub(crate) fn register_jit_entry_owner_for_adapter(entry: usize, arc: &Arc<CompiledMethod>) {
+    jit_entry_owners().lock().insert(entry, Arc::downgrade(arc));
+}
+
 fn resolve_jit_entry_owner(entry: usize) -> Option<Arc<CompiledMethod>> {
     jit_entry_owners().lock().get(&entry)?.upgrade()
 }
@@ -11635,10 +11647,20 @@ flushed at epoch {barrier}",
                     }
                 }
             }
+            // A lambda-adapter thunk bakes a direct jump to a lambda impl
+            // exactly as a compiled caller bakes a direct call, but it is not a
+            // cached METHOD and so appears in none of the maps above. Without
+            // this it would survive the eviction of the very body it jumps
+            // into, and the inline-cache slot holding it would keep dispatching
+            // to code the cache has withdrawn. See `lambda_adapter`.
+            for entry in crate::lambda_adapter::adapters_reaching(&remove_entries) {
+                remove_entries.insert(entry);
+            }
             if remove_entries.len() == before {
                 break;
             }
         }
+        crate::lambda_adapter::forget_adapters(&remove_entries);
 
         // Retarget dynamic inline caches before withdrawing ownership from the
         // cache. Readers that already hold an old caller snapshot either miss

@@ -704,6 +704,7 @@ export inherited from a parent shell.
 | `vectorize` | `CRATONVM_JIT_VECTORIZE` |
 | `verify-arena-order` | `CRATONVM_JIT_VERIFY_ARENA_ORDER` |
 | `verify-frame-states` | `CRATONVM_JIT_VERIFY_FRAME_STATES` |
+| `lambda-adapter` | `CRATONVM_JIT_LAMBDA_ADAPTER` |
 | `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
 | `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-ir` | `CRATONVM_JIT_VERIFY_IR` |
