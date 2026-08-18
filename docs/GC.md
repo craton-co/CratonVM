@@ -207,7 +207,7 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
 | `CRATONVM_G1_PARALLEL_EVAC=0` | Force the single-threaded evacuator. Parallel evacuation is the DEFAULT since 2026-08-13; the "known race" this row used to warn about was G1-9, which was neither known to be a race nor a race — it was a compact-layout scan divergence, now fixed (`audits/g1-audit.md` §0, internal record tree). The worker threads are also no longer respawned per pause. Still owed: a gauntlet-scale soak and a throughput number, so this remains the bisection lever for any suspected parallel-evacuation regression. |
 | `CRATONVM_G1_EAGER_HUMONGOUS=0` | Restore cleanup-only humongous reclaim. By default an evacuation pause also frees humongous spans it can prove nothing references. This is the only path that frees memory outside the collection set, so it is the first thing to rule out if a live humongous object goes missing. |
-| `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` | Restore the free-pool-only collection trigger. By default `max_gc_pause_ms` also bounds the YOUNG generation: G1 collects once the Eden+Survivor region count reaches an adaptive target, shrunk after any pause that overruns the goal and grown back while pauses stay under half of it. Before this the goal reached only the OLD half of a mixed collection set, so young pause time scaled with `-Xmx` — the free-pool trigger fires at <25% free, which lets Eden grow to ~75% of the heap. The target starts at its ceiling (60% of regions), so a workload already meeting its goal sees no change; an unproductive pause resets it to the ceiling so the cap can never storm. This is the bisection lever for any suspected change in collection FREQUENCY. |
+| `CRATONVM_G1_YOUNG_PAUSE_TARGET=1` | **Opt-in.** Let `max_gc_pause_ms` bound the YOUNG generation too, not just the old half of a mixed collection set: G1 also collects once the Eden+Survivor region count reaches an adaptive target, tightened by 20% after any PRODUCTIVE pause that overruns the goal and relaxed while pauses stay under half of it. Does nothing until such an overrun is measured (the target starts at its 60%-of-regions ceiling and a target at the ceiling is not a trigger). Measured trade on `G1ChurnPauseProbe` at `-Xmx2048m`: p50 -21%, p99 +3%, wall +4.2%, one extra pause — see the young-sizing paragraph under Backend details for the full table and why it is not a default. |
 | `CRATONVM_G1_WORKERS=<n>` | Force the evacuation worker count; `=1` drains the parallel path serially, which separates a concurrency race from a logic divergence |
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
 | `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
@@ -302,19 +302,37 @@ coherent (remembered-set edges recorded, precise liveness answers).
 Allocation failure escalates: young pause → synchronous full mark cycle
 → OOM.
 
-*Young sizing (2026-08-18).* `max_gc_pause_ms` used to reach exactly one
-decision — how many OLD regions a mixed collection set may take. The young
-half was bounded by the free pool alone (`needs_gc` fires below 25 % free),
-so Eden grew to roughly three quarters of `-Xmx` before the first pause and
-young pause time scaled with the heap SIZE: raising `-Xmx` made every pause
-longer, which is the opposite of what a pause-target collector is for. G1
-now also collects once the young region count reaches an adaptive target,
-shrunk after a pause that overruns the goal and grown back while pauses stay
-under half of it (floor/ceiling 5 %/60 % of regions, HotSpot's
-`G1NewSizePercent`/`G1MaxNewSizePercent`). It STARTS at the ceiling, so a
-workload already meeting its goal never leaves it; an unproductive pause
-resets it to the ceiling so the cap can never become a storm of pauses that
-cannot help. `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` restores the old trigger.
+*Young sizing (2026-08-18), opt-in.* `max_gc_pause_ms` reaches exactly one
+decision by default — how many OLD regions a mixed collection set may take.
+The young half is bounded by the free pool alone (`needs_gc` fires below
+25 % free), so Eden grows to roughly three quarters of `-Xmx` and young
+pause time scales with the heap SIZE. `CRATONVM_G1_YOUNG_PAUSE_TARGET=1`
+adds an adaptive young-region target: shrink 20 % after a pause that
+overruns the goal, give 12.5 % back while pauses stay under half of it,
+floor/ceiling 5 %/60 % of regions. It does nothing until a PRODUCTIVE pause
+has been measured to overrun — the target starts at its ceiling and a
+target at the ceiling is not a trigger — and an unproductive pause (nothing
+copied, nothing freed) resets it to the ceiling so it can never storm.
+
+It is **not** a default, and the reason is measured. On
+`probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
+of garbage, 200 ms goal), medians of 3 interleaved reps:
+
+| arm | wall | pauses | total pause | p50 | p99 |
+|---|---|---|---|---|---|
+| pre-audit baseline | 5773 ms | 3 | 3801 ms | 1082 ms | 1726 ms |
+| audit fixes, flag OFF | 2633 ms | 3 | 719 ms | 236 ms | 243 ms |
+| audit fixes, flag ON | 2744 ms | 4 | 814 ms | 187 ms | 250 ms |
+
+The 7x pause reduction there belongs to the audit's evacuation-destination,
+free-region-scan, region-scrub and remembered-set fixes — the middle row has
+this flag off. The flag itself buys the third row against the second: p50
+−21 %, p99 **+3 %**, wall +4.2 %, one extra pause. p99 is what a pause goal
+is about and it did not move, and on an adaptive scheme it cannot: the
+target only tightens after a pause has already overrun, so the largest pause
+is always paid in full and it is the one p99 reports. A latency-sensitive
+workload may still want the median improvement — turn it on and measure your
+own pause distribution.
 
 *Known structural limit — the Phase-4 walk.* A young pause's reference
 fix-up (`update_references_in_regions`) walks EVERY object of every non-CSet

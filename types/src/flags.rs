@@ -733,8 +733,8 @@ pub struct GcFlags {
     pub g1_eager_humongous: bool,
     /// `CRATONVM_G1_YOUNG_PAUSE_TARGET` — let `max_gc_pause_ms` bound the
     /// YOUNG generation, not just the old half of a mixed collection set.
-    /// Default **ON** ([`parse::on_unless_zero`]); `=0` restores the
-    /// free-pool-only trigger.
+    /// **Opt-in** ([`parse::present`]); see the measurement below for why it is
+    /// not a default.
     ///
     /// G1's whole proposition is a configurable pause goal, and until this flag
     /// the goal reached exactly one decision: how many OLD regions a mixed
@@ -748,15 +748,47 @@ pub struct GcFlags {
     ///
     /// With it on, the collector also collects once the young region count
     /// reaches an adaptive target, shrunk after any pause that overruns
-    /// `max_gc_pause_ms` and grown back while pauses stay under half of it. The
-    /// target starts at its maximum, so a workload whose pauses already meet
-    /// the goal never sees a behaviour change; it only ever binds after a
-    /// measured overrun. An unproductive pause (nothing copied, nothing freed —
-    /// e.g. everything pinned) resets the target to the maximum, so the cap can
-    /// never turn into a storm of pauses that cannot help.
+    /// `max_gc_pause_ms` and grown back while pauses stay under half of it. Two
+    /// rules keep it from acting on anything but evidence:
     ///
-    /// `=0` is the bisection lever for any suspected change in collection
-    /// FREQUENCY under `-XX:+UseG1GC`.
+    /// * the target starts at its ceiling AND a target at the ceiling is not a
+    ///   trigger, so the cap does nothing at all until a productive pause has
+    ///   been measured to overrun the goal. (Starting at the ceiling alone was
+    ///   not enough and this doc claimed it was: the ceiling is 60% of the
+    ///   region count while the free-pool trigger waits for 75%, so on a heap
+    ///   with headroom the ceiling itself fired. Measured at `-Xmx2048m`: a
+    ///   210 ms pause manufactured in a run whose other arms took none.)
+    /// * an unproductive pause (nothing copied, nothing freed — e.g. everything
+    ///   pinned) resets the target to the ceiling, so the cap can never turn
+    ///   into a storm of pauses that cannot help.
+    ///
+    /// # Measured, 2026-08-18 — why this is opt-IN
+    ///
+    /// `probes/G1ChurnPauseProbe 96 900` under `-Xmx2048m` (96 MiB retained,
+    /// 3.6 GiB of garbage, 200 ms goal), 3 interleaved reps, medians, all three
+    /// arms from ONE binary except `base` which differs only in `gc/src/g1.rs`
+    /// and `gc/src/region.rs`:
+    ///
+    /// | arm                    | wall    | pauses | total pause | p50     | p99     |
+    /// |------------------------|---------|--------|-------------|---------|---------|
+    /// | pre-audit baseline     | 5773 ms | 3      | 3801 ms     | 1082 ms | 1726 ms |
+    /// | audit, this flag OFF   | 2633 ms | 3      |  719 ms     |  236 ms |  243 ms |
+    /// | audit, this flag ON    | 2744 ms | 4      |  814 ms     |  187 ms |  250 ms |
+    ///
+    /// The 7x pause reduction in that table belongs to the audit's scan and
+    /// scrub fixes, NOT to this flag — the middle row has it off. What the flag
+    /// itself buys is the third row against the second: p50 -21%, p99 **+3%**,
+    /// wall +4.2%, one extra pause.
+    ///
+    /// p99 is the quantity a pause GOAL is about, and it did not move. It
+    /// cannot, on an adaptive scheme: the target only tightens after a pause
+    /// has already overrun, so the first (largest) pause is always paid in
+    /// full and it is the one p99 reports. The flag delivers a real median
+    /// improvement and a real throughput cost, which is a trade a specific
+    /// latency-sensitive workload may well want — but it is not a default, and
+    /// nothing measured here says it should be one.
+    ///
+    /// Turn it on and measure YOUR pause distribution before keeping it.
     pub g1_young_pause_target: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
@@ -959,7 +991,7 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
-            g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
+            g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),

@@ -2058,17 +2058,31 @@ pub struct G1Collector {
     /// collector whose entire proposition is a configurable pause goal, that is
     /// the goal not being implemented on the path that matters.
     ///
-    /// # Why it starts at the maximum
+    /// # Why it starts at the maximum, and why the maximum is not a trigger
     ///
     /// So that it is a no-op until a pause is actually measured to overrun.
     /// `record_collection` shrinks the target after a pause longer than
     /// `max_gc_pause_ms` and grows it back while pauses stay under half of it,
-    /// bounded by [`Self::young_region_bounds`]. A workload already meeting its
-    /// goal never leaves the maximum and never sees a changed collection
-    /// frequency; the cap only ever binds on the workloads it was measured to
-    /// be needed for. (The reverse — starting small and growing — would change
-    /// the trigger for every existing workload on the first allocation, which
-    /// is a throughput decision no measurement here supports.)
+    /// bounded by [`Self::young_region_bounds`]. (The reverse — starting small
+    /// and growing — would change the trigger for every existing workload on
+    /// the first allocation, which is a throughput decision no measurement here
+    /// supports.)
+    ///
+    /// Starting at the ceiling is NOT on its own enough to make it a no-op, and
+    /// this doc claimed otherwise until a measurement said so. The ceiling is
+    /// 60% of the region count; the free-pool trigger does not fire until 75%
+    /// is consumed. So on any heap with headroom the CEILING ITSELF was the
+    /// binding trigger, and the cap manufactured collections on a workload
+    /// whose pauses had never once overrun. Measured (2026-08-18,
+    /// `probes/G1ChurnPauseProbe 64 300`, `-Xmx2048m`, 1.2 GiB of garbage): the
+    /// other two arms took ZERO pauses and this one took a 210 ms pause, for a
+    /// 20% wall-clock cost and no latency to gain — there were no pauses to
+    /// shorten.
+    ///
+    /// `needs_gc` therefore also requires `target < ceiling`: the cap acts only
+    /// on the collector's own evidence that this workload's young generation is
+    /// too big for its goal. Regression:
+    /// `a_young_target_at_its_ceiling_never_triggers_a_collection`.
     ///
     /// # The anti-storm rule
     ///
@@ -11197,9 +11211,32 @@ impl GarbageCollector for G1Collector {
         if !gc_flags().g1_young_pause_target {
             return false;
         }
-        let young = self.young_region_count.load(Ordering::Relaxed);
         let target = self.young_target_regions.load(Ordering::Relaxed);
-        young >= target && target > 0
+        if target == 0 {
+            return false;
+        }
+        // The target must have been TIGHTENED by a measured overrun before it
+        // is allowed to trigger anything.
+        //
+        // MEASURED (2026-08-18, `probes/G1ChurnPauseProbe 64 300`, `-Xmx2048m`,
+        // 1.2 GiB of garbage): without this test the ceiling ITSELF was a
+        // trigger. 60% of 2048 regions is 1228, and the free-pool trigger does
+        // not fire until 1536 regions are consumed — so on a heap with headroom
+        // the cap manufactured a 210 ms pause in a run that otherwise took NONE,
+        // for a 20% wall-clock cost and no latency to gain (there were no pauses
+        // to shorten). That is the exact failure the field doc claims cannot
+        // happen: "it STARTS at the ceiling, so a workload already meeting its
+        // goal never leaves it and sees no change". The claim was right about
+        // the target and wrong about the trigger.
+        //
+        // Below the ceiling, `update_young_target` has seen a productive pause
+        // exceed `max_gc_pause_ms` — the collector's own evidence that this
+        // workload's young generation is too big for its goal.
+        let (_min, max) = self.young_region_bounds();
+        if target >= max {
+            return false;
+        }
+        self.young_region_count.load(Ordering::Relaxed) >= target
     }
 
     fn collect_garbage(
@@ -15702,38 +15739,46 @@ mod tests {
     /// ceiling and only tightens after a pause is measured to overrun.
     #[test]
     fn the_young_target_shrinks_after_an_overrun_and_recovers_under_the_goal() {
-        let gc = make_collector(); // 8 regions, goal 200 ms
-        let (min, max) = gc.young_region_bounds();
-        assert_eq!(
-            gc.young_target_regions(),
-            max,
-            "the cap must be a no-op until a pause is measured to overrun"
-        );
+        // Ships opt-in (see `VmFlags::g1_young_pause_target` for the
+        // measurement) — a test named after the feature has to turn it on,
+        // or it silently measures the flag being off.
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
+            || {
+            let gc = make_collector(); // 8 regions, goal 200 ms
+            let (min, max) = gc.young_region_bounds();
+            assert_eq!(
+                gc.young_target_regions(),
+                max,
+                "the cap must be a no-op until a pause is measured to overrun"
+            );
 
-        let productive = GcStats {
-            objects_copied: 1,
-            bytes_copied: 64,
-            bytes_freed: 4096,
-        };
-        // 500 ms against a 200 ms goal.
-        gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
-        let shrunk = gc.young_target_regions();
-        assert!(
-            shrunk < max && shrunk >= min,
-            "an overrun must tighten the young generation (got {shrunk}, was {max})"
-        );
-
-        // Drive it to the floor, then confirm it never goes under.
-        for _ in 0..64 {
+            let productive = GcStats {
+                objects_copied: 1,
+                bytes_copied: 64,
+                bytes_freed: 4096,
+            };
+            // 500 ms against a 200 ms goal.
             gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
-        }
-        assert_eq!(gc.young_target_regions(), min, "the floor must hold");
+            let shrunk = gc.young_target_regions();
+            assert!(
+                shrunk < max && shrunk >= min,
+                "an overrun must tighten the young generation (got {shrunk}, was {max})"
+            );
 
-        // Comfortably-under pauses give the slack back, up to the ceiling.
-        for _ in 0..256 {
-            gc.update_young_target(G1CollectionType::YoungOnly, 1_000, &productive);
-        }
-        assert_eq!(gc.young_target_regions(), max, "the ceiling must hold");
+            // Drive it to the floor, then confirm it never goes under.
+            for _ in 0..64 {
+                gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
+            }
+            assert_eq!(gc.young_target_regions(), min, "the floor must hold");
+
+            // Comfortably-under pauses give the slack back, up to the ceiling.
+            for _ in 0..256 {
+                gc.update_young_target(G1CollectionType::YoungOnly, 1_000, &productive);
+            }
+            assert_eq!(gc.young_target_regions(), max, "the ceiling must hold");
+            },
+        );
     }
 
     /// The anti-storm rule. A pause that reclaims nothing leaves the young
@@ -15743,31 +15788,39 @@ mod tests {
     /// WIDEN the target.
     #[test]
     fn an_unproductive_pause_restores_the_full_young_target() {
-        let gc = make_collector();
-        let (_min, max) = gc.young_region_bounds();
-        let productive = GcStats {
-            objects_copied: 1,
-            bytes_copied: 64,
-            bytes_freed: 4096,
-        };
-        for _ in 0..64 {
-            gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
-        }
-        assert!(gc.young_target_regions() < max);
+        // Ships opt-in (see `VmFlags::g1_young_pause_target` for the
+        // measurement) — a test named after the feature has to turn it on,
+        // or it silently measures the flag being off.
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
+            || {
+            let gc = make_collector();
+            let (_min, max) = gc.young_region_bounds();
+            let productive = GcStats {
+                objects_copied: 1,
+                bytes_copied: 64,
+                bytes_freed: 4096,
+            };
+            for _ in 0..64 {
+                gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
+            }
+            assert!(gc.young_target_regions() < max);
 
-        gc.update_young_target(
-            G1CollectionType::YoungOnly,
-            500_000,
-            &GcStats {
-                objects_copied: 0,
-                bytes_copied: 0,
-                bytes_freed: 0,
+            gc.update_young_target(
+                G1CollectionType::YoungOnly,
+                500_000,
+                &GcStats {
+                    objects_copied: 0,
+                    bytes_copied: 0,
+                    bytes_freed: 0,
+                },
+            );
+            assert_eq!(
+                gc.young_target_regions(),
+                max,
+                "a pause that reclaimed nothing must not be allowed to tighten the trigger"
+            );
             },
-        );
-        assert_eq!(
-            gc.young_target_regions(),
-            max,
-            "a pause that reclaimed nothing must not be allowed to tighten the trigger"
         );
     }
 
@@ -15777,23 +15830,31 @@ mod tests {
     /// young/mixed pause.
     #[test]
     fn a_real_pause_resizes_the_young_target() {
-        let gc = make_collector(); // goal 200 ms; a unit-test pause is far under
-        let (min, max) = gc.young_region_bounds();
-        // Start pinned at the floor so the only observable direction is UP.
-        gc.young_target_regions.store(min, Ordering::Relaxed);
+        // Ships opt-in (see `VmFlags::g1_young_pause_target` for the
+        // measurement) — a test named after the feature has to turn it on,
+        // or it silently measures the flag being off.
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
+            || {
+            let gc = make_collector(); // goal 200 ms; a unit-test pause is far under
+            let (min, max) = gc.young_region_bounds();
+            // Start pinned at the floor so the only observable direction is UP.
+            gc.young_target_regions.store(min, Ordering::Relaxed);
 
-        // A productive pause: one rooted object is copied out of Eden.
-        let a = gc.alloc_object(ClassId::new(1), 1);
-        let mut roots = vec![a];
-        let result = gc.young_collection(&mut roots, &NoopMonitors);
-        assert!(
-            result.stats.objects_copied > 0,
-            "the pause must be productive or the anti-storm rule applies instead"
-        );
+            // A productive pause: one rooted object is copied out of Eden.
+            let a = gc.alloc_object(ClassId::new(1), 1);
+            let mut roots = vec![a];
+            let result = gc.young_collection(&mut roots, &NoopMonitors);
+            assert!(
+                result.stats.objects_copied > 0,
+                "the pause must be productive or the anti-storm rule applies instead"
+            );
 
-        assert!(
-            gc.young_target_regions() > min && gc.young_target_regions() <= max,
-            "a pause comfortably under the goal must hand slack back —              `record_collection` is where the adapter is wired in"
+            assert!(
+                gc.young_target_regions() > min && gc.young_target_regions() <= max,
+                "a pause comfortably under the goal must hand slack back —              `record_collection` is where the adapter is wired in"
+            );
+            },
         );
     }
 
@@ -15802,25 +15863,96 @@ mod tests {
     /// only thing that can fire the trigger is the young cap.
     #[test]
     fn needs_gc_fires_on_the_young_target_while_the_free_pool_is_comfortable() {
-        let gc = make_collector(); // 8 regions; free trigger at < 25%
-        {
-            let mut regions = gc.regions.lock();
-            // Three Eden regions: five of eight Free, far above the 25% floor.
-            for r in regions.iter_mut().take(3) {
-                r.region_type = RegionType::Eden;
+        // Ships opt-in (see `VmFlags::g1_young_pause_target` for the
+        // measurement) — a test named after the feature has to turn it on,
+        // or it silently measures the flag being off.
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
+            || {
+            let gc = make_collector(); // 8 regions; free trigger at < 25%
+            {
+                let mut regions = gc.regions.lock();
+                // Three Eden regions: five of eight Free, far above the 25% floor.
+                for r in regions.iter_mut().take(3) {
+                    r.region_type = RegionType::Eden;
+                }
+                gc.publish_region_census(&regions);
             }
-            gc.publish_region_census(&regions);
-        }
-        assert_eq!(gc.young_region_count(), 3);
-        assert!(
-            !<G1Collector as GarbageCollector>::needs_gc(&gc),
-            "the Free pool is comfortable and the target is at its ceiling"
-        );
+            assert_eq!(gc.young_region_count(), 3);
+            assert!(
+                !<G1Collector as GarbageCollector>::needs_gc(&gc),
+                "the Free pool is comfortable and the target is at its ceiling"
+            );
 
-        gc.young_target_regions.store(3, Ordering::Relaxed);
-        assert!(
-            <G1Collector as GarbageCollector>::needs_gc(&gc),
-            "reaching the adaptive young size must request a collection"
+            gc.young_target_regions.store(3, Ordering::Relaxed);
+            assert!(
+                <G1Collector as GarbageCollector>::needs_gc(&gc),
+                "reaching the adaptive young size must request a collection"
+            );
+            },
+        );
+    }
+
+    /// G1AUD-9 — a target still sitting at its CEILING must never trigger,
+    /// however much young the heap holds.
+    ///
+    /// Measured failure this guards (2026-08-18, `-Xmx2048m`,
+    /// `G1ChurnPauseProbe 64 300`): the ceiling is 60% of the region count and
+    /// the free-pool trigger does not fire until 75% is consumed, so on a heap
+    /// with headroom the ceiling ITSELF fired — manufacturing a 210 ms pause in
+    /// a run that otherwise took none, at a 20% wall-clock cost and with no
+    /// latency to gain, because there were no pauses to shorten. The cap is
+    /// only ever allowed to act on the collector's own evidence: a productive
+    /// pause that overran `max_gc_pause_ms` and therefore tightened the target
+    /// below its ceiling.
+    #[test]
+    fn a_young_target_at_its_ceiling_never_triggers_a_collection() {
+        // Ships opt-in (see `VmFlags::g1_young_pause_target` for the
+        // measurement) — a test named after the feature has to turn it on,
+        // or it silently measures the flag being off.
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
+            || {
+            let gc = make_collector(); // 8 regions
+            let (_min, max) = gc.young_region_bounds();
+            {
+                let mut regions = gc.regions.lock();
+                // Every region young — as far past any plausible target as the heap
+                // allows — while the target is untouched at its ceiling.
+                for r in regions.iter_mut() {
+                    r.region_type = RegionType::Eden;
+                }
+                gc.publish_region_census(&regions);
+            }
+            assert!(gc.young_region_count() >= max);
+            assert_eq!(gc.young_target_regions(), max, "no pause has overrun yet");
+            // The free-pool arm is what must answer here (zero Free regions), so
+            // check the young arm in isolation by giving the pool room back.
+            gc.free_region_count.store(8, Ordering::Relaxed);
+            gc.needs_gc_since_recount.store(0, Ordering::Relaxed);
+            assert!(
+                !<G1Collector as GarbageCollector>::needs_gc(&gc),
+                "an untightened target must not be a trigger — the cap acts only on              a MEASURED overrun"
+            );
+
+            // One measured overrun, and the same heap state now does trigger.
+            gc.update_young_target(
+                G1CollectionType::YoungOnly,
+                500_000, // 500 ms against a 200 ms goal
+                &GcStats {
+                    objects_copied: 1,
+                    bytes_copied: 64,
+                    bytes_freed: 4096,
+                },
+            );
+            assert!(gc.young_target_regions() < max);
+            gc.free_region_count.store(8, Ordering::Relaxed);
+            gc.needs_gc_since_recount.store(0, Ordering::Relaxed);
+            assert!(
+                <G1Collector as GarbageCollector>::needs_gc(&gc),
+                "once a pause has overrun the goal, the tightened target must bind"
+            );
+            },
         );
     }
 
