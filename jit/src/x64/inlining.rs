@@ -107,7 +107,14 @@ impl Compiler {
         self.slot_mirror = None;
         self.slot_mirror_suppressed = true;
         let deopt_points_checkpoint = self.deopt_points.len();
+        // The scope for this splice — the ENCLOSING method's frame at the
+        // invoke, captured before the callee's body is emitted. See
+        // `push_inline_scope`; popped on BOTH exits below, because a scope left
+        // behind by a bailed splice would attach a caller frame to every later
+        // point in the enclosing method.
+        self.push_inline_scope(pc, site.callee_num_args);
         let inline_ok = self.try_emit_inline_body(pc, site);
+        self.pop_inline_scope();
         self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
         self.slot_mirror = None;
         // PGO-02 §3, enforced rather than argued.
@@ -125,12 +132,52 @@ impl Compiler {
         // The safety argument used to be a claim about the source ("the
         // emitter contains no `build_and_record_deopt_point` on this path").
         // That claim is one future edit away from being false, and nothing
-        // would fail when it became false. Check the postcondition instead: if
-        // the body published any deopt metadata, refuse the splice and take
-        // the real call. A refusal costs one dispatch; the alternative costs a
-        // wrong stack.
-        let published_deopt_metadata = self.deopt_stubs.len() > deopt_stubs_checkpoint
-            || self.deopt_points.len() > deopt_points_checkpoint;
+        // would fail when it became false. Check the postcondition instead.
+        //
+        // **What it checks changed 2026-08-18; why it exists did not.** The old
+        // check refused any published metadata at all, because an inlined scope
+        // was not representable — `FrameState::caller` had no producer, so a
+        // point published here would have named the CALLER's method with the
+        // CALLEE's bci. There is a producer now (`push_inline_scope`), so the
+        // question is no longer "was anything published" but "does what was
+        // published SAY it came from inside a splice". A point without a caller
+        // scope is exactly the malformed frame the old rule was protecting
+        // against, so that one still refuses.
+        //
+        // Checked over the points this body added, not over the whole vector:
+        // an enclosing method's own earlier points legitimately have no caller
+        // scope, and scanning them would refuse every splice in any method that
+        // publishes anything at all.
+        let published_unscoped_point = self.deopt_points[deopt_points_checkpoint..]
+            .iter()
+            .any(|p| p.frame_state.caller.is_none());
+        // A raw stub with no matching point is metadata this check cannot read,
+        // and it is what `force_inline_deopt_publication` injects. Refuse it as
+        // before rather than assume it is well-formed.
+        let published_unreadable_stub = self.deopt_stubs.len() > deopt_stubs_checkpoint
+            && self.deopt_points.len() == deopt_points_checkpoint;
+        let published_deopt_metadata = published_unscoped_point || published_unreadable_stub;
+        // Is this population non-empty? A relaxation nobody can see is
+        // indistinguishable from no relaxation, and the only splices affected
+        // are the ones that publish — which the old rule refused, so there is
+        // no prior count of them anywhere. Named per splice under
+        // `CRATONVM_DBG_JITC` rather than guessed at.
+        if (self.deopt_points.len() > deopt_points_checkpoint || published_unreadable_stub)
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+        {
+            eprintln!(
+                "[cratonvm-jitc] inline-splice {}.{}{} at pc={pc} published {} point(s): {}",
+                site.class_name,
+                site.method_name,
+                site.descriptor,
+                self.deopt_points.len() - deopt_points_checkpoint,
+                if published_deopt_metadata {
+                    "REFUSED (a point with no caller scope)"
+                } else {
+                    "admitted, every point carries its caller scope"
+                },
+            );
+        }
         if inline_ok && !published_deopt_metadata {
             true
         } else {

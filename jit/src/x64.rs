@@ -383,6 +383,23 @@ struct Compiler {
     /// This method uses frame-preserving exception exits for handlers that
     /// read non-parameter locals (RBC.6 precise-handler continuation).
     precise_exception_frames: bool,
+    /// The inlined-splice scope stack — one entry per splice currently being
+    /// emitted, outermost first.
+    ///
+    /// `docs/jit/deopt-frame-state-interning.md` §5.1 named this as the
+    /// remaining producer edit for the single-pass backend: "it needs one
+    /// pushed at the splice and popped at the callee's return". Each entry is
+    /// the CALLER's frame captured at the invoke — a `FrameState` whose `bci`
+    /// names the call in progress and whose operand stack has already had the
+    /// callee's arguments removed, which is what
+    /// `ResumeSemantics::for_caller_scope()` (`RESUME`) means and what the VM's
+    /// `caller_resume_pc` requires.
+    ///
+    /// Empty on every compile that splices nothing, so `inline_caller_chain`
+    /// answers `None` and the published metadata is byte-identical to what it
+    /// was before this existed.
+    pub(super) inline_scope_stack: Vec<crate::deopt::FrameState>,
+
     /// `[start_pc, end_pc)` ranges covered by this method's exception table.
     /// Empty when the method has no handlers. Consulted only by
     /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
@@ -2351,6 +2368,7 @@ impl Compiler {
             emitted_athrow: false,
             emitted_monitor_call: false,
             precise_exception_frames,
+            inline_scope_stack: Vec::new(),
             protected_ranges,
             // Installed after construction by `compile_with_param_slots`, and
             // only when it decided to compile rewritten bytecode.

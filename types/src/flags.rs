@@ -66,6 +66,24 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+/// FxHash-backed aliases for the two collections on the flag *read* path.
+///
+/// PERF (2026-08-18, commons-math `BigDecimalBench` profile): `runtime_var_os`
+/// consults `declared_flag_names()` on EVERY call, and with the default
+/// `RandomState` that is a SipHash of the key plus a `memcmp`. On a
+/// `BigDecimal` benchmark that showed up as `hash_one::<&str>` 1.70% +
+/// `sip::Hasher::write` 1.41% of the whole process — for looking up string
+/// constants in a set that never changes after startup.
+///
+/// This is the same trade this crate already made for `StringPool` (see the
+/// `rustc-hash` dependency note in Cargo.toml): FxHash is ~3-5x faster than
+/// SipHash on the short ASCII keys these hold, and neither collection is
+/// exposed to untrusted input — the flag-name set is built from a compile-time
+/// inventory, and `MapSource` from the process environment — so the HashDoS
+/// resistance SipHash buys is not load-bearing here.
+type FxHashSetStr = rustc_hash::FxHashSet<&'static str>;
+type FxHashMapStr = rustc_hash::FxHashMap<String, OsString>;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -97,7 +115,7 @@ impl FlagSource for EnvSource {
 /// An explicit map, for tests and for launchers that layer `-XX:` flags over
 /// the environment.
 #[derive(Debug, Clone, Default)]
-pub struct MapSource(HashMap<String, OsString>);
+pub struct MapSource(FxHashMapStr);
 
 impl MapSource {
     /// Build from `(name, value)` pairs.
@@ -131,7 +149,7 @@ impl MapSource {
     /// not valid UTF-8 are dropped, which is not observable — every lookup is
     /// by `&str`, so such a name could never be matched anyway.
     pub fn from_process_env() -> Self {
-        let mut map: HashMap<String, OsString> = HashMap::new();
+        let mut map: FxHashMapStr = FxHashMapStr::default();
         for (name, value) in std::env::vars_os() {
             if let Ok(name) = name.into_string() {
                 map.entry(name).or_insert(value);
@@ -141,7 +159,7 @@ impl MapSource {
     }
 
     fn declared_snapshot(src: &dyn FlagSource) -> Self {
-        let mut map = HashMap::new();
+        let mut map = FxHashMapStr::default();
         for &name in declared_flag_names() {
             if let Some(value) = src.get(name) {
                 map.insert(name.to_string(), value);
@@ -809,6 +827,38 @@ pub struct GcFlags {
     /// zeros" world back — a use-after-free read is the one thing the scrub was
     /// really buying — and it is what makes the change a single-binary A/B.
     pub g1_scrub_free: bool,
+    /// `CRATONVM_G1_NARROW_FIXUP` — restrict G1's Phase-4 reference fix-up to
+    /// the regions that can actually need it, instead of every non-CSet region
+    /// in the heap. Default **ON** ([`parse::on_unless_zero`]); `=0` restores
+    /// the whole-heap walk.
+    ///
+    /// The walk is what makes a young pause O(LIVE HEAP) rather than O(young
+    /// live set) — the property G1's region design exists to buy. It visits
+    /// every object of every surviving region to rewrite forwarding pointers
+    /// and rebuild GC-internal remembered-set edges. Neither job needs the
+    /// whole heap: the rewrite is redundant with Phases 2 and 3 once every
+    /// mutator store reaches `post_write_barrier_rset` (true since defect G1-2
+    /// closed), and the rebuild only concerns regions this pause WROTE INTO.
+    /// See `G1Collector::phase4_regions_to_walk`.
+    ///
+    /// `=0` is the bisection lever, and the FIRST thing to try for any
+    /// suspected G1 dangling-reference or lost-edge defect: under it the
+    /// collector re-walks the whole heap every pause, which is the behaviour
+    /// every G1 result before 2026-08-18 was produced under.
+    pub g1_narrow_fixup: bool,
+    /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
+    /// every cross-region reference into a COLLECTABLE region is named in that
+    /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
+    /// bytes), never a shipping default.
+    ///
+    /// The complement of `verify_no_dangling_into_cset`, which asks "did this
+    /// pause leave a stale pointer?". This asks "will the NEXT pause know where
+    /// to look?" — a missing edge means the pause that collects the target
+    /// never scans the holder and frees a live object. It exists because the
+    /// unit suite cannot discriminate a correct Phase-4 narrowing from one that
+    /// walks nothing: on every constructible fixture the mutator barrier alone
+    /// already records every edge.
+    pub g1_dbg_rset: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
@@ -1012,6 +1062,8 @@ impl GcFlags {
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
+            g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
+            g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
@@ -2218,10 +2270,10 @@ impl VmFlags {
 
 static FLAGS: OnceLock<VmFlags> = OnceLock::new();
 
-fn declared_flag_names() -> &'static HashSet<&'static str> {
-    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+fn declared_flag_names() -> &'static FxHashSetStr {
+    static NAMES: OnceLock<FxHashSetStr> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let mut names = HashSet::new();
+        let mut names = FxHashSetStr::default();
         for entry in crate::flag_groups::INVENTORY {
             if let Some(name) = entry.on_key {
                 names.insert(name);
