@@ -3605,12 +3605,30 @@ impl OsrEntryPlan {
         let point = match osr_exit::resume_image(&artifact.deopt_points, rframe.bci) {
             osr_exit::ResumeImage::Unique { index, .. } => &artifact.deopt_points[index],
             osr_exit::ResumeImage::None => {
+                // Two different states share this arm, and saying so matters:
+                // `resume_image` skips `rethrow_exception` points (they are not
+                // resume images — see its doc), so a bci whose ONLY point is a
+                // reason-9 exceptional frame answers `None` here. That is not a
+                // mis-routed stash, it is a frame arriving at the wrong sink:
+                // its bci names a THROWING instruction and it belongs to
+                // `take_exceptional_frame`, not to a resume.
+                let rethrow_here = artifact
+                    .deopt_points
+                    .iter()
+                    .any(|p| p.bci == rframe.bci && p.semantics.rethrow_exception);
                 return Err(osr_refusal(
                     OSR_REFUSE_EXIT_REPLAY,
-                    format!(
-                        "exit bci {} is not a recorded deopt point of this artifact",
-                        rframe.bci
-                    ),
+                    if rethrow_here {
+                        format!(
+                            "exit bci {} names only a RETHROW point, which is not a resume                              point at all — it must be routed through the exception table                              (REEXECUTE semantics are required here)",
+                            rframe.bci
+                        )
+                    } else {
+                        format!(
+                            "exit bci {} is not a recorded deopt point of this artifact",
+                            rframe.bci
+                        )
+                    },
                 ));
             }
             osr_exit::ResumeImage::Ambiguous { first, second } => {
@@ -12950,7 +12968,7 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
 /// is also the one that matters most — that door compiles a `@Test` method's hot
 /// loop, and a method denied there runs its whole life interpreted with no other
 /// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
-/// exhaustive loops (docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md).
+/// exhaustive loops (fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md).
 ///
 /// Consumes the thread-local site, like `try_compile`'s own recorder.
 pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
@@ -15083,8 +15101,19 @@ fn precise_exception_frame_sites_supported(
 /// A malformed instruction stream also answers `Some` (at the offending pc,
 /// with the opcode that could not be measured): a walk that cannot find the
 /// next boundary has not proved anything about the rest of the method.
+///
+/// **Public because the OSR door asks the same question.** RBC.6b refused any
+/// OSR compile of a method with a non-empty exception table outright, on the
+/// grounds that an OSR artifact carries no handler ranges. Staging the same
+/// three requests the method-entry path stages (`set_precise_exception_frame_
+/// request` / `set_protected_ranges_request` / `set_pending_exception_ranges`)
+/// gives the OSR body reason-9 frames at its protected-range invokes — but only
+/// where every throwing site in those ranges publishes one. That is exactly
+/// this predicate, so `compile_osr_artifact` calls it rather than growing a
+/// second, drifting copy of the opcode table. See
+/// `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`.
 #[cfg(target_arch = "x86_64")]
-fn first_unsupported_precise_frame_site(
+pub fn first_unsupported_precise_frame_site(
     code: &[u8],
     code_len: usize,
     exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
@@ -24647,20 +24676,30 @@ mod tests {
 
         // Two images of the loop header that disagree on the SEMANTICS.
         //
-        // `RETHROW`, not `RESUME`, and the choice is the whole point: a
-        // `RESUME` point anywhere in an artifact is already refused by the
-        // per-point rule above (`osr-entry-unresumable-exit`), so it could
-        // never reach this check. A `RETHROW` point is explicitly ALLOWED to
-        // exist — such points are stashed separately and never routed to a
-        // resume — which is exactly what makes it the reachable disagreement:
-        // `for_reason` answers `RETHROW` for `PendingException` and `REEXECUTE`
-        // for everything else.
+        // This used to be spelled `REEXECUTE` vs `RETHROW`, on the reasoning
+        // that a `RESUME` point is refused by the per-point rule before this
+        // check sees it while a `RETHROW` point is explicitly allowed to exist.
+        // Both halves of that were true and the conclusion was wrong: a
+        // `RETHROW` point is not a competing resume IMAGE — the same sentence
+        // that admits it says such points are "stashed separately and never
+        // routed to a resume" — so a bci carrying one plus one `REEXECUTE`
+        // point has exactly one image and no ambiguity.
+        //
+        // Refusing it was not academic. After the RBC.6b lift (2026-08-17) a
+        // `try { foo(x); } catch (...)` loop puts a speculative-dispatch guard
+        // and a `PendingException` frame on the same invoke bci, which is the
+        // ORDINARY shape of the population that lift admits;
+        // `probes/OsrExcTableProbe.java` reported `osr_entered=0
+        // osr_entry_refused_ambiguous_image=15` with every correctness arm
+        // green. `osr_exit::resume_image` now skips rethrow points, and
+        // `a_rethrow_point_is_not_a_competing_resume_image` is that case.
+        //
+        // What remains here is the genuine disagreement between two things that
+        // both claim to be resume points, which is the wrong-code half.
         let mut cm = osr_t_artifact(3);
         let mut other = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
         other.native_offset = 0x90;
-        other.reason = deopt::DeoptReason::PendingException;
-        other.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
-        assert_eq!(other.semantics, deopt::ResumeSemantics::RETHROW);
+        other.semantics = deopt::ResumeSemantics::RESUME;
         cm.deopt_points = vec![
             osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
             other,
@@ -24668,11 +24707,35 @@ mod tests {
         let err = cm
             .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
             .unwrap_err();
-        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE));
+        // The per-point `RESUME` rule fires first (it walks the list before the
+        // ambiguity scan), so THAT is what this pair reports. Assert the
+        // ambiguity scan itself directly, where nothing else can shadow it.
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
         assert!(
             osr_refusal_is_permanent(&err),
             "the point list is a pure function of the artifact, so the refusal is memoable"
         );
+        assert!(
+            osr_exit::first_ambiguous_resume_bci(&cm.deopt_points).is_some(),
+            "two points that both claim to be resume points and disagree are ambiguous"
+        );
+
+        // And the rethrow pairing, which must NOT be ambiguous — the correction
+        // above, asserted at the same level as the refusal it replaced.
+        let mut rethrow_pair = osr_t_artifact(3);
+        let mut exc = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        exc.native_offset = 0x90;
+        exc.reason = deopt::DeoptReason::PendingException;
+        exc.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
+        assert_eq!(exc.semantics, deopt::ResumeSemantics::RETHROW);
+        rethrow_pair.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            exc,
+        ];
+        let plan = rethrow_pair
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("a RETHROW point sharing a bci must not refuse the entry");
+        assert_eq!(plan.exit_policy, OsrExitPolicy::ExactTransfer);
 
         // Over-refusal guard 1: several native images of ONE bytecode is
         // exactly what a loop transform produces, and they agree on everything
@@ -24827,6 +24890,12 @@ mod tests {
         let err = plan.resume_after_exit(&cm, &rframe).unwrap_err();
         assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
         assert!(err.to_string().contains("REEXECUTE"), "{err}");
+        // …and it says WHY, rather than "not a recorded deopt point": since
+        // `resume_image` stopped counting rethrow points as resume images, a
+        // bci whose only point is one answers `None` there, and the generic
+        // "not recorded" wording would send the reader looking for a
+        // mis-routed stash that does not exist.
+        assert!(err.to_string().contains("RETHROW"), "{err}");
     }
 
     /// A crash handler must be able to tell "no compiled body covers this

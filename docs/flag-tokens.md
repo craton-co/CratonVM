@@ -520,7 +520,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-181 tokens.
+182 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -632,6 +632,7 @@ export inherited from a parent shell.
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
+| `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
 | `osr-seed-frame-slots` | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` |
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
@@ -710,7 +711,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-54 tokens.
+55 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -766,6 +767,7 @@ export inherited from a parent shell.
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
 | `zgc-gen-header-zero` | `CRATONVM_ZGC_GEN_HEADER_ZERO` |
 | `zgc-gen-dead-runs` | `CRATONVM_ZGC_GEN_DEAD_RUNS` |
+| `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
