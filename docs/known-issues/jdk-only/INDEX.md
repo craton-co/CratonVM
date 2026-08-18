@@ -982,3 +982,15 @@ Three of those are worth reading before acting anywhere in this tree:
   always computed the descriptor itself; that computation is now shared. Read §8
   N1 before trusting any of the other 306 sites that name an object by its class
   id, and §7 before believing a `0 of 100` suite run.
+* **`G70-1`** — the `native-collections` units refactor, **done whole**.
+  Seventeen `toString` families all bottomed out in one function that returned
+  a Rust `String`, which cannot hold an unpaired UTF-16 surrogate: **21 of 29
+  probe rows diverged**, where `G63-1` had sampled three. Two corrections to
+  that record's plan — it needs TWO trait methods (a lossless read written back
+  through a lossy constructor is still lossy), and `init_string_from_units`
+  cannot stand in for the second because it assumes the `char[]` layout a real
+  JDK String does not use. Then the part worth reading: **two rows survived the
+  whole-family fix**, because real JDK `AbstractCollection.toString` is a
+  `sb.append(e)` loop and `StringBuilder.append(Object)` was still calling the
+  lossy reader — whose units-exact twin was built by `G26` and sits directly
+  above it, unused. A family fix that stops at the crate boundary is not whole.
