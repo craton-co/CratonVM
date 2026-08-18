@@ -1054,3 +1054,13 @@ Three of those are worth reading before acting anywhere in this tree:
   positional-substitution trick — it works and it is a trick. Read the N2 entry
   before editing any `URL`/`URI` native: I fixed the wrong twin first, and the
   registry dump would have said so in one command.
+* **`TIMEOUT=420` — I ran a whole session without it and got away with it until
+  I did not.** `HANDOFF-20260812` says it is not optional on this host
+  (`RMapGcStress` needs ~4m55s against a 120 s default) and a retired record
+  calls the vector "a load flake [that] read as a result in both directions".
+  On a non-LTO binary it fit under 120 s and every arm was green; on the
+  fat-LTO binary it straddled the line and failed 2 runs of 4, which reads
+  exactly like a regression from whatever you just changed. It is not. Set
+  `TIMEOUT=420` on every arm, and when a GC-stress vector fails intermittently,
+  check the timeout before the diff — the documented answer was already written
+  down and the cost of not reading it was an hour.
