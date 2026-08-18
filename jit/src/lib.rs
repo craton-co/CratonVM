@@ -18130,6 +18130,16 @@ fn try_compile_inner(
             if compact_fields {
                 if let Some((c_off, c_ref)) = compact_slot {
                     compact_field_info.push((pc, c_off, c_ref));
+                } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
+                    .is_some()
+                {
+                    // ENGAGEMENT CENSUS — see the OSR twin in
+                    // `vm/src/runtime/interpreter/jit_bridge.rs`. A `None` here
+                    // costs a `jit_getfield` call on EVERY access to a compact
+                    // receiver, not merely a missed inline.
+                    eprintln!(
+                        "[compact-inline] MISS entry pc={pc} field_index={field_index} -> guarded-uniform arm (helper on every compact receiver)"
+                    );
                 }
             }
             if code[pc] == 0xb5 && (type_tag == b'L' || type_tag == b'[') {
@@ -29325,7 +29335,23 @@ mod layout_constant_inventory {
         // `field_cell_layout_matches_value_enum` pins. It is a disp32 site
         // (`48 8B 80 disp32` / `48 63 80 disp32`), so it does not share the
         // disp8 backwards-addressing hazard the three array sites have.
-        ("ir_lower.rs", [10, 4, 5, 0, 0, 0, 4, 2]),
+        //
+        // 2026-08-18 added the eleventh `HEADER_SIZE`, the sixth `SLOT_SIZE`,
+        // and TWO each of `FIELD_CELL_PAYLOAD32_OFFSET` (4 -> 6, the `F` arm
+        // and the int-category default arm) and `FIELD_CELL_PAYLOAD64_OFFSET`
+        // (2 -> 4, the reference arm and the `J`/`D` arm): the IR inline
+        // `getfield`'s LEGACY
+        // branch, `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload bias
+        // inside the 16-byte `Value` cell. It is the arm that stopped every
+        // legacy-layout receiver from taking `jit_getfield` — see
+        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md
+        // — and it is a disp32 site in all three forms it emits
+        // (`48 8B 80 disp32`, `8B 80 disp32`, `48 63 80 disp32`), so it does
+        // not share the disp8 hazard either. `SLOT_SIZE` goes 5 -> 6 with it:
+        // the legacy cell address is `field_index * SLOT_SIZE`, a use of its
+        // own and not a reuse of the compact arm's — which this comment claimed
+        // until the inventory test refused the count and said so.
+        ("ir_lower.rs", [11, 4, 6, 0, 0, 0, 6, 4]),
     ];
 
     fn source(file: &str) -> &'static str {

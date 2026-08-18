@@ -489,14 +489,19 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // reproduces the message verbatim.
     //
     // **Known residual, stated so a green run is not read as more than it is:**
-    // `getProvider()` on the returned Mac answers the canonical `SunJCE` object
+    // on the SYNTHETIC path only — a name this engine computes itself —
+    // `getProvider()` answers the canonical `SunJCE` object
     // (`jce_provider_object`), not the instance the caller passed. HotSpot
     // returns the caller's own instance (`m.getProvider() == provider` measured
-    // `true`). Fixing that means giving `MacState` a provider field, and
-    // `MacState` is built with an explicit all-fields literal in
-    // `phases_late.rs` — a file this lane does not own — whose own comment says
-    // to list every field. For every provider this VM can actually serve a Mac
-    // from, `SunJCE` is the right answer; for an application provider it is not.
+    // `true`); this VM answers an equal NAME but a different object. Fixing
+    // that means giving `MacState` a provider field, and `MacState` is built
+    // with an explicit all-fields literal in `phases_late.rs` — a file this
+    // lane does not own — whose own comment says to list every field.
+    //
+    // A Mac built from the named provider's own SPI (`build_real_mac`, below)
+    // does not have this residual: it is constructed through
+    // `javax.crypto.Mac`'s real `(MacSpi, Provider, String)` constructor with
+    // that provider's object, so `getProvider().getName()` is `BC`.
     r.register(
         mac,
         "getInstance",
@@ -538,6 +543,53 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 &algo,
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
+            // Resolve against the NAMED provider's own alias rows, then build
+            // that provider's own `MacSpi` — the same two steps the
+            // `(String, String)` overload takes, for the same reasons, and this
+            // overload had NEITHER.
+            //
+            // Ownership was checked just above and then the name was put to
+            // THIS engine's `mac_algorithm_supported` gate, so every algorithm
+            // BouncyCastle owns and this engine does not compute was refused
+            // with `no such algorithm: <name> for provider BC` — a provider
+            // being told it does not implement what it had just been confirmed
+            // to own, one line earlier, by the same table.
+            //
+            // Measured against HotSpot 25 (`MacProvObj2`), before:
+            //
+            // ```text
+            // 1.3.14.3.2.26     byName   BC len=20 2376178e…
+            //                   byObject EX NoSuchAlgorithmException:
+            //                            no such algorithm: 1.3.14.3.2.26 for provider BC
+            // ```
+            //
+            // `PBEwithHmacSHA1` and `AESCMAC` are the same shape. HotSpot
+            // serves both forms identically, which is what makes the two
+            // overloads' disagreement the defect rather than a policy: a caller
+            // holding a `Provider` INSTANCE — which is what
+            // `Security.getProvider("BC")` hands back, and what BouncyCastle's
+            // own `JcaJceHelper`/`PKCS12` paths carry — got a refusal the same
+            // caller would not have got from the string.
+            let requested_provider =
+                crate::jca::provider_chain::provider_arg_name(ctx, args, algo_idx + 1);
+            let requested_algo = algo.clone();
+            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
+                requested_provider.as_deref(),
+                "Mac",
+                &algo,
+                &mac_algorithm_supported,
+            )
+            .unwrap_or(algo);
+            if let Some(provider) = requested_provider.as_deref() {
+                if let Some(obj) = crate::jca::provider_chain::build_real_mac(
+                    ctx,
+                    provider,
+                    &requested_algo,
+                    &algo,
+                )? {
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
             // Backstop for the case ownership cannot see: a provider whose name
             // this VM could not read (`provider_name_of` -> "<unknown>", which
             // `check_provider_ownership` deliberately admits) asking for a name

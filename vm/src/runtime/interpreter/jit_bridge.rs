@@ -29,6 +29,21 @@
 
 use super::*;
 
+/// Class name for the `CRATONVM_DBG_COMPACT_INLINE` engagement census, or a
+/// `<class_id=N>` placeholder when the class store cannot name it.
+///
+/// Diagnostic-only, and deliberately `#[cold]`: the census fires once per
+/// unresolved field site at COMPILE time, never on the execution path it is
+/// reporting about.
+#[inline(never)]
+#[cold]
+fn declaring_class_name_for_diag(shared: &SharedVm, class_id: ClassId) -> String {
+    let cm = shared.classes.class_manager.read();
+    cm.get_class(class_id)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| format!("<class_id={}>", class_id.as_u32()))
+}
+
 /// `CRATONVM_DBG_JITC` diagnostic: name the cache state that forced an OSR
 /// recompile — `no-cached-artifact` (the one legitimate case),
 /// `cached-not-via-osr`, or `cached-cannot-enter-at-pc`.
@@ -632,11 +647,35 @@ pub(super) fn compile_osr_artifact(
                     let type_tag = *descriptor.as_bytes().first()?;
                     field_info.push((pc, field.field_index, type_tag));
                     if compact_fields {
-                        if let Some((c_off, c_ref)) = cratonvm_types::compact_field_slot(
+                        let slot = cratonvm_types::compact_field_slot(
                             field.declaring_class_id.as_u32(),
                             field.field_index,
-                        ) {
+                        );
+                        if let Some((c_off, c_ref)) = slot {
                             compact_field_info.push((pc, c_off as u32, c_ref));
+                        } else if cratonvm_types::flags::runtime_var_os(
+                            "CRATONVM_DBG_COMPACT_INLINE",
+                        )
+                        .is_some()
+                        {
+                            // ENGAGEMENT CENSUS. A `None` here is not a missing
+                            // optimisation, it is a *helper call on every access*:
+                            // this pc takes the guarded uniform arm, which keys on
+                            // GC_FLAG_COMPACT and routes every COMPACT receiver —
+                            // the default layout — to `jit_getfield`, whose
+                            // `is_object_address` walk the profile shows at ~31% of
+                            // a field-dense run. Naming the declaring class and
+                            // index is what separates "no layout registered for
+                            // this class" from "index outside the layout it has".
+                            let declaring = declaring_class_name_for_diag(
+                                shared,
+                                field.declaring_class_id,
+                            );
+                            eprintln!(
+                                "[compact-inline] MISS osr pc={pc} declaring={declaring} class_id={} field_index={} -> guarded-uniform arm (helper on every compact receiver)",
+                                field.declaring_class_id.as_u32(),
+                                field.field_index,
+                            );
                         }
                     }
                 }

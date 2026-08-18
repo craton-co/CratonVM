@@ -340,7 +340,7 @@ be converted before the shrink, as a standalone no-op commit.**
 ### 6.6 `jit/src/ir_lower.rs` — a second emitter the tripwire never covered
 
 `header_offset_emission_site_inventory_matches_the_doc` scans only `x64.rs`. `ir_lower.rs`
-is a second x64 emitter with five header-offset emission sites that were invisible to the
+is a second x64 emitter with header-offset emission sites that were invisible to the
 audit the shrink was planned from:
 
 - `ir_lower.rs:1971`, `:1992` — `HEADER_SIZE as u8` inside literal instruction byte arrays (disp8)
@@ -357,6 +357,17 @@ audit the shrink was planned from:
   they are listed because they bake the header size into machine code. The
   codegen picks between them per OBJECT on the `GC_FLAG_COMPACT` header bit, so
   a smaller header must move BOTH or the legacy arm reads the wrong cell.
+- `ir_lower.rs::emit_inline_compact_getfield`, LEGACY branch (added 2026-08-18)
+  — `HEADER_SIZE + field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`,
+  the uniform 16-byte `Value` cell, emitted in four forms (reference and
+  `J`/`D` as a qword load, `F` as a zero-extending dword, int-category as
+  `MOVSXD`). All disp32, so no disp8 hazard. It is the sibling of the compact
+  arm listed above and the codegen picks between them per OBJECT on the
+  `GC_FLAG_COMPACT` header bit — so, exactly as for `AtomicIntFieldLayout`, a
+  smaller header must move BOTH or the legacy arm reads the wrong cell. Added
+  because the compact-only arm sent every legacy receiver to `jit_getfield`,
+  which measured as 100% of that helper's calls on Generational; see
+  known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
 - `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
   `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
   as a disp32, from the class's **statics block** base. It bakes the field-cell

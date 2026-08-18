@@ -713,6 +713,23 @@ impl Compiler {
                 None
             };
         let compact_body: Option<usize> = compact_snapshot.map(|(body, _, _)| body);
+        // The inline allocator's OWN legacy-fallback census.
+        //
+        // `plan_object_alloc` prints `[compact-legacy]` when the helper path
+        // cannot find a matching layout; this path never reaches it, so an
+        // inline `new` that falls back to the uniform 16-byte-cell layout was
+        // INVISIBLE to that census — a class could allocate legacy on the
+        // hottest path in the program and still be absent from the only report
+        // that names legacy allocations. That blind spot is how
+        // `SHA256Digest` came to be 100% of the `jit_getfield` helper's
+        // receivers on Generational while appearing in no legacy census at all.
+        if compact_body.is_none() && cratonvm_types::flags().gc.dbg_compact_legacy {
+            eprintln!(
+                "[compact-legacy] JIT inline-new class_id={class_id_raw} num_fields={num_fields}                  registered_field_count={:?} compact_enabled={} -> LEGACY object",
+                cratonvm_types::class_layout(class_id_raw).map(|l| l.field_count()),
+                cratonvm_types::compact_ref_fields_enabled(),
+            );
+        }
         // Object total size (header + body). Computed at compile time.
         let total_size = HEADER_SIZE + compact_body.unwrap_or(num_fields * SLOT_SIZE);
         // Cast: value to i32 (encoding immediate/displacement)

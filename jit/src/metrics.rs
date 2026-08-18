@@ -2714,3 +2714,98 @@ mod tests {
         assert_eq!(Measured::<u32>::default(), Measured::NotMeasured);
     }
 }
+
+/// Which emission arm produced each `jit_getfield` CALL.
+///
+/// The runtime helper counter says compiled code called the helper 49 M times;
+/// the collector A/B and the compile-time layout census both came back negative,
+/// and a receiver dump showed the failing receivers were INSIDE the published
+/// bounds on Generational — i.e. they should have passed the inline guard. That
+/// leaves only "a different arm emitted the CALL", and there are six of them.
+/// This names the one, at COMPILE time, instead of another round of inference.
+///
+/// Index: 0 = single-pass inlined-callee, 1 = single-pass compact-inline slow
+/// path, 2 = single-pass legacy-inline slow path, 3 = single-pass
+/// resolved-but-inline-disabled, 4 = single-pass unresolved, 5 = IR tier
+/// helper fallback.
+pub static GETFIELD_ARM_EMITS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`GETFIELD_ARM_EMITS`], index-parallel.
+pub const GETFIELD_ARM_NAMES: [&str; 6] = [
+    "sp-inlined-callee",
+    "sp-compact-inline-slowpath",
+    "sp-legacy-inline-slowpath",
+    "sp-resolved-inline-disabled",
+    "sp-unresolved",
+    "ir-helper-fallback",
+];
+
+/// Record that emission arm `arm` emitted a `jit_getfield` CALL site.
+#[inline]
+pub fn note_getfield_arm(arm: usize) {
+    if let Some(c) = GETFIELD_ARM_EMITS.get(arm) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for every arm that emitted at least one CALL site.
+pub fn getfield_arm_emits() -> Vec<(&'static str, u64)> {
+    GETFIELD_ARM_NAMES
+        .iter()
+        .zip(GETFIELD_ARM_EMITS.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}
+
+/// Why the IR tier declined to inline a `getfield`, by early-out.
+///
+/// The tier A/B (C2 threshold raised out of reach) moved helper calls
+/// 48.9 M -> 5.7 M, so ~88% of them are this function's `return false`
+/// fallback, which emits an UNGUARDED `CALL jit_getfield`. It has seven
+/// early-outs; this says which.
+pub static IR_GETFIELD_DECLINE: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`IR_GETFIELD_DECLINE`], index-parallel.
+pub const IR_GETFIELD_DECLINE_NAMES: [&str; 7] = [
+    "no-helper-addr",
+    "no-bytecode-pc",
+    "no-compact-slot-for-pc",
+    "narrow-oops-or-zgc-barrier",
+    "inline-gates-off",
+    "type-tag-disagrees",
+    "width-not-int-category",
+];
+
+/// Record an IR-tier inline-`getfield` refusal.
+#[inline]
+pub fn note_ir_getfield_decline(reason: usize) {
+    if let Some(c) = IR_GETFIELD_DECLINE.get(reason) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for every refusal reason that fired.
+pub fn ir_getfield_declines() -> Vec<(&'static str, u64)> {
+    IR_GETFIELD_DECLINE_NAMES
+        .iter()
+        .zip(IR_GETFIELD_DECLINE.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}

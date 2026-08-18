@@ -848,6 +848,230 @@ fn extend_chain_by_issuer(
     certs_by_local_id.retain(|_, group| !group.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// BER -> DER normalisation
+// ---------------------------------------------------------------------------
+//
+// PKCS#12 is a **BER** format, not a DER one, and the `p12` crate this module
+// parses with accepts only DER. That is not a theoretical gap: BouncyCastle
+// writes indefinite-length constructions, so every PKCS#12 file written by the
+// most widely deployed third-party JCA provider was unreadable here.
+//
+// `openssl asn1parse` on the two, same certificate, same password:
+//
+// ```text
+// BouncyCastle            JDK
+//   0:d=0 hl=2 l=inf        0:d=0 hl=4 l= 786   SEQUENCE
+//  20:d=3 hl=2 l=inf       26:d=3 hl=4 l= 681   OCTET STRING  (BC's is CONSTRUCTED)
+// 669:d=4 hl=2 l=  0                            EOC
+// ```
+//
+// Two BER features are in play and both are handled below:
+//
+// 1. **Indefinite lengths** - `80` in place of the length, terminated by an
+//    end-of-contents `00 00`. Rewritten to the definite form.
+// 2. **Segmented strings** - a CONSTRUCTED OCTET STRING whose children are the
+//    pieces of one string. DER requires the primitive form, so the pieces are
+//    concatenated. This matters beyond parsing: the PKCS#12 MAC is computed
+//    over the *contents* of the authSafe OCTET STRING, which is exactly that
+//    concatenation.
+//
+// This is deliberately a LENGTH normalisation and not a general BER-to-DER
+// canonicaliser: SET OF ordering and primitive-value canonicalisation are left
+// alone, because the parser does not depend on them and rewriting them would
+// change bytes the MAC is taken over.
+
+/// The BER indefinite-length marker.
+const BER_INDEFINITE: u8 = 0x80;
+
+/// Bound on nesting, so a corrupt or hostile file cannot recurse without end.
+const BER_MAX_DEPTH: usize = 64;
+
+struct BerHeader<'a> {
+    /// The identifier octets, re-emitted verbatim.
+    ident: &'a [u8],
+    constructed: bool,
+    /// `None` is the indefinite form.
+    len: Option<usize>,
+}
+
+fn ber_header<'a>(src: &'a [u8], pos: &mut usize) -> Result<BerHeader<'a>, String> {
+    let ident_start = *pos;
+    let first = *src
+        .get(*pos)
+        .ok_or_else(|| "truncated identifier".to_string())?;
+    *pos += 1;
+    if first & 0x1f == 0x1f {
+        // High-tag-number form: continues while the top bit is set.
+        loop {
+            let b = *src
+                .get(*pos)
+                .ok_or_else(|| "truncated high-tag-number identifier".to_string())?;
+            *pos += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    let ident = &src[ident_start..*pos];
+    let l0 = *src.get(*pos).ok_or_else(|| "truncated length".to_string())?;
+    *pos += 1;
+    let len = if l0 == BER_INDEFINITE {
+        None
+    } else if l0 & 0x80 == 0 {
+        Some(l0 as usize)
+    } else {
+        let n = (l0 & 0x7f) as usize;
+        if n == 0 || n > 8 {
+            return Err(format!("unsupported long-form length 0x{l0:02x}"));
+        }
+        let mut v: usize = 0;
+        for _ in 0..n {
+            let b = *src
+                .get(*pos)
+                .ok_or_else(|| "truncated long-form length".to_string())?;
+            *pos += 1;
+            v = v
+                .checked_mul(256)
+                .and_then(|x| x.checked_add(b as usize))
+                .ok_or_else(|| "length overflows usize".to_string())?;
+        }
+        Some(v)
+    };
+    Ok(BerHeader {
+        ident,
+        constructed: first & 0x20 != 0,
+        len,
+    })
+}
+
+/// Append `len` in the DER definite form (shortest encoding).
+fn der_length(len: usize, out: &mut Vec<u8>) {
+    if len < 0x80 {
+        out.push(len as u8);
+        return;
+    }
+    let mut be = Vec::new();
+    let mut v = len;
+    while v > 0 {
+        be.push((v & 0xff) as u8);
+        v >>= 8;
+    }
+    be.reverse();
+    out.push(0x80 | (be.len() as u8));
+    out.extend_from_slice(&be);
+}
+
+/// A universal OCTET STRING (tag 4), primitive or constructed.
+fn ber_is_octet_string(ident: &[u8]) -> bool {
+    ident.len() == 1 && ident[0] & 0xc0 == 0x00 && ident[0] & 0x1f == 0x04
+}
+
+fn ber_rewrite_one(
+    src: &[u8],
+    pos: &mut usize,
+    out: &mut Vec<u8>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > BER_MAX_DEPTH {
+        return Err(format!("nesting deeper than {BER_MAX_DEPTH}"));
+    }
+    let header = ber_header(src, pos)?;
+    let is_octet_string = ber_is_octet_string(header.ident);
+
+    if !header.constructed {
+        let len = header
+            .len
+            .ok_or_else(|| "primitive value with indefinite length".to_string())?;
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| "content length overflows".to_string())?;
+        let content = src
+            .get(*pos..end)
+            .ok_or_else(|| "truncated primitive content".to_string())?;
+        out.extend_from_slice(header.ident);
+        der_length(len, out);
+        out.extend_from_slice(content);
+        *pos = end;
+        return Ok(());
+    }
+
+    // Constructed: rewrite the children first, so the length emitted is the
+    // length of the REWRITTEN body rather than the original one.
+    let mut inner = Vec::new();
+    match header.len {
+        Some(len) => {
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| "content length overflows".to_string())?;
+            if end > src.len() {
+                return Err("truncated constructed content".to_string());
+            }
+            while *pos < end {
+                ber_rewrite_one(src, pos, &mut inner, depth + 1)?;
+            }
+            if *pos != end {
+                return Err("child value overran its parent".to_string());
+            }
+        }
+        None => loop {
+            let a = *src
+                .get(*pos)
+                .ok_or_else(|| "truncated indefinite-length value".to_string())?;
+            let b = *src
+                .get(*pos + 1)
+                .ok_or_else(|| "truncated end-of-contents".to_string())?;
+            if a == 0x00 && b == 0x00 {
+                *pos += 2;
+                break;
+            }
+            ber_rewrite_one(src, pos, &mut inner, depth + 1)?;
+        },
+    }
+
+    if is_octet_string {
+        // Segments of one string: DER wants them joined and primitive. Every
+        // child is primitive by now, because a nested constructed OCTET STRING
+        // took this same branch.
+        let mut joined = Vec::new();
+        let mut p = 0usize;
+        while p < inner.len() {
+            let child = ber_header(&inner, &mut p)?;
+            let len = child
+                .len
+                .ok_or_else(|| "rewritten segment still indefinite".to_string())?;
+            let end = p
+                .checked_add(len)
+                .ok_or_else(|| "segment length overflows".to_string())?;
+            joined.extend_from_slice(
+                inner
+                    .get(p..end)
+                    .ok_or_else(|| "truncated segment".to_string())?,
+            );
+            p = end;
+        }
+        out.push(header.ident[0] & !0x20);
+        der_length(joined.len(), out);
+        out.extend_from_slice(&joined);
+    } else {
+        out.extend_from_slice(header.ident);
+        der_length(inner.len(), out);
+        out.extend_from_slice(&inner);
+    }
+    Ok(())
+}
+
+/// Rewrite one BER value into the equivalent definite-length encoding.
+///
+/// A file that is already DER comes back byte-identical, which is what makes
+/// this safe as a fallback: the DER path is unchanged.
+pub(crate) fn ber_to_definite_length(src: &[u8]) -> Result<Vec<u8>, String> {
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(src.len());
+    ber_rewrite_one(src, &mut pos, &mut out, 0)?;
+    Ok(out)
+}
+
 pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
     load_pkcs12_ex(bytes, password, true)
 }
@@ -866,7 +1090,23 @@ pub(crate) fn load_pkcs12_ex(
     password: &[u8],
     verify_mac: bool,
 ) -> Result<LoadedKeyStore, KeyStoreError> {
-    let pfx = p12::PFX::parse(bytes).map_err(|e| KeyStoreError::Pkcs12Parse(format!("{e:?}")))?;
+    // DER first, so a conforming file takes exactly the path it always did.
+    // A BER one (BouncyCastle writes indefinite lengths and segmented OCTET
+    // STRINGs) is normalised and retried - see `ber_to_definite_length`. Both
+    // errors are reported if the retry also fails, because "the file is BER"
+    // and "the file is corrupt" are different answers.
+    let normalised: Vec<u8>;
+    let pfx = match p12::PFX::parse(bytes) {
+        Ok(pfx) => pfx,
+        Err(der_err) => {
+            normalised = ber_to_definite_length(bytes).map_err(|ber_err| {
+                KeyStoreError::Pkcs12Parse(format!("{der_err:?}; not valid BER either: {ber_err}"))
+            })?;
+            p12::PFX::parse(&normalised).map_err(|e| {
+                KeyStoreError::Pkcs12Parse(format!("{e:?} (after BER normalisation)"))
+            })?
+        }
+    };
 
     // p12 takes the password as &str (it internally converts to UTF-16BE for
     // PBE-key derivation, matching the PKCS#12 spec). We ask the caller for
@@ -4146,6 +4386,66 @@ mod tests {
         let mac = jks_password_mac(password, &body);
         body.extend_from_slice(&mac);
         body
+    }
+
+    // -- BER -> DER length normalisation -----------------------------------
+
+    #[test]
+    fn der_input_is_returned_unchanged() {
+        // SEQUENCE { INTEGER 5 }, already definite-length.
+        let der = [0x30u8, 0x03, 0x02, 0x01, 0x05];
+        assert_eq!(ber_to_definite_length(&der).expect("rewrite"), der.to_vec());
+    }
+
+    #[test]
+    fn indefinite_length_becomes_definite() {
+        // SEQUENCE (indefinite) { INTEGER 5 } EOC
+        let ber = [0x30u8, 0x80, 0x02, 0x01, 0x05, 0x00, 0x00];
+        assert_eq!(
+            ber_to_definite_length(&ber).expect("rewrite"),
+            vec![0x30, 0x03, 0x02, 0x01, 0x05]
+        );
+    }
+
+    #[test]
+    fn nested_indefinite_lengths_are_rewritten_innermost_first() {
+        // SEQ(indef){ SEQ(indef){ INTEGER 5 } } - the outer length can only be
+        // known once the inner one has been rewritten.
+        let ber = [
+            0x30u8, 0x80, 0x30, 0x80, 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            ber_to_definite_length(&ber).expect("rewrite"),
+            vec![0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x05]
+        );
+    }
+
+    #[test]
+    fn segmented_octet_string_is_joined_and_made_primitive() {
+        // constructed OCTET STRING (indef) { OCTET STRING AA BB, OCTET STRING CC }
+        let ber = [
+            0x24u8, 0x80, 0x04, 0x02, 0xAA, 0xBB, 0x04, 0x01, 0xCC, 0x00, 0x00,
+        ];
+        assert_eq!(
+            ber_to_definite_length(&ber).expect("rewrite"),
+            vec![0x04, 0x03, 0xAA, 0xBB, 0xCC]
+        );
+    }
+
+    #[test]
+    fn long_form_lengths_survive_the_round_trip() {
+        // A 200-byte OCTET STRING needs the long form (0x81 0xC8) both ways.
+        let mut der = vec![0x04u8, 0x81, 0xC8];
+        der.extend(std::iter::repeat(0x41).take(200));
+        assert_eq!(ber_to_definite_length(&der).expect("rewrite"), der);
+    }
+
+    #[test]
+    fn truncated_input_is_an_error_not_a_silent_short_read() {
+        // SEQUENCE claiming 3 content bytes but carrying one.
+        assert!(ber_to_definite_length(&[0x30u8, 0x03, 0x02]).is_err());
+        // Indefinite length with no end-of-contents.
+        assert!(ber_to_definite_length(&[0x30u8, 0x80, 0x02, 0x01, 0x05]).is_err());
     }
 
     #[test]
