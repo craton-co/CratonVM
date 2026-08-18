@@ -13,15 +13,28 @@
  *   CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1 cratonvm ...                 -- bar lifted
  *   CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=1 CRATONVM_JIT_SP_IC_DEOPT_CHECK=0 cratonvm ...
  *
- * The last line is the RED PROOF and is the reason this probe is shaped the way
- * it is. `SP_IC_DEOPT_CHECK=0` deletes `emit_inline_callee_deopt_check` -- the
- * one instruction sequence that lets a raw machine-code CALL notice the callee
- * trapped -- so with the bar lifted it removes exactly the mechanism this probe
- * exists to test, and the probe MUST fail. A first version of this probe put the
- * throwing call AFTER the warm-up loop instead of inside it; that call ran from
- * an interpreted frame, so all four arms passed and the probe proved nothing.
- * Every throwing call below therefore happens INSIDE the hot loop, at the same
- * call site the warm-up published the cache for.
+ * The last line is the RED PROOF. `SP_IC_DEOPT_CHECK=0` deletes
+ * `emit_inline_callee_deopt_check` -- the one instruction sequence that lets a
+ * raw machine-code CALL notice the callee trapped -- so with the bar lifted it
+ * removes exactly the mechanism this probe exists to test.
+ *
+ * **Which binary that arm must be run on matters, and the answer is
+ * counter-intuitive.** On a binary BEFORE the interlock landed it fails 8 runs
+ * out of 8: an `ArithmeticException` escapes `Div.apply`'s own `catch` and
+ * reaches `main`. On a binary WITH the interlock it PASSES 8 out of 8 -- not
+ * because the probe went blind, but because
+ * `mic_publish_exception_table_callees` refuses to publish at all when the
+ * check is not being emitted, so the unsound state is no longer reachable by
+ * setting one switch. Confirm which of the two you are looking at with
+ * `NativeFunnelFloorProbe`'s try/catch rung under the same environment: ~200
+ * ns/op means nothing was published (interlocked), ~24 ns/op means it was
+ * published with the check deleted, which is the state that fails here.
+ *
+ * A first version of this probe put the throwing call AFTER the warm-up loop
+ * instead of inside it; that call ran from an interpreted frame, so every arm
+ * passed and the probe proved nothing. Every throwing call below therefore
+ * happens INSIDE the hot loop, at the same call site the warm-up published the
+ * cache for.
  */
 public final class CalleeExceptionTableSemanticsProbe {
 

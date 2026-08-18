@@ -2385,7 +2385,8 @@ fn site_alias_detect_enabled() -> bool {
 /// | HotSpot 25 (the oracle) | PASS |
 /// | ban kept | PASS |
 /// | ban lifted | PASS |
-/// | ban lifted + `CRATONVM_JIT_SP_IC_DEOPT_CHECK=0` | **`ArithmeticException` escapes `Div.apply`'s own `catch` to `main`** |
+/// | ban lifted + `CRATONVM_JIT_SP_IC_DEOPT_CHECK=0`, **pre-interlock binary** | **FAIL 8/8 — `ArithmeticException` escapes `Div.apply`'s own `catch` to `main`** |
+/// | the same arm on a binary carrying the interlock below | PASS 8/8 |
 ///
 /// The fourth arm is the point: deleting the sentinel check is the only way to
 /// make the lifted ban wrong, which is what says the check is what makes it
@@ -2393,6 +2394,15 @@ fn site_alias_detect_enabled() -> bool {
 /// knob — publishing while the check is suppressed is unsound, and `SkipVoid`
 /// suppresses it for exactly the void callees whose return register carries no
 /// value.
+///
+/// The fifth row is the interlock working, not the probe going blind, and the
+/// difference is visible as a THROUGHPUT reading rather than a claim.
+/// `NativeFunnelFloorProbe`'s try/catch rung under `MIC_EXC_TABLE_PUBLISH=1
+/// SP_IC_DEOPT_CHECK=0`: **207.04 ns/op** with the interlock (nothing was
+/// published — the banned reading) against **24.12 ns/op** without it
+/// (published with no check — the unsound state the fourth arm catches).
+/// Anyone re-running the red proof must do it on a binary that predates the
+/// interlock, or they will read a refusal as a pass.
 ///
 /// **What it buys.** `probes/NativeFunnelFloorProbe.java`, ABBA on one binary,
 /// two interleaved rounds, ns/op:

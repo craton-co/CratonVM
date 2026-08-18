@@ -115,23 +115,43 @@ an explicit `athrow`, a table that does NOT cover what it throws, and a
 every round, so a swallowed, duplicated or mis-routed exception cannot average
 away.
 
-| arm | result |
-| --- | --- |
-| HotSpot 25 (the oracle) | PASS |
-| ban kept | PASS |
-| ban lifted | PASS |
-| ban lifted **+ `CRATONVM_JIT_SP_IC_DEOPT_CHECK=0`** | **FAIL — `ArithmeticException` escapes `Div.apply`'s own `catch` to `main`** |
-| ban kept + `SP_IC_DEOPT_CHECK=0` | PASS |
+| arm | binary | result |
+| --- | --- | --- |
+| HotSpot 25 (the oracle) | — | PASS |
+| ban kept | either | PASS |
+| ban lifted | either | PASS |
+| ban kept + `SP_IC_DEOPT_CHECK=0` | either | PASS |
+| ban lifted **+ `CRATONVM_JIT_SP_IC_DEOPT_CHECK=0`** | pre-interlock | **FAIL 8/8 — `ArithmeticException` escapes `Div.apply`'s own `catch` to `main`** |
+| the same arm | post-interlock | PASS 8/8 |
 
-The fourth row is the point. Deleting the sentinel check is the only way found to
+The fifth row is the point. Deleting the sentinel check is the only way found to
 make the lifted ban wrong, which is what says the check is what makes it right.
-The fifth row is its control: with the ban kept, deleting the check changes
-nothing, because nothing is published.
+The row above it is its control: with the ban kept, deleting the check changes
+nothing, because nothing is published. Both are 8-of-8, not one observation —
+this was checked, because a red proof that fires once is a coincidence.
 
-**The first version of this probe was blind and passed all five.** It warmed the
-site with a loop and then made the throwing call after it, from a frame that was
-never compiled — so no throwing call ever reached the cascade. Every throwing
-call now happens inside the hot loop, at the same site the warm-up published.
+**The last row was mistaken for the probe going blind, and it is the opposite.**
+Re-running the red arm on the FIXED binary passes 8/8, which reads exactly like a
+probe that stopped testing anything. It is the interlock refusing to publish, and
+the difference is legible as a throughput reading rather than an argument —
+`NativeFunnelFloorProbe`'s try/catch rung under the identical environment
+(`MIC_EXC_TABLE_PUBLISH=1 SP_IC_DEOPT_CHECK=0`):
+
+| binary | try/catch rung | means |
+| --- | ---: | --- |
+| pre-interlock | 24.12 ns/op | published, with no check — the unsound state |
+| post-interlock | **207.04 ns/op** | nothing published — the gate refused |
+| post-interlock, check left `On` | 23.62 ns/op | published, with the check |
+
+So the red proof must be run on a binary that predates the interlock, or a
+refusal will be read as a pass. Both the probe's header comment and
+`mic_publish_exception_table_callees`'s doc say so at the point of use.
+
+**And the first version of this probe was genuinely blind — it passed every
+arm.** It warmed the site with a loop and then made the throwing call after it,
+from a frame that was never compiled, so no throwing call ever reached the
+cascade. Every throwing call now happens inside the hot loop, at the same site
+the warm-up published.
 
 ### What lifting it buys
 
