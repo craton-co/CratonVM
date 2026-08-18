@@ -120,6 +120,36 @@ the bodies compiled:
 * `CRATONVM_DBG_RBC6_EMIT`: the emitter still chooses `REASON9`, so the fix did
   not quietly move the sites onto the shared sentinel stub.
 
+## The blast radius was nine test suites, not one probe
+
+The probe found it; it was never confined to the probe. Running the same scoped
+set (`cratonvm-vm`, `-jit`, `-gc`, `-types`, `-cli`) at this branch's merge base
+`c3c593f01` and on the fix: **zero regressions, and nine suites that fail at the
+base pass with it.** Each was re-run individually on both trees to rule out
+flakiness — all nine are deterministic:
+
+| suite | at `c3c593f01` | with the fix |
+|---|---|---|
+| `clinit_first_call_compile_order` | FAILED | ok |
+| `jit_cold_new_cp` | FAILED (2 of 5) | ok (5/5) |
+| `jit_collection_ctor_identity` | FAILED | ok |
+| `intrinsic_diff` | FAILED | ok |
+| `conscrypt_logger_dispatch` | FAILED | ok |
+| `fjp_recursive` | FAILED | ok |
+| `threadpoolexecutor_prestart_regression` | FAILED | ok |
+| `vthread_probe_regression` | FAILED (1 of 3) | ok (3/3) |
+| `wave1_c_executor` | FAILED (4 of 5) | ok (5/5) |
+
+That is what "every compiled `try`-wrapped field access in the tree" means
+concretely: executor shutdown paths, a ForkJoinPool recursion, a virtual-thread
+probe, a `<clinit>` ordering test and a logger dispatch all depend on a handler
+that was being skipped.
+
+**A tenth suite is NOT claimed.** `cratonvm-jit --lib` appeared in the same
+delta but passes 1994/1994 on BOTH trees when re-run — it was flaky in the bulk
+run, not fixed here. It is called out because a 10-row table would have been
+easier to write and one row of it would have been false.
+
 ## Repro
 
 ```bash
