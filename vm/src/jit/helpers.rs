@@ -10947,12 +10947,24 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // such a site was paying for no reason. See `NativeSiteCache`.
     // Unlike the `jit_invoke_virtual_mic` call site, no borrow is live here —
     // the nearest one above is scoped to an `if let` that has already closed —
-    // so this one acquires it, and the guard's scope is the call itself. The
-    // `?` this replaces (`jit_thread_mut()?` inside the callee) returned `None`
-    // when no JIT thread was installed; skipping the call has the same effect.
-    let site_native = jit_thread_mut().and_then(|(thread, _guard)| {
-        try_jit_site_cached_native_dispatch(vm, thread, info, info_key, args_slice)
-    });
+    // so this one acquires it, and the guard's scope is exactly the call.
+    //
+    // The borrow is passed as an `Option` rather than being required, so a run
+    // with no JIT thread installed still ENTERS the callee and still runs its
+    // counted pre-resolution bails; the `?` inside consumes the `None` at the
+    // same point the callee's own `jit_thread_mut()?` used to. Requiring it
+    // here instead would have skipped those `site_refusal::note_and_decline`
+    // counters, which the callee's own comment calls out as the thing that
+    // made its first cut unexplainable.
+    let mut thread_and_guard = jit_thread_mut();
+    let site_native = try_jit_site_cached_native_dispatch(
+        vm,
+        thread_and_guard.as_mut().map(|(t, _)| &mut **t),
+        info,
+        info_key,
+        args_slice,
+    );
+    drop(thread_and_guard);
     if let Some(result) = site_native {
         disp_census::note(disp_census::OUT_SITE_NATIVE);
         return result;
@@ -11819,7 +11831,13 @@ unsafe fn try_jit_site_cached_native_dispatch(
     //
     // The `debug_assert!` is `#[cfg(debug_assertions)]`; the aliasing is not.
     // Release built the same two derivations and simply did not look.
-    thread: &mut JvmThread,
+    //
+    // `Option`, not `&mut`, and consumed at exactly the point the old
+    // `jit_thread_mut()?` stood — several counted bails
+    // (`site_refusal::note_and_decline`) run before it, and hoisting the
+    // thread requirement above them would silently stop counting a refusal
+    // whenever no JIT thread is installed.
+    thread: Option<&mut JvmThread>,
     info: &JitInvokeInfo,
     info_key: JitSiteKey,
     args_slice: &[i64],
@@ -11894,6 +11912,9 @@ unsafe fn try_jit_site_cached_native_dispatch(
         }
     }
 
+    // The old `let (thread, _guard) = jit_thread_mut()?;` stood here. Same
+    // position, same early-out, but the reference is the caller's.
+    let thread = thread?;
     if entry.kind == LeafNativeKind::ThreadCurrentThread {
         // The mirror is a per-thread GC root the collector remaps, and handing
         // it to the caller roots it again with no allocation in between. When
@@ -14499,7 +14520,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
-        thread,
+        Some(thread),
         info,
         jit_site_key(vm.vm_identity, info_ptr as usize),
         args_slice,
