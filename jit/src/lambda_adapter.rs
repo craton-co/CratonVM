@@ -663,6 +663,59 @@ mod tests {
         assert!(!ARG_REGS.contains(&R11));
     }
 
+    /// A stand-in implementation to build thunks against. Its code is never
+    /// executed here — only its entry address and ABI are read.
+    fn dummy_impl() -> Arc<CompiledMethod> {
+        let mut buffer = ExecutableBuffer::new(64).expect("executable memory");
+        buffer.emit(&[0xC3]); // RET
+        Arc::new(CompiledMethod::new(buffer))
+    }
+
+    /// **Compressed oops must NOT stop a reference capture being thunked.**
+    ///
+    /// This emitter used to refuse one whenever
+    /// `narrow_oops_block_inline_fields()` held, by analogy with the inline
+    /// `getfield` codegen. The analogy was wrong: that predicate guards a
+    /// COMPACT slot read, and a lambda proxy's capture is always a legacy
+    /// 16-byte `Value` cell, which compressed oops do not narrow. See
+    /// `gc/tests/lambda_proxy_capture_word.rs`, which pins that against every
+    /// collector's own `get_field`.
+    ///
+    /// The refusal was inert in a default run — compressed oops is opt-in and
+    /// ZGC's barrier never arms — so nothing but a test that turns the flag ON
+    /// can tell the two behaviours apart. Which is exactly why one is here.
+    #[test]
+    fn a_reference_capture_is_still_served_under_compressed_oops() {
+        let owner = dummy_impl();
+        // A distinct proxy id per arm: thunks are cached by (proxy, impl), so
+        // reusing one would answer the second arm from the first arm's entry.
+        let base = 0x1_0000u64;
+        assert!(
+            cratonvm_types::narrow_oop::enable(base, 3),
+            "could not turn compressed oops on — the assertion below would then \
+             be testing the default configuration and proving nothing"
+        );
+        assert_eq!(
+            cratonvm_types::narrow_oop::ref_field_size(),
+            4,
+            "compressed oops reported on but a compact reference field is still \
+             8 bytes, so the condition under test is not in force"
+        );
+        let armed = lambda_adapter_entry(0x8000_0101, &owner, b"L", 1);
+        cratonvm_types::narrow_oop::disable_for_test();
+
+        assert!(
+            armed.is_some(),
+            "a REFERENCE capture was refused under compressed oops. That was the \
+             old behaviour and it cost ~120 ns a call for nothing: the capture \
+             lives in a legacy `Value` cell, which is not narrowed, and the Rust \
+             arm it was diverted to reads the identical word."
+        );
+        // And the primitive arm, which was never gated, still works — so a
+        // failure above cannot be a general breakage of the emitter.
+        assert!(lambda_adapter_entry(0x8000_0102, &owner, b"I", 1).is_some());
+    }
+
     /// `long`/`double` take the same 8-byte payload a reference does, and
     /// `V`/junk map to no load at all.
     #[test]
