@@ -510,13 +510,7 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
         // here is what separated "Quartz leaks memory" from "Quartz throws the
         // same exception 25,000 times" — see
         // known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.
-        let cls = ctx
-            .class_name_of_id(ctx.class_id_of_object(this))
-            .unwrap_or_else(|| "?".to_string());
-        eprintln!(
-            "STTRACE_DBG_CTOR_CAP this={:?} hash={hash} class={cls}",
-            this.as_ptr()
-        );
+        eprintln!("STTRACE_DBG_CTOR_CAP this={:?} hash={hash}", this.as_ptr());
     }
     let trace = ctx.capture_throwable_stack_trace(this);
     let depth = trace.len() as i32;
@@ -535,11 +529,17 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
             format!("{}.{}:{}", f.class_name, f.method_name, f.line_number)
         };
         let innermost: Vec<String> = trace.iter().rev().take(5).map(&fmt).collect();
-        let outermost: Vec<String> = trace.iter().take(2).map(&fmt).collect();
+        // Class AND frames on ONE line. They were two `eprintln!`s, and
+        // `eprintln!` from several threads interleaves, so pairing "the last
+        // class line" with "the next frame line" attributes frames to the
+        // wrong throwable — the same unsound pairing this file already fixed
+        // once, reintroduced by splitting the print. One line, one throwable.
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_else(|| "?".to_string());
         eprintln!(
-            "STTRACE_DBG_TOP hash={hash} depth={depth} innermost={} || outermost={}",
-            innermost.join(" <- "),
-            outermost.join(" <- ")
+            "STTRACE_DBG_TOP hash={hash} class={cls} depth={depth} innermost={}",
+            innermost.join(" <- ")
         );
     }
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
