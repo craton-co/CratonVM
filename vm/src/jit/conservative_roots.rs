@@ -3562,6 +3562,22 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                 c.set(m);
                 d
             });
+            // ENGAGEMENT census for the site that actually runs. The coverage
+            // probe's counter reported `calls=0` on the StackWalker workload,
+            // so this is where the 17.9% comes from; counting the verdict here
+            // says whether the memo saves the scan or merely observes it.
+            if a5_engagement_enabled() {
+                A5_PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
+                match decision {
+                    UnregScan::AlreadyClean => A5_PROBE_MEMO_CLEAN.fetch_add(1, Ordering::Relaxed),
+                    UnregScan::Detect { hi: Some(_) } => {
+                        A5_PROBE_MEMO_BANDED.fetch_add(1, Ordering::Relaxed)
+                    }
+                    UnregScan::Detect { hi: None } => {
+                        A5_PROBE_FULL_RESCAN.fetch_add(1, Ordering::Relaxed)
+                    }
+                };
+            }
             let already_clean = decision == UnregScan::AlreadyClean;
             // Consume the authoritative marker: this scan is the one the
             // preceding `invalidate_scan_cache_for_gc` was announcing.
