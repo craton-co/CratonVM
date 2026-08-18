@@ -25058,6 +25058,79 @@ mod tests {
         );
     }
 
+    /// **An OSR artifact may not contain an inlined body that publishes a deopt
+    /// point.** This is the constraint that gates the whole nesting-inliner
+    /// programme, and until now it existed only as prose.
+    ///
+    /// `osr_exit_policy` refuses any deopt point whose `frame_state.caller` is
+    /// set, because the VM's in-place OSR-exit transfer is single-frame
+    /// (`transfer_osr_exit_into_live_frame` bails on "inlined caller chain", as
+    /// do `resume_from_ir_deopt` and `build_deopt_frame_inner`). Nothing in this
+    /// crate sets `caller` today — `build_and_record_deopt_point` hard-codes
+    /// `None` and the IR-side `InlineScopeTable` has no producer — so this arm
+    /// had no test, and a future producer could have landed against it without
+    /// anything failing.
+    ///
+    /// Why it matters beyond tidiness, from
+    /// `netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`: the
+    /// method that needs inlining there is a `@Test` body, i.e. invoked ONCE, so
+    /// OSR is its only door out of the interpreter. An inliner that records
+    /// caller scopes would therefore make exactly the artifact that needs it
+    /// un-enterable, and the loop would run interpreted — strictly worse than
+    /// not inlining. The VM's multi-frame resume has to come first; this test is
+    /// what says so in code rather than in a design note.
+    ///
+    /// Both spellings are asserted, because they are two different gates and a
+    /// producer could satisfy one while tripping the other:
+    ///  * a point carrying a caller scope refuses at ADMISSION here;
+    ///  * a reconstructed frame carrying caller frames refuses at the EXIT
+    ///    (`resume_after_exit`, covered by
+    ///    `only_reexecute_semantics_yield_an_exact_resume_point`).
+    #[test]
+    fn a_deopt_point_with_an_inlined_caller_scope_refuses_the_osr_entry() {
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        // Sanity: the SAME artifact without the caller scope is admitted. Without
+        // this the test could pass because the fixture is malformed some other
+        // way, which is the shape of a guard that cannot fail.
+        let mut flat = osr_t_artifact(3);
+        flat.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        )];
+        flat.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("the same artifact without a caller scope must be admitted");
+
+        // The caller scope is fully DESCRIBABLE — every slot resolvable, no
+        // monitors, no virtuals. The refusal is not about describability; it is
+        // that the resume path has nowhere to put a second frame.
+        let mut inlined = osr_t_artifact(3);
+        let mut point = osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        );
+        point.frame_state.caller = Some(Box::new(deopt::FrameState {
+            method_key: "craton/probe/OsrEntry.caller:()V".to_string(),
+            bci: 12,
+            locals: vec![deopt::FrameValue::Int(7)],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        }));
+        inlined.deopt_points = vec![point];
+
+        let err = inlined
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a deopt point under an inlined caller scope must refuse the entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_INLINED_SCOPE));
+        assert!(
+            osr_refusal_is_permanent(&err),
+            "the point list is a pure function of the artifact, so the refusal is memoable"
+        );
+    }
+
     /// The lane's "what to refuse", and the two halves of getting it right:
     /// an ambiguous resume bci refuses the ENTRY, and copies that agree do not.
     ///
