@@ -6303,6 +6303,28 @@ pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
 ///
 /// The dump itself was already `#[cold]` and bounded to 8 lines. It was never
 /// the cost; the gate was.
+/// Is anything going to READ [`GETFIELD_HELPER_CALLS`] this run?
+///
+/// The increment is one relaxed atomic on the hottest helper in the VM, and
+/// its original comment claimed "this is not visible in it". That claim was
+/// never tested and was wrong: an ablation build measured it at ~2-3 ns of a
+/// 9 ns reference-field read, i.e. a quarter to a third of the post-fix cost.
+/// The counter is only ever printed under `CRATONVM_DBG=mic-prof` or
+/// `CRATONVM_DBG=jit-method-stats` (and it is the denominator the receiver
+/// census needs), so counting outside those buys nothing and costs the default
+/// configuration.
+///
+/// Cached, because a per-call `runtime_var_os` on this exact path is the 3.4x
+/// regression [`getfield_guard_dump_enabled`] documents.
+fn getfield_census_counting_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
+    })
+}
+
 fn getfield_guard_dump_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -6325,8 +6347,16 @@ fn getfield_receiver_census_enabled() -> bool {
 /// the helper stopped incrementing reading a confident `0` at shutdown, which
 /// on a page about instruments that measure the wrong thing would have been a
 /// poor way to go.
-pub fn jit_getfield_helper_calls() -> u64 {
-    GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+pub fn jit_getfield_helper_calls() -> Option<u64> {
+    if !getfield_census_counting_enabled() {
+        // NOT `Some(0)`. The counter is gated (see
+        // `getfield_census_counting_enabled`), and a gated counter reported as
+        // a number is indistinguishable from a fast path that never fell
+        // through — which is the precise misreading this whole counter exists
+        // to prevent.
+        return None;
+    }
+    Some(GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Why each helper call arrived: the receiver's own shape, counted at
@@ -6659,7 +6689,9 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // measured one. It costs one uncontended increment on a path that already
     // pays `note_jit_boundary`, `is_object_address` and a layout lookup — the
     // measured `receiverFieldTax` is 8.2 ns, and this is not visible in it.
-    GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if getfield_census_counting_enabled() {
+        GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if getfield_receiver_census_enabled() {
         note_getfield_receiver_shape(obj_ptr, field_index);
     }
