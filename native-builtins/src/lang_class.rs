@@ -3031,7 +3031,8 @@ pub(crate) fn native_class_for_name(
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Class.forName: name is null".to_string()),
+                // HotSpot's is a bare NPE with no message.
+                message: None,
             }
             .into())
         }
@@ -3694,7 +3695,8 @@ pub(crate) fn native_class_for_name_module(
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Class.forName: name is null".to_string()),
+                // HotSpot's is a bare NPE with no message.
+                message: None,
             }
             .into());
         }

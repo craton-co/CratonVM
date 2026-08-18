@@ -1,28 +1,40 @@
 # G72-1 — a negative timeout that waits forever
 
-> **UPDATE 2026-08-18 — a fix is WRITTEN and is UNVERIFIED. Do not trust it
-> until it has been run.** The toolchain on this host began crashing
-> (`STATUS_STACK_BUFFER_OVERRUN` inside rustc) partway through the session:
-> first only under `-C lto=fat`, then on plain library compiles that had
-> succeeded twenty minutes earlier, at `-j 1` as well as `-j 16`, with 40 GB
-> RAM free. It reproduces on unmodified `HEAD`, so it is not this change. No
-> binary could be produced, so **§1's hang has not been observed to stop
-> hanging**, no vector rows were added, and no suite arm was run.
+> **RESOLVED 2026-08-18. The sweep now runs to completion: all 32 rows match.**
 >
-> Two corrections to what is written below, both learned while fixing it:
+> **The "broken toolchain" in the previous banner was my own mess, and the
+> cause is worth more than the fix.** rustc was crashing with
+> `STATUS_STACK_BUFFER_OVERRUN` on crates that had compiled minutes earlier,
+> including on unmodified `HEAD` — which I read as a host failure. It was not.
+> A `cratonvm.exe` left running by **this record's own hang** was holding the
+> output binary open and consuming memory, alongside orphaned `rustc`
+> processes from builds I had stopped. Killing them made the build succeed in
+> 17 seconds. A liveness defect does not only hang the program under test; it
+> leaves a process behind that breaks the next thing you do, and the symptom
+> arrives disguised as something else entirely.
 >
-> * §2 says `Thread.join(-1)` is "correct", implying a correctly-written
->   sibling. **`Thread.join` is not registered as a native at all** — the
->   registry dump shows no row for it, so it runs real JDK bytecode and gets
->   the contract for free. The asymmetry was never two implementations, it
->   was one implementation and one absence.
-> * The two overloads do NOT share a message. Measured:
->   `wait(-5)` is `"timeout value is negative"`, `wait(-5, 0)` is
+> Two corrections to the body below, both found by dumping the native registry
+> BEFORE editing:
+>
+> * §2 calls `Thread.join(-1)` a correctly-written sibling and reasons from
+>   it. **`Thread.join` is not registered as a native at all** — it runs real
+>   JDK bytecode and gets the contract for free. One implementation and one
+>   absence, not two implementations.
+> * The overloads do not share a message: `wait(-5)` is
+>   `"timeout value is negative"`, `wait(-5, 0)` is
 >   `"timeoutMillis value is negative"`. Ours said
 >   `"Object.wait: timeout value is negative"` for the second — wrong prefix
 >   AND wrong noun.
+>
+> **What the other 28 rows turned out to be.** Once the hang was gone the
+> sweep ran, and the axis was in far better shape than §4 assumed: every
+> exception TYPE and every control-flow contract was already exact —
+> locks, conditions, semaphores, barriers, class loading, resource lookup, and
+> the whole charset decode/encode error-action matrix. Only **five messages**
+> diverged, and all five are fixed here. That is the `G69-1` shape again: the
+> lattice is right and the sentence is not.
 
-**Status:** MEASURED, fix WRITTEN and UNVERIFIED (see the banner). The sweep is INCOMPLETE and cannot be
+**Status:** RESOLVED — fixed and verified. The sweep is INCOMPLETE and cannot be
 completed until §1 is fixed — the VM blocks partway through it.
 **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS; CratonVM
 `C:/craton/target-nolto` (non-LTO release, see `G71-1`), `--jdk-only`.

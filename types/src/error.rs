@@ -1747,7 +1747,18 @@ impl RuntimeError {
             }
             RuntimeError::IllegalThreadStateException { message } => (
                 "java/lang/IllegalThreadStateException",
-                Some(message.as_str()),
+                // G72-1: an EMPTY message is not the empty string, it is no
+                // message. `Thread.start()` on a started thread throws the
+                // no-arg constructor on HotSpot, so `getMessage()` is null --
+                // and `Some("")` renders as `""`, which is a different value a
+                // caller can see. The variant is a `String` rather than an
+                // `Option<String>`, so this is where the distinction has to be
+                // made.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
             ),
             RuntimeError::IllegalCallerException { message } => {
                 // Task #57: route the new variant to `java.lang.IllegalCallerException`

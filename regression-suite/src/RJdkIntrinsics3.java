@@ -2589,7 +2589,104 @@ public class RJdkIntrinsics3 {
         ckS("misc:Class.newInstance on void.class names it",
                 t == null ? null : t.getMessage(), "void");
 
-        sectionEnd("misc", 35);
+        // -- a negative timeout is an error, not a long wait ------------------
+        // `o.wait(-5)` on a held monitor USED TO BLOCK FOREVER: the arm folded
+        // `ms <= 0` into "wait forever" and the thread parked with nobody to
+        // notify it. If that regresses, this family HANGS rather than failing,
+        // and the harness reports a 120s timeout — which is the correct and
+        // only possible signal for a liveness defect.
+        //
+        // Zero really does mean forever (JLS 17.2), so the contract is `< 0`.
+        final Object mon = new Object();
+        t = null;
+        try {
+            Thread.sleep(-1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Thread.sleep(-1)", t, "java.lang.IllegalArgumentException");
+        ckS("misc:Thread.sleep(-1) message", t == null ? null : t.getMessage(),
+                "timeout value is negative");
+        t = null;
+        try {
+            synchronized (mon) {
+                mon.wait(-5);
+            }
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Object.wait(-5) refuses instead of hanging", t,
+                "java.lang.IllegalArgumentException");
+        ckS("misc:Object.wait(-5) message", t == null ? null : t.getMessage(),
+                "timeout value is negative");
+        // The two overloads do NOT use the same noun. Measured, not composed.
+        t = null;
+        try {
+            synchronized (mon) {
+                mon.wait(-5, 0);
+            }
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Object.wait(-5,0) says timeoutMillis, not timeout",
+                t == null ? null : t.getMessage(), "timeoutMillis value is negative");
+        // Zero is still an indefinite wait, so it must NOT be refused — asserted
+        // by a notify from another thread rather than by waiting for one.
+        t = null;
+        try {
+            synchronized (mon) {
+                mon.wait(1);
+            }
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Object.wait(1) is a real timed wait, not a refusal", t, "none");
+
+        // -- the messages around it -------------------------------------------
+        t = null;
+        try {
+            mon.wait();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:wait() without the monitor", t, "java.lang.IllegalMonitorStateException");
+        ckS("misc:wait() without the monitor message", t == null ? null : t.getMessage(),
+                "current thread is not owner");
+        t = null;
+        try {
+            Thread th = new Thread(() -> { });
+            th.start();
+            th.join();
+            th.start();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Thread.start() twice", t, "java.lang.IllegalThreadStateException");
+        ckS("misc:Thread.start() twice has a NULL message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+        t = null;
+        try {
+            Thread.currentThread().interrupt();
+            Thread.sleep(1);
+        } catch (Throwable x) {
+            t = x;
+        } finally {
+            Thread.interrupted();
+        }
+        ckX("misc:sleep after interrupt", t, "java.lang.InterruptedException");
+        ckS("misc:sleep after interrupt names the operation",
+                t == null ? null : t.getMessage(), "sleep interrupted");
+        t = null;
+        try {
+            sinkO = Class.forName(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.forName(null)", t, "java.lang.NullPointerException");
+        ckS("misc:Class.forName(null) has a NULL message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+
+        sectionEnd("misc", 49);
     }
 
     // ========================================================================

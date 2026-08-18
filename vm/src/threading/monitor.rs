@@ -1938,7 +1938,7 @@ impl MonitorTable {
                 MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
                         message: format!(
-                            "thread {thread_id} called wait() without owning the monitor"
+                            "current thread is not owner"
                         ),
                     },
                 ))
@@ -1954,7 +1954,7 @@ impl MonitorTable {
             MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::IllegalMonitorStateException {
                     message: format!(
-                        "thread {thread_id} called notify() without owning the monitor"
+                        "current thread is not owner"
                     ),
                 },
             ))
