@@ -969,3 +969,16 @@ Three of those are worth reading before acting anywhere in this tree:
   application (embedded Tomcat, booting and serving under `--jdk-only`) puts the
   population at **521 native-won triples**, so one vector was about a ninth of
   it, and the report now says out loud when its own list is truncated.
+* **`G69-1`** — 82 rows where **the exception type and the precedence were both
+  already exact and the sentence was wrong on every one**. A reflective field
+  refusal is diagnosed by reading its message, and ours named neither the field
+  nor the value (`Can not set static final field via Field.set: Field typed
+  setter`). Five grammars, three of them deliberately non-uniform — the
+  bad-receiver form carries `final`, the conversion form drops the modifiers and
+  quotes the name, and the generic `set` names a bad RECEIVER where every other
+  row names the value. Also the one thing nobody was looking for: **an array's
+  `class_id_of_object` is the COMPONENT's id**, so `int[]` printed as
+  `java.lang.Object` and `String[][]` lost a dimension. `Object.getClass()` had
+  always computed the descriptor itself; that computation is now shared. Read §8
+  N1 before trusting any of the other 306 sites that name an object by its class
+  id, and §7 before believing a `0 of 100` suite run.
