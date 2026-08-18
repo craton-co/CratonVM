@@ -44,6 +44,8 @@
 
 use super::*;
 
+use crate::runtime::resolve::MemberResolver;
+
 
 /// B5: convert a malformed-constant-pool `ClassFormatError` (produced by
 /// `execute_ldc`/`execute_ldc2w` on a bad CP index or wrong-type entry) into a
@@ -293,11 +295,7 @@ pub(super) fn execute_ldc(
             if remap_trace_on() {
                 push_prov_record(mt.as_ptr() as usize, "ldc-methodtype");
             }
-            shared.classes.resolution_cache.write().put_condy(
-                frame_class_id,
-                index,
-                Value::Object(Some(mt)),
-            );
+            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(mt)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(mt)))?;
@@ -324,11 +322,7 @@ pub(super) fn execute_ldc(
             if remap_trace_on() {
                 push_prov_record(mh.as_ptr() as usize, "ldc-methodhandle");
             }
-            shared.classes.resolution_cache.write().put_condy(
-                frame_class_id,
-                index,
-                Value::Object(Some(mh)),
-            );
+            record_cp_constant(shared, frame_class_id, index, Value::Object(Some(mh)));
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(mh)))?;
@@ -344,13 +338,30 @@ pub(super) fn execute_ldc(
 /// The recorded result of a previous resolution of this constant-pool entry,
 /// if any. See the `LdcValue::MethodTypeDesc` arm for why the condy map is the
 /// right store for `CONSTANT_MethodType` / `CONSTANT_MethodHandle` too.
+///
+/// This and [`record_cp_constant`] are the only two places in this file that
+/// touch the resolution record, and they reach it through
+/// `MemberResolver::probe_constant` / `record_constant` rather than
+/// `shared.classes.resolution_cache` directly. That was the point of the
+/// migration: each constant tag that learned to cache used to add its own raw
+/// reach, so the file went from two sites to five without anyone deciding to.
+/// Everything else here calls one of these two.
 fn cached_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Option<Value> {
-    shared
-        .classes
-        .resolution_cache
-        .read()
-        .get_condy(class_id, cp_index)
-        .copied()
+    let resolver = MemberResolver::new(shared);
+    let caller = resolver.scope(class_id);
+    resolver
+        .probe_constant(caller, cp_index)
+        .into_hit()
+        .and_then(|hit| resolver.adopt(hit).ok())
+}
+
+/// Record the result of resolving this constant-pool entry. Write half of
+/// [`cached_cp_constant`].
+fn record_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16, value: Value) {
+    let resolver = MemberResolver::new(shared);
+    let caller = resolver.scope(class_id);
+    let value = resolver.scope(value);
+    resolver.record_constant(caller, cp_index, value);
 }
 
 /// JVMS §5.4.3.5 resolution of a `CONSTANT_MethodType`, shared by `ldc` and
@@ -710,16 +721,13 @@ pub(super) fn resolve_condy_constant(
     frame_class_id: ClassId,
     cp_index: u16,
 ) -> Result<Value, MethodCallFailed> {
-    {
-        let cache = shared.classes.resolution_cache.read();
-        if let Some(val) = cache.get_condy(frame_class_id, cp_index) {
-            if remap_trace_on() {
-                if let Value::Object(Some(o)) = val {
-                    push_prov_record(o.as_ptr() as usize, "ldc-condy-cached");
-                }
+    if let Some(val) = cached_cp_constant(shared, frame_class_id, cp_index) {
+        if remap_trace_on() {
+            if let Value::Object(Some(o)) = &val {
+                push_prov_record(o.as_ptr() as usize, "ldc-condy-cached");
             }
-            return Ok(*val);
         }
+        return Ok(val);
     }
 
     // Resolve the dynamic constant by invoking its bootstrap method.
@@ -803,12 +811,8 @@ pub(super) fn resolve_condy_constant(
         &bsm_extra_args,
     )?;
 
-    // Cache the result
-    shared
-        .classes
-        .resolution_cache
-        .write()
-        .put_condy(frame_class_id, cp_index, result);
+    // Record the result (JVMS §5.4.3: resolved once per CP entry).
+    record_cp_constant(shared, frame_class_id, cp_index, result);
     if remap_trace_on() {
         if let Value::Object(Some(o)) = &result {
             push_prov_record(o.as_ptr() as usize, "ldc-condy");

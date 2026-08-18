@@ -407,21 +407,15 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
          `runtime::resolve` when the core does.",
     ),
     (
-        "vm/src/runtime/interpreter/constants.rs",
-        ".resolution_cache",
-        2,
-        "migration step 3c: `ldc` of a condy / dynamic constant. Needs a \
-         `MemberResolver::condy` entry point, which this pass did not add \
-         because no second consumer exists yet.",
-    ),
-    (
         "vm/src/runtime/invokedynamic.rs",
         ".resolution_cache",
         7,
         "migration step 3c: the call-site cache for `invokedynamic` and \
-         method handles. Same missing entry point as constants.rs — \
-         `ResolvedCallSite` is a third member kind alongside method and \
-         field, and giving it a resolver method is its own design step.",
+         method handles. This is NOT the gap constants.rs had, which is now \
+         migrated: `MemberResolver::probe_constant` records a resolved \
+         CONSTANT_* value, whereas `ResolvedCallSite` is a third member kind \
+         alongside method and field, and giving it a resolver method is its \
+         own design step.",
     ),
     // ---------------------------------------------------------------
     // Migration step 4 — hard-coded field offsets in the VM's own plumbing.
@@ -668,7 +662,13 @@ fn the_split_did_not_change_the_interpreter_budget() {
         ("find_field_recursive(", 5),
         ("resolve_field_ref(", 13),
         ("resolve_method_metadata(", 2),
-        (".resolution_cache", 9),
+        // 2026-08-18: 9 -> 7. `constants.rs` is migrated — its two condy sites
+        // (and the three `CONSTANT_MethodType` / `CONSTANT_MethodHandle` ones
+        // that had joined them without a row of their own) now go through
+        // `MemberResolver::probe_constant` / `record_constant`, so the file has
+        // no bypass left and its row is gone. This is the ratchet moving in the
+        // only direction it may.
+        (".resolution_cache", 7),
         ("access_control::check_", 3),
     ];
     for (needle, expected) in INTERPRETER_TOTALS {
