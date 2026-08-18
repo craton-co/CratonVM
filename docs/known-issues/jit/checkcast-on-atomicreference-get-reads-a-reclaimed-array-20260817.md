@@ -1,6 +1,9 @@
-# `checkcast` after `AtomicReference.get()` reads a reclaimed object — a JIT precise-root-map gap, not a checkcast logic bug
+# A JIT-compiled frame's array reference gets reclaimed by GC before it's read back — a precise-root-map gap, not a checkcast logic bug
 
-**Status: OPEN, reproduced and diagnosed 2026-08-17, not fixed.**
+**Status: OPEN, reproduced and diagnosed 2026-08-17, not fixed. Confirmed
+across 4 test classes and 2 independent code paths (bytecode `checkcast` and
+`ObjectInputStream`'s reflective field restoration) — see "What this affects"
+below.**
 
 Found triaging the Apache Commons Math test suite
 (`apps/commons-math/RESULTS-20260817.md`): `DerivativeStructureTest` fails
@@ -118,6 +121,48 @@ method. `DSCompiler.getCompiler` is simply the shape that reliably surfaces it
 (a value read from a field/`AtomicReference`, immediately checkcast, under
 allocation pressure sufficient to trigger a GC at that pc).
 
+**Confirmed same root cause, three more witnesses, 2026-08-17 (second pass):**
+
+* `FunctionUtilsTest.testToDifferentiableMultivariate` and
+  `FiniteDifferencesDifferentiatorTest.testGaussian` — identical stack
+  (`DSCompiler.getCompiler` → `DerivativeStructure.<init>`), same exact
+  `ClassCastException`. Not new bugs; the same defect reached through
+  different call sites that also build many `DerivativeStructure`s in a loop
+  (tight nested loops in the first, `getCompiler(index, order)` at
+  `DerivativeStructure.java:118` in the second).
+* `NordsieckStepInterpolatorTest.serialization` — **the same defect through a
+  completely different code path**, which is the strongest evidence yet that
+  this is a general JIT root-map gap and not something specific to
+  `AtomicReference`/checkcast:
+  ```
+  java.lang.ClassCastException: cannot assign instance of [Ljava.lang.Object;
+    to field org.apache.commons.math4.legacy.linear.Array2DRowRealMatrix.data
+    of type [[D in instance of org.apache.commons.math4.legacy.linear.Array2DRowRealMatrix
+      at java.io.ObjectStreamClass$FieldReflector.setObjFieldValues(ObjectStreamClass.java:1966)
+  ```
+  This is `ObjectInputStream`'s own reflective field-restoration path during
+  Java deserialization — not a bytecode `checkcast` at all, so `site=checkcast`
+  does not apply here; the type validation happens inside JDK library code
+  (`FieldReflector.setObjFieldValues`) that rejects an array whose actual
+  runtime class doesn't match the field's declared type. Same signature
+  (`[Ljava.lang.Object;` where a real 2D array class was expected), same
+  confirmation: **100% reproducible (3/3) with JIT on, 0/1 with `--nojit`**.
+  A minimal standalone repro (plain `main()`, same integrator, same object
+  graph, byte-identical 47889-byte serialized size) does **not** reproduce it —
+  only running the real class through the full suite's JIT/GC history
+  (JUnit4 launcher, prior class loading, accumulated allocation pressure)
+  does, which matches the timing-dependent/allocation-pressure-dependent
+  profile documented above for `DerivativeStructureTest`.
+
+That the same signature and the same `--nojit`-fixes-it behavior shows up
+through `ObjectInputStream`'s internal reflection rather than a compiled
+`checkcast` bytecode suggests the leak is upstream of any specific
+bytecode-level instruction — most likely in how arrays allocated/read inside
+JIT-compiled frames get published to the GC's root snapshot in general, with
+`checkcast` (bug report above) and `Unsafe`-based reflective field stores
+(this witness) both just being consumers of a stale/corrupted array reference
+that a GC already reclaimed out from under a live but unpublished root.
+
 ## Reproduction
 
 ```bash
@@ -139,6 +184,12 @@ RUNNER="<dir containing CratonRunner.java from apps/netty-suite-runner/,
 
 # Re-run with CRATONVM_DBG_JIT_NAMES=1 to see the cratonvm::gc::guard
 # site=checkcast in_published_snapshot=false line at the moment of failure.
+
+# Second, independent witness — same signature, different code path
+# (ObjectInputStream reflection, not checkcast), 3/3 reproducible:
+"$CV" --java-home "$JDK" --Xmx 1g -c "$RUNNER;$CP" CratonRunner \
+  org.apache.commons.math4.legacy.ode.sampling.NordsieckStepInterpolatorTest
+# --nojit -> 2/2 pass.
 ```
 
 ## What would fix it
