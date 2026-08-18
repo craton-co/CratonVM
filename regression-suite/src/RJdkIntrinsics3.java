@@ -2566,7 +2566,30 @@ public class RJdkIntrinsics3 {
         ckS("misc:Class.newInstance on interface names it", t == null ? null : t.getMessage(),
                 "java.lang.Runnable");
 
-        sectionEnd("misc", 31);
+        // A PRIMITIVE mirror carries no class id -- there is no `int` class to
+        // resolve -- and that was reported as "receiver is not a Class mirror".
+        // It is one: `int.class` is a Class, and the answer is the same
+        // InstantiationException every other uninstantiable type gets.
+        t = null;
+        try {
+            sinkO = int.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on int.class", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on int.class names the primitive",
+                t == null ? null : t.getMessage(), "int");
+        t = null;
+        try {
+            sinkO = void.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on void.class", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on void.class names it",
+                t == null ? null : t.getMessage(), "void");
+
+        sectionEnd("misc", 35);
     }
 
     // ========================================================================

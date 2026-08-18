@@ -1015,6 +1015,20 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
             let this_class = obj_arg(args, 0)?;
             let class_id = match crate::lang_class::mirror_class_id(ctx, this_class) {
                 Some(cid) => cid,
+                // G69-1 closes `G68-1` section 5's residue. A PRIMITIVE mirror
+                // carries no class id -- there is no `int` class to resolve --
+                // so `mirror_class_id` answers `None` and this arm used to
+                // report the receiver as "not a Class mirror". It IS one:
+                // `int.class` is a `Class`, and HotSpot answers
+                // `InstantiationException` with the primitive's name (`int`),
+                // exactly as it does for an interface or an array. The
+                // no-class-id case and the not-a-mirror case had been collapsed
+                // into one message, and only the second of them was true.
+                None if crate::lang_class::mirror_is_primitive(ctx, this_class) => {
+                    let name = crate::lang_class::mirror_class_name(ctx, this_class)
+                        .unwrap_or_default();
+                    return Err(instantiation_exception(ctx, Some(&name)));
+                }
                 None => return Err(RuntimeError::UnsupportedOperationException {
                     message: "Class.newInstance: receiver is not a Class mirror".to_string(),
                 }.into()),
