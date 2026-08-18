@@ -12,7 +12,7 @@ one is now closed:
 | outcome | count | classes |
 |---|---:|---|
 | fixed, verified re-running the class | 5 | `DerivativeStructureTest`, `FunctionUtilsTest`, `FiniteDifferencesDifferentiatorTest`, `NordsieckStepInterpolatorTest`, `SparseRealVectorTest` |
-| fixed enough to clear the suite budget | 1 | `LegendreHighPrecisionTest` (HANG → PASS) |
+| reduced 24% — now ON the suite budget rather than over it | 1 | `LegendreHighPrecisionTest` (HANG → borderline PASS, see the note below the table) |
 | re-filed as a general VM throughput gap, not a commons-math defect | 1 | `BOBYQAOptimizerTest` |
 | confirmed pre-existing test flakiness (fails on HotSpot too) | 4 | `LogitTest`, `UnivariatePeriodicInterpolatorTest`, `MultiStartMultivariateOptimizerTest`, `CorrelatedVectorFactoryTest` |
 
@@ -65,12 +65,26 @@ current binary, a `dev`-base control built from the same tree, and HotSpot.
 | `analysis.FunctionUtilsTest` | FAIL | **PASS** 2 s | same |
 | `analysis.differentiation.FiniteDifferencesDifferentiatorTest` | FAIL | **PASS** 1 s | same |
 | `ode.sampling.NordsieckStepInterpolatorTest` | FAIL | **PASS** 1 s | same — a second reader (`ObjectInputStream`'s reflective field restore) of the same wrong array class |
-| `analysis.integration.gauss.LegendreHighPrecisionTest` | HANG | **PASS** 86-89 s | `perf/bigdecimal-native-overhead-20260818` — three per-call taxes removed from the bignum natives, 110-119 s → 86-89 s |
+| `analysis.integration.gauss.LegendreHighPrecisionTest` | HANG | **PASS** 86 s in the sweep | `perf/bigdecimal-native-overhead-20260818` — three per-call taxes removed from the bignum natives, 110-120 s → 86-105 s. **Borderline:** see below |
 | `optim…noderiv.BOBYQAOptimizerTest` | HANG | HANG | re-filed: the OSR refusal it was blamed on was real and IS fixed, and the wall time did not move. It is compiled-code throughput |
 | `analysis.function.LogitTest` | FAIL | **PASS** | pre-existing ~1/3 floating-point tolerance flake, reproduces on HotSpot |
 | `analysis.interpolation.UnivariatePeriodicInterpolatorTest` | FAIL | FAIL both VMs | unseeded RNG |
 | `optim…scalar.MultiStartMultivariateOptimizerTest` | FAIL | FAIL both VMs | unseeded RNG |
 | `random.CorrelatedVectorFactoryTest` | FAIL | PASS here, FAIL on HotSpot here | unseeded RNG, flips both ways |
+
+### The one borderline row
+
+`LegendreHighPrecisionTest` costs ~90 s, and the budget is 90 s, so which side of
+it a run lands on is decided by host load as much as by the binary. Measured
+over six INTERLEAVED rounds against a `dev`-base control built from the same
+tree: the fixed binary won every round by 20-27% (86, 87, 89, 89, 96, 105 s
+against 110, 112, 113, 118, 119, 120 s), and the control never once came in
+under 90 s. It scored PASS in the 310-class sweep and in 4 of 7 timed runs.
+
+The correct reading is "the fix is worth ~24% and moved this class onto the
+budget", not "this class passes now". The rest of the gap — CratonVM 86-105 s
+against HotSpot 2.7 s — is the general throughput residual the two known-issues
+pages carry.
 
 ## Two things this page got wrong, kept because the shape recurs
 

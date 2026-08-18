@@ -5,9 +5,10 @@ REFUTED the original per-call-overhead hypothesis in the form it was written.
 The three contained items that profile named are fixed
 (`perf/bigdecimal-native-overhead-20260818`, measured below): the benchmark
 moved 31x -> 21x against HotSpot, and the witness class
-`LegendreHighPrecisionTest` went from 110-119 s to 85-89 s and now finishes
-INSIDE the 90 s per-class suite budget it used to blow — by 2-6%, which is thin
-enough that a busier host will still time it out. The remaining ~32x is not
+`LegendreHighPrecisionTest` went from 110-120 s to 86-105 s — from clearly over
+the 90 s per-class suite budget to ON it. It scored PASS in the 310-class sweep
+and in 4 of 7 timed runs, and still exceeded 90 s in the other 3 under heavier
+host load, so call this borderline rather than closed. The remaining ~32x is not
 bignum-specific and is tracked on the two pages under "Related".**
 
 Found triaging the Apache Commons Math test suite
@@ -111,7 +112,7 @@ two release binaries from the same `dev` base, arms INTERLEAVED, six rounds:
 | | dev base | fixed | HotSpot 25 | change |
 |---|---:|---:|---:|---:|
 | `BigDecimalBench` 50k (median of 6) | 1,955 ms | **1,299 ms** | 63 ms | **-33%**, 31x -> 21x |
-| `LegendreHighPrecisionTest`, suite conditions (`--Xmx 1g`), 3 rounds | 110-119 s | **86-89 s** | 2.7 s | **-24%; HANG -> PASS** at the 90 s budget |
+| `LegendreHighPrecisionTest`, suite conditions (`--Xmx 1g`), 6 interleaved rounds | 110-120 s | **86-105 s** | 2.7 s | **-24%; HANG -> borderline PASS** at the 90 s budget |
 | `BigDecimal.signum()` per call | 1,232 ns | **140 ns** | 4 ns | -89% |
 | `BigInteger.signum()` per call | 288 ns | **101 ns** | 2 ns | -65% |
 | `BigDecimal.scale()` per call | 379 ns | **98 ns** | 2 ns | -74% |
@@ -171,6 +172,13 @@ Every remaining bignum native costs ~1 us against HotSpot's ~50 ns, of which
 ~100 ns is the native funnel itself — measured directly, since `BigDecimal.scale()`
 now does nothing but read one field and still costs 98 ns against a 23 ns
 one-line Java getter on the same VM.
+
+That last row is a range, not a number, and the range straddles the budget. The
+host is shared — other sessions build and run VMs on it — so a class that costs
+~90 s is scored PASS or HANG by load as much as by the binary. The controlled
+statement is the INTERLEAVED comparison: across six rounds the fixed binary beat
+the `dev`-base control in every round, by 20-27%, and the control never once came
+in under 90 s. Do not quote "it passes now" without that qualifier.
 
 Controls that rule the collector out as the differentiator, one command each:
 `--Xmx 8g` and `--XX:UseGc G1` both reproduce the witness class's wall time
