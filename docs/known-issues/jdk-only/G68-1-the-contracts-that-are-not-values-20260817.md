@@ -1,6 +1,19 @@
 # G68-1 — the contracts that are not values, and two formats I guessed wrong
 
 **Status:** MEASURED throughout; four fixes included, one residue named.
+
+> **RESIDUE CLOSED 2026-08-18 at `5c7a8ecb8`.** Section 5's
+> `int.class.newInstance()` row is fixed, so section 2's table is **seven of
+> seven** and the "six of seven" headline below is superseded. `mirror_class_id`
+> answers `None` for a PRIMITIVE mirror as well as for a non-mirror, and the two
+> had been collapsed onto one message: `int.class` IS a `Class`, it just has no
+> class id. N2 stands only as the wider audit.
+>
+> **N1 is also done**, in
+> `G69-1-the-message-was-the-only-thing-wrong-20260818.md`. Its four rows were
+> right to be called "a start": the table is 82 rows, the exception types and
+> the precedence were already exact on every one, and the messages were wrong on
+> every one.
 **Provenance:** every row on both VMs. Oracle HotSpot 25.0.3+9-LTS; CratonVM
 `C:/craton/target-rel11` (before) and `target-rel12` (after), `--jdk-only`.
 Probes: `scratchpad/g70/{Sweep7,P8,P9,PA,PB,PC}.java`, ASCII and deterministic.
