@@ -2967,13 +2967,10 @@ fn native_bi_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let abs = if let Some(rest) = a.strip_prefix('-') {
-        rest.to_string()
-    } else {
-        a
-    };
-    let result = bi_alloc(ctx, &abs);
+    // Word-based limb path — sign clear only, no decimal round-trip (the
+    // `negate` twin above already worked this way).
+    let a = bi_read_int(ctx, this);
+    let result = bi_alloc_int(ctx, &a.abs_value());
     Ok(Some(Value::Object(Some(result?))))
 }
 
@@ -5216,16 +5213,13 @@ fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     // Sign-flip on the exact unscaled value (the rendered string bakes
     // negative-scale trailing zeros in — see `bd_unscaled_and_precision`).
+    // PERF (2026-08-18): the flip is `neg_value()`, a sign-bit change on the
+    // limbs. It used to render the unscaled value to a decimal `String`, edit
+    // its leading '-', and re-parse the result — two O(digits^2) conversions
+    // for one boolean. `neg_value` already normalises zero to non-negative,
+    // which is what the `dec == "0"` arm was protecting.
     let (u, scale) = bd_unscaled_bigint(ctx, this);
-    let dec = u.to_decimal();
-    let neg = if let Some(stripped) = dec.strip_prefix('-') {
-        stripped.to_string()
-    } else if dec == "0" {
-        dec
-    } else {
-        format!("-{}", dec)
-    };
-    let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&neg), scale);
+    let result = bd_alloc_bigint(ctx, &u.neg_value(), scale);
     Ok(Some(Value::Object(Some(result?))))
 }
 
@@ -5234,10 +5228,10 @@ fn native_bd_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Limb `abs_value()`, not a decimal render + '-'-strip + re-parse — see
+    // `native_bd_negate`.
     let (u, scale) = bd_unscaled_bigint(ctx, this);
-    let dec = u.to_decimal();
-    let abs = dec.strip_prefix('-').unwrap_or(&dec).to_string();
-    let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&abs), scale);
+    let result = bd_alloc_bigint(ctx, &u.abs_value(), scale);
     Ok(Some(Value::Object(Some(result?))))
 }
 
@@ -5249,15 +5243,36 @@ fn native_bd_signum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Exact sign from the unscaled value — this native shadows `signum()`
     // inside the real `compareTo` bytecode, so an f64 parse (the old
     // implementation; underflows past ~1e-324) must not decide ordering.
+    //
+    // PERF (2026-08-18): exactness never needed the DIGITS. This read the whole
+    // magnitude and rendered it to a decimal `String` to look at its first
+    // byte — 738 ns/call against 148 ns for the bignum natives that only touch
+    // a field, and `BigDecimal.signum()` runs 8x per iteration of the
+    // commons-math `LegendreHighPrecisionTest` inner loop (it is on the real
+    // `compareTo`/`doRound` path), which made it ~12% of that benchmark on its
+    // own. The sign is already stored: `intCompact` carries it for a compact
+    // value, and the backing `BigInteger`'s own `signum:I` slot carries it for
+    // an inflated one. Neither needs `mag[]`.
+    if let Some((iv_i, _sc_i, _pr_i, ic_i)) = bd_layout(ctx) {
+        if let Value::Long(ic) = ctx.get_field(this, ic_i) {
+            if ic != BD_INFLATED {
+                return Ok(Some(Value::Int(ic.signum() as i32)));
+            }
+        }
+        if let Value::Object(Some(bi)) = ctx.get_field(this, iv_i) {
+            if let Some((sig_i, _mag_i)) = bi_layout(ctx) {
+                if let Value::Int(sg) = ctx.get_field(bi, sig_i) {
+                    return Ok(Some(Value::Int(sg)));
+                }
+            }
+        }
+        // `intCompact == INFLATED` with a null/unreadable `intVal` is the
+        // zero `bd_unscaled_bigint` reports for the same state.
+        return Ok(Some(Value::Int(0)));
+    }
+    // Synthetic-stub layout: no `intCompact` slot to read.
     let (u, _scale) = bd_unscaled_bigint(ctx, this);
-    let dec = u.to_decimal();
-    Ok(Some(Value::Int(if dec == "0" {
-        0
-    } else if dec.starts_with('-') {
-        -1
-    } else {
-        1
-    })))
+    Ok(Some(Value::Int(u.signum())))
 }
 
 /// Decide whether `|quotient|` must be incremented (rounded away from zero)
