@@ -1,5 +1,20 @@
 # G63-1 — sweeping the hazard instead of the row, and a refactor I started and refused
 
+> **ID COLLISION — there are TWO records numbered `G63-1`, written the same day
+> by two lanes that could not see each other.** This one is the surrogate sweep.
+> The other is
+> `G63-1-the-values-view-iterator-is-not-fail-fast-20260817.md`, on
+> `map.values().iterator()`.
+>
+> **A citation of "G63-1" is therefore ambiguous, and it has already misled
+> once**: "G63-1's own N1, the one-line strict-mode fix" means the OTHER
+> record's N1. This record's N1 is the 27-site `native-collections` units
+> refactor, which is not one line and is not strict-mode-only. Cite by title,
+> not by number, until one of the two is renumbered — neither was renamed here
+> because both are already cited by number in landed commit messages, where a
+> rename cannot follow.
+
+
 **Status:** MEASURED throughout, fixes included (see the banner). **Provenance:**
 every row is MEASURED on both VMs. Oracle HotSpot 25.0.3+9-LTS; CratonVM
 `C:/craton/target-rel6` and `target-rel7` under `--jdk-only`. Probes:

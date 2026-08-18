@@ -5,6 +5,20 @@ and why it is not a corner of this session. **Provenance:** both VMs, oracle
 HotSpot 25.0.3+9-LTS, CratonVM `C:/craton/target-rel9` under `--jdk-only`.
 Probe: `scratchpad/g68/Sweep5.java`, 29 rows, ASCII and deterministic.
 
+> **CONVERGENT with `G63-1-the-values-view-iterator-is-not-fail-fast`**, which
+> another lane measured independently and at the same time, on a different host
+> (Linux/Azure, JDK 25.0.4+7) with different probes. It found
+> `map.values().iterator()`; this found `keySet()`, `HashSet` and `TreeMap`.
+> Same mechanism, reached twice from opposite ends — which is worth more than
+> either measurement alone.
+>
+> **Adopt its framing on one point where it is better than mine.** It measured
+> all THREE arms and found the defect in Compatible mode too, so this is a
+> **compatibility defect, not a strict-mode one**. §0 below reports only the
+> `--jdk-only` arm, which understates the reach: the fix is owed to every mode,
+> and the iterator-`remove()` write-through rows it checked are correct in all
+> three.
+
 ---
 
 ## 0. The defect
