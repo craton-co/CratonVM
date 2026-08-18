@@ -7014,11 +7014,29 @@ fn resolve_inline_site_from(
     // inline the empty-looking JDK body, so a JIT-created map silently dropped
     // every put after tier-up. The callee compiler already has this own-class
     // guard; keep the inline resolver aligned with it.
-    if shared
-        .natives
-        .native_methods
-        .find(callee_class, callee_method, callee_desc)
-        .is_some()
+    //
+    // CONSTANT-POOL RESOLUTION ONLY. `callee_class` is the DECLARED class, and
+    // for a receiver-resolved site that is a supertype which may own no body at
+    // all — `java/lang/Object` for an `equals` call site, say. Refusing there
+    // refuses every override too, including the plain-bytecode one the receiver
+    // actually dispatches to.
+    //
+    // Measured 2026-08-18: this is what stopped devirtualisation inside a
+    // splice from ever firing. The MIC evidence named the receiver class,
+    // resolution found its real `equals` override, and the site was still
+    // refused — `inline-resolve REFUSED java/lang/Object.equals: native-shadow`
+    // — because `java/lang/Object.equals` has a registered native and that is
+    // the name the constant pool carries. `objectsAreEqual` then refused in
+    // turn, because a call in it was "neither spliced nor direct-bound".
+    //
+    // The SELECTED method is checked below against its own declaring class,
+    // unconditionally, which is the precise form of this rule.
+    if receiver_class_id.is_none()
+        && shared
+            .natives
+            .native_methods
+            .find(callee_class, callee_method, callee_desc)
+            .is_some()
     {
         no!("native-shadow");
     }
@@ -7073,20 +7091,28 @@ fn resolve_inline_site_from(
             return None;
         }
     }
-    // Same rule for an inherited native: resolution may start at a subclass
-    // while the executable override is registered on the declaring class.
-    // Checking exactly the declaring class still permits a real bytecode
-    // override on an intermediate subclass, matching
-    // `try_jit_compile_callee_slow`.
+    // The same rule, applied to the method actually SELECTED rather than the
+    // one the constant pool names. Resolution may start at a subclass while the
+    // executable override is registered on the declaring class, and it may
+    // equally start at a supertype whose own method is native while the
+    // receiver's override is ordinary bytecode.
+    //
+    // UNCONDITIONAL, where it used to be guarded by
+    // `declaring_class_name != callee_class`. That guard was load-bearing only
+    // because the early check above covered the equal case; now that the early
+    // check runs for constant-pool resolution only, this one has to cover both
+    // — otherwise a receiver-resolved site whose selection lands back on the
+    // declared class would splice bytecode a native shadows. Checking exactly
+    // the declaring class still permits a real bytecode override on an
+    // intermediate subclass, matching `try_jit_compile_callee_slow`.
     let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
-    if declaring_class_name != callee_class
-        && shared
-            .natives
-            .native_methods
-            .find(declaring_class_name, callee_method, callee_desc)
-            .is_some()
+    if shared
+        .natives
+        .native_methods
+        .find(declaring_class_name, callee_method, callee_desc)
+        .is_some()
     {
-        return None;
+        no!("native-shadow-on-selected-method");
     }
     // The class the SPLICED BODY belongs to, which is what an invalidation
     // dependency must name. For a constant-pool resolution this stays the
