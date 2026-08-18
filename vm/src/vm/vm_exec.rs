@@ -14783,6 +14783,32 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let Some(tid) = tid else {
             return Vec::new();
         };
+        // A RUNNING target has published nothing worth reading.
+        //
+        // The deposit points are the BLOCKING ones, so the snapshot below
+        // answers "where is this thread parked" and nothing else. Ask about a
+        // thread that is not parked and the answer is an empty array (it never
+        // blocked) or the call site where it blocked LAST — a confident wrong
+        // answer. Measured against HotSpot on a spin loop through three named
+        // methods, sampled every 2 ms: HotSpot named the running method on all
+        // ~840 samples; this returned `<empty>` on 1471 of 1495 and the running
+        // method on none. Every in-process sampling profiler, thread dump and
+        // hang diagnostic that inspects another thread was reading that.
+        //
+        // So ask the target to publish, by taking the pause that makes it —
+        // another thread cannot walk `JvmThread::frames`, which its own thread
+        // owns. Skipped when the target is parked: that is both the common case
+        // for a thread dump and the one whose deposit is ALREADY current, so the
+        // pause would stop the world to re-derive a stack we already have.
+        // Skipped too when another STW owns the world
+        // (`stw_publish_frame_traces` returns false), where this read degrades
+        // to exactly the behaviour it had before.
+        if !self.shared.threads.thread_registry.is_blocked(tid) {
+            crate::runtime::interpreter::stw_publish_frame_traces(
+                self.shared,
+                self.thread.thread_id,
+            );
+        }
         // CR-CLO-1 (`arch-2026-07-26/cross-owner-closeout.md` §6).
         //
         // Two stale comments used to sit here. The first claimed line numbers
