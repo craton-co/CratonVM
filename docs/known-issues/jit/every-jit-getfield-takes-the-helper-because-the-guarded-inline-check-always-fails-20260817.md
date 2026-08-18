@@ -8,9 +8,10 @@ collector family, and both of the actionable ones are closed:
 * **Generational** (`legacy-layout-receiver`, defect 2) — closed 2026-08-18 on
   the reader side: 68 722 450 helper calls -> **0**, 3.07x.
 * **G1** (`outside-published-bounds`, defect 1) — closed 2026-08-18 by the
-  READ-side bounds table item 2 below specifies: **56 929 530 helper calls ->
-  0**, and 4111 ms -> 1747 ms on the same workload (2.35x). G1 now lands on
-  Generational's number, which is what "only G1 was left paying" predicted.
+  READ-side bounds table item 2 below specifies: **56 930 918 helper calls ->
+  0**. Wall clock improved in 6 of 6 pinned interleaved pairs, 1.33x-2.14x; see
+  item 2 for why that is quoted as a range and why the first version of this
+  line said 2.35x.
 * **ZGC** — still 56.9M, still 100% `outside-published-bounds`, and
   deliberately so. A compact reference slot there holds
   `Z_COLORED_TAG | colour | offset`, not a pointer, so inlining its load is the
@@ -486,14 +487,48 @@ Partial, and named as such.
    the reasoning is what made it safe; the two places reality differed from it
    are marked **[REVISED]**.
 
-   *What it bought.* SHA256Digest x200 000, two binaries from the same tree,
-   medians of 3:
+   *What it bought — the counter.* SHA256Digest x200 000, two binaries built
+   from `dev`@`1f41cb193` +/- this change:
 
-   | collector | baseline | patched | helper calls |
-   |---|---:|---:|---|
-   | Generational | 1552 ms | 1609 ms | 0 -> 0 |
-   | **G1** | **4111 ms** | **1747 ms** | **56 929 530 -> 0** |
-   | ZGC | 3473 ms | 3513 ms | 56 931 604 -> unchanged |
+   | collector | baseline | patched |
+   |---|---:|---:|
+   | Generational | 0 | 0 |
+   | **G1** | **56 930 918**, 100% `outside-published-bounds` | **0** |
+   | ZGC | 56 930 768 | 56 930 752 (unchanged, by design) |
+
+   Reproduced exactly on three separate runs against two different base trees.
+   This is the load-bearing result: it is a COUNT, so host load cannot move it.
+
+   *What it bought — the clock, quoted carefully.* The host was shared and at
+   load ~6/8 throughout, so this is six pinned (`taskset -c 6,7`) base/patched
+   pairs run back-to-back, reported as a sign test and a range rather than a
+   point estimate:
+
+   | collector | pairs favouring patched | ratio range | median |
+   |---|---|---|---|
+   | **G1** (changed) | **6 / 6** | 1.33x - 2.14x | **1.39x** |
+   | Generational (unchanged) | 3 / 6 | 0.95x - 1.19x | 1.01x |
+   | ZGC (unchanged) | 4 / 6 | 0.92x - 1.81x | 1.31x |
+
+   The two control rows are the point. Both emit byte-identical code before and
+   after this change, so their spread IS the noise floor, and ZGC's is nearly as
+   wide as G1's effect — its concurrent threads make it the most contention-
+   sensitive of the three on two pinned cores. Generational, which is neither
+   concurrent nor changed, gives the honest floor at 0.95-1.19x, and G1's
+   1.33-2.14x sits outside it in every pair. A cleaner number needs a quiet
+   host; the counter above does not.
+
+   *The first timing table on this page was wrong, and the reason is worth
+   more than the number was.* It read G1 4111 ms -> 1747 ms (2.35x), measured
+   against a base tree that predated `c88ee725a` — "jit_getfield read an
+   environment flag on every call", a 3.4x cost INSIDE the very helper this
+   change is about avoiding. So the baseline arm was paying a tax that `dev`
+   had already removed, and the change looked roughly twice as good as it is.
+   Nothing about the measurement was sloppy; the base commit was simply four
+   days stale on a file under active repair by someone else. **Re-base the
+   baseline before quoting a speedup, especially when the function under test
+   is somewhere other people are also working.** The counter was immune,
+   because a count of calls does not care what each call costs.
 
    *The instrument mattered, again.* The first A/B used
    `CRATONVM_JIT_GETFIELD_HELPER=1` as the "before" — one binary, no rebuild,
