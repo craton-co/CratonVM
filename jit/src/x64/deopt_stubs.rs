@@ -224,15 +224,132 @@ impl Compiler {
             .unwrap_or(u64::MAX)
     }
 
+    /// The caller chain for a point published from inside a spliced body, or
+    /// `None` when nothing is being spliced.
+    ///
+    /// `FrameState::caller` is a linked list from the innermost scope OUTWARD,
+    /// while `inline_scope_stack` is outermost-first, so this walks the stack in
+    /// reverse and nests as it goes. An empty stack answers `None`, which is
+    /// every compile that splices nothing.
+    pub(super) fn inline_caller_chain(&self) -> Option<Box<crate::deopt::FrameState>> {
+        let mut chain: Option<Box<crate::deopt::FrameState>> = None;
+        for scope in self.inline_scope_stack.iter() {
+            let mut fs = scope.clone();
+            fs.caller = chain;
+            chain = Some(Box::new(fs));
+        }
+        chain
+    }
+
+    /// Capture the enclosing method's frame at `invoke_bci` and push it as the
+    /// scope for a splice about to be emitted.
+    ///
+    /// `arg_slots` is the number of operand-stack slots the callee's arguments
+    /// occupy — `InlineSite::callee_num_args`, which is exactly how many
+    /// `pop_stack()` calls `try_emit_inline_body` makes. They are dropped here
+    /// because a caller scope is parked mid-`invoke`: the arguments have been
+    /// consumed and the result is not yet pushed. Capturing the stack *with* the
+    /// arguments still on it would describe a frame that resumes by pushing the
+    /// return value on top of its own arguments.
+    ///
+    /// Taking the snapshot at the splice — rather than rebuilding it at each
+    /// deopt point inside the callee — is sound because this backend is
+    /// memory-homed: a caller local lives at a fixed `[rbp - (idx+1)*8]`, and
+    /// `try_emit_inline_body` allocates the callee's locals ABOVE the caller's
+    /// live stack (`callee_local_base = next_spill_offset`), so nothing the
+    /// splice emits can move a slot this snapshot names.
+    pub(super) fn push_inline_scope(&mut self, invoke_bci: usize, arg_slots: usize) {
+        let mut fs = self.build_frame_state_at(invoke_bci, None);
+        // `bci` names the invoke ITSELF, not its successor: the VM computes the
+        // successor (`caller_resume_pc`), because that needs the method's
+        // bytecode, which the consumer has and this crate does not.
+        let keep = fs.stack.len().saturating_sub(arg_slots);
+        fs.stack.truncate(keep);
+        self.inline_scope_stack.push(fs);
+    }
+
+    /// Pop the scope pushed by [`Self::push_inline_scope`].
+    ///
+    /// Called on BOTH exits from a splice — the successful one and the rollback
+    /// — because a scope left on the stack after a bailed splice would be
+    /// attached to every later point in the enclosing method, describing a
+    /// caller frame for a call that is not in progress.
+    pub(super) fn pop_inline_scope(&mut self) {
+        self.inline_scope_stack.pop();
+    }
+
     pub(super) fn build_and_record_deopt_point(
         &mut self,
         bci: usize,
         reason: crate::deopt::DeoptReason,
     ) -> *const crate::deopt::DeoptimizationPoint {
-        use crate::deopt::{DeoptAction, DeoptimizationPoint, FrameState, FrameValue};
-
+        use crate::deopt::{DeoptAction, DeoptimizationPoint};
         // Cast: buffer position/length to encoding offset (i32/u32)
         let native_offset = self.buf.pos() as u32;
+        // Cast: bytecode index to u32 (non-negative, fits)
+        let resume_bci = self.orig_bci(bci) as u32;
+        let mut frame_state = self.build_frame_state_at(bci, Some(reason));
+        // The inlined caller chain, if this point is being published from
+        // inside a spliced body. `caller: None` was hard-coded here until
+        // 2026-08-18 — `docs/jit/deopt-frame-state-interning.md` §5.1 listed
+        // exactly this as the remaining producer edit: "the single-pass backend
+        // … has no scope stack at all; it needs one pushed at the splice and
+        // popped at the callee's return". Empty stack ⇒ `None` ⇒ byte-identical
+        // metadata for every non-inlined compile, which is all of them until a
+        // splice publishes.
+        frame_state.caller = self.inline_caller_chain();
+        let point = DeoptimizationPoint {
+            native_offset,
+            // Interpreter-bci space; see "THE COORDINATE CHANGE" in
+            // `build_frame_state_at`.
+            bci: resume_bci,
+            reason,
+            action: DeoptAction::Reinterpret,
+            // Behaviour-preserving: `for_reason` is exactly the per-`DeoptReason`
+            // prose convention this site already relied on, now written down in
+            // one place instead of being inferred by each resume sink.
+            semantics: crate::deopt::ResumeSemantics::for_reason(reason),
+            speculation_id: 0,
+            frame_state,
+        };
+        // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
+        // the by-value point (find_deopt_point / iteration). The Box payload does
+        // not move when `deopt_boxes` reallocs or when it is moved into
+        // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
+        // Drop), so a baked imm64 of this pointer outlives the emitted code.
+        // Capture the heap payload's address with `addr_of!` BEFORE moving the
+        // Box into the Vec — pushing the Box (a pointer) does not relocate its
+        // payload, so this is the same address `&**deopt_boxes.last()` would
+        // yield, without a `.unwrap()` (keeps this hot codegen path panic-free).
+        let boxed = Box::new(point.clone());
+        let box_ptr: *const crate::deopt::DeoptimizationPoint = std::ptr::addr_of!(*boxed);
+        self.deopt_boxes.push(boxed);
+        self.deopt_points.push(point);
+        // The emitter pc this point was recorded at, kept in step with
+        // `deopt_points` so the coordinate change can be re-derived and
+        // checked at finalize rather than trusted.
+        self.deopt_point_pcs.push(bci);
+        box_ptr
+    }
+
+    /// This method's own frame state at `bci` — locals, operand stack and held
+    /// monitors, with no caller chain.
+    ///
+    /// Split out of [`Self::build_and_record_deopt_point`] 2026-08-18 so an
+    /// inlined splice can capture the CALLER's frame with the same code that
+    /// builds the trapping one. Two producers of one frame shape, built two
+    /// ways, is how the caller scopes end up describing something the resume
+    /// sinks then reject.
+    /// `reason` is `None` when this is a CALLER scope captured at a splice
+    /// rather than a trapping point: a caller frame is parked mid-`invoke` and
+    /// has no deopt reason of its own. It reaches only the `CRATONVM_DBG_EXCFRAME`
+    /// trace, which says so rather than printing a borrowed one.
+    fn build_frame_state_at(
+        &mut self,
+        bci: usize,
+        reason: Option<crate::deopt::DeoptReason>,
+    ) -> crate::deopt::FrameState {
+        use crate::deopt::{FrameState, FrameValue};
 
         // ── THE COORDINATE CHANGE ────────────────────────────────────────
         //
@@ -677,58 +794,35 @@ impl Compiler {
             })
             .unwrap_or_default();
 
-        let point = DeoptimizationPoint {
-            native_offset,
+        FrameState {
+            // Deopt-frame identity (jit-invokedynamic-groovy-regression root
+            // cause): bake this method's `"<class>.<method>:<descriptor>"`
+            // key into every snapshot so the VM-side resume sinks can verify
+            // a stashed `ReconstructedFrame` actually belongs to the method
+            // they are about to resume. Without it, a trap in a NESTED
+            // compiled callee propagated the `i64::MIN` sentinel up through
+            // its compiled callers' epilogue bails, and the OUTERMOST
+            // interpreter sink consumed the (identity-less) inner frame as
+            // if it were the outer method's — materializing the outer
+            // method's frame with the inner method's locals/stack/bci, i.e.
+            // resuming arbitrary bytecode with a foreign frame. Empty only
+            // for legacy/test wrappers that pass no key (the consumers
+            // treat an empty key as "never matches" → safe re-run).
+            //
+            // Inside a splice this is still the ENCLOSING method's key, which
+            // is why `capture_inline_caller_scope` records the key BEFORE the
+            // callee's body is emitted and why the scope stack carries it: a
+            // point published from inside a spliced body takes its own key
+            // from the site that pushed the scope, not from here.
+            method_key: self.method_key.clone(),
             // Interpreter-bci space; see "THE COORDINATE CHANGE" above.
             bci: resume_bci,
-            reason,
-            action: DeoptAction::Reinterpret,
-            // Behaviour-preserving: `for_reason` is exactly the per-`DeoptReason`
-            // prose convention this site already relied on, now written down in
-            // one place instead of being inferred by each resume sink.
-            semantics: crate::deopt::ResumeSemantics::for_reason(reason),
-            speculation_id: 0,
-            frame_state: FrameState {
-                // Deopt-frame identity (jit-invokedynamic-groovy-regression root
-                // cause): bake this method's `"<class>.<method>:<descriptor>"`
-                // key into every snapshot so the VM-side resume sinks can verify
-                // a stashed `ReconstructedFrame` actually belongs to the method
-                // they are about to resume. Without it, a trap in a NESTED
-                // compiled callee propagated the `i64::MIN` sentinel up through
-                // its compiled callers' epilogue bails, and the OUTERMOST
-                // interpreter sink consumed the (identity-less) inner frame as
-                // if it were the outer method's — materializing the outer
-                // method's frame with the inner method's locals/stack/bci, i.e.
-                // resuming arbitrary bytecode with a foreign frame. Empty only
-                // for legacy/test wrappers that pass no key (the consumers
-                // treat an empty key as "never matches" → safe re-run).
-                method_key: self.method_key.clone(),
-                // Interpreter-bci space; see "THE COORDINATE CHANGE" above.
-                bci: resume_bci,
-                locals,
-                stack,
-                monitors,
-                caller: None,
-            },
-        };
-        // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
-        // the by-value point (find_deopt_point / iteration). The Box payload does
-        // not move when `deopt_boxes` reallocs or when it is moved into
-        // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
-        // Drop), so a baked imm64 of this pointer outlives the emitted code.
-        // Capture the heap payload's address with `addr_of!` BEFORE moving the
-        // Box into the Vec — pushing the Box (a pointer) does not relocate its
-        // payload, so this is the same address `&**deopt_boxes.last()` would
-        // yield, without a `.unwrap()` (keeps this hot codegen path panic-free).
-        let boxed = Box::new(point.clone());
-        let box_ptr: *const crate::deopt::DeoptimizationPoint = std::ptr::addr_of!(*boxed);
-        self.deopt_boxes.push(boxed);
-        self.deopt_points.push(point);
-        // The emitter pc this point was recorded at, kept in step with
-        // `deopt_points` so the coordinate change above can be re-derived and
-        // checked at finalize rather than trusted.
-        self.deopt_point_pcs.push(bci);
-        box_ptr
+            locals,
+            stack,
+            monitors,
+            // Filled by `build_and_record_deopt_point` from the scope stack.
+            caller: None,
+        }
     }
 
     /// Republish this caller's frame after a raw JIT-to-JIT CALL.
