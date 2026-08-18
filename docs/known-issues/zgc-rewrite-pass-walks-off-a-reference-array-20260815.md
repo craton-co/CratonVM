@@ -1,6 +1,10 @@
 # ZGC's own rewrite pass faults walking a reference array
 
-**Status: STILL OPEN — reopened 2026-08-15, later the same day.** The
+**Status: STILL OPEN.** Fifth pass 2026-08-18 — the fourth pass's prescribed
+next step is retired unrun (it cannot fire, see the foot of the page), and the
+candidate it displaced is instrumented but not yet run against the repro.
+
+**Reopened 2026-08-15, later the same day.** The
 straddler fix below is real and landed; the crash it was closed against is
 not gone. `io.netty.util.ResourceLeakDetectorTest` under `-XX:+UseZGC --nojit`
 still SIGSEGVs, on a binary built from **pristine `origin/dev`**, and the
@@ -445,6 +449,102 @@ All three are behind `CRATONVM_DBG_ZGC_CORPSE=1` and cost a branch when off:
 And one counter is exported unconditionally in the shutdown summary:
 `tlab_retire_skipped`, which is what ruled the TLAB story out and is how
 someone re-opens it.
+
+# Fifth pass, 2026-08-18: the prescribed next step cannot fire, and the table has a gap
+
+## The tagged-handle door is closed by construction, not by measurement
+
+The fourth pass ended by naming the tagged-arena-handle path as "the one door
+left" and prescribing a first edit: move the `heapcopy_dbg()` check above the
+tagged early return in `copy_to_native_memory`. **The early return is real —
+that part is confirmed — but the edit would produce a probe that cannot fire,
+and the door it guards cannot reach the Java heap at all.**
+
+Two facts from the source, both cheap to re-check:
+
+* **The probe would test the wrong value.** After the move, `heapcopy_dbg()`
+  would ask `is_heap_addr(addr)` where `addr` is a *tagged handle* —
+  `0x4000_0010_…`, bit 62 set. That is never a managed-heap address, so the
+  condition is false on every tagged call by construction.
+* **The write cannot reach the heap even so.** `ArenaStore::copy_in` resolves
+  the handle to `arena.bytes[offset..end]` — a Rust-owned `Vec<u8>` in a
+  `BTreeMap<i64, Arena>`, wholly separate from the managed heap — and refuses
+  when `end > arena.bytes.len()`. It is bounds-checked into its own block.
+
+So the last row of the elimination table resolves to **no**, on the same footing
+as the others.
+
+## What the table never enumerated: the handle TRANSLATED, and the bound dropped
+
+The hazard is the mirror image of the one that was being chased. It is not a
+write *through* a handle — those are bounds-checked into a `Vec`. It is
+`unsafe_arena_real_ptr`, which the module's own doc calls "the one place the
+arena's backing store is exposed rather than copied". It has **two production
+callers, both in `vm/src/native/jni.rs`**:
+
+* `jni_long_arg_bits` — a tagged handle arriving as a JNI `jlong` argument. Its
+  doc names the case: netty-tcnative's `SSL.bioWrite(long bio, long address, int
+  len)`. **The repro for this page is a netty test.**
+* `direct_buffer_native_address` — `GetDirectBufferAddress`.
+
+**Both discard the bound.** `Some((ptr, _remaining))` and
+`.map(|(ptr, _len)| ptr)`. Native code receives a bare `*mut u8` into a
+`Vec<u8>` with no length, and nothing checks what it writes.
+
+Two ways that becomes a write into unrelated memory, neither instrumented:
+
+* **past the end of the block** — nothing bounds the callee, and the length it
+  does use comes from Java;
+* **after the block has moved or died** — `reallocate` is
+  `bytes.resize(new_size, 0)`, and `Vec::resize` may **move** the buffer; `free`
+  drops it. Either way a pointer already handed out then names memory the
+  process allocator has taken back.
+
+That is a raw write of pointer-shaped bytes, from outside this process's Rust
+code, invisible to every audit this page has added — which is exactly the writer
+it has been looking for: one that puts an 8-byte arena pointer on a live
+object's header and leaves no trace in `zgc access audit`, `zgc alloc audit`,
+`zgc registry insert` or `CRATONVM_DBG_HEAPCOPY`.
+
+**Stated as a candidate, not a conclusion.** It has not been run against the
+repro — see below.
+
+## The instrument
+
+`unsafe_arena_translation_stats() -> (translations, stale_on_realloc,
+stale_on_free)`, always on (a `BTreeMap` insert per translation, and translations
+are rare):
+
+* every `real_ptr` records the block it exposed;
+* `reallocate` and `free` report — with the handle and the translation count —
+  when they touch a block whose pointer is outstanding.
+
+**Nonzero `stale_on_*` means the mechanism is live on the workload.** Zero does
+*not* clear the path, because the unbounded-write half leaves no trace here; that
+half needs the bound to be carried to the callee rather than dropped, which is a
+fix rather than a probe.
+
+## The elimination table, corrected
+
+| candidate writer | verdict | the number |
+|---|---|---|
+| a bad registry insert (three shapes) | **no** | all 0 |
+| the slide itself | **no** | post-slide survey clean the cycle before |
+| the live set arriving broken | **no** | pre-slide census 0 |
+| a retained TLAB chunk | **no** | `tlab_retire_skipped=0` |
+| an allocation sized wrong | **no** | `zgc alloc audit` never fires |
+| a Java field/array store | **no** | `zgc access audit` never fires |
+| a raw native copy into the heap | **no** | `CRATONVM_DBG_HEAPCOPY` 0 |
+| ~~a write through a TAGGED arena handle~~ | **no** | bounds-checked into its own `Vec`; and the prescribed probe tests a handle against `is_heap_addr` and cannot fire |
+| **a raw pointer TRANSLATED out of the arena** | **untested** | `unsafe_arena_translation_stats`, added here |
+
+## Not run against the repro, and why
+
+`ResourceLeakDetectorTest` under `-XX:+UseZGC --nojit` at ~3/23 needs the netty
+suite and enough reps to see a 1-in-8 event. The Azure host was at **load 38 with
+31 GB of 31 GB used and OOM-killing builds** for the whole session. Recorded so
+the next person starts from "run the instrument" rather than from "read the
+arena".
 
 ## Related
 
