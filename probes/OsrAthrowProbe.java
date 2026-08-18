@@ -27,9 +27,10 @@
  *                       the RBC.7 silent-corruption shape) re-runs every
  *                       iteration between OSR entry and the throw, so this
  *                       counter reads HIGH — with no exception anywhere.
- *   * `nestedThrow`   — the throw happens in a CALLEE, propagating through the
- *                       OSR'd frame, which is the path `propagate_osr_exception`
- *                       was written for. Same exact-count rule.
+ *   * `nestedThrow`   — the callee-unwind control: the throw happens in a
+ *                       CALLEE, so this arm carries no `athrow` of its own and
+ *                       its OSR admission did not change with the lift. Same
+ *                       exact-count rule, on a shape the lift did not touch.
  *   * `control`       — the identical loop with the `throw` statement deleted,
  *                       so the throughput columns have a same-binary control
  *                       and "compiled" is not inferred from a wall-clock guess.
@@ -100,8 +101,11 @@ public final class OsrAthrowProbe {
     }
 
     /**
-     * Same rule, but the throwable originates in a callee and unwinds THROUGH
-     * the OSR'd frame — `propagate_osr_exception`'s own path.
+     * The callee-unwind control. This arm has NO `athrow` of its own (the
+     * throw is in `coldThrower`), so it is the arm that was already admitted
+     * before the lift — it holds the exact-count rule to a shape whose OSR
+     * admission did not change, which is what makes a HIGH count in the
+     * `athrow` arms attributable to the lift rather than to OSR in general.
      */
     static void nestedThrow(int n, int throwAt) {
         for (int i = 0; i < n; i++) {

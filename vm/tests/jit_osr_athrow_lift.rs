@@ -80,8 +80,9 @@ public final class OsrAthrowLiftProbe {
         }
     }
 
-    // Same rule, but the throwable originates in a callee and unwinds THROUGH
-    // the OSR'd frame -- `propagate_osr_exception`'s own path.
+    // The callee-unwind control: NO `athrow` of its own, so its OSR admission
+    // did not change with the lift. It holds the exact-count rule to a shape
+    // the lift did not touch.
     static void nestedThrow(int n, int throwAt) {
         for (int i = 0; i < n; i++) {
             effects++;

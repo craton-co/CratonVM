@@ -201,6 +201,29 @@ impl Compiler {
         })
     }
 
+    /// The `local_liveness` word covering local `i` at `bci`.
+    ///
+    /// `local_liveness` is `regalloc::live_locals_per_pc_all`'s flat row-major
+    /// table — `words` bitsets per pc, window `w` covering slots
+    /// `[w*64, w*64+64)` — so a caller must select BOTH the pc and the window.
+    /// Reading it as one word per pc (which is what it was before methods with
+    /// more than 64 locals could drop a dead high local) silently returns
+    /// window 0 of the wrong instruction.
+    ///
+    /// Answers `u64::MAX` — "assume everything live", the conservative
+    /// direction — when the table is absent (the ungated compile) or the index
+    /// is out of range.
+    fn local_liveness_word(&self, bci: usize, i: usize) -> u64 {
+        let words = self.local_liveness_words;
+        if words == 0 {
+            return u64::MAX;
+        }
+        self.local_liveness
+            .get(bci.saturating_mul(words).saturating_add(i / 64))
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
+
     pub(super) fn build_and_record_deopt_point(
         &mut self,
         bci: usize,
@@ -274,9 +297,16 @@ impl Compiler {
             // Only act on a COMPUTED liveness answer. An uncovered pc (no
             // basic block reaches it) reads as 0 = "nothing live", and acting
             // on that would drop every local in the frame.
-            if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
-                let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
-                if live_here & (1u64 << i) == 0 {
+            // No `i < 64` bound here any more. It used to be one, because
+            // `local_liveness` held a single `u64` per pc — so a method with
+            // more than 64 locals could not drop a DEAD local above slot 63,
+            // and an `Ambiguous`-kind slot up there therefore published
+            // `Unsupported`, which made every deopt point's frame unresumable
+            // and cost the whole METHOD its OSR entry at every back edge. See
+            // `regalloc::live_locals_per_pc_all` for the measurement.
+            if self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
+                let live_here = self.local_liveness_word(bci, i);
+                if live_here & (1u64 << (i % 64)) == 0 {
                     // `CRATONVM_DBG_EXCFRAME=1` reports every local DROPPED
                     // from a snapshot. That is the actionable signal for this
                     // whole bug class: a handler that reads a dropped local
@@ -554,14 +584,42 @@ impl Compiler {
                         }
                     }
                 }
-                // An XMM-resident operand is FP, but float-vs-double is not
-                // recoverable from the abstract stack alone — EXCEPT at an
-                // invokedynamic trap bci, where the call site's own descriptor
-                // types each of its arguments exactly.
+                // An XMM-resident operand is FP, and float-vs-double has two
+                // sources: the call site's own descriptor at an invoke/indy bci
+                // (`indy_tag`, which types that call's arguments exactly), and
+                // the typed operand stack for everything else.
+                //
+                // The second one was missing here. The frame-slot and GPR arms
+                // above both grew a `stack_kinds` fallback when the typed stack
+                // landed; this arm kept its original "not recoverable from the
+                // abstract stack alone" comment, which stopped being true, and
+                // so an FP operand that happened to be REGISTER-resident — the
+                // ordinary case in FP code, which is where the XMMs are —
+                // published `Unsupported` while its spilled twin published a
+                // precise `StackSlotDouble`.
+                //
+                // One such entry makes the whole frame unresumable, and
+                // `osr_exit_policy` refuses OSR ENTRY at every back edge of the
+                // method for it. Measured on Apache Commons Math's
+                // `BOBYQAOptimizer.trsbox`: 17 757 of its 21 109 entry refusals
+                // were this one deopt point, bci 628 — a `getEntry(I)D` call
+                // with a live `dload`ed double underneath the receiver, which
+                // the typed stack calls `[Double, Ref, Int]` and agrees with the
+                // emitter's own oop marks about.
                 StackSlot::Xmm(n) => match indy_tag {
                     Some(b'D') => FrameValue::XmmDouble(*n),
                     Some(b'F') => FrameValue::XmmFloat(*n),
-                    _ => FrameValue::Unsupported,
+                    _ => match stack_kinds.and_then(|kinds| kinds.get(i)) {
+                        Some(super::stack_kinds::StackKind::Double) => {
+                            FrameValue::XmmDouble(*n)
+                        }
+                        Some(super::stack_kinds::StackKind::Float) => FrameValue::XmmFloat(*n),
+                        // An `Int`/`Long`/`Ref` kind claiming an XMM home is a
+                        // contradiction, not a value to encode — the same
+                        // judgement the two arms above make in the other
+                        // direction for a wide-FP kind in a GPR.
+                        _ => FrameValue::Unsupported,
+                    },
                 },
             });
         }
