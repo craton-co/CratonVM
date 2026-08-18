@@ -421,10 +421,23 @@ pub struct ClassRealm {
     /// OOM even though most of the heap was nominally free.
     /// Grow-only, bounded by the number of distinct (proxy class, method)
     /// pairs an application actually exercises — not user-input-sized.
-    /// Rooted unconditionally in `memory::roots` alongside `class_mirrors`
+    /// Rooted unconditionally in `memory::roots` §6b alongside `class_mirrors`
     /// since these Method objects, like class mirrors, are meant to outlive
     /// any single call and be shared across every future dispatch to the
-    /// same proxy method.
+    /// same proxy method — **and remapped** in
+    /// `memory::gc::update_all_roots` §6a via `remap_proxy_method_cache`.
+    ///
+    /// Both halves are load-bearing, and for a long time only the scan half
+    /// shipped. Rooting alone makes a MOVING young collection *evacuate* the
+    /// Method (it is reachable) and leave this map holding the from-space
+    /// address, so the next dispatch on the same key hands running Java an
+    /// object whose body has been reset: `Method.getName()` returns `null`,
+    /// and any `InvocationHandler` that switches on the method name (javac
+    /// lowers a String switch to `String.hashCode()`) throws
+    /// `NullPointerException: Cannot invoke "String.hashCode()"`. That was
+    /// 18 + 11 Spring Boot failures under `-XX:+UseGenerationalGC` with ZGC
+    /// and G1 green on the same binary. Witness:
+    /// `probes/ProxyMethodNameProbe.java`.
     pub proxy_method_cache: RwLock<FxHashMap<(ClassId, String, String), ObjectRef>>,
 
     /// Resolved implementation-owner `ClassId` for each lambda proxy id, on the
