@@ -1,9 +1,12 @@
-# `BigDecimal` arithmetic is 50-64x slower than HotSpot — profiled 2026-08-18: the arithmetic is ~2% of the profile, and there is no single hotspot
+# `BigDecimal` arithmetic is slower than HotSpot — three per-call taxes removed 2026-08-18 (31x -> 21x on the benchmark), residual is general native->heap cost
 
-**Status: OPEN, perf. Profiled 2026-08-18 on `dev` `64c02b7ac`; the original
-per-call-overhead hypothesis is REFUTED in the form it was written. No fix
-attempted — but the plan this page used to prescribe is now known to be the
-wrong one, and its replacement is measured rather than reasoned from shape.**
+**Status: OPEN (reduced). Profiled 2026-08-18 on `dev` `64c02b7ac`, which
+REFUTED the original per-call-overhead hypothesis in the form it was written.
+The three contained items that profile named have since been fixed
+(`perf/bigdecimal-native-overhead-20260818`, measured below): the benchmark
+moved 31x -> 21x against HotSpot and `LegendreHighPrecisionTest` ~47x -> ~38x.
+The class still does not finish inside the 90 s suite budget. What is left is
+not bignum-specific and is tracked on the two pages under "Related".**
 
 Found triaging the Apache Commons Math test suite
 (`apps/commons-math/RESULTS-20260817.md`): `LegendreHighPrecisionTest` (2 JUnit
@@ -97,42 +100,108 @@ Recorded so nobody re-runs them.
    plain monomorphic loops the controls drop to 1.3x. **A microbenchmark that
    dials through a lambda is measuring the lambda.**
 
-## Where to actually look, in profile order
+## What was fixed, 2026-08-18, and what it bought
 
-Nothing below is attempted. Each carries the ceiling it can buy, so nobody
-spends a week on a 5% item expecting 60x.
+Items 1, 2 and 4 of the profile list this page used to carry, implemented on
+`perf/bigdecimal-native-overhead-20260818`. Measured on Azure Linux (8 core),
+two release binaries from the same `dev` base, arms INTERLEAVED, six rounds:
 
-1. **`resolve_field_index` (5.06%, plus much of the 3.31% `memcmp`).**
-   `bd_layout` resolves `intVal` / `scale` / `precision` / `intCompact` **by name
-   on every call**, and `resolve_field_index_in_hierarchy_desc` is a linear
-   string-compare scan over every non-static field, walking the superclass chain.
-   `native_bd_add` pays that for both operands and the result, plus `bi_layout`
-   for each `BigInteger`. Memoizing the layout is contained and is the single
-   biggest coherent item — **ceiling ~8%, i.e. 1.09x, not 60x.** Note AGENTS.md
-   forbids process globals for per-VM state, so the cache must hang off the VM
-   rather than a `static`.
-2. **Heap address validation (~8%: `is_object_address` + `ZObjectStarts::contains`).**
-   Every `get_array_element` / `set_field` from a native re-validates the
-   address, and the bignum natives walk `mag:[I` element by element, so this
-   scales with digit count.
-3. **Allocation (~7%).** Each operation allocates a `BigDecimal`, a `BigInteger`
-   and an `int[]`.
-4. **`BigInt::to_decimal` at 1.29%** — a decimal *rendering* on a path that
-   should be pure limbs. Small, but it is exactly the kind of decimal round trip
-   the limb rewrite retired elsewhere, so it may be a loose end rather than a
-   cost.
+| | dev base | fixed | HotSpot 25 | change |
+|---|---:|---:|---:|---:|
+| `BigDecimalBench` 50k (median of 6) | 1,955 ms | **1,299 ms** | 63 ms | **-33%**, 31x -> 21x |
+| `LegendreHighPrecisionTest` (the witness class) | 146-169 s | **117-131 s** | 3.1 s | -20%, ~47x -> ~38x |
+| `BigDecimal.signum()` per call | 1,232 ns | **140 ns** | 4 ns | -89% |
+| `BigInteger.signum()` per call | 288 ns | **101 ns** | 2 ns | -65% |
+| `BigDecimal.scale()` per call | 379 ns | **98 ns** | 2 ns | -74% |
+| `BigInteger.multiply` per call | 1,438 ns | **1,005 ns** | 47 ns | -30% |
 
-The honest summary for planning: **no single change here returns the 12-64x.**
-Three subsystems each cost several times what the arithmetic does, and closing
-the gap means making native→heap interaction cheap in general, not patching
-`math_bignum.rs`.
+Three changes, all inside `native-builtins/src/math_bignum.rs`:
+
+1. **`mag:[I` is read and written in one copy.** Every read boundary walked the
+   array with `get_array_element` per word — a trait-object dispatch, a `Value`
+   box, and a full ZGC `audit_access_receiver` address validation EACH. The bulk
+   primitives it needed already existed (`read_int_array_into` /
+   `write_int_array_from`, added for the BouncyCastle digest kernels for exactly
+   this reason): one bounds check, one `copy_nonoverlapping`, one validation
+   instead of `len`. The per-element loop stays as the fallback for the cases the
+   memcpy declines (wrong array kind; G1 humongous `int[]`, which has no flat
+   `array_data_ptr`).
+2. **The layout and the `ClassId` are memoized per VM.** `bi_layout` /
+   `bd_layout` resolved every field index BY NAME on every call, and every result
+   object re-resolved `"java/math/BigInteger"` through `ensure_class_initialized`
+   before allocating. Both are fixed for the life of a VM once the class loads.
+   The memo is a thread-local scoped by `NativeContext::vm_identity()` — the
+   discriminator that API documents for exactly this ("native side caches must
+   scope entries to this value; Rust tests can create multiple independent `Vm`
+   instances in one process") — and only a SUCCESSFUL resolve is stored, because
+   the pre-load `None` is legitimate and caching it would pin every later call to
+   the synthetic-stub fallback. The `ClassId` memo additionally arms only once
+   BOTH real-JDK layouts are visible, so synthetic-JDK mode — where the
+   allocation funnel may FABRICATE a class whose identity is not stable — keeps
+   going through the funnel unchanged.
+3. **`signum` / `negate` / `abs` stopped rendering the magnitude to a decimal
+   string.** This page had `BigInt::to_decimal` at 1.29% and called it "a loose
+   end rather than a cost". It was a cost, concentrated in one method:
+   `BigDecimal.signum()` read the whole magnitude and formatted it to a `String`
+   to look at the first byte, and it runs 8x per benchmark iteration because it
+   sits inside the real `compareTo`/`doRound` bytecode — 1,232 ns/call against
+   ~150 ns for the accessors beside it. `negate` was worse in kind: render, edit
+   the leading '-', re-parse, i.e. two O(digits^2) conversions to flip one bit.
+   The sign is already stored in `intCompact` and in the backing `BigInteger`'s
+   `signum:I`, so `signum` now touches `mag[]` not at all.
+
+**The ceiling this page predicted for item 1 was "~8%, i.e. 1.09x".** The three
+together are 1.5x. Two reasons the per-symbol shares understated it, both worth
+carrying forward: a name-keyed resolve costs more than its own samples (it takes
+the class-manager `RwLock`, and its `memcmp` lands in libc), and a 1.29% symbol
+can be a 30x outlier concentrated in ONE caller rather than a thin tax spread
+over many. `--dump-native-registry`'s invocation census plus a per-call probe
+(`probes/BignumNativeCostProbe.java`) separate those two; a flat profile alone
+cannot.
+
+## What is left, and why it is not on this page
+
+The post-fix profile of the witness class is flat and no longer bignum-shaped:
+~25% GC and allocation (`alloc_raw_tlab`, `is_object_address`,
+`ZObjectStarts::contains`, `MonitorTable::prune_dead`), ~14% JIT call and
+allocation helpers, ~5% class/method metadata lookup, no member above 6.2%.
+Every remaining bignum native costs ~1 us against HotSpot's ~50 ns, of which
+~100 ns is the native funnel itself — measured directly, since `BigDecimal.scale()`
+now does nothing but read one field and still costs 98 ns against a 23 ns
+one-line Java getter on the same VM.
+
+Controls that rule the collector out as the differentiator, one command each:
+`--Xmx 8g` and `--XX:UseGc G1` both reproduce the witness class's wall time
+within noise (154 s / 158 s / 142 s). The cost is allocation and access RATE,
+not collector choice or heap size.
+
+So the residual is the general "make native->heap interaction cheap" problem —
+the same verdict `bobyqa-numeric-kernel-is-80x-slower-than-hotspot` reaches from
+a workload with no bignum in it at all. Further work belongs there, not here.
 
 ## Reproduction
 
 ```bash
-javac -d <dir> probes/BigDecimalBench.java
+javac -d <dir> probes/BigDecimalBench.java probes/BignumNativeCostProbe.java
 java -cp <dir> BigDecimalBench 200000                       # HotSpot
 <cratonvm> --java-home <jdk-25> --Xmx 1g -cp <dir> BigDecimalBench 200000
+
+# Per-call cost of the cheapest methods on the surface, against a one-line Java
+# getter as the control. This is what separates "the method is slow" from "the
+# call is slow", and it is how BigDecimal.signum() was caught.
+<cratonvm> --java-home <jdk-25> --Xmx 1g -cp <dir> BignumNativeCostProbe 2000000
+
+# Which natives a workload actually reaches, and how often.
+<cratonvm> --java-home <jdk-25> --dump-native-registry /tmp/census.json \
+    -cp <dir> BigDecimalBench 20000
+```
+
+The witness class itself, against HotSpot in the same shell (needs the
+commons-math test classpath — see `apps/commons-math/`):
+
+```bash
+<cratonvm> --java-home <jdk-25> --Xmx 1g -c "<runner>:$CP" CratonRunner \
+  org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionTest
 ```
 
 Profiling needs a Linux host (`perf` is absent on the Windows dev box):
