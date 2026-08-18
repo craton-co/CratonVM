@@ -1988,13 +1988,13 @@ fn cipher_get_instance_with_provider(
 ) -> MethodCallResult {
     let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
     if let Some(provider) = requested_provider.as_deref() {
-        // Providers register a `Cipher` service under the bare algorithm and
-        // take mode/padding through `engineSetMode`/`engineSetPadding`, so the
-        // ownership question is asked about the base name only.
-        let base = algo_str.split('/').next().unwrap_or(algo_str);
-        if crate::jca::provider_chain::third_party_service_class(Some(provider), "Cipher", base)
-            .is_some()
-        {
+        // Asked about EVERY name the transformation may be registered under,
+        // not just the bare algorithm: a provider may own only the fuller form
+        // (`GOST3412-2015/CFB8`). See `cipher_transform_candidates`.
+        if cipher_transform_candidates(algo_str).into_iter().any(|(service, _, _)| {
+            crate::jca::provider_chain::third_party_service_class(Some(provider), "Cipher", &service)
+                .is_some()
+        }) {
             let obj = cipher_alloc(ctx, algo)?;
             // An `Err` here is the named provider refusing its own service's
             // mode or padding, which is exactly what HotSpot surfaces from
@@ -2132,6 +2132,35 @@ fn try_delegate_cipher_to_provider(
     try_delegate_cipher_to_named_provider(ctx, &provider, algo, cipher_obj)
 }
 
+/// The service names `Cipher.getInstance` tries for one transformation, in the
+/// JDK's own order, each paired with the mode and padding that form still has
+/// to configure by hand.
+///
+/// `Cipher` does not simply strip the mode and padding off and configure the
+/// bare algorithm: `getTransforms` builds FOUR candidates for `alg/mode/pad`
+/// and the bare-algorithm one is the LAST. A provider is entitled to register
+/// the fuller forms as distinct services with different classes, and
+/// BouncyCastle does — `Cipher.GOST3412-2015` is `$ECB` while
+/// `Cipher.GOST3412-2015/CFB8` is `$GCFB8`, a different cipher whose IV
+/// register is 32 bytes rather than 16. Asking only for the bare name and then
+/// calling `engineSetMode("CFB8")` builds a GENERIC CFB, which refused the
+/// published test vector's 32-byte IV with
+/// `InvalidAlgorithmParameterException: IV must be 16 bytes long`
+/// (`GOST3412Test.testCFB`, which HotSpot passes).
+fn cipher_transform_candidates(algo: &str) -> Vec<(String, Option<&str>, Option<&str>)> {
+    let parts: Vec<&str> = algo.split('/').collect();
+    if parts.len() == 3 {
+        vec![
+            (algo.to_string(), None, None),
+            (format!("{}/{}", parts[0], parts[1]), None, Some(parts[2])),
+            (format!("{}//{}", parts[0], parts[2]), Some(parts[1]), None),
+            (parts[0].to_string(), Some(parts[1]), Some(parts[2])),
+        ]
+    } else {
+        vec![(algo.to_string(), None, None)]
+    }
+}
+
 /// Is this refusal one `Cipher.getInstance` is allowed to hand back unchanged?
 ///
 /// Only the two checked exceptions `CipherSpi.engineSetMode`/`engineSetPadding`
@@ -2165,48 +2194,72 @@ fn try_delegate_cipher_to_named_provider(
     algo: &str,
     cipher_obj: ObjectRef,
 ) -> Result<bool, MethodCallFailed> {
-    // A transformation is `alg[/mode/padding]`; providers register the service
-    // under the bare algorithm and handle mode/padding through
-    // `engineSetMode`/`engineSetPadding`.
-    let base = algo.split('/').next().unwrap_or(algo);
-    let Some(result) = crate::jca::provider_chain::build_jca_impl(ctx, provider, "Cipher", base)
-    else {
-        return Ok(false);
-    };
-    let spi = match result {
-        Ok(Some(Value::Object(Some(spi)))) => spi,
-        // The provider owns the name but its class would not instantiate.
-        // Report that rather than falling back to our own implementation —
-        // "the provider you named is broken" is a different fact from "no such
-        // algorithm", and hiding it behind our own answer is the defect this
-        // whole block exists to remove.
-        Err(e) => return Err(e),
-        _ => return Ok(false),
-    };
-    // Mode and padding, if the transformation carried them. Both are
-    // `protected` on `CipherSpi` and both may legitimately refuse, in which
-    // case this provider cannot serve the transformation after all.
-    let parts: Vec<&str> = algo.split('/').collect();
-    let pin = ctx.pin_native_root(spi);
+    // Every service name this transformation may be registered under, most
+    // specific first — see `cipher_transform_candidates`. `owned` records that
+    // the provider claimed at least one of them, which is what separates "not
+    // this provider's algorithm" (the caller's own refusal stands) from "this
+    // provider's algorithm, and it refused" (its refusal stands).
     let mut refusal: Option<MethodCallFailed> = None;
-    if parts.len() == 3 {
-        for (idx, method) in [(1usize, "engineSetMode"), (2usize, "engineSetPadding")] {
+    let mut owned = false;
+    let mut installed: Option<ObjectRef> = None;
+    for (service, mode, padding) in cipher_transform_candidates(algo) {
+        let Some(result) =
+            crate::jca::provider_chain::build_jca_impl(ctx, provider, "Cipher", &service)
+        else {
+            continue;
+        };
+        owned = true;
+        let spi = match result {
+            Ok(Some(Value::Object(Some(spi)))) => spi,
+            // The provider owns the name but its class would not instantiate.
+            // Remember it and try the next form, exactly as `createCipher`'s
+            // `catch (Exception)` does, rather than reporting our own answer —
+            // "the provider you named is broken" is a different fact from "no
+            // such algorithm".
+            Err(e) => {
+                refusal = Some(e);
+                continue;
+            }
+            _ => continue,
+        };
+        // Mode and padding, only where this form still has to set them. Both
+        // are `protected` on `CipherSpi` and both may legitimately refuse, in
+        // which case this form cannot serve the transformation and the next
+        // one gets a turn.
+        let pin = ctx.pin_native_root(spi);
+        let mut this_refusal: Option<MethodCallFailed> = None;
+        for (arg, method) in [(mode, "engineSetMode"), (padding, "engineSetPadding")] {
+            let Some(arg) = arg else {
+                continue;
+            };
             let spi_now = ctx.read_native_pin(pin, spi);
-            let arg = ctx.create_string(parts[idx]);
+            let arg = ctx.create_string(arg);
             if let Err(e) = ctx.invoke_virtual(
                 spi_now,
                 method,
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(arg))],
             ) {
-                refusal = Some(e);
+                this_refusal = Some(e);
                 break;
             }
         }
+        let spi = ctx.read_native_pin(pin, spi);
+        ctx.unpin_native_roots(pin);
+        if let Some(e) = this_refusal {
+            refusal = Some(e);
+            continue;
+        }
+        installed = Some(spi);
+        break;
     }
-    let spi = ctx.read_native_pin(pin, spi);
-    ctx.unpin_native_roots(pin);
-    if let Some(refusal) = refusal {
+    if installed.is_none() {
+        if !owned {
+            return Ok(false);
+        }
+        let Some(refusal) = refusal else {
+            return Ok(false);
+        };
         // The provider OWNS the algorithm and refused the mode or the padding.
         // `Cipher.getInstance(t, provider)` lets a DECLARED refusal propagate —
         // measured on HotSpot 25, `AES/EAX/PKCS5Padding` with BouncyCastle is
@@ -2237,6 +2290,7 @@ fn try_delegate_cipher_to_named_provider(
         }
         return Err(refusal);
     }
+    let spi = installed.expect("installed is Some on this path");
     // The SPI lives in the Java-visible `spi` field so the collector owns it.
     ctx.set_field_by_name(cipher_obj, "spi", Value::Object(Some(spi)));
     let key = obj_key(ctx, cipher_obj);
@@ -2297,13 +2351,36 @@ fn try_delegate_cipher_to_chain(
 /// own default source and produced a different answer on every run. A null
 /// argument is still passed through as null, which is what a JDK caller of
 /// `init(mode, key)` gets.
+/// Which `Cipher.init` overload the caller used — which is NOT the same
+/// question as whether it passed a non-null parameter object.
+///
+/// `Cipher.init(int, Key, AlgorithmParameterSpec, SecureRandom)` calls
+/// `engineInit(opmode, key, params, random)` even when `params` is null, and a
+/// provider is entitled to answer that call differently from the three-argument
+/// one. BouncyCastle does: its `engineInit(int, Key, SecureRandom)` is a
+/// wrapper that catches `InvalidAlgorithmParameterException` and rethrows it as
+/// `InvalidKeyException`. So routing a null spec to the three-argument form
+/// turned `PBEKey requires parameters to specify salt` from the
+/// `InvalidAlgorithmParameterException` the caller catches into an
+/// `InvalidKeyException` that sails past the handler — `PBETest.testNullSalt`,
+/// which passes `(AlgorithmParameterSpec)null` on purpose.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CipherInitParams {
+    /// `init(int, Key)` / `init(int, Key, SecureRandom)`.
+    None,
+    /// `init(int, Key, AlgorithmParameterSpec[, SecureRandom])`.
+    Spec,
+    /// `init(int, Key, AlgorithmParameters[, SecureRandom])`.
+    Params,
+}
+
 fn cipher_delegate_init(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     mode: i32,
     key: Option<ObjectRef>,
     params: Option<ObjectRef>,
-    params_is_spec: bool,
+    params_kind: CipherInitParams,
     random: Option<ObjectRef>,
 ) -> MethodCallResult {
     let Some(spi) = cipher_delegate_spi(ctx, this) else {
@@ -2333,19 +2410,16 @@ fn cipher_delegate_init(
         },
     };
     let random_v = Value::Object(random);
-    let args: Vec<Value> = match params {
-        Some(p) => vec![
-            Value::Int(mode),
-            key_v,
-            Value::Object(Some(p)),
-            random_v,
-        ],
-        None => vec![Value::Int(mode), key_v, random_v],
+    // The parameter slot is filled from the OVERLOAD, not from whether the
+    // object is null — see `CipherInitParams`.
+    let args: Vec<Value> = match params_kind {
+        CipherInitParams::None => vec![Value::Int(mode), key_v, random_v],
+        _ => vec![Value::Int(mode), key_v, Value::Object(params), random_v],
     };
-    let desc = match (params.is_some(), params_is_spec) {
-        (false, _) => SPI_INIT_PLAIN,
-        (true, true) => SPI_INIT_SPEC,
-        (true, false) => SPI_INIT_PARAMS,
+    let desc = match params_kind {
+        CipherInitParams::None => SPI_INIT_PLAIN,
+        CipherInitParams::Spec => SPI_INIT_SPEC,
+        CipherInitParams::Params => SPI_INIT_PARAMS,
     };
     // Re-read every argument from its pin: `new SecureRandom()` above may have
     // moved them.
@@ -4484,7 +4558,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let mode = args[1].as_int().unwrap_or(0);
         let key = obj_arg(args, 2)?;
         if cipher_is_delegated(ctx, this) {
-            return cipher_delegate_init(ctx, this, mode, Some(key), None, false, None);
+            return cipher_delegate_init(
+                ctx,
+                this,
+                mode,
+                Some(key),
+                None,
+                CipherInitParams::None,
+                None,
+            );
         }
         // A ChaCha20 cipher initialised with no parameters at all still needs a
         // nonce, and SunJCE GENERATES one for ENCRYPT rather than refusing —
@@ -4511,7 +4593,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true, None);
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    spec,
+                    CipherInitParams::Spec,
+                    None,
+                );
             }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
@@ -4540,7 +4630,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true, obj_at(args, 4));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    spec,
+                    CipherInitParams::Spec,
+                    obj_at(args, 4),
+                );
             }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
@@ -4580,7 +4678,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false, None);
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    alg_params,
+                    CipherInitParams::Params,
+                    None,
+                );
             }
             cipher_init_from_algorithm_parameters(ctx, this, mode, key, alg_params)
         },
@@ -4599,7 +4705,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false, obj_at(args, 4));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    alg_params,
+                    CipherInitParams::Params,
+                    obj_at(args, 4),
+                );
             }
             cipher_init_from_algorithm_parameters(ctx, this, mode, key, alg_params)
         },
@@ -4658,7 +4772,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 }
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), None, false, obj_at(args, 3));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    None,
+                    CipherInitParams::None,
+                    obj_at(args, 3),
+                );
             }
             cipher_init_record(ctx, this, mode, key, Vec::new())
         });
@@ -4685,7 +4807,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let mode = args[1].as_int().unwrap_or(0);
             let key = obj_arg(args, 2)?;
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), None, false, obj_at(args, 3));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    None,
+                    CipherInitParams::None,
+                    obj_at(args, 3),
+                );
             }
             cipher_init_record(ctx, this, mode, key, Vec::new())
         },

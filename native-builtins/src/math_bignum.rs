@@ -4141,6 +4141,34 @@ fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    // NON-FINITE FIRST. `BigDecimal.valueOf(double)` is specified as
+    // `new BigDecimal(Double.toString(val))`, and that parse rejects NaN and
+    // both infinities. MEASURED on both VMs:
+    //
+    //   BigDecimal.valueOf(NaN)    HotSpot  NumberFormatException: Infinite or NaN
+    //   BigDecimal.valueOf(+Inf)   HotSpot  NumberFormatException: Infinite or NaN
+    //
+    // This native REPLACES `valueOf` outright, so no `BigDecimal(String)`
+    // parse happens and there is nothing left to throw: `format_double(NaN)`
+    // is `"NaN"`, which flows through `bd_parts_of_java_double_string` as a
+    // mantissa with no `.` and reaches `BigInt::from_decimal`, and all three
+    // rows silently answered `0`. Returning a wrong NUMBER where the oracle
+    // refuses is worse than the E-notation defect this function was written
+    // to fix.
+    //
+    // `bd_parts_of_java_double_string`'s doc used to assert that non-finite
+    // doubles "cannot reach here" because `valueOf` throws inside the parse.
+    // That was true of the bytecode path and stopped being true the moment
+    // this native took the slot; the assertion is corrected there.
+    //
+    // The message is transcribed, not composed — `java.math.BigDecimal`'s own
+    // `Infinite or NaN`, with no value interpolated.
+    if !d.is_finite() {
+        return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
+            message: "Infinite or NaN".to_string(),
+        }
+        .into());
+    }
     let (unscaled, scale) = bd_parts_of_java_double_string(&crate::lang_string::format_double(d));
     let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&unscaled), scale);
     Ok(Some(Value::Object(Some(result?))))
@@ -4152,9 +4180,17 @@ fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// `Double.toString` output is always `[-]<digit>.<digits>[E[-]<exp>]`, so the
 /// scale is "digits after the point, less the exponent" --- e.g. `1.0E100` ->
 /// (`10`, `1 - 100` = `-99`), `2.0` -> (`20`, `1`), `1.0E-7` -> (`10`, `8`).
-/// Non-finite doubles cannot reach here: `valueOf` on them throws inside the
-/// `Double.toString`-fed `BigDecimal(String)` parse, and H2 screens them out
-/// before the call.
+/// Non-finite doubles do not reach here, because [`native_bd_value_of_double`]
+/// refuses them BEFORE calling this — not, as this note previously claimed,
+/// because "`valueOf` throws inside the `Double.toString`-fed
+/// `BigDecimal(String)` parse". That was true of the bytecode path and stopped
+/// being true the moment a native took the `valueOf` slot: there is no parse
+/// left to throw. `"NaN"` arrives here as a mantissa with no `.` and leaves as
+/// unscaled `NaN` at scale 0, which `BigInt::from_decimal` renders as `0` —
+/// measured, three silently wrong rows.
+///
+/// The distinction matters beyond this function: a guard that lives in a body
+/// you have replaced is not a guard you still have.
 fn bd_parts_of_java_double_string(s: &str) -> (String, i32) {
     let (mantissa, exp) = match s.find(['E', 'e']) {
         Some(i) => (&s[..i], s[i + 1..].parse::<i32>().unwrap_or(0)),

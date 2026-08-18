@@ -1217,12 +1217,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-promotion-age", on_key: Some("CRATONVM_ZGC_GEN_PROMOTION_AGE"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0") },
-    // G2e/G2f (2026-08-17). Both are default-ON kill switches over the young
-    // sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
+    // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
+    // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run
     // and not a rebuild.
-    E { group: Group::GC, token: "zgc-gen-header-zero", on_key: Some("CRATONVM_ZGC_GEN_HEADER_ZERO"), off_key: None, off_word: Some("0") },
-    E { group: Group::GC, token: "zgc-gen-dead-runs", on_key: Some("CRATONVM_ZGC_GEN_DEAD_RUNS"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-sweep-header-zero", on_key: Some("CRATONVM_ZGC_SWEEP_HEADER_ZERO"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-sweep-dead-runs", on_key: Some("CRATONVM_ZGC_SWEEP_DEAD_RUNS"), off_key: None, off_word: Some("0") },
+    // C5 (2026-08-18). Hand the mark coordinator the heap's own `Arc` instead of
+    // a forwarding wrapper -- one fewer indirect call per marked object on the
+    // parallel path. Default-on and `0` restores the wrapper, so the A/B is one
+    // binary; the whole path is already opt-in behind `zgc-parmark`.
+    E { group: Group::GC, token: "zgc-mark-ctx-direct", on_key: Some("CRATONVM_ZGC_MARK_CTX_DIRECT"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
@@ -1382,6 +1387,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::SECURITY, token: "reflect-export-gate", on_key: None, off_key: Some("CRATONVM_REFLECT_NO_EXPORT_GATE"), off_word: None },
     E { group: Group::SECURITY, token: "require-policy", on_key: Some("CRATONVM_REQUIRE_POLICY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "trust-pem", on_key: Some("CRATONVM_TRUST_PEM"), off_key: None, off_word: None },
+    // Default-ON kill switch for the raw-OpenSSL client connector on the
+    // default `SSLSocket` path (Unix only — `openssl` is a Unix-scoped
+    // dependency). `0` reverts that path to `native_tls::TlsConnector`, which
+    // captures ONLY the peer's leaf certificate and cannot set the
+    // certificate security level. SECURITY rather than IO: what the switch
+    // selects is which verifier sees which chain, and at what strength floor.
+    E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },

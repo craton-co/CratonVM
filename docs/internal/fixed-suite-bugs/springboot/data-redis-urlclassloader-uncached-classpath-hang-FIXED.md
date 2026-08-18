@@ -703,8 +703,11 @@ Two separate things were stacked in those rows:
    which the pinned `jedis-7.4.1.jar` does not have; Windows resolves
    `spring-data-redis-4.1.0-RC1`, which does not call it, which is the whole
    reason this cluster is green there and red here. Tracked separately as
-   `data-redis-fixture-jedis-snapshot-skew-20260813.md` under
-   `known-issues/springboot/`.
+   `data-redis-fixture-jedis-alignment-FIXED-20260818.md` in this directory —
+   **fixed 2026-08-18**: Boot's `library("Jedis", ...)` pin is declared to align
+   with `spring-data-redis`'s own `jedis` property, and the literal had gone
+   stale at `7.4.1` while the snapshot moved to `8.0.0`. All three classes are
+   now green on both VMs.
 
 **So CratonVM diverges from HotSpot nowhere in this cluster, on either
 platform.** That is the claim this page needed before it could retire, and the
