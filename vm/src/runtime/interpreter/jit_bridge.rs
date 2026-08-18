@@ -7052,12 +7052,15 @@ fn resolve_inline_site_from(
             .read()
             .contains_key(&receiver_id)
         {
-            return None;
+            no!("receiver-is-lambda-proxy");
         }
     }
 
     let cm = shared.classes.class_manager.read();
-    let cp_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
+    let Some(cp_class_id) = cm.find_class_by_name_for_class(callee_class, requesting_class_id)
+    else {
+        no!("cp-class-not-loaded");
+    };
     let store = cm.class_store();
     // Where the JVMS method-selection walk starts. For a guarded site that is
     // the RUNTIME receiver class; `find_method_recursive` performs the
@@ -7066,19 +7069,23 @@ fn resolve_inline_site_from(
     // redirects to the receiver id for interface calls.
     let search_start = receiver_class_id.unwrap_or(cp_class_id);
     if let Some(receiver_id) = receiver_class_id {
-        let receiver = store.get(receiver_id)?;
+        let Some(receiver) = store.get(receiver_id) else {
+            no!("receiver-class-not-in-store");
+        };
         // A guard admits an EXACT class, so an interface or an array class is
         // never a class a receiver can have here.
         if receiver.is_interface() || receiver.name.starts_with('[') {
-            return None;
+            no!("receiver-is-interface-or-array");
         }
     }
-    let (method, declaring_id) = crate::classloading::find_method_recursive(
+    let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
         search_start,
         callee_method,
         callee_desc,
         store,
-    )?;
+    ) else {
+        no!("method-not-found-from-search-start");
+    };
     if let Some(receiver_id) = receiver_class_id {
         if !receiver_resolution_is_dispatch_faithful(
             store,
@@ -7088,7 +7095,10 @@ fn resolve_inline_site_from(
             method,
             callee_method,
         ) {
-            return None;
+            no!(format!(
+                "receiver-resolution-not-dispatch-faithful (selected on class id {})",
+                declaring_id.as_u32()
+            ));
         }
     }
     // The same rule, applied to the method actually SELECTED rather than the
@@ -7105,7 +7115,9 @@ fn resolve_inline_site_from(
     // declared class would splice bytecode a native shadows. Checking exactly
     // the declaring class still permits a real bytecode override on an
     // intermediate subclass, matching `try_jit_compile_callee_slow`.
-    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+    let Some(declaring_class_name) = store.get(declaring_id).map(|c| &*c.name) else {
+        no!("declaring-class-not-in-store");
+    };
     if shared
         .natives
         .native_methods
@@ -7129,7 +7141,9 @@ fn resolve_inline_site_from(
     if method.is_synchronized() {
         no!("synchronized");
     }
-    let code_attr = method.code()?;
+    let Some(code_attr) = method.code() else {
+        no!("selected-method-has-no-code");
+    };
     let code_len = code_attr.code.len();
     if code_len > cratonvm_jit::MAX_INLINE_BYTECODE_SIZE {
         no!("too-large");
@@ -7299,7 +7313,9 @@ fn resolve_inline_site_from(
         scan_pc += inline_instr_length(code, scan_pc);
     }
 
-    let callee_class_info = cm.get_class(declaring_id)?;
+    let Some(callee_class_info) = cm.get_class(declaring_id) else {
+        no!("declaring-class-info-unavailable");
+    };
 
     // Validate the deferred invokespecial sites: every one must be a
     // resolver-PROVEN no-op super-constructor call, or the whole callee is

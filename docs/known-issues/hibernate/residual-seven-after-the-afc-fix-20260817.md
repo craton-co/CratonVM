@@ -362,24 +362,58 @@ from the recorded call graph, are `jit::helpers::jit_invoke_virtual_mic` and
 Pre-sized to 16, which covers the real-JDK interface DAGs it walks
 (`CompletableFuture`, `Function`, the `Collection` family) without a resize.
 
-Four pinned, interleaved pairs, same binary pair throughout:
+**CORRECTED 2026-08-18, same day.** The first version of this section reported
+"4/4 pairs, 3.1%-12.1%" from a run that was **not** interleaved — it ran
+baseline-then-patched in every pair, so any systematic advantage to running
+second (page cache, frequency ramp) would land entirely on the patched arm and
+produce exactly that clean sweep. This repo's own convention is ABBA and it was
+not followed. Re-measured properly, `taskset -c 6,7`, 8 ABBA blocks = 16
+samples per arm:
 
-| shape | before | after | pairs favouring after |
+| | median | mean | blocks favouring pre-size |
 |---|---:|---:|---|
-| `thenApply` | 5 645 – 5 795 | 5 062 – 5 509 | **4 / 4** (3.1% – 12.1%) |
-| `thenCompose` | 10 520 – 10 938 | 9 869 – 10 301 | **4 / 4** (4.6% – 8.2%) |
+| `default()` | 5 580.0 | 5 542.7 | — |
+| pre-sized to 16 | 5 352.6 | 5 249.9 | **7 / 8** |
 
-**This is worth flagging against §3's own warning**, which is that two changes
-on 2026-08-13 each removed 5–10% of attributed samples and neither moved CPU.
-This one removed ~3.5% of samples and moved wall clock by more than that —
-because deleting a growing hash table also deletes the `malloc`/`free` traffic
-underneath it, which is attributed to the allocator cluster, not to the set.
-Sample share is a lower bound on what an allocation costs, not an estimate.
+**median 4.1%, mean 5.3%** — real, and smaller and noisier than the first
+number claimed. Keep the 4-5% figure, not the 12%.
 
-It is a **~5% change on a 60x gap**, and it is reported as exactly that. It
-does not touch the cause.
+**The probe is BIMODAL, which is why the first design was so easy to fool.**
+Runs land in one of two states — around 5.3 µs/stage or around 4.4 µs/stage for
+`thenApply` — and both binaries reach both (block 5 has the pre-sized arm at
+4 384 and block 6 has the baseline arm at 5 029, reversing the sign). A design
+that gives one arm a fixed position cannot separate that from a real effect.
+Anything measured on this probe needs ABBA and needs enough blocks to see both
+modes; three reps is not enough. What causes the bimodality is not known and is
+worth its own look — it is a ~1.2x swing in a VM running an identical workload.
 
-### 6.4 What is still not known
+### 6.4 A candidate found, measured, and NOT landed
+
+`force_native_over_real_jdk_bytecode_memoized`
+(`vm/src/runtime/interpreter/native_override.rs`) exists to avoid a ~55-branch
+scan. Its key is `(Box<str>, Box<str>, Box<str>)`, so **every lookup, including
+every hit, first builds that key**: three heap allocations and three copies,
+then three string comparisons inside the probe, then three frees — under a
+process-global `Mutex`. That is a memo whose hit path may well cost more than
+the miss it replaces, and it fits the evidence: `__memcmp_evex_movbe` at 2.71%
+with `should_force_registered_native_over_bytecode` among its callers, on a
+workload that does no string work of its own.
+
+The fix is mechanical, because `Box<str>: Borrow<str>` but a TUPLE of them has
+no such impl — which is exactly why the old shape had to allocate. Splitting
+the key into "hash the class, then linear-scan its methods" makes the hit path
+allocation-free, and the common case (a class in no triple) becomes one hash
+lookup returning `None`.
+
+**It was written, built, and measured, and it did not move this probe.** So it
+is described here and NOT landed. The reasoning that it is strictly less work
+is exactly the reasoning behind the two 2026-08-13 changes §3 warns about, and
+this page is not the place to add a third. Someone with a workload that
+actually stresses reflective / megamorphic dispatch — the paths the memo's own
+doc comment says it was added for, which composition is not — should pick it up
+with that as the instrument.
+
+### 6.5 What is still not known
 
 The gap is not lambda dispatch (§5 settled that), and it is not the visited set
 (§6.3 is 5%). The profile says the next place to look is the **native-registry
@@ -392,3 +426,53 @@ Unchanged from §5: any candidate fix must be A/B'd on
 run — the hibernate-reactive suite is not on the Azure host. The numbers above
 are `LambdaCompositionProbe` only, and the page's own history is that probe
 wins do not always convert.
+
+## 7. The registry cluster, measured — 4 lookups per stage and every one of them misses
+
+§6.5 pointed at the ~12.5% native-registry cluster. `CRATONVM_DBG=native-lookups`
+(the census built for exactly this question) over
+`probes/LambdaCompositionProbe.java`, four workload sizes:
+
+| chains | stages | `find` | `quirks` | `invokes(stackless)` |
+|---:|---:|---:|---:|---:|
+| 2 500 | 20 000 | 151 254 | 147 753 | 966 |
+| 5 000 | 40 000 | 231 254 | 227 756 | 966 |
+| 10 000 | 80 000 | 391 254 | 387 756 | 966 |
+| 20 000 | 160 000 | 711 254 | 707 756 | 966 |
+
+**Exactly 4.0 `find` calls per composition stage**, at every size — the deltas
+are 80 000 / 160 000 / 320 000 against 20 000 / 40 000 / 80 000 added stages,
+linear to three digits, over a fixed ~71 k boot cost.
+
+**And essentially every one of them misses.** `quirks` tracks `find` to within
+0.5%, and `resolve_id_with_descriptor_quirks` is only reached *after* the exact
+lookup has already failed. So each of those four does: a class prefilter hash,
+a slot hash, a miss, then a full byte pass over the descriptor in an arm marked
+`#[cold]` `#[inline(never)]` — which on this workload is taken ~100% of the
+time. The arm is correct to bail (it returns `None` before allocating), but
+`#[cold]` is a branch-layout hint that is simply wrong here.
+
+That is the shape behind the 2.71% `__memcmp_evex_movbe` and a good part of the
+`find` / `slot_for_exact` / `quirks` lines: not one expensive lookup, but four
+cheap ones per stage that were never going to hit.
+
+**The instrument's own headline number is misleading, and this is the trap.**
+`lookups_per_invoke` printed 162 -> 245 -> 411 -> 742 across those four rows,
+which reads like a per-call cost that worsens with load. It is not:
+`invokes(stackless)` is **constant at 966** in all four runs, so the ratio grew
+only because its denominator could not move. The lookups this workload
+generates do not arrive through `try_stackless_invoke` at all, though that
+counter's doc comment calls itself "the every-invoke entry point". Corrected at
+the source in this change; the reliable reading is the marginal rate between
+two sizes, which is what the 4.0 above is.
+
+**Not fixed here, and deliberately.** The obvious moves — a negative cache, or
+dropping `#[cold]` — are each a one-line change with an obvious story, and this
+page's history (§3, and §6.4 in this session) is that such changes do not
+convert. Whoever takes it should start from the fact above: the target is
+*four misses per stage*, so the question is which call site issues them and
+whether it can ask once, not whether each miss can be made cheaper.
+
+`perf` could not answer that here: dwarf unwinding through these frames yields
+bogus return addresses (`0x1ffffffffff`, `0x3`), so `--call-graph` gives no
+callers for `find`. A counter at the call sites will be needed instead.
