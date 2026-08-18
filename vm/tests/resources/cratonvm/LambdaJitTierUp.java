@@ -233,6 +233,26 @@ public final class LambdaJitTierUp {
         return sum + caught * 31;
     }
 
+    /**
+     * Long enough that the background compiler certainly publishes the impl
+     * body and the fast path certainly enters it.
+     *
+     * The other checksums here run 4 000 iterations, which crosses the tier-up
+     * threshold but need not outlast an asynchronous compile — so a run in
+     * which the fast path never engaged would still produce the right answer
+     * and still pass. That is a test agreeing with HotSpot about a code path it
+     * never took. This one exists so `lambda_jit_engagement_tests` can assert
+     * the path was taken at all.
+     */
+    public static int warmChecksum() {
+        IntUnaryOperator plus1 = v -> v + 3;
+        int sum = 0;
+        for (int i = 0; i < 400_000; i++) {
+            sum += plus1.applyAsInt(i & 0xFF);
+        }
+        return sum;
+    }
+
     private static int indirect(IntUnaryOperator op, int v) {
         return level2(op, v);
     }

@@ -1704,6 +1704,25 @@ pub(crate) mod lambda_site_prof {
 }
 
 
+/// The lambda tier-up engagement counters, for tests that must prove they
+/// EXERCISE the fast path rather than merely agreeing with HotSpot while it
+/// never ran.
+///
+/// Returns `(interpreter fast returns, JIT-side direct calls, tier-up
+/// nominations)`. Counting is gated on `CRATONVM_DBG_LAMBDA_JIT` — the same
+/// switch the `[LAMBDA-JIT]` line rides on — so an ordinary run pays one
+/// relaxed load per dispatch and nothing else. A caller that wants numbers
+/// must set that variable BEFORE the first lambda dispatch, because the gate
+/// is read once into a `OnceLock`.
+pub fn lambda_jit_engagement() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        lambda_jit::FAST_RETURNS.load(Ordering::Relaxed),
+        lambda_site_prof::SITE_DIRECT.load(Ordering::Relaxed),
+        lambda_jit::NOMINATIONS.load(Ordering::Relaxed),
+    )
+}
+
 /// Census shims for the JIT-side direct call arm (`crate::jit::helpers`), which
 /// lives outside this module and so cannot touch the counters directly.
 #[inline]
