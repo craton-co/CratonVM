@@ -90,6 +90,14 @@ Nothing scoped to this class. In rough order of expected size:
 3. **Compiled double arithmetic throughput** in the residual ~43%. Unprofiled at
    the instruction level; this host has no `perf`, and the Azure Linux box does.
 
+The sibling page's `perf record` on `BigDecimalBench` is the closest thing to a
+prior for what that profile will say, and it is not encouraging for the
+one-lever theory: **flat, largest symbol 5.06%**, ~15% name/metadata resolution,
+~15% heap address validation and allocation, ~6% native dispatch plumbing, and
+**~2% in the arithmetic itself**. Two independent commons-math workloads, two
+different arithmetic surfaces, the same answer — the cost is VM plumbing per
+operation, spread thin.
+
 ## Reproduction
 
 ```bash
@@ -121,6 +129,8 @@ HotSpot finishes the same class in 1 806 ms (17 of 18 tests run, 1 skipped).
   — the OSR gate this workload was first blamed on. Really was a gate, really is
   fixed, worth ~29x on the shape it governs, worth nothing here.
 * [`bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md`](bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md)
-  — the other commons-math "hang", also a raw compiled-throughput gap rather
-  than a hang.
+  — the other commons-math "hang", also a compiled-throughput gap rather than a
+  hang, and the one that has an actual `perf` profile. Its conclusion — flat,
+  ~2% arithmetic, the rest VM plumbing — is the independent corroboration this
+  page's sampler can only gesture at.
 * `apps/commons-math/RESULTS-20260817.md` — the suite run both were found from.
