@@ -279,10 +279,16 @@ fn field(stdout: &str, key: &str) -> Option<String> {
 }
 
 /// True when this run OSR-compiled `method` (as opposed to refusing it).
+///
+/// The refusal line is `OSR-compile FAILED <method> ...`, which shares the
+/// `OSR-compile ` prefix with the success line — so the negative arm below is
+/// only a real check with `FAILED` excluded. Without that, the OFF arm's own
+/// refusal satisfied the "did it compile?" predicate and the test reported the
+/// two gate states as indistinguishable.
 fn osr_compiled(stderr: &str, method: &str) -> bool {
-    stderr
-        .lines()
-        .any(|l| l.contains("] OSR-compile ") && l.contains(method))
+    stderr.lines().any(|l| {
+        l.contains("] OSR-compile ") && !l.contains("OSR-compile FAILED") && l.contains(method)
+    })
 }
 
 #[test]

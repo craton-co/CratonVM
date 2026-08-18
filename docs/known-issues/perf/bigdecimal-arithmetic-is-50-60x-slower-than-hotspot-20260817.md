@@ -103,7 +103,9 @@ above, not in the arithmetic itself.
 ## Related
 
 * `apps/commons-math/RESULTS-20260817.md` — the suite run this was found from.
-* `docs/known-issues/jit/bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-20260817.md`
-  — the other CratonVM-only "hang" found in the same run; a different root
-  cause (OSR refusal, not raw arithmetic cost) that happens to produce the
+* [`bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`](bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md)
+  — the other CratonVM-only "hang" found in the same run. It was first filed as
+  an OSR refusal; that gate was real and is now fixed, and the wall time did not
+  move. It is the SAME root cause as this page — compiled-code throughput, not
+  an admission gap — that happens to produce the
   same symptom (a test that never finishes).
