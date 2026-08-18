@@ -3303,6 +3303,19 @@ fn proxy_desc_assignable_opt(
     if to == from {
         return Some(true);
     }
+    // `Object` is assignable from every REFERENCE type, array or not, and
+    // deciding that needs no class resolution.
+    //
+    // This has to sit ABOVE the array block rather than inside it. The
+    // recursion below peels one `[` off each side, so the measured
+    // `Object[] vs String[]` row arrives at the next level as
+    // `Ljava/lang/Object; vs Ljava/lang/String;` — no array left to match on —
+    // and inside-the-block placement meant it fell straight through to the
+    // `let ctx = ctx?;` path and answered `None` for a row that is decidable
+    // without a VM at all.
+    if to == "Ljava/lang/Object;" && (from.starts_with('L') || from.starts_with('[')) {
+        return Some(true);
+    }
     let to_arr = to.starts_with('[');
     let from_arr = from.starts_with('[');
     if to_arr || from_arr {
@@ -3311,9 +3324,6 @@ fn proxy_desc_assignable_opt(
         // the difference between the measured `Object[] vs String[]` row (which
         // HotSpot ACCEPTS) and the `String[] vs Integer[]` row (which it
         // refuses), so it cannot be collapsed to "arrays differ -> conflict".
-        if to == "Ljava/lang/Object;" {
-            return Some(true);
-        }
         if to_arr && from_arr {
             return proxy_desc_assignable_opt(ctx, &to[1..], &from[1..]);
         }

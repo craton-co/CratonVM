@@ -7604,6 +7604,24 @@ mod tests {
         }
     }
 
+    /// `addLogger(null)` rejects by THROWING, not by answering `false`.
+    ///
+    /// MEASURED on Temurin 25.0.4+7-LTS — `LogManager.getLogManager()
+    /// .addLogger(null)` throws `NullPointerException: Cannot invoke
+    /// "java.util.logging.Logger.getName()" because "logger" is null`, because
+    /// `LogManager.addLogger` opens with an unguarded `logger.getName()`. The
+    /// same run answers `false` for `addLogger(alreadyRegistered)`, which is
+    /// the SEPARATE rule `t19_h3_add_logger_returns_true_then_false_on_duplicate`
+    /// covers.
+    ///
+    /// This row used to assert `Int(0)` — the old deliberate swallow, whose
+    /// own comment at `native_add_logger` conceded "the contract says NPE" and
+    /// kept `false` to keep bootstraps alive. That swallow was removed once it
+    /// was measured (it kept alive nothing a real JDK would have run), and this
+    /// row was not updated with it, so it went on pinning the behaviour the fix
+    /// deleted. `log_manager_add_logger_null_throws_instead_of_answering_false`
+    /// is the test that landed WITH the fix; the two agree now, and this one
+    /// stays because T19.H3 is a tracked family.
     #[test]
     fn t19_h3_add_logger_rejects_null_logger_argument() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -7613,10 +7631,11 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let r = native_add_logger(&mut ctx, &[Value::Object(Some(mgr)), Value::Object(None)])
-            .unwrap()
-            .unwrap();
-        assert_eq!(r, Value::Int(0));
+        assert_npe(
+            native_add_logger(&mut ctx, &[Value::Object(Some(mgr)), Value::Object(None)]),
+            JUL_NPE_NULL_LOGGER,
+            "LogManager.addLogger(null)",
+        );
     }
 
     #[test]

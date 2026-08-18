@@ -19023,6 +19023,16 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // bounds table. Non-zero even under G1/ZGC (the table just stays
         // all-zero there, so every guard falls through to the checked helper).
         region_bounds_addr: cratonvm_gc::jit_region_bounds_addr(),
+        // The READ-side sibling. Same six-word shape, DIFFERENT table on
+        // purpose: `JIT_REGION_BOUNDS` above is what gates inline reference
+        // STORES, and G1/ZGC keep it empty so an inline store can never skip
+        // `post_write_barrier_rset` (`audits/g1-audit.md` 8.1). This one
+        // answers only the read question -- is the receiver inside mapped
+        // arena memory, so a raw load cannot fault -- and G1 does publish its
+        // single contiguous arena span into it. ZGC publishes nothing, which
+        // is what keeps inline reference reads unreachable there until the
+        // ZGC JIT load barrier lands.
+        read_bounds_addr: cratonvm_gc::jit_read_bounds_addr(),
         // Inline self-recursion check — leaf floor-query helper (see the
         // jit-api field doc; prologue-called once per self-recursive method).
         native_stack_floor_fn: jit_native_stack_floor as *const () as usize,

@@ -1147,6 +1147,43 @@ pub struct JitRuntimeHelpers {
     /// inside a `String[]`) this slot exists to close. Appended at the END of
     /// the struct so all prior golden offsets stay stable.
     pub aastore_type_check: usize,
+
+    /// Guarded inline `getfield` READ side — address of the GC's process-global
+    /// `JIT_READ_BOUNDS` table (`gc/src/gen_heap.rs`), six consecutive
+    /// `AtomicUsize` words in the same `[b0, e0, b1, e1, b2, e2]` layout as
+    /// [`Self::region_bounds_addr`], so the emitted containment sequence is
+    /// byte-identical and only the baked address differs.
+    ///
+    /// **Why a second table rather than reusing the first.**
+    /// [`Self::region_bounds_addr`] is doing two jobs whose answers diverge.
+    /// Its documented job is "is this address mapped, so a raw load cannot
+    /// fault" — a READ question. Its load-bearing job since G1-2
+    /// (`audits/g1-audit.md` §8.1) is "may an inline reference STORE skip the
+    /// collector's write barrier", and G1/ZGC answer that by leaving the table
+    /// EMPTY: a JNI-pinned, CSet-excluded G1 region is reachable only through
+    /// its remembered set, so an inline store that skips
+    /// `post_write_barrier_rset` loses that edge. One table, two questions,
+    /// opposite answers — filling it to fix loads would silently unblock the
+    /// stores it exists to block.
+    ///
+    /// **Who publishes.** `GenerationalHeap` (its three arenas, refreshed at
+    /// every GC start/end) and `G1Collector` (its single contiguous `Box`
+    /// arena, `[arena_base, arena_end)`, published once at construction and
+    /// cleared on drop — G1's N regions are carved from ONE allocation, so
+    /// three slots are more than the one it needs). **ZGC deliberately does
+    /// NOT publish**, which is what keeps this table from landing ahead of the
+    /// ZGC JIT load barrier: a compact reference slot there holds
+    /// `Z_COLORED_TAG | colour | offset`, not a pointer, and inlining its load
+    /// is the use-after-free `feature-designs/zgc-jit-load-barrier.md` exists
+    /// to stop. Not publishing is a strictly stronger discharge of that
+    /// obligation than a per-field-kind gate would be, and it costs G1 nothing:
+    /// the measured containment-failure split there is 100% reference / 0%
+    /// primitive.
+    ///
+    /// `0` = not wired (hand-built test tables) → the READ path keeps the
+    /// checked `jit_getfield` helper, which is the pre-fix behaviour. Appended
+    /// at the END of the struct so all prior golden offsets stay stable.
+    pub read_bounds_addr: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1323,6 +1360,10 @@ helper_fields! {
     // Required: the `0x53` lowering is inline and calls this for the JVMS §6.5
     // covariance check; 0 would mean a reference store with no check at all.
     (aastore_type_check,             FieldKind::RequiredPtr),
+    // NOT a pointer: address of the GC's JIT_READ_BOUNDS table, baked as an
+    // immediate by the guarded inline getfield READ path. Deliberately a
+    // DIFFERENT table from region_bounds_addr above -- see the field doc.
+    (read_bounds_addr,               FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1348,7 +1389,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 64,
+    JitRuntimeHelpers::NUM_FIELDS == 65,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1742,6 +1783,7 @@ mod tests {
             monitor_exit: 0x11B0,
             ldc_class_cp: 0x11B8,
             aastore_type_check: 0x11C0,
+            read_bounds_addr: 0x11C8,
         }
     }
 
@@ -1978,6 +2020,7 @@ mod tests {
             monitor_exit: 0,
             ldc_class_cp: 0,
             aastore_type_check: 0,
+            read_bounds_addr: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2153,8 +2196,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 64.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 64);
+        // And the macro-driven count is the canonical 65.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 65);
     }
 
     #[test]
@@ -2472,6 +2515,11 @@ mod tests {
                 "aastore_type_check",
                 std::mem::offset_of!(JitRuntimeHelpers, aastore_type_check),
             ),
+            (
+                64,
+                "read_bounds_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, read_bounds_addr),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2509,7 +2557,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
         // The macro must classify every field.
-        // 42 RequiredPtr + 9 OptionalPtr + 9 Offset = 60. A new
+        // 43 RequiredPtr + 12 OptionalPtr + 10 Offset = 65. A new
         // field whose classification is omitted will fail to compile (the
         // macro requires both arms); this test pins the *counts* so a
         // reclassification (e.g. demoting a RequiredPtr to OptionalPtr) is
@@ -2527,7 +2575,7 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 12, "optional-pointer count drifted");
-        assert_eq!(off, 9, "offset-field count drifted");
+        assert_eq!(off, 10, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 
@@ -2731,6 +2779,7 @@ mod tests {
             "ldc_string" => h.ldc_string = 0,
             "set_throw_bci" => h.set_throw_bci = 0,
             "aastore_type_check" => h.aastore_type_check = 0,
+            "read_bounds_addr" => h.read_bounds_addr = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

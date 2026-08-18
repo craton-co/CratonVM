@@ -47224,25 +47224,35 @@ mod throwable_ctor_single_table_witness {
 
         // Assembled, not written as one literal, so this test's own text is
         // never what a scan of these files finds.
-        let begin = format!("// THROWABLE-CTOR-{}-BEGIN", "TABLE").replace("-BEGIN", " BEGIN");
-        let end = format!("// THROWABLE-CTOR-{}-END", "TABLE").replace("-END", " END");
         let ctor = format!("\"{}\"", "<init>");
 
         // --- 1. the one table, read out of the file that owns it -------------
+        //
+        // The table used to be a marker-fenced two-column list of
+        // `("class", &[descriptors])` rows in this file, and this step used to
+        // look for those markers. It is now SPLIT: `lang_misc.rs` keeps the
+        // class-name column as `THROWABLE_FAMILY_CLASSES`, and the descriptor
+        // column moved to `cratonvm_classloading::throwable_ctor_descriptors`
+        // (which `THROWABLE_FAMILY_CLASSES`'s own doc comment points at). One
+        // table still, stored in two places — and every step below only ever
+        // used the class-name column, so this reads that.
+        let anchor = "THROWABLE_FAMILY_CLASSES: &[&str] = &[";
         let start = lang_misc
-            .find(&begin)
-            .unwrap_or_else(|| panic!("table start marker {begin:?} not found in lang_misc.rs"));
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor:?} not found in lang_misc.rs; re-point this witness"))
+            + anchor.len();
         let stop = lang_misc[start..]
-            .find(&end)
+            .find("
+];")
             .map(|i| start + i)
-            .unwrap_or_else(|| panic!("table end marker {end:?} not found in lang_misc.rs"));
+            .unwrap_or_else(|| panic!("THROWABLE_FAMILY_CLASSES has no terminator in lang_misc.rs"));
         let table: Vec<&str> = lang_misc[start..stop]
             .lines()
             .filter_map(|line| {
                 line.trim()
-                    .strip_prefix("(\"")
-                    .and_then(|rest| rest.split_once("\", &["))
-                    .map(|(class, _)| class)
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix("\","))
+                    .filter(|class| class.contains('/'))
             })
             .collect();
         assert!(
