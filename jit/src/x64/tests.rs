@@ -11815,6 +11815,9 @@ fn make_inline_site(
         method_name: "inlined".to_string(),
         descriptor,
         elided_invoke_pcs: Vec::new(),
+        invoke_targets: Vec::new(),
+        resolved_invoke_infos: Vec::new(),
+        nested_sites: Vec::new(),
     }
 }
 

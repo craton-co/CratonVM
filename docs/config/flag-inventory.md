@@ -1209,6 +1209,8 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_OSR_DEAD_LOCALS` | JIT | `CRATONVM_JIT=osr-dead-locals` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` | JIT | `CRATONVM_JIT=osr-dead-mask-blanket` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_EXC_TABLE` | JIT | `CRATONVM_JIT=osr-exc-table` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_INLINE_CALLS` | JIT | `CRATONVM_JIT=inline-calls` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_INLINE_NEST` | JIT | `CRATONVM_JIT=inline-nest` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` | JIT | `CRATONVM_JIT=osr-seed-frame-slots` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_SINGLE_PC` | JIT | `CRATONVM_JIT=osr-single-pc` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` | JIT | `CRATONVM_JIT=osr-strip-all-high-halves` | opt-in | off | behaviour | snapshot | jit |

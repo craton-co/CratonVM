@@ -76895,6 +76895,9 @@ public class SkippedTest {
             method_name: "bar".to_string(),
             descriptor: "(I)I".to_string(),
             elided_invoke_pcs: vec![5],
+            invoke_targets: Vec::new(),
+            resolved_invoke_infos: Vec::new(),
+            nested_sites: Vec::new(),
         };
 
         assert_eq!(site.callee_code_len, 2);
