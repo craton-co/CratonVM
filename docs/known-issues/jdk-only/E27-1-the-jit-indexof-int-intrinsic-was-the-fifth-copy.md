@@ -396,7 +396,7 @@ If the fast path is later restored under N2b's screen, (a)/(b)/(c) invert and
 the differential test comes back **with its needle list derived from the
 measured JDK rows in §2.1**, not from `& 0xFFFF`.
 
-### N2b — **DO NOT IMPLEMENT AS WRITTEN.** Re-scoped 2026-08-18.
+### N2b — **DONE 2026-08-18**, but NOT as written. The sketch was a cliff.
 
 The sketch below is kept because its *shape* is right and its premise is
 wrong, and the wrong premise is the interesting part.
@@ -431,6 +431,47 @@ against a 63-72s/round fully-interpreted baseline. A runtime screen whose miss
 path is a deopt is only safe when the miss is genuinely once-per-program. A
 needle outside the BMP is a property of the DATA, not a mis-speculation, so it
 can recur every call.
+
+**What landed.** The compile-time screen below, and nothing else — the emitted
+scan is byte-for-byte the one that was already there. `indexOf(I)` is
+recognised again in `try_resolve_string_intrinsic`, and
+`x64/bytecode_walk.rs::prev_insn_int_const` decides per site whether the needle
+is a provable constant in `0..=0xFFFF`. The screen is a `direct.filter` placed
+BEFORE the intrinsic ladder — the same shape as the `ArraycopyPrimitive`
+despec filter already there — so a declined site never enters the intrinsic
+branch at all and takes the dispatch it takes today. **No deopt path was
+added.** The only bails in the emitted scan remain the null receiver and the
+null `value` array, both genuinely once-per-program.
+
+`iconst_m1..iconst_5`, `bipush` and `sipush` are decoded; `ldc`/`ldc_w` are
+not, because they need the constant pool and this layer does not have it. A
+`char` literal above `0x7FFF` therefore falls back to dispatch — a missed
+optimisation, never a wrong answer.
+
+Tests, in `jit/tests/intrinsic_string_search.rs`:
+
+* `index_of_char_screen_admits_only_constant_bmp_needles` — the gate. Pins that
+  `sipush 0xFFFF` reads as `-1` and is REJECTED rather than masked back to
+  `0xFFFF`, which is the measured `"\u{FFFF}q".indexOf(-1)` row from §2.1; and
+  that a non-constant needle (`iload_1`) screens out. That last row is the one
+  that stops the cliff.
+* `string_index_of_const_char_differential` — the emitted code, against a
+  UTF-16 oracle. Legitimate here precisely because the screen holds: on
+  `0..=0xFFFF` a single-code-unit scan IS `code_point_needle`'s answer. The
+  pre-N2b differential derived its expected value from `(ch & 0xFFFF)` and so
+  asserted a wrong answer; this one cannot, because the range where the two
+  disagree is unreachable.
+* `string_index_of_const_char_counts_utf16_units_not_code_points` — the row
+  that catches the N2c family's bug from the JIT side:
+  `"x\u{10437}yz".indexOf('z')` must be **4**, counting the surrogate pair as
+  the two code units it is.
+
+`cargo test --release -p cratonvm-jit`: green in full.
+
+**The old harness could not have caught any of this**, which is worth its own
+line: it passed the needle in `iload_1`, so under the screen it is a declined
+site. A test that reaches an intrinsic only through a shape the intrinsic no
+longer accepts is not a test of the intrinsic.
 
 **The re-scoped design: screen at COMPILE time, not run time.** The needle at
 the overwhelming majority of real call sites is a literal — `indexOf(',')`,

@@ -509,28 +509,189 @@ fn string_compare_to_null_argument_deopts() {
 
 // --- indexOf(I) -----------------------------------------------------------
 
+/// E27-1 N2b: `indexOf(I)` registers again, but the RANGE screen that makes it
+/// correct is not here — it is `prev_insn_int_const` in the backend, which sees
+/// the operand this door never does. So this pins the door's half only:
+/// registration is layout-gated exactly like its siblings.
 #[test]
-fn string_index_of_char_is_not_intrinsified() {
-    // `indexOf(I)` is deliberately NOT intrinsified: the inline body masks the
-    // needle to `ch & 0xFFFF` and the JDK does not. The gate is
-    // `Character.isValidCodePoint`, applied BEFORE any narrowing, and a
-    // supplementary `ch` matches the surrogate PAIR. Measured on OpenJDK
-    // 25.0.3+9: `"abc".indexOf(0x10061)` is -1, and `"\u{FFFF}q".indexOf(-1)`
-    // is -1 even though `(char) -1 == 0xFFFF` and the receiver holds 0xFFFF.
-    // The rule lives once, in `lang_string.rs`'s `code_point_needle`; this
-    // door reaches it through ordinary dispatch rather than owning a copy.
-    //
-    // This assertion is the retirement's only guard. Without it the absence is
-    // just a missing match arm, and the next reader adds it back. See
-    // docs/known-issues/jdk-only/
-    // E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md
+fn string_index_of_char_registers_with_a_layout() {
     assert!(
         try_resolve_string_intrinsic("java/lang/String", "indexOf", "(I)I", Some(string_layout()))
-            .is_none(),
-        "indexOf(I) must NOT be intrinsified — the inline body masks to (ch & 0xFFFF)",
+            .is_some(),
+        "indexOf(I) must register with a StringFieldLayout (E27-1 N2b)",
     );
-    // And not through the layout-free door either.
+    assert!(
+        try_resolve_string_intrinsic("java/lang/String", "indexOf", "(I)I", None).is_none(),
+        "indexOf(I) must NOT register without a layout",
+    );
+    // The 3-arg layout-free matcher never registers a String method.
     assert!(cratonvm_jit::try_resolve_intrinsic("java/lang/String", "indexOf", "(I)I").is_none());
+}
+
+/// The screen itself: which call sites the backend will inline.
+///
+/// This is the assertion that keeps N2b honest. The inline scan is only the
+/// JDK's answer for a needle in `0..=0xFFFF`; outside it the rule is
+/// `Character.isValidCodePoint` plus a surrogate-PAIR match. A site whose
+/// needle is not a provable BMP constant must therefore NOT be intrinsified —
+/// and must not be deoptimised either, which is why the screen is a compile-
+/// time filter rather than a runtime guard. See `prev_insn_int_const`.
+#[test]
+fn index_of_char_screen_admits_only_constant_bmp_needles() {
+    use cratonvm_jit::x64::prev_insn_int_const_for_test as screen;
+    // `bipush 'a'; invokevirtual` — the shape of `s.indexOf('a')`.
+    let code = [0x2a, 0x10, b'a', 0xb6, 0x00, 0x01, 0xac];
+    assert_eq!(screen(&code, code.len(), 3), Some('a' as i32));
+    // `sipush 0xFFFF` is -1 as a SIGNED 16-bit immediate, which is exactly the
+    // measured `"\u{FFFF}q".indexOf(-1)` row: it must be rejected, not masked
+    // back to 0xFFFF.
+    let neg = [0x2a, 0x11, 0xFF, 0xFF, 0xb6, 0x00, 0x01, 0xac];
+    assert_eq!(screen(&neg, neg.len(), 4), Some(-1));
+    // sipush of a large BMP value stays in range.
+    let big = [0x2a, 0x11, 0x4e, 0x2d, 0xb6, 0x00, 0x01, 0xac];
+    assert_eq!(screen(&big, big.len(), 4), Some(0x4e2d));
+    // iconst_0 .. iconst_5 and iconst_m1.
+    for (op, want) in [(0x02u8, -1i32), (0x03, 0), (0x08, 5)] {
+        let c = [0x2a, op, 0xb6, 0x00, 0x01, 0xac];
+        assert_eq!(screen(&c, c.len(), 2), Some(want), "opcode {op:#x}");
+    }
+    // A NON-constant needle — `iload_1` — is not screened in, so the site is
+    // never intrinsified. This is the row that stops the cliff.
+    let var = [0x2a, 0x1b, 0xb6, 0x00, 0x01, 0xac];
+    assert_eq!(screen(&var, var.len(), 2), None);
+    // `ldc` is deliberately not decoded (no constant pool at this layer):
+    // a missed optimisation, never a wrong answer.
+    let ldc = [0x2a, 0x12, 0x07, 0xb6, 0x00, 0x01, 0xac];
+    assert_eq!(screen(&ldc, ldc.len(), 3), None);
+    // pc 0 has no previous instruction.
+    assert_eq!(screen(&var, var.len(), 0), None);
+}
+
+/// JIT-compile `int f(String this)` whose body is
+/// `aload_0; sipush <ch>; invokevirtual indexOf(I)I; ireturn` — one compiled
+/// wrapper per CONSTANT needle, which is the only shape E27-1 N2b's screen
+/// admits. (The pre-N2b harness passed the needle in `iload_1`; that site is
+/// now correctly declined, so it can no longer reach the intrinsic at all.)
+fn compile_index_of_const_char(ch: u16) -> impl Fn(i64) -> i64 {
+    let entry =
+        try_resolve_string_intrinsic("java/lang/String", "indexOf", "(I)I", Some(string_layout()))
+            .expect("indexOf(I) must register with a layout")
+            .0;
+    // aload_0 (2a), sipush ch (11 hi lo), invokevirtual (b6 00 01), ireturn (ac).
+    let code: Vec<u8> = vec![
+        0x2a,
+        0x11,
+        (ch >> 8) as u8,
+        (ch & 0xFF) as u8,
+        0xb6,
+        0x00,
+        0x01,
+        0xac,
+        0,
+        0,
+    ];
+    let compiled = compile(
+        &code,
+        code.len(),
+        2,
+        1,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            4,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 1,
+                return_type: b'I',
+                guard_class_id: 0,
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(string_layout()),
+    )
+    .expect("indexOf(I) wrapper compilation failed");
+    move |this: i64| unsafe { compiled.try_call(&[this]).expect("test JIT call") }
+}
+
+/// The emitted scan, against the JDK's rule — not against the sibling
+/// implementation.
+///
+/// The oracle here is a UTF-16 code-unit position, which for a needle in
+/// `0..=0xFFFF` IS `code_point_needle`'s answer (single code unit, lone
+/// surrogates included). That equivalence is precisely what the screen buys,
+/// and it is why this oracle is legitimate where the pre-N2b one — which
+/// derived its expected value from `(ch & 0xFFFF)` and so asserted that
+/// `"a…".indexOf(0x10061)` finds `'a'` — was not.
+#[test]
+fn string_index_of_const_char_differential() {
+    let haystacks = [
+        "",
+        "a",
+        "hello",
+        "banana",
+        "caf\u{e9}",
+        "A\u{4e2d}Z\u{4e2d}",
+        // A supplementary char in the HAYSTACK is fine and is worth pinning:
+        // the needle is BMP, so the answer is a UTF-16 index that must count
+        // the surrogate pair as TWO units. This is the row the old
+        // `chars().enumerate()` native family got wrong.
+        "x\u{10437}yz",
+    ];
+    let needles: [u16; 6] = [
+        'a' as u16,
+        'z' as u16,
+        'o' as u16,
+        0x00e9,
+        0x4e2d,
+        0xFFFF, // a valid non-character, and a BMP one: scanned, not rejected
+    ];
+    for &ch in &needles {
+        let f = compile_index_of_const_char(ch);
+        for h in haystacks {
+            let (s, _ss) = string_of(h);
+            let got = f(s.ptr()) as i32;
+            let want = h
+                .encode_utf16()
+                .position(|c| c == ch)
+                .map(|i| i as i32)
+                .unwrap_or(-1);
+            assert_eq!(got, want, "indexOf({h:?}, {ch:#x})");
+        }
+    }
+}
+
+/// The pinned row: a BMP needle must be found at its UTF-16 index, counting a
+/// preceding supplementary character as the TWO code units it is.
+#[test]
+fn string_index_of_const_char_counts_utf16_units_not_code_points() {
+    let f = compile_index_of_const_char('z' as u16);
+    let (s, _ss) = string_of("x\u{10437}yz");
+    // x=0, surrogate pair=1,2, y=3, z=4. A code-point index would say 3.
+    assert_eq!(f(s.ptr()) as i32, 4, "must be a UTF-16 index, not a code-point one");
+}
+
+#[test]
+fn string_index_of_const_char_null_receiver_deopts() {
+    let _guard = deopt_lock();
+    let f = compile_index_of_const_char('a' as u16);
+    let before = clear_deopt_signals();
+    assert_eq!(f(0), i64::MIN, "null receiver must deopt");
+    assert_one_deopt_after(before, "indexOf(I) null receiver");
 }
 
 // --- indexOf(String) ------------------------------------------------------
