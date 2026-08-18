@@ -5350,6 +5350,87 @@ pub struct InlineInvokeTarget {
     /// picks a different method with the same name. The enclosing method's id
     /// would be the wrong answer whenever the callee comes from another loader.
     pub declaring_class_id: u32,
+    /// `(compiled entry address, callee takes the VM context)` when this target
+    /// could be bound to a raw `CALL` at plan time, `None` when it could not.
+    ///
+    /// This is what makes a call-carrying splice pay for itself. Measured
+    /// 2026-08-18: emitting an admitted call through the blind
+    /// `jit_invoke_dispatch` took the JUnit assertion chain from 47 to 163-266
+    /// ns/iter, because the call it replaced was ALREADY direct-bound — a raw
+    /// `CALL` to a compiled entry — and the helper resolves by name on every
+    /// execution. Removing a ~4 ns frame does not pay for a ~175 ns downgrade.
+    ///
+    /// Filled by the same `callee_compiler` / `direct_callee_lookup` resolver
+    /// the top-level `direct_calls` planning uses, so every one of its refusal
+    /// gates (FJP blocklist, native shadow, callee exception table,
+    /// `synchronized`, JVMS §5.5 static-init, indy trap, eager-chain depth /
+    /// cycle / fan-out) applies here unchanged and in the same order.
+    ///
+    /// KEEP-ALIVE CONTRACT: an entry recorded here MUST reach
+    /// `CompiledMethod::_direct_callee_entries`, which is what pins the callee
+    /// artifact (`prepare_for_publication`) and what the invalidation reverse
+    /// closure walks to evict a caller whose callee was withdrawn.
+    /// `try_compile_inner` does that for every site, nested ones included; a
+    /// baked address that skipped it is a use-after-free waiting for a tier-up.
+    pub direct_entry: Option<(usize, bool)>,
+}
+
+/// One call inside a spliced body, resolved and interned for the emitter.
+///
+/// Two shapes, and the emitter prefers the first:
+///
+///  * `direct_entry != 0` — a raw `CALL` to the callee's compiled entry, the
+///    same thing the top-level `direct_calls` path emits. `info_addr` is still
+///    needed: a baked direct call has no dispatch-helper frame to recover its
+///    arguments from when the callee deopts, so
+///    `emit_inline_callee_deopt_check` reads them out of a service copy keyed
+///    by this `JitInvokeInfo`.
+///  * `direct_entry == 0` — the blind `jit_invoke_dispatch` helper. Only
+///    reachable with `CRATONVM_JIT_INLINE_CALL_DISPATCH` on, because it is a
+///    measured 3.5x pessimisation on an already-direct-bound chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ResolvedInlineInvoke {
+    /// Bytecode pc in the CALLEE's own code, which is the space the emitter's
+    /// inner walk indexes.
+    pub callee_pc: usize,
+    /// `*const JitInvokeInfo` as an address. Never 0 for a recorded site.
+    pub info_addr: usize,
+    /// Compiled callee entry for a direct `CALL`, or 0 for "dispatch".
+    pub direct_entry: usize,
+    /// Whether that entry expects the VM context as its first argument.
+    pub direct_needs_context: bool,
+    /// Operand slots the call consumes, receiver included.
+    pub num_jit_args: usize,
+    /// Descriptor return byte (`b'V'` for void).
+    pub return_type: u8,
+}
+
+/// A call inside a spliced body that is spliced IN TURN rather than called.
+///
+/// `guard_class_id` is what makes this more than a recursion:
+///
+///  * `0` — the target is statically bound (`invokestatic` / `invokespecial`),
+///    so there is exactly one body and the splice is unconditional.
+///  * non-zero — the target is `invokevirtual` / `invokeinterface`, and this is
+///    the receiver class the CALLEE's own profile says dominates that site. The
+///    emitter guards the splice with an exact class-id compare and sends the
+///    miss edge to the ordinary call, exactly as PGO-02 does one level up.
+///
+/// Why the callee's OWN profile is the right source, and why this needed no
+/// re-keyed (caller pc, callee pc) profile after all: receiver types are
+/// recorded by the interpreter against the bci of the method that is EXECUTING.
+/// A call inside `objectsAreEqual` is therefore already profiled under
+/// `objectsAreEqual`'s own `MethodKey` at its own bci — which is precisely the
+/// (method, pc) pair a nested site names. The enclosing method's profile never
+/// had this information and never could.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct NestedInlineSite {
+    /// Bytecode pc in the enclosing CALLEE's code.
+    pub callee_pc: usize,
+    /// Exact receiver class the splice is guarded on, or 0 for no guard.
+    pub guard_class_id: u32,
+    /// The body to splice.
+    pub site: InlineSite,
 }
 
 /// Resolved metadata for a method eligible for inlining at a specific call site.
@@ -5414,25 +5495,26 @@ pub struct InlineSite {
     /// reads [`Self::resolved_invoke_infos`], which `try_compile_inner` derives
     /// from it.
     pub invoke_targets: Vec<(usize, InlineInvokeTarget)>,
-    /// `(callee_pc, *const JitInvokeInfo as usize)` — the interned form of
-    /// [`Self::invoke_targets`], filled by `try_compile_inner` immediately
-    /// before backend emission and read by `try_emit_inline_body`'s invoke arm.
+    /// The interned form of [`Self::invoke_targets`], filled by
+    /// `try_compile_inner` immediately before backend emission and read by
+    /// `try_emit_inline_body`'s invoke arm.
     ///
-    /// A `usize` rather than a raw pointer so the struct keeps its derived
-    /// `Clone`/`Eq`/`Debug` and stays `Send`: an `InlineSite` is planning data
-    /// that may be cloned into an `InlinePlan` and moved between threads, while
-    /// the pointer is only ever dereferenced inside the one compile that
-    /// interned it. Empty on every path that does not intern (planning,
-    /// tests, and every compile with the gate off), and an empty vector makes
-    /// the emitter's invoke arm bail exactly as it did before it existed.
+    /// Addresses are `usize` rather than raw pointers so the struct keeps its
+    /// derived `Clone`/`Eq`/`Debug` and stays `Send`: an `InlineSite` is
+    /// planning data that may be cloned into an `InlinePlan` and moved between
+    /// threads, while the pointers are only ever dereferenced inside the one
+    /// compile that interned them. Empty on every path that does not intern
+    /// (planning, tests, and every compile with the gate off), and an empty
+    /// vector makes the emitter's invoke arm bail exactly as it did before it
+    /// existed.
     ///
-    /// SAFETY CONTRACT: the pointee lives in this compile's
+    /// SAFETY CONTRACT: `info_addr`'s pointee lives in this compile's
     /// `_jit_invoke_infos` arena, which `try_compile_inner` moves into the
     /// `CompiledMethod` — so it outlives the emitted code, which bakes the
     /// address as an immediate. An `InlineSite` that escapes that compile
     /// (a cached plan) must not carry these; nothing repopulates them, and
     /// `try_compile_inner` overwrites the vector wholesale on every compile.
-    pub resolved_invoke_infos: Vec<(usize, usize)>,
+    pub resolved_invoke_infos: Vec<ResolvedInlineInvoke>,
     /// Calls the callee body makes that are themselves SPLICED rather than
     /// dispatched, keyed by CALLEE pc — the nesting step.
     ///
@@ -5444,7 +5526,7 @@ pub struct InlineSite {
     ///
     /// Depth is bounded by the resolver (`MAX_INLINE_NEST_DEPTH`); this vector
     /// is empty at the deepest admitted level, which terminates the recursion.
-    pub nested_sites: Vec<(usize, InlineSite)>,
+    pub nested_sites: Vec<NestedInlineSite>,
 }
 
 /// How many levels of splice-inside-a-splice the resolver will plan.
@@ -5473,6 +5555,7 @@ pub(crate) fn intern_inline_invoke_targets(
     site: &mut InlineSite,
     owned_strings: &mut Vec<Box<str>>,
     owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
+    direct_callee_entries: &mut Vec<usize>,
 ) {
     // Wholesale, never additive: an `InlineSite` may have been CLONED from
     // a cached plan that already carries pointers from an earlier compile,
@@ -5505,13 +5588,36 @@ pub(crate) fn intern_inline_invoke_targets(
         });
         let info_ptr: *const JitInvokeInfo = &*info;
         owned_invoke_infos.push(info);
-        site.resolved_invoke_infos
-            .push((*callee_pc, info_ptr as usize)); // Cast: pointer parked in a Send-able plan; deref only inside this compile
+        let (direct_entry, direct_needs_context) = target.direct_entry.unwrap_or((0, false));
+        // THE KEEP-ALIVE STEP, and the one whose omission has no symptom until
+        // a tier-up. `_direct_callee_entries` is what `prepare_for_publication`
+        // pins the callee artifact through, and what the invalidation reverse
+        // closure walks to evict this caller when that callee is withdrawn. A
+        // spliced direct call bakes the same kind of address a top-level one
+        // does and needs the same registration; skipping it leaves a raw `CALL`
+        // into freed code.
+        if direct_entry != 0 {
+            direct_callee_entries.push(direct_entry);
+        }
+        site.resolved_invoke_infos.push(ResolvedInlineInvoke {
+            callee_pc: *callee_pc,
+            // Cast: pointer parked in a Send-able plan; deref only inside this compile
+            info_addr: info_ptr as usize,
+            direct_entry,
+            direct_needs_context,
+            num_jit_args: target.num_jit_args,
+            return_type: target.return_type,
+        });
     }
     // A nested body's calls need the same treatment; the resolver bounds
     // the depth (`MAX_INLINE_NEST_DEPTH`), so this terminates.
-    for (_, nested) in site.nested_sites.iter_mut() {
-        intern_inline_invoke_targets(nested, owned_strings, owned_invoke_infos);
+    for nested in site.nested_sites.iter_mut() {
+        intern_inline_invoke_targets(
+            &mut nested.site,
+            owned_strings,
+            owned_invoke_infos,
+            direct_callee_entries,
+        );
     }
 }
 
@@ -5571,7 +5677,7 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
     // Charged per NON-nested call only. A nested call's cost arrives through
     // `nested_expansion` below, which is the nested body's own estimate; adding
     // both would double-charge the same call site.
-    let nested_pcs: Vec<usize> = site.nested_sites.iter().map(|(pc, _)| *pc).collect();
+    let nested_pcs: Vec<usize> = site.nested_sites.iter().map(|n| n.callee_pc).collect();
     let dispatch_cost = site
         .invoke_targets
         .iter()
@@ -5587,9 +5693,14 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
     let nested_expansion = site
         .nested_sites
         .iter()
-        .map(|(_, nested)| {
-            inline_site_expansion_cost_tiered(nested, site_is_hot)
+        .map(|nested| {
+            // A guarded nested splice also emits the compare, the null check
+            // and the miss-edge jump; 8 is the same order the guarded-virtual
+            // planner charges one level up.
+            let guard_cost = if nested.guard_class_id != 0 { 8 } else { 0 };
+            inline_site_expansion_cost_tiered(&nested.site, site_is_hot)
                 .unwrap_or(MAX_INLINE_EXPANSION_COST_HOT)
+                .saturating_add(guard_cost)
         })
         .fold(0usize, |a, b| a.saturating_add(b));
     let cost = site
@@ -8056,15 +8167,15 @@ pub enum JitIntrinsic {
     // is local and not externally observed.
     StringEquals,    // equals(Ljava/lang/Object;)Z
     StringCompareTo, // compareTo(Ljava/lang/String;)I
-    // `indexOf(I)I` — the codegen for this variant still exists in
-    // `x64/bytecode_walk.rs`, but `try_resolve_string_intrinsic` no longer
-    // hands the entry out, so nothing reaches it. Its inline body masks the
-    // needle to `ch & 0xFFFF`, which is not what the JDK does — the gate is
-    // `Character.isValidCodePoint`, applied BEFORE any narrowing, and a
-    // supplementary `ch` is matched as a surrogate PAIR. See the retirement
-    // note in `try_resolve_string_intrinsic` for the measured rows and for
-    // what restoring the fast path would take.
-    StringIndexOfChar, // indexOf(I)I — NOT handed out; see above
+    // `indexOf(I)I` — handed out again (E27-1 N2b, 2026-08-18), but only for a
+    // call site whose needle the backend can prove is a compile-time constant
+    // in `0..=0xFFFF`. The inline body scans for one UTF-16 code unit, which is
+    // the JDK's answer on exactly that range and NOT outside it (the gate is
+    // `Character.isValidCodePoint` before any narrowing, and a supplementary
+    // `ch` matches a surrogate PAIR). The screen is
+    // `x64/bytecode_walk.rs::prev_insn_int_const`; a site that fails it is not
+    // intrinsified and dispatches normally, with no deopt involved.
+    StringIndexOfChar, // indexOf(I)I — constant BMP needles only
     StringIndexOfStr,  // indexOf(Ljava/lang/String;)I
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
@@ -9431,58 +9542,49 @@ pub fn try_resolve_string_intrinsic(
     //   * indexOf(String)     — naive O(n*m) substring search from 0; an
     //     empty needle returns 0.
     //
-    // `indexOf(I)` is deliberately NOT recognised — see the block below.
+    // `indexOf(I)` is recognised only for a constant BMP needle — see below.
     if is_string {
         let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
             ("compareTo", "(Ljava/lang/String;)I") => {
                 Some((JitIntrinsic::StringCompareTo, 1, b'I'))
             }
-            // `indexOf(I)` — RETIRED, deliberately not intrinsified here.
+            // `indexOf(I)` — intrinsified again as of E27-1 N2b (2026-08-18),
+            // but ONLY where the backend can prove the needle is a
+            // compile-time constant in `0..=0xFFFF`. That screen lives in
+            // `x64/bytecode_walk.rs` (`prev_insn_int_const`), not here: this
+            // function sees a name and a descriptor, never an operand.
             //
-            // The inline body masks the needle to `ch & 0xFFFF` and the comment
-            // that used to stand here called that "bit-identical to native
-            // `String.indexOf(int)`". Both halves were false. The JDK does not
-            // narrow `ch`: it gates on `Character.isValidCodePoint` FIRST, then
-            // scans for one code unit if `ch <= 0xFFFF` and for the SURROGATE
-            // PAIR if `ch >= 0x10000`. Measured on OpenJDK 25.0.3+9 (this
-            // lane's `scratchpad/e27/E27Probe.java`):
+            // Why the range is the whole question. The inline body scans for
+            // ONE UTF-16 code unit. The JDK does not narrow `ch` — it gates on
+            // `Character.isValidCodePoint` FIRST, then scans for one code unit
+            // if `ch <= 0xFFFF` and for the SURROGATE PAIR if `ch >= 0x10000`.
+            // Measured on OpenJDK 25.0.3+9:
             //
             //     "abc".indexOf(0x10061)   -1     masking finds 'a' at 0
             //     "￿q".indexOf(-1)    -1     masking finds U+FFFF at 0
             //     mixed.indexOf(0x10437)    3     the pair, not its low half at 1
             //
-            // The `indexOf(-1)` row is the one that rejects the plausible wrong
-            // fix: `(char) -1` IS `0xFFFF` and the receiver DOES hold `0xFFFF`,
-            // yet HotSpot answers -1 — so the rule is the validity gate, not a
-            // narrowing cast.
+            // The `indexOf(-1)` row rejects the plausible wrong fix: `(char) -1`
+            // IS `0xFFFF` and the receiver DOES hold `0xFFFF`, yet HotSpot
+            // answers -1 — so the rule is the validity gate, not a narrowing
+            // cast. Inside `0..=0xFFFF` all three rows are vacuous and the
+            // single-code-unit scan IS `code_point_needle`'s answer, including
+            // for a lone surrogate.
             //
-            // E18-1 rewrote the native side onto ONE `code_point_needle`
-            // predicate plus two shared scanners, replacing four divergent
-            // copies of this single JVMS rule. Re-implementing the gate here
-            // would make a fifth. Dropping the recognition sends the call site
-            // through ordinary dispatch to that one predicate instead, which is
-            // the only way this door can carry the rule without owning a copy
-            // of it — `jit/src/lib.rs` is below `native-builtins` in the crate
-            // graph and cannot call `code_point_needle` directly.
+            // The retirement this replaces was right to remove the unscreened
+            // form: E18-1 had reduced the rule to ONE predicate in
+            // `native-builtins`, and `jit/src/lib.rs` is below that crate in
+            // the graph and cannot call it. A screen that admits only the
+            // range where no rule is needed is not a fifth copy of it.
             //
-            // Verified before landing: ordinary dispatch reaches a CORRECT
-            // implementation in both modes. In real-JDK mode a `Bridge`-kind
-            // `java/lang/String` native is dropped at registration
-            // (`native-api/src/registry.rs`, `drop_real_layout_synthetic`), so
-            // nothing shadows the real JDK's own `String.indexOf(int)`
-            // bytecode; in synthetic-jdk mode `register_synthetic_overrides`
-            // last-write-wins with `native_string_index_of`, which is the
-            // `code_point_needle` body.
-            //
-            // This costs the inline scan on a hot method. Restoring it is a
-            // codegen change, not a recognition change: emit the fast path
-            // under a runtime screen (`ch < 0 || ch > 0xFFFF` -> deopt), which
-            // admits exactly the range where a single-code-unit scan already IS
-            // the whole answer and defers every other case to the predicate.
-            // That belongs in `x64/bytecode_walk.rs` and is nominated as N2b in
-            // `docs/known-issues/jdk-only/`
-            // `E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md`.
+            // A declined site is not deoptimised — it is simply not
+            // intrinsified, and dispatches exactly as it does today. The
+            // runtime-screen-plus-deopt design the first draft of N2b proposed
+            // would have invalidated the enclosing compiled METHOD on every
+            // out-of-range needle and then barred it from compilation; see
+            // `prev_insn_int_const` and the page's N2b section.
+            ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
             ("indexOf", "(Ljava/lang/String;)I") => Some((JitIntrinsic::StringIndexOfStr, 1, b'I')),
             _ => None,
         };
@@ -20103,11 +20205,21 @@ fn try_compile_inner(
     // Done HERE, after `precise_exception_frames` has had its chance to
     // `inline_sites.clear()`, so a cleared plan interns nothing at all.
     for site in inline_sites.values_mut() {
-        intern_inline_invoke_targets(site, &mut owned_strings, &mut owned_invoke_infos);
+        intern_inline_invoke_targets(
+            site,
+            &mut owned_strings,
+            &mut owned_invoke_infos,
+            &mut direct_callee_entries,
+        );
     }
     for variants in inline_guard_variants.values_mut() {
         for (_, site) in variants.iter_mut() {
-            intern_inline_invoke_targets(site, &mut owned_strings, &mut owned_invoke_infos);
+            intern_inline_invoke_targets(
+                site,
+                &mut owned_strings,
+                &mut owned_invoke_infos,
+                &mut direct_callee_entries,
+            );
         }
     }
 

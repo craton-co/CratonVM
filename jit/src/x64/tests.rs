@@ -11930,14 +11930,15 @@ fn compile_with_inlines_heap(
 /// at this layer has no arena, so it leaks. One per call, deliberately: the
 /// address is what `resolved_invoke_infos` carries and two sites must not
 /// alias.
-fn leak_invoke_info(
+fn resolved_invoke(
+    callee_pc: usize,
     class_name: &'static str,
     method_name: &'static str,
     descriptor: &'static str,
     num_jit_args: usize,
     return_type: u8,
     invoke_kind: u8,
-) -> usize {
+) -> crate::ResolvedInlineInvoke {
     let info: &'static crate::JitInvokeInfo = Box::leak(Box::new(crate::JitInvokeInfo {
         class_name,
         method_name,
@@ -11947,7 +11948,18 @@ fn leak_invoke_info(
         invoke_kind,
         declaring_class_id: 0,
     }));
-    info as *const crate::JitInvokeInfo as usize // Cast: address parked in a Send-able plan
+    crate::ResolvedInlineInvoke {
+        callee_pc,
+        info_addr: info as *const crate::JitInvokeInfo as usize, // Cast: address parked in a Send-able plan
+        // 0 = "no direct bind", i.e. the dispatch-helper form. The direct form
+        // needs a real compiled entry to CALL, which this layer has no way to
+        // produce; `a_spliced_direct_call_is_registered_for_keep_alive` covers
+        // that half on the data instead.
+        direct_entry: 0,
+        direct_needs_context: false,
+        num_jit_args,
+        return_type,
+    }
 }
 
 fn take_last_dispatch() -> Option<(String, String, String, Vec<i64>)> {
@@ -11980,10 +11992,8 @@ fn a_call_inside_a_spliced_body_reaches_the_dispatch_helper() {
     //   6: ireturn
     let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
     let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
-    callee.resolved_invoke_infos = vec![(
-        3,
-        leak_invoke_info("pkg/Target", "target", "(II)I", 2, b'I', 3),
-    )];
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Target", "target", "(II)I", 2, b'I', 3)];
 
     // caller: `static int f(int a) { return leaf(a); }`
     //   0: iload_0
@@ -12069,10 +12079,8 @@ fn an_invokeinterface_inside_a_splice_is_five_bytes_wide() {
     //   8: ireturn
     let callee_body: [u8; 9] = [0x1a, 0x10, 0x0a, 0xb9, 0x00, 0x03, 0x02, 0x00, 0xac];
     let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
-    callee.resolved_invoke_infos = vec![(
-        3,
-        leak_invoke_info("pkg/Iface", "m", "(II)I", 2, b'I', 2),
-    )];
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Iface", "m", "(II)I", 2, b'I', 2)];
 
     let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
     let mut sites = HashMap::new();
@@ -12112,11 +12120,13 @@ fn a_nested_splice_replaces_the_call_entirely() {
     // ADDITIVE by design: the pc carries both a nested body and a dispatch
     // target, so a nested bail falls back to the call instead of failing the
     // outer splice. The next test relies on exactly this.
-    callee.resolved_invoke_infos = vec![(
-        3,
-        leak_invoke_info("pkg/Inner", "inner", "(II)I", 2, b'I', 3),
-    )];
-    callee.nested_sites = vec![(3, inner)];
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: 0,
+        site: inner,
+    }];
 
     let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
     let mut sites = HashMap::new();
@@ -12157,11 +12167,13 @@ fn a_nested_splice_that_bails_falls_back_to_the_call() {
 
     let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
     let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
-    callee.resolved_invoke_infos = vec![(
-        3,
-        leak_invoke_info("pkg/Inner", "inner", "(II)I", 2, b'I', 3),
-    )];
-    callee.nested_sites = vec![(3, inner)];
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: 0,
+        site: inner,
+    }];
 
     let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
     let mut sites = HashMap::new();
@@ -12177,6 +12189,128 @@ fn a_nested_splice_that_bails_falls_back_to_the_call() {
     let (_, _, _, args) =
         take_last_dispatch().expect("the fallback dispatch must have run");
     assert_eq!(args, vec![5, 10], "with the same arguments the nested body would have had");
+}
+
+/// DEVIRTUALISATION INSIDE A SPLICE. Both edges of the receiver guard, from one
+/// compiled body.
+///
+/// The hot edge is a spliced body that returns 42; the cold edge is the
+/// ordinary call, which this harness answers with the argument sum. So the
+/// SAME machine code returns 42 for a receiver whose class id matches the
+/// guard and takes the dispatch for one that does not — which is the only way
+/// to show that the guard is a guard and not a constant.
+///
+/// What each assertion would catch:
+///   * hit returning something other than 42 — the guard fell through to the
+///     call, or the spliced body was never emitted;
+///   * a recorded dispatch on the hit path — the JMP over the miss edge is
+///     missing, so both arms run;
+///   * miss NOT recording a dispatch — the guard is never false, i.e. the
+///     class-id compare is against the wrong operand or the wrong offset;
+///   * the miss dispatch seeing arguments other than `[receiver, 10]` — the
+///     miss arm did not pop what the hit arm popped, which is the operand-stack
+///     disagreement the emitter restores its symbolic state to prevent.
+#[test]
+fn a_guarded_nested_splice_takes_the_body_on_a_hit_and_the_call_on_a_miss() {
+    const GUARD_CLASS_ID: u32 = 0x4242;
+
+    // The devirtualised target: `int m(int) { return 42; }` — a constant, so
+    // the returned value alone says which arm ran.
+    let inner = make_inline_site(&[0x10, 0x2a, 0xac], 2, 2, false, b'I');
+
+    // The spliced body: `static int leaf(Object o) { return o.m(10); }`
+    //   0: aload_0
+    //   1: bipush 10
+    //   3: invokevirtual #3
+    //   6: ireturn
+    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
+    // A guarded pc KEEPS its dispatch entry: the miss edge has to go
+    // somewhere, and a virtual site has no direct bind to send it to.
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: GUARD_CLASS_ID,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x2a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a guarded nested splice must compile");
+
+    // Two receivers, one compiled body. Class id lives in the first four bytes
+    // of the object header, which is what `CMP [rax+0], imm32` reads.
+    let mut hit = Box::new([0u64; 8]);
+    let mut miss = Box::new([0u64; 8]);
+    hit[0] = GUARD_CLASS_ID as u64;
+    miss[0] = (GUARD_CLASS_ID + 1) as u64;
+    let hit_addr = hit.as_mut_ptr() as i64; // Cast: receiver address
+    let miss_addr = miss.as_mut_ptr() as i64; // Cast: receiver address
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // receiver is a live 64-byte buffer shaped like an object header, and the
+    // only helper reachable is `stub_invoke_dispatch`, which reads the argument
+    // buffer and nothing else.
+    let got_hit = unsafe { compiled.call_with_heap(0, &[hit_addr]) };
+    assert_eq!(got_hit, 42, "a guard hit must run the spliced body");
+    assert!(
+        take_last_dispatch().is_none(),
+        "and must not also fall into the miss edge",
+    );
+
+    // SAFETY: as above.
+    let got_miss = unsafe { compiled.call_with_heap(0, &[miss_addr]) };
+    let (_, _, _, args) =
+        take_last_dispatch().expect("a guard miss must take the ordinary call");
+    assert_eq!(
+        args,
+        vec![miss_addr, 10],
+        "the miss arm must pop exactly the operands the hit arm popped",
+    );
+    assert_eq!(
+        got_miss,
+        miss_addr.wrapping_add(10),
+        "and its result must be the call's, not the body's",
+    );
+}
+
+/// A null receiver fails the guard rather than dereferencing it.
+///
+/// `CMP DWORD [RAX+0], guard` on a null receiver is a segfault, so the null
+/// test has to come FIRST and branch to the same miss edge. Nothing else in
+/// this construct would catch that: a null receiver is exactly the case a
+/// profile never records, and the ordinary call reproduces the NPE correctly.
+#[test]
+fn a_null_receiver_takes_the_guarded_splices_miss_edge() {
+    const GUARD_CLASS_ID: u32 = 0x4242;
+    let inner = make_inline_site(&[0x10, 0x2a, 0xac], 2, 2, false, b'I');
+    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: GUARD_CLASS_ID,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x2a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a guarded nested splice must compile");
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode; a null receiver must not
+    // be dereferenced by the guard, which is the property under test.
+    let got = unsafe { compiled.call_with_heap(0, &[0]) };
+    let (_, _, _, args) = take_last_dispatch()
+        .expect("a null receiver must reach the ordinary call, not the body");
+    assert_eq!(args, vec![0, 10]);
+    assert_eq!(got, 10);
 }
 
 /// The interning pass fills `resolved_invoke_infos` from `invoke_targets`, for
@@ -12200,6 +12334,7 @@ fn interning_reaches_nested_bodies_too() {
             return_type: b'I',
             invoke_kind: 3,
             declaring_class_id: 7,
+            direct_entry: None,
         },
     )];
     let mut outer = make_inline_site(&[0x1a, 0xac], 1, 1, true, b'I');
@@ -12213,32 +12348,65 @@ fn interning_reaches_nested_bodies_too() {
             return_type: b'I',
             invoke_kind: 3,
             declaring_class_id: 9,
+            direct_entry: Some((0xfeed_0000, true)),
         },
     )];
-    outer.nested_sites = vec![(0, inner)];
+    outer.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 0,
+        guard_class_id: 0,
+        site: inner,
+    }];
     // Stale pointers from a hypothetical earlier compile must be REPLACED, not
     // appended to: an `InlineSite` can be cloned out of a cached plan.
-    outer.resolved_invoke_infos = vec![(999, 0xdead_beef)];
+    outer.resolved_invoke_infos = vec![crate::ResolvedInlineInvoke {
+        callee_pc: 999,
+        info_addr: 0xdead_beef,
+        ..Default::default()
+    }];
 
     let mut strings: Vec<Box<str>> = Vec::new();
     let mut infos: Vec<Box<crate::JitInvokeInfo>> = Vec::new();
-    crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos);
+    let mut direct_entries: Vec<usize> = Vec::new();
+    crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos, &mut direct_entries);
 
     assert_eq!(outer.resolved_invoke_infos.len(), 1);
-    assert_eq!(outer.resolved_invoke_infos[0].0, 0);
-    let deep = &outer.nested_sites[0].1;
+    assert_eq!(outer.resolved_invoke_infos[0].callee_pc, 0);
+    let deep = &outer.nested_sites[0].site;
     assert_eq!(
         deep.resolved_invoke_infos.len(),
         1,
         "a nested body's own calls must be interned too",
     );
     // SAFETY: the pointee is `infos[1]`, alive for the rest of this test.
-    let deep_info = unsafe { &*(deep.resolved_invoke_infos[0].1 as *const crate::JitInvokeInfo) };
+    let deep_info =
+        unsafe { &*(deep.resolved_invoke_infos[0].info_addr as *const crate::JitInvokeInfo) };
     assert_eq!(deep_info.class_name, "pkg/Deep");
     assert_eq!(deep_info.declaring_class_id, 7);
     // Six boxed strs (two triples), two infos.
     assert_eq!(strings.len(), 6);
     assert_eq!(infos.len(), 2);
+
+    // THE KEEP-ALIVE. A baked direct-call address that never reaches
+    // `_direct_callee_entries` is a use-after-free with no symptom until the
+    // callee tiers up: nothing pins the callee artifact
+    // (`prepare_for_publication`) and the invalidation reverse closure has no
+    // way to find this caller. The outer target carries one bind, the nested
+    // one carries none, so exactly one address must come out — and it must be
+    // the one that was bound, not a placeholder.
+    assert_eq!(
+        direct_entries,
+        vec![0xfeed_0000],
+        "every baked direct-call entry must be registered for keep-alive",
+    );
+    assert_eq!(
+        outer.resolved_invoke_infos[0].direct_entry, 0xfeed_0000,
+        "and the emitter must be handed the same address that was registered",
+    );
+    assert!(outer.resolved_invoke_infos[0].direct_needs_context);
+    assert_eq!(
+        deep.resolved_invoke_infos[0].direct_entry, 0,
+        "a target with no bind stays on the dispatch form",
+    );
 }
 
 #[test]
