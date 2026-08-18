@@ -187,6 +187,13 @@ Two changes were written, built, measured interleaved, and reverted
    nothing, A/B'd in ONE binary through its own kill switch: 4,994 vs 6,113 ms,
    then 7,903 vs 7,892 ms. Noise either way.
 
+3. **Turn on the existing `rootsnap-cache`.** The Spring suite sets
+   `CRATONVM_JIT=rootsnap-cache` and the isolated probe did not, so the obvious
+   suspicion was that the probe simply ran without a cache the real workload
+   has. Interleaved, same binary: off 5,007 / 4,972 / 5,014 ms, on
+   4,911 / 5,009 / 5,001 ms. **Inert.** (It also means the Spring suite was
+   already getting whatever this buys, which is nothing here.)
+
 **The arithmetic that should have come first.**
 `native_stack_has_jit_frame` is ~17.9% of this workload, so deleting it
 *entirely* buys **1.2x against a 38x gap**. No amount of memoizing that symbol
@@ -207,10 +214,36 @@ frame stop paying a per-call conservative root deposit at all — the same
 `bobyqa-numeric-kernel-is-80x-slower-than-hotspot` both reach. This page is a
 third witness, not a separate problem.
 
-A cheaper mitigation exists and is untested: `StackWalker.walk` does not need
-the frames' object roots at all, only their metadata. If the deposit could be
-skipped for walks specifically — rather than made cheaper for everyone — that is
-a bounded change with a much better ratio than memoizing the band scan.
+One structural detail worth carrying: `capture_full_trace` has a cheap path and
+an expensive one, and the JIT arm takes the expensive one.
+
+```rust
+let jit = active_compiled_frames();
+if jit.is_empty() {                       // <- the --nojit path
+    return frames.iter().map(|f| entry_from_frame(class_store, f)).collect();
+}
+interleave_compiled_frames(class_store, frames, &jit)   // <- the JIT path
+```
+
+`active_compiled_frames` returns `Vec<(u32, String, u32)>` and does
+`cm.method_label.clone()` — a heap allocation per compiled frame per capture,
+then a second conversion into the `Arc<str>` a `StackTraceEntry` actually holds.
+That is a real inefficiency and it is a plausible-looking lead. **It was not
+pursued, on the ceiling argument this page now exists to make**: neither
+`active_compiled_frames` nor any string/allocation symbol appears in the
+profile's top ten, so it is a low-single-digit item against 38x. Anyone picking
+it up should price it from a profile first.
+
+The honest summary for planning: **there is no contained fix on this page.**
+Three were tried and measured inert, and the remaining candidates are all
+1-5% items. The gap is that a native call made from a JIT frame pays a per-call
+conservative root deposit whose cost scales with stack depth, and HotSpot pays
+nothing equivalent because it has precise oop maps. That is architectural work
+on native->heap interaction, it is the same conclusion
+`bigdecimal-arithmetic-is-50-60x-slower-than-hotspot` and
+`bobyqa-numeric-kernel-is-80x-slower-than-hotspot` reach from unrelated
+workloads, and it should be scoped as its own task rather than as a fix to any
+one of the three pages that witness it.
 
 ## NAMED, 2026-08-18: `quartzTriggerJobWithUnknownJobKey`, the WebMvc variant only
 
