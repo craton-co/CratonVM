@@ -8659,6 +8659,372 @@ pub(super) fn execute_jit_call_decoded(
     Ok(Some(CachedCallResult::Handled))
 }
 
+/// A ONE-SHOT sibling of [`execute_jit_call_decoded`] — enter an already
+/// compiled method, run it to completion, and hand its return value back as a
+/// `Value` instead of pushing it onto a caller's operand stack.
+///
+/// # Why this exists rather than another caller of `execute_jit_call_decoded`
+///
+/// `execute_jit_call_decoded` is written for ONE shape of caller: the
+/// interpreter's own per-instruction dispatch loop. Its contract is
+/// loop-integrated in two ways that a plain Rust subroutine cannot honour:
+///
+///  * the normal return value is PUSHED onto `thread.frames[frame_idx].stack`,
+///    where the loop expects to find it; and
+///  * on an exception routed into the callee's own handler, or on a
+///    precise-resume deopt, it PUSHES an interpreter frame and returns
+///    `CachedCallResult::FramePushed`, meaning "I have set up a frame; the
+///    stepping loop will run it as part of normal control flow".
+///
+/// A dispatch helper such as `try_invoke_cached_lambda_impl` is not that loop.
+/// It must return a complete `Value` synchronously, and it has no way to run a
+/// frame somebody else pushed. Handing it `FramePushed` and reading the caller
+/// frame's stack anyway leaves an ORPHANED frame behind, whose later return
+/// corrupts the frame/stack accounting of a thread that has long since moved
+/// on — observed as a `usize::MAX` operand-stack index underflow inside a
+/// LATER, interpreted execution of the very same lambda body, thousands of
+/// calls after the deopt that actually caused it. See
+/// known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md
+/// section 5.3 for that crash and 5.4(b) for this function being the
+/// prescribed fix.
+///
+/// So this function keeps `execute_jit_call_decoded`'s run/signal/deopt logic
+/// verbatim — same guards, same one-shot signal drain, same routing sinks —
+/// and differs in exactly the two places above:
+///
+///  * a normal return is CONVERTED to a `Value` and returned, never pushed;
+///  * a sink that materialises a frame has that frame RUN TO COMPLETION here
+///    (`run_pushed_frame_to_completion`), so the handler / resumed body
+///    finishes as part of this call and its result — value or exception —
+///    becomes this call's result. Nothing is left on `thread.frames`.
+///
+/// The caller's frames are therefore never read and never written. That is why
+/// this needs no trusted `frame_idx` and is safe from every dispatch context,
+/// including the ones that hold no interpreter frame at all.
+///
+/// Returns:
+///   * `Ok(Some(value))` — ran to completion; `value` is `None` for a `void`
+///     descriptor and `Some(v)` otherwise.
+///   * `Ok(None)` — DECLINED, side-effect-free: the ABI could not carry the
+///     args, or a deopt landed with no resumable frame. Nothing was executed
+///     that the caller must not repeat, so the caller falls back to the
+///     interpreted path with the same `args`.
+///   * `Err(_)` — a Java exception escaped the callee (or an internal error).
+///     Propagates synchronously, exactly like the interpreted path's own `?`.
+pub(super) fn execute_jit_call_oneshot(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    compiled: &crate::jit::CompiledMethod,
+    cached: &Arc<CachedBytecodeMethod>,
+    args_slice: &[Value],
+) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
+    let needs_heap = compiled.needs_heap();
+    // Widening: parameter count conversion
+    let np = cached.num_params as usize + usize::from(!cached.is_static);
+    let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
+    // Too many args for the register-only JIT ABI, or a mismatch between the
+    // decoded args and the declared count → interpreter fallback (Ok(None)).
+    if np > max_java_params || args_slice.len() != np {
+        return Ok(None);
+    }
+    // `is_synchronized` needs the monitor enter/exit this path does not do.
+    // Every producer of a lambda-impl `CachedBytecodeMethod` already refuses
+    // one, so this is a guard against a future producer, not a live arm.
+    if cached.is_synchronized {
+        return Ok(None);
+    }
+    // Decode each Java arg to its raw JIT-ABI bit pattern, exactly as
+    // `execute_jit_call_decoded` does (receiver = arg 0 for an instance impl).
+    let mut jit_args = [0i64; JIT_ABI_MAX_JAVA_ARGS];
+    for (i, v) in args_slice.iter().enumerate().take(np) {
+        jit_args[i] = match v {
+            Value::Int(x) => *x as i64, // Cast: JIT ABI -- i64 register convention
+            Value::Long(x) => *x,
+            Value::Float(x) => x.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+            Value::Double(x) => x.to_bits() as i64, // Cast: JIT ABI -- double bits to i64
+            Value::Object(Some(obj)) => obj.as_ptr() as i64, // Cast: JIT ABI -- pointer to i64
+            Value::Object(None) => 0,
+            _ => 0,
+        };
+    }
+    let args_jit = &jit_args[..np];
+    let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
+    let return_type = crate::jit::return_type(&cached.method_descriptor);
+    // `run_pushed_frame_to_completion` needs the depth the thread had BEFORE
+    // any sink below materialised a frame.
+    let frames_depth_on_entry = thread.frames.len();
+
+    // Run the compiled body. Mirrors `execute_jit_call_decoded`'s run+exception
+    // logic (including its one-shot signal drain).
+    let (result, sig) = if !compiled.has_dispatch {
+        // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
+        let fast_result: Result<i64, cratonvm_jit::CompileError> = {
+            let _jit_root_guard =
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+                    compiled,
+                    Some(thread.frames.len()),
+                );
+            unsafe {
+                if needs_heap {
+                    compiled.try_call_with_context(vm_ptr, args_jit)
+                } else {
+                    compiled.try_call(args_jit)
+                }
+            }
+        };
+        let sig = crate::jit::helpers::take_all_jit_signals(thread);
+        match fast_result {
+            Ok(v) => (v, sig),
+            Err(jit_err) => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("JIT call failed: {jit_err}"),
+                }));
+            }
+        }
+    } else {
+        let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
+        let jit_result = {
+            let _jit_root_guard =
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+                    compiled,
+                    Some(thread.frames.len()),
+                );
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: see the fast-path SAFETY note above.
+                unsafe {
+                    if needs_heap {
+                        compiled.try_call_with_context(vm_ptr, args_jit)
+                    } else {
+                        compiled.try_call(args_jit)
+                    }
+                }
+            }))
+        };
+        crate::jit::helpers::restore_jit_thread(saved_jit_thread);
+        let mut sig = crate::jit::helpers::take_all_jit_signals(thread);
+        if let Some(exc) = sig.exception.take() {
+            let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
+            return oneshot_route_exception(
+                shared,
+                thread,
+                cached,
+                throw_pc,
+                exc,
+                args_slice,
+                frames_depth_on_entry,
+            );
+        }
+        match jit_result {
+            Ok(Ok(v)) => (v, sig),
+            Ok(Err(jit_err)) => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("JIT call failed: {jit_err}"),
+                }));
+            }
+            Err(panic_payload) => {
+                return Err(jit_panic_to_exception(shared, thread, panic_payload));
+            }
+        }
+    };
+
+    let deopt_signaled = sig.deopt;
+
+    // Drain pending NPE / AIOOBE / divide-by-zero set by void-return store
+    // helpers, routing each through the JIT'd method's own exception table
+    // (same three sinks, same order, as `execute_jit_call_decoded`).
+    if sig.npe {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::NullPointerException { message: None },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                return oneshot_route_exception(
+                    shared,
+                    thread,
+                    cached,
+                    JitThrowPc::Unknown,
+                    exc,
+                    args_slice,
+                    frames_depth_on_entry,
+                );
+            }
+            other => return Err(other),
+        }
+    }
+    if let Some((index, length)) = sig.aioobe {
+        let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
+        match crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/ArrayIndexOutOfBoundsException",
+            Some(&msg),
+        ) {
+            Ok(exc) => {
+                return oneshot_route_exception(
+                    shared,
+                    thread,
+                    cached,
+                    JitThrowPc::Unknown,
+                    exc,
+                    args_slice,
+                    frames_depth_on_entry,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if sig.arithmetic {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::ArithmeticException {
+                message: "/ by zero".to_string(),
+            },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                return oneshot_route_exception(
+                    shared,
+                    thread,
+                    cached,
+                    JitThrowPc::Unknown,
+                    exc,
+                    args_slice,
+                    frames_depth_on_entry,
+                );
+            }
+            other => return Err(other),
+        }
+    }
+
+    // Deopt. The stashed reconstructed frame is the only way this call can
+    // still produce the right answer: an `Ok(None)` decline re-runs the whole
+    // body from entry in the interpreter, which double-executes every side
+    // effect the compiled body already committed before it trapped. So prefer
+    // resuming — and, unlike the loop-integrated sink, RUN the resumed frame
+    // here instead of leaving it for a stepping loop that does not exist.
+    //
+    // This is the arm that produced section 5.3's crash in the earlier
+    // `execute_jit_call_decoded`-reusing attempt: a lambda body whose `throw`
+    // sits on a cold branch compiles that branch to an uncommon trap, so the
+    // FIRST throwing call deopts, `resume_from_ir_deopt` pushed a frame, and
+    // the helper returned as if the value had been produced normally.
+    if result == i64::MIN {
+        if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            dbg_deopt_sink("lambda-oneshot", &rframe, "");
+            if ir_deopt_resume_enabled()
+                && resume_from_ir_deopt(shared, thread, cached, &rframe).is_some()
+            {
+                return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry)
+                    .map(Some);
+            }
+            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+                if real_frame_deopt_resume_and_despeculate(
+                    shared, thread, compiled, cached, &rframe,
+                )
+                .is_some()
+                {
+                    return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry)
+                        .map(Some);
+                }
+            } else if !rframe.method_key.is_empty()
+                && !deopt_frame_matches_method(
+                    &rframe,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                )
+            {
+                // The stash belongs to a nested callee, not to `cached`:
+                // de-speculate its real owner so it stops re-trapping.
+                despeculate_stashed_frame_method(shared, &rframe);
+            } else {
+                let despec_reason = compiled
+                    .deopt_points
+                    .iter()
+                    .find(|dp| dp.bci == rframe.bci)
+                    .map(|dp| dp.reason)
+                    .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
+                let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                    shared,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                    despec_reason,
+                    rframe.bci,
+                );
+            }
+            return Ok(None);
+        }
+    }
+    if result == i64::MIN && deopt_signaled {
+        return Ok(None);
+    }
+
+    // Normal return — convert, never push.
+    Ok(Some(match return_type {
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(result as i32)), // Cast: JIT ABI -- i64 register convention
+        b'J' => Some(Value::Long(result)),
+        b'F' => Some(Value::Float(f32::from_bits(result as u32))), // Cast: JIT ABI -- i64 register convention
+        b'D' => Some(Value::Double(f64::from_bits(result as u64))), // Cast: JIT ABI -- i64 register convention
+        b'[' | b'L' => Some(Value::Object(if result == 0 {
+            None
+        } else {
+            // SAFETY: non-zero JIT return encodes a heap pointer to a valid object header.
+            Some(unsafe { crate::types::ObjectRef::from_raw(result as *mut u8) }) // Cast: JIT ABI -- i64 register convention
+        })),
+        _ => None, // void
+    }))
+}
+
+/// The one-shot arm of `route_jit_signal_exception`: route an exception raised
+/// inside a compiled body through that body's OWN exception table, and — when
+/// a handler matched and a frame was materialised for it — run that frame to
+/// completion here so the handler's result is this call's result.
+///
+/// `route_jit_exception_through_method` returns `FramePushed` after pushing the
+/// handler frame; for the interpreter's stepping loop that IS the answer, but a
+/// one-shot subroutine must finish the frame itself. `Err(ExceptionThrown)` (no
+/// matching handler) needs nothing: it already propagates synchronously, which
+/// is exactly what the interpreted lambda path does.
+///
+/// The `caller_frame_idx` argument is passed as the current top-of-stack index
+/// purely to satisfy the signature — `route_jit_exception_through_method` does
+/// not read it (`let _ = caller_frame_idx`), because a routed handler frame is
+/// built from the CALLEE's own incoming args, never from the caller's stack.
+/// The `debug_assert` below pins the only property this path depends on: that
+/// the sink pushed exactly one frame, the one we are about to run.
+fn oneshot_route_exception(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: JitThrowPc,
+    exc: ObjectRef,
+    fallback_locals: &[Value],
+    frames_depth_on_entry: usize,
+) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    let idx_for_signature = thread.frames.len().saturating_sub(1);
+    match route_jit_signal_exception(
+        shared,
+        thread,
+        idx_for_signature,
+        cached,
+        throw_pc,
+        exc,
+        fallback_locals,
+    )? {
+        CachedCallResult::FramePushed => {
+            debug_assert_eq!(thread.frames.len(), frames_depth_on_entry + 1);
+            run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry).map(Some)
+        }
+        // `Handled` / `CacheMiss` are unreachable from
+        // `route_jit_exception_through_method`, which only ever returns
+        // `FramePushed` or `Err`. Decline rather than invent a return value.
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod elidable_ctor_policy_tests {
     use super::elidable_ctor_native_would_run;

@@ -11007,6 +11007,35 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // Lambda proxies are synthetic and therefore cannot participate in the
     // class-store MIC. Give the erased primitive adapter its own receiver-guarded
     // direct path before allocating decoded Values for the generic fallback.
+    //
+    // The lambda call site's own cached invoke target goes FIRST and takes any
+    // arity — this is the SECOND door into lambda dispatch from compiled code
+    // (`jit_invoke_virtual_mic` is the other), and a fast path wired into only
+    // one of them is a fast path that a workload can miss entirely for reasons
+    // that have nothing to do with its shape.
+    if matches!(info.invoke_kind, 0 | 2) && !args_slice.is_empty() {
+        if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
+            let proxy_class_id = vm.mem.heap.class_id_of_validated(proxy);
+            if vm
+                .classes
+                .lambda_proxies
+                .read()
+                .contains_key(&proxy_class_id)
+            {
+                if let Some(result) = try_lambda_site_direct_call(
+                    vm,
+                    thread,
+                    proxy,
+                    proxy_class_id,
+                    info,
+                    args_slice,
+                    vm_ptr,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
     if matches!(info.invoke_kind, 0 | 2) && args_slice.len() == 2 {
         if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
             let proxy_class_id = vm.mem.heap.class_id_of_validated(proxy);
@@ -13474,6 +13503,165 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     }
 }
 
+/// A compiled caller's SAM call, served straight from the lambda call site's
+/// own cached target.
+///
+/// This is the arm that gives a lambda call site what every named-class call
+/// site already had. `jit_invoke_virtual_mic` is entered ONCE per named-class
+/// site — after that the inline cascade in `jit/src/x64.rs` calls the callee
+/// from machine code and never returns to Rust (`mic_calls=1` over 2 200 000
+/// dispatches on `probes/SamHotLoopProbe.java`). A lambda receiver is caught by
+/// the arm above this one, which returns before the inline cache is ever
+/// reached, so its site can never be cached: `mic_calls=2197000`,
+/// `hit_entry=0`, ~819 cycles a call.
+///
+/// The inline cache cannot hold a lambda — its cascade passes the caller's own
+/// argument registers straight through, and a SAM call's registers are not the
+/// impl's (the proxy receiver has to go, the captures have to arrive). So the
+/// site is cached one level out, in Rust, and this arm spends it: read the
+/// captures out of the proxy's fields, put the SAM's own already-decoded raw
+/// arguments after them, and call the compiled impl through the same
+/// reentrant primitive the monomorphic hit path uses.
+///
+/// Deliberately identical to the MIC hit path in everything that is not the
+/// argument shuffle — same `try_call_compiled_entry_reentrant_owned`, same
+/// `i64::MIN` deopt-sentinel handling, same "an escaping exception is left in
+/// `jit_pending_exception` for the compiled caller's own post-invoke check".
+/// A `None` from it means the callee's arity exceeds the register tables, and
+/// the caller falls through to the generic path with nothing done.
+///
+/// See known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md.
+unsafe fn try_lambda_site_direct_call(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    receiver_ref: ObjectRef,
+    receiver_class_id: ClassId,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    vm_ptr: i64,
+) -> Option<i64> {
+    const MAX_DIRECT_ARGS: usize = 8;
+    let site = crate::runtime::interpreter::lambda_jit_site(
+        vm,
+        receiver_class_id,
+        info.method_name,
+        info.descriptor,
+    )?;
+    crate::runtime::interpreter::lambda_site_bump_calls();
+    // `args_slice[0]` is the proxy receiver; the SAM's own arguments follow it.
+    if !site.direct_enabled() {
+        // This site's body deoptimized once already; the interpreter's one-shot
+        // path owns it from here (see `LambdaJitSite::direct_disabled`).
+        crate::runtime::interpreter::lambda_site_bump_deopted();
+        return None;
+    }
+    if args_slice.is_empty() || site.total_args() > MAX_DIRECT_ARGS {
+        crate::runtime::interpreter::lambda_site_bump_arity();
+        return None;
+    }
+    let sam_args = &args_slice[1..];
+    if site.num_captures() + sam_args.len() != site.total_args() {
+        crate::runtime::interpreter::lambda_site_bump_arity();
+        return None;
+    }
+    let Some(code) = crate::runtime::interpreter::lambda_jit_site_code(vm, &site) else {
+        // Still interpreted. The warmup counter on the generic path is what
+        // gets it compiled; until then this arm has nothing to call.
+        crate::runtime::interpreter::lambda_site_bump_no_code();
+        return None;
+    };
+
+    if !crate::runtime::interpreter::lambda_jit_site_checkcasts_pass(vm, &site, sam_args) {
+        // A cast that would throw. Decline, and let the generic path raise the
+        // `ClassCastException` it has always raised, message and all.
+        crate::runtime::interpreter::lambda_site_bump_refused();
+        return None;
+    }
+    let mut jit_args = [0i64; MAX_DIRECT_ARGS];
+    crate::runtime::interpreter::lambda_jit_site_capture_args(
+        vm,
+        &site,
+        receiver_ref,
+        &mut jit_args,
+    );
+    jit_args[site.num_captures()..site.total_args()].copy_from_slice(sam_args);
+    let entry = code.entry_ptr() as usize;
+    let needs_ctx = code.needs_context();
+    let Some(rc) = try_call_compiled_entry_reentrant_owned(
+        &code,
+        entry,
+        needs_ctx,
+        vm_ptr,
+        &jit_args[..site.total_args()],
+    ) else {
+        // The callee's arity is past what the register tables cover. Nothing
+        // ran; the generic path takes it.
+        crate::runtime::interpreter::lambda_site_bump_arity();
+        return None;
+    };
+    if rc == i64::MIN {
+        // `i64::MIN` is either a deopt sentinel or a `long` that really is
+        // `Long.MIN_VALUE`, and only the out-of-band signals can tell them
+        // apart. Draining them is safe here BECAUSE this arm called exactly one
+        // method: whatever they say happened, happened inside this site's impl.
+        //
+        // The shared sentinel handler cannot be used for this: it identifies
+        // the trapped callee by the CALL SITE's name (`try_resume_trapped_callee`
+        // compares `info.method_name`), which for a SAM call is `apply` — never
+        // the `lambda$...` body that actually trapped. It would refuse the
+        // resume, re-stash the deopt flag, and the compiled CALLER would then
+        // read the callee's deopt as its own, de-speculating an innocent method
+        // and leaving a reconstructed frame nobody can claim.
+        let sig = take_all_jit_signals(thread);
+        let stashed = cratonvm_jit::deopt::take_last_deopt();
+        if sig.exception.is_some() || (stashed.is_none() && !sig.deopt) {
+            // Not a deopt: an escaping exception (which propagates through
+            // `jit_pending_exception`, exactly as it does out of the MIC hit
+            // path) or a genuine `Long.MIN_VALUE`. Put every signal back the
+            // way it was found and hand the value on.
+            restash_jit_signals(thread, sig);
+            crate::runtime::interpreter::lambda_site_bump_direct();
+            return Some(rc);
+        }
+        // A deopt. The body did not complete, so its signals describe an
+        // attempt that is being abandoned and are dropped with it, and the
+        // reconstructed frame is consumed here rather than left for a later
+        // call to mis-claim. This site leaves the direct arm for good; the
+        // generic path below re-runs the body, and every later call goes
+        // through the interpreter's one-shot, which can resume such a frame
+        // precisely because it knows the impl's own identity.
+        drop(stashed);
+        site.disable_direct();
+        crate::runtime::interpreter::lambda_site_bump_deopted();
+        return None;
+    }
+    crate::runtime::interpreter::lambda_site_bump_direct();
+    Some(rc)
+}
+
+/// Put a drained [`DrainedJitSignals`] back exactly as it was found.
+///
+/// The direct lambda arm has to DRAIN the signals to tell a deopt sentinel from
+/// a `long` equal to `Long.MIN_VALUE`, and when the answer is "not a deopt" the
+/// signals still belong to the compiled caller's own post-invoke checks.
+fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
+    if let Some(exc) = sig.exception {
+        set_jit_pending_exception(thread, exc);
+    }
+    if let Some((index, length)) = sig.aioobe {
+        stash_jit_pending_aioobe(index, length);
+    }
+    if sig.npe {
+        stash_jit_pending_npe();
+    }
+    if sig.arithmetic {
+        stash_jit_pending_arithmetic();
+    }
+    if sig.deopt {
+        set_jit_deopt_pending();
+    }
+}
+
 // SAFETY: the JIT invoke metadata and the validated proxy receiver originate
 // from the active interpreted frame; callers fall back to interpretation on a miss.
 unsafe fn try_fast_lambda_int_to_double_apply(
@@ -14012,6 +14200,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         .contains_key(&receiver_class_id)
     {
         mic_prof::bump(&mic_prof::MIC_LAMBDA);
+        // The lambda call site's own cached invoke target. Tried FIRST: it is
+        // the only arm here that does not re-derive the whole dispatch, and
+        // when it declines it has done nothing.
+        if let Some(result) = try_lambda_site_direct_call(
+            vm,
+            thread,
+            receiver_ref,
+            receiver_class_id,
+            info,
+            args_slice,
+            vm_ptr,
+        ) {
+            return result;
+        }
         match try_fast_lambda_int_to_double_apply(
             vm,
             thread,

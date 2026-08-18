@@ -805,6 +805,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_LAMBDA` | DBG | `CRATONVM_DBG=lambda` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LAMBDA_DISPATCH` | DBG | `CRATONVM_DBG=lambda-dispatch` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LAMBDA_GENERIC` | DBG | `CRATONVM_DBG=lambda-generic` | opt-in | off | diag | snapshot | types |
+| `CRATONVM_DBG_LAMBDA_JIT` | DBG | `CRATONVM_DBG=lambda-jit` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LAMBDA_PROF` | DBG | `CRATONVM_DBG=lambda-prof` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LAYOUT` | DBG | `CRATONVM_DBG=layout` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_LAYOUT_ALIAS` | DBG | `CRATONVM_DBG=layout-alias` | opt-in | off | diag | snapshot | native-api |
@@ -1231,6 +1232,8 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_VERIFY_ARENA_ORDER` | JIT | `CRATONVM_JIT=verify-arena-order` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_VERIFY_FRAME_STATES` | JIT | `CRATONVM_JIT=verify-frame-states` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_VERIFY_IR` | JIT | `CRATONVM_JIT=verify-ir` | default-on | on | behaviour | snapshot | jit, types |
+| `CRATONVM_JIT_LAMBDA_SITE` | JIT | `CRATONVM_JIT=lambda-site` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_LAMBDA_TIERUP` | JIT | `CRATONVM_JIT=lambda-tierup` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` | JIT | `CRATONVM_JIT=verify-memory-chain` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_VERIFY_SCHEDULE` | JIT | `CRATONVM_JIT=verify-schedule` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_VERIFY_TYPES` | JIT | `CRATONVM_JIT=verify-types` | opt-in | off | behaviour | snapshot | jit, types |
