@@ -5,8 +5,8 @@
 | **Status** | RETIRED — both defects it named are fixed, shipped and pinned; the residual it leaves has a mechanism, a count and a named fix class |
 | **Opened** | 2026-08-17 as `known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`; §5 added the same day |
 | **Closed by** | `fix/lambda-sam-jit-tierup-20260817` |
-| **Measured effect** | **2.3x–2.8x** on every lambda row of `probes/SamHotLoopProbe.java` — `ifaceLambda` 434 → 192 ns/op, method reference 435 → 195, capturing 552 → 200 — same binary, ABBA, six runs an arm, non-overlapping ranges, with the named-class control unmoved |
-| **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (both halves), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller half only) |
+| **Measured effect** | **37x** on `probes/SamHotLoopProbe.java`'s lambda row — 379 → 10.2 ns/op, against a named-class control of 10.3 — same binary, three-arm ABBA, six runs an arm. The gap this page was filed about is GONE, not narrowed |
+| **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (everything), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller Rust arm), `CRATONVM_JIT_LAMBDA_ADAPTER=0` (the inline-cache thunk) |
 
 The page asked for one thing in its §4 — *"giving lambda call sites a cached
 invoke target of their own"* — and reported in §5 that the attempt at the other
@@ -127,18 +127,78 @@ call ever happened":
 1 100 000 of 1 100 000 — every dispatch after warmup took the direct arm, none
 refused, none declined.
 
-## 4. The residual, and why it is not this page's
+## 4. The rest of the gap, closed: a lambda receiver the inline cache CAN hold
 
-The gap to the named-class row is 15x, down from 34x. Closing it needs what
-section 1 says it needs: a lambda receiver that the inline cache can hold. That
-means a per-proxy ADAPTER — a small piece of generated code that shifts the
-captured values into the argument registers and jumps to the impl — so the MIC
-can cache it like any other callee and the cascade can call it from machine code
-without re-entering Rust at all. That is JIT codegen work, deliberately not
-attempted here, and it is the honest successor to this page.
+The two halves above left the lambda row at 15x the named-class row, and section
+1 already said what the remainder was: a receiver the inline cache cannot hold.
+That was written as this page's successor work. It is done, and it turned out
+to be smaller than it looked.
 
-**What is emphatically NOT the successor is the workload this page was filed
-from.** `residual-seven-after-the-afc-fix-20260817.md` put ~55% of
+**The obstacle was an argument shuffle, not anything about caching.** The
+cascade passes what the CALL SITE has — `(proxy, samArg1, …)` — and a
+non-capturing lambda's impl wants `(samArg1, …)`, because javac compiles the
+body to a private static synthetic that never sees the proxy. One register too
+many, in the wrong place.
+
+So `jit/src/lambda_adapter.rs` emits a per-(proxy class, impl) THUNK that
+performs exactly that shuffle and tail-jumps to the impl, and the MIC/PIC slot
+holds the thunk:
+
+```text
+    mov  ARG0, ARG1        ; drop the receiver, slide the SAM args down
+    mov  r11, <impl entry>
+    jmp  r11
+```
+
+Thirteen bytes for a one-argument SAM. Three properties keep it that small:
+
+* **It tail-JUMPS**, so the impl sees byte-identical stack state to a direct
+  call, the caller's return address is what it returns to, Windows shadow space
+  and alignment are inherited, and a conservative stack walk never sees the
+  thunk at all — after the jump the machine state is indistinguishable from the
+  cascade having called the impl directly, which is why GC safety needs no new
+  argument.
+* **The slide is type-blind.** This VM's JIT ABI gives every Java argument one
+  INTEGER register — `execute_jit_call` passes a `double` as `to_bits()` and the
+  cascade loads each operand-stack slot into `ARG_REGS[i]` without consulting
+  its type — so no type information is needed. `LambdaAdapterProbe`'s
+  double-argument arm is the check that this stays true.
+* **It touches no memory**, which is what confines it to NON-CAPTURING lambdas:
+  reading a captured field from a hand-emitted thunk would mean reproducing the
+  compact/legacy body-layout branch and every per-type width the `getfield` arms
+  handle. A capturing lambda keeps the Rust arm at ~200 ns.
+
+Invalidation is the same commitment a JIT'd caller's baked direct call makes,
+and is registered the same way: the thunk's `_direct_callee_entries` names the
+impl, and the cache's existing invalidation closure — which already promotes any
+method whose baked callee is being removed — now reaches thunks through
+`adapters_reaching`, so a slot holding one is cleared when its impl is evicted.
+
+### What it measures
+
+Three arms, one binary, ABBA, six runs an arm:
+
+| row | thunk | Rust arm only | feature off |
+|---|---:|---:|---:|
+| named class (control) | 10.3 | 10.2 | 9.7 |
+| `ifaceLambda` | **10.2** | 175.1 | 379.4 |
+| method reference | **10.0** | 177.1 | 372.4 |
+
+**A lambda SAM call now costs what an interface call on an ordinary class costs**
+— 10.2 against 10.3 — where this page opened at 40x. And the census that named
+the defect in section 1 now reads, for a lambda:
+
+```
+[MIC_PROF] mic_calls=1 hit_entry=0 miss=0 lambda=1 …
+```
+
+`mic_calls=1` across 1 100 000 dispatches, which is exactly the named-class line
+from section 1's table. The helper is entered once per call site, the thunk is
+installed, and nothing returns to Rust again.
+
+### What is emphatically NOT closed by any of this
+
+The workload this page was filed from. `residual-seven-after-the-afc-fix-20260817.md` put ~55% of
 `MultithreadedInsertionTest`'s samples in `CompletableFuture` composition, and
 this page inherited the inference that composition is slow because SAM dispatch
 is slow. It is not. `probes/LambdaCompositionProbe.java` — `thenApply` /
@@ -163,6 +223,15 @@ So the hibernate-reactive composition residual needs its own investigation,
 starting from a profile of `LambdaCompositionProbe` (flat: the interpreter loop
 at 7%, the native registry's three lookup functions at ~5.8%, allocation ~3%),
 and it should not be filed as a lambda problem.
+
+### The one that is still open
+
+A CAPTURING lambda keeps the Rust arm and its ~200 ns, because the thunk may not
+read a captured field without reproducing the compact/legacy body-layout branch.
+That is the honest successor to this page, and unlike the residual it replaces
+it is a bounded piece of work with a known shape: emit the `GC_FLAG_COMPACT`
+test and the per-type loads the `getfield` arms already emit, or give the proxy
+a real body the ordinary compiler can handle.
 
 ## 5. What pins it
 
@@ -212,6 +281,20 @@ What the suite proves now, on the default configuration:
   `lambda_jit_tierup_tests` red; breaking the one-shot's return conversion turns
   `lambda_jit_oneshot_tests` red. Both were re-run after every change to the
   fixture, and both are red for the current one.
+* The thunk has its own pair. `lambda_jit_adapter_engagement_tests` asserts both
+  that a site got one and that Rust LEFT the path (`site_direct < 10 000` of
+  800 000 dispatches), and `probes/LambdaAdapterProbe.java` diffs twelve
+  argument shapes — two and three arguments, `long`, mixed widths, references,
+  `void`, zero arguments, a `double`, a polymorphic site, a throwing body —
+  against HotSpot's own output. Reversing the slide and removing it entirely
+  both turn the engagement test red with wrong sums, which is what says the
+  shuffle is under test rather than merely present.
+
+That last check also caught the probe testing nothing: with all twelve loops in
+`main` the census read `site_calls=0 site_adapters=0` across 3 400 000
+dispatches — the frame was too large to compile, so no inline-cache call site
+existed and the whole file agreed with HotSpot about the interpreter. One tight
+loop per method, taking the SAM as a parameter, is what made it real.
 
 One honest limitation: under the default asynchronous compiler, a given run
 turns exactly the arm that won the compile race red — one test of the twelve,
