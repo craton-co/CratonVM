@@ -396,44 +396,140 @@ If the fast path is later restored under N2b's screen, (a)/(b)/(c) invert and
 the differential test comes back **with its needle list derived from the
 measured JDK rows in §2.1**, not from `& 0xFFFF`.
 
-### N2b — OPTIONAL, restores the throughput. `jit/src/x64/bytecode_walk.rs:8029-8082`
+### N2b — **DONE 2026-08-18**, but NOT as written. The sketch was a cliff.
 
-To bring the inline scan back without a copy of the rule: keep the masking
-scan but reach it only through a runtime screen, and route everything else to
-the existing deopt stub, which already reaches the correct native.
+The sketch below is kept because its *shape* is right and its premise is
+wrong, and the wrong premise is the interesting part.
 
-After the receiver / `value` null-check bails and before the needle is
-computed, screen the argument. The existing `bail` vector and deopt stub are
-the whole mechanism; no new one is needed:
+**The premise.** "Outside it, the deopt hands the call to `code_point_needle`."
 
-```text
-    load ch into a scratch register
-    CMP  ch, 0          ; JL   -> bail   (ch < 0: isValidCodePoint fails)
-    CMP  ch, 0xFFFF     ; JG   -> bail   (supplementary, or > 0x10FFFF)
-```
+**What actually happens.** The bail does not hand over the CALL. It hands over
+the METHOD, and then the method is thrown away. Traced through:
 
-Inside `0 <= ch <= 0xFFFF` the existing `AND r9d, 0xFFFF` is the identity and
-the single-code-unit scan is the complete JDK answer — including for a lone
-surrogate. Outside it, the deopt hands the call to `code_point_needle`. That
-is a range screen, not a fifth implementation of the rule.
+1. the site snapshots with `DeoptReason::ReceiverTypeChanged`
+   (`snapshot_pre_intrinsic_call`, `bytecode_walk.rs`);
+2. both arms of the reason-6 stub (`deopt_stubs.rs`) load `i64::MIN` into RAX
+   and run **`emit_epilogue`** — the compiled frame is abandoned, not bypassed;
+3. `jit_uncommon_trap` -> `DeoptimizationController::deoptimize`, whose own doc
+   says step 2 is *"Invalidate the compiled method in the JIT cache"*;
+4. `recommend_action` gives `ReceiverTypeChanged` an override that skips the
+   count-based ladder entirely: **`RecompileAndReinterpret` on EVERY
+   occurrence**, then `MakeNotCompilable` once
+   `count >= max_deopts_per_method`.
 
-The comment at `:8029-8038` must change either way; it currently states the
-masking is "bit-identical to `native_string_index_of`, which likewise masks",
-and both halves are now false.
+So a method containing `s.indexOf(cp)` for a negative, supplementary or
+out-of-range `cp` would be **recompiled on every call** until the cap, and then
+**permanently barred from compilation**. Today that same program pays one
+ordinary native call and keeps its compiled method. The nomination would make
+the case it exists to handle dramatically worse, and would do it silently.
 
-### N2c — `native-builtins/src/lib.rs:8174-8216`: delete two dead, wrong copies
+`recommend_action`'s own `OsrExit` arm records this lesson empirically, in this
+exact file: routing a structurally-recurring exit through the generic policy
+got a hot method "evicted and eagerly recompiled dozens of times over a single
+benchmark for zero benefit", and always-reinterpreting measured 347s/round
+against a 63-72s/round fully-interpreted baseline. A runtime screen whose miss
+path is a deopt is only safe when the miss is genuinely once-per-program. A
+needle outside the BMP is a property of the DATA, not a mis-speculation, so it
+can recur every call.
 
-The `indexOf(I)I` and `lastIndexOf(I)I` closures (§2.3). They answer in no
-mode, and they are wrong in a way the other copies were not — `chars()` is a
-code-point index, so `MIXED.indexOf('z')` would be `4` where HotSpot says `5`.
-Delete both `registry.register(...)` calls and leave a note in the style of
-the `codePointAt` retirement, naming why: the rule lives in
-`lang_string.rs`'s `code_point_needle`, `register_synthetic_overrides`
-overwrites these anyway, and in real-JDK mode a `Bridge`-kind `java/lang/String`
-native is dropped at registration so the real JDK bytecode answers.
+**What landed.** The compile-time screen below, and nothing else — the emitted
+scan is byte-for-byte the one that was already there. `indexOf(I)` is
+recognised again in `try_resolve_string_intrinsic`, and
+`x64/bytecode_walk.rs::prev_insn_int_const` decides per site whether the needle
+is a provable constant in `0..=0xFFFF`. The screen is a `direct.filter` placed
+BEFORE the intrinsic ladder — the same shape as the `ArraycopyPrimitive`
+despec filter already there — so a declined site never enters the intrinsic
+branch at all and takes the dispatch it takes today. **No deopt path was
+added.** The only bails in the emitted scan remain the null receiver and the
+null `value` array, both genuinely once-per-program.
 
-Low urgency (no live wrong answer), high value (`[1 of 10 callsites]` — these
-read as working implementations, which is how five copies survived).
+`iconst_m1..iconst_5`, `bipush` and `sipush` are decoded; `ldc`/`ldc_w` are
+not, because they need the constant pool and this layer does not have it. A
+`char` literal above `0x7FFF` therefore falls back to dispatch — a missed
+optimisation, never a wrong answer.
+
+Tests, in `jit/tests/intrinsic_string_search.rs`:
+
+* `index_of_char_screen_admits_only_constant_bmp_needles` — the gate. Pins that
+  `sipush 0xFFFF` reads as `-1` and is REJECTED rather than masked back to
+  `0xFFFF`, which is the measured `"\u{FFFF}q".indexOf(-1)` row from §2.1; and
+  that a non-constant needle (`iload_1`) screens out. That last row is the one
+  that stops the cliff.
+* `string_index_of_const_char_differential` — the emitted code, against a
+  UTF-16 oracle. Legitimate here precisely because the screen holds: on
+  `0..=0xFFFF` a single-code-unit scan IS `code_point_needle`'s answer. The
+  pre-N2b differential derived its expected value from `(ch & 0xFFFF)` and so
+  asserted a wrong answer; this one cannot, because the range where the two
+  disagree is unreachable.
+* `string_index_of_const_char_counts_utf16_units_not_code_points` — the row
+  that catches the N2c family's bug from the JIT side:
+  `"x\u{10437}yz".indexOf('z')` must be **4**, counting the surrogate pair as
+  the two code units it is.
+
+`cargo test --release -p cratonvm-jit`: green in full.
+
+**The old harness could not have caught any of this**, which is worth its own
+line: it passed the needle in `iload_1`, so under the screen it is a declined
+site. A test that reaches an intrinsic only through a shape the intrinsic no
+longer accepts is not a test of the intrinsic.
+
+**The re-scoped design: screen at COMPILE time, not run time.** The needle at
+the overwhelming majority of real call sites is a literal — `indexOf(',')`,
+`indexOf('/')` — which reaches the invoke as `iconst_*` / `bipush` / `sipush` /
+`ldc` immediately before it. So:
+
+* recognise `("indexOf", "(I)I")` again in `try_resolve_string_intrinsic`;
+* in the emitter, take the inline scan **only** when the `ch` operand is a
+  compile-time constant in `0..=0xFFFF`, and bake it as an immediate — at which
+  point the `AND r9d, 0xFFFF` disappears too, because the constant IS the
+  needle and `code_point_needle` agrees with it by construction on that range;
+* otherwise leave `intrinsic_handled = false` and let ordinary dispatch run.
+  **No deopt path is added at all**, so there is no cliff to reason about: a
+  non-constant or non-BMP needle costs exactly what it costs today.
+
+The blocker is that this backend has no operand constant tracking —
+`StackSlot` (`jit/src/x64.rs:243`) is `Frame`/`CalleeSaved`/`Scratch`/`Xmm`
+with no `Const` variant — so the constant has to be carried from the push arm
+to the invoke arm. That is the whole cost of N2b now, and it is a real change
+rather than the ten-line screen the sketch implies.
+
+The original sketch, for the shape only:
+
+### N2c — **DONE 2026-08-18.** `native-builtins/src/lib.rs`
+
+Two corrections to this nomination as written, both found while landing it.
+
+**It was FOUR copies, not two.** `indexOf(I)I` and `lastIndexOf(I)I` were the
+two §2.3 named; the same `chars().enumerate()` body also appears for
+`indexOf(II)I` and `lastIndexOf(II)I` in the same registrar. Copies six
+through **nine**. The sweep that found the first five was a grep for the
+scanning shape; these four sit under a different one (`registry.register(...,
+|ctx, args| { ... })` closures rather than named `native_*` fns), which is why
+a name-based census missed them and a body-based one would not have.
+
+**"Delete both" was not safe, so they were REWIRED instead.** Deletion needs
+them unreachable in every configuration. They are provably dead in two of
+three:
+
+* real-JDK mode drops them — they register under `NativeKind::Bridge` (the
+  `set_category(Bridge)` at the head of `register_essential_natives_with_shims`,
+  restored at the regex block and never changed again before these lines), and
+  `registry.rs`'s `java/lang/String` adjudication drops every `Bridge` on that
+  class except `intern`;
+* a `synthetic-jdk` build has `register_synthetic_overrides` re-register all
+  four later, and last-write-wins.
+
+The third configuration has neither mechanism: feature OFF (so
+`vm/src/native/builtins.rs`'s no-op shim stands in for
+`register_synthetic_overrides`) and `drop_real_layout_synthetic` false. Rather
+than prove that combination unreachable — which is a claim about launcher
+modes, not about this file — all four now point at the canonical natives
+(`native_string_index_of`, `native_string_last_index_of_char`,
+`native_string_index_of_from`, `native_string_last_index_of_from`). Correct in
+all three, and no deadness argument has to hold for it to stay correct.
+
+`cargo test --release -p cratonvm-native-builtins --lib`: 4119 passed, 0
+failed.
 
 ### N3-obs — `jit/src/x64/bytecode_walk.rs:7745-7771`: is the `equals` receiver null-checked?
 

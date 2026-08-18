@@ -2,9 +2,11 @@
 
 **Status: STILL OPEN, but it no longer reproduces.** Seventh pass 2026-08-18 —
 **0 SIGSEGV in 52 reps** (26 instrumented, 26 not) in an arm proven to collect
-AND compact; under the documented 3/23 that is a sub-0.1% outcome. Not retired:
-the writer was never identified, both new instruments are armed and SILENT rather
-than vindicated, and no bisect has been run. Sixth pass 2026-08-18 — two more bulk writers closed
+AND compact; under the documented 3/23 that is a sub-0.1% outcome. Not retired: the
+writer was never identified, both instruments are armed and SILENT rather than
+vindicated, and **the control is missing — nobody has shown this machine
+reproduces the crash at all**, so "does not reproduce here" is as far as it
+goes. Sixth pass 2026-08-18 — two more bulk writers closed
 by construction, and the evidence re-read: the corrupting value is a *heap
 pointer at offset 0*, which is equally consistent with an unregistered object
 based 16 bytes below the victim. Fifth pass 2026-08-18 — the fourth pass's prescribed
@@ -725,8 +727,31 @@ Three reasons, and the first is this page's own scar tissue:
   and from several sessions. Any of them may have closed it. Nobody has bisected
   it, and the honest record is "does not reproduce", not "was fixed by X".
 
-**What would retire it:** a bisect across the commits since 2026-08-15 that finds
-the one which stops it, or a longer run at higher rep count that reproduces it
+## The control this run is MISSING, and it is the one that matters
+
+The arm was proven non-vacuous — it collects and it compacts, checked above. **The
+environment was not.** Nobody has shown that *this machine* reproduces the crash
+at all, and the two are different claims: a non-vacuous arm says the code path
+runs, not that the failure is reachable here.
+
+The 3/23 was measured on a different day and possibly a different box. So the
+honest reading of 0/52 is **"does not reproduce here, now"**, and it becomes
+"the tree changed" only after this control:
+
+> Build `dev` as of 2026-08-15 — the tree the 3/23 was measured against — and run
+> the same 26 reps on the same machine.
+
+* **~3 crashes** → the box reproduces it, something since then fixed it, and a
+  bisect is worth its cost.
+* **0 crashes** → the difference is the environment, not the tree, and nothing
+  here says anything about whether the defect is gone.
+
+Cost of the bisect *after* a positive control: each step needs ~26 reps to
+separate a 0.13 rate from 0, so ~30 minutes per step plus a build, and log₂ of
+the commits since 2026-08-15.
+
+**What would retire it:** the control above coming back positive, then a bisect
+across the commits since 2026-08-15 that finds the one which stops it, or a longer run at higher rep count that reproduces it
 once with the instruments armed — at which point `below16=` answers the question
 that has been open since the second pass. The instruments are in the tree and
 cost a branch when off, so the next run is cheap.
