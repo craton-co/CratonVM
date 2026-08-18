@@ -15,11 +15,11 @@ handed the chain the VM captured:
   peer chain length       2-4                   1                 2-4
 ```
 
-Closing it took three defects, not one. Only the first was the one on this
-page; the other two were **invisible until it was fixed**, because a validator
-that is never handed a real chain is never asked a real question. They are
-recorded here rather than as separate pages because none of them can be
-understood apart from this one.
+Closing it took two defects, not one. The second was **invisible until the
+first was fixed**, because a validator that is never handed a real chain is
+never asked a real question. A third was diagnosed, fixed, measured to fix
+nothing, and reverted — §3 keeps it, because how it came to look like a cause
+is the most reusable thing on this page.
 
 The residue page it blocked,
 `tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816-FIXED-20260817.md`,
@@ -134,7 +134,7 @@ verifier that rejects everything**, which looks exactly like the bug being
 fixed. They are checked *as parameters*: the generator is on the curve, `n·G`
 is the identity and `(n−1)·G` is not.
 
-## 3. Found by the fix: a trust anchor was identified by exact DER
+## 3. Not a defect, and the more useful half of the story
 
 Two of the remaining sites — `www.cloudflare.com` and `adoptium.net` — said
 `no trust anchor found for chain` where HotSpot accepts. Both end their chain
@@ -143,17 +143,37 @@ cross-certificate whose bytes differ from the self-signed GTS Root R4 that JDK
 25's `cacerts` ships, and whose own issuer that `cacerts` no longer ships at
 all.
 
-`x509_manager::presented_cert_is_anchor` required
-`anchor.full_cert_der == presented_der`. The exact match failed, the issuer
-lookup then found no GlobalSign anchor, and the verdict was `NoTrustAnchor`.
+`x509_manager::presented_cert_is_anchor` requires
+`anchor.full_cert_der == presented_der`, where RFC 5280 §6.1.1 identifies a
+trust anchor by (name, public key). That is exactly the error printed, so it
+read as the cause. **It was not.** A relaxation to `(subject_der, spki_der)`
+was written, landed, and then measured:
 
-RFC 5280 §6.1.1 identifies a trust anchor by **(name, public key)** — a trust
-anchor is not a certificate; the certificate is one way to carry it, and its
-own signature is never checked. The match now falls back to
-`(subject_der, spki_der)`. That is not a widening: what the anchor contributes
-to the rest of validation is its SPKI, and the SPKI compared is byte-identical
-to the stored one, so every signature below is still verified against the key
-the application installed.
+```
+RealChainProbe, ECDSA fix in, anchor relaxation REVERTED:
+  handshake ok=20  validator accept=20  reject=0
+```
+
+It fixed nothing. `validate_chain` retries through `rebuild_path`, and
+`select_path` stops the moment the current certificate's ISSUER is a configured
+anchor — so the cross-signed tail is dropped and the anchor is found by issuer
+lookup instead. The presented-order `NoTrustAnchor` is simply the error
+`validate_chain` reports when the rebuild ALSO fails, and at the time the
+rebuild failed for an unrelated reason: the P-384 gap in §2. Both sites were
+closed by that, and the relaxation was reverted.
+
+Two things worth keeping from it:
+
+* **An error message is a symptom, not an attribution.** The one printed came
+  from the arm that ran first, not from the arm that decided. The retry was
+  right there in the same function.
+* **The test written for it was vacuous and said so under pressure.** It passed
+  identically with the relaxation reverted — because it had never exercised it.
+  It survives, renamed to what it actually proves
+  (`a_cross_signed_tail_is_dropped_and_the_real_anchor_still_found`) and
+  re-verified by breaking `rebuild_path` instead. Had the five break-runs not
+  been done, a change that moved nothing would have shipped inside a trust
+  decision, with a green test over it.
 
 ---
 
@@ -192,7 +212,7 @@ defect. May-well-be is now a measurement.
   corpus by construction. That is the generalisable part: **a fixture whose
   certificate is self-signed cannot exercise chain building at all, and no
   number of them adds up to one that can.**
-* `x509_manager::real_chain_shape_tests` — the cross-signed root and a P-384
+* `x509_manager::real_chain_shape_tests` — the cross-signed tail and a P-384
   chain, with real OpenSSL keys and real signatures.
 * `crypto_impl::named_curve_param_tests` / `named_curve_openssl_tests` — the
   curve table checked as a table, and the verifier round-tripped against
@@ -210,7 +230,8 @@ single tree, and confirming the intended test fails:
 CONTROL (unmodified)                    16 passed, 0 failed
 leaf-only capture again                 client_captures_the_whole_chain FAILED
 security level back to OpenSSL's 2      client_security_level…floor    FAILED
-anchor identity back to exact-DER       a_cross_signed_copy…root       FAILED
+anchor identity back to exact-DER       nothing failed — see §3
+`rebuild_path` returns None             a_cross_signed_tail_is_dropped FAILED
 one nibble of P-384's b                 the_generator_is_on_the_curve  FAILED
 assume P-256, ignore the SPKI OID       p384_sha384_round_trips        FAILED
 ```

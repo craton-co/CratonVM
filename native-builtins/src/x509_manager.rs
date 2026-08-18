@@ -1667,16 +1667,19 @@ mod real_chain_shape_tests {
     }
 
     /// A peer that ends its chain with a CROSS-SIGNED copy of a root that IS in
-    /// the trust store.
+    /// the trust store — `www.cloudflare.com` and `adoptium.net` both serve
+    /// `CN=GTS Root R4` as signed by `CN=GlobalSign Root CA`, whose bytes
+    /// differ from the self-signed GTS Root R4 in JDK 25's cacerts and whose
+    /// own issuer that cacerts no longer ships.
     ///
-    /// MEASURED as `NoTrustAnchor` on `www.cloudflare.com` and `adoptium.net`,
-    /// which both serve `CN=GTS Root R4` as signed by `CN=GlobalSign Root CA`
-    /// — a cross-certificate whose bytes differ from the self-signed GTS Root
-    /// R4 that JDK 25's cacerts ships, and whose own issuer that cacerts no
-    /// longer ships at all. HotSpot accepts both: an RFC 5280 trust anchor is
-    /// a (name, key) pair, not one encoding of one certificate.
+    /// What carries it is the PATH REBUILD, not the anchor comparison: the
+    /// cross-signed tail is dropped by `select_path` and the anchor is found
+    /// by issuer lookup. Named that way because the first version of this test
+    /// was written to guard a relaxation of `presented_cert_is_anchor` and
+    /// passed just as well with that relaxation reverted — it never touched
+    /// it. Breaking `rebuild_path` is what fails this.
     #[test]
-    fn a_cross_signed_copy_of_a_trusted_root_is_still_that_root() {
+    fn a_cross_signed_tail_is_dropped_and_the_real_anchor_still_found() {
         let root_key = p384_key();
         let other_root_key = p384_key();
         let leaf_key = p384_key();
@@ -1697,7 +1700,7 @@ mod real_chain_shape_tests {
         let chain = vec![leaf, root_cross_signed];
         assert!(
             validate_chain(&chain, &trust).is_ok(),
-            "a cross-signed copy of a trusted root must still be that anchor"
+            "the cross-signed tail must be dropped and the real anchor still found"
         );
     }
 
@@ -1780,32 +1783,34 @@ fn presented_cert_is_anchor(
     presented_der: &[u8],
     parsed: &ParsedCert,
 ) -> bool {
-    // Exact-encoding equality FIRST, because it is the common case and costs a
-    // memcmp.
-    if anchor.full_cert_der.as_deref() == Some(presented_der) {
-        return true;
+    // Exact-encoding equality, NOT the (name, key) pair RFC 5280 §6.1.1
+    // defines a trust anchor by. That relaxation was written, and then
+    // MEASURED to fix nothing, so it is not here.
+    //
+    // The shape it was aimed at is real: `www.cloudflare.com` and
+    // `adoptium.net` both end their chain with `CN=GTS Root R4` as signed by
+    // `CN=GlobalSign Root CA`, whose bytes differ from the self-signed GTS
+    // Root R4 in JDK 25's cacerts, and whose own issuer that cacerts no longer
+    // ships. Both were rejected with `NoTrustAnchor` — which is what this
+    // exact-match produces, and is why it looked like the cause.
+    //
+    // It was not. `validate_chain` retries through `rebuild_path`, and
+    // `select_path` stops the moment the current certificate's ISSUER is a
+    // configured anchor — so the cross-signed tail is dropped and the anchor
+    // is found by issuer lookup instead. The presented-order `NoTrustAnchor`
+    // is simply the error `validate_chain` reports when the REBUILD also
+    // fails, and at the time it failed for an unrelated reason: the P-384
+    // ECDSA gap. With that closed, both sites validate with this function
+    // untouched — 20 of 20 live public sites, measured with the relaxation
+    // reverted.
+    //
+    // Read an error message as a symptom, not as an attribution: the one
+    // printed here came from the arm that ran FIRST, not from the arm that
+    // decided.
+    match anchor.full_cert_der.as_deref() {
+        Some(anchor_der) => anchor_der == presented_der,
+        None => anchor.subject_der == parsed.subject_der && anchor.spki_der == parsed.spki_der,
     }
-    // Then the identity RFC 5280 §6.1.1 actually defines for a trust anchor:
-    // the (issuer NAME, public KEY) pair. A trust anchor is not a certificate
-    // — the certificate is only one way to carry it, and its own signature is
-    // never checked.
-    //
-    // Requiring the exact bytes refused a shape the public internet serves
-    // every day: a peer that sends a CROSS-SIGNED copy of a root that IS in
-    // the trust store. MEASURED — `www.cloudflare.com` and `adoptium.net`
-    // both end their chain with `CN=GTS Root R4` as signed by
-    // `CN=GlobalSign Root CA`, which JDK 25's cacerts no longer ships, while
-    // the self-signed `GTS Root R4` it DOES ship differs from it byte for
-    // byte. The exact-match failed, the fallback then looked up the
-    // GlobalSign issuer and found nothing, and the verdict was
-    // `NoTrustAnchor` on a chain HotSpot accepts.
-    //
-    // This is not a widening. What the anchor contributes to the rest of
-    // validation is its SPKI, and the SPKI compared here is byte-identical to
-    // the stored one — so every signature below is still verified against the
-    // key the application installed. A forged certificate carrying that same
-    // subject and key is useless without the matching private key.
-    anchor.subject_der == parsed.subject_der && anchor.spki_der == parsed.spki_der
 }
 
 /// Is this exact presented certificate one the application installed as a
