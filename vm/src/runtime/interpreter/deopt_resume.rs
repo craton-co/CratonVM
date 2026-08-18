@@ -970,6 +970,171 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
     Ok(())
 }
 
+/// The RBC.6b lift's exception exit: transfer a **reason-9**
+/// (`DeoptReason::PendingException`) frame published by an OSR'd body into the
+/// live interpreter frame and park it at `handler_pc`, with `exc` on the
+/// operand stack.
+///
+/// The sibling of [`transfer_osr_exit_into_live_frame_checked`], and it exists
+/// for the same reason that one does: once an OSR'd body has committed loop
+/// iterations, "resume interpretation where the frame was parked" is not a safe
+/// fallback but a silent re-execution of everything since OSR entry (RBC.7).
+/// Until 2026-08-17 that could not arise, because `compile_osr_artifact`
+/// refused every method with an exception table outright; now that it admits
+/// the ones whose protected-range throwing sites all publish a precise frame,
+/// this is the path those exceptions take.
+///
+/// Three things differ from the resume transfer, and each is deliberate:
+///
+///  * **The resume point is a handler, not a re-execute bci.** A reason-9
+///    point's [`cratonvm_jit::deopt::ResumeSemantics`] is `RETHROW`, so
+///    `OsrEntryPlan::resume_after_exit` correctly refuses it — its bci names a
+///    THROWING instruction, not somewhere the interpreter may be parked. The
+///    caller has already run that bci through this frame's own exception table
+///    (`find_exception_handler_any_pc`) and passes the handler it found.
+///
+///  * **The operand stack is not restored.** JVMS §2.10: entering a handler
+///    empties the operand stack and pushes the throwable. Whatever the snapshot
+///    recorded there is discarded by definition, so an unmappable STACK slot —
+///    fatal to the resume transfer, which has to rebuild the stack exactly —
+///    cannot make this transfer wrong. Locals are the whole payload.
+///
+///  * **The bci is checked against a `PendingException` point.** The resume
+///    transfer spends `resume_after_exit` on that check; here it is made
+///    directly. A frame whose bci this artifact recorded no reason-9 point for
+///    is a mis-routed stash, and routing a mis-routed stash into a handler
+///    would enter it with another site's locals.
+///
+/// Fail-closed exactly as the sibling is: every check that can refuse runs
+/// BEFORE the first write to the live frame, so a refusal can never half-write
+/// it. `Err` means the caller must NOT resume this frame — see the exception
+/// drain in `try_osr`, which propagates instead.
+pub(super) fn transfer_osr_exception_exit_into_live_frame(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    artifact: &cratonvm_jit::CompiledMethod,
+    handler_pc: usize,
+    exc: ObjectRef,
+) -> Result<(), String> {
+    use cratonvm_jit::deopt::FrameValue;
+
+    // ── Phase-A scope, same three as the sibling ──────────────────────────
+    if !rframe.caller_frames.is_empty() {
+        return Err("inlined caller chain".to_string());
+    }
+    if !rframe.monitors.is_empty() {
+        return Err("held monitors".to_string());
+    }
+    if rframe.locals.iter().any(|v| {
+        matches!(
+            v,
+            FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
+        )
+    }) {
+        return Err("virtual-object local".to_string());
+    }
+    // `MaterializationRequired` means an optimization DELETED a value that WAS
+    // live and left no rebuild recipe, so the live frame's stale pre-OSR word is
+    // genuinely wrong rather than merely unread. Named here, as its own refusal,
+    // for the reason the sibling names it: falling through to the generic
+    // "unmappable local" reports the wrong cause. Only LOCALS are inspected —
+    // the stack is discarded at handler entry (see the doc comment).
+    if let Some(what) = rframe
+        .locals
+        .iter()
+        .enumerate()
+        .find_map(|(i, v)| match v {
+            FrameValue::MaterializationRequired(ev) => {
+                Some(format!("materialization required (local {i}: {ev})"))
+            }
+            _ => None,
+        })
+    {
+        return Err(what);
+    }
+
+    // ── The stash really is a reason-9 point of THIS artifact ─────────────
+    //
+    // The caller has already checked the frame's baked `method_key` names this
+    // method. That is identity; this is provenance: an ordinary guard deopt
+    // (reason 0-8) reaching here would mean the bci names a re-execute point
+    // and the exception came from somewhere else entirely.
+    if !artifact.deopt_points.iter().any(|dp| {
+        dp.bci == rframe.bci && dp.reason == cratonvm_jit::deopt::DeoptReason::PendingException
+    }) {
+        return Err(format!(
+            "exit bci {} is not a PendingException point of this artifact",
+            rframe.bci
+        ));
+    }
+
+    // ── Oop plausibility, before a garbage address becomes a GC root ──────
+    //
+    // Default-off (`CRATONVM_DEOPT_VERIFY`). The structural sibling check is
+    // deliberately not run: it validates the operand stack against `max_stack`,
+    // and this transfer does not write the operand stack.
+    if cratonvm_jit::deopt_verify_enabled() {
+        if let Err(why) = verify_reconstructed_oops(rframe, shared) {
+            eprintln!(
+                "[DEOPT-VERIFY] OSR exception-exit bci={}: {why} — refusing the transfer",
+                rframe.bci
+            );
+            return Err(format!("deopt-verify: {why}"));
+        }
+    }
+
+    // ── The reconstructed slots must fit the live frame ───────────────────
+    if rframe.locals.len() > thread.frames[frame_idx].locals_len() {
+        return Err("local slot overflow".to_string());
+    }
+
+    // ── Map, then write ───────────────────────────────────────────────────
+    //
+    // `Unsupported` in a LOCAL leaves the live frame's current value alone, for
+    // exactly the argument the sibling makes: `classify_local_kinds` is a coarse
+    // whole-method scan that marks a slot ambiguous at EVERY bci if it is
+    // accessed as two kinds anywhere, and the already-verified bytecode
+    // guarantees such a slot is dead or re-stored before it is read.
+    let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
+    for (i, v) in rframe.locals.iter().enumerate() {
+        if matches!(v, FrameValue::Unsupported) {
+            locals.push(None);
+        } else {
+            match fv_to_value(v) {
+                Some(val) => locals.push(Some(val)),
+                None => return Err(format!("unmappable local ({i}: {v:?})")),
+            }
+        }
+    }
+
+    let frame = &mut thread.frames[frame_idx];
+    for (i, v) in locals.iter().enumerate() {
+        if let Some(val) = v {
+            frame.set_local_unchecked(i, *val);
+        }
+    }
+    // JVMS §2.10 handler entry: empty the operand stack, push the throwable.
+    frame.stack.clear();
+    frame.stack.push_unchecked(Value::Object(Some(exc)));
+    frame.pc = handler_pc;
+
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_exit(frame, handler_pc);
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        eprintln!(
+            "[cratonvm-deopt] OSR exception-exit TRANSFER: throw bci={} -> handler pc={} \
+             ({} locals)",
+            rframe.bci,
+            handler_pc,
+            locals.len(),
+        );
+    }
+    Ok(())
+}
+
 /// deopt-osr Step 9 — stamp a freshly compiled artifact with the method's
 /// current live compilation epoch (`SharedVm::method_epochs`) so the
 /// real-frame-deopt resume sink can distinguish a current compilation from one
