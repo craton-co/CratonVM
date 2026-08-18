@@ -294,8 +294,8 @@ the owning lane can settle it, not as a defect claim.
   no `indexOf(int)`, and every `.equals(` in it is String-vs-String.
 * **`--only=bounds`** — nothing from this lane. E18-1's one predicted flip
   stands on its own.
-* **`jit/tests/intrinsic_string_search.rs`** — **three tests go red** until
-  N2a lands: `string_search_compare_and_index_of_register_with_a_layout`
+* **`jit/tests/intrinsic_string_search.rs`** — three tests went red until
+  N2a landed (2026-08-18); they were red on `dev` in the interim: `string_search_compare_and_index_of_register_with_a_layout`
   (`:358`), `string_index_of_char_differential` (`:558`),
   `string_index_of_char_null_receiver_deopts` (`:595`). Two of the three
   assert a measurably wrong answer (§2.3).
@@ -315,10 +315,28 @@ The changes that alter an answer for a valid input are, exhaustively:
 
 ## 5. NOMINATIONS
 
-### N2a — REQUIRED for `jit/tests/` to pass. `jit/tests/intrinsic_string_search.rs`
+### N2a — **DONE 2026-08-18.** `jit/tests/intrinsic_string_search.rs`
 
-Three tests pin the retired intrinsic. Two of them also freeze the masking
-divergence (§2.3), so this is a correction, not just an accommodation.
+Landed as written: (a), (b) and (c) below, verbatim. `cargo test --release -p
+cratonvm-jit` is now green in full — 15 test binaries, 0 failures;
+`intrinsic_string_search` is 14/14.
+
+The three tests had been red on `dev` since the retirement commit
+(`9781e456e`), which changed `jit/src/lib.rs` and nothing else — this section
+was written, and then not applied. Worth noting for the next lane that writes
+a nomination it expects someone else to land: **the prediction in §4 was
+exactly right, down to the test names, and that did not make it happen.**
+
+One thing was added beyond (a)-(c): the dead codegen at
+`x64/bytecode_walk.rs` still carried the sentence this page exists to refute —
+*"Bit-identical to `native_string_index_of`, which likewise masks the
+argument"* — both halves false, in the file N2b will open. §2.3's own finding
+is that dead code reading as a working implementation is how four copies of
+this rule survived, so the comment now says it is dead, why the old claim was
+wrong, and what N2b would take.
+
+Three tests pinned the retired intrinsic. Two of them also froze the masking
+divergence (§2.3), so this was a correction, not just an accommodation.
 
 **(a)** At `:361-365`, drop the retired row from the loop. Replace exactly:
 
