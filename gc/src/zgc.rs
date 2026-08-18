@@ -3508,6 +3508,17 @@ impl ZgcRealHeap {
     ///
     /// A quarter of the cores, floor 1, cap 4. `CRATONVM_ZGC_CONC_WORKERS`
     /// overrides.
+    /// This heap's own `Arc`, typed as the mark context — `None` when the heap
+    /// was not built by [`Self::new_shared`], or when the kill switch is set.
+    /// See [`zgc_mark_ctx_direct`].
+    fn mark_context_arc(&self) -> Option<std::sync::Arc<dyn mark::ZMarkContext>> {
+        if !zgc_mark_ctx_direct() {
+            return None;
+        }
+        let arc = self.self_weak.get()?.upgrade()?;
+        Some(arc as std::sync::Arc<dyn mark::ZMarkContext>)
+    }
+
     fn conc_mark_workers(&self) -> usize {
         static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CACHED.get_or_init(|| {
@@ -4604,9 +4615,14 @@ impl ZgcRealHeap {
         use crate::zgc_concurrent::{
             ZgcConcurrentMarkController, ZgcConcurrentMarkParams, ZgcNoMutatorSafepoint,
         };
-        let bridge: std::sync::Arc<dyn mark::ZMarkContext> =
-            std::sync::Arc::new(ZHeapMarkBridge { heap: self });
-        let coordinator = std::sync::Arc::new(mark::ZMarkCoordinator::new(bridge, workers));
+        // ONE FEWER INDIRECT HOP PER CALL -- see `zgc_mark_ctx_direct`. Falls
+        // back to the wrapper for a heap with no self-`Arc` (a `with_capacity`
+        // test heap), which is also what the kill switch selects.
+        let ctx: std::sync::Arc<dyn mark::ZMarkContext> = match self.mark_context_arc() {
+            Some(direct) => direct,
+            None => std::sync::Arc::new(ZHeapMarkBridge { heap: self }),
+        };
+        let coordinator = std::sync::Arc::new(mark::ZMarkCoordinator::new(ctx, workers));
         coordinator.begin_cycle();
         coordinator.push_roots(roots);
 
@@ -9097,6 +9113,53 @@ fn zgc_gen_dead_runs() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_GEN_DEAD_RUNS") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            }
+            None => true,
+        }
+    })
+}
+
+/// `CRATONVM_ZGC_MARK_CTX_DIRECT` -- hand the mark coordinator the heap's own
+/// `Arc` instead of wrapping it in [`ZHeapMarkBridge`]. **Default on**; `0` /
+/// `off` / `false` / `no` restores the wrapper, so the A/B is a re-run.
+///
+/// # What it removes, and why it is the FIRST thing to try for C5
+///
+/// `ZMarkShared` holds `Arc<dyn ZMarkContext>`, so every `try_mark`,
+/// `visit_refs`, `is_in_heap` and `object_size` on the parallel mark path is an
+/// indirect call. With the bridge in the way each of those is **two** indirect
+/// hops — bridge, then heap — because `ZHeapMarkBridge`'s methods do nothing but
+/// forward. `ZgcRealHeap` implements `ZMarkContext` itself, so when the heap was
+/// built by `new_shared` (which every VM-owned heap is) its own `Arc` can be
+/// handed over directly and one whole hop per call disappears.
+///
+/// The 2026-08-17 profile is what points here: `try_mark` (7.14%) and
+/// `visit_refs` (2.26%) appear as their own frames on the one-worker arm and on
+/// no other, while the serial marker's equivalent work is inlined into
+/// `collect_garbage`. A symbol that exists on one arm and is inlined away on the
+/// other is a DISPATCH difference. Whether that is the whole of C5 is exactly
+/// what this switch is for — it is the cheap half of the monomorphisation
+/// hypothesis, and if it moves nothing the hypothesis is wrong and the striped
+/// queues and per-cycle pool construction get their turn.
+///
+/// # It also deletes an unsafe pointer
+///
+/// The bridge is a `*const ZgcRealHeap` with a hand-written `Send`/`Sync`, kept
+/// sound by a three-fact argument about the coordinator's `Drop`. The direct
+/// path has no raw pointer and needs no argument: the `Arc` keeps the heap alive
+/// by construction. The bridge stays as the fallback for a heap built by
+/// `with_capacity` (tests), which has no self-`Arc` to hand over.
+///
+/// Default-on is safe here because the whole path is already opt-in: the
+/// parallel marker runs only when `CRATONVM_ZGC_PARMARK` asks for workers, and
+/// its default is zero.
+fn zgc_mark_ctx_direct() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_MARK_CTX_DIRECT") {
             Some(raw) => {
                 let v = raw.to_string_lossy().trim().to_ascii_lowercase();
                 !matches!(v.as_str(), "0" | "off" | "false" | "no")
@@ -15797,6 +15860,69 @@ pub(crate) mod tests {
             over < heap.heap_capacity(),
             "and it must be a plausible figure rather than an underflowed \
              subtraction: {over}"
+        );
+    }
+
+    /// **A shared heap hands the marker its own `Arc`; a borrowed one still
+    /// gets the wrapper, and both mark the same set.**
+    ///
+    /// The property that matters is the second clause. `mark_context_arc`
+    /// returning `None` is not a failure — a `with_capacity` heap has no
+    /// self-`Arc` to give — but it must then fall back rather than skip the
+    /// mark, and a fallback that silently marked nothing would present as a
+    /// use-after-free at the next sweep, not as a failed assertion.
+    ///
+    /// Asserted on `mark_context_arc` directly and not on a timing: the whole
+    /// point of the change is that the two paths are behaviourally identical and
+    /// differ only in how many indirect calls they cost, so no observable of the
+    /// mark can distinguish them. See `zgc_mark_ctx_direct`.
+    #[test]
+    fn a_shared_heap_marks_through_its_own_arc_and_a_borrowed_one_through_the_bridge() {
+        let shared = ZgcRealHeap::new_shared(4 * 1024 * 1024);
+        assert!(
+            shared.mark_context_arc().is_some(),
+            "a heap built by new_shared must be able to hand over its own Arc -- \
+             that is what removes one indirect hop per marked object"
+        );
+
+        let borrowed = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        assert!(
+            borrowed.mark_context_arc().is_none(),
+            "a heap with no self-Arc must fall back to the wrapper, not panic"
+        );
+
+        // THE BEHAVIOURAL IDENTITY, which is the property a change that should
+        // be invisible actually needs: the same graph marked through each path
+        // must give the same answer. Absolute counts are deliberately not
+        // asserted -- what `objects_marked` includes is the engine's business,
+        // and pinning it here would make this test fail for reasons that have
+        // nothing to do with which context object the coordinator was handed.
+        let chain = |heap: &ZgcRealHeap| -> u64 {
+            let mut prev: Option<ObjectRef> = None;
+            let mut root = None;
+            for i in 0..16u32 {
+                let o = heap.alloc_object(ClassId::new(i + 1), 1);
+                if let Some(p) = prev {
+                    heap.set_field(p, 0, Value::Object(Some(o)));
+                } else {
+                    root = Some(o);
+                }
+                prev = Some(o);
+            }
+            let r = root.expect("root");
+            heap.mark_parallel_stw(&[r.as_ptr() as u64], 1)
+                .expect("the driver must certify a complete mark set")
+                .objects_marked
+        };
+        let via_bridge = chain(&borrowed);
+        let via_arc = chain(&shared);
+        assert!(
+            via_bridge > 1,
+            "the fixture must actually TRACE, or this compares two constants:              {via_bridge}"
+        );
+        assert_eq!(
+            via_arc, via_bridge,
+            "the two context paths must mark identically -- the change is which              object the coordinator holds, not what it traces"
         );
     }
 

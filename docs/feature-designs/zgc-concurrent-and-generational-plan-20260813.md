@@ -1460,6 +1460,64 @@ becomes `impl FnMut(u64)`. It is mechanical but it is not small — `mark.rs` is
 ~4,600 lines and the type parameter reaches the coordinator, the controller and
 `zgc_concurrent`.
 
+### The cheap experiment was run, and the dispatch hypothesis did NOT survive it — 2026-08-18
+
+`CRATONVM_ZGC_MARK_CTX_DIRECT` hands the coordinator the heap's own `Arc`
+instead of `ZHeapMarkBridge`, removing **one of the two indirect hops** on every
+`try_mark`, `visit_refs`, `is_in_heap` and `object_size`. One binary, three arms,
+interleaved, order reversed on alternate reps, 6 runs per arm, `BigLive 3000 200`:
+
+| arm | mean `mark_us` | vs serial |
+|---|---:|---:|
+| serial (`PARMARK=0`) | 47,052 | — |
+| parallel + bridge | 61,976 | +31.7% |
+| parallel + **direct** | 63,453 | +34.9% |
+
+**Halving the indirect calls on the two hottest methods moved nothing** — the two
+parallel arms are 2.4% apart with within-arm spreads of ±7%, i.e.
+indistinguishable. Dispatch is not where the C5 cost lives.
+
+The change is kept anyway, and **not for performance**: it deletes a
+`*const ZgcRealHeap` with a hand-written `Send`/`Sync` and a three-fact soundness
+argument, replacing it with an `Arc` that keeps the heap alive by construction.
+The wrapper remains as the fallback for a `with_capacity` heap, which has no
+self-`Arc`. Perf-neutral, safety-positive; the flag stays so the next person can
+re-run the A/B rather than re-derive it.
+
+### What the cost IS: per object, not per cycle
+
+Same binary, same interleaving, three live-set sizes — because a per-cycle setup
+cost (pool construction, thread spawn/join, the terminator handshake) does not
+scale with the live set and a per-object cost does:
+
+| `BigLive` | serial `mark_us` | parallel `mark_us` | delta |
+|---|---:|---:|---:|
+| 400×60 | ~3,759 | ~5,294 | ~1,535 |
+| 1200×120 | ~13,453 | ~15,439 | ~1,985 |
+| 3000×200 | ~45,650 | ~58,302 | ~12,652 |
+
+Fitting `delta = fixed + k × serial` across the smallest and largest points gives
+**k ≈ 0.27 and fixed ≈ 0.5 ms**. So the per-cycle setup — the thing that spawns a
+pool and a driver thread per collection — is worth about half a millisecond, and
+**~27% is proportional to the objects marked**. At any realistic live set the
+proportional term is the whole story, which also rules out "it spawns threads per
+cycle" as the explanation.
+
+Indicative rather than settled: three reps on a loaded developer machine, and the
+within-size spread is larger than the between-size differences. What it is good
+enough to do is *order the suspects*.
+
+**So the remaining suspect is the per-object WORK, not the per-object CALL.** The
+serial marker pushes children onto a plain local `Vec` and sets the mark bit
+directly; the parallel one publishes into striped queues behind mutexes and marks
+through a CAS that must be atomic because other workers may race for the same
+object. That is real work the serial path does not do, it is per object, and it
+does not go away with one worker — which is exactly the property §3c's numbers
+demand. The plan already listed the striped queues as a suspect; this promotes
+them from "a candidate" to "the leading one".
+
+**The original cheap-experiment note follows.**
+
 **Cheap experiment first, before that refactor.** `ZHeapMarkBridge` adds a
 *second* indirect hop for no reason other than to hold a `&ZgcRealHeap` —
 `mark_with_controller_stw` builds `Arc::new(ZHeapMarkBridge { heap: self })` and
