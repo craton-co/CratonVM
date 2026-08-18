@@ -107,7 +107,7 @@ client retry loop.
 `@WebEndpointTest` is a parameterized template — 15 methods x 3 web-server
 variants = the 45 tests — so `DiscoverySelectors.selectMethod(fqcn, name)`
 cannot address one (it returns `tests=0 containersFailed=1` for every method).
-`sb-runner/SbRunnerTrace.java` (added with this) registers a
+`probes/SbRunnerTrace.java` (added with this; the fixture copy lives in `sb-runner/`) registers a
 `TestExecutionListener` that prints every test as it starts and finishes,
 flushed per line so a kill still leaves the last `@@START` behind:
 
