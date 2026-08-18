@@ -334,20 +334,51 @@ is always paid in full and it is the one p99 reports. A latency-sensitive
 workload may still want the median improvement — turn it on and measure your
 own pause distribution.
 
+*Where a young pause actually goes (2026-08-18).* Every `--verbose:gc`
+`[GC-STAT]` line now carries a per-phase breakdown — `roots_us`, `rset_us`,
+`closure_us`, `fixup_us`, `free_us` — with `fixup_us` printed beside the
+`fixup_regions` / `fixup_bytes` it covered, because a slow walk and a large
+old generation are different problems. On `probes/G1ChurnPauseProbe 96 900`
+at `-Xmx2048m` a 330 ms young pause split: roots 0.7 %, remembered-set
+walks 0.03 %, Cheney closure 38 %, whole-heap fix-up 10-18 %, freeing the
+collection set **42 %**. That last figure is why the phase breakdown exists
+at all: the reclaim phase was the most expensive part of a G1 pause and
+nobody had ever looked.
+
+It was `G1Region::reset` scrubbing every reclaimed region — 1.61 GB at
+11.9 GB/s, which is memset bandwidth and nothing else — and it was
+redundant with the allocator's own zeroing (`bump_alloc` zeroes exactly the
+range it hands out; `alloc_humongous_locked` zeroes its whole span; no
+inter-object padding can exist because every object size is a multiple of
+8; no walker reads a `Free` region). Removed: single-binary A/B, medians of
+3 interleaved reps, identical program checksums in both arms — p50 403 ->
+265 ms, p99 412 -> 267 ms, total pause 1213 -> 790 ms, the free phase
+itself 152 -> 18 ms. `CRATONVM_G1_SCRUB_FREE=1` restores it, and that is
+the first thing to try if a G1 heap-corruption investigation wants the old
+"a freed region reads as zeros" world back.
+
 *Known structural limit — the Phase-4 walk.* A young pause's reference
 fix-up (`update_references_in_regions`) walks EVERY object of every non-CSet
 region, so young pause time is O(heap) rather than O(young live set) — the
-one property G1's region design exists to buy. It is not gratuitous: the
-walk is also where the GC-internal remembered-set rebuild happens, and
-narrowing it to the CSet's remembered-set sources is sound only once every
-mutator reference store is guaranteed to have gone through
-`post_write_barrier_rset`. It is not: a JIT-compiled null→non-null
-`putfield` into a YOUNG receiver still takes an inline store with no post
-barrier (defect G1-2), which is harmless for an ordinary young source
-(every young region is in the CSet) but not for one held out of the CSet by
-a JNI pin. Closing G1-2 is a `jit/` change; until then the whole-heap walk
-is the thing standing in for the missing barrier, and
-`verify_no_dangling_into_cset` is its tripwire.
+one property G1's region design exists to buy. The walk is also where the
+GC-internal remembered-set rebuild and the humongous census happen, so it is
+not gratuitous.
+
+Narrowing it to the collection set's remembered-set sources requires every
+mutator reference store to be guaranteed to reach `post_write_barrier_rset`.
+That IS now true — defect G1-2 (a JIT-compiled store into a young receiver
+taking an inline path with no post barrier) was closed in `jit/` on
+2026-08-13, though the audit's own summary table went on saying "Not fixed"
+until 2026-08-18 and this paragraph repeated it. Under G1 the six-word
+`JIT_REGION_BOUNDS` table is never written (only `gen_heap` writes it), so
+`region_bounds_are_live` is false and all four inline reference-store
+emitters route to `jit_putfield_object`, which runs the full SATB + RSet
+pair.
+
+So the blocker is gone and the remaining question is whether the walk is
+worth removing, which needs a number rather than an argument — see the
+per-phase `[GC-STAT]` breakdown (`fixup_us`, beside the `fixup_regions` /
+`fixup_bytes` it covered).
 
 **ZgcRealHeap.** One arena + free list (post-sweep coalesced) + hash-set
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with

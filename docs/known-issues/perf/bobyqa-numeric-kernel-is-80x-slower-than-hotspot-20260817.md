@@ -5,10 +5,13 @@ the fix belongs to
 [`../jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md`](../jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md),
 which this page now supplies the missing price and engagement counter for.
 
-Every `BOBYQAOptimizerTest` method that runs the optimizer times out under the
-90 s per-class suite budget (`apps/commons-math/RESULTS-20260817.md`). The
-process is not deadlocked and is not stuck in the interpreter — it is running
-compiled code, correctly, about eighty times too slowly.
+Re-verified 2026-08-18 on `dev` `c6299ca2a`: still HANG at the 90 s per-class
+cap while HotSpot passes the class in 2 s, and it is now one of only two
+non-PASSing classes in the whole 310-class `commons-math-legacy` sweep (the
+suite run recorded in retired/commons-math-suite-run-RETIRED-20260818.md).
+
+The process is not deadlocked and is not stuck in the interpreter — it is
+running compiled code, correctly, about eighty times too slowly.
 
 ## This page replaces two wrong diagnoses, and both are worth reading first
 
@@ -201,7 +204,7 @@ cratonvm --XX:UseGc Generational … AccessorDispatchProbe 5 2000000
 The workload itself, for the wall clock:
 
 ```bash
-CP="<commons-math test classpath — see apps/commons-math/RESULTS-20260817.md>"
+CP="<commons-math test classpath — /data/cm-legacy-classpath.txt on the Azure Linux box>"
 javac -nowarn -cp "$CP" -d . probes/BobyqaOne.java
 java     -cp ".;$CP" BobyqaOne 12 1                                    # 0.5 s
 cratonvm --java-home <jdk> --Xmx 1g -c ".;$CP" BobyqaOne 12 1          # ~45 s
@@ -221,5 +224,8 @@ finishes the full class in 1 806 ms (17 of 18 tests, 1 skipped).
   — the OSR gate this workload was first blamed on. Real gate, really fixed,
   worth ~29x on the shape it governs, worth nothing here.
 * [`bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md`](bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md)
-  — the other commons-math throughput page, and the corroborating profile.
-* `apps/commons-math/RESULTS-20260817.md` — the suite run both were found from.
+  — the other commons-math throughput page, and the one with an actual `perf`
+  profile. Its conclusion — flat, ~2% arithmetic, the rest VM plumbing — is the
+  independent corroboration this page's sampler could only gesture at.
+* retired/commons-math-suite-run-RETIRED-20260818.md — the suite run both were
+  found from, now closed.

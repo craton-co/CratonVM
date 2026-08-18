@@ -790,6 +790,25 @@ pub struct GcFlags {
     ///
     /// Turn it on and measure YOUR pause distribution before keeping it.
     pub g1_young_pause_target: bool,
+    /// `CRATONVM_G1_SCRUB_FREE` — zero a region's bytes when a collection
+    /// frees it. **Opt-in** ([`parse::present`]); off means the allocator's own
+    /// zeroing is relied on, which is where it always came from.
+    ///
+    /// G1 used to `fill(0)` every reclaimed region. That was the LARGEST single
+    /// phase of a young pause — 42% of a 330 ms pause on
+    /// `probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m`, freeing 1.61 GB at
+    /// 11.9 GB/s, which is memset bandwidth and nothing else. It was also
+    /// entirely redundant: `G1Region::bump_alloc` zeroes exactly the range it
+    /// hands out (the TLAB zeroing contract that gives a fresh object its
+    /// default-zero fields), `alloc_humongous_locked` zeroes its whole span,
+    /// every object size is a multiple of 8 so no inter-object padding exists,
+    /// and no walker reads a `Free` region at all.
+    ///
+    /// `=1` restores the scrub. It is the first thing to try if a G1
+    /// heap-corruption investigation wants the old "a freed region reads as
+    /// zeros" world back — a use-after-free read is the one thing the scrub was
+    /// really buying — and it is what makes the change a single-binary A/B.
+    pub g1_scrub_free: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
@@ -992,6 +1011,7 @@ impl GcFlags {
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
+            g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),

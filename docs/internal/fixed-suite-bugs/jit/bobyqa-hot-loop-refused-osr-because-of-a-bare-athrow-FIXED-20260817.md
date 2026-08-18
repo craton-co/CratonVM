@@ -286,4 +286,4 @@ right for free).
   throw; that constraint is gone.
 * known-issues/perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md
   — what actually costs `BOBYQAOptimizerTest` its 90 seconds.
-* `apps/commons-math/RESULTS-20260817.md` — the suite run this was found from.
+* retired/commons-math-suite-run-RETIRED-20260818.md — the suite run this was found from, now closed.
