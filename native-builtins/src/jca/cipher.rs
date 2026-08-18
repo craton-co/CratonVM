@@ -2314,13 +2314,36 @@ fn try_delegate_cipher_to_chain(
 /// own default source and produced a different answer on every run. A null
 /// argument is still passed through as null, which is what a JDK caller of
 /// `init(mode, key)` gets.
+/// Which `Cipher.init` overload the caller used — which is NOT the same
+/// question as whether it passed a non-null parameter object.
+///
+/// `Cipher.init(int, Key, AlgorithmParameterSpec, SecureRandom)` calls
+/// `engineInit(opmode, key, params, random)` even when `params` is null, and a
+/// provider is entitled to answer that call differently from the three-argument
+/// one. BouncyCastle does: its `engineInit(int, Key, SecureRandom)` is a
+/// wrapper that catches `InvalidAlgorithmParameterException` and rethrows it as
+/// `InvalidKeyException`. So routing a null spec to the three-argument form
+/// turned `PBEKey requires parameters to specify salt` from the
+/// `InvalidAlgorithmParameterException` the caller catches into an
+/// `InvalidKeyException` that sails past the handler — `PBETest.testNullSalt`,
+/// which passes `(AlgorithmParameterSpec)null` on purpose.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CipherInitParams {
+    /// `init(int, Key)` / `init(int, Key, SecureRandom)`.
+    None,
+    /// `init(int, Key, AlgorithmParameterSpec[, SecureRandom])`.
+    Spec,
+    /// `init(int, Key, AlgorithmParameters[, SecureRandom])`.
+    Params,
+}
+
 fn cipher_delegate_init(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     mode: i32,
     key: Option<ObjectRef>,
     params: Option<ObjectRef>,
-    params_is_spec: bool,
+    params_kind: CipherInitParams,
     random: Option<ObjectRef>,
 ) -> MethodCallResult {
     let Some(spi) = cipher_delegate_spi(ctx, this) else {
@@ -2350,19 +2373,16 @@ fn cipher_delegate_init(
         },
     };
     let random_v = Value::Object(random);
-    let args: Vec<Value> = match params {
-        Some(p) => vec![
-            Value::Int(mode),
-            key_v,
-            Value::Object(Some(p)),
-            random_v,
-        ],
-        None => vec![Value::Int(mode), key_v, random_v],
+    // The parameter slot is filled from the OVERLOAD, not from whether the
+    // object is null — see `CipherInitParams`.
+    let args: Vec<Value> = match params_kind {
+        CipherInitParams::None => vec![Value::Int(mode), key_v, random_v],
+        _ => vec![Value::Int(mode), key_v, Value::Object(params), random_v],
     };
-    let desc = match (params.is_some(), params_is_spec) {
-        (false, _) => SPI_INIT_PLAIN,
-        (true, true) => SPI_INIT_SPEC,
-        (true, false) => SPI_INIT_PARAMS,
+    let desc = match params_kind {
+        CipherInitParams::None => SPI_INIT_PLAIN,
+        CipherInitParams::Spec => SPI_INIT_SPEC,
+        CipherInitParams::Params => SPI_INIT_PARAMS,
     };
     // Re-read every argument from its pin: `new SecureRandom()` above may have
     // moved them.
@@ -4490,7 +4510,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let mode = args[1].as_int().unwrap_or(0);
         let key = obj_arg(args, 2)?;
         if cipher_is_delegated(ctx, this) {
-            return cipher_delegate_init(ctx, this, mode, Some(key), None, false, None);
+            return cipher_delegate_init(
+                ctx,
+                this,
+                mode,
+                Some(key),
+                None,
+                CipherInitParams::None,
+                None,
+            );
         }
         // A ChaCha20 cipher initialised with no parameters at all still needs a
         // nonce, and SunJCE GENERATES one for ENCRYPT rather than refusing —
@@ -4517,7 +4545,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true, None);
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    spec,
+                    CipherInitParams::Spec,
+                    None,
+                );
             }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
@@ -4546,7 +4582,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true, obj_at(args, 4));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    spec,
+                    CipherInitParams::Spec,
+                    obj_at(args, 4),
+                );
             }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
@@ -4586,7 +4630,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false, None);
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    alg_params,
+                    CipherInitParams::Params,
+                    None,
+                );
             }
             cipher_init_from_algorithm_parameters(ctx, this, mode, key, alg_params)
         },
@@ -4605,7 +4657,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false, obj_at(args, 4));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    alg_params,
+                    CipherInitParams::Params,
+                    obj_at(args, 4),
+                );
             }
             cipher_init_from_algorithm_parameters(ctx, this, mode, key, alg_params)
         },
@@ -4664,7 +4724,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 }
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), None, false, obj_at(args, 3));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    None,
+                    CipherInitParams::None,
+                    obj_at(args, 3),
+                );
             }
             cipher_init_record(ctx, this, mode, key, Vec::new())
         });
@@ -4691,7 +4759,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let mode = args[1].as_int().unwrap_or(0);
             let key = obj_arg(args, 2)?;
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), None, false, obj_at(args, 3));
+                return cipher_delegate_init(
+                    ctx,
+                    this,
+                    mode,
+                    Some(key),
+                    None,
+                    CipherInitParams::None,
+                    obj_at(args, 3),
+                );
             }
             cipher_init_record(ctx, this, mode, key, Vec::new())
         },
