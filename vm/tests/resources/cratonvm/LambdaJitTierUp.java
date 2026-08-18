@@ -31,7 +31,21 @@ import java.util.function.*;
  */
 public final class LambdaJitTierUp {
 
-    private static final int N = 4000;
+    /**
+     * Long enough that the background compiler certainly publishes each impl
+     * body and the fast path certainly enters it for the BULK of the run.
+     *
+     * This was 4 000, which crosses the tier-up threshold (500) but need not
+     * outlast an ASYNCHRONOUS compile. Measured, it did not: with a deliberate
+     * off-by-one planted in the one-shot's return-value conversion and the
+     * implicit-NPE drain deleted outright, eleven of the twelve tests here
+     * still passed — they had computed their answers in the interpreter and
+     * agreed with HotSpot about a code path they never took. Only the arm that
+     * happened to run late enough caught it. At 200 000 every arm fails when
+     * the fast path is broken, which is the only property that makes any of
+     * them worth running.
+     */
+    private static final int N = 200_000;
 
     private LambdaJitTierUp() {}
 
@@ -47,11 +61,14 @@ public final class LambdaJitTierUp {
         return v * 2;
     };
 
+    /** Divides by zero once every 500 calls — often enough to exercise the
+     * `sig.arithmetic` drain, rare enough that the run stays short. */
     private static final IntUnaryOperator DIVIDER = v -> 1000 / (v % 500);
 
+    /** Indexes out of range once every 500 calls (`sig.aioobe`). */
     private static final IntUnaryOperator INDEXER = v -> {
         int[] a = new int[4];
-        return a[v % 8];
+        return a[v % 500 == 499 ? 7 : v % 4];
     };
 
     /** Carries its own exception table: the fast path must DECLINE this one. */
@@ -106,7 +123,7 @@ public final class LambdaJitTierUp {
         int sum = 0;
         int caught = 0;
         for (int i = 0; i < N; i++) {
-            int v = (i > 2000 && i % 500 == 0) ? 999 : i;
+            int v = (i > 2000 && i % 5000 == 0) ? 999 : i;
             try {
                 sum += MAYBE_THROW.applyAsInt(v);
             } catch (RuntimeException e) {
@@ -142,13 +159,14 @@ public final class LambdaJitTierUp {
             lsum += lop.applyAsLong(i % 7);
             dsum += dop.applyAsDouble(i % 11);
             ssum += sop.apply(i).length();
+            lsum %= 1_000_003;
         }
         int[] sink = new int[1];
         IntConsumer voidOp = v -> sink[0] += v;
         for (int i = 0; i < N; i++) {
             voidOp.accept(i % 5);
         }
-        return (int) (lsum % 1_000_003) + (int) dsum + ssum + sink[0];
+        return (int) (lsum % 1_000_003) + (int) (dsum % 1_000_003) + ssum + sink[0];
     }
 
     /** ArithmeticException raised inside the compiled body (the sig.arithmetic drain). */
@@ -171,7 +189,7 @@ public final class LambdaJitTierUp {
         int sum = 0;
         int caught = 0;
         for (int i = 0; i < N; i++) {
-            String s = (i % 700 == 0) ? null : "abc";
+            String s = (i % 500 == 499) ? null : "abc";
             try {
                 sum += lengthOf.apply(s);
             } catch (NullPointerException e) {
@@ -225,7 +243,7 @@ public final class LambdaJitTierUp {
         int sum = 0;
         for (int i = 0; i < N; i++) {
             try {
-                sum += indirect(MAYBE_THROW, (i > 3000 && i % 300 == 0) ? 999 : i);
+                sum += indirect(MAYBE_THROW, (i > 3000 && i % 5000 == 0) ? 999 : i);
             } catch (RuntimeException e) {
                 caught++;
             }

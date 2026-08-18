@@ -86,26 +86,32 @@ fn checksum(method: &str) -> i32 {
 // Golden values below were produced by running the byte-identical
 // `LambdaJitTierUp.java` fixture under a real JDK (Temurin 25.0.3), driver
 // calling each `*Checksum()` method reflectively and printing its result.
+//
+// Several of them overflow `int`, deliberately: 200 000 iterations of a sum is
+// what it takes for these to be testing the compiled path rather than the
+// interpreter (see the fixture's own note on `N`), and a wrapped sum is a
+// perfectly good checksum — it just has to be the SAME wrapped sum a real JDK
+// produces, which is what these are.
 
 #[test]
 fn test_plain_lambda() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("plainChecksum"), 8_002_000);
+    assert_eq!(checksum("plainChecksum"), -1_474_736_480);
 }
 
 #[test]
 fn test_capturing_lambda() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("capturingChecksum"), 8_026_000);
+    assert_eq!(checksum("capturingChecksum"), -1_473_536_480);
 }
 
 #[test]
 fn test_method_reference() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("methodRefChecksum"), 8_002_000);
+    assert_eq!(checksum("methodRefChecksum"), -1_474_736_480);
 }
 
 /// The section 5.3 crash, pinned: a compiled lambda body throwing from a cold
@@ -115,14 +121,14 @@ fn test_method_reference() {
 fn test_throwing_lambda_body() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("throwingChecksum"), 15_976_126);
+    assert_eq!(checksum("throwingChecksum"), 1_337_293_578);
 }
 
 #[test]
 fn test_default_method_through_lambda() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("composedChecksum"), 16_796_000);
+    assert_eq!(checksum("composedChecksum"), 1_385_094_336);
 }
 
 /// Every arm of the one-shot's return-value conversion: `J`, `D`, `L`, and
@@ -132,7 +138,7 @@ fn test_default_method_through_lambda() {
 fn test_return_shapes() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("returnShapesChecksum"), 76_985);
+    assert_eq!(checksum("returnShapesChecksum"), 1_203_530);
 }
 
 /// `sig.arithmetic` — divide-by-zero raised inside the compiled body, which
@@ -141,7 +147,7 @@ fn test_return_shapes() {
 fn test_arithmetic_exception_from_body() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("arithmeticChecksum"), 52_784);
+    assert_eq!(checksum("arithmeticChecksum"), 2_639_200);
 }
 
 /// `sig.npe` — the same, for an implicit null dereference.
@@ -149,7 +155,7 @@ fn test_arithmetic_exception_from_body() {
 fn test_npe_from_body() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("npeChecksum"), 12_168);
+    assert_eq!(checksum("npeChecksum"), 611_200);
 }
 
 /// `sig.aioobe` — the same, for an out-of-range array index.
@@ -157,7 +163,7 @@ fn test_npe_from_body() {
 fn test_array_index_exception_from_body() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("arrayIndexChecksum"), 62_000);
+    assert_eq!(checksum("arrayIndexChecksum"), 12_400);
 }
 
 /// A body that carries its OWN exception table. The fast path must decline it
@@ -167,14 +173,14 @@ fn test_array_index_exception_from_body() {
 fn test_self_catching_body_declines_fast_path() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("selfCatchingChecksum"), 6_854_286);
+    assert_eq!(checksum("selfCatchingChecksum"), -37_154_898);
 }
 
 #[test]
 fn test_nested_lambda_dispatch() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("nestedChecksum"), 16_000_000);
+    assert_eq!(checksum("nestedChecksum"), 1_345_294_336);
 }
 
 /// An exception thrown by a warm lambda body and caught two Java frames out:
@@ -184,5 +190,5 @@ fn test_nested_lambda_dispatch() {
 fn test_exception_propagates_through_two_frames() {
     require_class_files!();
     require_class_library!();
-    assert_eq!(checksum("propagationChecksum"), 15_972_526);
+    assert_eq!(checksum("propagationChecksum"), 1_337_293_578);
 }
