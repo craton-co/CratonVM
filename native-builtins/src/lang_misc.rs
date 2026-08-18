@@ -526,12 +526,21 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
         // is not sound — captures from several threads interleave in the log,
         // and reading "the deepest frame" out of a merged group names a throw
         // site that never existed. One line per throwable cannot be mispaired.
-        let top: Vec<String> = trace
-            .iter()
-            .take(4)
-            .map(|f| format!("{}.{}:{}", f.class_name, f.method_name, f.line_number))
-            .collect();
-        eprintln!("STTRACE_DBG_TOP hash={hash} depth={depth} top={}", top.join(" <- "));
+        // Captured traces are OUTERMOST-first, so the throw site is the LAST
+        // entry, not the first. Print both ends labelled — an unlabelled
+        // "top=" that is really the thread entry point reads as a perfectly
+        // plausible answer, which is how the first version of this line sent
+        // the investigation at `TaskThread.run`.
+        let fmt = |f: &cratonvm_native_api::registry::StackTraceEntry| {
+            format!("{}.{}:{}", f.class_name, f.method_name, f.line_number)
+        };
+        let innermost: Vec<String> = trace.iter().rev().take(5).map(&fmt).collect();
+        let outermost: Vec<String> = trace.iter().take(2).map(&fmt).collect();
+        eprintln!(
+            "STTRACE_DBG_TOP hash={hash} depth={depth} innermost={} || outermost={}",
+            innermost.join(" <- "),
+            outermost.join(" <- ")
+        );
     }
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
     // park a self-reference as the non-null marker (the real frame data lives
