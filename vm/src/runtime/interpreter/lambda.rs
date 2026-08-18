@@ -1318,6 +1318,19 @@ pub(crate) struct LambdaJitSite {
     num_captures: usize,
     /// `num_captures` + the SAM's parameter count == the impl's arity.
     total_args: usize,
+    /// The `checkcast` the synthetic bridge would have performed, for each SAM
+    /// parameter that needs one: `(index among the SAM's own arguments, the
+    /// instantiated type token)`.
+    ///
+    /// A generic functional interface erases its parameters to `Object`, so
+    /// `Function<Integer,Integer>` — the shape `CompletableFuture` composition
+    /// is built out of — reaches its impl through a javac bridge that casts
+    /// each argument to the instantiated type first. Coercion is still the
+    /// identity for these (both tokens are references), so only the cast is
+    /// left, and a cast that would FAIL simply declines this arm: the generic
+    /// path then throws the `ClassCastException` with the message it has always
+    /// produced. Empty for the great majority of sites.
+    checkcasts: Vec<(usize, Arc<str>)>,
     /// The impl method, for the JIT-cache probe and the redefinition gate.
     cached: Arc<CachedBytecodeMethod>,
     gate: RedefineGate,
@@ -1459,18 +1472,20 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         return SiteVerdict::Never;
     }
 
-    // Coercion must be provably the identity, argument by argument. These three
-    // conditions are exactly what makes `coerce_lambda_args` and `coerce_return`
-    // no-ops (`coerce_arg` returns its input unchanged for equal tokens — see
-    // its own "LOAD-BEARING BEYOND THIS FUNCTION" note) and
-    // `checkcast_lambda_instantiated_args` a no-op (nothing to narrow when the
-    // instantiated descriptor IS the erased one).
-    if call_site.instantiated_descriptor != call_site.sam_descriptor {
-        return SiteVerdict::Never;
-    }
+    // Coercion must be provably the identity, argument by argument, and the
+    // only thing left over may be a `checkcast`.
+    //
+    // `coerce_arg` returns its input unchanged in exactly two cases: equal
+    // tokens (see its own "LOAD-BEARING BEYOND THIS FUNCTION" note), and two
+    // REFERENCE tokens — neither its unbox arm (`Object` SAM over a primitive
+    // impl), its box arm, nor its widening arm can fire when both sides are
+    // references. `coerce_return` has the same three arms in the same order and
+    // so the same two identity cases. Anything else is real work this arm must
+    // not skip.
+    let identity = |a: &str, b: &str| a == b || (is_reference_desc(a) && is_reference_desc(b));
     let (sam_params, sam_ret) = split_method_descriptor_ref(&call_site.sam_descriptor);
     let (impl_params, impl_ret) = split_method_descriptor_ref(&call_site.impl_handle.descriptor);
-    if sam_ret != impl_ret {
+    if !identity(sam_ret, impl_ret) {
         return SiteVerdict::Never;
     }
     let num_captures = call_site.capture_types.len();
@@ -1478,9 +1493,28 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         return SiteVerdict::Never;
     }
     for (k, sam_tok) in sam_params.iter().enumerate() {
-        if *sam_tok != impl_params[num_captures + k] {
+        if !identity(sam_tok, impl_params[num_captures + k]) {
             return SiteVerdict::Never;
         }
+    }
+    // What `checkcast_lambda_instantiated_args` would check, decided once:
+    // a reference instantiated token that differs from the erased SAM token.
+    // Its own loop skips every other case.
+    let (inst_params, _inst_ret) = split_method_descriptor_ref(&call_site.instantiated_descriptor);
+    let mut checkcasts: Vec<(usize, Arc<str>)> = Vec::new();
+    for (k, inst_tok) in inst_params.iter().enumerate() {
+        if !is_reference_desc(inst_tok) {
+            continue;
+        }
+        if sam_params.get(k).map(|s| s == inst_tok).unwrap_or(false) {
+            continue;
+        }
+        if k >= sam_params.len() {
+            // An instantiated descriptor longer than the SAM's is a shape this
+            // arm has no mapping for.
+            return SiteVerdict::Never;
+        }
+        checkcasts.push((k, Arc::from(*inst_tok)));
     }
 
     // A loader-local divergence must dispatch on the exact class the generic
@@ -1515,6 +1549,7 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         sam_descriptor: Arc::clone(&call_site.sam_descriptor),
         num_captures,
         total_args: impl_params.len(),
+        checkcasts,
         cached,
         gate,
         code: std::cell::RefCell::new(None),
@@ -1558,6 +1593,39 @@ pub(crate) fn lambda_jit_site_code(
         site.direct_disabled.set(false);
     }
     site.code.borrow().clone()
+}
+
+/// Replay the `checkcast` the synthetic bridge would have done, for the SAM
+/// arguments this site recorded as needing one.
+///
+/// `true` means every cast passes (or there were none) and the direct call may
+/// proceed. `false` means one would THROW — this arm declines and the generic
+/// path raises the `ClassCastException` with the message it has always built
+/// (`cce_display_class_name` and all), which is worth far more than saving a
+/// dispatch on a call that is about to fail anyway.
+///
+/// `sam_args` are raw JIT-ABI registers, so a reference is a pointer and `0` is
+/// `null` — which every `checkcast` accepts.
+pub(crate) fn lambda_jit_site_checkcasts_pass(
+    shared: &SharedVm,
+    site: &LambdaJitSite,
+    sam_args: &[i64],
+) -> bool {
+    for (sam_idx, inst_tok) in &site.checkcasts {
+        let Some(raw) = sam_args.get(*sam_idx).copied() else {
+            continue;
+        };
+        if raw == 0 {
+            continue;
+        }
+        // SAFETY: a non-zero reference register is a live object pointer — the
+        // same assumption every other raw-argument arm in the JIT bridge makes.
+        let obj = unsafe { ObjectRef::from_raw(raw as *mut u8) };
+        if lambda_arg_provably_not_instance(shared, obj, inst_tok) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Read this site's captured values out of the proxy object, in

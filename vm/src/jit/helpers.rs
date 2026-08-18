@@ -13414,6 +13414,12 @@ unsafe fn try_lambda_site_direct_call(
         return None;
     };
 
+    if !crate::runtime::interpreter::lambda_jit_site_checkcasts_pass(vm, &site, sam_args) {
+        // A cast that would throw. Decline, and let the generic path raise the
+        // `ClassCastException` it has always raised, message and all.
+        crate::runtime::interpreter::lambda_site_bump_refused();
+        return None;
+    }
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
     crate::runtime::interpreter::lambda_jit_site_capture_args(
         vm,
