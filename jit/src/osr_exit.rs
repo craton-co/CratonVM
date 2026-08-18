@@ -92,7 +92,26 @@
 //! `RETHROW` point is explicitly allowed to exist — such points are stashed via
 //! `take_exceptional_frame` and never routed to a resume — so the reachable
 //! disagreement is `REEXECUTE` vs `RETHROW`: a `PendingException` point sharing
-//! a bci with a loop-boundary exit map.
+//! a bci with a speculative-dispatch guard or a loop-boundary exit map.
+//!
+//! **And that one must NOT refuse (corrected 2026-08-17).** The paragraph above
+//! named the reachable case correctly and then drew the wrong conclusion from
+//! it: it counted a `RETHROW` point as a candidate resume image. It is not one,
+//! by the same sentence that admits it — never routed to a resume. So a bci
+//! carrying one `REEXECUTE` point and one `RETHROW` point has exactly ONE
+//! resume image, and the resume bci is not arbitrary at all.
+//!
+//! `resume_image` now skips `rethrow_exception` points for that reason. What
+//! made the correction is a measurement, not the argument: after the RBC.6b
+//! lift admitted `try`/`catch` methods to OSR, a `try { foo(x); } catch (...)`
+//! loop puts a `ReceiverTypeChanged` guard and a `PendingException` frame on
+//! the same invoke bci, which is the ordinary shape rather than an exotic one.
+//! `probes/OsrExcTableProbe.java` reported `osr_entered=0
+//! osr_entry_refused_ambiguous_image=15`: the artifact compiled, every
+//! correctness arm passed, and NOTHING EVER ENTERED THE COMPILED BODY.
+//!
+//! Two points that both claim to be resume images and disagree are still
+//! refused; that half of the rule is unchanged and is the wrong-code half.
 //!
 //! Everything else about two points at one bci is *supposed* to differ:
 //! `native_offset` by construction (that IS what makes them two images), and
@@ -219,11 +238,39 @@ pub enum ResumeImage {
 /// The agreement predicate is `semantics` alone; see the module note for why
 /// `reason` is observed rather than refused, and why the per-slot state is not
 /// this check's business at all.
+///
+/// **A `RETHROW` point is not a resume image and is skipped.** Its `bci` names
+/// a THROWING instruction, and this module already says so: "`RETHROW` points
+/// are fine to *have* — they are stashed separately (`take_exceptional_frame`)
+/// and never routed to a resume". Counting one as a candidate image made a
+/// protected invoke that ALSO carries a speculative-dispatch guard read as two
+/// images that disagree on `semantics`, and `first_ambiguous_resume_bci` then
+/// refused the whole OSR entry.
+///
+/// That is not a hypothetical shape, it is the ordinary one after the RBC.6b
+/// lift (2026-08-17): a `try { foo(x); } catch (...)` loop puts a
+/// `ReceiverTypeChanged` guard (`reexecute`) and a `PendingException` frame
+/// (`rethrow`) on the same invoke bci. Measured on
+/// `probes/OsrExcTableProbe.java`: `osr_entered=0
+/// osr_entry_refused_ambiguous_image=15` — the artifact compiled and NOTHING
+/// EVER ENTERED IT, while every correctness arm passed. The lift was a vacuous
+/// green until this skip.
+///
+/// Skipping is not a relaxation of the rule the ambiguity check enforces. The
+/// question that check asks is "if this body exits here and the VM has to park
+/// the interpreter at `bci`, is the bci well defined?" — and a `RETHROW` point
+/// is never an answer to it: `resume_after_exit` rejects non-`REEXECUTE`
+/// semantics explicitly, and the exception path finds its own point by
+/// `(bci, reason == PendingException)` rather than through this function. Two
+/// points that both claim to be resume images and disagree are still refused.
 pub fn resume_image(deopt_points: &[DeoptimizationPoint], bci: u32) -> ResumeImage {
     let mut first: Option<(usize, ResumeSemantics, DeoptReason)> = None;
     let mut reason_ambiguous = false;
     for (i, p) in deopt_points.iter().enumerate() {
         if p.bci != bci {
+            continue;
+        }
+        if p.semantics.rethrow_exception {
             continue;
         }
         match first {
@@ -471,29 +518,14 @@ mod tests {
         assert!(has_reason_ambiguous_bci(&pts));
     }
 
-    /// The `semantics` disagreement, which is the unsound half — in both the
-    /// reachable spelling and the unreachable one.
+    /// The `semantics` disagreement, which is the unsound half.
     ///
-    /// `REEXECUTE` vs `RETHROW` is what can actually arrive: a `RESUME` point
-    /// is refused wholesale before this check ever sees it, while a `RETHROW`
-    /// point is explicitly allowed to exist. Both are asserted so a future
-    /// producer that starts emitting `RESUME` does not silently fall out of
-    /// coverage.
+    /// Only `REEXECUTE` vs `RESUME` is a disagreement between two RESUME
+    /// IMAGES, and that is the pair this must refuse. A `RESUME` point is also
+    /// refused wholesale by `osr_exit_policy` before this check sees it in
+    /// practice; it is asserted here so the check itself stays covered.
     #[test]
     fn points_that_disagree_on_the_semantics_are_ambiguous() {
-        let reachable = vec![
-            point(12, 0x40, DeoptReason::OsrExit),
-            point(12, 0x90, DeoptReason::PendingException),
-        ];
-        assert_eq!(
-            ResumeSemantics::for_reason(DeoptReason::PendingException),
-            ResumeSemantics::RETHROW
-        );
-        assert!(matches!(
-            resume_image(&reachable, 12),
-            ResumeImage::Ambiguous { .. }
-        ));
-
         let mut pts = vec![
             point(12, 0x40, DeoptReason::OsrExit),
             point(12, 0x90, DeoptReason::OsrExit),
@@ -503,6 +535,62 @@ mod tests {
             resume_image(&pts, 12),
             ResumeImage::Ambiguous { .. }
         ));
+    }
+
+    /// A `RETHROW` point sharing a bci with a resume point is NOT ambiguous.
+    ///
+    /// The correction of 2026-08-17, and the shape that motivated it: after the
+    /// RBC.6b lift a `try { foo(x); } catch (...)` loop puts a
+    /// speculative-dispatch guard (`REEXECUTE`) and a `PendingException` frame
+    /// (`RETHROW`) on the same invoke bci. Refusing that took `osr_entered` to
+    /// ZERO on `probes/OsrExcTableProbe.java` — the artifact compiled, every
+    /// correctness arm passed, and no back edge ever entered it.
+    ///
+    /// A `RETHROW` point is not a resume image: its bci names a throwing
+    /// instruction, `resume_after_exit` rejects non-`REEXECUTE` semantics
+    /// explicitly, and the exception path finds its own point by
+    /// `(bci, reason == PendingException)`. So this bci has exactly one image,
+    /// and `resume_image` must name it rather than call the pair arbitrary.
+    #[test]
+    fn a_rethrow_point_is_not_a_competing_resume_image() {
+        let pts = vec![
+            point(12, 0x40, DeoptReason::OsrExit),
+            point(12, 0x90, DeoptReason::PendingException),
+        ];
+        assert_eq!(
+            ResumeSemantics::for_reason(DeoptReason::PendingException),
+            ResumeSemantics::RETHROW,
+            "the fixture only means anything while PendingException is RETHROW"
+        );
+        assert!(
+            matches!(
+                resume_image(&pts, 12),
+                ResumeImage::Unique { index: 0, .. }
+            ),
+            "the OsrExit point is the one and only resume image at bci 12"
+        );
+        assert_eq!(
+            first_ambiguous_resume_bci(&pts),
+            None,
+            "refusing this costs every try/catch loop its OSR entry"
+        );
+
+        // Order-independent: the rethrow point first must not become the
+        // representative, which would hand `resume_after_exit` a bci it then
+        // rejects for its semantics.
+        let flipped = vec![
+            point(12, 0x90, DeoptReason::PendingException),
+            point(12, 0x40, DeoptReason::OsrExit),
+        ];
+        assert!(matches!(
+            resume_image(&flipped, 12),
+            ResumeImage::Unique { index: 1, .. }
+        ));
+
+        // A bci carrying ONLY a rethrow point names no resume image at all.
+        let only_rethrow = vec![point(12, 0x90, DeoptReason::PendingException)];
+        assert_eq!(resume_image(&only_rethrow, 12), ResumeImage::None);
+        assert_eq!(first_ambiguous_resume_bci(&only_rethrow), None);
     }
 
     /// A disagreement at a bci OTHER than the first one scanned is still
