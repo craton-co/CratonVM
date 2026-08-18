@@ -5626,6 +5626,40 @@ pub(crate) fn illegal_arg_exc(msg: String) -> MethodCallFailed {
 /// Falls back to the plain message-only `illegal_arg_exc` if the exception
 /// object can't be materialized (e.g. exotic classloader state) -- losing the
 /// cause is preferable to losing the exception entirely.
+/// Give a reflective coercion refusal the CAUSE HotSpot gives it.
+///
+/// `Method.invoke` and `Constructor.newInstance` both refuse a bad argument
+/// with `IllegalArgumentException("argument type mismatch")` — but the JDK
+/// arrives at that by CATCHING something, so the IAE carries a cause, and
+/// callers branch on it: Spring's `InvocableHandlerMethod.doInvoke` tests
+/// `getCause() instanceof NullPointerException` to choose a friendlier
+/// message. A bare message-only IAE matches on TYPE and diverges on that test.
+///
+/// Extracted from the inline block in `Method.invoke`, which had it, and
+/// called from `Constructor.newInstance`, which did not — measured: null into
+/// a primitive carried an NPE cause through `invoke` and no cause at all
+/// through `newInstance`. Two spellings of one rule was how they came to
+/// disagree, so there is now one.
+fn attach_reflective_coercion_cause(
+    ctx: &mut dyn NativeContext,
+    arg_val: Value,
+    pdesc: &str,
+    e: MethodCallFailed,
+) -> MethodCallFailed {
+    let is_null_into_primitive = matches!(arg_val, Value::Object(None))
+        && matches!(pdesc, "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C");
+    let is_plain_iae = matches!(
+        &e,
+        MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException { .. }
+        ))
+    );
+    if is_null_into_primitive && is_plain_iae {
+        return illegal_arg_exc_null_to_primitive(ctx, "argument type mismatch".to_string());
+    }
+    e
+}
+
 pub(crate) fn illegal_arg_exc_null_to_primitive(
     ctx: &mut dyn NativeContext,
     msg: String,
@@ -9606,7 +9640,10 @@ pub(crate) fn native_method_invoke(
         let recv =
             receiver.ok_or_else(
                 || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some("Method.invoke: null receiver for instance method".to_string()),
+                    message: Some(
+                        "Cannot invoke \"Object.getClass()\" because \"obj\" is null"
+                            .to_string(),
+                    ),
                 },
             )?;
         // JDK contract: `Method.invoke` throws `IllegalArgumentException`
@@ -9693,10 +9730,9 @@ pub(crate) fn native_method_invoke(
     };
     if actual_arg_count != param_descs.len() {
         return Err(illegal_arg_exc(format!(
-            "Method.invoke: wrong number of arguments for {class_name}.{method_name}: \
-             expected {}, got {}",
-            param_descs.len(),
+            "wrong number of arguments: {} expected: {}",
             actual_arg_count,
+            param_descs.len(),
         )));
     }
 
@@ -9743,23 +9779,7 @@ pub(crate) fn native_method_invoke(
                     // bare message-only IAE here diverges from HotSpot even
                     // though the exception TYPE matches. See
                     // `illegal_arg_exc_null_to_primitive`.
-                    let e = if matches!(arg_val, Value::Object(None))
-                        && matches!(
-                            pdesc.as_str(),
-                            "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C"
-                        )
-                        && matches!(
-                            &e,
-                            MethodCallFailed::InternalError(
-                                cratonvm_types::error::VmError::Runtime(
-                                    cratonvm_types::error::RuntimeError::IllegalArgumentException { .. }
-                                )
-                            )
-                        ) {
-                        illegal_arg_exc_null_to_primitive(ctx, "argument type mismatch".to_string())
-                    } else {
-                        e
-                    };
+                    let e = attach_reflective_coercion_cause(ctx, arg_val, pdesc.as_str(), e);
                     // CRATONVM_DBG_INVOKE_COERCE=1 вЂ” dump the method, formal
                     // descriptors, actual arg runtime types, and innermost Java
                     // caller frames on a coercion mismatch. Env-gated.
@@ -12189,11 +12209,12 @@ pub(crate) fn native_constructor_new_instance(
     };
 
     if actual_arg_count != param_descs.len() {
+        // Identical wording to `Method.invoke`'s -- HotSpot does not
+        // distinguish the two here, and naming the class was ours.
         return Err(illegal_arg_exc(format!(
-            "Constructor.newInstance: wrong number of arguments for {class_name}: \
-             expected {}, got {}",
-            param_descs.len(),
+            "wrong number of arguments: {} expected: {}",
             actual_arg_count,
+            param_descs.len(),
         )));
     }
 
@@ -12208,13 +12229,20 @@ pub(crate) fn native_constructor_new_instance(
         } else {
             Value::Object(None)
         };
-        let coerced = coerce_arg_strict(
+        let coerced = match coerce_arg_strict(
             ctx,
             arg_val,
             pdesc,
             "Constructor.newInstance argument",
             declaring_cid,
-        )?;
+        ) {
+            Ok(v) => v,
+            // The bare `?` here is what dropped the cause: `Method.invoke` a
+            // few hundred lines up attached one and this path did not, so the
+            // same wrong argument produced a different exception through the
+            // two entry points.
+            Err(e) => return Err(attach_reflective_coercion_cause(ctx, arg_val, pdesc, e)),
+        };
         init_args.push(coerced);
     }
 

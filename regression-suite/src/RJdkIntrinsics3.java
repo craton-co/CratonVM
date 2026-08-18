@@ -2410,6 +2410,14 @@ public class RJdkIntrinsics3 {
     // is that they stay at zero callers forever.
     // ========================================================================
     public static class MiscHolder {
+        public MiscHolder() { }
+
+        public MiscHolder(int a) { }
+
+        public int takesInt(int a) {
+            return a;
+        }
+
         public void m(int i) {}
     }
 
@@ -2686,7 +2694,83 @@ public class RJdkIntrinsics3 {
         ckS("misc:Class.forName(null) has a NULL message",
                 t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
 
-        sectionEnd("misc", 49);
+        // -- what a reflective CALL says when it refuses ----------------------
+        // Sweep 10 (scratchpad/g75/M.java, 31 rows): 23 were already exact,
+        // including all the InvocationTargetException wrapping, the access
+        // checks, widening/narrowing, and the whole java.lang.reflect.Array
+        // family. These are the ones that were not.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class).invoke(new MiscHolder());
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Method.invoke with too few arguments", t,
+                "java.lang.IllegalArgumentException");
+        // Bare, and the counts run GOT then EXPECTED — the opposite order to
+        // how anyone writes it. Ours named the class and method, which is more
+        // useful and is not what a caller matching the text sees.
+        ckS("misc:Method.invoke arity message", t == null ? null : t.getMessage(),
+                "wrong number of arguments: 0 expected: 1");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class)
+                    .invoke(new MiscHolder(), 1, 2);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Method.invoke arity message counts the SURPLUS too",
+                t == null ? null : t.getMessage(), "wrong number of arguments: 2 expected: 1");
+        // Constructor uses the SAME sentence — HotSpot does not distinguish.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getConstructor(int.class).newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Constructor.newInstance arity message is the same sentence",
+                t == null ? null : t.getMessage(), "wrong number of arguments: 0 expected: 1");
+
+        // A null receiver is HotSpot's helpful NPE, naming the JDK's own local.
+        // NOTE the variable is `obj` here and `o` in Field.set — two call sites,
+        // two names, neither derivable from the other.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class).invoke(null, 1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Method.invoke with a null receiver", t, "java.lang.NullPointerException");
+        ckS("misc:Method.invoke null-receiver message", t == null ? null : t.getMessage(),
+                "Cannot invoke \"Object.getClass()\" because \"obj\" is null");
+
+        // The refusal carries a CAUSE, and frameworks branch on it: Spring's
+        // InvocableHandlerMethod tests `getCause() instanceof NPE`. Method.invoke
+        // attached one and Constructor.newInstance dropped it, so the same bad
+        // argument produced different exceptions through the two doors.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class)
+                    .invoke(new MiscHolder(), (Object) null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Method.invoke null-into-primitive cause",
+                t == null || t.getCause() == null ? "none" : t.getCause().getClass().getName(),
+                "java.lang.NullPointerException");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getConstructor(int.class).newInstance((Object) null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Constructor.newInstance null-into-primitive", t,
+                "java.lang.IllegalArgumentException");
+        ckS("misc:Constructor.newInstance carries the SAME cause as Method.invoke",
+                t == null || t.getCause() == null ? "none" : t.getCause().getClass().getName(),
+                "java.lang.NullPointerException");
+
+        sectionEnd("misc", 58);
     }
 
     // ========================================================================
