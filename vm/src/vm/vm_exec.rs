@@ -11892,6 +11892,26 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             .try_alloc_array_full(ClassId::new(0), element_type, length)
     }
 
+    fn reclaim_before_alloc_retry(&mut self) -> bool {
+        // The same ladder `gc_alloc_array` (interpreter) and `jit_newarray`
+        // (JIT) run between their failed attempts. See the trait method for the
+        // precondition the CALLER is responsible for — this function cannot
+        // check it, because the locals at risk are the caller's.
+        //
+        // Order matches the interpreter's exactly, and the overhead-limit check
+        // sits between the two reclaim steps for the reason it does there: once
+        // consecutive forced collections stop freeing anything, more of them are
+        // a death spiral, and OOM is the honest answer. Reporting `false` there
+        // rather than `true` is what keeps this from becoming that spiral.
+        self.thread.tlab.retire();
+        crate::runtime::interpreter::maybe_gc_forced_pub(self.shared, self.thread);
+        if crate::runtime::interpreter::gc_overhead_limit_exceeded(self.shared) {
+            return false;
+        }
+        crate::runtime::interpreter::last_ditch_reclaim(self.shared, self.thread);
+        true
+    }
+
     fn array_component_class_id(&self, class_id: ClassId) -> Option<ClassId> {
         // `array_info` is `Some` only for array classes; its `component_class_id`
         // is the immediate element type (e.g. `String[]` for `String[][]`).

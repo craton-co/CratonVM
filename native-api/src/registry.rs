@@ -2771,6 +2771,54 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
         Some(self.new_array(element_type, length))
     }
 
+    /// Reclaim the heap and report whether a retry is worth making, for a
+    /// native whose `try_new_array` / `try_new_ref_array` / `alloc_object`
+    /// just returned `None`.
+    ///
+    /// # Why this is not simply done inside the allocators
+    ///
+    /// The fallible native allocators deliberately do NOT collect. A native
+    /// holds raw `ObjectRef`s in Rust locals, and those are in no GC root set:
+    /// a collection triggered underneath one would relocate them (dangling the
+    /// locals) or sweep them (freeing live objects). See `runtime::native_oom`,
+    /// whose whole design follows from that rule. So the allocators get exactly
+    /// one attempt and then report failure — which is correct for them and, on
+    /// its own, wrong for the program.
+    ///
+    /// What the rule costs, measured: the interpreter's `gc_alloc_array` and
+    /// the JIT's `jit_newarray` both run a LADDER on a failed allocation —
+    /// retire the TLAB, force a collection, retry, `last_ditch_reclaim`, retry
+    /// again — and only then throw. A native allocating the same array gets no
+    /// ladder at all, so it reports `OutOfMemoryError` on the first refusal.
+    /// On H2 `TestBenchmark` (`-Xmx1g`, ZGC) that surfaced as a 10 MiB
+    /// `ByteBuffer.allocate` failing with the heap **97% free**: the arena had
+    /// no hole that big at that instant, the collection that would have opened
+    /// one had not been asked for, and repeating the identical allocation one
+    /// Java statement later succeeded immediately.
+    ///
+    /// # The precondition, which the CALLER owns
+    ///
+    /// Only call this when **this native holds no unpinned `ObjectRef` in a
+    /// Rust local** — i.e. at an allocation performed before the native has
+    /// acquired any heap reference, or with everything it holds pinned through
+    /// [`pin_native_root`](Self::pin_native_root). At that point the collection
+    /// is exactly as safe as the one the interpreter runs between two
+    /// bytecodes. A native that has already stashed a bare `ObjectRef` must NOT
+    /// call this; it must report OOM as before.
+    ///
+    /// That is why this is a separate call rather than a retry folded into the
+    /// allocators: the allocators cannot see their caller's locals, and the
+    /// caller can.
+    ///
+    /// Returns `false` when no reclamation was attempted or the heap is
+    /// GC-thrashing past the overhead limit — in which case the caller should
+    /// surface `OutOfMemoryError` without a retry, rather than spin. The
+    /// default is `false` so mock/non-VM contexts keep their current
+    /// single-attempt behaviour.
+    fn reclaim_before_alloc_retry(&mut self) -> bool {
+        false
+    }
+
     /// Component (element) class id of an array class `class_id`, or `None` if
     /// it is not an array class. Lets natives allocate a typed array matching a
     /// given array `Class` — e.g. `Arrays.copyOf(T[], n, a.getClass())` /
