@@ -157,6 +157,18 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // What the SPLICED-CALL emitter actually emitted, per arm. Zeros are
+        // printed: a feature measuring "no different from the arm below it" and
+        // a feature that never fired look identical in a timing table, and this
+        // is the only line that separates them.
+        eprintln!(
+            "[cratonvm] inline call arms: {}",
+            cratonvm_jit::metrics::inline_call_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
         // fall-through crosses. The two lines above count EMISSIONS, which is

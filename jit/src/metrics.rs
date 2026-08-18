@@ -2737,6 +2737,46 @@ pub static GETFIELD_ARM_EMITS: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// What the spliced-call emitter actually EMITTED, per arm.
+///
+/// A feature that reports itself on while emitting nothing is the failure mode
+/// this whole line of work keeps running into: `nest` and `devirt` measured
+/// within noise of each other, and without these there is no way to tell "the
+/// devirtualised splice did not help" from "the devirtualised splice never
+/// fired". Index-parallel with [`INLINE_CALL_ARM_NAMES`].
+pub static INLINE_CALL_ARM_EMITS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`INLINE_CALL_ARM_EMITS`], index-parallel.
+pub const INLINE_CALL_ARM_NAMES: [&str; 5] = [
+    // A call inside a spliced body, emitted as a raw CALL to a compiled entry.
+    "spliced-call-direct",
+    // The same, emitted through the blind `jit_invoke_dispatch` helper. Should
+    // be 0 unless `CRATONVM_JIT_INLINE_CALL_DISPATCH` is on.
+    "spliced-call-dispatch",
+    // A statically bound call replaced by the callee's own body.
+    "nested-splice",
+    // A virtual/interface call replaced by a body behind a receiver class-id
+    // guard. This is the devirtualisation counter.
+    "nested-splice-guarded",
+    // A guarded splice that was PLANNED and then refused at emission — the
+    // number that distinguishes "did not help" from "could not be emitted".
+    "nested-splice-guarded-refused",
+];
+
+/// Record that the spliced-call emitter took arm `arm`.
+#[inline]
+pub fn note_inline_call_arm(arm: usize) {
+    if let Some(slot) = INLINE_CALL_ARM_EMITS.get(arm) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Names for [`GETFIELD_ARM_EMITS`], index-parallel.
 pub const GETFIELD_ARM_NAMES: [&str; 6] = [
     "sp-inlined-callee",
@@ -2753,6 +2793,20 @@ pub fn note_getfield_arm(arm: usize) {
     if let Some(c) = GETFIELD_ARM_EMITS.get(arm) {
         c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// `(name, count)` for every spliced-call arm, INCLUDING the zeros.
+///
+/// Unfiltered on purpose, unlike `getfield_arm_emits`: a zero is the answer
+/// here. "devirt measured the same as nest" and "devirt never fired" are
+/// different findings, and only an explicit `nested-splice-guarded=0` tells
+/// them apart.
+pub fn inline_call_arm_emits() -> Vec<(&'static str, u64)> {
+    INLINE_CALL_ARM_NAMES
+        .iter()
+        .zip(INLINE_CALL_ARM_EMITS.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .collect()
 }
 
 /// `(name, count)` for every arm that emitted at least one CALL site.

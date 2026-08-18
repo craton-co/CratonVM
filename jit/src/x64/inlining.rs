@@ -1498,6 +1498,7 @@ impl Compiler {
                     if let Some(nested) = nested {
                         if nested.guard_class_id == 0 {
                             if self.try_emit_nested_inline(&nested.site) {
+                                crate::metrics::note_inline_call_arm(2);
                                 cpc += width;
                                 prev_was_terminator = false;
                                 continue;
@@ -1514,10 +1515,12 @@ impl Compiler {
                             // resolved record for that miss edge, which is why
                             // the resolver keeps a guarded pc's dispatch entry.
                             if self.emit_guarded_nested_inline(nested, &resolved) {
+                                crate::metrics::note_inline_call_arm(3);
                                 cpc += width;
                                 prev_was_terminator = false;
                                 continue;
                             }
+                            crate::metrics::note_inline_call_arm(4);
                         }
                     }
 
@@ -1670,8 +1673,11 @@ impl Compiler {
             if !self.emit_inline_direct_call(resolved, info, &arg_slots, pre_pop_spill) {
                 return false;
             }
+            crate::metrics::note_inline_call_arm(0);
         } else if !self.emit_inline_dispatch_call(info, &arg_slots, pre_pop_spill) {
             return false;
+        } else {
+            crate::metrics::note_inline_call_arm(1);
         }
         self.emit_post_invoke_exception_check(return_type);
         self.next_spill_offset = post_pop_spill;
