@@ -61,7 +61,7 @@ Plus one the control added and then retracted: `TestBackup`, a false
 divergence manufactured by the shared working directory.
 
 This matches the independent finding in
-`docs/internal/jdk-only/h2-under-jdk-only-three-arm-triage-20260805.md`, which
+`internal/jdk-only/h2-under-jdk-only-three-arm-triage-20260805.md`, which
 already listed `TestCases` under "both modes — pre-existing, NOT strict-mode
 defects", and which warned in almost these words that a per-class wall-clock
 bound on this host "is measuring the host".
@@ -275,7 +275,7 @@ intrinsically broken.
 
 **A receiver whose class id is 0 is the `ClassId(0)` family**, which has its own
 record at
-`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
+`internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
 That page closed on the `"result" is null` face and says explicitly of the
 other two:
 
@@ -549,8 +549,8 @@ from `lib/src.zip`; `vm-cli/src/main.rs`,
 `native-builtins/src/service_loader.rs`, `native-api/src/registry.rs`,
 `native-io/src/stream_encoder.rs`, `classloading/src/class_manager.rs`,
 `regression-suite/corpus/run-corpus.sh`;
-`docs/internal/jdk-only/h2-under-jdk-only-three-arm-triage-20260805.md` and
-`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
+`internal/jdk-only/h2-under-jdk-only-three-arm-triage-20260805.md` and
+`internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
 
 **Wall-clock is not quoted as a result anywhere here**, with one exception that
 is called out as such: §3b quotes elapsed times *to show that two runs are not

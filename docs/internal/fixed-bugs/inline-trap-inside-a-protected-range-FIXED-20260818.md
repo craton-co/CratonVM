@@ -171,4 +171,4 @@ replay" until one of them lands.
   while this change was in flight. Still not the mechanism here: the open page
   was right that this shape falls outside it, and wrong about what catches it
   instead.
-* `apps/commons-math/RESULTS-20260817.md` — the suite run this came from.
+* retired/commons-math-suite-run-RETIRED-20260818.md — the suite run this came from, now closed.

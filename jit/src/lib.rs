@@ -15317,7 +15317,7 @@ fn precise_virtual_invokes_enabled() -> bool {
 ///
 /// ## Why it is this narrow
 ///
-/// `docs/internal/fixed-bugs/unresumable-unconditional-trap-mvmap-FIXED-20260802.md`
+/// `internal/fixed-bugs/unresumable-unconditional-trap-mvmap-FIXED-20260802.md`
 /// warns in as many words: *"Do not apply the publish-side rule blind... the
 /// naive form would refuse every trap-carrying artifact, including the many
 /// whose re-run-from-entry fallback works fine."* Two narrowing terms keep that
@@ -20904,6 +20904,61 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `System.arraycopy` intrinsic's scratch homes must be allocated
+    /// clear of the five operands' own frame homes.
+    ///
+    /// `pop_stack` reclaims a Frame slot sitting at the top of the spill
+    /// region, so the intrinsic's five pops rewind `next_spill_offset` back
+    /// over the very slots `flush_scratch_registers` spilled the oop operands
+    /// into. Basing the scratch homes on `next_spill_offset` therefore aliases
+    /// them BY CONSTRUCTION — and the emitter's own workaround (load all five
+    /// into distinct GPRs before storing any) only protects its own reads. The
+    /// deopt snapshot is a second consumer: it names each operand's original
+    /// home and reads it when the bail fires, long after `s_src_pos`'s store
+    /// has overwritten `dst`'s home with srcPos. A reference-array copy — which
+    /// always bails here, by design — then resumed with `Object(srcPos)` where
+    /// `dst` belonged and threw NullPointerException on a valid copy.
+    ///
+    /// A source witness because reproducing it needs a full `Vm`, an OSR-
+    /// compiled method and a specific spill layout; the executable half is
+    /// `regression-suite/src/RJitArraycopyRefDeopt.java`. Anchored on code
+    /// text, not line numbers.
+    #[test]
+    fn arraycopy_scratch_homes_are_allocated_clear_of_the_operand_homes() {
+        let src = std::fs::read_to_string(format!(
+            "{}/src/x64/bytecode_walk.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read bytecode_walk.rs");
+
+        let at = src
+            .find("let s_src = ")
+            .expect("the arraycopy scratch-home allocation must still exist");
+        let from = at.saturating_sub(2500);
+        let window = &src[from..at];
+
+        assert!(
+            window.contains("let mut scratch_base"),
+            "the arraycopy intrinsic's scratch homes are not computed from a base \
+             that clears the operand homes. Basing them on `next_spill_offset` \
+             aliases `dst`'s spilled home, and the deopt snapshot reads that home."
+        );
+        assert!(
+            window.contains("StackSlot::Frame(off)") && window.contains("scratch_base.max("),
+            "the scratch base must be pushed past EVERY operand that lives in a \
+             frame slot; a base that does not consult the operand homes cannot \
+             know it clears them"
+        );
+        // The five homes must all be derived from that base, not from
+        // `next_spill_offset` — the whole point of computing it.
+        let decls = &src[at..(at + 400).min(src.len())];
+        assert!(
+            !decls.contains("next_spill_offset"),
+            "an `s_*` scratch home is still taken from `next_spill_offset`, which \
+             is exactly the aliasing this base was introduced to remove"
+        );
+    }
 
     /// Every publication into `jit_cache` must stamp
     /// `CompiledMethod::requires_wrapped_entry`.

@@ -155,7 +155,7 @@ opened with `if !class_files_available() { eprintln!("Skipping…"); return; }`,
 which in cargo's output is `test jck_regression_gate ... ok` in 0.00 s.
 
 The committed baseline document itself records the third layer without knowing
-it. `docs/internal/gaps/jdk-regression-baseline.md` §"How to run" says:
+it. `internal/gaps/jdk-regression-baseline.md` §"How to run" says:
 
 ```bash
 # Default features (honest baseline — no synthetic JDK stubs):
@@ -214,8 +214,11 @@ mutations C and D).
 
 ### 3.5 The baseline document may be missing, and that is a failure
 
-`baseline_document()` searches `docs/internal/gaps/` then `gaps/` and **panics**
-if neither exists, naming both paths. `docs/internal` is being removed from
+`baseline_document()` searches the internal tree's `gaps/` directory first and
+the repo-root `gaps/` second, and **panics** if neither exists, naming both
+paths. (It is the one place in the tree that still spells the internal prefix in
+full, because it is a filesystem probe rather than a citation — see the
+`NOT_A_CITATION` row in `types/tests/doc_citation_paths.rs`.) `docs/internal` is being removed from
 history by a separate effort; if it goes, this fails, and that is the correct
 signal — a regression gate whose committed baseline was deleted is not a gate.
 The panic text says exactly that and tells the reader what to do. **NOM E33-4**
@@ -453,7 +456,7 @@ verbatim, compiled against a tree with no `docs/internal`):
 
 ```
 the committed JCK baseline document was not found. Searched:
-  …/vm/../docs/internal/gaps/jdk-regression-baseline.md
+  …/vm/../…/gaps/jdk-regression-baseline.md      <- the internal tree
   …/vm/../gaps/jdk-regression-baseline.md
 ```
 
@@ -568,7 +571,7 @@ Expect this to be **loud on its first run** — 1,000+ integration tests that no
 job has ever executed in this configuration. Land it advisory first and read the
 list before promoting it to blocking; `[gates=stale]`.
 
-### NOM E33-3 — `docs/internal/gaps/jdk-regression-baseline.md` — four stale numbers and a command that runs nothing
+### NOM E33-3 — `internal/gaps/jdk-regression-baseline.md` — four stale numbers and a command that runs nothing
 
 Doc change, not owned by this lane.
 

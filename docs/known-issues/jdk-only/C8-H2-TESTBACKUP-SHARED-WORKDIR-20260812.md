@@ -51,7 +51,7 @@ inherit the mess, including the **reference** side, where it reads as a VM
 defect and gets scored as one.
 
 `MVStoreException: Chunk N not found` is a known H2-side shape on this host in
-other contexts too — see `docs/internal/fixed-suite-bugs/h2-suite-bugs/`
+other contexts too — see `internal/fixed-suite-bugs/h2-suite-bugs/`
 (`TestLob`: `Chunk 18 not found`, `Chunk 6 not found`, both adjudicated as not
 CratonVM defects). A `Chunk N not found` in a shared-cwd run is *presumed
 fixture* until a fresh-cwd run says otherwise.

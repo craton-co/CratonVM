@@ -260,11 +260,26 @@ admitted, and which fails if either refusal arm is removed.
 
 The order is therefore:
 
-1. **VM-side multi-frame deopt resume** — build a chain of interpreter frames
-   from `ReconstructedFrame::caller_frames` instead of refusing it, at all three
-   sinks. A caller scope is parked mid-`invoke`, so its `ResumeSemantics` is
-   `RESUME` and the frame must resume *after* the call with the callee's result
-   pushed; that protocol does not exist yet.
+1. ~~VM-side multi-frame deopt resume.~~ **STARTED 2026-08-18 — done for the
+   deopt-exit sink (`resume_from_ir_deopt`), which is the one that materialises
+   fresh frames.** `materialise_inlined_chain` builds the whole chain
+   outermost-first or refuses it, and `push_inlined_chain` pushes what it built;
+   the split is structural because a deopt that half-materialises a chain has no
+   recovery. A refusal still falls back to the whole-method re-run, so the worst
+   case is the old behaviour. Three things it had to get right, each with a test
+   that fails when its guard is removed:
+   * a caller scope parks at the invoke's **successor**, not at its bci — the
+     call is already in progress (`RESUME`, not `REEXECUTE`), and this is the
+     computation `jit/src/lib.rs` says it cannot do because it has no bytecode;
+   * `Unsupported` in a caller's locals **refuses**, where the in-place OSR
+     transfer tolerates it — a materialised frame has no existing value to leave
+     alone, and every sink maps a missing slot to `Int(0)`;
+   * an inlined callee is resolved in the loader context of the scope that
+     encloses it, through `MemberResolver` — `method_key` is a bare string with
+     no VM and no loader, which is the ambiguity that door exists to close.
+
+   Still to do here: the other two sinks (`build_deopt_frame_inner` and the
+   OSR-exit transfer, which is item 2 below).
 2. **Multi-frame OSR-exit transfer**, and only then relax `osr_exit_policy`'s
    `caller.is_some()` refusal. Steps 1 and 2 are what make an inlined artifact
    usable by an OSR-only method at all.

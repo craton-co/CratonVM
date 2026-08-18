@@ -269,7 +269,7 @@ only hiding the sweep.
 
 `BENCHMARK.md` (Binary Trees bullet) records a 512 MiB young-semispace cap that
 measured as a **12–13% regression** and was reverted.
-`docs/internal/performance/binarytrees-bt18-half-gap-20260730.md` gives the
+`internal/performance/binarytrees-bt18-half-gap-20260730.md` gives the
 mechanism in full: the cap forced ~6x more young collections, and *every* young
 collection on that workload was falling back to the non-moving sweep
 (fallback reasons `missing-exact-rbp`,
