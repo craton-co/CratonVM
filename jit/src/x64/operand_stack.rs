@@ -353,6 +353,60 @@ impl Compiler {
         Some(cat2)
     }
 
+    /// The JVM category of the live operand-stack entries at `pc`, as an
+    /// index-aligned vector of `Some(true)` = category-2, `Some(false)` =
+    /// category-1, `None` = the analysis declined to type that entry.
+    ///
+    /// This is the **second-entry width oracle** that `dup2_top_cat2` is not:
+    /// that helper reads the one instruction before the dup and so can only
+    /// ever answer for the TOP entry, whereas `dup2_x2` needs the width of the
+    /// entry below it (and, for a category-1 top, the one below that) to know
+    /// how many compact entries its four JVM slots occupy.
+    ///
+    /// The source is `x64::stack_kinds`, the forward abstract interpretation
+    /// already computed for the deopt snapshot encoder. Using it to pick a
+    /// CODEGEN SHAPE is a stronger use than typing a snapshot, so it is
+    /// admitted only under the same two independent cross-checks the snapshot
+    /// encoder applies, plus a third:
+    ///
+    ///   * DEPTH — the analysis derives it from JVMS stack effects, the
+    ///     emitter from running its own opcode handlers. A modelling error
+    ///     that shifts the stack changes the depth.
+    ///   * REF-NESS — every entry the analysis calls a reference must be one
+    ///     the emitter's own oop mark also calls a reference. The marks are
+    ///     maintained for the GC, so this is a second opinion with a different
+    ///     provenance, and it catches an off-by-one that preserves depth.
+    ///   * THE TOP ENTRY, when `dup2_top_cat2` answers — a third, wholly
+    ///     independent peephole opinion. Disagreement means one of the two is
+    ///     wrong and neither may be used. (Checked by the caller, which is the
+    ///     only place that knows the dup's pc.)
+    ///
+    /// Any disagreement returns `None` and the caller stays interpreted.
+    pub(super) fn stack_entry_categories(&self, pc: usize) -> Option<Vec<Option<bool>>> {
+        let kinds = self.stack_kinds.get(pc)?;
+        if kinds.len() != self.stack.len() {
+            return None;
+        }
+        if self.stack_oop_marks.len() != self.stack.len() {
+            return None;
+        }
+        for (i, k) in kinds.iter().enumerate() {
+            let cat = k.is_category_2();
+            if cat.is_some() {
+                let says_ref = k.is_ref();
+                if self.stack_oop_marks[i] != says_ref {
+                    return None;
+                }
+            }
+        }
+        Some(
+            kinds
+                .iter()
+                .map(|k| k.is_category_2())
+                .collect(),
+        )
+    }
+
     /// Peek at the top of the simulated stack.
     /// Returns `StackSlot::Frame(0)` and sets `self.failed` on underflow.
     pub(super) fn peek_stack(&mut self) -> StackSlot {

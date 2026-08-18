@@ -475,7 +475,7 @@ CratonVM's client applies OpenSSL's SECLEVEL to the peer certificate; HotSpot
 applies the JDK's `jdk.certpath.disabledAlgorithms` rules, which exempt a trust
 anchor from the signature-algorithm check. The two VMs agree on `TestTools`
 only because H2 configures no trust store there. Filed as
-`docs/known-issues/tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816.md`
+`fixed-suite-bugs/tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816-FIXED-20260817.md`
 — it changes no verdict in this cluster, and it is a real divergence in the
 other direction (CratonVM refusing what HotSpot accepts), so it does not belong
 buried in a closed page.

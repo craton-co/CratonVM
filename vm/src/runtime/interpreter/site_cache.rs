@@ -259,6 +259,56 @@ pub struct MethodSiteInfo {
     pub num_params: u16,
 }
 
+/// Everything the interpreter's `new` (0xbb) opcode needs after resolution.
+///
+/// `Instruction::New` re-derived all of this on EVERY execution: a
+/// `class_manager` read plus `get_class_name(cp_index).to_string()` (a fresh
+/// `String` per allocation), a full `resolve_class_loader_aware`, a second
+/// `class_manager` read for `check_class_access`, an
+/// `ensure_class_initialized_shared` (a third), and a fourth for
+/// `num_total_fields`. None of it can change for a site that this table admits
+/// — see [`ClassSiteCache`] for which sites those are.
+#[derive(Clone, Copy)]
+pub struct ResolvedNewSite {
+    /// The class `new` allocates.
+    pub class_id: ClassId,
+    /// `Class::num_total_fields` as of the fill. A layout replacement moves it
+    /// — and bumps `resolution_epoch`, which is one half of the entry's tag.
+    pub num_fields: u32,
+}
+
+/// Per-thread resolved `new`-site cache.
+///
+/// # Which sites are admissible
+///
+/// Only those whose referencing class has **no loader namespace**: no entry in
+/// the defining-loader side table, and a class-manager loader id that is not
+/// `UserDefined`. For such a class `resolve_class_loader_aware` reduces to the
+/// global name → `ClassId` mapping plus the resolution memo, which is exactly
+/// what this module's two epochs cover. The field arm draws the same line, and
+/// puts its loader-sensitive half behind a separate flag for the same reason.
+///
+/// That property is **immutable per class**, not merely current: a defining
+/// loader is fixed when the class is defined, so an app- or bootstrap-defined
+/// referencing class can never later acquire one. Checking it at FILL time is
+/// therefore a complete guard, and the hit path needs no re-check.
+///
+/// # What a hit is allowed to skip
+///
+/// The access check (JVMS §5.4.4) is a function of the (accessor, target) pair
+/// alone, and neither class's identity or modifiers change once defined — so a
+/// site that passed once passes forever.
+///
+/// Class initialization is monotonic (JVMS §5.5): an entry is only filled after
+/// `ensure_class_initialized_shared` has returned `Ok`, so a hit cannot be the
+/// first touch. This is the one skip worth naming, because
+/// `ensure_class_initialized_shared`'s own "fast path" still takes a
+/// `class_manager` read lock — the hit would otherwise keep paying a lock for a
+/// question already answered. A redefinition latches the whole table off
+/// (`any_class_redefined`) and class unloading bumps `class_definition_epoch`,
+/// so neither can strand an entry describing an uninitialized class.
+pub type ClassSiteCache = SiteCache<ResolvedNewSite>;
+
 /// Per-thread resolved-field sites. Stores the whole `ResolvedField` — it is
 /// plain data (ids, an index and four flag bytes), so a hit clones no `Arc`.
 pub type FieldSiteCache = SiteCache<cratonvm_classloading::resolution::ResolvedField>;
@@ -285,8 +335,16 @@ pub mod site_stats {
     pub const METHOD_HIT: usize = 4;
     pub const METHOD_MISS: usize = 5;
     pub const METHOD_FILL: usize = 6;
+    pub const NEW_HIT: usize = 7;
+    pub const NEW_MISS: usize = 8;
+    pub const NEW_FILL: usize = 9;
+    /// A `new` site refused a fill because its referencing class has a loader
+    /// namespace. A workload whose whole `new` traffic lands here is one the
+    /// cache cannot help, and saying so is the difference between "measured no
+    /// effect" and "never fired".
+    pub const NEW_REJECT_LOADER: usize = 10;
 
-    const N: usize = 7;
+    const N: usize = 11;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -312,7 +370,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -321,6 +379,10 @@ pub mod site_stats {
             COUNTS[METHOD_HIT].load(Ordering::Relaxed),
             COUNTS[METHOD_MISS].load(Ordering::Relaxed),
             COUNTS[METHOD_FILL].load(Ordering::Relaxed),
+            COUNTS[NEW_HIT].load(Ordering::Relaxed),
+            COUNTS[NEW_MISS].load(Ordering::Relaxed),
+            COUNTS[NEW_FILL].load(Ordering::Relaxed),
+            COUNTS[NEW_REJECT_LOADER].load(Ordering::Relaxed),
         );
     }
 

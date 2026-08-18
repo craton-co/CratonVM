@@ -1,5 +1,6 @@
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
@@ -1510,6 +1511,25 @@ public class RJdkIntrinsics3 {
             t = x;
         }
         ckX("bigdec:BigDecimal.valueOf(NaN)", t, "java.lang.NumberFormatException");
+        // Both infinities, because valueOf's guard is one `isFinite` test and a
+        // fix that checks only NaN passes the row above while leaving these two
+        // answering a NUMBER. Measured: all three returned 0.
+        t = null;
+        try {
+            sinkO = BigDecimal.valueOf(dInf);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("bigdec:BigDecimal.valueOf(+Inf)", t, "java.lang.NumberFormatException");
+        ckS("bigdec:BigDecimal.valueOf(+Inf) message", t == null ? null : t.getMessage(),
+                "Infinite or NaN");
+        t = null;
+        try {
+            sinkO = BigDecimal.valueOf(dNegInf);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("bigdec:BigDecimal.valueOf(-Inf)", t, "java.lang.NumberFormatException");
 
         // -- toString vs toPlainString ----------------------------------------
         BigDecimal sci = new BigDecimal("1E+10");
@@ -1584,7 +1604,7 @@ public class RJdkIntrinsics3 {
         ckS("bigdec:-2.9 toBigInteger", new BigDecimal("-2.9").toBigInteger().toString(), "-2");
         ckS("bigdec:1E+10 toBigInteger", sci.toBigInteger().toString(), "10000000000");
 
-        sectionEnd("bigdec", 56);
+        sectionEnd("bigdec", 59);
     }
 
     // ========================================================================
@@ -2357,7 +2377,27 @@ public class RJdkIntrinsics3 {
         }
         ckX("regex:findWithinHorizon(s, -1)", t, "java.lang.IllegalArgumentException");
 
-        sectionEnd("regex", 42);
+        // Scanner over a READABLE, not a String. Every Scanner row above uses
+        // the String constructor, which is why an empty Scanner(Reader) was
+        // invisible: `new Scanner(System.in)`, `new Scanner(new FileReader(f))`
+        // and `new Scanner(new InputStreamReader(s))` all take this path.
+        Scanner sr = new Scanner(new StringReader("hello 42 world"));
+        ckB("regex:Scanner(Reader).hasNext()", sr.hasNext(), true);
+        ckS("regex:Scanner(Reader).next()", sr.next(), "hello");
+        ckI("regex:Scanner(Reader).nextInt()", sr.nextInt(), 42);
+
+        // Longer than one read chunk, so a chunked drain that stops after the
+        // first block is caught. 5000 'a' then a space then a token.
+        StringBuilder big = new StringBuilder();
+        for (int i = 0; i < 5000; i++) {
+            big.append('a');
+        }
+        big.append(" tail");
+        Scanner sr2 = new Scanner(new StringReader(big.toString()));
+        ckI("regex:Scanner(Reader) first token spans chunks", sr2.next().length(), 5000);
+        ckS("regex:Scanner(Reader) token after the chunk boundary", sr2.next(), "tail");
+
+        sectionEnd("regex", 47);
     }
 
     // ========================================================================

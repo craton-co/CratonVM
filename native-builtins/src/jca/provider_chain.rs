@@ -1271,6 +1271,55 @@ pub(crate) fn canonical_service_algorithm(
     }
 }
 
+/// [`canonical_if_unrecognised`] for the ANONYMOUS overloads, where the rewrite
+/// may only come from a provider this VM implements natively.
+///
+/// An alias row is owned by the provider that registered it, and it means that
+/// provider's implementation. `Alg.Alias.Mac.2.16.840.1.101.3.4.2.1` is
+/// BouncyCastle's, and it names BouncyCastle's `SHA256$HashMac` — a PKCS#12
+/// capable MAC that derives its key from a `PKCS12Key` plus a
+/// `PBEParameterSpec`. Rewriting the caller's OID to `HmacSHA256` on the
+/// strength of that row and then serving it from this crate's plain HMAC
+/// borrows one provider's NAME to reach another's IMPLEMENTATION, and the two
+/// are not the same function — measured, they disagree on every byte.
+///
+/// The cost was silent and asymmetric. BouncyCastle's
+/// `JcePKCS12MacCalculatorBuilder` builds its MAC through the ANONYMOUS
+/// `Mac.getInstance(oid)` while `JcePKCS12MacCalculatorBuilderProvider` names
+/// BC, so a PKCS#12 file got a MAC from this engine and was then verified
+/// against BouncyCastle's: `PfxPduTest.testCreateAES256andSHA256`, where the
+/// stored and recomputed MacData differed for SHA-256 and agreed for SHA-1
+/// (SunJCE owns neither OID; the SHA-1 one simply had no rewrite this engine
+/// accepted).
+///
+/// A provider outside `NATIVELY_SERVICED_PROVIDERS` therefore does not get to
+/// rename anything here; the caller's own spelling goes to the chain instead,
+/// which hands the call to the provider that owns it.
+pub(crate) fn canonical_if_unrecognised_native_only(
+    type_str: &str,
+    algo: &str,
+    recognised: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    if recognised(algo) {
+        return None;
+    }
+    let type_n = normalize_engine(type_str);
+    let algo_n = normalize_algo(algo);
+    let names = snapshot();
+    let table = aliases().lock();
+    let canonical = names.into_iter().find_map(|(name, _, _)| {
+        if !NATIVELY_SERVICED_PROVIDERS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(&name))
+        {
+            return None;
+        }
+        table.get(&(name, type_n.clone(), algo_n.clone())).cloned()
+    })?;
+    drop(table);
+    recognised(&canonical).then_some(canonical)
+}
+
 /// `algo` rewritten to the canonical name a native engine recognises, or `None`
 /// when no rewrite helps.
 ///

@@ -230,10 +230,13 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 .into());
             };
             // An `Alg.Alias.Mac.<oid>` spelling resolves to the primary name
-            // first — see `provider_chain::canonical_service_algorithm`. The
-            // anonymous overload searches the chain in chain order.
-            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
-                None,
+            // first — but only through a provider this VM implements. A
+            // THIRD-PARTY provider's alias row names that provider's own MAC,
+            // not a rename this engine may answer; see
+            // `provider_chain::canonical_if_unrecognised_native_only`. The
+            // anonymous overload then searches the chain in chain order below,
+            // which is what hands such a name to its owner.
+            let algo = crate::jca::provider_chain::canonical_if_unrecognised_native_only(
                 "Mac",
                 &algo,
                 &mac_algorithm_supported,
@@ -2717,6 +2720,25 @@ pub(crate) fn new13_connect_and_handshake(
     new13_connect_and_handshake_on(ctx, host, port, extra_root_ders, java_tm_key, max_protocol, None)
 }
 
+/// Is the default client path backed by the raw `openssl::SslConnector`
+/// (`servlet::s2_openssl_tls_connect_on`) rather than by
+/// `native_tls::TlsConnector`?
+///
+/// Default ON, off with `CRATONVM_TLS_OPENSSL_CLIENT=0`. The switch exists so
+/// the two backends can be A/B'd inside ONE binary — a cross-binary comparison
+/// against a separately-built tree is not an A/B, and has invented regressions
+/// on phases the change cannot reach.
+///
+/// Unix only, because `openssl` is a Unix-scoped dependency of this crate (see
+/// `native-builtins/Cargo.toml`). On Windows the SChannel-backed native-tls
+/// path stays exactly as it was, leaf-only chain included: `schannel` exposes
+/// no chain accessor through native-tls either, so closing it there needs a
+/// different backend, not a different configuration.
+#[cfg(unix)]
+fn openssl_client_enabled() -> bool {
+    crate::nbflags().tls_openssl_client
+}
+
 /// [`new13_connect_and_handshake`], optionally over a connection the caller
 /// already established (`SSLSocket.connect`'s deferred-handshake path — see
 /// [`PendingConnectSocket::tcp`]). `None` connects here, as before.
@@ -2778,27 +2800,109 @@ pub(crate) fn new13_connect_and_handshake_on(
     // installed as its trust anchor is something JSSE accepts and OpenSSL, at
     // this level, cannot be told to.
     //
-    // native-tls exposes no security-level control (that needs a raw
-    // `SslConnector`, as `s2_legacy_dsa_tls_connect_on` uses), so for THIS
-    // case — and only this one — the verdict moves to the validator that
-    // already implements the JDK's rules, exactly as the Java-TrustManager
-    // path above does: native verification stands down and the captured chain
-    // is checked against the configured anchors immediately after connect,
-    // failing closed.
+    // So for THIS case — and only this one — the verdict moves to the
+    // validator that already implements the JDK's rules, exactly as the
+    // Java-TrustManager path above does: native verification stands down and
+    // the captured chain is checked against the configured anchors
+    // immediately after connect, failing closed.
     //
     // The blast radius is deliberately the set of connections that are
     // MISCONFIGURED today: an application that named a trust store and was
     // being validated against the platform roots regardless. A connection
     // with no `javax.net.ssl.trustStore` keeps OpenSSL as its verifier,
     // untouched.
+    //
+    // WHY THIS STAYS, now that the connector below CAN set a security level
+    // (`servlet::CLIENT_SECURITY_LEVEL`): the level is a floor on key sizes
+    // and signature algorithms, and even level 0 does not make OpenSSL's path
+    // builder agree with the JDK's rules — the JDK exempts a TRUST ANCHOR
+    // from the signature-algorithm check entirely, which is not a level.
+    // MEASURED on the arm this case exists for (`TmProbe`): the VM's own
+    // validator accepts a 1024-bit MD5-self-signed certificate installed as
+    // the anchor and rejects the same certificate when it is not, matching
+    // HotSpot on both. Moving a just-fixed path back onto a different
+    // verifier to save one branch would put that verdict at risk for nothing.
     let verify_against_default_roots = jsse_default_roots.is_some();
-    let connector = new13_build_connector(
-        extra_root_ders,
-        java_tm_key.is_some() || verify_against_default_roots,
-        max_protocol,
-        jsse_default_roots,
-    )
-    .map_err(|msg| RuntimeError::IOException { message: msg })?;
+    // FIX (tls-client-trust-is-openssl-seclevel, residue): JSSE's default
+    // trust store for a connection that configured NOTHING — no
+    // `javax.net.ssl.trustStore`, no explicit roots, no TrustManager. That is
+    // `<java.home>/lib/security/{jssecacerts,cacerts}`, and this path had been
+    // using the OS store (`/etc/ssl/certs`, via
+    // `SSL_CTX_set_default_verify_paths`) instead.
+    //
+    // MEASURED (`TrustSetProbe`, keyed on the SHA-256 of each encoded
+    // certificate): the OS store is a strict SUPERSET — 122 anchors against
+    // cacerts' 118, overlap 118, four trusted here that the JDK does not, one
+    // of which is the BUILD HOST'S OWN self-signed machine certificate sitting
+    // in `/etc/ssl/certs`. So every default-context client in the VM trusted a
+    // CA the JDK deliberately does not, which is the widening direction.
+    //
+    // `default_trust_store_keystore_id` answers 0 — keep today's platform
+    // roots — whenever the file is absent, unreadable, unparseable or parses
+    // to zero entries, so a VM with no JDK image (synthetic-jdk mode) is
+    // unaffected. Only reachable on the raw connector: `native_tls` has no
+    // "replace the built-in roots" that also keeps its own verifier.
+    #[cfg(unix)]
+    let jdk_default_roots: Option<Vec<Vec<u8>>> = if openssl_client_enabled()
+        && !legacy_dsa_context
+        && extra_root_ders.is_empty()
+        && java_tm_key.is_none()
+        && jsse_default_roots.is_none()
+    {
+        match crate::tls::default_trust_store_keystore_id(ctx) {
+            0 => None,
+            id => {
+                let state = crate::x509_manager::build_trust_manager_state(id);
+                (!state.anchor_ders.is_empty()).then_some(state.anchor_ders)
+            }
+        }
+    } else {
+        None
+    };
+    // The raw-OpenSSL connector's configuration, or `None` to keep native-tls.
+    // Every arm restates what `new13_build_connector` would have configured;
+    // the two differ only in what native-tls cannot express (the full peer
+    // chain, and the certificate security level).
+    #[cfg(unix)]
+    let openssl_cfg: Option<crate::servlet::OpensslClientConfig> =
+        if openssl_client_enabled() && !legacy_dsa_context {
+            // The anchors, and whether they REPLACE the platform set. JSSE's
+            // rule is replace for a store that was resolved as "the default
+            // trust material" (the property, or cacerts); a per-`SSLContext`
+            // custom anchor set has always been ADDITIVE here and stays so.
+            let (roots, replace_roots) = match (jsse_default_roots, jdk_default_roots) {
+                (Some(roots), _) => (roots.to_vec(), true),
+                (None, Some(roots)) => (roots, true),
+                (None, None) => (extra_root_ders.to_vec(), false),
+            };
+            Some(crate::servlet::OpensslClientConfig {
+                roots,
+                replace_roots,
+                skip_verify: java_tm_key.is_some() || verify_against_default_roots,
+                max_tls12: matches!(max_protocol, Some(native_tls::Protocol::Tlsv12)),
+            })
+        } else {
+            None
+        };
+    #[cfg(unix)]
+    let use_openssl = openssl_cfg.is_some();
+    #[cfg(not(unix))]
+    let use_openssl = false;
+    // Not built at all when the raw connector is in charge: building one reads
+    // the OS root store, which is exactly the set this path is moving off.
+    let connector = if use_openssl {
+        None
+    } else {
+        Some(
+            new13_build_connector(
+                extra_root_ders,
+                java_tm_key.is_some() || verify_against_default_roots,
+                max_protocol,
+                jsse_default_roots,
+            )
+            .map_err(|msg| RuntimeError::IOException { message: msg })?,
+        )
+    };
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
     // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
     // client createSocket, which already announces this — see its "T19.H1"
@@ -2815,19 +2919,39 @@ pub(crate) fn new13_connect_and_handshake_on(
     // heap alone does not suppress it either since young-gen collections
     // still fire from ordinary allocation churn on OTHER threads.
     ctx.begin_blocking_region();
+    // `connector` is `Some` exactly when `openssl_cfg` is `None`, one line
+    // apart above. The arms below still spell the impossible combination as a
+    // handshake failure rather than an `unwrap`: a panic inside a blocking
+    // region is a far worse failure mode than a refused connection.
+    let no_connector = || {
+        crate::servlet::TlsConnectFailure::Handshake(
+            "no TLS connector was configured for this connection".to_string(),
+        )
+    };
     #[cfg(unix)]
-    let connect_result = match (legacy_dsa_context, established) {
-        (true, Some(tcp)) => {
+    let connect_result = match (legacy_dsa_context, openssl_cfg.as_ref(), established) {
+        (true, _, Some(tcp)) => {
             crate::servlet::s2_legacy_dsa_tls_connect_on(host, port, extra_root_ders, tcp)
         }
-        (true, None) => crate::servlet::s2_legacy_dsa_tls_connect(host, port, extra_root_ders),
-        (false, Some(tcp)) => crate::servlet::s2_tls_connect_on(&connector, host, port, tcp),
-        (false, None) => crate::servlet::s2_tls_connect(&connector, host, port),
+        (true, _, None) => crate::servlet::s2_legacy_dsa_tls_connect(host, port, extra_root_ders),
+        (false, Some(cfg), Some(tcp)) => {
+            crate::servlet::s2_openssl_tls_connect_on(cfg, host, port, tcp)
+        }
+        (false, Some(cfg), None) => crate::servlet::s2_openssl_tls_connect(cfg, host, port),
+        (false, None, Some(tcp)) => match connector.as_ref() {
+            Some(c) => crate::servlet::s2_tls_connect_on(c, host, port, tcp),
+            None => Err(no_connector()),
+        },
+        (false, None, None) => match connector.as_ref() {
+            Some(c) => crate::servlet::s2_tls_connect(c, host, port),
+            None => Err(no_connector()),
+        },
     };
     #[cfg(not(unix))]
-    let connect_result = match established {
-        Some(tcp) => crate::servlet::s2_tls_connect_on(&connector, host, port, tcp),
-        None => crate::servlet::s2_tls_connect(&connector, host, port),
+    let connect_result = match (connector.as_ref(), established) {
+        (Some(c), Some(tcp)) => crate::servlet::s2_tls_connect_on(c, host, port, tcp),
+        (Some(c), None) => crate::servlet::s2_tls_connect(c, host, port),
+        (None, _) => Err(no_connector()),
     };
     ctx.end_blocking_region();
     // A REJECTED HANDSHAKE is `javax.net.ssl.SSLHandshakeException` on JSSE —

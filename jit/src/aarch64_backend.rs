@@ -27,18 +27,34 @@
 //! arm, **39** do not (table below). Of the 163, five arms exist but always
 //! refuse the method — `invokestatic` (`0xb8`, no call-target resolution) and
 //! `idiv`/`ldiv`/`irem`/`lrem` (see the safety notes) — so **158** opcodes
-//! actually lower. For comparison, `x64.rs` has an arm for 192 of the same
-//! 202 and lacks only `dup2_x2`, `frem`, `drem`, `jsr`, `ret`, `wide`,
-//! `goto_w`, `jsr_w`. (`pop2` and `dup2_x1` were on that list until the
-//! commons-math throughput fix added x64 arms for them — see
-//! `fixed-suite-bugs/bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816-FIXED.md`.
-//! `dup2_x2` is the one this backend lowers and x64 still does not, and
-//! `jit_scan` admits it, so on x64 a method containing one reaches the
-//! codegen's `_ =>` catch-all and stays interpreted for the life of the
-//! process.)
+//! actually lower. Two more arms — `ldc`/`ldc_w` (`0x12`/`0x13`) and `ldc2_w`
+//! (`0x14`) — also always refuse, for want of a constant pool, so the real
+//! figure is **156**. For comparison, `x64.rs` has an arm for 193 of the same
+//! 202 and lacks only `frem`, `drem`, `jsr`, `ret`, `wide`, `goto_w`, `jsr_w`.
+//! (`pop2`, `dup2_x1` and `dup2_x2` were on that list until the commons-math
+//! throughput fix and the `dup2_x2` fix added x64 arms for them — see
+//! `fixed-suite-bugs/bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816-FIXED.md`
+//! and
+//! `fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md`.
+//! `x64::tests::scan_admitted_opcodes_are_lowered_or_declared` now fails if a
+//! scan-admitted opcode ever loses its x64 arm again.)
 //!
-//! What lowers: constants (`*const_*`, `bipush`, `sipush`,
-//! `ldc`/`ldc_w`/`ldc2_w` for numeric constants), local load/store for
+//! **The stack shuffles are category- and stack-aware as of 2026-08-18, and
+//! were not before.** This backend keeps TWO simulated operand stacks —
+//! `operand_stack` for int/long/reference and `float_operand_stack` for
+//! float/double — and `pop`/`pop2`/`dup`/`dup_x1`/`dup_x2`/`dup2`/`dup2_x1`/
+//! `dup2_x2`/`swap` each popped a FIXED number of entries from the first one.
+//! A `float`/`double` operand is on the other stack, so those arms shuffled
+//! unrelated integer values and left the FP value untouched — silently, with
+//! no underflow, whenever the integer stack happened to be deep enough. And a
+//! `long` is ONE entry here and TWO JVM slots, so every `pop2`/`dup2*`/
+//! `dup_x2` form except the all-category-1 one touched the wrong number of
+//! entries. All nine arms now consult [`Arm64Backend::int_stack_shuffle_entries`]
+//! and refuse the method when the operands cannot be proven integer-stack
+//! values of a known category.
+//!
+//! What lowers: constants (`*const_*`, `bipush`, `sipush` — the `ldc` family
+//! has arms but refuses, there being no constant pool here), local load/store for
 //! int/long/float/double/reference, `iinc`, int/long/float/double arithmetic
 //! and bitwise ops **except division and remainder**, the numeric conversions
 //! (`i2l` … `i2s`), `fcmp*`/`dcmp*`/`lcmp`, all
@@ -868,6 +884,22 @@ pub struct Arm64Backend {
     float_local_regs: Vec<Option<Arm64Register>>,
     /// Simulated operand stack (tracks which register holds each stack slot).
     operand_stack: Vec<Arm64Register>,
+    /// Per-bci operand-stack kinds, for the stack-shuffle opcodes only.
+    ///
+    /// This backend keeps TWO simulated stacks — `operand_stack` for
+    /// int/long/reference and `float_operand_stack` for float/double — and its
+    /// shuffle arms only ever touched the first one, by a fixed number of
+    /// entries. Both assumptions are wrong in general: `dup` of a `double`
+    /// shuffles the wrong stack entirely, and every `pop2`/`dup2*` form except
+    /// the all-category-1 one touches a different number of entries than the
+    /// arm popped. See [`Arm64Backend::int_stack_shuffle_entries`].
+    ///
+    /// Populated with EMPTY metadata, which costs nothing here: the analysis
+    /// needs field types, call arities and constant-pool tags, and this backend
+    /// refuses every method containing a field access, a call of any kind, or
+    /// any `ldc`, so no admissible method has a site the analysis would need
+    /// them for.
+    stack_kinds: crate::x64::stack_kinds::StackKindMap,
     /// Simulated float operand stack (V registers).
     float_operand_stack: Vec<Arm64Register>,
     /// Next scratch register to hand out (cycles through X9-X15).
@@ -941,6 +973,7 @@ impl Arm64Backend {
             local_regs: Vec::new(),
             float_local_regs: Vec::new(),
             operand_stack: Vec::new(),
+            stack_kinds: crate::x64::stack_kinds::StackKindMap::default(),
             float_operand_stack: Vec::new(),
             scratch_cursor: 0,
             float_scratch_cursor: 0,
@@ -1102,6 +1135,109 @@ impl Arm64Backend {
         }
         self.scratch_cursor += 1;
         r
+    }
+
+
+    /// Run the shared operand-stack kind analysis over `bytecode`.
+    ///
+    /// See the `stack_kinds` field for why empty metadata is sufficient on
+    /// this backend.
+    fn analyze_stack_kinds(bytecode: &[u8]) -> crate::x64::stack_kinds::StackKindMap {
+        use crate::x64::stack_kinds::{analyze, StackKindInputs};
+        let refs = rustc_hash::FxHashSet::default();
+        let inputs = StackKindInputs {
+            field_types: rustc_hash::FxHashMap::default(),
+            static_types: rustc_hash::FxHashMap::default(),
+            calls: rustc_hash::FxHashMap::default(),
+            ldc_refs: &refs,
+            ldc_fp: &refs,
+            ldc_resolved: &refs,
+        };
+        analyze(bytecode, bytecode.len(), &inputs)
+    }
+
+    /// How many `operand_stack` entries the stack-shuffle at `pc` may touch,
+    /// or `None` when this backend must refuse the method.
+    ///
+    /// `want` is the number of TOP-OF-STACK entries the arm needs to be
+    /// integer-stack values; the answer is `Some(n)` only when the analysis
+    /// types all of them and none is a `float`/`double`.
+    ///
+    /// **Why a refusal and not a shuffle.** The shuffle arms below were written
+    /// against a single stack of category-1 values, and this backend has
+    /// neither property:
+    ///
+    ///   * A `float`/`double` operand lives on `float_operand_stack`. Popping
+    ///     `operand_stack` for it takes an unrelated value — or underflows into
+    ///     a caller's entry — and pushes the shuffled result onto a stack the
+    ///     consuming arm will not read.
+    ///   * A `long` is ONE entry here and TWO JVM slots, so every
+    ///     `pop2`/`dup2`/`dup2_x1`/`dup2_x2`/`dup_x2` form except the
+    ///     all-category-1 one touches a different number of entries than the
+    ///     arm popped.
+    ///
+    /// Both produce a silently wrong operand stack, which this file's own
+    /// `irem`/`lrem` note already calls worse than a bail: "A silent wrong
+    /// answer is worse than a bail". This is the answer to the question the
+    /// x64 `dup2_x2` page left open — whether that backend's unconditional
+    /// four-pop was live here. It was, and so were four more arms.
+    fn int_stack_shuffle_entries(&mut self, pc: usize, want: usize) -> Option<Vec<bool>> {
+        let kinds = self.stack_kinds.get(pc)?;
+        if kinds.len() < want {
+            return None;
+        }
+        let mut cats = Vec::with_capacity(want);
+        for k in kinds[kinds.len() - want..].iter().rev() {
+            match k {
+                crate::x64::stack_kinds::StackKind::Int
+                | crate::x64::stack_kinds::StackKind::Ref => cats.push(false),
+                crate::x64::stack_kinds::StackKind::Long => cats.push(true),
+                // Float / Double live on the OTHER stack; Unknown is not a
+                // guess this may make.
+                _ => return None,
+            }
+        }
+        // `cats[0]` is the top, `cats[1]` the entry below it, ...
+        Some(cats)
+    }
+
+
+    /// The shared `dup2_x1` / `dup2_x2` shuffle:
+    /// `[under.., group..] -> [group.., under.., group..]`, counted in
+    /// `operand_stack` ENTRIES rather than JVM slots.
+    ///
+    /// Both opcodes differ only in how many entries each group is, and both
+    /// resolve that from [`Arm64Backend::int_stack_shuffle_entries`] before
+    /// calling here, so this routine never has to guess a category.
+    fn emit_dup_group_over(&mut self, group_entries: usize, under_entries: usize) {
+        // Pop top-down: `group[0]` is the topmost value.
+        let mut group = Vec::with_capacity(group_entries);
+        for _ in 0..group_entries {
+            group.push(self.pop_operand());
+        }
+        let mut under = Vec::with_capacity(under_entries);
+        for _ in 0..under_entries {
+            under.push(self.pop_operand());
+        }
+        // One fresh scratch per duplicated entry. `alloc_scratch` round-robins,
+        // so take them all before emitting to avoid a copy landing in a
+        // register a later copy is about to overwrite.
+        let copies: Vec<Arm64Register> = (0..group_entries).map(|_| self.alloc_scratch()).collect();
+        for (copy, src) in copies.iter().zip(group.iter()) {
+            self.buffer.emit(Arm64Instruction::Mov {
+                rd: *copy,
+                rm: *src,
+            });
+        }
+        for copy in copies.into_iter().rev() {
+            self.push_operand(copy);
+        }
+        for reg in under.into_iter().rev() {
+            self.push_operand(reg);
+        }
+        for reg in group.into_iter().rev() {
+            self.push_operand(reg);
+        }
     }
 
     /// Push a value onto the simulated operand stack.
@@ -1473,6 +1609,7 @@ impl Arm64Backend {
         self.spill_map.clear();
         self.num_params = num_params;
         self.method_info = method_info;
+        self.stack_kinds = Self::analyze_stack_kinds(bytecode);
 
         // Run graph-coloring register allocation for ARM64.
         let alloc = super::regalloc::allocate_registers_arm64(
@@ -1791,6 +1928,16 @@ impl Arm64Backend {
                 }
                 // dup — duplicate top of stack
                 0x59 => {
+                    // JVMS: category-1 only. A `double` on top would live on
+                    // `float_operand_stack`, so duplicating `operand_stack`'s
+                    // top copies an unrelated value.
+                    match self.int_stack_shuffle_entries(start_pc, 1) {
+                        Some(c) if !c[0] => {}
+                        _ => {
+                            success = false;
+                            break;
+                        }
+                    }
                     let top = self.pop_operand();
                     let dup = self.alloc_scratch();
                     self.buffer.emit(Arm64Instruction::Mov { rd: dup, rm: top });
@@ -1799,15 +1946,47 @@ impl Arm64Backend {
                 }
                 // pop
                 0x57 => {
+                    // JVMS: category-1 only, and it must be on the int stack.
+                    match self.int_stack_shuffle_entries(start_pc, 1) {
+                        Some(c) if !c[0] => {}
+                        _ => {
+                            success = false;
+                            break;
+                        }
+                    }
                     let _ = self.pop_operand();
                 }
                 // pop2
                 0x58 => {
-                    let _ = self.pop_operand();
-                    let _ = self.pop_operand();
+                    // FORM 2 is a single category-2 entry here, not two.
+                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 1) else {
+                        success = false;
+                        break;
+                    };
+                    if cats[0] {
+                        let _ = self.pop_operand();
+                    } else {
+                        match self.int_stack_shuffle_entries(start_pc, 2) {
+                            Some(c) if !c[1] => {}
+                            _ => {
+                                success = false;
+                                break;
+                            }
+                        }
+                        let _ = self.pop_operand();
+                        let _ = self.pop_operand();
+                    }
                 }
                 // swap
                 0x5f => {
+                    // JVMS: both operands category-1.
+                    match self.int_stack_shuffle_entries(start_pc, 2) {
+                        Some(c) if !c[0] && !c[1] => {}
+                        _ => {
+                            success = false;
+                            break;
+                        }
+                    }
                     let a = self.pop_operand();
                     let b = self.pop_operand();
                     self.push_operand(a);
@@ -2430,7 +2609,17 @@ impl Arm64Backend {
                 }
 
                 // -- dup_x1 (0x5a) --
+                //
+                // JVMS: both operands category-1. A `float`/`double` in either
+                // position is on the other stack; refuse.
                 0x5a => {
+                    match self.int_stack_shuffle_entries(start_pc, 2) {
+                        Some(c) if !c[0] && !c[1] => {}
+                        _ => {
+                            success = false;
+                            break;
+                        }
+                    }
                     let val1 = self.pop_operand();
                     let val2 = self.pop_operand();
                     let dup = self.alloc_scratch();
@@ -2442,71 +2631,160 @@ impl Arm64Backend {
                 }
 
                 // -- dup_x2 (0x5b) --
+                //
+                // FORM 1 is three category-1 entries; FORM 2 is a category-1
+                // top over ONE category-2, i.e. two entries. The old
+                // unconditional three-pop was FORM 1 only.
                 0x5b => {
+                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 2) else {
+                        success = false;
+                        break;
+                    };
+                    if cats[0] {
+                        success = false; // no dup_x2 form has a category-2 top
+                        break;
+                    }
+                    let below_entries = if cats[1] {
+                        1 // FORM 2 — one category-2 entry under the top
+                    } else {
+                        match self.int_stack_shuffle_entries(start_pc, 3) {
+                            Some(c) if !c[2] => 2, // FORM 1
+                            _ => {
+                                success = false;
+                                break;
+                            }
+                        }
+                    };
                     let val1 = self.pop_operand();
-                    let val2 = self.pop_operand();
-                    let val3 = self.pop_operand();
+                    let mut below = Vec::with_capacity(below_entries);
+                    for _ in 0..below_entries {
+                        below.push(self.pop_operand());
+                    }
                     let dup = self.alloc_scratch();
                     self.buffer
                         .emit(Arm64Instruction::Mov { rd: dup, rm: val1 });
                     self.push_operand(dup);
-                    self.push_operand(val3);
-                    self.push_operand(val2);
+                    for reg in below.into_iter().rev() {
+                        self.push_operand(reg);
+                    }
                     self.push_operand(val1);
                 }
 
                 // -- dup2 (0x5c) --
+                //
+                // FORM 2 is a single category-2 entry, duplicated like `dup`.
+                // The old unconditional two-pop duplicated an unrelated value
+                // sitting under the long — the exact miscompile the x64
+                // backend was fixed for (`dup2_category_safe`'s doc comment).
                 0x5c => {
-                    let val1 = self.pop_operand();
-                    let val2 = self.pop_operand();
-                    let dup1 = self.alloc_scratch();
-                    let dup2 = self.alloc_scratch();
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup1, rm: val1 });
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup2, rm: val2 });
-                    self.push_operand(val2);
-                    self.push_operand(val1);
-                    self.push_operand(dup2);
-                    self.push_operand(dup1);
+                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 1) else {
+                        success = false;
+                        break;
+                    };
+                    if cats[0] {
+                        let val = self.pop_operand();
+                        let dup = self.alloc_scratch();
+                        self.buffer
+                            .emit(Arm64Instruction::Mov { rd: dup, rm: val });
+                        self.push_operand(val);
+                        self.push_operand(dup);
+                    } else {
+                        match self.int_stack_shuffle_entries(start_pc, 2) {
+                            Some(c) if !c[1] => {}
+                            _ => {
+                                success = false;
+                                break;
+                            }
+                        }
+                        let val1 = self.pop_operand();
+                        let val2 = self.pop_operand();
+                        let dup1 = self.alloc_scratch();
+                        let dup2 = self.alloc_scratch();
+                        self.buffer
+                            .emit(Arm64Instruction::Mov { rd: dup1, rm: val1 });
+                        self.buffer
+                            .emit(Arm64Instruction::Mov { rd: dup2, rm: val2 });
+                        self.push_operand(val2);
+                        self.push_operand(val1);
+                        self.push_operand(dup2);
+                        self.push_operand(dup1);
+                    }
                 }
 
                 // -- dup2_x1 (0x5d) --
+                //
+                // FORM 1 duplicates two category-1 entries over one; FORM 2
+                // duplicates ONE category-2 entry over one. The old
+                // unconditional three-pop was FORM 1 only.
                 0x5d => {
-                    let val1 = self.pop_operand();
-                    let val2 = self.pop_operand();
-                    let val3 = self.pop_operand();
-                    let dup1 = self.alloc_scratch();
-                    let dup2 = self.alloc_scratch();
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup1, rm: val1 });
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup2, rm: val2 });
-                    self.push_operand(dup2);
-                    self.push_operand(dup1);
-                    self.push_operand(val3);
-                    self.push_operand(val2);
-                    self.push_operand(val1);
+                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 2) else {
+                        success = false;
+                        break;
+                    };
+                    // JVMS requires the entry under the duplicated group to be
+                    // category-1 in both forms.
+                    let dup_entries = if cats[0] {
+                        if cats[1] {
+                            success = false;
+                            break;
+                        }
+                        1
+                    } else {
+                        match self.int_stack_shuffle_entries(start_pc, 3) {
+                            Some(c) if !c[1] && !c[2] => 2,
+                            _ => {
+                                success = false;
+                                break;
+                            }
+                        }
+                    };
+                    self.emit_dup_group_over(dup_entries, 1);
                 }
 
                 // -- dup2_x2 (0x5e) --
+                //
+                // The four JVMS forms, in this backend's one-entry-per-value
+                // model. The old arm popped four unconditionally, which is
+                // FORM 1 alone; on the other three it took entries belonging to
+                // the caller's stack — the question the x64 page
+                // (`dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend`)
+                // raised and did not answer.
+                //
+                //   FORM 4  v1,v2 cat-2   [v2, v1]         -> [v1, v2, v1]
+                //   FORM 2  v1 cat-2      [v3, v2, v1]     -> [v1, v3, v2, v1]
+                //   FORM 3  v3 cat-2      [v3, v2, v1]     -> [v2, v1, v3, v2, v1]
+                //   FORM 1  all cat-1     [v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]
                 0x5e => {
-                    let val1 = self.pop_operand();
-                    let val2 = self.pop_operand();
-                    let val3 = self.pop_operand();
-                    let val4 = self.pop_operand();
-                    let dup1 = self.alloc_scratch();
-                    let dup2 = self.alloc_scratch();
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup1, rm: val1 });
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup2, rm: val2 });
-                    self.push_operand(dup2);
-                    self.push_operand(dup1);
-                    self.push_operand(val4);
-                    self.push_operand(val3);
-                    self.push_operand(val2);
-                    self.push_operand(val1);
+                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 2) else {
+                        success = false;
+                        break;
+                    };
+                    let shape = if cats[0] {
+                        if cats[1] {
+                            Some((1usize, 1usize)) // FORM 4
+                        } else {
+                            match self.int_stack_shuffle_entries(start_pc, 3) {
+                                Some(c) if !c[2] => Some((1, 2)), // FORM 2
+                                _ => None,
+                            }
+                        }
+                    } else if cats[1] {
+                        None // no form has a category-2 under a category-1 top
+                    } else {
+                        match self.int_stack_shuffle_entries(start_pc, 3) {
+                            Some(c) if c[2] => Some((2, 1)), // FORM 3
+                            Some(_) => match self.int_stack_shuffle_entries(start_pc, 4) {
+                                Some(c) if !c[3] => Some((2, 2)), // FORM 1
+                                _ => None,
+                            },
+                            None => None,
+                        }
+                    };
+                    let Some((dup_entries, under_entries)) = shape else {
+                        success = false;
+                        break;
+                    };
+                    self.emit_dup_group_over(dup_entries, under_entries);
                 }
 
                 // -- tableswitch (0xaa) --
@@ -6850,4 +7128,155 @@ mod tests {
         ]);
         assert!(emit_machine_code(&ok).is_some());
     }
+    // =====================================================================
+    // The category-dependent stack shuffles.
+    //
+    // This backend keeps TWO simulated operand stacks — `operand_stack` for
+    // int/long/reference and `float_operand_stack` for float/double — and its
+    // shuffle arms popped a FIXED number of entries from the first one. Both
+    // assumptions are wrong in general, and the x64 `dup2_x2` page
+    // (`dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend`) raised
+    // exactly this as a question it did not answer: whether that backend's
+    // unconditional four-pop was live here too.
+    //
+    // It was, and so were four more arms. These tests read the simulated
+    // stack directly after the walk, because entry COUNT is what the defect
+    // was about: a category-2 value is one entry here and two JVM slots, so a
+    // fixed pop either leaves the shuffle short or reaches past it into
+    // entries the shuffle must not touch.
+    // =====================================================================
+
+    /// `[int, int, long, long] dup2_x2` is JVMS FORM 4 — two entries, not
+    /// four. The old unconditional four-pop swallowed the two `int`s beneath
+    /// and pushed a six-entry stack in the wrong order; the `int`s below the
+    /// shuffle must come through untouched.
+    #[test]
+    fn dup2_x2_form4_leaves_the_entries_beneath_it_alone() {
+        // iconst_0, iconst_1, lconst_0, lconst_1
+        let prefix = [0x03u8, 0x04, 0x09, 0x0a];
+        let mut control = Arm64Backend::new();
+        assert!(control.compile_method(4, 0, 8, &prefix).success);
+        let before = control.operand_stack.clone();
+        assert_eq!(before.len(), 4, "control: four values, four entries");
+
+        let mut backend = Arm64Backend::new();
+        let mut code = prefix.to_vec();
+        code.push(0x5e); // dup2_x2
+        assert!(
+            backend.compile_method(4, 0, 8, &code).success,
+            "FORM 4 dup2_x2 must lower"
+        );
+        let after = &backend.operand_stack;
+        assert_eq!(after.len(), 5, "[v2, v1] -> [v1, v2, v1] over two ints");
+        assert_eq!(
+            &after[..2],
+            &before[..2],
+            "the two ints below the shuffle must not move"
+        );
+        assert_eq!(after[3], before[2], "v2 stays in place");
+        assert_eq!(after[4], before[3], "v1 stays on top");
+        assert!(
+            after[2] != after[4],
+            "the inserted copy is a fresh register, not the original"
+        );
+    }
+
+    /// `[long, int, int] dup2_x2` is FORM 3 — the copy goes three entries
+    /// down, not four. The old arm popped a fourth entry that did not exist.
+    #[test]
+    fn dup2_x2_form3_duplicates_two_entries_over_one() {
+        let prefix = [0x09u8, 0x03, 0x04]; // lconst_0, iconst_0, iconst_1
+        let mut control = Arm64Backend::new();
+        assert!(control.compile_method(4, 0, 8, &prefix).success);
+        let before = control.operand_stack.clone();
+
+        let mut backend = Arm64Backend::new();
+        let mut code = prefix.to_vec();
+        code.push(0x5e);
+        assert!(
+            backend.compile_method(4, 0, 8, &code).success,
+            "FORM 3 dup2_x2 must lower"
+        );
+        let after = &backend.operand_stack;
+        assert_eq!(after.len(), 5, "[v3, v2, v1] -> [v2, v1, v3, v2, v1]");
+        assert_eq!(after[2], before[0], "the long stays where it was");
+        assert_eq!(after[3], before[1]);
+        assert_eq!(after[4], before[2]);
+    }
+
+    /// FORM 1, the only form the old arm handled: four category-1 entries.
+    #[test]
+    fn dup2_x2_form1_still_lowers() {
+        let prefix = [0x03u8, 0x04, 0x05, 0x06]; // iconst_0..3
+        let mut backend = Arm64Backend::new();
+        let mut code = prefix.to_vec();
+        code.push(0x5e);
+        assert!(backend.compile_method(4, 0, 8, &code).success);
+        assert_eq!(backend.operand_stack.len(), 6);
+    }
+
+    /// A `double` operand lives on `float_operand_stack`, so a shuffle that
+    /// pops `operand_stack` for it takes an unrelated value. Refuse.
+    #[test]
+    fn a_floating_point_operand_refuses_the_shuffle_rather_than_moving_the_wrong_stack() {
+        for (name, code) in [
+            // The int stack has enough entries here that the old arms did NOT
+            // underflow — they duplicated `iconst_1` and left the float where
+            // it was, silently. Without these two cases the rest of this test
+            // passes against the pre-fix backend for the wrong reason (an
+            // accidental underflow), which is no test at all.
+            ("dup of a float over two ints", vec![0x03u8, 0x04, 0x0b, 0x59]),
+            ("pop of a float over two ints", vec![0x03, 0x04, 0x0b, 0x57]),
+            ("dup of a double", vec![0x0e, 0x59]),
+            ("dup2 of a double", vec![0x0e, 0x5c]),
+            ("dup2_x2 of two doubles", vec![0x0e, 0x0f, 0x5e]),
+            ("dup_x1 with a float below", vec![0x0b, 0x03, 0x5a]),
+            ("swap with a float below", vec![0x0b, 0x03, 0x5f]),
+            ("pop of a float", vec![0x0b, 0x57]),
+        ] {
+            let mut backend = Arm64Backend::new();
+            assert!(
+                !backend.compile_method(4, 0, 8, &code).success,
+                "{name} must refuse the method, not shuffle the integer stack"
+            );
+        }
+    }
+
+    /// `pop2` over a single category-2 value pops ONE entry here. The old arm
+    /// popped two, discarding whatever the `long` was sitting on.
+    #[test]
+    fn pop2_over_a_long_discards_one_entry_not_two() {
+        // iconst_0, lconst_0, pop2 -> the int must survive.
+        let mut backend = Arm64Backend::new();
+        assert!(backend
+            .compile_method(4, 0, 8, &[0x03, 0x09, 0x58])
+            .success);
+        assert_eq!(
+            backend.operand_stack.len(),
+            1,
+            "pop2 of a category-2 value leaves the int beneath it"
+        );
+    }
+
+    /// `dup2` over a single category-2 value duplicates ONE entry. The old arm
+    /// duplicated the unrelated value beneath the `long` as well — the same
+    /// miscompile x64 was fixed for.
+    #[test]
+    fn dup2_over_a_long_duplicates_one_entry_not_two() {
+        let mut backend = Arm64Backend::new();
+        assert!(backend
+            .compile_method(4, 0, 8, &[0x03, 0x09, 0x5c])
+            .success);
+        assert_eq!(backend.operand_stack.len(), 3, "[int, long] -> [int, long, long]");
+    }
+
+    /// When the width analysis cannot type the operands, the method is
+    /// refused rather than shuffled on a guess. `dup2_x2` at pc 0 has no
+    /// operands at all.
+    #[test]
+    fn an_untypeable_shuffle_refuses_the_method() {
+        let mut backend = Arm64Backend::new();
+        assert!(!backend.compile_method(4, 0, 8, &[0x5e]).success);
+    }
+
 }

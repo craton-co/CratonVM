@@ -1460,6 +1460,64 @@ becomes `impl FnMut(u64)`. It is mechanical but it is not small — `mark.rs` is
 ~4,600 lines and the type parameter reaches the coordinator, the controller and
 `zgc_concurrent`.
 
+### The cheap experiment was run, and the dispatch hypothesis did NOT survive it — 2026-08-18
+
+`CRATONVM_ZGC_MARK_CTX_DIRECT` hands the coordinator the heap's own `Arc`
+instead of `ZHeapMarkBridge`, removing **one of the two indirect hops** on every
+`try_mark`, `visit_refs`, `is_in_heap` and `object_size`. One binary, three arms,
+interleaved, order reversed on alternate reps, 6 runs per arm, `BigLive 3000 200`:
+
+| arm | mean `mark_us` | vs serial |
+|---|---:|---:|
+| serial (`PARMARK=0`) | 47,052 | — |
+| parallel + bridge | 61,976 | +31.7% |
+| parallel + **direct** | 63,453 | +34.9% |
+
+**Halving the indirect calls on the two hottest methods moved nothing** — the two
+parallel arms are 2.4% apart with within-arm spreads of ±7%, i.e.
+indistinguishable. Dispatch is not where the C5 cost lives.
+
+The change is kept anyway, and **not for performance**: it deletes a
+`*const ZgcRealHeap` with a hand-written `Send`/`Sync` and a three-fact soundness
+argument, replacing it with an `Arc` that keeps the heap alive by construction.
+The wrapper remains as the fallback for a `with_capacity` heap, which has no
+self-`Arc`. Perf-neutral, safety-positive; the flag stays so the next person can
+re-run the A/B rather than re-derive it.
+
+### What the cost IS: per object, not per cycle
+
+Same binary, same interleaving, three live-set sizes — because a per-cycle setup
+cost (pool construction, thread spawn/join, the terminator handshake) does not
+scale with the live set and a per-object cost does:
+
+| `BigLive` | serial `mark_us` | parallel `mark_us` | delta |
+|---|---:|---:|---:|
+| 400×60 | ~3,759 | ~5,294 | ~1,535 |
+| 1200×120 | ~13,453 | ~15,439 | ~1,985 |
+| 3000×200 | ~45,650 | ~58,302 | ~12,652 |
+
+Fitting `delta = fixed + k × serial` across the smallest and largest points gives
+**k ≈ 0.27 and fixed ≈ 0.5 ms**. So the per-cycle setup — the thing that spawns a
+pool and a driver thread per collection — is worth about half a millisecond, and
+**~27% is proportional to the objects marked**. At any realistic live set the
+proportional term is the whole story, which also rules out "it spawns threads per
+cycle" as the explanation.
+
+Indicative rather than settled: three reps on a loaded developer machine, and the
+within-size spread is larger than the between-size differences. What it is good
+enough to do is *order the suspects*.
+
+**So the remaining suspect is the per-object WORK, not the per-object CALL.** The
+serial marker pushes children onto a plain local `Vec` and sets the mark bit
+directly; the parallel one publishes into striped queues behind mutexes and marks
+through a CAS that must be atomic because other workers may race for the same
+object. That is real work the serial path does not do, it is per object, and it
+does not go away with one worker — which is exactly the property §3c's numbers
+demand. The plan already listed the striped queues as a suspect; this promotes
+them from "a candidate" to "the leading one".
+
+**The original cheap-experiment note follows.**
+
 **Cheap experiment first, before that refactor.** `ZHeapMarkBridge` adds a
 *second* indirect hop for no reason other than to hold a `&ZgcRealHeap` —
 `mark_with_controller_stw` builds `Arc::new(ZHeapMarkBridge { heap: self })` and
@@ -1486,6 +1544,71 @@ so drift and order are confounded with the change. `perf record --call-graph
 dwarf` also inflated a 2.2 s run to 13–36 s, which is the overhead and not the
 binary. The profile shares above are used instead precisely because a **symbol
 share is structural**: it cannot be moved by the neighbour benchmark.
+
+---
+
+## 3f. The sweep reductions applied to EVERY cycle — the first measured default-config gain, 2026-08-18
+
+G2e and G2f landed on 2026-08-17 ANDed with `young_cycle`, for one reason: they
+went in mid-gauntlet and a default run had to stay byte-for-byte unchanged.
+Neither argument was ever young-specific — the body is unreachable behind a zeroed
+header whatever the cycle kind, and the walk is ascending on both paths. §3d then
+showed the restriction was pointing them away from the cost:
+
+| | `sweep_us` | share of pause |
+|---|---:|---:|
+| young cycle | 6.3 ms | 5.6% |
+| **whole-heap cycle** | **170 ms** | **64%** |
+
+A default run performs *only* whole-heap cycles. The −30% was being applied to
+the 5.6%.
+
+### Measured with the restriction lifted
+
+One binary, four arms, interleaved with the order reversed on alternate reps,
+`ZgcGenProbe 400000 30000 300`, `-Xmx1200m`, **generational OFF** — i.e. the
+default configuration. 8 whole-heap sweeps per arm.
+
+| arm | mean `sweep_us` | vs off | range |
+|---|---:|---:|---|
+| both off | 711,110 | — | 568k–863k |
+| header-zero only | 535,354 | **−24.7%** | 435k–590k |
+| dead-run merge only | 256,190 | **−64.0%** | 188k–334k |
+| **both on (the default)** | **216,850** | **−69.5%** | 176k–291k |
+
+**Whole pause: 879.6 ms → 360.6 ms, −59.0%.** `BAD=0 OK` on every run.
+
+The arms do not overlap — the worst "on" run (291k) is better than the best "off"
+run (568k) by a factor of two — so the separation survives the wide wall-clock
+variance of a loaded developer machine, which is exactly why the comparison is
+one binary and interleaved.
+
+### And it explains §3d's zero
+
+On a **young** cycle the header-only zeroing measured *nothing*, and §3d's
+explanation was that G2d had already capped the memset volume: a bounded nursery
+bounds the garbage a young cycle reclaims. That prediction is now confirmed from
+the other side — on a whole-heap cycle, which has no such cap and reclaims 13.0M
+dead objects against a young cycle's 137k, the same switch is worth **−24.7%**.
+The feature was never inert; it was being measured on the arm that could not show
+it.
+
+The run merge dominates either way (−64% alone, −69.5% with the memset reduction
+on top; they overlap because both cut per-dead-object work).
+
+### What this changes
+
+**This is the first measured gain in this plan that a default run actually
+gets.** Everything else built here — concurrent marking, parallel marking,
+generational — is opt-in and has so far measured negative or neutral. Both
+switches are default-on and now apply to every cycle, so no flag has to be flipped
+to collect it.
+
+Renamed with the restriction: `CRATONVM_ZGC_GEN_HEADER_ZERO` →
+`CRATONVM_ZGC_SWEEP_HEADER_ZERO` and `CRATONVM_ZGC_GEN_DEAD_RUNS` →
+`CRATONVM_ZGC_SWEEP_DEAD_RUNS`. The `GEN_` prefix described the day they were
+young-only and would now be a lie; they are a day old and nothing depends on
+them.
 
 ---
 
