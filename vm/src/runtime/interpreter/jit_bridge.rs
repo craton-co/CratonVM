@@ -7604,7 +7604,7 @@ fn resolve_inline_site_from(
             match target.invoke_kind {
                 // Statically bound: one body, no guard.
                 1 | 3 => {
-                    if let Some(nested) = resolve_inline_site_from(
+                    let nested = resolve_inline_site_from(
                         shared,
                         declaring_id,
                         None,
@@ -7613,7 +7613,19 @@ fn resolve_inline_site_from(
                         &target.descriptor,
                         nest_depth + 1,
                         direct_bind,
-                    ) {
+                    );
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] nest-static {}.{}{} at callee_pc={} depth={} -> {}",
+                            target.class_name,
+                            target.method_name,
+                            target.descriptor,
+                            ipc,
+                            nest_depth + 1,
+                            if nested.is_some() { "SPLICED" } else { "refused" },
+                        );
+                    }
+                    if let Some(nested) = nested {
                         nested_sites.push(cratonvm_jit::NestedInlineSite {
                             callee_pc: *ipc,
                             guard_class_id: 0,
@@ -7625,9 +7637,23 @@ fn resolve_inline_site_from(
                 // needs a guard and the profile has to name the class.
                 0 | 2 => {
                     let Some(profile) = callee_profile.as_ref() else {
+                        if crate::runtime::env_cache::dbg_jitc() {
+                            eprintln!(
+                                "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> NO PROFILE for {}.{}{}",
+                                target.class_name, target.method_name, target.descriptor, ipc,
+                                callee_class, callee_method, callee_desc,
+                            );
+                        }
                         continue;
                     };
                     let Some(counts) = profile.receivers.get(ipc) else {
+                        if crate::runtime::env_cache::dbg_jitc() {
+                            eprintln!(
+                                "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> profile has no receivers at that pc (pcs: {:?})",
+                                target.class_name, target.method_name, target.descriptor, ipc,
+                                profile.receivers.keys().take(8).collect::<Vec<_>>(),
+                            );
+                        }
                         continue;
                     };
                     // Same 80% dominance bar the top-level guarded-virtual
