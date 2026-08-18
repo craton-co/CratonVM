@@ -2063,7 +2063,57 @@ public class RJdkBridge1 {
         check("Optional.empty".equals(Optional.empty().toString()),
                 "Optional.empty has no element to render");
 
-        sectionEnd("surrog", 56);
+        // -- the three routes that reach text WITHOUT going through a String --
+        // Sweep 8 asked the append/insert siblings and the surfaces G63-1 N4
+        // named: 38 of 42 rows were already exact, including every
+        // StringBuilder/StringBuffer overload, Base64, URLEncoder, Collator,
+        // MessageDigest, java.time and chars()/codePoints(). These are the
+        // three that were not, and they share a shape: the value never IS a
+        // String, so the units path that carries a String argument was
+        // never on.
+        step("surrog", "boxed Character, string concat and %s");
+
+        // A boxed Character can itself BE an unpaired surrogate. This one
+        // rendered '?', not even U+FFFD -- a Rust char cannot hold the value at
+        // all, and the fallback substituted a character that means something
+        // else.
+        Character boxedLone = Character.valueOf((char) 0xD800);
+        String cat = "" + boxedLone;
+        check(cat.length() == 1 && cat.charAt(0) == 0xD800,
+                "string concat of a boxed Character must carry the unit, got "
+                        + Integer.toHexString(cat.length() == 1 ? cat.charAt(0) : -1));
+
+        // %s is String.valueOf(arg) == arg.toString(). A STRING argument was
+        // already exact; every other object went through a renderer that
+        // returns host text.
+        String fs = String.format("%s", boxedLone);
+        check(fs.length() == 1 && fs.charAt(0) == 0xD800,
+                "%s of a boxed Character must carry the unit, got "
+                        + Integer.toHexString(fs.length() == 1 ? fs.charAt(0) : -1));
+        String fo = String.format("%s", new Object() {
+            @Override
+            public String toString() {
+                return LONE_HI;
+            }
+        });
+        ckCarries("%s of an object whose toString carries one", fo, 1);
+
+        // CharBuffer.wrap(CharSequence) STORES what it reads, so a lossy read
+        // meant it could not give back the sequence it was handed. G63-1 N2
+        // measured the char[] overload and left this one open.
+        String cbw = CharBuffer.wrap((CharSequence) LONE_HI).toString();
+        ckCarries("CharBuffer.wrap(CharSequence).toString()", cbw, 1);
+
+        // Controls for the same three routes.
+        check("Z".equals("" + Character.valueOf('Z')),
+                "ordinary boxed Character concat must be unchanged");
+        check("ok|q".equals(String.format("%s|%c", "ok", 'q')),
+                "ordinary %s and %c must be unchanged");
+        String pairWrap = CharBuffer.wrap((CharSequence) "\uD83D\uDE00").toString();
+        check(pairWrap.length() == 2 && pairWrap.charAt(0) == 0xD83D,
+                "a well-formed pair through CharBuffer.wrap must stay two units");
+
+        sectionEnd("surrog", 63);
     }
 
     static final int SFF = 15;

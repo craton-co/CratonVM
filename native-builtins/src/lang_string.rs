@@ -11284,6 +11284,23 @@ fn fmt_general_units(
             if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(*obj)) {
                 return Ok(read_string_chars(ctx, *obj));
             }
+            // Every OTHER object: `%s` is `String.valueOf(arg)` ==
+            // `arg.toString()`, and that result can hold an unpaired surrogate
+            // exactly as a String argument can -- `String.format("%s", x)` where
+            // `x.toString()` returns one, and any boxed `Character` holding one.
+            // `format_arg` renders it and hands back a Rust `String`, so the
+            // unit was already gone by the time this function saw it.
+            //
+            // These are the SAME two calls `format_arg`'s own `%s` arm makes,
+            // in the same order, differing only in reading the result as units
+            // -- so the two cannot disagree about anything except the loss.
+            return match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => Ok(ctx
+                    .read_string_units(s)
+                    .unwrap_or_else(|| "null".encode_utf16().collect())),
+                Ok(_) => Ok("null".encode_utf16().collect()),
+                Err(err) => Err(err),
+            };
         }
     }
     let rendered = format_arg(ctx, val, spec)?;
