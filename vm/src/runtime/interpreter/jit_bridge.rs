@@ -295,13 +295,90 @@ pub(super) fn compile_osr_artifact(
                     return None;
                 }
             };
-            // RBC.6 — never OSR an athrow method: the OSR bail path resumes
+            // Does this method declare any local exception handlers? Read once,
+            // here, because BOTH of the next two gates need the answer: RBC.6
+            // (immediately below) admits a bare `athrow` only when the answer is
+            // "no", and RBC.6b (further down) refuses on "yes" outright.
+            let has_exception_handlers =
+                match shared.classes.class_manager.read().get_class(class_id) {
+                    Some(class) => class
+                        .methods
+                        .iter()
+                        .find(|m| {
+                            &*m.name == method_name_check
+                                && &*m.descriptor == method_descriptor.as_str()
+                        })
+                        .and_then(|m| {
+                            m.attributes.iter().find_map(|a| match a.as_decoded() {
+                                Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
+                                    Some(!ca.exception_table.is_empty())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
+            // RBC.6 (2026-07-18; LIFTED 2026-08-17 for the no-handler case) —
+            // this door used to refuse **any** method containing a bare
+            // `athrow` (0xbf), whatever its exception table looked like, on the
+            // grounds stated in its own comment: "the OSR bail path resumes
             // interpretation at the back-edge, so an athrow lowering that ran
-            // side effects natively before throwing could see them re-applied.
-            // Method-entry compilation (which propagates cleanly through the
-            // JIT-return exception drains) remains available, so do NOT
-            // bail-list here.
-            if scan.has_athrow {
+            // side effects natively before throwing could see them re-applied".
+            // That hazard is RBC.7's silent-corruption shape and it was real
+            // when the comment was written — the athrow drain's only move was
+            // to re-stash the throwable and resume the live interpreter frame
+            // at the STALE pre-OSR back-edge pc, re-running every iteration the
+            // OSR'd code had already committed.
+            //
+            // Its blast radius was not deliberate. OSR is the ONLY door out of
+            // the interpreter for a method invoked once — which is what a
+            // `@Test` body, a `main`, and any one-shot driver is — so a `throw`
+            // anywhere in such a method, even on a path never taken, kept its
+            // hot loop interpreted for the method's whole life. Witness:
+            // `BOBYQAOptimizerTest`, whose `trsbox`/`bobyqb` (each called once
+            // per test; translated-from-Fortran numerical code that `throw`s a
+            // `MathIllegalStateException` on an internal assertion and catches
+            // nothing) turned a sub-second `optimize()` call into an unbounded
+            // hang. See the known-issue page cited from that suite's RESULTS.
+            //
+            // What makes the lift safe is not new machinery but a PRECONDITION
+            // that is checkable right here: when the method declares **no**
+            // exception handlers, an `athrow` in its body cannot be caught by
+            // the OSR'd frame, so the drain never has to resume that frame at
+            // all. `propagate_osr_exception` (read its doc) hands the throwable
+            // straight to the dispatch loop's unwinder as
+            // `OsrBackoffOutcome::ThrowJava`, the frame is torn down, and there
+            // is no stale resume for already-committed iterations to be re-run
+            // from. That path is not new either: it is the same one the
+            // callee-throw fix already routes an unwinding exception through,
+            // and it RE-CHECKS the empty table rather than assuming it.
+            //
+            // The converse is exactly what stays refused. With handlers
+            // present the drain would have to ENTER one, and entering a handler
+            // means resuming this frame — whose locals the OSR'd body advanced
+            // natively and never wrote back. So `has_exception_handlers` keeps
+            // the whole refusal here, independently of RBC.6b's own (which
+            // refuses that same set for its own, different reason). Do not
+            // collapse the two: RBC.6b's rule is about which opcodes publish a
+            // precise exceptional frame inside a protected range, and if it is
+            // ever relaxed, this gate must still hold for `athrow`.
+            //
+            // Not bail-listed, for the original reason: method-entry
+            // compilation propagates cleanly through the JIT-return exception
+            // drains and stays available either way.
+            //
+            // `CRATONVM_JIT_OSR_ATHROW=0` restores the blanket refusal, so one
+            // binary can A/B the lift.
+            if scan.has_athrow
+                && (has_exception_handlers || !crate::runtime::env_cache::osr_athrow_allowed())
+            {
+                if crate::runtime::env_cache::dbg_jitc() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr-DENY (RBC.6 athrow, handlers={}) {}.{}{}",
+                        has_exception_handlers, class_name, method_name, method_descriptor
+                    );
+                }
                 return None;
             }
             // RBC.7 (jit-osr-loop-duplicate-execution, silent data corruption,
@@ -354,27 +431,8 @@ pub(super) fn compile_osr_artifact(
             // try/catch around a throwing call (e.g. a servlet's
             // `try { resp.resetBuffer(); } catch (IllegalStateException)`)
             // silently stopped catching. Permanent for this bytecode, like
-            // the sibling RBC bails above.
-            let has_exception_handlers =
-                match shared.classes.class_manager.read().get_class(class_id) {
-                    Some(class) => class
-                        .methods
-                        .iter()
-                        .find(|m| {
-                            &*m.name == method_name_check
-                                && &*m.descriptor == method_descriptor.as_str()
-                        })
-                        .and_then(|m| {
-                            m.attributes.iter().find_map(|a| match a.as_decoded() {
-                                Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
-                                    Some(!ca.exception_table.is_empty())
-                                }
-                                _ => None,
-                            })
-                        })
-                        .unwrap_or(false),
-                    None => false,
-                };
+            // the sibling RBC bails above. (`has_exception_handlers` is read
+            // once, above RBC.6, which needs the same answer.)
             if has_exception_handlers {
                 crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
                 return None;

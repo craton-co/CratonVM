@@ -399,6 +399,33 @@ pub fn osr_newarray_allowed() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_OSR_ATHROW` — back-edge OSR for a method that contains a bare
+/// `athrow` (0xbf) and declares **no** local exception handlers. **Default: ON**
+/// (RBC.6 lift, 2026-08-17).
+///
+/// RBC.6 refused every `athrow`-containing method outright, because the OSR
+/// bail path's only move was to re-stash the throwable and resume the live
+/// interpreter frame at the STALE pre-OSR back-edge pc — re-running every
+/// iteration the OSR'd code had already committed (RBC.7's silent-corruption
+/// shape). With no handlers declared, the throwable provably cannot be caught
+/// by the OSR'd frame, so `propagate_osr_exception` unwinds it out of the frame
+/// instead and there is no resume left to be stale. A method that DOES declare
+/// handlers is still refused — by this gate and, independently, by RBC.6b. The
+/// full argument is at the gate itself, in `compile_osr_artifact`.
+///
+/// Set `CRATONVM_JIT_OSR_ATHROW=0` to restore the blanket refusal so ONE binary
+/// can A/B the lift (a cross-binary A/B is not an A/B). Read once and cached.
+#[inline]
+pub fn osr_athrow_allowed() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_ATHROW") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.
