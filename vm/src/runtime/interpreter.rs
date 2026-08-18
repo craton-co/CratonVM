@@ -5882,51 +5882,7 @@ fn execute_frame_from_index(
                 0xa2 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va >= vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception =
-                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va >= vb);
                 }
                 // if_icmplt
                 0xa1 => {
