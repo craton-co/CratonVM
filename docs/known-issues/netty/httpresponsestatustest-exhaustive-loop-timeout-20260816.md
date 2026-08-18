@@ -320,20 +320,35 @@ The order is therefore:
    * **write the arm.** `try_emit_inline_body` has no `0xb6`/`0xb8`/`0xb9` case
      — they hit its catch-all bail — and `resolve_inline_site_from` rejects
      those opcodes before a site is ever planned. Both gates have to open.
-   * **the exception-check stub's throw pc.** Outside a protected range (or with
-     precise frames off, which is every inlining compile),
-     `emit_post_invoke_exception_check` records `(patch_offset, dbg_last_pc)` on
-     `exception_check_stubs` rather than publishing a frame. Inside a spliced
-     body `dbg_last_pc` is the CALLEE's pc, and the VM routes that throw pc
-     through the ENCLOSING method's exception table — the same "callee bci in
-     the caller's frame" class of defect as the deopt one, in the exception
-     path instead. The tractable first cut is to admit a call-carrying splice
-     only where the enclosing method has no exception table, or where the splice
-     site lies outside every protected range. `testHttpStatusClassValueOf` has no
-     `try` at all, so it qualifies.
+   * **resolve the callee's own invoke targets.** This is the substantive half.
+     `InlineSite` carries `field_info`, `static_field_info`, `ldc_info` and
+     `elided_invoke_pcs`, all keyed by CALLEE pc and resolved against the
+     CALLEE's constant pool — but nothing for invokes, because none were ever
+     admitted. The emitter has nothing to call until `resolve_inline_site_from`
+     resolves them the same way, and the top-level `invoke_info` cannot be
+     reused: it is keyed by CALLER pc, which is a different bytecode space.
    * **callee handlers.** `resolve_inline_site_from` already refuses a callee
      whose own `exception_table` is non-empty; splicing one would need the
      caller to carry its ranges. Leave that refusal in place for the first cut.
+
+   **Two things previously listed here as blockers are not blockers**, both
+   checked in the code rather than inferred from the comment that suggested
+   them:
+
+   * *The deopt-metadata postcondition.* Measured at step 3: no splice publishes
+     a deopt point, structurally (see above). It is a guard, not a gate.
+   * *The exception-check stub's throw pc.* `dbg_last_pc` is assigned in exactly
+     one place — the outer bytecode walk (`bytecode_walk.rs`, `self.dbg_last_pc
+     = pc`) — and `try_emit_inline_body` never touches it, so throughout a
+     splice it still holds the CALLER's invoke pc. That is not a hazard, it is
+     the correct answer: an exception from an inlined body is attributed to the
+     call site in the caller, whose exception table is the one that should be
+     searched. The inline emitter already relies on this — it calls
+     `emit_post_invoke_exception_check` today for `getfield`, `getstatic`'s
+     `<clinit>` and the arraycopy dispatch, all inside spliced bodies. So a
+     call-carrying splice needs no special admission rule about protected
+     ranges, and there is no reason to restrict the first cut to methods with no
+     exception table.
 5. **Nesting.** `InlineSite` grows a `nested_sites: HashMap<callee_pc,
    InlineSite>`, `resolve_inline_site_from` fills it recursively under a depth
    budget, and the emitter recurses. Statically bound callees are the tractable
