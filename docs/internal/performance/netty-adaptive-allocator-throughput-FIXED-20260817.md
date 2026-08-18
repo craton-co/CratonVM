@@ -75,6 +75,19 @@ method and an interpreted method is correct. What makes it non-vacuous is
 
 Same answers out, five methods compiled instead of none.
 
+**Read that alongside one thing this work found and did not fix.** The sibling
+probe `Rbc6FieldProbe.java` — the acceptance test named in
+`precise_field_ops_enabled`'s own doc — was run here as a regression control
+and is **RED on this tree, and was red at the branch point**: under JIT, at
+200 000 iterations, it lets a `NullPointerException` escape a handler that
+catches it, and `CRATONVM_JIT_NO_PRECISE_FIELD_OPS=1` makes it correct in one
+run. That is filed as
+`known-issues/jit/rbc6-getfield-putfield-admission-lets-an-npe-escape-its-handler-20260818`.
+It is a different admission through different emitters, and the `new`/`athrow`
+half above is validated on its own probe — but nobody should read "RBC.6
+admitted two more opcodes" as "the RBC.6 admission family is healthy". It is
+not, and the failing member is the one that has been shipping since 2026-08-02.
+
 On the pcap loop the same counter moves 1 → 0 and the tracked interpreted
 invocation count falls from 137 643 to 90 733.
 
