@@ -2511,6 +2511,93 @@ fn ir_deopt_frame_values_maps_object_and_int() {
     );
 }
 
+/// A caller scope parks at the invoke's SUCCESSOR, never at the invoke.
+///
+/// `ResumeSemantics::for_caller_scope()` is `RESUME`: the call at that bci is
+/// already in progress, so parking the interpreter there would run it a second
+/// time — the double-execution defect the deopt contract exists to prevent, one
+/// bytecode instead of one loop iteration. `jit/src/lib.rs` refuses `RESUME`
+/// points precisely because "computing the successor bci needs the method's
+/// bytecode, which this crate does not have"; the VM does, and this is it.
+#[test]
+fn a_caller_scope_resumes_after_its_invoke_not_at_it() {
+    use super::deopt_resume::caller_resume_pc;
+    // 0xb8 invokestatic is 3 bytes; 0xb9 invokeinterface is 5.
+    let code = [0x2a, 0xb8, 0x00, 0x07, 0xb9, 0x00, 0x0b, 0x02, 0x00, 0x57];
+    assert_eq!(caller_resume_pc(&code, code.len(), 1).unwrap(), 4);
+    assert_eq!(caller_resume_pc(&code, code.len(), 4).unwrap(), 9);
+
+    // A bci that is not an invoke is a malformed chain, not a resume point.
+    let err = caller_resume_pc(&code, code.len(), 0).unwrap_err();
+    assert!(err.contains("not an invoke"), "{err}");
+    let err = caller_resume_pc(&code, code.len(), 9).unwrap_err();
+    assert!(err.contains("not an invoke"), "{err}");
+
+    // Past the end, and an invoke whose operands run off the end, both refuse
+    // rather than reading padding as bytecode.
+    assert!(caller_resume_pc(&code, code.len(), 99).is_err());
+    let truncated = [0xb9u8, 0x00, 0x0b];
+    assert!(caller_resume_pc(&truncated, truncated.len(), 0).is_err());
+}
+
+/// `Unsupported` in a caller scope's locals must REFUSE, where the in-place OSR
+/// transfer tolerates it.
+///
+/// The difference is the whole reason `caller_frame_values` is not the same
+/// function as the transfer's mapping loop. That transfer leaves an
+/// `Unsupported` local at the live frame's existing value, sound because the
+/// verified bytecode proves the slot is dead or re-stored before it is read. A
+/// MATERIALISED frame has no existing value — every sink maps a missing slot to
+/// `Value::Int(0)` — so tolerating it would resume a caller with silently
+/// zeroed locals, which is exactly what `docs/jit/deopt-inline-scopes.md`
+/// describes when it says an undescribed caller frame lowers to
+/// `[FrameValue::Unsupported]` so that this consumer refuses it.
+#[test]
+fn an_unsupported_caller_local_refuses_where_the_in_place_transfer_tolerates_it() {
+    use super::deopt_resume::caller_frame_values;
+    use cratonvm_jit::deopt::FrameValue;
+
+    let scope = |locals: Vec<FrameValue>, stack: Vec<FrameValue>| {
+        cratonvm_jit::deopt::ReconstructedFrame {
+            method_key: "p/C.m:()V".to_string(),
+            bci: 4,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        }
+    };
+
+    // The describable case is accepted, so the refusals below cannot be passing
+    // for some unrelated reason.
+    let (locals, stack) = caller_frame_values(&scope(
+        vec![FrameValue::Int(7), FrameValue::Long(9)],
+        vec![FrameValue::Int(1)],
+    ))
+    .expect("a fully described caller scope must be accepted");
+    assert_eq!(locals.len(), 2, "the cat-2 upper half is compacted away");
+    assert_eq!(stack.len(), 1);
+
+    let err = caller_frame_values(&scope(vec![FrameValue::Unsupported], Vec::new())).unwrap_err();
+    assert!(err.contains("Unsupported"), "{err}");
+    assert!(
+        err.contains("no existing value to leave in place"),
+        "the refusal must say WHY a materialised frame differs: {err}"
+    );
+
+    // An unmappable STACK slot refuses too, as it does everywhere.
+    assert!(caller_frame_values(&scope(Vec::new(), vec![FrameValue::Unsupported])).is_err());
+
+    // A held monitor in a caller scope is out of scope for this sink.
+    let mut with_monitor = scope(Vec::new(), Vec::new());
+    with_monitor.monitors = vec![cratonvm_jit::deopt::MonitorInfo {
+        object: FrameValue::Int(0),
+        lock_depth: 1,
+    }];
+    let err = caller_frame_values(&with_monitor).unwrap_err();
+    assert!(err.contains("monitor"), "{err}");
+}
+
 /// `ir_deopt_locals` produces a COMPACT arg list: the JVM-slot-indexed
 /// snapshot reserves the upper half of a cat-2 `long` as an `Undefined`
 /// placeholder at the next slot, which must be SKIPPED (Frame::new_pooled's
