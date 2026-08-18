@@ -90,6 +90,6 @@ grep -c 'because "<local4>" is null' /data/sb-out/gen/FlywayAutoConfigurationTes
 - retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md —
   the page this was found from. Its mechanism (the fallback spiral) is closed;
   this is what became visible underneath it.
-- `docs/known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.md`
+- `docs/known-issues/perf/quartz-stackwalker-walk-is-38x-hotspot-20260818.md`
   — the other finding from the same re-measurement, collector-independent and
   unrelated to this one.
