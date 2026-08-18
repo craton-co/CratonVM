@@ -107,6 +107,13 @@ fn maybe_dump_shutdown_reports() {
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
 
+    // The G1 live-region memo's tally, self-gated on
+    // `CRATONVM_DBG_G1_LIVE_MEMO`. Same argument as the line above, and it is
+    // the only usable one for that change: this host has no PMU, so a
+    // `perf stat -e instructions` A/B is unavailable, and its load average
+    // moves further in an hour than the effect does.
+    cratonvm_vm::dump_g1_live_region_memo_stats();
+
     // The JIT root-scan tally, self-gated the same way. It answers what the
     // method-stats line below cannot: those counters price the COMPILER, and a
     // run where compilation costs 3 ms while the JIT still costs +83% CPU has
