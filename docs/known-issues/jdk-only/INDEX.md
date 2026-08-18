@@ -938,7 +938,7 @@ through four each did and why they took a lane apiece.
 
 `G35-1` `G36-1` `G36-2` `G37-1` `G38-1` `G39-1` `G41-1` `G42-1` `G43-1` `G44-1`
 `G45-1` `G46-1` `G47-1` `G48-1` `G49-1` `G50-1` `G51-1` `G52-1` `G53-1` `G54-1`
-`G55-1` `G56-1` `G57-1` `G58-1` `G59-1` `G60-1`
+`G55-1` `G56-1` `G57-1` `G58-1` `G59-1` `G60-1` `G61-1` `G62-1` `G63-1`
 
 Three of those are worth reading before acting anywhere in this tree:
 
@@ -950,6 +950,14 @@ Three of those are worth reading before acting anywhere in this tree:
   map into a real JDK class. **Two of its four wrong writes were invisible to
   the guard**, because a well-typed value in the wrong slot is not a descriptor
   mismatch. Read this before treating a quiet coercion log as a clean one.
+* **`G63-1`** — `map.values().iterator()` is **not fail-fast**, in BOTH modes.
+  The view is real (`HashMap$Values`); its iterator is a snapshot `ArrayList$Itr`
+  handed over by the `java/util/Collection.iterator` interface door, so a
+  structural modification mid-iteration throws `ConcurrentModificationException`
+  on HotSpot and nothing here. `keySet()`/`entrySet()` are correct, which is what
+  localises it to the door. Found by disbelieving a measurement in `G60-1` — that
+  record had attributed the same exception to `java/util/ArrayList.iterator` and
+  held four retirable triples back on it.
 * **`G60-1`** — **RESOLVED 2026-08-17, moved to
   `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`.**
   `--jdk-only` counts its own violations and nobody had read the count. 0 classes
