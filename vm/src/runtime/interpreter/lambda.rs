@@ -1414,7 +1414,10 @@ pub(crate) fn lambda_jit_site(
     method_name: &str,
     descriptor: &str,
 ) -> Option<std::rc::Rc<LambdaJitSite>> {
-    if !crate::runtime::env_cache::jit_lambda_tierup() || crate::runtime::env_cache::disable_jit() {
+    if !crate::runtime::env_cache::jit_lambda_tierup()
+        || !crate::runtime::env_cache::jit_lambda_site()
+        || crate::runtime::env_cache::disable_jit()
+    {
         return None;
     }
     let key = (shared.vm_identity, proxy_class_id.as_u32());

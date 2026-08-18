@@ -868,6 +868,33 @@ pub fn jit_lambda_tierup() -> bool {
         }
     })
 }
+/// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
+/// compiled caller's SAM call served straight from the call site's own cached
+/// target (`jit::helpers::try_lambda_site_direct_call`).
+///
+/// Default ON, and separate from [`jit_lambda_tierup`] on purpose. The two
+/// halves of this feature serve DIFFERENT callers — this one a compiled caller,
+/// the interpreter's one-shot (`execute_jit_call_oneshot`) an interpreted one —
+/// and a workload reaches whichever its callers happen to be. Turning this one
+/// off routes a compiled caller's SAM call back through the generic path and
+/// therefore through the interpreted half, which is what makes each half
+/// separately measurable, separately bisectable, and separately TESTABLE: see
+/// `vm/tests/lambda_jit_oneshot_tests.rs`, which exists because the correctness
+/// suite otherwise never reaches the interpreted half at all.
+///
+/// `CRATONVM_JIT_LAMBDA_SITE=0` disables it; `CRATONVM_JIT_LAMBDA_TIERUP=0`
+/// disables both halves.
+#[inline]
+pub fn jit_lambda_site() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_SITE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
 /// / `matches` and the literal `String.replace(CharSequence,CharSequence)` to
 /// CratonVM's fast cached Rust natives instead of the real JDK bytecode. The
