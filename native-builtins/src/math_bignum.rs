@@ -138,6 +138,91 @@ fn bd_layout_store(vm: usize, layout: (usize, usize, usize, usize)) {
     BD_LAYOUT_TLS.with(|c| c.set(Some((vm, layout))));
 }
 
+// PERF (2026-08-18, same profile as the layout memo above): every
+// `BigInteger`/`BigDecimal` result object is allocated through
+// `try_alloc_concurrent_synthetic`, which re-resolves the class BY NAME on
+// each call — `ensure_class_initialized("java/math/BigInteger")` walks the
+// class manager's loaded-class table (`load_class_concurrent_for` +
+// the `loaded_classes_probe` hash search), then `class_name_of_id` renders the
+// resolved id back to a string to compare it against the name we just passed
+// in. On the `BigInteger.multiply` loop that was ~6% of the process, once per
+// allocated result.
+//
+// Once the REAL JDK class is loaded its `ClassId` is fixed for the life of the
+// VM, so it is memoized per VM (same `vm_identity()` scoping and same
+// only-cache-a-success rule as the layout memo). Two deliberate narrowings
+// keep the memo away from everything that is not that case:
+//
+//   * It is armed only when the caller has already seen the real-JDK layout
+//     (`bi_layout`/`bd_layout` answered `Some`). In synthetic-JDK mode the
+//     allocation funnel may FABRICATE a class for the name, and a fabricated
+//     class's identity and field count are not stable across calls — those
+//     runs keep going through the funnel unchanged.
+//   * The slot count is still derived fresh from `class_num_total_fields(cid)`
+//     on every allocation, exactly as the funnel does it, so nothing about the
+//     sizing decision moves — only the name→id lookup is skipped.
+thread_local! {
+    static BIGNUM_CID_TLS: std::cell::Cell<Option<(usize, ClassId, ClassId)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn bignum_cids(vm: usize) -> Option<(ClassId, ClassId)> {
+    BIGNUM_CID_TLS.with(|c| match c.get() {
+        Some((owner, bi, bd)) if owner == vm => Some((bi, bd)),
+        _ => None,
+    })
+}
+
+fn bignum_cids_store(vm: usize, bi: ClassId, bd: ClassId) {
+    BIGNUM_CID_TLS.with(|c| c.set(Some((vm, bi, bd))));
+}
+
+/// Which of the two bignum classes a memoized allocation is for.
+#[derive(Clone, Copy)]
+enum BignumClass {
+    Integer,
+    Decimal,
+}
+
+/// Allocate a `java.math.BigInteger` / `java.math.BigDecimal` instance,
+/// skipping the by-name class resolution once it is known for this VM.
+///
+/// Falls back to `try_alloc_concurrent_synthetic` verbatim whenever the memo is
+/// not armed, so the synthetic-JDK and not-yet-loaded paths are untouched.
+fn bignum_alloc(
+    ctx: &mut dyn NativeContext,
+    which: BignumClass,
+    num_fields: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_name = match which {
+        BignumClass::Integer => "java/math/BigInteger",
+        BignumClass::Decimal => "java/math/BigDecimal",
+    };
+    let vm = ctx.vm_identity();
+    if let Some((bi_cid, bd_cid)) = bignum_cids(vm) {
+        let cid = match which {
+            BignumClass::Integer => bi_cid,
+            BignumClass::Decimal => bd_cid,
+        };
+        let n = num_fields.max(ctx.class_num_total_fields(cid));
+        return Ok(ctx
+            .try_alloc_object_gc_safe(cid, n)
+            .unwrap_or_else(|| ctx.alloc_object(cid, n)));
+    }
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, num_fields)?;
+    // Arm the memo only when BOTH real-JDK classes are loaded with the layout
+    // these natives read — that is the one state in which the ids are fixed.
+    if bi_layout(ctx).is_some() && bd_layout(ctx).is_some() {
+        if let (Some(bi_cid), Some(bd_cid)) = (
+            ctx.class_id_by_name("java/math/BigInteger"),
+            ctx.class_id_by_name("java/math/BigDecimal"),
+        ) {
+            bignum_cids_store(vm, bi_cid, bd_cid);
+        }
+    }
+    Ok(obj)
+}
+
 /// Read a `BigInteger` instance and return its decimal string representation.
 ///
 /// Two layouts are supported:
@@ -179,7 +264,7 @@ pub(crate) fn bi_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
 }
 
 pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2)?;
+    let obj = bignum_alloc(ctx, BignumClass::Integer, 2)?;
     // GC-SAFETY (use-after-move — mirrors the `bi_alloc_int` fix): `obj` is
     // freshly allocated and not yet reachable from any Java root. The
     // `new_array` / `create_string` allocations below can trigger a minor GC
@@ -256,7 +341,7 @@ pub(crate) fn bi_read_int(ctx: &dyn NativeContext, this: ObjectRef) -> crate::bi
 /// conversion (unlike `bi_alloc`, which goes through `decimal_to_mag_words`).
 /// Fast write boundary for the limb rewrite.
 pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigInt) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2)?;
+    let obj = bignum_alloc(ctx, BignumClass::Integer, 2)?;
     // GC-SAFETY (bc math-ec use-after-move, 2026-06-05): `obj` is freshly
     // allocated and NOT yet reachable from any Java root. The `new_array` /
     // `create_string` allocations below can trigger a minor GC that relocates
@@ -3488,7 +3573,7 @@ fn bd_unscaled_and_precision(value: &str, scale: i32) -> (String, i32) {
 }
 
 fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3)?;
+    let obj = bignum_alloc(ctx, BignumClass::Decimal, 3)?;
     // GC-SAFETY (use-after-move — see `bi_alloc`/`bi_alloc_int`): pin `obj`
     // across the `bi_alloc` / `create_string` allocations below, which can
     // trigger a minor GC that relocates the not-yet-rooted `obj`. Each branch
@@ -4365,7 +4450,7 @@ fn bd_alloc_bigint(
         } else {
             None
         };
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3)?;
+        let obj = bignum_alloc(ctx, BignumClass::Decimal, 3)?;
         if let Some(ic) = compact {
             ctx.set_field(obj, iv_i, Value::Object(None));
             ctx.set_field(obj, ic_i, Value::Long(ic));
