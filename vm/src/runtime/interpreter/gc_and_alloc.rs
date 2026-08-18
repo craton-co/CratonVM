@@ -209,6 +209,100 @@ pub(super) fn stw_takeover_should_scan(rounds: u32, jit_hint: bool) -> bool {
     }
 }
 
+/// Raised for the duration of a [`stw_publish_frame_traces`] pause; read by
+/// `safepoint_check` on the arriving side.
+///
+/// Process-global rather than per-thread because the request is scoped to one
+/// stop-the-world, and only one of those runs at a time — a second requester
+/// finds `request_stw` already taken and gives up. A per-thread flag would buy
+/// nothing and cost a registry lookup at every safepoint park.
+static FRAME_TRACE_WANTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Is a cross-thread stack dump in flight? See [`stw_publish_frame_traces`].
+#[inline]
+pub(crate) fn frame_trace_wanted() -> bool {
+    FRAME_TRACE_WANTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Take a stop-the-world pause whose only purpose is to make every mutator
+/// publish its live call stack into `JvmThread::frame_trace`, so a cross-thread
+/// `Thread.getStackTrace()` / `Thread.dumpThreads()` can read where the target
+/// thread ACTUALLY is.
+///
+/// # Why a safepoint is needed at all
+///
+/// `frame_trace` is deposited at the blocking deposit points, which is exactly
+/// right for a parked thread and says nothing about a running one. A thread that
+/// has never blocked has published nothing (cross-thread `getStackTrace()`
+/// returned a zero-length array — measured against HotSpot on a spin loop:
+/// HotSpot named the running method on every one of ~840 samples, this VM
+/// returned `<empty>` on 1471 of 1495 and the real method on none), and a thread
+/// that HAS blocked publishes where it blocked last, which is worse than
+/// nothing: it is a confident wrong answer. Another thread cannot walk a running
+/// thread's frames from outside — `JvmThread::frames` is owned by its own
+/// thread — so the only way to get a truthful stack is to ask that thread to
+/// publish one at a point where it is not mid-instruction. That is what a
+/// safepoint is.
+///
+/// This is HotSpot's answer too; it uses a per-thread handshake rather than a
+/// global pause, which is cheaper but needs a per-thread poll word this VM's
+/// JIT does not emit (`emit_safepoint_poll` tests exactly one byte, the GC
+/// barrier's `stw_requested`, and widening that test costs every back-edge in
+/// every compiled method). Reusing the existing pause keeps the change off the
+/// hot path entirely, at the cost of making a thread dump as expensive as a GC
+/// pause. Callers should skip it when the target is parked — see
+/// `NativeContextImpl::thread_stack_trace`, which does.
+///
+/// Returns `false` when no pause was taken (another STW already owns the
+/// world); the caller then reads whatever was last deposited, i.e. the
+/// behaviour that predates this function.
+pub(crate) fn stw_publish_frame_traces(
+    shared: &SharedVm,
+    initiator: crate::ThreadId,
+) -> bool {
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    // Raised BEFORE the request: a mutator that reaches its poll between the
+    // request and the flag would otherwise park without publishing, and this
+    // pause has no second chance to ask it.
+    FRAME_TRACE_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let stw_taken = shared
+        .mem
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(initiator, || {
+            let (n, blocked, tids, blocked_tids) = shared
+                .threads
+                .thread_registry
+                .alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
+    if !stw_taken {
+        FRAME_TRACE_WANTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    // `stw_take_over_and_wait`, not the plain `wait_for_all()`: a peer spinning
+    // in compiled code that never reaches a poll is FROZEN and scanned in place
+    // rather than waited on forever. Such a peer never runs `safepoint_check`
+    // and so publishes nothing — its trace stays as last deposited, which is
+    // the pre-existing answer and never worse than it.
+    let mut xt_roots: Vec<ObjectRef> = Vec::new();
+    let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+    // Nothing to do in the pause itself: the work is what the ARRIVING threads
+    // did on their way in. Nothing moves, so there is no pointer map.
+    crate::jit::xt_root_scan::resume(taken);
+    shared
+        .mem
+        .gc_barrier
+        .complete_gc(cratonvm_types::PointerMap::default());
+    FRAME_TRACE_WANTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 pub(super) fn stw_take_over_and_wait(
     shared: &SharedVm,
     xt_roots: &mut Vec<ObjectRef>,
@@ -4809,6 +4903,26 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         if remap_trace_on() {
             let snap = thread.root_snapshot.lock().clone();
             deposit_gap_diff(thread, &snap, "publish");
+        }
+        // Publish this thread's LIVE call stack, when — and only when — some
+        // other thread is at this moment taking a cross-thread
+        // `Thread.getStackTrace()` / `dumpThreads()` (see
+        // [`stw_publish_frame_traces`]).
+        //
+        // `frame_trace` is otherwise written at the BLOCKING deposit points
+        // only, which is the right place for a parked thread (it shows the
+        // blocking call site) and useless for a running one: a thread that has
+        // never blocked publishes nothing, and one that has publishes where it
+        // blocked LAST. That is what made cross-thread `getStackTrace()` return
+        // an empty array for any thread actually executing Java code.
+        //
+        // Gated on the request flag rather than unconditional: this runs inside
+        // every safepoint park, i.e. on every mutator on every GC pause, and the
+        // capture allocates a `Vec` per thread. A thread dump is rare; a GC
+        // pause is not. Unset, this is one relaxed load.
+        if frame_trace_wanted() {
+            let trace = crate::runtime::stackwalker::capture_frames_no_lines(&thread.frames);
+            *thread.frame_trace.lock() = trace;
         }
 
         // Arrive at barrier and wait for GC to complete. Census-aware (auto):
