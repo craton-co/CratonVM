@@ -92,12 +92,26 @@ fn deprecated_api_manifest() -> Vec<DeprecatedApi> {
 }
 
 /// Build a fresh registry with all deprecated natives registered.
+///
+/// The registrars run in the SAME ORDER as `lib.rs`'s
+/// `register_all_natives`, because `NativeMethodRegistry::register` is
+/// last-write-wins and several of these names are registered twice. A registry
+/// assembled in a different order resolves those to a different body than the
+/// VM does, so the verification below would be describing a registry that
+/// never exists at runtime — see the note at `deprecated_util.rs`'s
+/// `Hashtable.keys` registration, where which copy wins is the whole bug.
+///
+/// `deprecated_util` used to be missing here entirely, which is what made
+/// `Character.isJavaLetter` / `isJavaLetterOrDigit` / `isSpace` look
+/// unregistered to T8.5.1 and T8.5.3: all three are implemented and
+/// registered, just by the one registrar this list omitted.
 fn build_deprecated_registry() -> NativeMethodRegistry {
     let mut r = NativeMethodRegistry::new();
+    crate::security_manager::register_security_manager_natives(&mut r);
     crate::deprecated_lang::register_deprecated_lang_natives(&mut r);
     crate::deprecated_io_util::register_deprecated_io_util_natives(&mut r);
+    crate::deprecated_util::register_deprecated_util_natives(&mut r);
     crate::deprecated_internal::register_deprecated_internal_natives(&mut r);
-    crate::security_manager::register_security_manager_natives(&mut r);
     r
 }
 

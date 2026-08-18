@@ -21671,26 +21671,25 @@ mod g22_glob_translation_tests {
     #[test]
     fn windows_translation_matches_the_jdk() {
         // `*` and `?` stop at the separator; `**` crosses it.
-        assert_eq!(dos("*.txt"), r"^[^\]*\.txt$");
-        assert_eq!(dos("a?c"), r"^a[^\]c$");
+        assert_eq!(dos("*.txt"), r"^[^\\]*\.txt$");
+        assert_eq!(dos("a?c"), r"^a[^\\]c$");
         assert_eq!(dos("**.txt"), r"^.*\.txt$");
-        assert_eq!(dos("**/*.txt"), r"^.*\[^\]*\.txt$");
-        assert_eq!(dos("src/**"), r"^src\.*$");
+        assert_eq!(dos("**/*.txt"), r"^.*\\[^\\]*\.txt$");
+        assert_eq!(dos("src/**"), r"^src\\.*$");
         // A `/` in the PATTERN is the separator; a lone `\` is the ESCAPE, so
         // `sub\a.txt` is the file name `suba.txt` and matches no directory.
-        assert_eq!(dos("sub/a.txt"), r"^sub\a\.txt$");
+        assert_eq!(dos("sub/a.txt"), r"^sub\\a\.txt$");
         assert_eq!(dos(r"sub\a.txt"), r"^suba\.txt$");
-        assert_eq!(dos(r"sub\a.txt"), r"^sub\a\.txt$");
         // Alternation, and a stray `}` / `,` outside a group is a literal.
-        assert_eq!(dos("*.{java,class}"), r"^[^\]*\.(?:(?:java)|(?:class))$");
+        assert_eq!(dos("*.{java,class}"), r"^[^\\]*\.(?:(?:java)|(?:class))$");
         assert_eq!(dos("a}b"), "^a}b$");
         assert_eq!(dos("a,b"), "^a,b$");
         // Classes: `!` negates, `^` is a LITERAL, a leading `-` is literal.
-        assert_eq!(dos("[abc].txt"), r"^[[^\]&&[abc]]\.txt$");
-        assert_eq!(dos("[!a-z].txt"), r"^[[^\]&&[^a-z]]\.txt$");
-        assert_eq!(dos("[^abc].txt"), r"^[[^\]&&[\^abc]]\.txt$");
-        assert_eq!(dos("[a-]"), r"^[[^\]&&[a-]]$");
-        assert_eq!(dos("[-a]"), r"^[[^\]&&[-a]]$");
+        assert_eq!(dos("[abc].txt"), r"^[[^\\]&&[abc]]\.txt$");
+        assert_eq!(dos("[!a-z].txt"), r"^[[^\\]&&[^a-z]]\.txt$");
+        assert_eq!(dos("[^abc].txt"), r"^[[^\\]&&[\^abc]]\.txt$");
+        assert_eq!(dos("[a-]"), r"^[[^\\]&&[a-]]$");
+        assert_eq!(dos("[-a]"), r"^[[^\\]&&[-a]]$");
         // `regexMetaChars` is escaped, and nothing outside it is.
         assert_eq!(dos("a+b"), r"^a\+b$");
         assert_eq!(dos("a-b"), "^a-b$");
@@ -21761,7 +21760,7 @@ mod g22_glob_translation_tests {
     fn globs_defers_two_cases_to_the_regex_engine() {
         // `[]` translates; `Pattern.compile` then reports
         // "Unclosed character class near index 12" over THIS string.
-        assert_eq!(dos("[]"), r"^[[^\]&&[]]$");
+        assert_eq!(dos("[]"), r"^[[^\\]&&[]]$");
         // Sequential groups are legal; only NESTING is banned.
         assert_eq!(dos("{a}{b}"), "^(?:(?:a))(?:(?:b))$");
     }

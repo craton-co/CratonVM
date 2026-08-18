@@ -19,12 +19,14 @@
 //! So this file runs the identical fixture, against the identical golden
 //! values, with `CRATONVM_JIT_LAMBDA_SITE=0` — which sends a compiled caller's
 //! SAM call back down the generic path and therefore through the one-shot.
-//! Same numbers, other half. Its own file so the variable is set before any
-//! dispatch in the process reads it.
+//! Same numbers, other half — see `interpreted_half` for how that flag is
+//! installed, and why every test in this binary runs one at a time.
 
+use cratonvm_types::flags::with_process_overrides;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
+use std::sync::Mutex;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -45,14 +47,34 @@ fn real_jdk_vm() -> Option<Vm> {
     ))
 }
 
-/// One process, one flag, set once before anything can read it.
-fn force_interpreted_half() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: runs before this binary has created any VM, and every test
-        // here goes through this function first.
-        std::env::set_var("CRATONVM_JIT_LAMBDA_SITE", "0");
-    });
+/// Run `body` with the JIT-side arm off, which is the whole point of this file.
+///
+/// Process-scoped rather than thread-scoped: a compiled caller's SAM call is
+/// served on the VM's background JIT threads, which this test never created,
+/// so `override_thread` would not reach the reader.
+///
+/// Hence the mutex. `override_process` swaps a process-wide slot and its docs
+/// make serialising against other process-scoped overrides the caller's job; a
+/// concurrent test in this binary would otherwise both observe this file's
+/// value and race the guard's restore. `cargo test` runs the twelve tests here
+/// in parallel by default, so they take this lock one at a time rather than
+/// the suite needing `--test-threads=1` — the cost lands on one binary instead
+/// of on every developer's command line.
+///
+/// A per-test override is enough, and does not need to be installed once for
+/// the whole binary the way a `Once` did it, because the reader is
+/// `env_cache::jit_lambda_site` — a `MemoSlot`, which
+/// `flags::invalidate_memos` resets whenever an override is installed or
+/// dropped. So each test genuinely re-reads the flag. (Contrast the counter
+/// gate in the two engagement files: that one is a plain `OnceLock`, latched
+/// for the life of the process, which is why those live one test to a binary.)
+///
+/// The guard is dropped normally at the end of the call — NOT `mem::forget`ed,
+/// which would leak the override into whatever runs next in this process.
+fn interpreted_half<R>(body: impl FnOnce() -> R) -> R {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    with_process_overrides(&[("CRATONVM_JIT_LAMBDA_SITE", Some("0"))], body)
 }
 
 macro_rules! require_class_library {
@@ -76,7 +98,6 @@ macro_rules! require_class_files {
 }
 
 fn checksum(method: &str) -> i32 {
-    force_interpreted_half();
     let mut vm = real_jdk_vm().expect("guarded by require_class_library!");
     match vm.invoke("cratonvm/LambdaJitTierUp", method, "()I", &[]) {
         Ok(Some(Value::Int(v))) => v,
@@ -96,23 +117,29 @@ fn checksum(method: &str) -> i32 {
 
 #[test]
 fn test_oneshot_plain_lambda() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("plainChecksum"), 1_345_494_336);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("plainChecksum"), 1_345_494_336);
+    });
 }
 
 #[test]
 fn test_oneshot_capturing_lambda() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("capturingChecksum"), 1_347_894_336);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("capturingChecksum"), 1_347_894_336);
+    });
 }
 
 #[test]
 fn test_oneshot_method_reference() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("methodRefChecksum"), 1_345_494_336);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("methodRefChecksum"), 1_345_494_336);
+    });
 }
 
 /// The section 5.3 crash, pinned: a compiled lambda body throwing from a cold
@@ -120,16 +147,20 @@ fn test_oneshot_method_reference() {
 /// returned a wrong sum from the calls that followed the first throw.
 #[test]
 fn test_oneshot_throwing_lambda_body() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("throwingChecksum"), -1_620_381_380);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("throwingChecksum"), -1_620_381_380);
+    });
 }
 
 #[test]
 fn test_oneshot_default_method_through_lambda() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("composedChecksum"), -1_524_778_624);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("composedChecksum"), -1_524_778_624);
+    });
 }
 
 /// Every arm of the one-shot's return-value conversion: `J`, `D`, `L`, and
@@ -137,34 +168,42 @@ fn test_oneshot_default_method_through_lambda() {
 /// corrupts the caller's stack; this is the arm that would catch it.
 #[test]
 fn test_oneshot_return_shapes() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("returnShapesChecksum"), 2_407_060);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("returnShapesChecksum"), 2_407_060);
+    });
 }
 
 /// `sig.arithmetic` — divide-by-zero raised inside the compiled body, which
 /// reaches the interpreter as an out-of-band signal rather than as a return.
 #[test]
 fn test_oneshot_arithmetic_exception_from_body() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("arithmeticChecksum"), 5_266_000);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("arithmeticChecksum"), 5_266_000);
+    });
 }
 
 /// `sig.npe` — the same, for an implicit null dereference.
 #[test]
 fn test_oneshot_npe_from_body() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("npeChecksum"), 1_210_000);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("npeChecksum"), 1_210_000);
+    });
 }
 
 /// `sig.aioobe` — the same, for an out-of-range array index.
 #[test]
 fn test_oneshot_array_index_exception_from_body() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("arrayIndexChecksum"), 12_400);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("arrayIndexChecksum"), 12_400);
+    });
 }
 
 /// A body that carries its OWN exception table. The fast path must decline it
@@ -172,16 +211,20 @@ fn test_oneshot_array_index_exception_from_body() {
 /// must still be right.
 #[test]
 fn test_oneshot_self_catching_body_declines_fast_path() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("selfCatchingChecksum"), -74_309_796);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("selfCatchingChecksum"), -74_309_796);
+    });
 }
 
 #[test]
 fn test_oneshot_nested_lambda_dispatch() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("nestedChecksum"), -1_604_378_624);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("nestedChecksum"), -1_604_378_624);
+    });
 }
 
 /// An exception thrown by a warm lambda body and caught two Java frames out:
@@ -189,7 +232,9 @@ fn test_oneshot_nested_lambda_dispatch() {
 /// synchronously, exactly as the interpreted path's own `?` does.
 #[test]
 fn test_oneshot_exception_propagates_through_two_frames() {
-    require_class_files!();
-    require_class_library!();
-    assert_eq!(checksum("propagationChecksum"), -1_620_381_380);
+    interpreted_half(|| {
+        require_class_files!();
+        require_class_library!();
+        assert_eq!(checksum("propagationChecksum"), -1_620_381_380);
+    });
 }

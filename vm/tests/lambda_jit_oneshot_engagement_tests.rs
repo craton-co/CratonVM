@@ -12,16 +12,19 @@
 //! So this file asserts the path was taken. It runs a fixture method long
 //! enough (400 000 dispatches) that the background compiler certainly publishes
 //! the impl body, and then reads the engagement counters
-//! (`lambda_jit_engagement`, gated on `CRATONVM_DBG_LAMBDA_JIT` — set below
-//! BEFORE any VM exists, because the gate is read once into a `OnceLock`).
+//! (`lambda_jit_engagement`, gated on `CRATONVM_DBG_LAMBDA_JIT` — installed by
+//! `run_under_oneshot_flags` BEFORE any VM exists, because the gate is read
+//! once into a `OnceLock`).
 //!
 //! Its own file, and therefore its own process: the gate cannot be set after
 //! another test in the same binary has already dispatched a lambda and locked
-//! it to `false`.
+//! it to `false`. That is also why the override below can be process-scoped
+//! without taking a lock.
 //!
 //! **Prerequisites:** Java test classes are compiled automatically by
 //! `build.rs` if `javac` is on the PATH. If not, the test is skipped.
 
+use cratonvm_types::flags::with_process_overrides;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::runtime::interpreter::lambda_jit_engagement;
 use cratonvm_vm::types::Value;
@@ -52,10 +55,39 @@ fn test_lambda_one_shot_actually_engages() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
-    // Before the first dispatch: the counters' gate is a `OnceLock`.
-    // SAFETY: single-threaded, and the first statement of the only test in this
-    // binary — nothing else can be reading the environment concurrently.
-    std::env::set_var("CRATONVM_DBG_LAMBDA_JIT", "1");
+    run_under_oneshot_flags(probe_interpreted_arm);
+}
+
+/// The flags this file's measurement depends on, installed for the whole run.
+///
+/// Process-scoped rather than thread-scoped: the counters are bumped from the
+/// background JIT compile worker as well, a thread this test never created,
+/// which `override_thread` would not reach.
+///
+/// It also has to be in place before the first dispatch. `flags()` serves
+/// declared names from one process-wide snapshot latched on first read, so the
+/// `set_var`s that used to sit here only landed when they won that race; and
+/// the counter gate itself (`interpreter::lambda::counters::on`) is a plain
+/// `OnceLock`, not one of the `env_cache` memo slots that installing an
+/// override invalidates, so it is read exactly once per process and never
+/// revisited.
+///
+/// No serialisation is owed despite the process scope: this is the only test in
+/// the binary (see the module docs).
+fn run_under_oneshot_flags(body: fn()) {
+    with_process_overrides(
+        &[
+            ("CRATONVM_DBG_LAMBDA_JIT", Some("1")),
+            // ...and the JIT-side arm OFF, so the interpreted one-shot is what
+            // serves. This is the half the file exists to cover.
+            ("CRATONVM_JIT_LAMBDA_SITE", Some("0")),
+        ],
+        body,
+    );
+}
+
+/// The measurement. See `run_under_oneshot_flags` for the flags it needs.
+fn probe_interpreted_arm() {
     // NOT `CRATONVM_BG_COMPILE=0`. Inline compilation looks like the way to
     // make "the body is compiled by iteration N" deterministic, and it is —
     // but measured across this fixture it compiles only ~6% of the dispatches
@@ -64,9 +96,6 @@ fn test_lambda_one_shot_actually_engages() {
     // `try_jit_upgrade_with_gate` route declines bodies the worker admits. A
     // configuration that suppresses the thing under test is a worse trade than
     // a race the counters below can see.
-    // ...and the JIT-side arm OFF, so the interpreted one-shot is what serves.
-    // SAFETY: as above.
-    std::env::set_var("CRATONVM_JIT_LAMBDA_SITE", "0");
 
     let Some(mut vm) = real_jdk_vm() else {
         eprintln!(
