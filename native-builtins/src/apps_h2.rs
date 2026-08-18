@@ -827,10 +827,30 @@ fn h2_comparison_compare_pinned(
 fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = h2_object_arg(args, 0, "ConditionAndOr receiver is null")?;
     let session = h2_object_arg(args, 1, "ConditionAndOr session is null")?;
+    // `getValue` runs Java, so a peer thread's collection can relocate
+    // everything held in a Rust local here — where no root scan reaches it.
+    // `this` is read AFTER the first callback (`andOrType`, then `right`) and
+    // `session` is PASSED to the second one, so both must survive it.
+    //
+    // A stale `session` is the H2 MVStore-writer page's own headline verdict —
+    // `receiver names an address the ZGC slide VACATED … original_class=
+    // org/h2/engine/SessionLocal … site="invoke dispatch"` — which is this
+    // argument reaching `getValue(SessionLocal)` after a relocation. The
+    // receiver of a `ctx` field read is repaired by `load_and_forward`; an
+    // ARGUMENT handed to `invoke_virtual` is not, so it lands in a Java frame
+    // as a raw stale pointer.
+    //
+    // Pins are truncated to the call's watermark by `safe_native_call_impl` on
+    // every exit, so the early returns below need no unpin.
+    let this_pin = ctx.pin_native_root(this);
+    let session_pin = ctx.pin_native_root(session);
     let left =
         h2_object_field(ctx, this, "left").ok_or_else(|| RuntimeError::NullPointerException {
             message: Some("ConditionAndOr.left".to_string()),
         })?;
+    let left_pin = ctx.pin_native_root(left);
+    let left = ctx.read_native_pin(left_pin, left);
+    let session = ctx.read_native_pin(session_pin, session);
     let left_value = h2_value_result(
         ctx.invoke_virtual(
             left,
@@ -840,6 +860,7 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
         )?,
         "ConditionAndOr.left.getValue",
     )?;
+    let this = ctx.read_native_pin(this_pin, this);
     let left_value_ref = h2_object_arg(
         &[left_value.clone()],
         0,
@@ -851,10 +872,12 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
         1 => "isTrue",
         _ => return Err(h2_internal_error(ctx, and_or_type.to_string())),
     };
+    let left_value_pin = ctx.pin_native_root(left_value_ref);
     let left_matches = matches!(
         ctx.invoke_virtual(left_value_ref, test_method, "()Z", &[])?,
         Some(Value::Int(value)) if value != 0
     );
+    let left_value_ref = ctx.read_native_pin(left_value_pin, left_value_ref);
     let boolean_field = if and_or_type == 0 { "FALSE" } else { "TRUE" };
     if left_matches {
         return Ok(Some(h2_static_value(
@@ -863,10 +886,14 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
             boolean_field,
         )?));
     }
+    let this = ctx.read_native_pin(this_pin, this);
     let right =
         h2_object_field(ctx, this, "right").ok_or_else(|| RuntimeError::NullPointerException {
             message: Some("ConditionAndOr.right".to_string()),
         })?;
+    let right_pin = ctx.pin_native_root(right);
+    let right = ctx.read_native_pin(right_pin, right);
+    let session = ctx.read_native_pin(session_pin, session);
     let right_value = h2_value_result(
         ctx.invoke_virtual(
             right,
@@ -876,11 +903,16 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
         )?,
         "ConditionAndOr.right.getValue",
     )?;
+    // `left_value_ref` is live across the callback just above and compared by
+    // IDENTITY against `ValueNull.INSTANCE` at the end of this function, where a
+    // stale address would silently compare unequal.
+    let left_value_ref = ctx.read_native_pin(left_value_pin, left_value_ref);
     let right_value_ref = h2_object_arg(
         &[right_value.clone()],
         0,
         "ConditionAndOr right value is null",
     )?;
+    let right_value_pin = ctx.pin_native_root(right_value_ref);
     if matches!(
         ctx.invoke_virtual(right_value_ref, test_method, "()Z", &[])?,
         Some(Value::Int(value)) if value != 0
@@ -891,6 +923,11 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
             boolean_field,
         )?));
     }
+    // Both operands are compared by IDENTITY below, so both have to be re-read
+    // after the callback above: a stale address compares unequal to the live
+    // `ValueNull.INSTANCE` and this returns TRUE/FALSE where SQL requires NULL.
+    let left_value_ref = ctx.read_native_pin(left_value_pin, left_value_ref);
+    let right_value_ref = ctx.read_native_pin(right_value_pin, right_value_ref);
     let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
     if null == Some(left_value_ref) || null == Some(right_value_ref) {
         Ok(Some(h2_static_value(
