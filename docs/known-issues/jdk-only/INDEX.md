@@ -1017,3 +1017,15 @@ Three of those are worth reading before acting anywhere in this tree:
   is worse than a wrong value: it presents as "the application stopped", far
   from the call. NOT FIXED. The oracle column for all 29 unmeasured rows is in
   §4 so the next pass is a diff, not a measurement exercise.
+* **`G73-1`** — sweep 10 closes the exception-contract axis `G68-1` opened:
+  `Method.invoke` and `Constructor.newInstance`, 31 rows, **23 already exact**
+  — every `InvocationTargetException` wrapping, the access checks, argument
+  widening/narrowing, and the whole `java.lang.reflect.Array` family. Four
+  message defects fixed, and the one that is not a message: **`Constructor`
+  dropped the CAUSE that `Method` attaches**, so the same bad argument produced
+  different exceptions through the two doors and Spring's
+  `getCause() instanceof NPE` branch took the wrong arm. The logic was inline
+  in one and absent in the other; it is a shared helper now. Two residues are
+  left deliberately unfaked — their text names JDK internals
+  (`sun.invoke.util.ValueConversions`, a module/loader-qualified
+  `ClassCastException`), and inventing that is not transcription.
