@@ -15695,15 +15695,58 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(arr))))
     });
+/// `File.createTempFile`'s prefix contract, transcribed rather than composed.
+///
+/// MEASURED on both VMs; the oracle refuses where this VM was creating files:
+///
+/// ```text
+///   createTempFile("m",   ".t")  HotSpot IllegalArgumentException
+///                                        Prefix string "m" too short: length must be at least 3
+///   createTempFile("mm",  ".t")  HotSpot the same, naming "mm"
+///   createTempFile("mmm", ".t")  HotSpot OK
+///   createTempFile(null,  ".t")  HotSpot NullPointerException
+///                                        Cannot invoke "String.length()" because "prefix" is null
+/// ```
+///
+/// Both `File.createTempFile` overloads defaulted a null prefix to `"tmp"` and
+/// never looked at the length, so all four rows above created a file. This is a
+/// VALIDATION gap, not a message gap: a program that relies on the refusal —
+/// and `File.createTempFile`'s own javadoc documents it — silently got a file.
+///
+/// The message names the prefix and is quoted exactly as the JDK writes it,
+/// including the double quotes around the offending string. The NPE text is
+/// the helpful-NPE form HotSpot produces for `prefix.length()`, measured, not
+/// guessed.
+///
+/// A null SUFFIX is legal and means `.tmp` — that is the documented default
+/// and is deliberately not touched here.
+fn jdk_check_temp_prefix(prefix: Option<&str>) -> Result<(), MethodCallFailed> {
+    match prefix {
+        None => Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"prefix\" is null".into(),
+            ),
+        }
+        .into()),
+        Some(p) if p.chars().count() < 3 => Err(RuntimeError::IllegalArgumentException {
+            message: format!("Prefix string \"{p}\" too short: length must be at least 3"),
+        }
+        .into()),
+        Some(_) => Ok(()),
+    }
+}
+
     r.register(
         file,
         "createTempFile",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/File;",
         |ctx, args| {
-            let prefix = match args.get(0) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
-                _ => "tmp".into(),
+            let prefix_opt = match args.get(0) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
             };
+            jdk_check_temp_prefix(prefix_opt.as_deref())?;
+            let prefix = prefix_opt.unwrap_or_else(|| "tmp".into());
             let suffix = match args.get(1) {
                 Some(Value::Object(Some(s))) => {
                     ctx.read_string(*s).unwrap_or_else(|| ".tmp".into())
@@ -15720,10 +15763,12 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         "createTempFile",
         "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;",
         |ctx, args| {
-            let prefix = match args.get(0) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
-                _ => "tmp".into(),
+            let prefix_opt = match args.get(0) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
             };
+            jdk_check_temp_prefix(prefix_opt.as_deref())?;
+            let prefix = prefix_opt.unwrap_or_else(|| "tmp".into());
             let suffix = match args.get(1) {
                 Some(Value::Object(Some(s))) => {
                     ctx.read_string(*s).unwrap_or_else(|| ".tmp".into())

@@ -10592,6 +10592,70 @@ pub(crate) fn native_class_get_declared_methods(
     result
 }
 
+/// `NoSuchMethodException`'s message, transcribed rather than composed.
+///
+/// MEASURED on both VMs; the oracle names the class and the parameter types
+/// and this VM named neither:
+///
+/// ```text
+///   H.class.getMethod("nope")           HotSpot  P8$H.nope()        was  nope
+///   H.class.getMethod("m", int.class)   HotSpot  P8$H.m(int)        was  m
+///   Runnable.class.getDeclaredConstructor()
+///                                       HotSpot  java.lang.Runnable.<init>()   was  <init>
+/// ```
+///
+/// This is the message a framework prints when reflection misses, and `nope`
+/// on its own does not say which class was searched or with what signature —
+/// which is the entire diagnostic value of the exception.
+///
+/// Rendering follows `Class.getName()`, NOT `getTypeName()`, and the separator
+/// is a bare comma. Both were measured after being guessed wrong:
+///
+/// ```text
+///   getMethod("zz", int.class, String.class)  P9$H.zz(int,java.lang.String)
+///   getMethod("zz", int[].class)              P9$H.zz([I)
+///   getMethod("zz", String[][].class)         P9$H.zz([[Ljava.lang.String;)
+///   getMethod("zz", (Class<?>) null)          P9$H.zz(null)
+///   getMethod("zz")                           P9$H.zz()
+/// ```
+///
+/// So an array parameter appears as `[I`, never `int[]` — reaching for
+/// [`array_descriptor_to_type_name`] here is exactly wrong — and there is no
+/// space after the comma. This is the JDK's `Class.methodToString`, which
+/// joins `getName()` with `","`.
+fn no_such_method_message(
+    ctx: &dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    member: &str,
+    param_types_arr: Option<cratonvm_types::ObjectRef>,
+) -> String {
+    let owner = ctx
+        .class_name_of_id(class_id)
+        .map(|n| n.replace('/', "."))
+        .unwrap_or_default();
+    let mut params: Vec<String> = Vec::new();
+    if let Some(arr) = param_types_arr {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            let rendered = match ctx.get_array_element(arr, i) {
+                Value::Object(Some(m)) => mirror_type_name(ctx, m),
+                _ => "null".to_string(),
+            };
+            params.push(rendered);
+        }
+    }
+    format!("{owner}.{member}({})", params.join(","))
+}
+
+/// A `Class` mirror rendered as `Class.getName()` renders it — which for an
+/// array is its descriptor with dots (`[[Ljava.lang.String;`), not `String[][]`.
+/// Measured; see [`no_such_method_message`].
+fn mirror_type_name(ctx: &dyn NativeContext, mirror: cratonvm_types::ObjectRef) -> String {
+    mirror_class_name(ctx, mirror)
+        .unwrap_or_default()
+        .replace('/', ".")
+}
+
 pub(crate) fn native_class_get_declared_method(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10794,7 +10858,7 @@ pub(crate) fn native_class_get_declared_method(
     }
 
     Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
-        message: target_name,
+        message: no_such_method_message(&*ctx, class_id, &target_name, param_types_arr),
     }
     .into())
 }
@@ -11707,12 +11771,19 @@ pub(crate) fn native_constructor_new_instance(
             // abstract class?")` (DefaultListableBeanFactoryTests
             // .beanDefinitionWithAbstractClass). With the wrong type that catch
             // is missed and the bean appears to instantiate.
-            let dotted = class_name.replace('/', ".");
-            let msg = ctx.create_string(&dotted);
+            // MEASURED: `Constructor.newInstance()` on an abstract class or an
+            // abstract JDK type throws `InstantiationException` with a NULL
+            // message on HotSpot — `java.io.InputStream` and `PB$A` both — while
+            // `Class.newInstance()` on an INTERFACE names it. The two entry
+            // points differ, and this one is the null-message form; passing the
+            // class name here was the other form's rule applied to this one.
+            //
+            // Spring's `beanDefinitionWithAbstractClass` depends on the TYPE
+            // (see the note above), which is unchanged.
             if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
                 "java/lang/InstantiationException",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(msg))],
+                "()V",
+                &[],
             ) {
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
                     exc,
@@ -11925,7 +11996,7 @@ pub(crate) fn native_class_get_declared_constructor(
     }
 
     Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
-        message: "<init>".to_string(),
+        message: no_such_method_message(&*ctx, class_id, "<init>", param_types_arr),
     }
     .into())
 }
@@ -12518,7 +12589,7 @@ pub(crate) fn native_class_get_method(
     }
 
     Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
-        message: target_name,
+        message: no_such_method_message(&*ctx, class_id, &target_name, param_types_arr),
     }
     .into())
 }
@@ -12629,7 +12700,7 @@ pub(crate) fn native_class_get_constructor(
     }
 
     Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
-        message: "<init>".to_string(),
+        message: no_such_method_message(&*ctx, class_id, "<init>", param_types_arr),
     }
     .into())
 }

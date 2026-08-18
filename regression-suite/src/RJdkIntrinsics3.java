@@ -1,5 +1,7 @@
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Field;
+import java.io.File;
 import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -2407,6 +2409,14 @@ public class RJdkIntrinsics3 {
     // none of them justifies a family. They are here because the alternative
     // is that they stay at zero callers forever.
     // ========================================================================
+    public static class MiscHolder {
+        public void m(int i) {}
+    }
+
+    abstract static class MiscAbstract {
+        MiscAbstract() {}
+    }
+
     static void misc() {
         // -- String(StringBuilder): a SNAPSHOT, not a view ---------------------
         StringBuilder sb = new StringBuilder("abc");
@@ -2486,7 +2496,77 @@ public class RJdkIntrinsics3 {
         check(df.format(new Date(1610712000000L)).equals(sdf.format(new Date(1610712000000L))),
                 "misc: the DateFormat-typed and SimpleDateFormat-typed call sites must agree");
 
-        sectionEnd("misc", 21);
+        // -- File.createTempFile validates its prefix -------------------------
+        // A VALIDATION contract, not a message one: this VM created the file.
+        t = null;
+        try {
+            sinkO = File.createTempFile("m", ".t");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:createTempFile short prefix", t, "java.lang.IllegalArgumentException");
+        ckS("misc:createTempFile short prefix message", t == null ? null : t.getMessage(),
+                "Prefix string \"m\" too short: length must be at least 3");
+        t = null;
+        try {
+            sinkO = File.createTempFile(null, ".t");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:createTempFile null prefix", t, "java.lang.NullPointerException");
+
+        // -- NoSuchMethodException names the class AND the signature -----------
+        // The separator is a bare comma and an array renders as getName()
+        // (`[I`), not `int[]`; both were measured after being guessed wrong.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("nope");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:NoSuchMethodException no-arg message", t == null ? null : t.getMessage(),
+                "RJdkIntrinsics3$MiscHolder.nope()");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("nope", int.class, String.class);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:NoSuchMethodException signature message", t == null ? null : t.getMessage(),
+                "RJdkIntrinsics3$MiscHolder.nope(int,java.lang.String)");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("nope", int[].class);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:NoSuchMethodException array parameter renders as getName", 
+                t == null ? null : t.getMessage(),
+                "RJdkIntrinsics3$MiscHolder.nope([I)");
+
+        // -- InstantiationException is a TYPE, not a word in a message ---------
+        // catch (InstantiationException) must match; the message is null for an
+        // abstract class and getName() for an interface.
+        t = null;
+        try {
+            sinkO = MiscAbstract.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on abstract", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on abstract has a null message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+        t = null;
+        try {
+            sinkO = Runnable.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on interface", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on interface names it", t == null ? null : t.getMessage(),
+                "java.lang.Runnable");
+
+        sectionEnd("misc", 31);
     }
 
     // ========================================================================
