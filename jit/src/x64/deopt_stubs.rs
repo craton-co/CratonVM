@@ -274,9 +274,44 @@ impl Compiler {
         let mut sr_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Locals: oop-ness from the intersection-dataflow mask (only when the
-        // forward dataflow reached this PC; otherwise treat as non-oop). A slot
-        // beyond bit 63, or in an unmapped method, reads as non-oop here — sound
-        // only because `can_deopt_resume` (later) gates such methods off.
+        // forward dataflow reached this PC; otherwise treat as non-oop).
+        //
+        // In a method with MORE THAN 64 LOCALS this mask is not merely truncated
+        // at bit 63 — `compute_local_oop_masks` returns EMPTY vectors for
+        // `max_locals > 64`, so `oop_reached` is `false`, `oop_mask` is `0`, and
+        // `is_oop` below reads FALSE FOR EVERY LOCAL, slot 0 included. Measured
+        // on an 84-local probe: `oop_reached=false oop_mask=0x0` while three
+        // reference locals were live.
+        //
+        // This comment used to say that was "sound only because
+        // `can_deopt_resume` (later) gates such methods off". That is not what
+        // gates it — `can_deopt_resume` is
+        // `!deopt_points.is_empty() && !has_elided_monitor` and says nothing
+        // about the local count. Audited 2026-08-18 (see
+        // fixed-suite-bugs/jit/bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-FIXED-20260817.md,
+        // "Residuals"); what actually holds is three other things, and a reader
+        // about to widen or delete any of them should know which:
+        //
+        //   1. **`classify_local_kinds` has no 64-slot cap**, and
+        //      `deopt_real_enabled()` defaults ON, so `local_kinds` is populated
+        //      in production and its `LocalKind::Ref` arm below publishes
+        //      `RegisterRef`/`StackSlotRef` at ANY slot index. It — not this
+        //      mask — is the reference authority above slot 63. A slot the
+        //      classifier calls `Ambiguous` publishes `Unsupported`, which is
+        //      fail-closed (`osr_exit_policy` refuses the entry).
+        //   2. **The two gates move together.** With `CRATONVM_DEOPT_REAL=0`,
+        //      `local_kinds` is empty — and so is this snapshot: no deopt point
+        //      is recorded for the method at all, and `osr_exit_points` /
+        //      `can_osr_exit` are empty/false, so nothing consumes one.
+        //   3. **The GC side refuses explicitly.**
+        //      `moving_young_safepoint_coverage_complete` has its own
+        //      `num_locals > 64 => false`, which diverts moving-young to the
+        //      non-moving sweep for that cycle; and `color_graph` caps at 64, so
+        //      a local above slot 63 is always frame-resident and the
+        //      conservative sweep (which pins) sees it.
+        //
+        // `classify_local_kinds_types_a_reference_above_slot_63` pins (1), which
+        // is the leg with no other guard behind it.
         let oop_reached = self.local_oop_reached.get(bci).copied().unwrap_or(false);
         let oop_mask = if oop_reached {
             self.local_oop_masks.get(bci).copied().unwrap_or(0)
