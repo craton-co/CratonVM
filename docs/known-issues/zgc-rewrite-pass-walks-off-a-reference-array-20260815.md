@@ -1,6 +1,9 @@
 # ZGC's own rewrite pass faults walking a reference array
 
-**Status: STILL OPEN.** Fifth pass 2026-08-18 — the fourth pass's prescribed
+**Status: STILL OPEN.** Sixth pass 2026-08-18 — two more bulk writers closed
+by construction, and the evidence re-read: the corrupting value is a *heap
+pointer at offset 0*, which is equally consistent with an unregistered object
+based 16 bytes below the victim. Fifth pass 2026-08-18 — the fourth pass's prescribed
 next step is retired unrun (it cannot fire, see the foot of the page), and the
 candidate it displaced is instrumented but not yet run against the repro.
 
@@ -545,6 +548,91 @@ suite and enough reps to see a 1-in-8 event. The Azure host was at **load 38 wit
 31 GB of 31 GB used and OOM-killing builds** for the whole session. Recorded so
 the next person starts from "run the instrument" rather than from "read the
 arena".
+
+# Sixth pass, 2026-08-18: two more writers closed by construction, and the evidence re-read
+
+## The two remaining bulk writers into the heap are both bounded
+
+Every audit on this page hooks `set_field` / `set_array_element`. The obvious
+gap is a **bulk** writer that touches heap memory without going through either.
+There are exactly two, and both are closed by reading them:
+
+* **`System.arraycopy`.** `native_system_arraycopy` copies **per element through
+  `ctx.set_array_element`**, so it is inside the audited path, not outside it.
+  (Worth stating because the card-barrier work on the same collector concluded
+  the opposite about *call-site* coverage — `arraycopy` defeats a per-call-site
+  barrier precisely because it is one call doing N stores. It does not defeat a
+  per-*accessor* audit, which is what `audit_access_receiver` is.)
+* **`Unsafe.copyMemory`, off-heap → heap.** Routes to
+  `unsafe_array_write_bytes`, which **refuses reference arrays outright**
+  (`et == Reference → false`), then bounds-checks `start + bytes.len() > total`,
+  and whose byte/boolean fast path calls `write_byte_array_from` — verified to
+  re-check kind, element type and `dst_off + src.len() > len` and to write
+  nothing on mismatch. It cannot write past an array and cannot write a
+  reference.
+
+Neither can put an 8-byte heap pointer on a header.
+
+## Re-reading the evidence: the victim may not be the object being written to
+
+The value observed on a corrupted header is `0x0000_0200_4xxx_xxxx`, and this
+page says in its own words that **this is the heap's own address range**. So the
+writer is storing a *managed heap pointer* — a reference — at **offset 0** of a
+live object.
+
+An ordinary reference store into object `O` at index `i` writes at
+`O + 16 + 16i`. For that to land on offset 0 of the victim, the writer's base
+must sit **exactly 16 bytes below the victim** — which is what the fifth pass
+already recorded, once, by hand:
+
+> the words just below the victim decode as a plausible header —
+> `class_id=1202 num_slots=11` at `base - 16` — **for an object the registry
+> does not contain**.
+
+That reframes the whole question. It is not necessarily "who corrupts the
+victim's header". It is equally consistent with **an unregistered object based
+at `victim - 16` whose field 0 IS the victim's header word** — i.e. two objects
+overlapping by one header, with only one of them registered. Every audit that
+asks "is the *receiver* a registered base?" is silent on it, because the store
+is a perfectly ordinary store into whatever the writer believes it owns.
+
+## What that makes the next instrument
+
+The fifth pass's `base - 16` probe was done once, manually, on one capture. Make
+it automatic: **when the extent census reports a victim, also decode
+`victim - 16` and `victim - 32`** and report, for each, whether it is a
+plausible header (`alloc_size` succeeds), whether the registry contains it, and
+whether its computed extent covers the victim. Three fields on a line that is
+already being printed.
+
+That distinguishes the two stories on the first crashing run:
+
+* **a stray writer** — nothing plausible sits below the victim;
+* **an overlapping allocation** — a plausible, unregistered object at
+  `victim - 16` whose extent covers the victim, and the "corruption" is its
+  field 0.
+
+If it is the second, the question becomes "how did an object get based 16 bytes
+below a registered base", and this page's own note that **the slide's
+`registry.insert(*to)` is deliberately un-audited** is then the first place to
+look, not the last.
+
+## The elimination table, sixth pass
+
+| candidate writer | verdict | the number / the reason |
+|---|---|---|
+| a bad registry insert (three shapes) | **no** | all 0 |
+| the slide itself | **no** | post-slide survey clean the cycle before |
+| the live set arriving broken | **no** | pre-slide census 0 |
+| a retained TLAB chunk | **no** | `tlab_retire_skipped=0` |
+| an allocation sized wrong | **no** | `zgc alloc audit` never fires |
+| a Java field/array store | **no** | `zgc access audit` never fires |
+| a raw native copy into the heap | **no** | `CRATONVM_DBG_HEAPCOPY` 0 |
+| a write through a TAGGED arena handle | **no** | bounds-checked into its own `Vec`; the prescribed probe cannot fire (fifth pass) |
+| **`System.arraycopy`** | **no** | per-element `set_array_element` — inside the audit |
+| **`Unsafe.copyMemory` off-heap→heap** | **no** | refuses reference arrays; bounds-checked twice |
+| a raw pointer TRANSLATED out of the arena | **untested** | `unsafe_arena_translation_stats` (fifth pass) |
+| **an unregistered object based at `victim - 16`** | **untested** | the `base - 16` decode, above |
 
 ## Related
 
