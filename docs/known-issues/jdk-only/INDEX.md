@@ -1077,3 +1077,14 @@ Three of those are worth reading before acting anywhere in this tree:
   the difference cannot be simplified away. `EOFException` carries a null
   message — an empty message is not the empty string, the same distinction
   `G72-1` needed.
+* **`G77-1`** — two sweeps that found **nothing**, recorded because the
+  alternative is somebody probing them again. String bounds messages, case
+  mapping (including `ß`→`SS`, the `ﬁ` ligature, final sigma, Turkish `i`/`I`,
+  surrogate pairs and lone surrogates) and comparison: **44 rows exact**.
+  Serialization round trips, back-reference identity, `transient`, every
+  refusal, and the stream header: **20 rows exact**. Six preceding
+  contract sweeps found a defect within the first ten rows every time; these
+  two are unrelated to each other and to those six. The cheap message-shaped
+  hunt has reached diminishing returns — see §4 N2 for the three question
+  SHAPES never asked (concurrency, GC pressure, scale), which is where a next
+  sweep should go rather than at another subject.
