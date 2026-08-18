@@ -6,6 +6,7 @@
 | **Opened** | 2026-08-17 as `known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`; §5 added the same day |
 | **Closed by** | `fix/lambda-sam-jit-tierup-20260817`, then `perf/lambda-mic-adapter-20260818`, then `perf/lambda-capturing-adapter-20260818` for the capturing residual |
 | **Measured effect** | **37x** on `probes/SamHotLoopProbe.java`'s lambda row — 379 → 10.2 ns/op, against a named-class control of 10.3 — same binary, three-arm ABBA, six runs an arm. The gap this page was filed about is GONE, not narrowed. The capturing row followed on 2026-08-18: **17.4x**, 125.1 → 7.2 ns/op against a control of 6.6 (see §4) |
+| **…on a real workload** | **Not measurable.** On Tomcat's JUnit suite the feature engages (7 of 24 classes install thunks, a third of them capturing) but the capturing thunk moves wall time 2% with fully overlapping ranges — a few hundred `site_calls` per process against a ~140 ns saving is tens of microseconds in a 45-second run. Quote the ns/op figures as microbenchmark numbers, not workload numbers; see §4 "Does any of this reach a real workload?" |
 | **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (everything), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller Rust arm), `CRATONVM_JIT_LAMBDA_ADAPTER=0` (the inline-cache thunk), `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` (just the capturing half of it) |
 
 The page asked for one thing in its §4 — *"giving lambda call sites a cached
@@ -387,6 +388,68 @@ necessarily goes quiet exactly when the fast path starts working.
 `jit::lambda_adapter`'s
 `a_reference_capture_is_still_served_under_compressed_oops` pins the behaviour
 directly, since nothing in a default run can tell the two versions apart.
+
+#### Does any of this reach a real workload? Mostly not — measured
+
+Every number above is a microbenchmark. `getResources` laziness was 20x on its
+microbench and 0% on the workload it was built for, so the question has to be
+asked rather than assumed.
+
+**First the instrument had to be fixed, and how it failed is the more useful
+half.** `CRATONVM_DBG=lambda-jit` printed every 200 000 *eligible* dispatches or
+100 000 *direct* calls — thresholds sized for a probe doing millions of one
+shape. A census over 24 Tomcat JUnit classes (129 s of real work) printed
+**nothing at all**, and the obvious reading — "no lambda activity" — is one the
+instrument cannot support: 199 999 eligible dispatches with fifty installed
+thunks looks identical. Silence below a threshold no application reaches is not
+evidence. The census now also dumps once at exit
+(`report_lambda_census_at_exit`), which is what made everything below
+measurable.
+
+With that, real Tomcat code does reach the feature:
+
+| class | eligible | fast_returns | site_calls | adapters | **capturing** |
+|---|---:|---:|---:|---:|---:|
+| `TestFilterValve` | 3 498 | 719 | 90 | 6 | **2** |
+| `TestHttpServletDoHead…1024` | 87 086 | 82 111 | 771 | 4 | **1** |
+| `TestHttp11InputBuffer` | 8 308 | 4 622 | 358 | 3 | **1** |
+
+Across the 24-class sample, 7 classes installed thunks, 24 sites in all, and
+roughly a third of those are capturing. So capturing SAM sites are not a
+microbenchmark artefact — ordinary framework code has them, and they do get
+thunks.
+
+**And it does not matter.** Same binary, kill switches, `A B C C B A`, three
+rounds, on the class with the most lambda traffic in the census:
+
+| arm | wall (ms) | range |
+|---|---:|---|
+| A — everything on | 45 655 | [39 386 … 53 373] |
+| B — capture thunk off | 46 646 | [38 767 … 51 551] |
+| C — whole lambda tier-up off | 50 646 | [44 902 … 58 766] |
+
+A against B is 2%, with ranges that overlap almost entirely: **the capturing
+thunk's effect on this workload is below the noise floor**, and the honest
+statement is that this measurement cannot see it. A against C suggests ~10% for
+the feature family as a whole, but those ranges overlap too and six runs on a
+shared box that varies 39–58 s for identical work cannot resolve it — it is a
+hypothesis for a quieter box, not a result.
+
+The arithmetic says why, and would have predicted it: `site_calls` is in the
+hundreds per process, and the thunk saves ~140 ns a call. That is tens of
+microseconds against a 45-second run. The microbenchmark is 2 000 000 calls of
+one shape; a JUnit class is a few hundred, because a short-lived process barely
+compiles its callers — note `fast_returns=82111` against `site_direct=197` on
+the DoHead class, i.e. the *interpreter's* one-shot arm served four hundred
+times more lambda calls than the JIT-side one did.
+
+**So the value of this work is not in Tomcat's test suite.** It is in the shape
+of workload where a SAM call site is genuinely hot and the caller is genuinely
+compiled — a long-lived server loop, a stream pipeline over a large collection —
+which is what the microbenchmark stands in for and what this suite is not. That
+is a claim about applicability and it is still unmeasured; anyone extending this
+page should measure a long-running workload before quoting the 17x as anything
+other than what it is.
 
 #### What the fixture had to learn
 
