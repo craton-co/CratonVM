@@ -34,8 +34,11 @@
 > diverged, and all five are fixed here. That is the `G69-1` shape again: the
 > lattice is right and the sentence is not.
 
-**Status:** RESOLVED — fixed and verified. The sweep is INCOMPLETE and cannot be
-completed until §1 is fixed — the VM blocks partway through it.
+**Status:** RESOLVED — fixed and verified; the sweep runs to completion and all
+32 rows match. The body below is kept in its ORIGINAL wording, written while
+§1 still hung, because the reasoning it records is the reasoning that found
+the defect. The banner above is what is true now; where the two disagree, the
+banner wins.
 **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS; CratonVM
 `C:/craton/target-nolto` (non-LTO release, see `G71-1`), `--jdk-only`.
 Probe: `regression-suite/probes/Sweep9ExceptionContracts.java`, 33 rows, ASCII.
@@ -71,10 +74,10 @@ stopped", usually far from the call. Any program that computes a timeout and
 lets it go negative (a deadline already passed — `deadline - now()`, the most
 ordinary way to get one) hangs here and returns immediately on HotSpot.
 
-It is also why this record exists instead of a complete sweep: **29 of the 33
-rows have never been measured on CratonVM**, because the probe cannot get past
-row 5. Their oracle values ARE recorded in §4 so the next pass starts with
-half the work done.
+It is also why this record existed instead of a complete sweep: 29 of the 33
+rows could not be measured on CratonVM, because the probe could not get past
+row 5. **They have since been measured — see the banner.** Their oracle values
+are in §4.
 
 ## 2. `Thread.sleep(-1)` succeeds silently
 
@@ -105,10 +108,11 @@ diagnostic surface, and a program or a test that matches on it does not care
 which of the two is more helpful. Note the shape is the same as `G69-1`'s: the
 lattice is right and the sentence is not.
 
-## 4. The oracle for the 29 unmeasured rows
+## 4. The oracle for the 29 rows the hang blocked
 
-Recorded so the next pass does not re-derive them. **These are HotSpot values
-only** — CratonVM's side is unknown for every one.
+Recorded when CratonVM's side was still unknown. **CratonVM now matches every
+one of them.** Kept because the column is worth having written down, and
+because it is what made the re-run a diff rather than a measurement.
 
 ```text
 wait_negative              IllegalArgumentException | timeout value is negative
@@ -145,28 +149,41 @@ Note `forName_array_binary` and `forName_primitive` disagree with each other —
 `"[I"` resolves and `"int"` does not — which is the kind of row that gets
 guessed wrong.
 
-## 5. Why nothing is fixed here, and no vector rows
+## 5. Why nothing was fixed in the FIRST pass (superseded)
 
-The hang has to be fixed FIRST, because it is what stops the rest of the axis
-being measured, and fixing it changes what the following 28 rows even do. A
-partial fix landed now would also land a probe that cannot run to completion.
+The hang had to be fixed first, because it was what stopped the rest of the
+axis being measured and it changed what the following 28 rows even did. That
+ordering held: the fix landed, the sweep ran, and the remaining five defects
+were only findable afterwards.
 
-No vector rows: same standard as `G67-1` §4 and `G71-1` — a row for a defect
-nobody is fixing turns the suite red and trains people to ignore it. The probe
-is checked in so the rows can be lifted with the fix.
+**Both halves are now done and 14 vector rows are in `RJdkIntrinsics3`'s
+`misc` family (35 -> 49).** Note one property of the hang row: if it
+regresses, the family HANGS rather than fails and the harness reports a 120 s
+timeout. That is the only signal a liveness defect can give, and it is called
+out at the rows so a future reader does not dismiss the timeout as
+flakiness.
 
-## 6. NOMINATIONS
+## 6. NOMINATIONS — all three CLOSED
 
-**N1 — fix §1 and §2 together; they are one missing argument check.** Both are
-"a negative timeout is not a long wait, it is an error". `Thread.join(long)`
-already has it and is the in-tree exemplar. `Object.wait(long)`,
-`Object.wait(long,int)` and `Thread.sleep(long)`/`sleep(long,int)` are the
-sites. Fixing §1 is also what unblocks N2.
+**N1 — CLOSED.** The missing argument check, on `Object.wait(long)` and
+`Thread.sleep(long)`. Fixed at `ebd877d45` and verified at `9fc2f3a55`. Two of
+its premises were wrong and are corrected in the banner: `Thread.join` was not
+the correctly-written sibling (it is not ours at all), and the two `wait`
+overloads do not share a message.
 
-**N2 — re-run the sweep and measure the other 29 rows.** The probe is checked
-in and the oracle column is already in §4, so this is a diff, not a
-measurement exercise. Given `G68-1` returned four defects from 29 rows on this
-axis, assume this half is not clean.
+**N2 — CLOSED by measurement.** The other 29 rows were re-run and the axis was
+in better shape than this record assumed: every exception TYPE and every
+control-flow contract already exact, five messages wrong. Worth keeping as a
+result rather than deleting — a nomination that resolved cheaply is as useful
+to the next reader as one that did not.
 
-**N3 — the two monitor messages, §3.** Cheap, and in the same family `G69-1`
-just finished for fields. Do it with N2 rather than alone.
+**N3 — CLOSED.** The two monitor messages, done with N2 as suggested, plus
+three more the re-run exposed (`Thread.start` twice, `Class.forName(null)`,
+`Thread.sleep` interrupted). One of them was not a string edit: an EMPTY
+message is not the empty string, and `RuntimeError` carries a `String`, so
+`Some("")` reached Java as `""` where HotSpot gives `null`.
+
+**N4 — NEW. `Method.invoke` and `Constructor.newInstance` message families.**
+`G69-1` N4 named them and this sweep did not reach them: it covered threads,
+locks, loading and charsets. They are the last untouched corner of the
+exception-contract axis that `G68-1` opened.
