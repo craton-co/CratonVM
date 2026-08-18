@@ -11,9 +11,17 @@ Harness: `/data/bc53-shard.sh` on the Azure host, `-Xmx 1g`, JIT ON
 
 | run | of 45 in-scope classes |
 |---|---|
-| CratonVM, start of this pass | 39 PASS, 6 not green |
-| **CratonVM, after the fixes below** | **42 PASS, 3 FAIL** |
+| CratonVM, start of the first pass | 39 PASS, 6 not green |
+| CratonVM, after the first pass | 42 PASS, 3 FAIL |
+| **CratonVM, after the second pass below** | **42 PASS, 3 FAIL** |
 | HotSpot 25, same harness, same heap | 44 PASS, 1 FAIL (`pkix.test`) |
+
+The class count is unchanged across the second pass and that is not a stall —
+the three remaining classes each shed their CratonVM-specific rows. `pkix.test`
+now fails on **exactly** the five rows HotSpot fails, so it is at parity;
+`jce.provider.test` is down to one flake; and `jcajce.provider` is down to the
+single `Provider`-map defect. Counting classes hides that, which is why the
+per-row table below is the one to read.
 
 **`pkix.test` cannot be green**: HotSpot fails it too, on the same four
 `MissingEntryException: Can't find entry CertPathReviewer.*.text in resource
@@ -121,9 +129,14 @@ component instead of asking it**.
 
 | class | what is left | shape |
 |---|---|---|
-| `jce.provider.test` | `PKCS12Store`, `RSATest`, `SlotTwo` every run, plus `CipherStreamTest2` in 1 run of 3 | see below |
+| `jce.provider.test` | `CipherStreamTest2` (flaky), `Serialisation` | GC root gap; and a `dev` defect, below |
 | `jcajce.provider` | `BouncyCastleProviderTest.testRegisteredClasses` | `Provider`'s Map view |
-| `pkix` | `IDPRelativeNameTest.testMultiValuedRelativeNameRoundTrip` | multi-valued RDN |
+| `pkix` | nothing CratonVM-only — **at parity with HotSpot** | — |
+
+`Serialisation` fails `NullPointerException` in
+`ObjectInputStream.readNonProxyDesc` and **fails identically on pristine
+`origin/dev`**, so it is not from this lane's work; it is recorded here because
+it is what the suite stops on next.
 
 ### `CipherStreamTest2` is a GC ROOT gap, not a JCA defect
 
@@ -171,39 +184,184 @@ third view that disagrees with `keySet().size()`. `testRegisteredClasses` walks
 with null messages — the two unmessaged `assertTrue(... instanceof String)`
 calls.
 
-Fixing this means giving `Provider` one store. Note what that then exposes: the
-test instantiates every registered `org.bouncycastle.*` class, ~2000 of them, so
-a faithful map view is the START of that work rather than the end of it.
+**The split is exactly which methods were intercepted.** In
+`jca/provider_chain.rs` the registrar projects the side table for `put`,
+`parseLegacyPut`, `putService`, `getService`, `getServices`, `containsKey`,
+`get` and `getProperty` — and stops there. `size`, `isEmpty`, `keySet`,
+`entrySet`, `values`, `keys` and `elements` are NOT registered, so they fall
+through to the inherited `Hashtable` bytecode operating on a map that only
+`putId` ever wrote to. That is the whole defect, and it names the fix: either
+project the same table through the Map views too, or have `put` write through
+to the real map.
 
-### A `dev` REGRESSION found while closing these: Mac.getInstance(name, Provider)
+This is worth fixing beyond this test. `for (Object k : provider.keySet())` is
+an ordinary idiom, and today it sees 4 entries where a real JDK shows 5153 —
+silently, with no error anywhere.
 
-`Mac.getInstance(algorithm, providerObject)` refuses EVERY BouncyCastle name
-while `Mac.getInstance(algorithm, "BC")` serves the same names, and HotSpot
-serves both forms:
+Note what a faithful map view then exposes rather than resolves: the test goes
+on to instantiate every registered `org.bouncycastle.*` class, ~2000 of them.
+The map view is the START of that work.
 
+### `Serialisation` — `readClassDescriptor()` returns a stub and reads nothing
+
+Fails `NullPointerException` at `ObjectInputStream.readNonProxyDesc:1927`, and
+**fails identically on pristine `origin/dev`**, so it is not from this lane's
+work. The cause is nevertheless identified, because the stack says it plainly:
+
+```text
+readNonProxyDesc(ObjectInputStream.java:1927)   <- NPE
+readClassDesc(ObjectInputStream.java:1785)
+readNonProxyDesc(ObjectInputStream.java:1927)
+readClassDesc(ObjectInputStream.java:1785)
+readOrdinaryObject(ObjectInputStream.java:2101)
 ```
-byName   1.3.14.3.2.26           -> BC          byObject 1.3.14.3.2.26           EX no such algorithm ... for provider BC
-byName   2.16.840.1.101.3.4.2.1  -> BC          byObject 2.16.840.1.101.3.4.2.1  EX no such algorithm ... for provider BC
-byName   PBEwithHmacSHA1         -> BC          byObject PBEwithHmacSHA1         EX no such algorithm ... for provider BC
+
+Line 1927 is `desc.initNonProxy(readDesc, cl, resolveEx, readClassDesc(false))`
+and `desc` cannot be null — it is `new ObjectStreamClass()` twenty lines up. The
+recursion is the tell: `readNonProxyDesc` is reading the SAME class descriptor
+twice.
+
+`serialization.rs` registers `ObjectInputStream.readClassDescriptor()` as:
+
+```rust
+let desc = alloc_stream_class_stub(ctx, "java/lang/Object")?;
+Ok(Some(Value::Object(Some(desc))))
 ```
 
-**It is not from this work.** Bisected by building the `origin/dev` merge point
-itself, before any of the fixes above: broken there too. It costs `cert.test`,
-which went from `OK (33 tests)` to one failure — BouncyCastle's PKCS#12
-keystore builds its MAC through a helper that holds a `Provider` OBJECT, so
-`error constructing MAC: NoSuchAlgorithmException` is how it surfaces — and it
-is what `PKCS12StoreTest` now stops on.
+It ignores the stream entirely — always `java/lang/Object`, and **consumes no
+bytes**. So the stream position never advances, the next read sees the same
+`TC_CLASSDESC` byte and recurses, and `initNonProxy` is handed a descriptor
+describing a class the stream never mentioned.
 
-The probe is `MacProvObj`: add BC, take `Security.getProvider("BC")`, and call
-both overloads. Three lines, no suite needed.
+The JDK's own `readClassDescriptor` is a documented extension point whose
+default reads the descriptor from the stream; a constant is not a
+simplification of that, it is a different function. Fixing it means parsing the
+serialized class descriptor properly, which is why it is recorded here rather
+than patched alongside the JCA work.
 
-This also blocks a fix that is otherwise ready. `Security.getProperty` answers
-from a hardcoded four-entry table and returns null for every other key, though
-the JDK's own `conf/security/java.security` is right there;
-`java_security_file_property` reads it and is committed UNWIRED, because the
-stock file sets `keystore.type.compat=true`, which sends BouncyCastle's
-`AdaptingKeyStoreSpi` down exactly the path that hits the defect above. Fix the
-overload, then delete that arm.
+### CLOSED: the `dev` defect — `Mac.getInstance(name, Provider)`
+
+`Mac.getInstance(algorithm, providerObject)` refused EVERY BouncyCastle name
+while `Mac.getInstance(algorithm, "BC")` served the same names, and HotSpot
+serves both forms.
+
+**It was not from this lane's work, and it was still unfixed on `dev`.** The
+goal for this pass was to check that before doing anything else, so it was
+checked twice: by building the `origin/dev` merge point itself, and by building
+current `origin/dev` (`9279bf108`, 44 commits later) and running the probe.
+Broken on both; no commit in between touched the JCA surface. The strengthened
+probe (`MacProvObj2`) also found what the original missed:
+
+```text
+                          before (pristine dev)         after
+HmacSHA256      byName    BC len=32 58019f4c…           BC len=32 58019f4c…
+                byObject  SunJCE len=32 58019f4c…       BC len=32 58019f4c…
+1.3.14.3.2.26   byObject  EX no such algorithm … BC     BC len=20 2376178e…
+```
+
+`HmacSHA256` SUCCEEDED and reported the wrong provider — a silent
+misattribution that an exception-only probe scores as a pass. Print the MAC and
+the provider, not "no exception".
+
+**Cause.** The overload checked that the named provider OWNS the algorithm and
+then put the name to this engine's own `mac_algorithm_supported` gate, with
+neither the provider's alias rows (`canonical_if_unrecognised`) nor its own SPI
+(`build_real_mac`). The `(String, String)` overload had both steps; this one had
+neither. So a provider was told it does not implement what the same table had
+confirmed it owns, one line earlier.
+
+Closed `BCFKS` and `PKCS12SecretKey`, restored `cert.test` to `OK (33 tests)`,
+and unblocked the `Security.getProperty` work below.
+
+### CLOSED: `Security.getProperty` now reads `java.security`
+
+It answered four hardcoded keys and `null` for every other one, though the
+configured JDK's own `conf/security/java.security` was right there. The reader
+was written in the first pass and committed UNWIRED, because turning it on sets
+`keystore.type.compat=true`, which sends BouncyCastle's `AdaptingKeyStoreSpi`
+down exactly the path that hit the Mac defect above — enabling it first took
+`cert.test` from PASS to FAIL. With the overload fixed the gate opens onto a
+path that works, and the `#[allow(dead_code)]` is gone.
+
+### CLOSED: the `KeyStore` service rows were transcribed from memory
+
+All five rows were wrong, and each wrong in a way that stays invisible until
+something asks the exact question. Measured on jdk-25 (`KsOwner` probe) against
+what this VM answered:
+
+| | JDK 25 | CratonVM (before) |
+|---|---|---|
+| SUN `PKCS12` | `PKCS12KeyStore$DualFormatPKCS12` | `PKCS12KeyStore` |
+| SUN `JKS` | `JavaKeyStore$DualFormatJKS` | `JavaKeyStore$JKS` |
+| SUN `DKS` | `DomainKeyStore$DKS` | missing |
+| SunJSSE `PKCS12` | `PKCS12KeyStore` | **missing** |
+| `getInstance("PKCS#12")` | `KeyStoreException` | invented alias, succeeded |
+
+The `DualFormat*` classes are the point of the SUN rows: they are the
+delegators that sniff the stream and accept either format, which is what makes
+`keystore.type.compat` mean anything at all. The missing SunJSSE row is what
+`PKCS12StoreTest.checkNoDuplicateOracleTrustedCertAttribute` asks for by name —
+it writes with BouncyCastle and reads back with the platform's own store, which
+is an interop check and not an implementation detail.
+
+### CLOSED: `X500Principal` did not keep the encoding it was built from
+
+`getEncoded()` re-derived the DER from the canonical RFC-4514 string, under a
+comment asserting *"the canonical `Name` form is byte-stable, so this
+round-trips exactly"*. It is not. The canonical string does not carry each
+value's ASN.1 STRING TYPE, so re-encoding picks PrintableString where
+BouncyCastle wrote UTF8String, and RFC 5280 name matching is byte equality over
+the DER:
+
+```text
+certGn  ...06035504030c04526f6f74...   from the certificate     (0c = UTF8String)
+expGn   ...0603550403 1304526f6f74...  rebuilt via X500Principal (13 = Printable)
+equals=false        -- and both print `CN=Root,O=BC,OU=Test+O=Bouncy`
+```
+
+That is `IDPRelativeNameTest.testMultiValuedRelativeNameRoundTrip`. The
+multi-valued RDN was a red herring: it survived every hop intact (parse,
+encode, decode, GeneralName, the certificate extension — all byte-identical to
+HotSpot). What differed was the CRL issuer name rebuilt through
+`getIssuerX500Principal()`.
+
+**Two things hid it.** First, the reported failure named a DIFFERENT
+distribution point than the one that actually failed: `checkCRLs` tries the
+certificate's real DPs, keeps only the LAST exception, then retries with a DP
+synthesised from the issuer — so the message on screen was the second failure
+and the first was discarded. Calling
+`PKIXCRLValidator.checkDistributionPointName` directly with the real DP is what
+surfaced it. Second, both names PRINT identically, so every `toString`
+comparison agreed; only the encodings disagreed.
+
+`--nojit` reproduced it, which took the JIT off the table in one run.
+
+### CLOSED: PKCS#12 is a BER format and the parser accepted only DER
+
+BouncyCastle writes indefinite lengths and segmented OCTET STRINGs, so every
+PKCS#12 file written by the most widely deployed third-party JCA provider was
+unreadable here — `IOException: PKCS#12 parse failed: ASN1Error { kind:
+Invalid }`, which is a Rust error surfacing through a Java API. `openssl
+asn1parse` on the two files, same certificate and password, shows it at a
+glance:
+
+```text
+BouncyCastle            JDK
+  0:d=0 hl=2 l=inf        0:d=0 hl=4 l= 786   SEQUENCE
+ 20:d=3 hl=2 l=inf       26:d=3 hl=4 l= 681   OCTET STRING  (BC's is CONSTRUCTED)
+669:d=4 hl=2 l=  0                            EOC
+```
+
+`ber_to_definite_length` rewrites indefinite lengths to definite ones and joins
+segmented OCTET STRINGs into primitive ones. It runs only after a DER parse
+fails, so the conforming path is untouched, and a DER file comes back
+byte-identical. Six unit tests cover the rewrite, including that a truncated
+input is an error rather than a short read.
+
+Deliberately NOT a general BER-to-DER canonicaliser: SET OF ordering and
+primitive-value canonicalisation are left alone, because the parser does not
+depend on them and rewriting them would change the bytes the PKCS#12 MAC is
+taken over.
 
 ### The other three `jce.provider.test` rows
 

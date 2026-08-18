@@ -663,6 +663,49 @@ impl ValueStack {
         Ok(())
     }
 
+    /// Verifier-trusted sibling of [`Self::pop_with_kind`] for the raw-bytecode
+    /// fast path (`pop2`, `dup_x1`, `dup2`, `dup_x2`, `dup2_x1`, `dup2_x2`).
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn pop_with_kind_unchecked(&mut self) -> (CompactValue, u8) {
+        debug_assert!(self.len > 0, "stack underflow in pop_with_kind_unchecked");
+        self.len -= 1;
+        (self.slots[self.len], self.kinds[self.len])
+    }
+
+    /// Verifier-trusted sibling of [`Self::peek_with_kind`].
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn peek_with_kind_unchecked(&self) -> (CompactValue, u8) {
+        debug_assert!(self.len > 0, "stack underflow in peek_with_kind_unchecked");
+        (self.slots[self.len - 1], self.kinds[self.len - 1])
+    }
+
+    /// Verifier-trusted sibling of [`Self::push_with_kind`].
+    ///
+    /// Copies the slot bits AND the kind mark verbatim, which is what makes the
+    /// shuffle opcodes bit-exact: a `Value` round-trip would re-encode a
+    /// NaN-payload double through [`CompactValue::double`] and lose the payload,
+    /// and would drop the `KIND_LONG` mark that tells the GC a pointer-shaped
+    /// long slot is a primitive.
+    ///
+    /// # Panics
+    /// Panics if the stack is full.
+    #[inline(always)]
+    pub fn push_with_kind_unchecked(&mut self, cv: CompactValue, kind: u8) {
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_with_kind_unchecked"
+        );
+        self.slots[self.len] = cv;
+        self.kinds[self.len] = kind;
+        self.len += 1;
+    }
+
     /// Category-2 (long/double) test that honors the slot's kind mark. A
     /// collision-shaped long is `CompactValue::is_category2() == false` by
     /// bits (its NaN-box sub-tag reads as `SUB_OBJECT`), but it IS a genuine
