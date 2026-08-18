@@ -6015,13 +6015,33 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     }
 }
 
-// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
-// leaf_et encodes the inner array's element type. dim1 and dim2 are the two dimension sizes.
-// Returns a raw heap pointer to the outer reference array whose elements are inner arrays.
+/// `multianewarray` with `dimensions == 2` — the only shape the x64 scan
+/// admits (`bytecode_compat.rs`, opcode `0xc5`).
+///
+/// `site` packs the compile-time-constant description of the site:
+/// `holder_class_id` in the low 32 bits, the constant-pool index of the array
+/// class in the next 16. The emitter has both as immediates; passing them
+/// instead of a pre-digested element type is what lets this helper reach the
+/// SAME body the interpreter runs (`interpreter::multianewarray_alloc`), which
+/// resolves the per-level component classes loader-faithfully.
+///
+/// It used to take a bare `leaf_et` element-type code and allocate every level
+/// with `ClassId::new(0)`. That is a real miscompile, not a cosmetic one: the
+/// outer array of a JIT-compiled `new String[a][b]` carried no class at all, so
+/// `getClass()` read back `[Ljava.lang.Object;` and any `checkcast` to the
+/// declared array type threw `ClassCastException`. Commons Math's
+/// `DSCompiler.getCompiler` publishes such an array through an
+/// `AtomicReference` and casts it back on the next call, which turned 118 of
+/// `DerivativeStructureTest`'s 124 methods red under the JIT and none under
+/// `--nojit`.
+///
+/// # Safety
+/// Called from JIT-compiled code. `vm_ptr` must be a valid `SharedVm` pointer.
+/// `dim1`/`dim2` are the two dimension sizes (outer, inner) as JIT stack slots.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_multianewarray_2d(
     vm_ptr: i64,
-    leaf_et: i64,
+    site: i64,
     dim1: i64,
     dim2: i64,
 ) -> i64 {
@@ -6030,18 +6050,11 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
     crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
-    let heap = heap_from_vm(vm_ptr);
-    let elem_type = match leaf_et as u8 {
-        4 => ArrayElementType::Boolean,
-        5 => ArrayElementType::Char,
-        6 => ArrayElementType::Float,
-        7 => ArrayElementType::Double,
-        8 => ArrayElementType::Byte,
-        9 => ArrayElementType::Short,
-        10 => ArrayElementType::Int,
-        11 => ArrayElementType::Long,
-        _ => ArrayElementType::Reference,
-    };
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // SAFETY: vm_ptr is a valid SharedVm pointer per the caller contract.
+    let vm = &*(vm_ptr as *const SharedVm);
 
     // BUGFIX (mirrors jit_newarray / jit_anewarray_object): narrow dimensions to
     // int payload and sign-extend, defending against NaN-boxed CompactValue raw
@@ -6049,14 +6062,42 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
     let dim1 = dim1 as i32 as i64;
     let dim2 = dim2 as i32 as i64;
     if dim1 < 0 || dim2 < 0 {
-        return 0;
+        // JLS: NegativeArraySizeException, routed through the pending-exception
+        // channel + the 0/null sentinel so the `multianewarray` codegen's
+        // `emit_post_alloc_oom_check` bail hands it to the method's exception
+        // table. Returning a bare 0 (what this did before) pushed a null the
+        // compiled code then dereferenced.
+        return jit_negative_array_size(vm, if dim1 < 0 { dim1 } else { dim2 });
     }
-    let outer = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, dim1 as usize);
-    for i in 0..dim1 as usize {
-        let inner = heap.alloc_array(ClassId::new(0), elem_type, dim2 as usize);
-        let _ = heap.set_array_element(outer, i, Value::Object(Some(inner)));
+
+    let (holder_class_id, cp_index) = cratonvm_jit::unpack_multianewarray_site(site);
+    let holder_cid = ClassId::new(holder_class_id);
+
+    // Resolution can define array classes and run a user `ClassLoader`, i.e.
+    // arbitrary Java on this thread, so it needs the real thread the way
+    // `jit_resolve_cp_class` does. `emit_post_alloc_oom_check` forces
+    // `has_dispatch` on every site that reaches here, so `JIT_THREAD` is set;
+    // the `None` arm is purely defensive.
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return jit_cp_alloc_internal_error(
+            vm,
+            "JIT multianewarray: no live JIT thread to resolve the array class",
+        );
+    };
+
+    match crate::runtime::interpreter::multianewarray_alloc(
+        vm,
+        thread,
+        holder_cid,
+        cp_index,
+        &[dim1 as usize, dim2 as usize],
+    ) {
+        Ok(arr) => arr.as_ptr() as i64,
+        // The failure paths above all leave a pending Java exception on this
+        // thread (or an internal VM error already reported); the 0/null
+        // sentinel is what tells the compiled code to bail into it.
+        Err(_) => 0,
     }
-    outer.as_ptr() as i64
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap

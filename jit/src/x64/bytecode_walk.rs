@@ -10870,25 +10870,52 @@ impl Compiler {
                     let dim2_slot = self.pop_stack(); // inner dimension
                     let dim1_slot = self.pop_stack(); // outer dimension
 
-                    // Look up resolved leaf element type for this PC
-                    let leaf_et = self
+                    // The packed `(holder_class_id | cp_idx << 32)` site
+                    // descriptor for this pc. The helper resolves the array
+                    // class from it at run time, loader-faithfully, through the
+                    // same `interpreter::multianewarray_alloc` the interpreter
+                    // uses — so both tiers stamp the same component classes
+                    // into the allocated levels.
+                    //
+                    // This used to be a bare leaf element-type code, which
+                    // carried no class at all; the helper then allocated every
+                    // level with `ClassId(0)` and a compiled `new String[a][b]`
+                    // came back as `[Ljava.lang.Object;`. A site with no entry
+                    // cannot be compiled correctly at all now (there is no
+                    // "default" array class), so bail rather than emit a call
+                    // that would allocate the wrong type.
+                    let Some(&(_, site)) = self
                         .multianewarray_info
                         .iter()
                         .find(|(p, _)| *p == pc)
-                        .map(|(_, et)| *et as i32) // Cast: x86-64 immediate encoding
-                        .unwrap_or(10); // default T_INT
+                    else {
+                        return false;
+                    };
 
-                    // Call jit_multianewarray_2d(heap_ptr, leaf_et, dim1, dim2)
+                    // Call jit_multianewarray_2d(heap_ptr, site, dim1, dim2)
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    self.emit_mov_imm32_sx(ARG_REGS[1], leaf_et);
+                    self.emit_mov_imm64(ARG_REGS[1], site);
                     self.load_slot_to_reg(ARG_REGS[2], dim1_slot);
                     self.load_slot_to_reg(ARG_REGS[3], dim2_slot);
                     // Round-8 wave-3: defensive callee-saved spill
                     // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.multianewarray_2d);
+                    // Resolution can run a user `ClassLoader.loadClass`, i.e.
+                    // arbitrary Java on this thread — republish the frame
+                    // afterwards exactly as the `new`/`anewarray` CP-indexed
+                    // arms do.
+                    crate::runtime_lowering::emit_post_call_frame_republish(
+                        &mut self.buf,
+                        self.helpers.frame_record,
+                    );
                     // T1.1.2 — multianewarray is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Negative dimension / OOM / failed resolution all come back
+                    // as the 0/null sentinel with a pending exception; bail into
+                    // the method's exception table instead of pushing the null
+                    // and dereferencing it.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // The result is a reference array.
                     self.mark_top_as_oop();

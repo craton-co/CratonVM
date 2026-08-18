@@ -476,20 +476,9 @@ pub(super) fn compile_osr_artifact(
                 let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(class_id)?;
                 for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-                    let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
-                    let leaf = class_name_ref.trim_start_matches('[');
-                    let leaf_et = match leaf.as_bytes().first() {
-                        Some(b'I') => 10u8,
-                        Some(b'J') => 11,
-                        Some(b'F') => 6,
-                        Some(b'D') => 7,
-                        Some(b'B') => 8,
-                        Some(b'C') => 5,
-                        Some(b'S') => 9,
-                        Some(b'Z') => 4,
-                        _ => 0,
-                    };
-                    mna_info.push((pc, leaf_et));
+                    // A malformed CP entry is still a whole-compile refusal.
+                    let _ = class.constant_pool.get_class_name(cp_idx)?;
+                    mna_info.push((pc, crate::jit::pack_multianewarray_site(class_id.as_u32(), cp_idx)));
                 }
             }
 

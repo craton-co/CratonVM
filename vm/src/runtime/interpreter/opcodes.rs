@@ -2777,134 +2777,20 @@ pub(super) fn execute_instruction(
             }
             sizes.reverse();
 
-            // Resolve the leaf element type AND total array depth from the
-            // array class descriptor. The `dimensions` operand may be less
-            // than the total `[` count, in which case the unspecified inner
-            // dimensions stay null and the deepest *allocated* array must
-            // hold references (not the leaf type) — see `alloc_multi_array`.
+            // Descriptor parse, the JVMS §4.9.1 bracket-count guard, the
+            // per-level component-class resolution and the allocation itself
+            // all live in `multianewarray_alloc`, which the JIT's
+            // `jit_multianewarray_2d` helper calls too. Keeping one body is the
+            // point: when this arm and the JIT helper were separate
+            // transcriptions, only this one resolved component classes, and a
+            // JIT-compiled `new String[a][b]` came back as `[Ljava.lang.Object;`.
             let referencing_class_id = thread.frames[frame_idx].class_id;
-            let (leaf_et, total_array_depth, leaf_desc) = {
-                let cm = shared.classes.class_manager.read();
-                let class =
-                    cm.get_class(referencing_class_id)
-                        .ok_or_else(|| VmError::Internal {
-                            message: "current class not found".to_string(),
-                        })?;
-                let array_class_name =
-                    class.constant_pool.get_class_name(*index).ok_or_else(|| {
-                        VmError::Internal {
-                            message: format!("invalid class ref at cp#{index}"),
-                        }
-                    })?;
-                // Strip leading '[' to find the leaf type descriptor; the
-                // count of stripped `[`s is the total array depth.
-                let total_depth = array_class_name
-                    .as_bytes()
-                    .iter()
-                    .take_while(|&&b| b == b'[')
-                    .count();
-                let leaf = &array_class_name.as_bytes()[total_depth..];
-                let et = match leaf.first() {
-                    Some(b'I') => ArrayElementType::Int,
-                    Some(b'J') => ArrayElementType::Long,
-                    Some(b'F') => ArrayElementType::Float,
-                    Some(b'D') => ArrayElementType::Double,
-                    Some(b'B') => ArrayElementType::Byte,
-                    Some(b'C') => ArrayElementType::Char,
-                    Some(b'S') => ArrayElementType::Short,
-                    Some(b'Z') => ArrayElementType::Boolean,
-                    _ => ArrayElementType::Reference,
-                };
-                (et, total_depth, array_class_name[total_depth..].to_string())
-            };
-
-            // JVMS §4.9.1 static constraint: `dimensions` must not exceed the
-            // number of leading `[` in the referenced array class.
-            //
-            // SECURITY (defense-in-depth, same policy as `execute_ldc`'s
-            // `ClassFormatError` conversion): the type-state verifier does
-            // enforce this (`verify_insn.rs`, `Instruction::Multianewarray`),
-            // but that pass does NOT run for every class. Pass 3 is deferred
-            // wholesale for any class defined by a user-defined loader while
-            // `loader_aware_resolution()` is on — which is the default, and
-            // covers every Spring / WildFly / H2 application class — and the
-            // structural-only substitute (`verifier::verify_method_structural`)
-            // never looks at this operand. `-Xverify:none` removes it too.
-            //
-            // Without this guard `total_array_depth - d - 1` below underflows:
-            // in a release build (overflow-checks off) it wraps to `usize::MAX`,
-            // and `"[".repeat(usize::MAX)` then asks the allocator for
-            // `usize::MAX` bytes, which aborts the process rather than raising
-            // anything Java can catch.
-            if sizes.len() > total_array_depth {
-                let (cls, mname) = {
-                    let f = &thread.frames[frame_idx];
-                    (f.class_name().to_string(), f.method_name().to_string())
-                };
-                return Err(crate::runtime::exceptions::throw_linkage_error(
-                    shared,
-                    thread,
-                    LinkageError::VerifyError {
-                        class_name: cls,
-                        method_name: mname,
-                        message: format!(
-                            "multianewarray: dimensions {} exceeds array bracket count {} \
-                             of type at cp#{index}",
-                            sizes.len(),
-                            total_array_depth
-                        ),
-                    },
-                ));
-            }
-
-            // Resolve the *component* class id for each allocated array level so
-            // the array objects carry their precise class (e.g. the outer level
-            // of `new String[8][8]` is a `[[Ljava/lang/String;` whose component
-            // is `[Ljava/lang/String;`). Without this every multi-dim array was
-            // allocated with `ClassId(0)` and `getClass().getName()` collapsed
-            // to `[Ljava/lang/Object;`. Each level d's component descriptor is
-            // `[`×(total_depth-d-1) followed by the leaf descriptor; a primitive
-            // leaf (`I`, `C`, …) needs no class (the element type drives naming).
-            let mut component_ids: Vec<ClassId> = Vec::with_capacity(sizes.len());
-            for d in 0..sizes.len() {
-                let comp_brackets = total_array_depth - d - 1;
-                let cid = if comp_brackets > 0 {
-                    // Component is itself an array class — resolve `[…`.
-                    //
-                    // JVMS §5.3.3: that inner array class is defined by the
-                    // defining loader of ITS component, so it must be resolved
-                    // loader-faithfully. This `ClassId` is stamped into the
-                    // allocated array object's header and is what a later
-                    // `getClass()` / `getComponentType()` reads back, so
-                    // collapsing two loaders' `[Lp/X;` here would make
-                    // `new p.X[2][2]` report the wrong loader's element type.
-                    let comp_desc = format!("{}{}", "[".repeat(comp_brackets), leaf_desc);
-                    resolve_class_or_array_loader_aware(
-                        shared,
-                        thread,
-                        referencing_class_id,
-                        &comp_desc,
-                    )
-                    .unwrap_or(ClassId::new(0))
-                } else if leaf_desc.starts_with('L') && leaf_desc.ends_with(';') {
-                    // Reference leaf — component is the element class itself.
-                    let comp_name = &leaf_desc[1..leaf_desc.len() - 1];
-                    resolve_class_loader_aware(shared, thread, referencing_class_id, comp_name)
-                        .unwrap_or(ClassId::new(0))
-                } else {
-                    // Primitive leaf: element type carries the descriptor.
-                    ClassId::new(0)
-                };
-                component_ids.push(cid);
-            }
-
-            let arr = alloc_multi_array(
+            let arr = crate::runtime::interpreter::multianewarray_alloc(
                 shared,
+                thread,
+                referencing_class_id,
+                *index,
                 &sizes,
-                0,
-                leaf_et,
-                total_array_depth,
-                &component_ids,
             )?;
             thread.frames[frame_idx]
                 .stack
