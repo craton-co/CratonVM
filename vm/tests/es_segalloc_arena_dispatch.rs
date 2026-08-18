@@ -39,13 +39,15 @@
 //! registry -- generalising the existing "receiver's own-class native
 //! rescue" to interface-stamped synthetic receivers, not just concrete ones.
 //!
-//! This test compiles a tiny Java 21 FFM program that reproduces the
-//! Elasticsearch shape (`Arena.allocate(long)` and `Arena.allocate(MemoryLayout)`,
-//! the same two default methods `SegmentAllocator.java` uses) and runs it
-//! through the `cratonvm` CLI against a real JDK 21 image. It skips
-//! gracefully (reports "skip") when `javac`, a real JDK 21 java-home, or the
-//! CLI binary is unavailable, so it never misattributes a missing toolchain
-//! as a failure.
+//! This test compiles a tiny FFM program that reproduces the Elasticsearch
+//! shape (`Arena.allocate(long)` and `Arena.allocate(MemoryLayout)`, the same
+//! two default methods `SegmentAllocator.java` uses) and runs it through the
+//! `cratonvm` CLI against a real JDK image. `compile_probe` picks the release
+//! and preview flags from what the toolchain accepts -- see its doc comment;
+//! JDK 21 is the floor, not the target. It skips gracefully (reports "skip")
+//! when a real java-home or the CLI binary is unavailable, so it never
+//! misattributes a missing toolchain as a failure -- but a compiler that RUNS
+//! and rejects the source is a hard failure, never a skip.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -119,10 +121,12 @@ fn cratonvm_binary_lookup() -> Option<PathBuf> {
     None
 }
 
-/// Resolve a real JDK 21+ home directory (needed because `java.lang.foreign`
-/// is a preview API whose default methods only carry real Code in an actual
-/// JDK image -- CratonVM's synthetic-JDK stubs do not reproduce this bug
-/// shape). Checks `CRATONVM_TEST_JAVA_HOME`, then `JAVA_HOME`, then a couple
+/// Resolve a real JDK 21+ home directory (needed because the
+/// `java.lang.foreign` default methods only carry real Code in an actual JDK
+/// image -- CratonVM's synthetic-JDK stubs do not reproduce this bug shape).
+/// 21 is the floor because that is the first release with FFM at all; the API
+/// stopped being preview in 22, which is what `compile_probe`'s flag ladder
+/// is about. Checks `CRATONVM_TEST_JAVA_HOME`, then `JAVA_HOME`, then a couple
 /// of conventional install locations used elsewhere in this repo's tests.
 ///
 /// Only requires `bin/java` to exist, not `bin/javac` -- some hosts (e.g. a
@@ -161,32 +165,54 @@ fn java_home() -> Option<PathBuf> {
 /// it (see below). Returns `false` if compilation is unavailable or failed
 /// (caller skips).
 ///
-/// `java.lang.foreign` is a JDK 21 preview API. Two compile strategies are
-/// tried:
-///   1. Standalone `javac --release 21 --enable-preview` (works whenever a
-///      full JDK is installed, e.g. the Windows dev-machine convention used
-///      elsewhere in this file).
-///   2. `java --module jdk.compiler/com.sun.tools.javac.Main -source 21
-///      --enable-preview` -- some hosts only ship a JRE-headless image
-///      without the standalone `javac` launcher, but still bundle the
-///      `jdk.compiler` module inside `java` itself and can invoke its main
-///      class directly. `-source 21` (not `--release 21`) avoids needing the
-///      `lib/ct.sym` cross-release symbol data that a minimal JRE image may
-///      omit.
+/// `java.lang.foreign` was preview in JDK 21 and **final since JDK 22**
+/// (JEP 454), so the flags this needs depend on the toolchain `jh` points at.
+/// Each branch below therefore tries the non-preview form FIRST and falls back
+/// to the JDK-21 preview form; the first strategy that compiles wins, and the
+/// assertion only fires when every strategy ran and rejected the source.
 ///
-/// Either path stamps the output class file's minor version to the preview
-/// marker `0xFFFF` (JVMS 4.1). CratonVM's `ClassFileVersion::is_supported`
-/// only accepts that marker when major == its own `MAX_SUPPORTED` (currently
-/// Java 25) -- a JDK-21-preview-marked class file is otherwise rejected as
-/// "unsupported class file version", even though the underlying bytecode is
-/// valid and CratonVM already implements the referenced JDK 21 API surface
-/// (proven by the real Elasticsearch fixture this bug was found against).
-/// The real Elasticsearch `.class` files sidestep this because ES's own
-/// Gradle toolchain compiles with a newer JDK whose `java.lang.foreign` is no
-/// longer preview-annotated, targeting `--release 21`, which produces a
-/// plain (minor=0) class file. Mirror that shape here by zeroing the minor
-/// version byte pair post-compile -- this is a compile-output normalisation,
-/// not a change to the compiled bytecode itself.
+///   * standalone `javac` present: `--release 22`, else
+///     `--release 21 --enable-preview`.
+///   * no standalone `javac` (an `openjdk-*-jre-headless` image still bundles
+///     the `jdk.compiler` module inside `java` itself): the module's main
+///     class at the toolchain's own default release, else with
+///     `-source 21 --enable-preview`. `-source` rather than `--release`
+///     avoids needing the `lib/ct.sym` cross-release symbol data such a
+///     minimal image may omit.
+///
+/// **Both flag pairs are load-bearing; neither works on both toolchains, and
+/// there is no third option that does.** Measured on Adoptium 25 (2026-08-18):
+///
+/// | flags | JDK 25 |
+/// |---|---|
+/// | `--release 21 --enable-preview` | `error: invalid source release 21 with --enable-preview` |
+/// | `--release 21` (drop the flag) | `error: Arena is a preview API and is disabled by default` |
+/// | `--release 22` | compiles, major 66 minor 0 |
+///
+/// The middle row is the one worth remembering: `ct.sym` records
+/// `java.lang.foreign` as preview *for release 21* no matter how new the
+/// compiler is, so dropping `--enable-preview` while keeping `--release 21`
+/// does not work. An earlier version of this comment asserted the opposite --
+/// that Elasticsearch's own Gradle toolchain gets a plain class file from a
+/// newer JDK at `--release 21` -- and that claim is false. What ES actually
+/// relies on is compiling against a *finalised* FFM, i.e. release >= 22, which
+/// is what the primary strategy now does.
+///
+/// The valid release window is therefore `22 ..= 25`: at least 22 for a
+/// non-preview `java.lang.foreign`, at most CratonVM's
+/// `ClassFileVersion::MAX_SUPPORTED` (Java 25, major 69). 22 is chosen because
+/// it stays inside that window as the ceiling rises and keeps the widest
+/// toolchain compatibility.
+///
+/// The JDK-21 fallback path still stamps the output class file's minor version
+/// to the preview marker `0xFFFF` (JVMS 4.1), which CratonVM's
+/// `ClassFileVersion::verify` only accepts when major == its own
+/// `MAX_SUPPORTED` -- a JDK-21-preview-marked class file is otherwise rejected
+/// as "unsupported class file version", even though the bytecode is valid and
+/// CratonVM implements the referenced API surface (proven by the real
+/// Elasticsearch fixture this bug was found against). So the post-compile
+/// minor-version zeroing below is still live, for that path only -- it is a
+/// compile-output normalisation, not a change to the compiled bytecode.
 fn compile_probe(jh: &Path, out_dir: &Path, name: &str, src: &str) -> bool {
     let java_file = out_dir.join(format!("{name}.java"));
     if let Ok(mut f) = std::fs::File::create(&java_file) {
@@ -199,43 +225,80 @@ fn compile_probe(jh: &Path, out_dir: &Path, name: &str, src: &str) -> bool {
     let java_name = if cfg!(windows) { "java.exe" } else { "java" };
     let javac_name = if cfg!(windows) { "javac.exe" } else { "javac" };
     let javac = jh.join("bin").join(javac_name);
-    let compiled = if javac.exists() {
-        Command::new(&javac)
-            .arg("--release")
-            .arg("21")
-            .arg("--enable-preview")
-            .arg("-d")
-            .arg(out_dir)
-            .arg(&java_file)
-            .output()
+    // Non-preview form first, JDK-21 preview form second — see the doc comment
+    // for why both are needed and why there is no single flag set that works on
+    // every toolchain.
+    let (program, attempts): (PathBuf, [(&str, &[&str]); 2]) = if javac.exists() {
+        (
+            javac,
+            [
+                ("javac --release 22", &["--release", "22"]),
+                (
+                    "javac --release 21 --enable-preview",
+                    &["--release", "21", "--enable-preview"],
+                ),
+            ],
+        )
     } else {
         // Fall back to invoking the `jdk.compiler` module's main class
         // directly through `java` (JRE-headless images without a standalone
         // `javac` binary still usually carry this module).
-        Command::new(jh.join("bin").join(java_name))
-            .arg("--module")
-            .arg("jdk.compiler/com.sun.tools.javac.Main")
-            .arg("-source")
-            .arg("21")
-            .arg("--enable-preview")
+        (
+            jh.join("bin").join(java_name),
+            [
+                (
+                    "java --module jdk.compiler (default release)",
+                    &["--module", "jdk.compiler/com.sun.tools.javac.Main"],
+                ),
+                (
+                    "java --module jdk.compiler -source 21 --enable-preview",
+                    &[
+                        "--module",
+                        "jdk.compiler/com.sun.tools.javac.Main",
+                        "-source",
+                        "21",
+                        "--enable-preview",
+                    ],
+                ),
+            ],
+        )
+    };
+
+    let mut rejections = String::new();
+    let mut compiled_ok = false;
+    for (label, args) in attempts {
+        match Command::new(&program)
+            .args(args)
             .arg("-d")
             .arg(out_dir)
             .arg(&java_file)
             .output()
-    };
-    match compiled {
-        // Neither compiler could be launched — the one legitimate skip.
-        Err(_) => return false,
-        // The compiler RAN and rejected the source: answering `false` here reads
-        // to the caller as "no javac, skip", which makes this test a permanent
-        // vacuous pass.
-        Ok(o) => assert!(
-            o.status.success(),
-            "[es_segalloc_arena_dispatch] the embedded probe failed to compile — fix \
-             the probe source. compiler stderr:\n{}",
-            String::from_utf8_lossy(&o.stderr)
-        ),
+        {
+            // The compiler could not be launched at all — the one legitimate
+            // skip. The second strategy runs the same program, so it cannot
+            // launch either.
+            Err(_) => return false,
+            Ok(o) if o.status.success() => {
+                compiled_ok = true;
+                break;
+            }
+            Ok(o) => {
+                rejections.push_str(&format!(
+                    "\n--- {label} ---\n{}",
+                    String::from_utf8_lossy(&o.stderr)
+                ));
+            }
+        }
     }
+    // Every strategy RAN and rejected the source. Returning `false` here would
+    // read to the caller as "no javac, skip", which makes this test a permanent
+    // vacuous pass — so assert, and print what each strategy said.
+    assert!(
+        compiled_ok,
+        "[es_segalloc_arena_dispatch] the embedded probe failed to compile under \
+         every strategy — fix the probe source or the release flags. \
+         compiler stderr:{rejections}"
+    );
     let class_file = out_dir.join(format!("{name}.class"));
     if !class_file.exists() {
         return false;
@@ -298,9 +361,12 @@ fn arena_segment_allocator_default_methods_dispatch_to_native() {
         "ArenaSegmentAllocatorDispatchProbe",
         PROBE_SRC,
     ) {
+        // `compile_probe` returns false ONLY when no compiler could be
+        // launched at all; a compiler that ran and rejected the source
+        // asserts inside it rather than reaching here.
         eprintln!(
-            "[es-segalloc] failed to compile ArenaSegmentAllocatorDispatchProbe \
-             (javac --release 21 --enable-preview); skipping"
+            "[es-segalloc] no launchable compiler in the resolved java-home \
+             (neither `bin/javac` nor `java --module jdk.compiler`); skipping"
         );
         return;
     }
