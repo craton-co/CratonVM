@@ -11010,6 +11010,167 @@ mod tests {
         .to_vec()
     }
 
+    /// Lower one `invokestatic` with `n` int parameters as a DIRECT call to
+    /// `entry`, and return the emitted bytes.
+    ///
+    /// `needs_ctx` picks whether the callee takes the hidden VM context
+    /// pointer in `abi[0]`, which is what decides how many Java arguments are
+    /// left for the register file.
+    fn lower_direct_call_with_n_args(n: usize, entry: usize, needs_ctx: bool) -> Vec<u8> {
+        assert!((1..=8).contains(&n));
+        let mut code: Vec<u8> = Vec::new();
+        for i in 0..n {
+            match i {
+                0 => code.push(0x1a), // iload_0
+                1 => code.push(0x1b),
+                2 => code.push(0x1c),
+                3 => code.push(0x1d),
+                // Cast: `i` is bounded by 8 above.
+                _ => code.extend_from_slice(&[0x15, i as u8]), // iload i
+            }
+        }
+        let invoke_pc = code.len();
+        code.extend_from_slice(&[0xb8, 0x00, 0x02]); // invokestatic #2
+        code.push(0xac); // ireturn
+        let code_len = code.len();
+        // `IrBuilder::build` reads a little past the end for operand fetch.
+        code.extend_from_slice(&[0x00, 0x00]);
+
+        let info: &'static JitInvokeInfo = Box::leak(Box::new(JitInvokeInfo {
+            class_name: "pkg/Wide",
+            method_name: "f",
+            descriptor: "(IIIIIII)I",
+            num_jit_args: n,
+            return_type: b'I',
+            invoke_kind: 3, // static — the statically bound, directly bindable kind
+            declaring_class_id: 0,
+        }));
+
+        let mut builder = IrBuilder::new(n, n);
+        builder.set_param_types(&vec![IrType::Int; n]);
+        let mut invoke_info = HashMap::new();
+        invoke_info.insert(
+            invoke_pc,
+            (info as *const JitInvokeInfo as usize, n, b'I'),
+        );
+        builder.set_invoke_info(invoke_info);
+        let graph = builder.build(&code, code_len).expect("IR build of wide call");
+        let schedule = ir_schedule::schedule(&graph);
+
+        let mut helpers = no_helpers();
+        helpers.invoke_dispatch = 0x1111_2222_3333_4440;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let mut direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        direct.insert(invoke_pc, (entry, needs_ctx));
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        lower_inner(
+            &graph,
+            &schedule,
+            n,
+            n,
+            &helpers,
+            &empty_hints,
+            None,
+            &direct,
+            &no_ic,
+            &no_compact,
+        )
+        .expect("wide direct call must lower")
+        .code_bytes()
+        .to_vec()
+    }
+
+    /// A direct call whose arguments do not all fit `ENTRY_ABI_REGS` marshals
+    /// the remainder on the stack instead of falling back to the dispatch
+    /// helper.
+    ///
+    /// This is the blocker `httpcontentdecompressortest-hang-20260816.md`
+    /// named: `emit_direct_cross_call` was register-only, so a site needing
+    /// seven incoming slots kept the full `jit_invoke_dispatch` round trip no
+    /// matter what the binding side had resolved. The map entry was recorded
+    /// and then silently dropped by the lowerer — nothing warned.
+    ///
+    /// The assertion is structural rather than a byte-for-byte golden: the
+    /// block size differs by platform (Win64 reserves 32 bytes of shadow
+    /// space below the outgoing arguments, SysV none) and so does how many
+    /// arguments are left over, and pinning both would only restate
+    /// `stack_arg_block_size`.
+    #[test]
+    fn a_direct_call_past_the_register_file_marshals_its_tail_on_the_stack() {
+        crate::x64::set_moving_young_override(Some(false));
+        const ENTRY: usize = 0x7fff_0000_0000_5000;
+        let n = ENTRY_ABI_REGS.len() + 2; // context + n args exceeds the file
+        let code = lower_direct_call_with_n_args(n, ENTRY, true);
+
+        assert!(
+            contains_seq(&code, &(ENTRY as u64).to_le_bytes()),
+            "the site must bake the callee entry, not fall back to dispatch"
+        );
+        assert!(
+            !contains_seq(&code, &0x1111_2222_3333_4440u64.to_le_bytes()),
+            "a bound direct site must not also emit the dispatch helper call"
+        );
+
+        // SUB RSP, imm32 / ADD RSP, imm32 with the SAME immediate: the block
+        // is reserved and released around one call, so an unbalanced pair
+        // would leave the frame's RSP permanently low.
+        let sub_at = code
+            .windows(3)
+            .position(|w| w == [0x48, 0x81, 0xEC])
+            .expect("a stack-argument block must be reserved");
+        let add_at = code
+            .windows(3)
+            .position(|w| w == [0x48, 0x81, 0xC4])
+            .expect("the stack-argument block must be released");
+        let sub_imm = i32::from_le_bytes(code[sub_at + 3..sub_at + 7].try_into().unwrap());
+        let add_imm = i32::from_le_bytes(code[add_at + 3..add_at + 7].try_into().unwrap());
+        assert_eq!(sub_imm, add_imm, "the reserve and the release must match");
+        assert!(sub_imm > 0, "a stack-argument block must be non-empty here");
+        assert_eq!(
+            sub_imm % 16,
+            0,
+            "RSP must stay 16-byte aligned at the CALL, so the block is a multiple of 16"
+        );
+        assert!(add_at > sub_at, "the release must follow the reserve");
+
+        // One `MOV [RSP + disp32], RAX` per argument past the register file.
+        let stack_args = n - (ENTRY_ABI_REGS.len() - 1);
+        assert_eq!(
+            count_seq(&code, &[0x48, 0x89, 0x84, 0x24]),
+            stack_args,
+            "every argument past the entry-ABI register file must be stored to the block"
+        );
+    }
+
+    /// The same lowering with arguments that DO fit emits no stack block at
+    /// all — the narrow path is unchanged.
+    ///
+    /// Without this the test above would pass just as well against a backend
+    /// that reserved a block on every direct call, which is a pessimisation of
+    /// every call site in the tree.
+    #[test]
+    fn a_direct_call_within_the_register_file_reserves_no_stack_block() {
+        crate::x64::set_moving_young_override(Some(false));
+        const ENTRY: usize = 0x7fff_0000_0000_5000;
+        let code = lower_direct_call_with_n_args(ENTRY_ABI_REGS.len() - 1, ENTRY, true);
+        assert!(
+            contains_seq(&code, &(ENTRY as u64).to_le_bytes()),
+            "the narrow site must still bind directly"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x48, 0x81, 0xEC]),
+            0,
+            "a call whose arguments all fit registers must emit no SUB RSP"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x48, 0x89, 0x84, 0x24]),
+            0,
+            "a call whose arguments all fit registers must store nothing to the stack"
+        );
+    }
+
     /// A self-recursive call must not PUBLISH to the shadow stack.
     ///
     /// That route bypasses `emit_call_return_check`, the one site that emits
