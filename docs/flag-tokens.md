@@ -352,6 +352,7 @@ export inherited from a parent shell.
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
 | `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
+| `a5-engagement` | `CRATONVM_DBG_A5_ENGAGEMENT` |
 | `unreg-memo-audit` | `CRATONVM_DBG_UNREG_MEMO_AUDIT` |
 | `redefine-dump` | `CRATONVM_DBG_REDEFINE_DUMP` |
 | `npe-stack` | `CRATONVM_DBG_NPE_STACK` |
