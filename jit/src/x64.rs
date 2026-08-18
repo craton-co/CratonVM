@@ -207,6 +207,17 @@ pub use driver::*;
 mod loop_rewrite;
 pub use loop_rewrite::*;
 mod bytecode_walk;
+/// Test-only view of the E27-1 N2b compile-time needle screen.
+///
+/// The screen decides which `String.indexOf(int)` sites the backend will
+/// inline, and it is the reason N2b is not a deopt cliff — so it is worth a
+/// test, and a test needs a way in. See
+/// `bytecode_walk::prev_insn_int_const` for the reasoning.
+#[doc(hidden)]
+pub fn prev_insn_int_const_for_test(code: &[u8], code_len: usize, pc: usize) -> Option<i32> {
+    bytecode_walk::prev_insn_int_const(code, code_len, pc)
+}
+
 mod inlining;
 mod objects;
 mod arrays;
@@ -723,7 +734,7 @@ struct Compiler {
     /// constant-pool tag the resolver already read; without it `x64::stack_kinds`
     /// answered `Unknown` for every numeric `ldc`, the snapshot recorded
     /// `Unsupported`, and `osr_exit_policy` then refused OSR entry for the whole
-    /// artifact. See `osr-refused-for-a-loop-inline-in-main-20260810`.
+    /// artifact. See `osr-refused-for-a-loop-inline-in-main-FIXED-20260818`.
     ldc_fp_pcs: FxHashSet<usize>,
     /// Runtime helper function pointers for JIT callbacks.
     helpers: JitRuntimeHelpers,

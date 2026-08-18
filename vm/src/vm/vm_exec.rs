@@ -11892,6 +11892,26 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             .try_alloc_array_full(ClassId::new(0), element_type, length)
     }
 
+    fn reclaim_before_alloc_retry(&mut self) -> bool {
+        // The same ladder `gc_alloc_array` (interpreter) and `jit_newarray`
+        // (JIT) run between their failed attempts. See the trait method for the
+        // precondition the CALLER is responsible for — this function cannot
+        // check it, because the locals at risk are the caller's.
+        //
+        // Order matches the interpreter's exactly, and the overhead-limit check
+        // sits between the two reclaim steps for the reason it does there: once
+        // consecutive forced collections stop freeing anything, more of them are
+        // a death spiral, and OOM is the honest answer. Reporting `false` there
+        // rather than `true` is what keeps this from becoming that spiral.
+        self.thread.tlab.retire();
+        crate::runtime::interpreter::maybe_gc_forced_pub(self.shared, self.thread);
+        if crate::runtime::interpreter::gc_overhead_limit_exceeded(self.shared) {
+            return false;
+        }
+        crate::runtime::interpreter::last_ditch_reclaim(self.shared, self.thread);
+        true
+    }
+
     fn array_component_class_id(&self, class_id: ClassId) -> Option<ClassId> {
         // `array_info` is `Some` only for array classes; its `component_class_id`
         // is the immediate element type (e.g. `String[]` for `String[][]`).
@@ -14763,6 +14783,32 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let Some(tid) = tid else {
             return Vec::new();
         };
+        // A RUNNING target has published nothing worth reading.
+        //
+        // The deposit points are the BLOCKING ones, so the snapshot below
+        // answers "where is this thread parked" and nothing else. Ask about a
+        // thread that is not parked and the answer is an empty array (it never
+        // blocked) or the call site where it blocked LAST — a confident wrong
+        // answer. Measured against HotSpot on a spin loop through three named
+        // methods, sampled every 2 ms: HotSpot named the running method on all
+        // ~840 samples; this returned `<empty>` on 1471 of 1495 and the running
+        // method on none. Every in-process sampling profiler, thread dump and
+        // hang diagnostic that inspects another thread was reading that.
+        //
+        // So ask the target to publish, by taking the pause that makes it —
+        // another thread cannot walk `JvmThread::frames`, which its own thread
+        // owns. Skipped when the target is parked: that is both the common case
+        // for a thread dump and the one whose deposit is ALREADY current, so the
+        // pause would stop the world to re-derive a stack we already have.
+        // Skipped too when another STW owns the world
+        // (`stw_publish_frame_traces` returns false), where this read degrades
+        // to exactly the behaviour it had before.
+        if !self.shared.threads.thread_registry.is_blocked(tid) {
+            crate::runtime::interpreter::stw_publish_frame_traces(
+                self.shared,
+                self.thread.thread_id,
+            );
+        }
         // CR-CLO-1 (`arch-2026-07-26/cross-owner-closeout.md` §6).
         //
         // Two stale comments used to sit here. The first claimed line numbers

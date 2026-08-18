@@ -13,6 +13,65 @@
 
 use super::*;
 
+/// The int constant pushed by the instruction IMMEDIATELY before `pc`, if that
+/// instruction is a constant push.
+///
+/// E27-1 N2b. The guarded inline `indexOf(I)` scan is only admissible for a
+/// needle in `0..=0xFFFF`, because outside that range the JDK's rule is
+/// `Character.isValidCodePoint` plus a surrogate-PAIR match and the inline
+/// single-code-unit scan is simply a different function. The obvious way to
+/// enforce that is a runtime screen with a deopt on the miss — and it is a
+/// trap: the miss path invalidates the whole compiled method
+/// (`DeoptimizationController::deoptimize`) and `ReceiverTypeChanged` is given
+/// `RecompileAndReinterpret` on EVERY occurrence, then `MakeNotCompilable`. A
+/// supplementary needle is a property of the DATA, so it recurs, and the
+/// method would be recompiled per call and then barred from compilation.
+///
+/// So the screen is here, at COMPILE time, and its miss costs nothing: the
+/// site simply is not intrinsified and takes the dispatch it takes today.
+///
+/// `ldc`/`ldc_w` are deliberately NOT decoded — they need the constant pool,
+/// which this layer does not have. A `char` literal above `0x7FFF` therefore
+/// falls back to dispatch. That is a missed optimisation, never a wrong
+/// answer, and it is the rare shape: `indexOf(',')`, `indexOf('/')`,
+/// `indexOf('=')` are `bipush`/`sipush`.
+///
+/// Scans from 0 rather than keeping a running "previous instruction" — the
+/// callers are `invokevirtual` sites that already resolved to one specific
+/// intrinsic, of which a method has a handful, and a linear scan of a
+/// bytecode array is nothing next to the compile it is part of.
+pub(super) fn prev_insn_int_const(code: &[u8], code_len: usize, pc: usize) -> Option<i32> {
+    if pc == 0 || pc > code_len {
+        return None;
+    }
+    let mut cur = 0usize;
+    let mut prev: Option<usize> = None;
+    while cur < pc {
+        let next = cur + crate::scev::bytecode_len(code, cur, code_len);
+        if next > pc {
+            // `pc` is not an instruction boundary on this linear decode
+            // (a jump target inside a wide/tableswitch pad, say). Decline.
+            return None;
+        }
+        prev = Some(cur);
+        cur = next;
+    }
+    let at = prev?;
+    match code.get(at)? {
+        // iconst_m1 .. iconst_5
+        op @ 0x02..=0x08 => Some(*op as i32 - 0x03),
+        // bipush <i8>
+        0x10 => code.get(at + 1).map(|b| *b as i8 as i32),
+        // sipush <i16>
+        0x11 => {
+            let hi = *code.get(at + 1)? as i16;
+            let lo = *code.get(at + 2)? as i16;
+            Some((((hi << 8) | lo) as i16) as i32)
+        }
+        _ => None,
+    }
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Bytecode compilation
@@ -4352,7 +4411,7 @@ impl Compiler {
                             !narrow_oops_block_inline_fields()
                                 && (inline_getfield_enabled()
                                     || (guarded_inline_getfield_enabled()
-                                        && self.helpers.region_bounds_addr != 0))
+                                        && self.helpers.read_bounds_addr != 0))
                         })
                     {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
@@ -4443,7 +4502,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
@@ -4593,7 +4652,7 @@ impl Compiler {
                             (inline_getfield_enabled()
                                 && !cratonvm_types::compact_ref_fields_enabled())
                                 || (guarded_inline_getfield_enabled()
-                                    && self.helpers.region_bounds_addr != 0)
+                                    && self.helpers.read_bounds_addr != 0)
                         })
                     {
                         // Inline field load — the field index and type tag are
@@ -4642,7 +4701,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
@@ -5179,6 +5238,24 @@ impl Compiler {
                             return true;
                         }
                         !crate::deopt::despec_contains(&self.method_key, pc as u32)
+                    });
+                    // E27-1 N2b: `indexOf(I)` is intrinsified ONLY where the
+                    // needle is a compile-time constant in `0..=0xFFFF`, which
+                    // is the range on which the inline single-code-unit scan
+                    // and `code_point_needle` are the same function. Filtered
+                    // HERE, before the intrinsic ladder, so a declined site
+                    // takes the ordinary dispatch it takes today — the same
+                    // shape as the `ArraycopyPrimitive` despec filter above.
+                    // Deliberately NOT a runtime screen: see
+                    // `prev_insn_int_const` for why that would be a cliff.
+                    let direct = direct.filter(|(entry, _, _, _)| {
+                        if *entry != crate::JitIntrinsic::StringIndexOfChar.as_entry() {
+                            return true;
+                        }
+                        matches!(
+                            prev_insn_int_const(code, code_len, pc),
+                            Some(0..=0xFFFF)
+                        )
                     });
 
                     if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct
@@ -8528,15 +8605,43 @@ impl Compiler {
                         }
 
                         // --- indexOf(I)I ----------------------------------
+                        // LIVE again as of E27-1 N2b (2026-08-18), for constant
+                        // BMP needles only. The `direct.filter` far above is
+                        // what enforces that; by the time control reaches here
+                        // the needle is known to be a compile-time constant in
+                        // `0..=0xFFFF`.
+                        //
                         // Scan the receiver for the first code unit equal to
-                        // `(ch & 0xFFFF)`, from index 0. Bit-identical to
-                        // `native_string_index_of`, which likewise masks the
-                        // argument to a single UTF-16 code unit — supplementary
-                        // code points therefore match their masked low half
-                        // (no surrogate special-casing, by design of the
-                        // oracle). The deopt stub is reached only for a null
-                        // receiver or a null backing `value` array. Uses only
-                        // caller-saved registers, so no PUSH/POP is needed.
+                        // `(ch & 0xFFFF)`, from index 0. This comment used to
+                        // call that "bit-identical to `native_string_index_of`,
+                        // which likewise masks the argument". BOTH HALVES WERE
+                        // FALSE — the JDK gates on `Character.isValidCodePoint`
+                        // BEFORE any narrowing and matches a supplementary `ch`
+                        // as a surrogate PAIR, and the native side stopped
+                        // masking at E18-1, which put the rule in one place
+                        // (`lang_string.rs`'s `code_point_needle`). It is
+                        // spelled out rather than deleted because E27-1's
+                        // finding is that code reading as a working
+                        // implementation is how four copies of this rule
+                        // survived.
+                        //
+                        // What makes the scan correct now is the RANGE, not the
+                        // mask: on `0..=0xFFFF` the JDK scans for exactly one
+                        // code unit, lone surrogates included, so the mask is
+                        // the identity and this loop is `code_point_needle`'s
+                        // answer. It is left in place rather than folded into a
+                        // baked immediate to keep this change a gate change and
+                        // nothing else — the emitted bytes here are unchanged.
+                        //
+                        // The deopt stub is reached only for a null receiver or
+                        // a null backing `value` array, both genuinely
+                        // once-per-program. It is NOT reached for an
+                        // out-of-range needle: such a site is never
+                        // intrinsified in the first place. That distinction is
+                        // the whole of N2b — see `prev_insn_int_const`.
+                        //
+                        // Uses only caller-saved registers, so no PUSH/POP is
+                        // needed.
                         if self.string_layout.is_some()
                             && callee_entry == crate::JitIntrinsic::StringIndexOfChar.as_entry()
                         {

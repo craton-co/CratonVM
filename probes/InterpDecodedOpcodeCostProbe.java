@@ -135,19 +135,32 @@ public final class InterpDecodedOpcodeCostProbe {
     }
 
     // + UNROLL x `checkcast`.
+    //
+    // CORRECTED 2026-08-18: this kernel used to read a field through the cast
+    // (`((Holder) o).a`), so its marginal cost was checkcast PLUS a getfield —
+    // and getfield is the most expensive opcode in the table. Reported as
+    // "checkcast", that inflated it by ~180 ns and made checkcast look 1.7x
+    // instanceof when the two are within noise of each other. The confound was
+    // noted in this file's own comments and then not applied when the summary
+    // table was read, which is the more useful half of the lesson: an
+    // instrument's caveat has to live in the OUTPUT, not in the source.
+    //
+    // The cast result is now consumed by an `if_acmpeq` against the same object
+    // — an opcode with a fast-path arm costing ~10 ns — so the row is
+    // checkcast plus a rounding error.
     private static long checkcastKernel(int iters) {
         int acc = 0;
         Object o = OBJ;
         for (int i = 0; i < iters; i++) {
             acc += i;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
-            acc += ((Holder) o).a; acc += ((Holder) o).a;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
+            if (((Holder) o) == o) acc++; if (((Holder) o) == o) acc++;
         }
         return acc;
     }

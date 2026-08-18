@@ -1,6 +1,12 @@
 # ZGC's own rewrite pass faults walking a reference array
 
-**Status: STILL OPEN.** Sixth pass 2026-08-18 — two more bulk writers closed
+**Status: STILL OPEN, but it no longer reproduces.** Seventh pass 2026-08-18 —
+**0 SIGSEGV in 52 reps** (26 instrumented, 26 not) in an arm proven to collect
+AND compact; under the documented 3/23 that is a sub-0.1% outcome. Not retired: the
+writer was never identified, both instruments are armed and SILENT rather than
+vindicated, and **the control is missing — nobody has shown this machine
+reproduces the crash at all**, so "does not reproduce here" is as far as it
+goes. Sixth pass 2026-08-18 — two more bulk writers closed
 by construction, and the evidence re-read: the corrupting value is a *heap
 pointer at offset 0*, which is equally consistent with an unregistered object
 based 16 bytes below the victim. Fifth pass 2026-08-18 — the fourth pass's prescribed
@@ -657,6 +663,98 @@ look, not the last.
 | **`Unsafe.copyMemory` off-heap→heap** | **no** | refuses reference arrays; bounds-checked twice |
 | a raw pointer TRANSLATED out of the arena | **untested** | `unsafe_arena_translation_stats` (fifth pass) |
 | **an unregistered object based at `victim - 16`** | **instrumented, unrun** | `below16=` / `below32=` on the extent census line — `covers=true registered=false` confirms it |
+
+# Seventh pass, 2026-08-18: the instruments are ARMED AND SILENT, and the crash did not reproduce in 52 reps
+
+## The run
+
+`io.netty.util.ResourceLeakDetectorTest`, one class per VM through
+`netty-suite-runner`'s `CratonRunner`, `-XX:+UseZGC --nojit`, `--Xmx 1500m`, real
+JDK, on Windows. **26 reps with `CRATONVM_DBG_ZGC_CORPSE=1` and 26 without.**
+
+| arm | reps | SIGSEGV | overlaps | `below16` lines | arena warnings |
+|---|---:|---:|---:|---:|---:|
+| corpse gate ON | 26 | **0** | **0** | **0** | **0** |
+| corpse gate OFF | 26 | **0** | — | — | — |
+
+All 52 reported `found=3 started=3 ok=2 failed=1` — the counts this page records
+for G1, i.e. the residual GC-independent failure and nothing else.
+
+**The second arm exists because the first one is not enough.** An instrument that
+runs on only one arm is a variable of the comparison: the corpse gate adds a full
+registry survey twice per cycle, which changes timing and could perturb a racy
+defect away. It did not — the uninstrumented arm is equally clean.
+
+## The arm is NOT vacuous, and that is checked rather than assumed
+
+This page's own history is a premature closure on `0/12`, so the first question is
+whether the arm can crash at all. Compaction is **required** — this page's own
+measurement is that `CRATONVM_ZGC_RELOCATE=0` has never produced an overlap or a
+crash on any arm. So: does the arm compact?
+
+| cycle | relocation on (default) | `CRATONVM_ZGC_RELOCATE=0` |
+|---|---:|---:|
+| 1 | 1,193,410,592 | 1,192,362,016 |
+| 2 | **138,121,840** | 1,191,852,304 |
+| 3 | 42,177,136 | 316,389,280 |
+
+`cursor=` from the `[GC] zgc-reclaim:` line. **The cursor collapses on cycle 2
+only when relocation is enabled** — that is a slide, and it does not happen with
+the kill switch set. The arm also collects three times per run, freeing 1.17 GB
+on cycle 1 with `sweep_us=590,926`. It collects, it slides, and `--nojit` means
+relocation is permitted on every cycle rather than declined on 64 of 68.
+
+## What that is worth, stated as arithmetic
+
+At the documented rate of **3/23 ≈ 0.13**, the chance of 52 consecutive clean
+reps is `0.87^52 ≈ 0.00075` — **under 1 in 1,300.** So the crash does not
+reproduce at anything like its recorded rate on current `dev`.
+
+## And it is still NOT RETIRED
+
+Three reasons, and the first is this page's own scar tissue:
+
+* **Nobody identified the writer.** Twelve candidates have been eliminated and
+  none confirmed. A defect that stops reproducing without its cause being found
+  has not been fixed, it has been perturbed — and the JIT-half of this pair is a
+  worked example: it masked this one for weeks by declining relocation.
+* **Both new instruments read ZERO, which is untriggered rather than
+  disproven.** `below16=` never printed because no overlap was found to print it
+  beside; the arena translation audit never warned. They are now *armed and
+  silent* — a different and better state than "unrun", but not evidence about the
+  two rows they were built for.
+* **Many GC changes have landed since 2026-08-15**, several on 2026-08-18 alone
+  and from several sessions. Any of them may have closed it. Nobody has bisected
+  it, and the honest record is "does not reproduce", not "was fixed by X".
+
+## The control this run is MISSING, and it is the one that matters
+
+The arm was proven non-vacuous — it collects and it compacts, checked above. **The
+environment was not.** Nobody has shown that *this machine* reproduces the crash
+at all, and the two are different claims: a non-vacuous arm says the code path
+runs, not that the failure is reachable here.
+
+The 3/23 was measured on a different day and possibly a different box. So the
+honest reading of 0/52 is **"does not reproduce here, now"**, and it becomes
+"the tree changed" only after this control:
+
+> Build `dev` as of 2026-08-15 — the tree the 3/23 was measured against — and run
+> the same 26 reps on the same machine.
+
+* **~3 crashes** → the box reproduces it, something since then fixed it, and a
+  bisect is worth its cost.
+* **0 crashes** → the difference is the environment, not the tree, and nothing
+  here says anything about whether the defect is gone.
+
+Cost of the bisect *after* a positive control: each step needs ~26 reps to
+separate a 0.13 rate from 0, so ~30 minutes per step plus a build, and log₂ of
+the commits since 2026-08-15.
+
+**What would retire it:** the control above coming back positive, then a bisect
+across the commits since 2026-08-15 that finds the one which stops it, or a longer run at higher rep count that reproduces it
+once with the instruments armed — at which point `below16=` answers the question
+that has been open since the second pass. The instruments are in the tree and
+cost a branch when off, so the next run is cheap.
 
 ## Related
 

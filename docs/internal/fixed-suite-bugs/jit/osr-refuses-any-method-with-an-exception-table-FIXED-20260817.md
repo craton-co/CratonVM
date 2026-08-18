@@ -212,6 +212,6 @@ cratonvm --java-home <jdk> -cp . OsrExcRateProbe 2000000
   workload this was found from. Its blocker (1) is this page and is closed; its
   blocker (2), 21 ns/iteration, is not, and the per-throw table above replaces
   that page's ~600 ns estimate.
-* `osr-refused-for-a-loop-inline-in-main-20260810.md` — the same "OSR is the
+* `osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md` — the same "OSR is the
   only door for a once-invoked method" structure, refused for a different
   reason.

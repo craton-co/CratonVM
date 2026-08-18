@@ -2172,6 +2172,24 @@ unsafe impl Sync for G1Collector {}
 /// Wraparound after 2^64 collectors is not a practical concern.
 static NEXT_G1_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Teardown counterpart to the `publish_jit_read_bounds` call in
+/// [`G1Collector::new`].
+///
+/// Without this the read table would keep naming an arena whose `Box` has been
+/// freed, and a guarded inline `getfield` would happily do a raw load into it.
+/// [`crate::gen_heap::GenerationalHeap`]'s `Drop` zeroes the store-side table
+/// for exactly this reason; embedding and unit tests are where a heap actually
+/// gets dropped.
+///
+/// Unconditional, matching that precedent: if another live heap owns the table
+/// it re-publishes (Generational at its next GC, G1 at construction), and until
+/// then helper-only is a safe, merely slower, state.
+impl Drop for G1Collector {
+    fn drop(&mut self) {
+        crate::gen_heap::clear_jit_read_bounds();
+    }
+}
+
 impl G1Collector {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -2232,6 +2250,27 @@ impl G1Collector {
         // silently rejected every real address.
 
         let ihop_threshold = (config.heap_size as u64 * config.ihop_percent as u64 / 100) as usize;
+
+        // Publish the READ-side bounds the JIT's guarded inline `getfield`
+        // tests against. One pair covers the whole collector: G1's N regions
+        // are carved out of this single `Box` (`arena_base + i*region_size`),
+        // which `alloc_zeroed_heap` allocates once here and never moves or
+        // resizes, so `[arena_base, arena_end)` is immutable for the
+        // collector's lifetime and needs no refresh at GC boundaries.
+        //
+        // Deliberately NOT `JIT_REGION_BOUNDS`: that table is what G1-2
+        // (`audits/g1-audit.md` §8.1) keeps EMPTY under G1 so no inline
+        // reference-STORE fast path is reachable and a JNI-pinned,
+        // CSet-excluded region cannot lose its remembered-set edge. Publishing
+        // reads here leaves that gate exactly as it was — see
+        // `gen_heap::JIT_READ_BOUNDS` for why the two questions need two
+        // tables.
+        //
+        // Sound for reference fields as well as primitives, which is what
+        // makes it worth doing: a G1 reference field is a plain pointer (no
+        // colored words, no load barrier), unlike ZGC's, which is why ZGC does
+        // not publish here.
+        crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_end);
 
         Self {
             layout_domain: std::sync::atomic::AtomicU32::new(

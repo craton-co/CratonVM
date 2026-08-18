@@ -559,6 +559,11 @@ pub struct JvmThread {
     /// sites are admissible and what a hit is allowed to skip.
     pub class_sites: crate::runtime::interpreter::ClassSiteCache,
 
+    /// Per-thread resolved `checkcast`/`instanceof` target classes. Separate
+    /// from `class_sites` on purpose — see `CastSiteCache`'s docs for why a
+    /// shared table would let a `checkcast` fill answer a `new`.
+    pub cast_sites: crate::runtime::interpreter::CastSiteCache,
+
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
     /// On invoke-cache misses, `execute_invokevirtual_vtable_fast` checks whether
@@ -786,6 +791,7 @@ impl JvmThread {
             field_sites: crate::runtime::interpreter::FieldSiteCache::new(),
             method_sites: crate::runtime::interpreter::MethodSiteCache::new(),
             class_sites: crate::runtime::interpreter::ClassSiteCache::new(),
+            cast_sites: crate::runtime::interpreter::CastSiteCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,

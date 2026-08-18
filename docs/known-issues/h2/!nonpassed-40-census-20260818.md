@@ -6,7 +6,7 @@
 | **Run** | The 62-class non-passed union from the last full run (the three 08-10 `gcvariant-*-jit-real-all` arms, 218 classes each), rerun on Azure `20.80.105.49` under Generational / G1 / ZGC, `jit-real`, `--max-heap 1g`, 300 s per-class cap, one shard each. Binary built at dev `64c02b7ac`. |
 | **Control** | **Stock HotSpot 25 over the same 40 classes, same host, same heap, same cap.** This is the line that decides what is a CratonVM bug. |
 
-## TL;DR — 22 are ours, 18 are not, and only 4 of the 22 are correctness
+## TL;DR — 22 are ours, 18 are not, and only 2 of the 22 are correctness
 
 | | classes |
 |---|---:|
@@ -15,8 +15,8 @@
 | **Fail on all three collectors** | **40** |
 | — of those, **HotSpot also fails** → not a CratonVM bug | **18** |
 | — of those, **HotSpot passes** → CratonVM-side | **22** |
-| — — of the 22, wall-clock (HotSpot passes in seconds, we hit the cap) | 18 |
-| — — of the 22, **real correctness** (we finish in comparable time, wrong answer) | **4** |
+| — — of the 22, wall-clock (HotSpot passes in seconds, we hit the cap) | 20 |
+| — — of the 22, **real correctness** (we finish in comparable time, wrong answer) | **2** |
 
 Per-arm totals over the 62: Generational 16 PASS / 29 HANG / 17 FAIL · G1 15 / 29 / 18 · ZGC 20 / 25 / 17. HotSpot over the 40: **22 PASS / 5 HANG / 13 FAIL** in 2269 s, against ~9500 s per CratonVM arm.
 
@@ -73,21 +73,48 @@ The required speed-up is the useful number, and it is not uniform: `TestCancel` 
 
 Two rows in this group are *not* at the cap and still lost: `TestKillProcessWhileWriting` (9.5 s → 147.7 s, 15.6x, finishes as FAIL) and `TestMultiThread` (12.2 s → 231.8 s, 19x — see its own page).
 
-### 2b. Four are real correctness — we finish in comparable time and get it wrong
+### 2b. Two are real correctness — we finish in comparable time and get it wrong
+
+> **Revised 2026-08-18, after both new rows were worked.** This section said
+> **four**. It is **two**: `TestTransaction` was not a correctness defect and
+> `TestBenchmark`'s was fixed. Both original readings came from believing an
+> assertion message over the mechanism behind it, which is what this section
+> exists to guard against — so the corrections are recorded here rather than
+> quietly dropped.
 
 These do not fit the throughput story and must not be filed under it:
 
 | class | HotSpot | CratonVM | what |
 |---|---:|---:|---|
-| `TestTransaction` | 9.9 s PASS | 10.2 s FAIL | `AssertionError: Expected: 100 actual: 50` — **new page below** |
-| `TestBenchmark` | 169.5 s PASS | 28.9 s FAIL | `OutOfMemoryError: Capacity: 10616832` — **new page below** |
 | `TestBnf` | 2.7 s PASS | 9.0 s FAIL | `Expected: true got: false` — existing autocomplete page |
 | `TestWeb` | 7.8 s PASS | 10.1 s FAIL | `does not contain: '...'` — existing autocomplete page |
 
-`TestTransaction` and `TestBenchmark` are filed as their own pages:
+**`TestBenchmark` — FIXED.** `OutOfMemoryError: Capacity: 10616832` at 28.9 s was
+not an exhausted heap. `ByteBuffer.allocate` is shadowed by a native whose
+backing array made one allocation attempt and threw, skipping the
+force-a-GC-and-retry ladder that both bytecode allocation paths run; the heap was
+29 MB used of 1024 MB, and repeating the identical allocation one Java statement
+later succeeded. Fixed by `NativeContext::reclaim_before_alloc_retry`. The class
+no longer OOMs and now runs the whole workload slowly, so it belongs in §2a
+below. Retired to bug-h2-testbenchmark-writebuffer-oom-at-1g-FIXED-20260818.md.
 
-* bug-h2-testtransaction-mergeusing-half-rows-20260818.md
-* bug-h2-testbenchmark-writebuffer-oom-at-1g-20260818.md
+**`TestTransaction` — not a correctness bug.** `Expected: 100 actual: 50` is not
+"half the rows": the assertion sums **two threads**, and 50 is `50 + 0`. One
+transaction ran all 50 merges; the other timed out on the row lock the first
+holds — at **key 1**, the first row, so nothing iterated wrong — and its
+`SQLException` is swallowed by the test's own `// Ignore`. The budget is the
+harness's `TestAll.lockTimeout = 50` ms; HotSpot's winning batch takes 5–8 ms and
+ours takes 66–100 ms. Every H2 DML statement is 50–100x here (MERGE is the
+*least* affected of the four measured), so this is §2a, not §2b. Retired to
+bug-h2-testtransaction-mergeusing-half-rows-DISPROVEN-20260818.md.
+
+The lesson both rows share, and the reason the "same speed" test in the header of
+this section is not sufficient on its own: **class wall-clock parity does not
+imply statement-level parity.** `TestTransaction` finishes in 10.2 s against
+9.9 s only because most of its sub-tests are dominated by sleeps and lock
+timeouts. Inside the one window that decided the assertion we were 10–14x slower.
+Before filing a row here again, time the operation the assertion depends on, not
+the class.
 
 ## 3. Not CratonVM — HotSpot fails these too (18 classes)
 
