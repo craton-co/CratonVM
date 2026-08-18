@@ -225,8 +225,9 @@ ineligible at every door. Measured on the real-loop probe:
 inside each other's noise. Turning inlining knobs on cannot help while the
 inliner cannot nest.
 
-**And the thing that must land first is not the inliner.** `try_emit_inline_site`
-refuses, as a *postcondition*, any spliced body that published deopt metadata:
+**And the thing that must land first is not the inliner — nor even the inline
+metadata.** `try_emit_inline_site` refuses, as a *postcondition*, any spliced
+body that published deopt metadata:
 
 > Every inlined body … is entered and left inside ONE frame, the caller's own,
 > and deopt metadata has no way to say otherwise: `deopt::FrameState::caller`
@@ -235,33 +236,69 @@ refuses, as a *postcondition*, any spliced body that published deopt metadata:
 > CALLER's method with the CALLEE's bci.
 
 A callee containing a real call publishes exactly that — `emit_post_invoke_
-exception_check` records a reason-9 point at the callee's bci. So the order is
-forced:
+exception_check` records a reason-9 point at the callee's bci.
 
-1. **Inline scopes in deopt metadata** — give `FrameState::caller` a producer
-   (`docs/jit/deopt-inline-scopes.md`). Until this exists, every later step
-   trades a throughput bug for a wrong-stack bug.
-2. **A real call inside a spliced body.** With scopes recorded, `try_emit_inline_
-   body` can emit the ordinary dispatch/direct-call sequence for `0xb6`/`0xb8`/
-   `0xb9` instead of bailing, and the postcondition above can be relaxed from
-   "published any metadata" to "published metadata with no caller scope".
-3. **Nesting.** `InlineSite` grows a `nested_sites: HashMap<callee_pc,
+The obvious reading is "record the scope, then relax the postcondition". **That
+is wrong for this class, and the reason is specific to it: the method that needs
+inlining here is a `@Test` body, invoked ONCE, so OSR is its only door out of the
+interpreter.** And an artifact carrying an inlined caller scope cannot be
+OSR-entered at all:
+
+* `CompiledMethod::osr_exit_policy` refuses any deopt point with
+  `frame_state.caller.is_some()` (`OSR_REFUSE_INLINED_SCOPE`), because
+* the VM's in-place OSR-exit transfer is single-frame —
+  `transfer_osr_exit_into_live_frame` bails on `"inlined caller chain"`, and so
+  do `resume_from_ir_deopt` and `build_deopt_frame_inner`. Its own comment says
+  "Lift this the same day that transfer grows a multi-frame path."
+
+So recording scopes first would make **exactly the artifact that needs inlining
+un-enterable**, and the loop would run interpreted — strictly worse than not
+inlining at all. That constraint was prose until 2026-08-17; it is now pinned by
+`a_deopt_point_with_an_inlined_caller_scope_refuses_the_osr_entry`
+(`jit/src/lib.rs`), which also asserts the same artifact without the scope IS
+admitted, and which fails if either refusal arm is removed.
+
+The order is therefore:
+
+1. **VM-side multi-frame deopt resume** — build a chain of interpreter frames
+   from `ReconstructedFrame::caller_frames` instead of refusing it, at all three
+   sinks. A caller scope is parked mid-`invoke`, so its `ResumeSemantics` is
+   `RESUME` and the frame must resume *after* the call with the callee's result
+   pushed; that protocol does not exist yet.
+2. **Multi-frame OSR-exit transfer**, and only then relax `osr_exit_policy`'s
+   `caller.is_some()` refusal. Steps 1 and 2 are what make an inlined artifact
+   usable by an OSR-only method at all.
+3. **Inline scopes in deopt metadata** — give `FrameState::caller` a producer.
+   The IR-side representation is already built and tested
+   (`docs/jit/deopt-inline-scopes.md`: `InlineScopeTable`, `caller_chain_for`,
+   `lower_inner_with_scopes`, chain-aware `frame_state_is_resumable`); what is
+   missing for THIS backend is the single-pass scope stack, "pushed at the splice
+   and popped at the callee's return", replacing
+   `build_and_record_deopt_point`'s hard-coded `caller: None`.
+4. **A real call inside a spliced body.** With scopes recorded and resumable,
+   `try_emit_inline_body` can emit the ordinary dispatch/direct-call sequence for
+   `0xb6`/`0xb8`/`0xb9` instead of bailing, and the postcondition above relaxes
+   from "published any metadata" to "published metadata with no caller scope".
+   Note this needs BOTH gates opened: `resolve_inline_site_from` rejects those
+   opcodes outright too, so a site is never even planned.
+5. **Nesting.** `InlineSite` grows a `nested_sites: HashMap<callee_pc,
    InlineSite>`, `resolve_inline_site_from` fills it recursively under a depth
-   budget, and the emitter recurses. Statically bound callees
-   (`invokestatic`/`invokespecial`) are the tractable first cut and are also
-   most of what this class needs: the assertion chain's first four rungs are all
-   `invokestatic`. `valueOf`'s five `contains` calls are `invokevirtual` on
-   static-final constants of anonymous subclasses, so they additionally need
-   devirtualisation with a guard.
+   budget, and the emitter recurses. Statically bound callees are the tractable
+   first cut and are most of what this class needs — the assertion chain's first
+   four rungs are all `invokestatic`. `valueOf`'s five `contains` calls are
+   `invokevirtual` on static-final constants of anonymous subclasses, so they
+   additionally need devirtualisation with a guard.
 
-Steps 1 and 2 are correctness-critical JIT features whose failure mode is a
-silent wrong stack, not a slow loop. That is the honest size of "needs an
-inliner that can nest".
+Steps 1-4 are correctness-critical, and their failure mode is a silent wrong
+stack rather than a slow loop. That is the honest size of "needs an inliner that
+can nest", and the inliner is the last item on the list rather than the first.
 
 ## What is left, in order
 
-1. Inline scopes → calls inside spliced bodies → nesting, as above. This is the
-   only item that can close the 2.2x.
+1. The five-step chain above, in that order — multi-frame resume, multi-frame
+   OSR transfer, inline scopes, calls inside spliced bodies, nesting. It is the
+   only item that can close the 2.2x, and its first two steps are VM work rather
+   than compiler work.
 2. `Enum.equals` at **10.8 ns for one virtual call** (`AssertChainProbe`) against
    a measured 8.2-9.0 ns virtual-call floor — so it is a plain virtual call and
    nothing more, which retires this page's earlier "37 ns, six times a compiled
