@@ -6403,6 +6403,59 @@ impl ZgcRealHeap {
     ///
     /// Returns the number of overlaps. Diagnostic only -- it never vetoes, and
     /// it is called only under `CRATONVM_DBG_ZGC_CORPSE`.
+    /// Decode the object that would sit `delta` bytes below `victim`, and say
+    /// whether it explains the victim.
+    ///
+    /// # The question this answers
+    ///
+    /// The extent census already prints the raw words below an offending base.
+    /// It never said what they MEAN, and the fifth pass of
+    /// `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` decoded them
+    /// once, by hand, and found "a plausible header for an object the registry
+    /// does not contain" at `victim - 16`.
+    ///
+    /// That distinction reframes the defect. The corrupting value is a MANAGED
+    /// HEAP POINTER at offset 0 of a live object, and an ordinary reference
+    /// store into `O` at index `i` writes at `O + 16 + 16i` — so for one to land
+    /// on offset 0 of the victim, the writer's base must sit exactly 16 bytes
+    /// below it. Two readings fit the same bytes:
+    ///
+    /// * **a stray writer** — nothing plausible sits below the victim, and
+    ///   something wrote through a pointer it should not have had;
+    /// * **an overlapping allocation** — a plausible, UNREGISTERED object at
+    ///   `victim - 16` whose extent covers the victim, in which case the
+    ///   "corruption" is just its field 0 and no writer is misbehaving at all.
+    ///
+    /// The second explains the most puzzling number on that page: `zgc access
+    /// audit` reads ZERO on runs that overlap. Every audit there asks "is the
+    /// RECEIVER a registered base?", and under the second reading the store is
+    /// an ordinary store into whatever the writer believes it owns.
+    ///
+    /// Returns `(plausible, registered, covers_victim, class_id, size)`.
+    /// `covers_victim` is the load-bearing one: a plausible unregistered object
+    /// whose extent reaches the victim is the second reading, confirmed.
+    fn decode_neighbour_below(&self, victim: usize, delta: usize) -> (bool, bool, bool, u32, usize) {
+        let Some(cand) = victim.checked_sub(delta) else {
+            return (false, false, false, 0, 0);
+        };
+        if cand < self.arena_base {
+            return (false, false, false, 0, 0);
+        }
+        // SAFETY: `cand` is inside the arena and the world is stopped for the
+        // census. Reading a header out of arbitrary payload bytes is exactly
+        // what this is for -- `alloc_size` is the plausibility filter.
+        let h = self.header_ref(cand as *mut u8);
+        let size = Self::alloc_size(h);
+        let registered = self.registry.contains(cand);
+        (
+            size.is_some(),
+            registered,
+            size.is_some_and(|sz| cand.saturating_add(sz) > victim),
+            h.class_id.as_u32(),
+            size.unwrap_or(0),
+        )
+    }
+
     fn survey_registry_extents(&self, all: &[usize], where_: &'static str) -> usize {
         let mut bases: Vec<usize> = all.to_vec();
         bases.sort_unstable();
@@ -6476,6 +6529,23 @@ impl ZgcRealHeap {
                                 w3 = format!("{:#018x}", w[3]),
                                 below0 = format!("{:#018x}", below[0]),
                                 below1 = format!("{:#018x}", below[1]),
+                                // WHAT THE WORDS BELOW MEAN, not just what they
+                                // are -- see `decode_neighbour_below`.
+                                // `covers=true registered=false` is the second
+                                // reading confirmed: the victim is not being
+                                // corrupted, it is overlapped.
+                                below16 = {
+                                    let (p, r, c, cid, sz) = self.decode_neighbour_below(b, 16);
+                                    format!(
+                                        "plausible={p} registered={r} covers={c}                                          class={cid} size={sz}"
+                                    )
+                                },
+                                below32 = {
+                                    let (p, r, c, cid, sz) = self.decode_neighbour_below(b, 32);
+                                    format!(
+                                        "plausible={p} registered={r} covers={c}                                          class={cid} size={sz}"
+                                    )
+                                },
                                 "zgc extent census: a registered object's computed extent \
                                  runs INTO the next registered object"
                             );
@@ -15990,6 +16060,66 @@ pub(crate) mod tests {
             runs >= 1 && runs < objects,
             "and adjacent dead objects must still collapse into runs: {runs} for \
              {objects}"
+        );
+    }
+
+    /// **The neighbour probe answers all three of its questions, and answers
+    /// them the boring way on a healthy heap.**
+    ///
+    /// `decode_neighbour_below` exists to separate two readings of the same
+    /// bytes in `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` — a
+    /// stray writer, or an unregistered object overlapping the victim by one
+    /// header. `covers=true registered=false` is the second reading confirmed,
+    /// so all three predicates have to be right independently.
+    ///
+    /// The negative half is the one that decides whether the instrument is worth
+    /// reading: on a heap where nothing is wrong, a properly adjacent
+    /// predecessor must report `covers=false`. A probe that says "overlapped" on
+    /// every object says nothing on the run that matters.
+    #[test]
+    fn the_neighbour_probe_separates_an_overlap_from_an_adjacency() {
+        let heap = ZgcRealHeap::new_shared(4 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        heap.set_relocation_enabled(false);
+
+        let a = heap.alloc_object(ClassId::new(77), 4);
+        let a_base = a.as_ptr() as usize;
+
+        // An address INTERIOR to `a`, read as if it were a victim: its
+        // predecessor at -16 is `a` itself, which is registered, plausible, and
+        // whose extent genuinely covers the address. All three true.
+        let (plausible, registered, covers, class_id, size) =
+            heap.decode_neighbour_below(a_base + 16, 16);
+        assert!(plausible, "a real object base must decode as a plausible header");
+        assert!(registered, "and the registry must contain it");
+        assert!(
+            covers,
+            "and its extent must be reported as covering an address 16 bytes \
+             into it -- `covers` is the whole point of the probe"
+        );
+        assert_eq!(class_id, 77, "and it must name the class doing the covering");
+        assert!(size >= 16 + 4 * SLOT_SIZE, "with its real size: {size}");
+
+        // THE NEGATIVE HALF. A second object allocated straight after `a`: its
+        // predecessor is `a`, adjacent but NOT overlapping, so `covers` must be
+        // false. This is the healthy shape, and it is what stops the instrument
+        // reporting an overlap for every object in the heap.
+        let b = heap.alloc_object(ClassId::new(78), 1);
+        let b_base = b.as_ptr() as usize;
+        let (_p2, _r2, covers_b, _c2, _s2) = heap.decode_neighbour_below(b_base, b_base - a_base);
+        assert!(
+            !covers_b,
+            "a properly adjacent predecessor must NOT be reported as covering \
+             its successor -- otherwise the probe fires on a healthy heap and \
+             says nothing on a sick one"
+        );
+
+        // And an address below the arena cannot be probed at all.
+        let (p3, r3, c3, _, _) = heap.decode_neighbour_below(heap.arena_base, 16);
+        assert!(
+            !p3 && !r3 && !c3,
+            "below the arena there is nothing to decode, and the probe must say \
+             so rather than read memory it does not own"
         );
     }
 
