@@ -238,10 +238,17 @@ assume P-256, ignore the SPKI OID       p384_sha384_round_trips        FAILED
 
 ### Gates
 
-* `cargo test -p cratonvm-native-builtins`: 4070 passed / 23 failed. The same
+* `cargo test -p cratonvm-native-builtins`: 4073 passed / 23 failed. The same
   23 fail on the base commit `2f4b2f82c`, name for name — all pre-existing, none
   in `servlet`, `x509_manager`, `crypto_impl` or `tls`. The branch adds 16
   passing tests.
+* `regression-suite/run.sh`: 59 passed / 3 failed on this binary AND on a
+  pristine build of the base commit, the same three
+  (`RImmutableFactoryTypes`, `RJdkOptionalShape`, `RJdkIntrinsics3`).
+  `RJdkSecurity` — the stage the sibling page added — is in the JDK-ONLY list
+  and therefore does NOT run in the default suite; a green default run says
+  nothing about it. Run explicitly with `RJdkX509Intercept` and `RJdkNet`:
+  3 passed / 0 failed on both binaries.
 * Netty's 78 SSL/TLS/cert test classes, fork-per-class, this binary against a
   pristine build of the base commit: identical status on every class.
 
