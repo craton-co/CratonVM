@@ -1549,6 +1549,13 @@ pub(crate) fn lambda_jit_site_code(
             .map(cratonvm_jit::RetainedCode::new);
         *site.code.borrow_mut() = found;
         site.code_generation.set(generation);
+        // A moved generation means a publication or an invalidation — including
+        // the recompile that a de-speculation drives. The body being probed now
+        // is not the one that deopted, so the latch that took this site off the
+        // direct arm is lifted with it. Without this the first uncommon trap in
+        // a body's life would exile its call site permanently, even after the
+        // speculation that failed had been compiled out.
+        site.direct_disabled.set(false);
     }
     site.code.borrow().clone()
 }
