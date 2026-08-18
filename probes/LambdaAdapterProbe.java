@@ -7,9 +7,10 @@ import java.util.function.*;
  * one register before tail-jumping to the implementation. That is three things
  * a register shuffle can get wrong and nothing else can:
  *
- *   - the WIDTH of what it moves (an `int` and a `long` share a register; a
- *     `double` does not travel in the integer registers the thunk shuffles at
- *     all, so a double-taking SAM must be REFUSED rather than mangled);
+ *   - the WIDTH of what it moves (`int`, `long`, `double` and a reference all
+ *     occupy exactly one integer register in this VM's JIT ABI — a `double` is
+ *     passed as raw bits, not in an FP register, so the slide is uniform across
+ *     types and a 32-bit move would truncate a `long`);
  *   - the ORDER it moves them in (slide two arguments the wrong way and the
  *     second arrives holding the first one's value);
  *   - the ARITY it accepts (the receiver, and the hidden context register when
@@ -156,9 +157,9 @@ public class LambdaAdapterProbe {
         // 9 — ZERO arguments: a bare tail jump, the receiver simply not passed.
         System.out.println("9 no_args=" + loop9(() -> 7));
 
-        // 10 — a DOUBLE argument, which travels in an FP register the thunk
-        // never touches. The arm that catches a thunk installed for a shape it
-        // cannot serve.
+        // 10 — a DOUBLE argument. This VM's JIT ABI passes it as raw bits in an
+        // ordinary integer register, so the thunk's uniform slide is what it
+        // needs; this arm is what says so rather than assuming it.
         System.out.printf("10 double_arg=%.6f%n", loop10(x -> x / 3.0));
 
         // 11 — two different lambdas at ONE call site, so it goes polymorphic

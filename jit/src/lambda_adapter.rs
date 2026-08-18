@@ -44,6 +44,13 @@
 //!   caller's return address is what the impl returns to, and a conservative
 //!   stack walk never sees the thunk at all. Windows shadow space and 16-byte
 //!   alignment are inherited unchanged for the same reason.
+//! * **The slide is uniform across argument types.** This VM's JIT ABI gives
+//!   every Java argument exactly one INTEGER register — `execute_jit_call`
+//!   builds its register array with `to_bits()` for a `double` and a raw
+//!   pointer for a reference, and the emitted cascade loads each operand-stack
+//!   slot into `ARG_REGS[i]` without consulting its type. So the thunk needs no
+//!   type information at all, and `probes/LambdaAdapterProbe.java`'s
+//!   double-argument arm is the check that this remains true.
 //! * **It touches no memory.** Registers only, which is what confines it to
 //!   NON-CAPTURING lambdas: reading a captured field from generated code would
 //!   mean replicating the compact/legacy body-layout branch
