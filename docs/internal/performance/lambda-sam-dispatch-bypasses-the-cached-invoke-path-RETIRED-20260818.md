@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| **Status** | RETIRED — both defects it named are fixed, shipped and pinned; the residual it leaves has a mechanism, a count and a named fix class |
+| **Status** | RETIRED — both defects it named are fixed, shipped and pinned, and the residual it left (capturing lambdas) is closed too |
 | **Opened** | 2026-08-17 as `known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`; §5 added the same day |
-| **Closed by** | `fix/lambda-sam-jit-tierup-20260817` |
-| **Measured effect** | **37x** on `probes/SamHotLoopProbe.java`'s lambda row — 379 → 10.2 ns/op, against a named-class control of 10.3 — same binary, three-arm ABBA, six runs an arm. The gap this page was filed about is GONE, not narrowed |
-| **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (everything), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller Rust arm), `CRATONVM_JIT_LAMBDA_ADAPTER=0` (the inline-cache thunk) |
+| **Closed by** | `fix/lambda-sam-jit-tierup-20260817`, then `perf/lambda-mic-adapter-20260818`, then `perf/lambda-capturing-adapter-20260818` for the capturing residual |
+| **Measured effect** | **37x** on `probes/SamHotLoopProbe.java`'s lambda row — 379 → 10.2 ns/op, against a named-class control of 10.3 — same binary, three-arm ABBA, six runs an arm. The gap this page was filed about is GONE, not narrowed. The capturing row followed on 2026-08-18: **17.4x**, 125.1 → 7.2 ns/op against a control of 6.6 (see §4) |
+| **Kill switches** | `CRATONVM_JIT_LAMBDA_TIERUP=0` (everything), `CRATONVM_JIT_LAMBDA_SITE=0` (the compiled-caller Rust arm), `CRATONVM_JIT_LAMBDA_ADAPTER=0` (the inline-cache thunk), `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` (just the capturing half of it) |
 
 The page asked for one thing in its §4 — *"giving lambda call sites a cached
 invoke target of their own"* — and reported in §5 that the attempt at the other
@@ -270,6 +270,60 @@ primitive capture is unaffected by either.
 `CRATONVM_JIT_LAMBDA_ADAPTER` so a same-binary A/B can hold the non-capturing
 thunk fixed while moving only this.
 
+#### The numbers
+
+Same binary throughout (`cratonvm-lamcap`, md5 `107ebef71211a5f334b96864b62fef53`),
+three arms selected by kill switch, order `A B C C B A` within each of three
+rounds so drift in the box's load falls on every arm equally. Six runs an arm,
+`probes/SamHotLoopProbe.java`, 2 000 000 ops, Azure 8-core — and unlike §3's
+table, a quiet one, which is why every absolute number here is about half of
+that table's.
+
+| row | A: both on | B: capture thunk off | C: no thunk at all |
+|---|---:|---:|---:|
+| `klass` (named class, control) | 6.6 | 6.7 | 6.6 |
+| `lambda` (non-capturing) | 6.9 | 6.9 | 122.0 |
+| `mref` | 6.9 | 6.9 | 119.7 |
+| **`cap` (capturing)** | **7.2** | **125.1** | 124.0 |
+
+**17.4x on the capturing row**, and it lands at the named-class control plus
+0.6 ns — which is about what one load off the receiver should cost. Ranges do
+not overlap: A `[7.0 … 7.3]` against B `[123.3 … 128.2]`.
+
+Three controls make that a measurement rather than a number:
+
+* `klass` is unmoved across all three arms, as it must be — nothing here
+  touches a named class's call site.
+* `lambda` and `mref` are IDENTICAL in A and B (6.9 both). The capture switch
+  moved only what it claims to; had it moved the non-capturing rows, the arms
+  would not be measuring what their names say.
+* `cap` in B ≈ `cap` in C (125.1 against 124.0). For a capturing lambda,
+  turning off the capture half alone is the same as turning off the thunk
+  entirely — which is the statement that B is a real "before".
+
+Every run of all seventy-two printed the same `sink=71449096416`.
+
+`probes/LambdaCaptureAdapterProbe.java` — seventeen capture shapes, including a
+negative `byte`, a `char` above `0x7FFF`, a `null` reference, three captures at
+once, and two instances of one lambda holding different values — is
+byte-identical to HotSpot's output on both arms, with
+`site_adapters=15 site_cap_adapters=14` printed beside it. The second number is
+the one that matters: fourteen CAPTURING sites were dispatching through a thunk
+while those lines were produced.
+
+Its engagement is modest on purpose — `site_no_code=895000` of
+`site_calls=1095000`, because 300 000 iterations across seventeen distinct impls
+does not give the background compiler time to publish them all. The probe's job
+is agreement across shapes; the fixture pair in §5 carries the engagement
+burden.
+
+Its captures go through one-line identity methods (`i32`, `i64`, …) for a
+reason worth repeating: `final int k = 7;` is a *constant variable* in the JLS
+sense and javac inlines it before desugaring the lambda, so the obvious way to
+write this file produces seventeen NON-capturing lambdas whose comments claim
+otherwise. `javap -p` on the class is the check — every `lambda$main$N` must
+take more parameters than its SAM.
+
 #### What the fixture had to learn
 
 `captureShapesChecksum` covers one capture of each width, and every lambda in it
@@ -288,6 +342,23 @@ not because anything can see it. The comment on `CaptureLoad::Int` says so.
 
 ## 5. What pins it
 
+For the capturing thunk, a PAIR:
+`vm/tests/lambda_capture_adapter_tests.rs` runs three fixtures through the
+thunk and asserts both the values and
+`lambda_jit_capture_adapter_installs() > 0`;
+`lambda_capture_adapter_off_tests.rs` runs the same three with
+`CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0`, asserts the SAME values, and asserts
+zero installs. Neither is worth much alone — the first could agree with a
+broken Rust arm, the second could pass while no thunk was ever built. Together
+they say the two independent implementations of "read the captures and call the
+impl" agree, and that both ran. The expected values are computed in Rust and
+were checked against HotSpot before being written down.
+
+`CRATONVM_DBG=lambda-jit` prints `site_cap_adapters` beside `site_adapters` for
+the same reason the pair exists: the total stays healthy on a workload full of
+non-capturing lambdas whatever happens to the capturing ones.
+
+For the original two halves:
 `vm/tests/lambda_jit_tierup_tests.rs` and `lambda_jit_oneshot_tests.rs` — the
 same twelve golden checksums from a real JDK, run against each half (the second
 sets `CRATONVM_JIT_LAMBDA_SITE=0`, which sends a compiled caller's SAM call back
