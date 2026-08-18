@@ -33,18 +33,48 @@ lift.
 own 2026-08-17 lift, a method with a table is admitted whenever every throwing
 site inside a protected range publishes a reason-9 frame — and `athrow`'s
 lowering is one of the few that does not, so an `athrow` INSIDE a `try` is
-already refused there. The residual case is an `athrow` OUTSIDE every protected
-range of a method that has one elsewhere. There
-`route_osr_exception_out_of_artifact` correctly answers `Propagate` (no precise
-frame, so the throw site is outside every range), but `ThrowJava` then hands the
-throwable to `unwind_to_handler` keyed on `entry_pc` — the BACK-EDGE the body
-was entered at, not the throw site. When that back-edge lies inside a protected
-range (`try { for (..) {..} } catch`), the unwinder finds a handler that does not
-cover the throw and enters it on the stale pre-OSR locals. Until `ThrowJava`
-carries "this frame has already declined to catch", admitting that shape trades a
-throughput bug for a wrong-answer bug. **That gap is live for the RBC.6b lift
-too**, independently of `athrow`: any implicit exception raised outside every
-range in a table-bearing OSR'd method takes the same path.
+already refused there. The residual case would be an `athrow` OUTSIDE every
+protected range of a method that has one elsewhere, and it stays refused because
+`athrow`'s lowering still publishes no frame to route by; that is a lowering
+gap, not a policy one.
+
+### The wrong-answer bug that residual uncovered, also fixed here
+
+Reasoning about that case found a live defect in the freshly-landed RBC.6b lift,
+independent of `athrow`. `route_osr_exception_out_of_artifact` asks this method's
+own table with the PRECISE throw bci and can answer `Propagate` — "this frame
+cannot catch". `OsrBackoffOutcome::ThrowJava` then handed the throwable to
+`unwind_to_handler` keyed on `entry_pc`, the BACK-EDGE the compiled body was
+ENTERED at, which has nothing to do with where the throw happened. With the loop
+inside the `try` (`try { for (..) {..} } catch`) that back-edge IS inside a
+protected range, so the unwinder found the `catch`, entered it, and resumed the
+frame on the stale pre-OSR locals.
+
+`probes/OsrThrowOutsideTryProbe.java` — a loop inside a `try`, a `trip()` throw
+after it — measured against HotSpot on the same host:
+
+```text
+HotSpot   caught=0 escaped=1 sink=80000200000
+CratonVM  caught=1 escaped=1 sink=80018203000     <- before
+CratonVM  caught=0 escaped=1 sink=80000200000     <- after
+```
+
+Both halves were silent: an exception swallowed by a handler that does not guard
+it, and an accumulator **18 003 000 too high** from the iterations the spurious
+resume re-ran. Nothing raised, and no termination test could see either.
+
+The fix is `exception_dispatch::OSR_FRAME_DECLINED_TO_CATCH` — a pc no
+`[start_pc, end_pc)` can contain, handed to `unwind_to_handler` in place of
+`entry_pc` at all fifteen `ThrowJava` sites. The first search matches nothing,
+the frame pops, and `exc_pc` is re-read from the caller's `last_instr_pc` as
+usual. Saying it in the existing signature rather than adding a parameter is
+deliberate: the router has ALREADY asked this frame with better information, so
+what the unwinder needs is not another opinion but a pc that cannot produce one.
+
+`probes/OsrExcTableProbe.java` (the RBC.6b lift's own acceptance probe) stays
+line-for-line identical to HotSpot after the fix, with
+`osr_exception_handler_entered=210` beside `osr_entered=213` — the lift's real
+handler entries are untouched; only the decline path changed.
 
 ### Two more gaps, both found only because the lift opened the door
 
@@ -169,10 +199,11 @@ known-issues/perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md.
   where liveness cannot drop it. Closing it needs a real per-slot type oracle,
   not a wider mask. It is now the only OSR refusal left in the method, and by the
   `--nojit` row above it costs approximately nothing.
-* **`OsrBackoffOutcome::ThrowJava` unwinds keyed on `entry_pc`**, not on the
-  throw site — see the second section. It blocks admitting an `athrow` in a
-  table-bearing method, and it is a live wrong-answer path for the RBC.6b lift
-  independently of `athrow`.
+* **An `athrow` in a table-bearing method is still refused** — not for the
+  unwind reason (fixed above) but because `athrow`'s lowering publishes no
+  precise exceptional frame, so a throw from inside a protected range has
+  nothing to route by. Admitting it needs the lowering to publish, which is the
+  same work `first_unsupported_precise_frame_site` lists `athrow` under.
 * `local_oop_masks` carries the same 64-slot truncation this page fixed for
   liveness. Its own comment says a slot beyond bit 63 "reads as non-oop here —
   sound only because `can_deopt_resume` (later) gates such methods off". Not
@@ -197,7 +228,10 @@ CRATONVM_DBG=jit-method-stats cratonvm --java-home <jdk> -cp . OsrAthrowProbe 40
 `vm/tests/jit_osr_athrow_lift.rs` is the same probe as a differential test: it
 runs both gate states of one binary, requires an `OSR-compile` line for
 `coldThrow` in the ON arm and its absence in the OFF arm, and asserts the exact
-iteration counts in both.
+iteration counts in both. `vm/tests/jit_osr_throw_outside_try.rs` is the
+regression test for the unwind fix, with the same anti-vacuity guard (a run that
+never OSR-compiled `afterLoop` proves nothing, because the interpreter gets this
+right for free).
 
 ## Related
 
