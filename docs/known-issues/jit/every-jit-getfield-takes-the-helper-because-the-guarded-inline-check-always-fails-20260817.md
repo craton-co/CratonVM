@@ -435,20 +435,65 @@ Partial, and named as such.
      and that is an ordinary bug.
 
    The split is one counter — classify the `outside-published-bounds` bucket by
-   whether the field read is a reference — and it is *written* but not yet
-   *run*: the release build crashed rustc during fat LTO
-   (`STATUS_STACK_BUFFER_OVERRUN`) twice on a contended host. `cargo check`
-   passes; this is a toolchain failure, not a code one. **Do not infer the
-   split from the numbers above** — inferring is what cost this page four
-   hypotheses.
+   whether the field read is a reference — and it is in the tree. **Do not
+   infer the split from the numbers above**; inferring is what cost this page
+   four hypotheses.
+
+   Two environment notes for whoever runs it, both of which cost an hour:
+   the release build failed three times, twice as `rustc` exiting
+   `0xc0000409 STATUS_STACK_BUFFER_OVERRUN` during the fat-LTO link and once
+   with the honest message, `os error 1455` — **the Windows page file was
+   exhausted**, with ~38 concurrent `rustc` processes from other sessions on
+   the box. Count toolchain processes before reading an LTO crash as a code
+   defect; `cargo check` passed throughout. And the obvious fallback does not
+   work: a **dev-profile** build (fine for a counting measurement, never for a
+   timing one) panics on this workload at `vm/src/jit/helpers.rs:1338`,
+   `jit_thread_mut: aliasing &mut JvmThread borrow detected`, twice during
+   boot — reproducible with every diagnostic flag OFF, so pre-existing and
+   unrelated, but it does block that route.
 2. **The proper fix for containment under a non-publishing collector is a
-   separate READ-SIDE bounds table.** `JIT_REGION_BOUNDS` cannot be filled (see
-   above), but nothing stops a second table carrying each collector's mapped
-   envelope — ZGC's `conservative_addr_span()` is exactly `[arena_base,
-   arena_end)`, documented as lock-free and fixed for the collector's lifetime —
-   consulted *only* by the getfield receiver check, leaving the store-side
-   interlock untouched. Reference loads would still need the ZGC colored-word
-   gate. This is a design, not a bug fix, and deserves its own page.
+   separate READ-SIDE bounds table.** This is a design, not a bug fix, and
+   deserves its own page — but the shape is settled enough to write down, so
+   the next person does not have to re-derive why the obvious thing is wrong.
+
+   *Why a second table and not the existing one.* `JIT_REGION_BOUNDS` is doing
+   two jobs at once. Its documented job is "is this address mapped, so a raw
+   load cannot fault" — a READ-side question. Its actual load-bearing job,
+   since G1-2, is "may an inline reference STORE skip the collector's write
+   barrier" — and G1/ZGC answer that by leaving the table empty. One table,
+   two questions, opposite answers. Filling it to fix loads breaks stores.
+
+   *The shape.* A `JIT_READ_BOUNDS` sibling, same six-word layout so the
+   emitted containment sequence is byte-identical and only the baked address
+   changes, published by every collector with its mapped envelope:
+
+   | collector | source | property relied on |
+   |---|---|---|
+   | Generational | the three arenas, as today | already refreshed at GC start/end |
+   | ZGC | `ZgcRealHeap::conservative_addr_span()` → `[arena_base, arena_end)` | "allocated once in `with_capacity` and never grown", read without the arena lock |
+   | G1 | the reserved heap range | needs checking — G1 has N regions and the table has 3 slots, so this is the one that may not fit |
+
+   `region_bounds_are_live` keeps reading the OLD table and keeps gating the
+   store paths; only `emit_guarded_getfield_receiver_check` and
+   `ir_lower`'s copy of it move to the new one.
+
+   *The ZGC obligation that comes with it.* Publishing read bounds makes the
+   inline path reachable for REFERENCE fields under ZGC, where a compact
+   reference slot may hold `Z_COLORED_TAG | colour | offset`. That is the
+   use-after-free `heap.rs::read_prim_element` panics on by design. So the
+   read-side table must land together with a per-field-kind gate that keeps
+   reference loads on the helper under ZGC — the same restriction the
+   trusted-oop shortcut already carries, applied to the containment path too.
+   `zgc_codegen_honours_read_barrier()`'s doc comment states the obligation
+   from the other side and must be revisited in the same change: it returns a
+   constant `true` and says so **only** while no inline reference emission
+   happens under an armed barrier.
+
+   *What it is worth.* Unknown until item 1 is measured. If the ZGC/G1
+   residual is mostly reference reads, this table buys little on its own and
+   the real gate is the ZGC JIT load barrier; if it is mostly primitives, it
+   buys most of the remaining 56.9M. **Measure item 1 first** — that ordering
+   is the whole point of this page.
 3. **`init_object_header` should honour the compact layout.** Defect 2 was fixed
    on the *reader* side, which is right and enough for `getfield` — but the
    underlying fact remains that ~99% of allocations ignore a registered compact
