@@ -414,11 +414,33 @@ Partial, and named as such.
 
 ## What is still open
 
-1. **The remaining ZGC/G1 misses are the SINGLE-PASS arm's containment check.**
-   That arm has its own trusted-oop shortcut and is not getting it here, because
-   it requires `stack_oop_marks_exact`. Why that is false at these sites is the
-   next question, and it is a third sub-problem, not a restatement of the first
-   two.
+1. **What the remaining 56.9M ZGC/G1 misses ARE has not been measured** — and
+   the previous revision of this list asserted an answer, which on this page of
+   all pages was the wrong thing to do. Struck and replaced with the two
+   candidates and the instrument that separates them:
+
+   * **reference-field reads.** `emit_trusted_oop_receiver_check` was extended
+     to the IR tier for PRIMITIVES only, so every reference read still goes
+     through containment and still misses. `SHA256Digest`'s hottest field by a
+     wide margin is `X:[I` — a reference, read inside the 64-round loop — so
+     this is a real share of the residual. If it is most of it, the rest is
+     blocked on the ZGC JIT load barrier
+     (`feature-designs/zgc-jit-load-barrier.md`) and there is nothing to fix in
+     the getfield arms.
+   * **the single-pass arm's containment check.** That arm has its own
+     trusted-oop shortcut, gated on `stack_oop_marks_exact`, which
+     `bytecode_walk.rs:317` clears at any branch target reached through the
+     dead-code merge reconstruction with a non-empty stack. If the residual is
+     primitive-heavy, an arm is failing to take a shortcut it is entitled to,
+     and that is an ordinary bug.
+
+   The split is one counter — classify the `outside-published-bounds` bucket by
+   whether the field read is a reference — and it is *written* but not yet
+   *run*: the release build crashed rustc during fat LTO
+   (`STATUS_STACK_BUFFER_OVERRUN`) twice on a contended host. `cargo check`
+   passes; this is a toolchain failure, not a code one. **Do not infer the
+   split from the numbers above** — inferring is what cost this page four
+   hypotheses.
 2. **The proper fix for containment under a non-publishing collector is a
    separate READ-SIDE bounds table.** `JIT_REGION_BOUNDS` cannot be filled (see
    above), but nothing stops a second table carrying each collector's mapped

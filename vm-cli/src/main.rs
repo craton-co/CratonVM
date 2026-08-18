@@ -168,6 +168,31 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        eprintln!(
+            "[cratonvm] getfield out-of-bounds by field kind: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_oob_field_kinds()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // The ALLOCATION side of the same question, from the path
+        // `plan_object_alloc`'s `[compact-legacy]` census cannot see: the TLAB
+        // fast path writes a legacy header unconditionally and serves ~99% of
+        // allocations, so a class can be 100% of the legacy field receivers
+        // above and appear in no allocation census at all. Needs
+        // `CRATONVM_DBG_COMPACT_LEGACY`.
+        let tlab_legacy = cratonvm_vm::runtime::interpreter::tlab_legacy_object_classes();
+        if !tlab_legacy.is_empty() {
+            eprintln!(
+                "[cratonvm] TLAB-allocated legacy objects by class: {}",
+                tlab_legacy
+                    .iter()
+                    .map(|(n, id, c)| format!("{n}(id={id})={c}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
         let legacy_classes = cratonvm_vm::jit::helpers::jit_getfield_legacy_receiver_classes();
         if !legacy_classes.is_empty() {
             eprintln!(
