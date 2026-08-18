@@ -1008,3 +1008,12 @@ Three of those are worth reading before acting anywhere in this tree:
   "toolchain" before trusting a build failure here: `-C lto=fat` crashes rustc
   on this tree AND on unmodified HEAD, so a red build is not evidence about a
   change.
+* **`G72-1`** — sweep 9 on the exception-contract axis `G68-1` N3 and `G69-1` N3
+  both nominated, and it **could not finish**: `Object.wait(-5)` on a held
+  monitor **blocks forever** where HotSpot throws `IllegalArgumentException`, so
+  29 of 33 rows have never been measured on CratonVM. A negative timeout is not
+  a long wait, it is an error — and `Thread.sleep(-1)` silently succeeds for the
+  same missing check while `Thread.join(-1)` right beside it is correct. A hang
+  is worse than a wrong value: it presents as "the application stopped", far
+  from the call. NOT FIXED. The oracle column for all 29 unmeasured rows is in
+  §4 so the next pass is a diff, not a measurement exercise.
