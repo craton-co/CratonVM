@@ -505,7 +505,18 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
 pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let hash = ctx.identity_hash_code(this);
     if crate::nbflags().dbg_sttrace {
-        eprintln!("STTRACE_DBG_CTOR_CAP this={:?} hash={hash}", this.as_ptr());
+        // The throwable's CLASS, not just its identity. Counting captures tells
+        // you a workload throws a lot; only the class tells you what. Naming it
+        // here is what separated "Quartz leaks memory" from "Quartz throws the
+        // same exception 25,000 times" — see
+        // known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_else(|| "?".to_string());
+        eprintln!(
+            "STTRACE_DBG_CTOR_CAP this={:?} hash={hash} class={cls}",
+            this.as_ptr()
+        );
     }
     let trace = ctx.capture_throwable_stack_trace(this);
     let depth = trace.len() as i32;
