@@ -112,7 +112,7 @@ fn maybe_dump_shutdown_reports() {
     // the only usable one for that change: this host has no PMU, so a
     // `perf stat -e instructions` A/B is unavailable, and its load average
     // moves further in an hour than the effect does.
-    cratonvm_gc::g1::live_region_memo::stats::dump();
+    cratonvm_vm::dump_g1_live_region_memo_stats();
 
     // The JIT root-scan tally, self-gated the same way. It answers what the
     // method-stats line below cannot: those counters price the COMPILER, and a
