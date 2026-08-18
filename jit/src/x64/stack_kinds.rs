@@ -58,7 +58,7 @@ use super::*;
 
 /// The kind of one compact operand-stack entry.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(super) enum StackKind {
+pub(crate) enum StackKind {
     /// Depth is known, type is not — indistinguishable from today's fallback.
     Unknown,
     Int,
@@ -85,7 +85,7 @@ impl StackKind {
     /// JVM category: `true` for `long`/`double`. `None` when unknown — the
     /// caller must poison rather than guess, because the category decides how
     /// many entries `pop2`/`dup2` touch.
-    pub(super) fn is_category_2(self) -> Option<bool> {
+    pub(crate) fn is_category_2(self) -> Option<bool> {
         match self {
             StackKind::Long | StackKind::Double => Some(true),
             StackKind::Int | StackKind::Float | StackKind::Ref => Some(false),
@@ -97,26 +97,26 @@ impl StackKind {
     /// so callers that cross-check against the emitter's oop marks must gate
     /// on [`Self::is_category_2`] answering first — an `Unknown` entry has no
     /// opinion about ref-ness either.
-    pub(super) fn is_ref(self) -> bool {
+    pub(crate) fn is_ref(self) -> bool {
         matches!(self, StackKind::Ref)
     }
 }
 
 /// Per-bci operand-stack kinds. Absent = no answer (unreached or poisoned).
 #[derive(Default)]
-pub(super) struct StackKindMap {
+pub(crate) struct StackKindMap {
     at: FxHashMap<usize, Vec<StackKind>>,
 }
 
 impl StackKindMap {
-    pub(super) fn get(&self, bci: usize) -> Option<&[StackKind]> {
+    pub(crate) fn get(&self, bci: usize) -> Option<&[StackKind]> {
         self.at.get(&bci).map(|v| v.as_slice())
     }
 
     /// How many pcs the analysis answered for. `0` means it declined entirely,
     /// which is the first thing to check when a snapshot that should have been
     /// typed stayed `Unsupported`.
-    pub(super) fn answered(&self) -> usize {
+    pub(crate) fn answered(&self) -> usize {
         self.at.len()
     }
 }
@@ -124,17 +124,17 @@ impl StackKindMap {
 /// Everything the analysis needs beyond the bytecode: the per-pc metadata the
 /// compiler already resolved. Borrowed, so the analysis allocates nothing but
 /// its own state.
-pub(super) struct StackKindInputs<'a> {
+pub(crate) struct StackKindInputs<'a> {
     /// `pc -> field type tag` for `getfield`/`putfield`.
-    pub(super) field_types: FxHashMap<usize, u8>,
+    pub(crate) field_types: FxHashMap<usize, u8>,
     /// `pc -> field type tag` for `getstatic`/`putstatic`.
-    pub(super) static_types: FxHashMap<usize, u8>,
+    pub(crate) static_types: FxHashMap<usize, u8>,
     /// `pc -> (arg slot count, return type tag)` for every call site, however
     /// it is dispatched. Receiver NOT included — the opcode says whether there
     /// is one.
-    pub(super) calls: FxHashMap<usize, (usize, u8)>,
+    pub(crate) calls: FxHashMap<usize, (usize, u8)>,
     /// `pc`s whose `ldc` pushes a reference (String / Class).
-    pub(super) ldc_refs: &'a FxHashSet<usize>,
+    pub(crate) ldc_refs: &'a FxHashSet<usize>,
     /// `pc`s in the `ldc` family whose constant is floating-point: a
     /// `CONSTANT_Float` for `ldc`/`ldc_w`, a `CONSTANT_Double` for `ldc2_w`.
     ///
@@ -143,18 +143,18 @@ pub(super) struct StackKindInputs<'a> {
     /// and absent is `Int`; an `ldc2_w` pc present is `Double` and absent is
     /// `Long`. "Absent" is only allowed to mean "the other one" for a pc the
     /// resolver actually answered — see [`Self::ldc_resolved`].
-    pub(super) ldc_fp: &'a FxHashSet<usize>,
+    pub(crate) ldc_fp: &'a FxHashSet<usize>,
     /// `pc`s in the `ldc` family the constant-pool resolver reduced to an
     /// immediate. Without this, a pc the resolver never saw (no resolver wired
     /// at all, or a site it declined) would read as "absent from `ldc_fp`,
     /// therefore `Int`" — a guess, which rule 2 of this module's safety
     /// argument forbids. A pc that is not here stays `Unknown`.
-    pub(super) ldc_resolved: &'a FxHashSet<usize>,
+    pub(crate) ldc_resolved: &'a FxHashSet<usize>,
 }
 
 /// Run the analysis. `None` results are normal: an unmodelled construct poisons
 /// its successors rather than answering.
-pub(super) fn analyze(code: &[u8], code_len: usize, inputs: &StackKindInputs<'_>) -> StackKindMap {
+pub(crate) fn analyze(code: &[u8], code_len: usize, inputs: &StackKindInputs<'_>) -> StackKindMap {
     let mut map = StackKindMap::default();
     if code_len == 0 || code_len > code.len() {
         return map;
@@ -756,6 +756,173 @@ mod tests {
             ldc_resolved: &resolved,
         };
         analyze(code, code.len(), &inputs)
+    }
+
+
+    // -----------------------------------------------------------------------
+    // The category-dependent dup family.
+    //
+    // Until 2026-08-18 all four of `dup_x2`/`dup2`/`dup2_x1`/`dup2_x2` poisoned
+    // here — "not modelling them costs precision, guessing them costs
+    // correctness". Modelling them costs neither, because every form is decided
+    // by categories this analysis already tracks, and `Unknown` still poisons.
+    //
+    // The payoff is not only precision downstream of a dup: this is the
+    // SECOND-ENTRY WIDTH ORACLE the single-pass `dup2_x2` arm needs, and whose
+    // absence kept that opcode unlowered on x64. A form picked from a wrong
+    // answer here duplicates an unrelated slot, so each case below pins the
+    // exact resulting vector, not just that an answer exists.
+    // -----------------------------------------------------------------------
+
+    /// `dup2` FORM 2 — a single category-2 entry, duplicated like `dup`.
+    #[test]
+    fn dup2_over_a_category_2_top_duplicates_one_entry() {
+        // 0: lconst_0  1: dup2  2: ladd  3: lreturn
+        let code: Vec<u8> = vec![0x09, 0x5c, 0x61, 0xad];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(m.get(1), Some(&[StackKind::Long][..]));
+        assert_eq!(m.get(2), Some(&[StackKind::Long, StackKind::Long][..]));
+    }
+
+    /// `dup2` FORM 1 — two category-1 entries.
+    #[test]
+    fn dup2_over_two_category_1_entries_duplicates_both() {
+        // 0: iconst_0  1: fconst_0  2: dup2  3: return
+        let code: Vec<u8> = vec![0x03, 0x0b, 0x5c, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(
+            m.get(3),
+            Some(
+                &[
+                    StackKind::Int,
+                    StackKind::Float,
+                    StackKind::Int,
+                    StackKind::Float
+                ][..]
+            )
+        );
+    }
+
+    /// `dup_x2` FORM 2 — the value below the category-1 top is a category-2,
+    /// so the copy is inserted TWO entries down, not three.
+    #[test]
+    fn dup_x2_inserts_below_one_entry_when_that_entry_is_category_2() {
+        // 0: dconst_0  1: iconst_0  2: dup_x2  3: return
+        let code: Vec<u8> = vec![0x0e, 0x03, 0x5b, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(
+            m.get(3),
+            Some(&[StackKind::Int, StackKind::Double, StackKind::Int][..])
+        );
+    }
+
+    /// `dup2_x1` FORM 2 — a category-2 top over one category-1.
+    #[test]
+    fn dup2_x1_form2_slides_a_category_2_under_one_entry() {
+        // 0: iconst_0  1: dconst_0  2: dup2_x1  3: return
+        let code: Vec<u8> = vec![0x03, 0x0e, 0x5d, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(
+            m.get(3),
+            Some(&[StackKind::Double, StackKind::Int, StackKind::Double][..])
+        );
+    }
+
+    /// `dup2_x2` FORM 4 — both operands category-2, two entries.
+    #[test]
+    fn dup2_x2_form4_is_two_entries() {
+        // 0: lconst_0  1: dconst_0  2: dup2_x2  3: return
+        let code: Vec<u8> = vec![0x09, 0x0e, 0x5e, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(
+            m.get(3),
+            Some(&[StackKind::Double, StackKind::Long, StackKind::Double][..])
+        );
+    }
+
+    /// `dup2_x2` FORM 2 — a category-2 top over two category-1 entries. This
+    /// is the form javac emits (`longArr[i] = otherArr[j] = v`), and the one
+    /// whose depth an unconditional four-pop gets wrong.
+    #[test]
+    fn dup2_x2_form2_slides_a_category_2_under_two_entries() {
+        // 0: iconst_0  1: fconst_0  2: dconst_0  3: dup2_x2  4: return
+        let code: Vec<u8> = vec![0x03, 0x0b, 0x0e, 0x5e, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(
+            m.get(4),
+            Some(
+                &[
+                    StackKind::Double,
+                    StackKind::Int,
+                    StackKind::Float,
+                    StackKind::Double
+                ][..]
+            )
+        );
+    }
+
+    /// `dup2_x2` FORM 3 — two category-1 entries duplicated over ONE
+    /// category-2. Three entries deep, not four: the difference between this
+    /// and FORM 1 is exactly what the top-entry oracle cannot see.
+    #[test]
+    fn dup2_x2_form3_duplicates_two_entries_over_a_category_2() {
+        // 0: lconst_0  1: iconst_0  2: fconst_0  3: dup2_x2  4: return
+        let code: Vec<u8> = vec![0x09, 0x03, 0x0b, 0x5e, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(
+            m.get(4),
+            Some(
+                &[
+                    StackKind::Int,
+                    StackKind::Float,
+                    StackKind::Long,
+                    StackKind::Int,
+                    StackKind::Float
+                ][..]
+            )
+        );
+    }
+
+    /// `dup2_x2` FORM 1 — four category-1 entries, six after.
+    #[test]
+    fn dup2_x2_form1_duplicates_two_entries_over_two() {
+        // 0: iconst_0 1: iconst_1 2: fconst_0 3: iconst_2 4: dup2_x2 5: return
+        let code: Vec<u8> = vec![0x03, 0x04, 0x0b, 0x05, 0x5e, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        assert_eq!(
+            m.get(5),
+            Some(
+                &[
+                    StackKind::Float,
+                    StackKind::Int,
+                    StackKind::Int,
+                    StackKind::Int,
+                    StackKind::Float,
+                    StackKind::Int
+                ][..]
+            )
+        );
+    }
+
+    /// Rule 2 of the module's safety argument still holds for the new arms: an
+    /// `Unknown` in a position whose category decides the form poisons instead
+    /// of guessing. An unresolved `ldc2_w` is `Unknown` but its CATEGORY is not
+    /// in doubt, so use an unresolved `ldc` (int-or-float, both category-1 —
+    /// still `Unknown` as a KIND) under a category-1 top, where the third
+    /// entry's category is what picks FORM 1 from FORM 3.
+    #[test]
+    fn dup2_x2_over_an_unknown_third_entry_poisons() {
+        // 0: ldc #0 (unresolved -> Unknown)  2: iconst_0  3: iconst_1
+        // 4: dup2_x2  5: return
+        let code: Vec<u8> = vec![0x12, 0x00, 0x03, 0x04, 0x5e, 0xb1];
+        let m = run(&code, FxHashMap::default());
+        // The dup's own bci still has its IN state (published pre-transfer)...
+        assert_eq!(
+            m.get(4),
+            Some(&[StackKind::Unknown, StackKind::Int, StackKind::Int][..])
+        );
+        // ...but nothing downstream of it gets an answer.
+        assert_eq!(m.get(5), None, "an unprovable form must poison, not guess");
     }
 
     /// The shape the whole thing exists for: a counted loop with a `long`

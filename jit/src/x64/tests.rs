@@ -14090,3 +14090,214 @@ fn the_unlowered_opcode_catch_all_names_itself() {
         "the catch-all must name itself rather than claim it cannot happen"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The opcode-coverage guard.
+//
+// `jit_scan` (admission) and the single-pass dispatch loop (codegen) are two
+// hand-maintained match statements over the same 202 opcode values, and until
+// this test nothing forced them to agree. An opcode the scanner advances past
+// but the walk has no arm for does not fail loudly: it falls into the walk's
+// catch-all and the method is bail-listed for the life of the process, with
+// the refusal attributed to an arm that names nothing.
+//
+// That gap has now cost three opcodes — `pop2` (0x58) and `dup2_x1` (0x5D),
+// found by the commons-math throughput work, and `dup2_x2` (0x5E), found by
+// hand-enumerating the arms of all four walkers. Each had been asserted away
+// for years by the comment "should not happen — jit_scan should have caught
+// this". A "should not happen" arm is a CLAIM, and claims about opcode
+// coverage are checkable.
+// ---------------------------------------------------------------------------
+
+/// Opcodes `jit_scan` admits on purpose despite the single-pass walk having
+/// no arm for them, each with the reason it is not the `dup2_x2` shape.
+///
+/// The bar for an entry here is a SECOND HOME: some other backend must lower
+/// the opcode, so admitting it buys a compilation the scanner would otherwise
+/// refuse. "Nobody lowers it anywhere" is the `dup2_x2` shape and belongs in
+/// an arm, not on this list.
+const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[
+    (
+        0x72,
+        "frem — the optimizing IR backend lowers it via a call to the jit_frem \
+         fmod helper, so admitting it lets the IR pipeline see the method",
+    ),
+    (
+        0x73,
+        "drem — same as frem, via jit_drem",
+    ),
+];
+
+/// Every opcode value the top-level dispatch `match op` in `bytecode_walk.rs`
+/// has an arm for.
+///
+/// Parsed from the source at COMPILE time (`include_str!`), because the set is
+/// a property of that match statement and nothing else — there is no runtime
+/// handle on it. Only arms at the match's own brace depth count, so the
+/// nested `match op` statements inside the branch arms (which re-dispatch on
+/// the same variable to pick a condition code) cannot forge coverage.
+fn single_pass_dispatch_arms() -> std::collections::BTreeSet<u8> {
+    let src = include_str!("bytecode_walk.rs");
+    // The dispatch loop's own `match op {`. Anchored on the two lines that
+    // immediately precede it so a nested `match op {` cannot be picked up.
+    let anchor = "self.dbg_last_op = op;\n            match op {\n";
+    let start = src
+        .find(anchor)
+        .expect("the single-pass dispatch `match op` must be findable")
+        + anchor.len();
+
+    let mut arms = std::collections::BTreeSet::new();
+    let mut depth = 0i32; // brace depth relative to the match body
+    for line in src[start..].lines() {
+        if depth == 0 {
+            if let Some(set) = parse_opcode_arm(line) {
+                arms.extend(set);
+            }
+            // The catch-all closes the enumeration.
+            if line.trim_start().starts_with("_ => {") {
+                break;
+            }
+        }
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth < 0 {
+            break; // the match's own closing brace
+        }
+    }
+    arms
+}
+
+/// `0x5e => {`, `0xC2 | 0xC3 => {`, `0x1a..=0x1d => {` — and nothing else.
+/// Returns `None` for any line that is not an opcode match arm, including
+/// comments and emitted byte literals.
+fn parse_opcode_arm(line: &str) -> Option<Vec<u8>> {
+    let t = line.trim();
+    if t.starts_with("//") {
+        return None;
+    }
+    let head = t.split("=>").next()?;
+    if head == t {
+        return None; // no `=>` on this line
+    }
+    let head = head.trim();
+    if head.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for alt in head.split('|') {
+        let alt = alt.trim();
+        let bytes: Vec<u8> = if let Some((lo, hi)) = alt.split_once("..=") {
+            let lo = parse_hex_byte(lo.trim())?;
+            let hi = parse_hex_byte(hi.trim())?;
+            (lo..=hi).collect()
+        } else {
+            vec![parse_hex_byte(alt)?]
+        };
+        out.extend(bytes);
+    }
+    Some(out)
+}
+
+fn parse_hex_byte(tok: &str) -> Option<u8> {
+    let hex = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X"))?;
+    if hex.len() != 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// The parser must actually find the dispatch arms — a `single_pass_dispatch_arms`
+/// that silently returned an empty set would make the guard below vacuously
+/// green, which is precisely how the `dup2_x2` gap survived so long.
+#[test]
+fn the_dispatch_arm_parser_reads_the_real_match() {
+    let arms = single_pass_dispatch_arms();
+    assert!(
+        arms.len() > 150,
+        "the single-pass walk lowers most of the opcode space; parsed only {}",
+        arms.len()
+    );
+    // Spot checks across the shapes the parser has to handle.
+    for (op, what) in [
+        (0x00u8, "nop, a bare single arm"),
+        (0x5eu8, "dup2_x2, the arm this guard was written for"),
+        (0x1bu8, "iload_1, inside a `..=` range arm"),
+        (0xc2u8, "monitorenter, inside an alternation arm"),
+        (0xacu8, "ireturn"),
+    ] {
+        assert!(arms.contains(&op), "dispatch arm for 0x{op:02x} ({what})");
+    }
+    // And it must not invent coverage for opcodes nobody lowers here.
+    for (op, what) in [
+        (0xa8u8, "jsr — unlowered in both walkers"),
+        (0xc4u8, "wide — unlowered in both walkers"),
+        (0x72u8, "frem — deliberately IR-only"),
+    ] {
+        assert!(
+            !arms.contains(&op),
+            "0x{op:02x} ({what}) must not read as lowered"
+        );
+    }
+}
+
+/// The guard itself: no opcode may be admitted by `jit_scan` and lowered by
+/// nothing.
+///
+/// Admission is probed BEHAVIOURALLY — a one-instruction body per opcode,
+/// handed to the real `jit_scan` — so the scanner's own table is never
+/// transcribed here and cannot drift from what it actually does.
+#[test]
+fn scan_admitted_opcodes_are_lowered_or_declared() {
+    let arms = single_pass_dispatch_arms();
+    let declared: std::collections::BTreeMap<u8, &str> = SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM
+        .iter()
+        .copied()
+        .collect();
+
+    let mut offenders = Vec::new();
+    for op in 0x00u8..=0xc9u8 {
+        // A body of just this opcode plus operand padding and a `return`. The
+        // scanner walks opcode widths and never simulates the stack, so this
+        // is enough to ask it the only question that matters: does it advance
+        // past this opcode, or refuse the method?
+        let mut code = vec![op, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        code.push(0xb1); // return
+        let admitted = super::bytecode_compat::jit_scan(&code, code.len(), "()V").is_some();
+        if !admitted || arms.contains(&op) {
+            continue;
+        }
+        if declared.contains_key(&op) {
+            continue;
+        }
+        offenders.push(op);
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these opcodes are admitted by `jit_scan` and lowered by no single-pass \
+         arm, so every method containing one silently never compiles: {}. \
+         Either add an arm in `bytecode_walk.rs`, stop admitting them in \
+         `jit_scan`, or — only if some OTHER backend lowers them — add them to \
+         SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM with the reason.",
+        offenders
+            .iter()
+            .map(|op| format!("0x{op:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // The allowlist is a ratchet in both directions: an entry that has since
+    // grown an arm must be removed, or it hides the next real gap behind a
+    // stale exemption.
+    for (op, reason) in SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM {
+        assert!(
+            !arms.contains(op),
+            "0x{op:02x} now HAS a single-pass arm; drop its exemption ({reason})"
+        );
+    }
+}
