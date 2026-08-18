@@ -2339,6 +2339,19 @@ pub struct CompiledMethod {
     /// `!compiler.indy_info.is_empty()`; `false` for IR-path artifacts (the
     /// IR lowerer rejects invokedynamic methods).
     pub has_indy_trap: bool,
+    /// Memoised [`Self::osr_exit_policy`] verdict.
+    ///
+    /// That function walks EVERY deopt point of the artifact, and per point
+    /// walks the whole frame state (`deopt::first_unresumable_slot`). It is
+    /// asked once per OSR ENTRY, from `validate_osr_entry` — and its answer is
+    /// a pure function of `deopt_points`, which is immutable after publication.
+    ///
+    /// Recomputing it was 3.3% of a throw-heavy OSR loop under `perf record`
+    /// (`probes/OsrExcRateProbe.java`), because since the RBC.6b lift a caught
+    /// exception is an OSR exit plus a re-entry — so a `try`/`catch` loop pays
+    /// one full policy walk per throw, over a point list that just grew a
+    /// reason-9 entry per protected invoke.
+    pub(crate) osr_exit_policy_memo: std::sync::OnceLock<Result<OsrExitPolicy, bailout::Bailout>>,
     /// deopt-osr Step 7 — the loop-boundary bcis (OSR-vetted, outside every
     /// LICM-hoisted body) for which an OSR-exit map was emitted into
     /// `deopt_points` (tagged `DeoptReason::OsrExit`). Empty unless
@@ -2545,6 +2558,7 @@ impl CompiledMethod {
             can_deopt_resume: false,
             can_osr_exit: false,
             has_indy_trap: false,
+            osr_exit_policy_memo: std::sync::OnceLock::new(),
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
@@ -2615,6 +2629,7 @@ impl CompiledMethod {
             can_deopt_resume: false,
             can_osr_exit: false,
             has_indy_trap: false,
+            osr_exit_policy_memo: std::sync::OnceLock::new(),
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
@@ -3776,6 +3791,16 @@ impl CompiledMethod {
     /// compiled body has committed iterations, and the only remaining options
     /// are to replay them or to lose them.
     fn osr_exit_policy(&self) -> Result<OsrExitPolicy, bailout::Bailout> {
+        // Memoised: the verdict is a pure function of `deopt_points`, which is
+        // immutable once the artifact is published, and this is asked once per
+        // OSR ENTRY rather than once per compile. See `osr_exit_policy_memo`.
+        self.osr_exit_policy_memo
+            .get_or_init(|| self.osr_exit_policy_uncached())
+            .clone()
+    }
+
+    /// The real walk behind [`Self::osr_exit_policy`]'s memo.
+    fn osr_exit_policy_uncached(&self) -> Result<OsrExitPolicy, bailout::Bailout> {
         if self.deopt_points.is_empty() {
             return Ok(OsrExitPolicy::PropagateOnly);
         }
