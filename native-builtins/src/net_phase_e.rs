@@ -9267,10 +9267,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // full URL written by url_parse.  We treat any string containing
         // ":" as a full URL so we don't mistake the real-JDK `authority`
         // slot for a synthetic full-URL cache.
-        let synth_full = match ctx.get_field(this, 5) {
-            Value::Object(Some(o)) => ctx.read_string(o),
+        // G75-1 N2: this whole reconstruction used to end in
+        // `create_string(&out)` over a Rust `String`, which cannot hold an
+        // unpaired UTF-16 surrogate — so `new URL(s).toString()` could not give
+        // back the `s` it was handed, while `getPath()`/`getFile()` were exact
+        // (under `--jdk-only` the real JDK constructor fills the component
+        // fields and only this cache goes through us). The STRUCTURE below is
+        // unchanged and still reasons over host text — scheme, host and port
+        // are ASCII by JVMS and by URI syntax. Only the OUTPUT is assembled in
+        // units, and only `file` and `ref` are read as units, because they are
+        // the two components that can carry arbitrary text.
+        let synth_full_obj = match ctx.get_field(this, 5) {
+            Value::Object(Some(o)) => Some(o),
             _ => None,
         };
+        let synth_full = synth_full_obj.and_then(|o| ctx.read_string(o));
         if let Some(ref s) = synth_full {
             // Only treat field 5 as a full-URL cache when it actually carries a
             // scheme — a real java.net.URL's field 5 is the `authority`
@@ -9278,7 +9289,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // instead of being returned as the whole URL. (BUG: openStream then
             // saw `unsupported scheme: localhost:<port>`.)
             if field5_is_full_url(s) {
-                return Ok(Some(Value::Object(Some(ctx.create_string(s)))));
+                // Hand back the STORED OBJECT, not a re-encoding of it: exact
+                // by construction, and one allocation cheaper.
+                if let Some(o) = synth_full_obj {
+                    return Ok(Some(Value::Object(Some(o))));
+                }
             }
         }
         // Real-JDK reconstruction: protocol:[//host[:port]]file[#ref].
@@ -9295,17 +9310,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             _ => -1,
         };
         let file = match ctx.get_field(this, 3) {
-            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
-            _ => String::new(),
+            Value::Object(Some(o)) => ctx.read_string_units(o).unwrap_or_default(),
+            _ => Vec::new(),
         };
         let ref_str = match ctx.get_field(this, 8) {
-            Value::Object(Some(o)) => ctx.read_string(o),
+            Value::Object(Some(o)) => ctx.read_string_units(o),
             _ => None,
         };
-        let mut out = String::new();
+        /// Append an ASCII/BMP literal to a UTF-16 buffer.
+        fn pu(buf: &mut Vec<u16>, text: &str) {
+            buf.extend(text.encode_utf16());
+        }
+        let mut out: Vec<u16> = Vec::new();
         if !proto.is_empty() {
-            out.push_str(&proto);
-            out.push(':');
+            pu(&mut out, &proto);
+            out.push(u16::from(b':'));
         }
         // Real java.net.URL.toExternalForm emits `protocol://authority` where
         // the authority (field 5) may carry user-info
@@ -9322,30 +9341,32 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             _ => None,
         };
         if let Some(auth) = authority_from_field5 {
-            out.push_str("//");
-            out.push_str(auth);
+            pu(&mut out, "//");
+            pu(&mut out, auth);
         } else if !host.is_empty() || port >= 0 {
-            out.push_str("//");
-            out.push_str(&host);
+            pu(&mut out, "//");
+            pu(&mut out, &host);
             if port >= 0 {
-                out.push(':');
-                out.push_str(&port.to_string());
+                out.push(u16::from(b':'));
+                pu(&mut out, &port.to_string());
             }
         }
-        out.push_str(&file);
+        out.extend_from_slice(&file);
         if let Some(r) = ref_str {
-            out.push('#');
-            out.push_str(&r);
+            out.push(u16::from(b'#'));
+            out.extend_from_slice(&r);
         }
         // Ultimate fallback: if we built nothing useful, fall back to the
         // legacy field-0 read for synthetic-mode URLs that stored the
         // full path at slot 0.
-        if out.is_empty() || out == ":" {
-            if let Some(s) = synth_full {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&s)))));
+        if out.is_empty() || out == [u16::from(b':')] {
+            if synth_full.is_some() {
+                if let Some(o) = synth_full_obj {
+                    return Ok(Some(Value::Object(Some(o))));
+                }
             }
         }
-        Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
+        Ok(Some(Value::Object(Some(ctx.create_string_from_units(&out)))))
     };
     r.register(url, "toString", "()Ljava/lang/String;", url_to_string);
     r.register(url, "toExternalForm", "()Ljava/lang/String;", url_to_string);

@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.io.StringReader;
 import java.math.BigInteger;
 import java.net.URI;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -2113,7 +2114,31 @@ public class RJdkBridge1 {
         check(pairWrap.length() == 2 && pairWrap.charAt(0) == 0xD83D,
                 "a well-formed pair through CharBuffer.wrap must stay two units");
 
-        sectionEnd("surrog", 63);
+        // -- URL.toString rebuilds the external form, and rebuilt it as text --
+        // Under --jdk-only the real JDK constructor fills the component fields,
+        // so getPath()/getFile() were always exact; only this reconstruction
+        // goes through us, and it assembled a Rust String. G75-1 N2 — a second,
+        // narrower defect than the URI parse (N1), found by asking why the two
+        // disagreed rather than assuming one cause.
+        step("surrog", "URL.toString/toExternalForm with a lone surrogate");
+        URL lurl;
+        URL plain;
+        try {
+            lurl = new URL("http://h.example/" + LONE_HI);
+            plain = new URL("http://h.example/ok");
+        } catch (Exception e) {
+            throw new AssertionError("URL construction must succeed: " + e);
+        }
+        ckCarries("URL.toString()", lurl.toString(), 18);
+        ckCarries("URL.toExternalForm()", lurl.toExternalForm(), 18);
+        // The two that were ALREADY right, kept as the rows that locate the
+        // defect: components exact, reconstruction not.
+        ckCarries("URL.getPath() was already exact", lurl.getPath(), 2);
+        ckCarries("URL.getFile() was already exact", lurl.getFile(), 2);
+        check("http://h.example/ok".equals(plain.toString()),
+                "an ordinary URL must round-trip unchanged");
+
+        sectionEnd("surrog", 68);
     }
 
     static final int SFF = 15;
