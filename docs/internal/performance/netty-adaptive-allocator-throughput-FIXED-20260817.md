@@ -81,8 +81,8 @@ invocation count falls from 137 643 to 90 733.
 ## 2. What profiling the loop actually named
 
 The page's instruction was to start from measurements. `perf record` on the
-reduced loop (`apps/netty-suite-runner/probes-adalloc/PcapThroughput.java`, now
-in-tree) put the largest single symbol somewhere the page had not looked:
+reduced loop (`probes-adalloc/PcapThroughput.java`, now in-tree — the netty
+checkout and its suite runner are host-side, the probes are not) put the largest single symbol somewhere the page had not looked:
 
 | symbol | self |
 |---|---:|
@@ -232,8 +232,8 @@ fired.** Size anything here with those first.
 ## Repro
 
 ```bash
-cd apps/netty-suite-runner
-CP="$(sed -n 2p common.args)"
+# CP comes from the host-side netty suite runner; the probes are in this repo.
+CP="$(sed -n 2p <netty-suite-runner>/common.args)"
 javac -nowarn -cp "$CP" -d /tmp/probes probes-adalloc/*.java
 
 # the loop, and the three kill switches (all default-ON, all A/B-able on ONE binary)
@@ -244,7 +244,7 @@ CRATONVM_DBG_FIELD_SITE=1     <cv-bin> ...    # new: hit / miss / fill
 CRATONVM_DBG_G1_LIVE_MEMO=1   <cv-bin> ...    # regions.lock() calls avoided
 
 # the RBC.6 acceptance differential — read jit-method-stats beside the checksum
-javac -d /tmp/probes ../../probes/Rbc6AllocThrowProbe.java
+javac -d /tmp/probes probes/Rbc6AllocThrowProbe.java
 <cv-bin> ... -cp /tmp/probes Rbc6AllocThrowProbe 200000
 CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW=1 <cv-bin> ... Rbc6AllocThrowProbe 200000
 

@@ -11799,7 +11799,7 @@ pub mod live_region_memo {
     /// the effect. A count is neither. Read this before quoting any timing
     /// number for the memo — an inert gate shows up as `hit=0`, which is a fact
     /// about the build rather than about the host.
-    pub(crate) mod stats {
+    pub mod stats {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::OnceLock;
 
