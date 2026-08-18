@@ -169,21 +169,48 @@ arm being the slow one.
 The memory growth this page originally reported follows from the same place:
 `Vec<StackTraceEntry>` per walk, at ~24,000 walks, is the 22 GB.
 
-### What would fix it
+### ATTEMPTED AND REVERTED: the memo route buys nothing
 
-Not attempted here — it is core GC-root code and wants its own session.
+Two changes were written, built, measured interleaved, and reverted
+(`b1ec1981a`). Recorded so the next pass does not spend the same day.
 
-1. **Do not re-derive the JIT-frame answer per native call.** `native_stack_has_jit_frame`
-   is a stack-shape question that cannot change between two native calls made
-   from the same frame at the same depth. The suite already sets
-   `CRATONVM_JIT=rootsnap-cache`, so a cache exists on this path — the first
-   thing to check is whether it engages for this call shape at all, with a
-   counter beside the number rather than by reading the code.
-2. **Make the deposit proportional to the walk, not to the frames.** One walk
-   currently pays per-frame conservative scanning; the walk itself only needs
-   the frames' metadata, not their object roots.
-3. Only then look at `StackWalker` itself; at 61 µs HotSpot is not fast either,
-   and Mockito calling it per mock invocation is the workload's own choice.
+1. **Route the coverage probe through the existing memo.**
+   `refresh_moving_young_coverage_for_current_thread` calls
+   `native_stack_has_jit_frame` with no memo, and `UnregMemo`'s own doc comment
+   names that as the site whose probes "dominate this workload" — so it read as
+   the binding inefficiency. Interleaved on the isolated probe:
+   4,965 / 4,970 / 5,082 ms before, 4,924 / 4,976 / 4,961 ms after, and
+   `native_stack_has_jit_frame` **17.90% → 17.45%** of the profile. The memo
+   never engaged.
+2. **Lift the memo's compilation-invalidation rule**, which (1)'s inert result
+   implicated — every observation was falling through to a full scan. Also
+   nothing, A/B'd in ONE binary through its own kill switch: 4,994 vs 6,113 ms,
+   then 7,903 vs 7,892 ms. Noise either way.
+
+**The arithmetic that should have come first.**
+`native_stack_has_jit_frame` is ~17.9% of this workload, so deleting it
+*entirely* buys **1.2x against a 38x gap**. No amount of memoizing that symbol
+closes this page, and the profile said so before either change was written. The
+lesson is the one the retired moving-young page already taught and this run
+re-learned: **price the ceiling from the profile before writing the fix.**
+
+### What is actually left
+
+The gap is not one symbol. Grouped, the isolated probe's profile is roughly half
+GC-root machinery (`native_stack_has_jit_frame`, `ZObjectStarts::contains`,
+`scan_local_objects_inner`, `deposit_root_snapshot_inner`,
+`is_object_address`, `scan_locals_conservative`) and the rest stack-walk and
+`Vec<StackTraceEntry>` churn. Closing 38x means making a native call from a JIT
+frame stop paying a per-call conservative root deposit at all — the same
+"make native→heap interaction cheap in general" conclusion
+`bigdecimal-arithmetic-is-50-60x-slower-than-hotspot` and
+`bobyqa-numeric-kernel-is-80x-slower-than-hotspot` both reach. This page is a
+third witness, not a separate problem.
+
+A cheaper mitigation exists and is untested: `StackWalker.walk` does not need
+the frames' object roots at all, only their metadata. If the deposit could be
+skipped for walks specifically — rather than made cheaper for everyone — that is
+a bounded change with a much better ratio than memoizing the band scan.
 
 ## NAMED, 2026-08-18: `quartzTriggerJobWithUnknownJobKey`, the WebMvc variant only
 
