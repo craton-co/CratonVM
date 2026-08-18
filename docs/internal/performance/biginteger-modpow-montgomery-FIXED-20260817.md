@@ -120,8 +120,8 @@ uses CRT — two half-width exponentiations, ~4x cheaper — even though the CRT
 parameters are already present and validated on every generated key
 (`rsa_generated_key_is_crt`). That is a different defect with a different name,
 and it is filed as
-`known-issues/perf/rsa-private-key-op-ignores-the-crt-parameters-it-already-has-20260817.md`
-rather than ridden in here. The open page made exactly this call about
+`rsa-private-key-op-crt-FIXED-20260817.md` rather than ridden in here
+(and FIXED there on the same day: 3.17x on signing, 7.08x on decrypt). The open page made exactly this call about
 Montgomery itself, and it was the right one.
 
 ## The differential net
@@ -210,8 +210,8 @@ cargo test --release -p cratonvm-native-builtins --lib -- --ignored rsa_sign_cos
 
 ## Related
 
-- `known-issues/perf/rsa-private-key-op-ignores-the-crt-parameters-it-already-has-20260817.md`
-  — the residual this pass found and did not take, with the attribution above.
+- `rsa-private-key-op-crt-FIXED-20260817.md` — the residual this pass found and
+  did not take, with the attribution above. Taken and FIXED the same day.
 - `internal/fixed-suite-bugs/netty/ocspclienttest-is-sixteen-rsa-certificates-CLOSED-20260817.md`
   — the page this was named in. Its §3 conclusion still holds: keygen is a
   minority of a certificate, so a 2x on `modPow` moves a certificate by well

@@ -295,13 +295,105 @@ pub(super) fn compile_osr_artifact(
                     return None;
                 }
             };
-            // RBC.6 — never OSR an athrow method: the OSR bail path resumes
+            // This method's own exception table. Read ONCE, here, because both
+            // of the RBC gates below need it: RBC.6 (immediately below) admits
+            // a bare `athrow` only when it is EMPTY, and RBC.6b (further down)
+            // admits a non-empty one only when every throwing site inside a
+            // protected range publishes a precise exceptional frame.
+            let osr_exception_table = match shared.classes.class_manager.read().get_class(class_id)
+            {
+                Some(class) => class
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        &*m.name == method_name_check
+                            && &*m.descriptor == method_descriptor.as_str()
+                    })
+                    .and_then(|m| {
+                        m.attributes.iter().find_map(|a| match a.as_decoded() {
+                            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
+                                Some(ca.exception_table.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            // RBC.6 (2026-07-18; LIFTED 2026-08-17 for the no-handler case) —
+            // this door used to refuse **any** method containing a bare
+            // `athrow` (0xbf), whatever its exception table looked like, on the
+            // grounds stated in its own comment: "the OSR bail path resumes
             // interpretation at the back-edge, so an athrow lowering that ran
-            // side effects natively before throwing could see them re-applied.
-            // Method-entry compilation (which propagates cleanly through the
-            // JIT-return exception drains) remains available, so do NOT
-            // bail-list here.
-            if scan.has_athrow {
+            // side effects natively before throwing could see them re-applied".
+            // That hazard is RBC.7's silent-corruption shape and it was real
+            // when the comment was written — the athrow drain's only move was
+            // to re-stash the throwable and resume the live interpreter frame
+            // at the STALE pre-OSR back-edge pc, re-running every iteration the
+            // OSR'd code had already committed.
+            //
+            // Its blast radius was not deliberate. OSR is the ONLY door out of
+            // the interpreter for a method invoked once — which is what a
+            // `@Test` body, a `main`, and any one-shot driver is — so a `throw`
+            // anywhere in such a method, even on a path never taken, kept its
+            // hot loop interpreted for the method's whole life. Witness:
+            // `BOBYQAOptimizerTest`, whose `trsbox`/`bobyqb` (each called once
+            // per test; translated-from-Fortran numerical code that `throw`s a
+            // `MathIllegalStateException` on an internal assertion and catches
+            // nothing) turned a sub-second `optimize()` call into an unbounded
+            // hang. See the known-issue page cited from that suite's RESULTS.
+            //
+            // What makes the lift safe is not new machinery but a PRECONDITION
+            // that is checkable right here: with an EMPTY exception table, an
+            // `athrow` in this body cannot be caught by the OSR'd frame, so no
+            // drain ever has to resume that frame. `route_osr_exception_out_of_
+            // artifact` answers `Propagate` on its first line for exactly this
+            // population, and the throwable goes to the dispatch loop's
+            // unwinder as `OsrBackoffOutcome::ThrowJava`: the frame is torn
+            // down, and there is no stale resume for already-committed
+            // iterations to be re-run from. That path is not new either — it is
+            // the one the callee-throw fix already routes an unwinding
+            // exception through — and it re-checks the empty table rather than
+            // assuming it.
+            //
+            // A NON-empty table stays refused here, and the reason is NOT
+            // RBC.6b's (which, since its own 2026-08-17 lift, admits such a
+            // method whenever every throwing site inside a protected range
+            // publishes a reason-9 frame — and `athrow`'s lowering is one of
+            // the few that does not, so an `athrow` INSIDE a `try` is already
+            // refused there). The residual case is an `athrow` OUTSIDE every
+            // protected range of a method that has one elsewhere. There,
+            // `route_osr_exception_out_of_artifact` correctly answers
+            // `Propagate` — no precise frame, so the throw site is outside
+            // every range — but `OsrBackoffOutcome::ThrowJava` then hands the
+            // throwable to `unwind_to_handler` keyed on `entry_pc`, the
+            // BACK-EDGE the body was entered at, not the throw site. When that
+            // back-edge lies inside a protected range (`try { for (..) {..} }
+            // catch`), the unwinder finds a handler that does not cover the
+            // throw at all and enters it — on the stale pre-OSR locals. Until
+            // `ThrowJava` carries "this frame has already declined to catch",
+            // admitting that shape would trade a throughput bug for a silent
+            // wrong-answer bug, which is the wrong direction.
+            //
+            // Not bail-listed, for the original reason: method-entry
+            // compilation propagates cleanly through the JIT-return exception
+            // drains and stays available either way.
+            //
+            // `CRATONVM_JIT_OSR_ATHROW=0` restores the blanket refusal, so one
+            // binary can A/B the lift.
+            if scan.has_athrow
+                && (!osr_exception_table.is_empty()
+                    || !crate::runtime::env_cache::osr_athrow_allowed())
+            {
+                if crate::runtime::env_cache::dbg_jitc() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr-DENY (RBC.6 athrow, handlers={}) {}.{}{}",
+                        osr_exception_table.len(),
+                        class_name,
+                        method_name,
+                        method_descriptor
+                    );
+                }
                 return None;
             }
             // RBC.7 (jit-osr-loop-duplicate-execution, silent data corruption,
@@ -341,43 +433,88 @@ pub(super) fn compile_osr_artifact(
             // to the StringConcatFactory bridge emits a real call, not a trap,
             // so there is no imprecise resume for an OSR frame to take. Only
             // methods with an UNBRIDGED indy are still refused.
-            // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
-            // its own local exception handlers, even when it never directly
-            // `athrow`s. `compile_with_param_slots` below has no
-            // exception-table parameter, so an OSR artifact NEVER carries
-            // handler ranges: a callee exception unwinding into this
-            // OSR-compiled frame finds no catch and escapes uncaught, even
-            // though a `catch` block textually guards the call. This was
-            // masked while methods with `ldc` string constants were
-            // unconditionally OSR-denied (fixed in d6f642695); once that
-            // denial was lifted, any hot-loop method with a trailing
-            // try/catch around a throwing call (e.g. a servlet's
-            // `try { resp.resetBuffer(); } catch (IllegalStateException)`)
-            // silently stopped catching. Permanent for this bytecode, like
-            // the sibling RBC bails above.
-            let has_exception_handlers =
-                match shared.classes.class_manager.read().get_class(class_id) {
-                    Some(class) => class
-                        .methods
-                        .iter()
-                        .find(|m| {
-                            &*m.name == method_name_check
-                                && &*m.descriptor == method_descriptor.as_str()
-                        })
-                        .and_then(|m| {
-                            m.attributes.iter().find_map(|a| match a.as_decoded() {
-                                Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
-                                    Some(!ca.exception_table.is_empty())
-                                }
-                                _ => None,
-                            })
-                        })
-                        .unwrap_or(false),
-                    None => false,
-                };
-            if has_exception_handlers {
-                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
-                return None;
+            // RBC.6b (dohead-residuals, 2026-07-18; LIFTED 2026-08-17) — this
+            // door used to refuse **any** method with a non-empty exception
+            // table, on the grounds that `compile_with_param_slots` below is
+            // never handed one, so an OSR artifact carries no handler ranges
+            // and a callee exception unwinding into that frame escapes a
+            // `catch` that textually guards the call. That hazard was real and
+            // was observed (a servlet's `try { resp.resetBuffer(); } catch
+            // (IllegalStateException)` silently ceasing to catch, once the
+            // blanket `ldc`-string OSR denial that had masked it was lifted).
+            //
+            // The blast radius was not deliberate. OSR is the ONLY door out of
+            // the interpreter for a method invoked once — which is what a
+            // `@Test` body, a `main`, and any one-shot driver is — so "a hot
+            // loop with a try/catch in it", ordinary Java, ran interpreted for
+            // its whole life. Measured: netty's two
+            // `HttpHeaderValidationUtilTest` exhaustive loops at 19 242 and
+            // 309 423 ns/iteration against HotSpot's 8.2 and 9.4.
+            //
+            // What replaces it is the method-entry path's own contract, staged
+            // here for the first time (see the three `set_*_request` calls
+            // immediately before `compile_with_param_slots` below):
+            //
+            //   1. `set_precise_exception_frame_request(true)` makes every
+            //      invoke inside a protected range publish a **reason-9**
+            //      (`DeoptReason::PendingException`) frame keyed on the
+            //      THROWING bci, not on the stale back-edge pc the live
+            //      interpreter frame is parked at;
+            //   2. `set_protected_ranges_request` suppresses the sibling
+            //      tail-call inside a `try` (which would tear this frame down
+            //      and `JMP`, unwinding past the handler);
+            //   3. `set_pending_exception_ranges` makes the handler entry edges
+            //      visible to `find_bypassable_loop_headers`.
+            //
+            // and the ADMISSION rule that makes the stale-resume fallback
+            // unreachable rather than merely unlikely: every throwing site
+            // inside a protected range must publish such a frame. That is
+            // exactly `first_unsupported_precise_frame_site`, the predicate
+            // RBC.6 already uses on the method-entry path — asked here rather
+            // than copied, so the two doors cannot drift. A method with an
+            // `ldc`, an array access, an `athrow`, a `new` or an
+            // `invokedynamic` inside a `try` is still refused, and named.
+            //
+            // The refusal has to be a COMPILE-time one. Deciding it at the exit
+            // instead would leave `transfer_osr_exit_into_live_frame`'s
+            // fail-closed reject as the only backstop, and for an exception
+            // exit that reject is not merely slow: it resumes interpretation at
+            // the STALE pre-OSR back-edge pc, re-running every iteration the
+            // OSR'd code already committed (RBC.7's silent-corruption shape).
+            //
+            // `CRATONVM_JIT_OSR_EXC_TABLE=0` restores the blanket refusal, so
+            // one binary can A/B the lift.
+            // (`osr_exception_table` is read once, above RBC.6, which gates on
+            // the same table.)
+            if !osr_exception_table.is_empty() {
+                if !crate::runtime::env_cache::osr_exception_table_allowed() {
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] osr-DENY (exception table, CRATONVM_JIT_OSR_EXC_TABLE=0) {}.{}{}",
+                            class_name, method_name, method_descriptor
+                        );
+                    }
+                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    return None;
+                }
+                // Name the ONE site that blocks the method, the way the
+                // method-entry path's `rbc6-handler-reads-unsafe-local` bail
+                // does. A bare "OSR denied" here is what cost this defect a
+                // six-arm shape bisect to find in the first place.
+                if let Some((pc, op)) = cratonvm_jit::first_unsupported_precise_frame_site(
+                    &code,
+                    code_len,
+                    &osr_exception_table,
+                ) {
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] osr-DENY (osr-exc-site-unpublished pc={} opcode={:#04x}) {}.{}{}",
+                            pc, op, class_name, method_name, method_descriptor
+                        );
+                    }
+                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    return None;
+                }
             }
             // 2026-07-10 BC-crypto session: OSR of `GOST3412_2015Engine.
             // init_gf256_mul_table` (a nested primitive-array allocation loop)
@@ -413,20 +550,9 @@ pub(super) fn compile_osr_artifact(
                 let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(class_id)?;
                 for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-                    let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
-                    let leaf = class_name_ref.trim_start_matches('[');
-                    let leaf_et = match leaf.as_bytes().first() {
-                        Some(b'I') => 10u8,
-                        Some(b'J') => 11,
-                        Some(b'F') => 6,
-                        Some(b'D') => 7,
-                        Some(b'B') => 8,
-                        Some(b'C') => 5,
-                        Some(b'S') => 9,
-                        Some(b'Z') => 4,
-                        _ => 0,
-                    };
-                    mna_info.push((pc, leaf_et));
+                    // A malformed CP entry is still a whole-compile refusal.
+                    let _ = class.constant_pool.get_class_name(cp_idx)?;
+                    mna_info.push((pc, crate::jit::pack_multianewarray_site(class_id.as_u32(), cp_idx)));
                 }
             }
 
@@ -1715,6 +1841,66 @@ pub(super) fn compile_osr_artifact(
             // previously ran memory-homed. Opt out:
             // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
             crate::jit::x64::set_kernel_reg_homes_osr_request(true);
+            // ── The RBC.6b lift's three staged requests ──────────────────
+            //
+            // `jit::try_compile` has always staged these for a method-entry
+            // compile; this door never did, which is the whole of why an OSR
+            // artifact "NEVER carries handler ranges" and why RBC.6b refused
+            // every method with an exception table. Staged here, at the same
+            // point `try_compile` stages them — after every early return above,
+            // so a refused attempt cannot leak a request into the next method
+            // compiled on this worker thread, and all three are consumed
+            // (`take`n) at backend entry.
+            //
+            // Set unconditionally, including the empty-table case, so the
+            // request state this compile runs under is decided HERE rather than
+            // inherited from whatever ran before it.
+            //
+            //   * precise frames — every invoke inside a protected range
+            //     publishes a reason-9 (`PendingException`) deopt frame keyed
+            //     on the THROWING bci. That bci is the whole point: the live
+            //     interpreter frame is parked at the stale pre-OSR back-edge
+            //     pc, so without it the handler `[start_pc, end_pc)` test runs
+            //     against a pc that has nothing to do with where the throw
+            //     happened. `admit_osr_exception_frame` consumes it.
+            //
+            //     The method-entry path asks for these only when a handler
+            //     reads a non-parameter local (`local_handler_reads_unsafe_
+            //     local`), because there it is a cost paid to keep a compile
+            //     that would otherwise be refused. Here it is asked for EVERY
+            //     method with a table: the alternative is not a coarser frame,
+            //     it is no bci at all.
+            //
+            //   * protected ranges — suppresses the sibling tail-call for a
+            //     call inside a `try`. A tail-call tears this frame down and
+            //     `JMP`s into the callee, so a callee exception unwinds past a
+            //     handler that was supposed to catch it — and for an OSR frame
+            //     that frame is the live interpreter one.
+            //
+            //   * pending exception ranges — handler entry edges are invisible
+            //     to the backend's bytecode branch decoding, so
+            //     `find_bypassable_loop_headers` needs them or a handler
+            //     entered from outside a loop lands in the body without running
+            //     its pre-header.
+            crate::jit::x64::set_precise_exception_frame_request(!osr_exception_table.is_empty());
+            crate::jit::x64::set_protected_ranges_request(
+                osr_exception_table
+                    .iter()
+                    .map(|e| (e.start_pc as u32, e.end_pc as u32))
+                    .collect(),
+            );
+            crate::jit::x64::set_pending_exception_ranges(
+                osr_exception_table
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.start_pc as usize,
+                            e.end_pc as usize,
+                            e.handler_pc as usize,
+                        )
+                    })
+                    .collect(),
+            );
             // This artifact's install epoch was stamped by the `compile_gate`
             // admission at the top of this closure — before the class loading
             // and constant-pool resolution above, not here. A witness opened at
@@ -1784,7 +1970,7 @@ pub(super) fn compile_osr_artifact(
                 // bail that matters most — this door compiles a `@Test` method's
                 // hot loop, and a method denied here runs its whole life in the
                 // interpreter with no other diagnostic. See
-                // docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md,
+                // fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
                 // which took a six-arm shape bisect to find for exactly this reason.
                 crate::jit::mark_jit_bail_listed_with_site(
                     &class_name,
@@ -1908,30 +2094,136 @@ pub(super) fn compile_osr_artifact(
     Some(compiled)
 }
 
-/// jit-osr-bail-on-callee-exception fix — hand an exception the OSR'd body
-/// exited with to the dispatch loop's unwinder instead of resuming the loop.
+/// Where an exception raised inside an OSR'd body must go.
 ///
-/// Returns `true` when the caller must `return None` immediately (the
-/// throwable is now owned by `throw_out` and `OsrBackoffOutcome::ThrowJava`
-/// will deliver it to `pending_java_exception`, which searches this frame's
-/// handlers and then unwinds).
+/// See [`route_osr_exception_out_of_artifact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OsrExceptionExit {
+    /// The live interpreter frame now sits at one of this method's handlers,
+    /// with the throwable on its operand stack. Keep interpreting it.
+    EnteredHandler,
+    /// The exception escapes this method. Hand it to `throw_out`.
+    Propagate,
+}
+
+/// Route an exception raised inside an OSR'd body out of the artifact —
+/// through this method's own exception table when it can catch, and out of the
+/// frame when it cannot.
 ///
-/// Returns `false` — leaving `throw_out` untouched — only when the OSR'd frame
-/// DOES declare an exception table, in which case the caller keeps its
-/// historical re-stash behaviour. `compile_osr_artifact` refuses to OSR such a
-/// method (RBC.6b), so this is a guard against a future gate relaxation
-/// silently changing exception routing, not a live path.
-pub(super) fn propagate_osr_exception(
-    thread: &JvmThread,
+/// **This is the consumer half of the RBC.6b lift.** Before 2026-08-17 the OSR
+/// door refused every method with an exception table, so every exception
+/// reaching an OSR bail was by construction one this frame could not catch, and
+/// the four drains in `try_osr` could simply propagate. Now that such methods
+/// compile, the frame CAN catch — and the one thing it must not do is what the
+/// drains used to do for a `NullPointerException`: search the table at
+/// `entry_pc`. `entry_pc` is the back-edge the OSR'd body was ENTERED at, which
+/// has nothing to do with where the throw happened, and the live frame's locals
+/// are the stale pre-OSR ones the compiled code never advanced. Entering a
+/// handler on those is a silent wrong answer.
+///
+/// The precise answer is the reason-9 (`DeoptReason::PendingException`) frame
+/// the compiled body publishes at every throwing site inside a protected range:
+/// it carries the THROWING bci and the live locals. `compile_osr_artifact`
+/// admits a method with an exception table only when every such site publishes
+/// one (`first_unsupported_precise_frame_site`), which is what makes the two
+/// deductions below sound:
+///
+///  * a frame IS stashed ⇒ its bci is the exact throw site; range-test the
+///    table against it;
+///  * NO frame is stashed ⇒ the throw site lies outside every protected range
+///    of this method, i.e. this method saying it cannot catch. Propagate. This
+///    is the same reasoning `route_jit_signal_exception` encodes as
+///    `JitThrowPc::OutsideAllRanges` on the method-entry path.
+///
+/// A stashed frame naming a *callee* is re-stashed untouched: its owner's own
+/// drain routes it, and dropping it there made a compiled callee's handler read
+/// its non-parameter locals as null once already (see
+/// `drop_own_exceptional_frame`).
+pub(super) fn route_osr_exception_out_of_artifact(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
     frame_idx: usize,
+    compiled: &crate::jit::CompiledMethod,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
     exc: ObjectRef,
-    throw_out: &mut Option<ObjectRef>,
-) -> bool {
-    if !thread.frames[frame_idx].exception_table().is_empty() {
-        return false;
+) -> OsrExceptionExit {
+    let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
+    let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
+        Some(rframe)
+            if deopt_frame_matches_method(&rframe, class_name, method_name, method_descriptor) =>
+        {
+            Some(rframe)
+        }
+        Some(foreign) => {
+            cratonvm_jit::deopt::restash_exceptional_frame(foreign);
+            None
+        }
+        None => None,
+    };
+
+    if thread.frames[frame_idx].exception_table().is_empty() {
+        // The pre-lift population, and still the overwhelming majority: no
+        // handler can exist here, so there is nothing to route.
+        return OsrExceptionExit::Propagate;
     }
-    *throw_out = Some(exc);
-    true
+
+    let Some(rframe) = precise else {
+        if trace {
+            eprintln!(
+                "[cratonvm-deopt] OSR exception with no precise frame in {class_name}.\
+                 {method_name}{method_descriptor} — throw site is outside every protected \
+                 range; propagating"
+            );
+        }
+        return OsrExceptionExit::Propagate;
+    };
+    let throw_pc = rframe.bci as usize;
+    let Some((handler_pc, exc_ref)) =
+        find_exception_handler_any_pc(shared, &thread.frames[frame_idx], throw_pc, exc)
+    else {
+        if trace {
+            eprintln!(
+                "[cratonvm-deopt] OSR exception at bci={throw_pc} in {class_name}.\
+                 {method_name}{method_descriptor} — no handler covers it; propagating"
+            );
+        }
+        return OsrExceptionExit::Propagate;
+    };
+
+    match super::deopt_resume::transfer_osr_exception_exit_into_live_frame(
+        shared, thread, frame_idx, &rframe, compiled, handler_pc, exc_ref,
+    ) {
+        Ok(()) => {
+            // The engagement counter for the whole lift. `osr_entered` says an
+            // artifact was entered; only this says an exception raised inside
+            // one was routed through the method's own handler — the thing
+            // RBC.6b refused to allow at all. Read it beside `osr_entered` and
+            // `osr_exited`: a run with `osr_entered` climbing and this at zero
+            // is a loop whose `catch` never fires, not a working lift.
+            cratonvm_jit::metrics::record_osr_event("osr_exception_handler_entered");
+            fire_jvmti_exception_catch(shared.vm_identity, &thread.frames[frame_idx], handler_pc);
+            OsrExceptionExit::EnteredHandler
+        }
+        // Unreachable by admission: `validate_osr_entry`'s `osr_exit_policy`
+        // walks EVERY deopt point of the artifact — reason-9 ones included —
+        // and refuses the entry outright when one reconstructs an unresumable
+        // frame, so an artifact that was entered cannot publish one here.
+        // Propagating rather than entering the handler on locals we could not
+        // map is the fail-closed direction: a visibly uncaught exception beats
+        // a handler silently running on stale values.
+        Err(why) => {
+            if trace {
+                eprintln!(
+                    "[cratonvm-deopt] OSR exception-exit transfer refused ({why}) at bci={} \
+                     in {class_name}.{method_name}{method_descriptor} — propagating",
+                    rframe.bci
+                );
+            }
+            OsrExceptionExit::Propagate
+        }
+    }
 }
 
 pub(super) fn try_osr(
@@ -1945,6 +2237,18 @@ pub(super) fn try_osr(
     // paths that used to re-stash + safe-reject; see `OsrBackoffOutcome::
     // ThrowJava` for why the safe reject was wrong there.
     throw_out: &mut Option<ObjectRef>,
+    // Out-channel: set when the OSR'd body RAN and this frame was advanced by
+    // it, even though the return is `None`. Today that is exactly one path —
+    // the RBC.6b lift's handler entry, where the frame is left parked at a
+    // `catch` block with the throwable on its stack.
+    //
+    // `None` from this function otherwise means "the OSR attempt was rejected,
+    // nothing ran", and the caller charges it against the per-pc rejection
+    // budget (`record_osr_rejection`, permanent after `OSR_MAX_ATTEMPTS = 5`).
+    // Charging a caught exception against that budget would turn OSR off after
+    // the fifth `catch` — on a loop with netty's measured 7.7% throw rate, some
+    // sixty-five compiled iterations out of four billion.
+    committed_out: &mut bool,
 ) -> Option<Option<Value>> {
     // Not gated on `class_was_redefined`. That predicate is true forever once
     // a class has been redefined, so it barred OSR from a redefined class for
@@ -1953,23 +2257,37 @@ pub(super) fn try_osr(
     // frame's current bytecode, so there is nothing stale left to protect
     // against here. See the note in `interpreter.rs`'s compile gate.
     let frame = &thread.frames[frame_idx];
-    let class_name = frame.class_name().to_string();
-    let method_name = frame.method_name().to_string();
-    let method_descriptor = frame.method_descriptor().to_string();
+    // Six heap allocations — three `to_string()` and three `Arc::from(&str)` —
+    // used to run here, on EVERY back-edge that reaches this function, which is
+    // once per OSR entry and not once per compile. The frame already holds all
+    // three as `Arc<str>`, so `*_arc()` is a refcount bump; the `&str` views the
+    // rest of the function wants come straight off those.
+    //
+    // It matters because entries are not rare: since the RBC.6b lift a caught
+    // exception is an OSR exit plus a re-entry, so a `try`/`catch` loop takes
+    // one entry per throw — measured `osr_entered=2280923` on
+    // `probes/OsrExcRateProbe.java`, i.e. 13.7 million allocations that bought
+    // nothing. `perf record` on that arm put 8.6% of the run in
+    // `mi_malloc`/`mi_free`.
+    //
+    // `frame.code` was already an `Arc<[u8]>` clone and stays one.
+    let class_name_arc: Arc<str> = frame.class_name_arc();
+    let method_name_arc: Arc<str> = frame.method_name_arc();
+    let descriptor_arc: Arc<str> = frame.method_descriptor_arc();
+    let class_name: &str = &class_name_arc;
+    let method_name: &str = &method_name_arc;
+    let method_descriptor: &str = &descriptor_arc;
     let code = frame.code.clone();
     let max_locals = frame.max_locals as usize;
-    let class_name_arc: Arc<str> = Arc::from(class_name.as_str());
-    let method_name_arc: Arc<str> = Arc::from(method_name.as_str());
-    let descriptor_arc: Arc<str> = Arc::from(method_descriptor.as_str());
     // wire-tiered-manager Step 5: the OSR compile (or cache reuse) now lives in
     // `compile_osr_artifact`, which the background worker can also call off-thread.
     // The live-frame entry/transfer below stays on the mutator.
     let compiled = compile_osr_artifact(
         shared,
         class_id,
-        class_name.clone(),
-        method_name.clone(),
-        method_descriptor.clone(),
+        class_name.to_string(),
+        method_name.to_string(),
+        method_descriptor.to_string(),
         &code,
         max_locals,
         entry_pc,
@@ -2206,81 +2524,88 @@ pub(super) fn try_osr(
                 &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, cname
             );
         }
-        // OSR is same-frame replacement: the interpreter keeps executing THIS
-        // frame, so a frame naming the OSR'd method itself can never be used and
-        // is dropped. A frame naming a CALLEE the OSR'd code invoked is a
-        // different matter — the callee's own drain routes it later, so that
-        // frame must survive.
-        drop_own_exceptional_frame(&class_name_arc, &method_name_arc, &descriptor_arc);
         // FIX (jit-osr-bail-on-callee-exception-reruns-loop-iterations,
-        // silent wrong answers on default settings): the re-stash + `return
-        // None` below is "OSR rejected, keep interpreting THIS frame from
-        // where it was". That is correct only when the bail precedes any
-        // committed loop iteration — true for the unconditional-at-header
-        // OSR-exit trigger it was written for, false here: the exception
-        // surfaces at an arbitrary invoke, possibly thousands of iterations
-        // into the loop, and the interpreter frame's induction variable and
-        // accumulators were never advanced by the OSR'd code. Every iteration
-        // between OSR entry and the throw was therefore executed a SECOND
-        // time (measured: 20 000 requested, 20 008 executed on the doc's
-        // repro; 12 346 requested, 42 730 executed when the exception escapes
-        // the OSR'd method entirely).
+        // silent wrong answers on default settings): re-stashing and
+        // continuing is "OSR rejected, keep interpreting THIS frame from where
+        // it was". That is correct only when the bail precedes any committed
+        // loop iteration — true for the unconditional-at-header OSR-exit
+        // trigger it was written for, false here: the exception surfaces at an
+        // arbitrary invoke, possibly thousands of iterations into the loop, and
+        // the interpreter frame's induction variable and accumulators were
+        // never advanced by the OSR'd code. Every iteration between OSR entry
+        // and the throw was therefore executed a SECOND time (measured: 20 000
+        // requested, 20 008 executed on the doc's repro; 12 346 requested,
+        // 42 730 executed when the exception escapes the OSR'd method
+        // entirely).
         //
-        // Propagate instead. This frame cannot catch: `compile_osr_artifact`
-        // refuses to OSR a method with a non-empty exception table (RBC.6b)
-        // and refuses one that `athrow`s (RBC.6), so an exception reaching
-        // here always escapes the OSR'd method. `propagate_osr_exception`
-        // re-checks that rather than assuming it, and falls back to the
-        // historical re-stash if a future gate relaxation makes it false.
-        if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
-            return None;
+        // Since the RBC.6b lift (2026-08-17) this frame may also CATCH, which
+        // it never could before — `route_osr_exception_out_of_artifact` is
+        // where that is decided, from the precise reason-9 throw bci rather
+        // than from the stale back-edge pc. It also owns the exceptional-frame
+        // stash (taking a frame that names this method, re-stashing one that
+        // names a callee), which is what `drop_own_exceptional_frame` used to
+        // do here.
+        match route_osr_exception_out_of_artifact(
+            shared,
+            thread,
+            frame_idx,
+            &compiled,
+            &class_name,
+            &method_name,
+            &method_descriptor,
+            exc,
+        ) {
+            OsrExceptionExit::EnteredHandler => {
+                *committed_out = true;
+                return None;
+            }
+            OsrExceptionExit::Propagate => {
+                *throw_out = Some(exc);
+                return None;
+            }
         }
-        crate::jit::helpers::stash_jit_pending_exception(thread, exc);
-        return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
-        // Round-9/10 HIGH fix: route the NPE through the OSR'd method's
-        // own exception table before falling back to the re-stash. The
-        // OSR target IS the method whose code raised the NPE, so the
-        // current frame's exception table is exactly the one that
-        // should be searched. If we find a typed handler whose
-        // `[start_pc, end_pc)` range covers `entry_pc` (our best-known
-        // throw site — the back-edge OSR entry, which dominates the
-        // failing helper call), we jump the interpreter PC there and
-        // resume in the catch block by returning `None` (OSR rejected;
-        // continue interpreting the same frame at its new PC).
+        // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
+        // exception table rather than losing it. The OSR target IS the method
+        // whose code raised the NPE, so this frame's table is the one to
+        // search.
         //
-        // The re-stash fallback (no in-frame handler found) preserves
-        // the round-9 invariant that the NPE survives the
-        // OSR→interpreter handoff and gets surfaced by the next JIT
-        // helper return drain (~line 2253 / ~12723) so it does not
-        // disappear silently.
+        // It used to be searched at `entry_pc` — "our best-known throw site —
+        // the back-edge OSR entry, which dominates the failing helper call".
+        // That was inert while RBC.6b refused every method with a table, and
+        // is not a defensible throw site now that they compile: the back-edge
+        // pc has nothing to do with where the null was dereferenced, and the
+        // live frame's locals are the stale pre-OSR ones. A protected
+        // `putfield` on a null receiver publishes a precise frame at the
+        // trapping bci (`emit_precise_null_check_field_store`, which records a
+        // `PendingException` deopt point and raises the NPE from the stub), so
+        // the same router the pending-exception drain uses has the real answer.
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                if let Some((handler_pc, exc_ref)) =
-                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
-                {
-                    let frame = &mut thread.frames[frame_idx];
-                    frame.stack.clear();
-                    let _ = frame.stack.push(Value::Object(Some(exc_ref)));
-                    frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
-                    return None;
+                match route_osr_exception_out_of_artifact(
+                    shared,
+                    thread,
+                    frame_idx,
+                    &compiled,
+                    &class_name,
+                    &method_name,
+                    &method_descriptor,
+                    exc,
+                ) {
+                    OsrExceptionExit::EnteredHandler => {
+                        *committed_out = true;
+                        return None;
+                    }
+                    OsrExceptionExit::Propagate => {
+                        *throw_out = Some(exc);
+                        return None;
+                    }
                 }
-                // No in-frame handler. Propagate out of the OSR'd frame
-                // rather than re-stashing and resuming the loop — see the
-                // pending-exception drain above for why resuming re-runs
-                // already-committed iterations.
-                if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
-                    return None;
-                }
-                // Historical fallback (unreachable while RBC.6b holds): keep
-                // the NPE alive across the OSR→interpreter handoff.
-                crate::jit::helpers::stash_jit_pending_exception(thread, exc);
             }
             _ => {
                 // Couldn't construct a Java NPE object (e.g. rt.jar not
@@ -2293,13 +2618,14 @@ pub(super) fn try_osr(
     }
     if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
         // Round-11 fix: mirror the NPE block above for AIOOBE on the OSR bail
-        // path. Route the ArrayIndexOutOfBoundsException through the OSR'd
-        // method's own exception table first (the OSR target IS the method
-        // whose code raised it); if a handler whose `[start_pc, end_pc)`
-        // covers `entry_pc` is found, jump the interpreter PC there and resume
-        // in the catch block by returning `None`. Otherwise re-stash so the
-        // exception survives the OSR→interpreter handoff and is surfaced by
-        // the next JIT helper return drain rather than being silently lost.
+        // path — routed through the same `route_osr_exception_out_of_artifact`,
+        // for the same reason that block no longer searches at `entry_pc`.
+        //
+        // Every array access is one of the sites
+        // `first_unsupported_precise_frame_site` refuses inside a protected
+        // range, so the OSR door never admits a method where a handler could
+        // cover this throw; the router's "no precise frame ⇒ outside every
+        // protected range ⇒ propagate" deduction is the whole answer here.
         let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -2308,27 +2634,25 @@ pub(super) fn try_osr(
             Some(&msg),
         ) {
             Ok(exc_obj) => {
-                if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
+                match route_osr_exception_out_of_artifact(
                     shared,
-                    &thread.frames[frame_idx],
-                    entry_pc,
+                    thread,
+                    frame_idx,
+                    &compiled,
+                    &class_name,
+                    &method_name,
+                    &method_descriptor,
                     exc_obj,
                 ) {
-                    let frame = &mut thread.frames[frame_idx];
-                    frame.stack.clear();
-                    let _ = frame.stack.push(Value::Object(Some(exc_ref)));
-                    frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
-                    return None;
+                    OsrExceptionExit::EnteredHandler => {
+                        *committed_out = true;
+                        return None;
+                    }
+                    OsrExceptionExit::Propagate => {
+                        *throw_out = Some(exc_obj);
+                        return None;
+                    }
                 }
-                // No in-frame handler. Propagate out of the OSR'd frame
-                // rather than re-stashing and resuming the loop (see the
-                // pending-exception drain above).
-                if propagate_osr_exception(thread, frame_idx, exc_obj, throw_out) {
-                    return None;
-                }
-                // Historical fallback (unreachable while RBC.6b holds).
-                crate::jit::helpers::stash_jit_pending_aioobe(index, length);
             }
             Err(_) => {
                 // Couldn't construct the Java object (e.g. rt.jar not loaded) —
@@ -2340,11 +2664,15 @@ pub(super) fn try_osr(
         return None;
     }
     // Divide-by-zero direct-throw drain on the OSR bail path (sibling of the
-    // NPE/AIOOBE OSR blocks above). Route the `ArithmeticException` through the
-    // OSR'd method's own exception table (the OSR target IS the method whose code
-    // raised it); if a handler covering `entry_pc` is found, jump there and
-    // resume interpreting. Otherwise re-stash the flag so the exception survives
-    // the OSR→interpreter handoff and is surfaced by the next JIT-return drain.
+    // NPE/AIOOBE OSR blocks above). Routed through the same
+    // `route_osr_exception_out_of_artifact` as the other three, and for the
+    // same reason the NPE block above no longer searches at `entry_pc`.
+    //
+    // An `idiv`/`irem` inside a protected range is one of the sites
+    // `first_unsupported_precise_frame_site` refuses, so the OSR door never
+    // admits a method that could raise this one where a handler covers it —
+    // which is why the router's "no precise frame ⇒ outside every protected
+    // range ⇒ propagate" deduction is the whole of the answer here.
     if crate::jit::helpers::take_jit_pending_arithmetic() {
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
@@ -2354,24 +2682,25 @@ pub(super) fn try_osr(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                if let Some((handler_pc, exc_ref)) =
-                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
-                {
-                    let frame = &mut thread.frames[frame_idx];
-                    frame.stack.clear();
-                    let _ = frame.stack.push(Value::Object(Some(exc_ref)));
-                    frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
-                    return None;
+                match route_osr_exception_out_of_artifact(
+                    shared,
+                    thread,
+                    frame_idx,
+                    &compiled,
+                    &class_name,
+                    &method_name,
+                    &method_descriptor,
+                    exc,
+                ) {
+                    OsrExceptionExit::EnteredHandler => {
+                        *committed_out = true;
+                        return None;
+                    }
+                    OsrExceptionExit::Propagate => {
+                        *throw_out = Some(exc);
+                        return None;
+                    }
                 }
-                // No in-frame handler. Propagate out of the OSR'd frame
-                // rather than re-stashing and resuming the loop (see the
-                // pending-exception drain above).
-                if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
-                    return None;
-                }
-                // Historical fallback (unreachable while RBC.6b holds).
-                crate::jit::helpers::stash_jit_pending_arithmetic();
             }
             _ => {
                 // Couldn't construct the Java object — re-stash the raw flag.
@@ -3289,12 +3618,24 @@ pub(super) fn try_jit_upgrade_with_gate(
     // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
     // through those two, so admitting a synchronized method here is contained.
     //
-    // The three entries that would NOT be wrapped each refuse a synchronized
-    // callee independently, and must keep doing so:
-    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`'s
-    //     `named_method_is_synchronized` gate;
+    // Every OTHER entry runs the body with no monitor at all, and each must
+    // refuse a synchronized callee independently:
+    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`, both
+    //     on its compile path (`..._slow`'s `is_synchronized` gate) AND on its
+    //     `jit_cache` fast path, which serves an already-published body and so
+    //     never reaches that gate;
+    //   * `jit_invoke_dispatch`'s own `jit_cache` arm (`vm/src/jit/helpers.rs`),
+    //     which fills `DISPATCH_CACHE` and does not go through
+    //     `try_jit_compile_callee` at all;
+    //   * the specialized `get(I)D` scalar routes in the same file — `Vector.get`
+    //     is `synchronized` in the JDK, so this one is not hypothetical;
     //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
     //   * OSR — the `is_synchronized` gate near the top of this file.
+    //
+    // The first three ask `CompiledMethod::requires_wrapped_entry`, stamped at
+    // publication, because they hold a raw entry pointer and no method handle.
+    // Listing only the compile-time gates here is what let the fast paths drift:
+    // the enumeration said "three" while `jit_cache` answered for two more.
     //
     // Why this matters: every layer Tomcat's BCEL annotation scan drives per
     // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
@@ -3751,6 +4092,9 @@ pub(super) fn try_jit_upgrade_with_gate(
             // RFJP.1 — never JIT a callee on a class transitively extending
             // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
             if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::FjpBlocklist,
+                );
                 return None;
             }
             // S111r15 — refuse to compile a callee that has a Rust native
@@ -3770,6 +4114,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                 .find(callee_class, callee_method, callee_desc)
                 .is_some()
             {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::NativeShadow,
+                );
                 return None;
             }
             // A direct compiled entry has no interpreter boundary to route an
@@ -3787,10 +4134,15 @@ pub(super) fn try_jit_upgrade_with_gate(
                         callee_desc,
                         store,
                     ) {
+                        // Sibling of the same gate in `direct_callee_lookup`.
                         if method
                             .code()
                             .map_or(false, |code| !code.exception_table.is_empty())
+                            && !cratonvm_jit::direct_call_exc_table_publish_enabled()
                         {
+                            cratonvm_jit::note_direct_callee_bind_refusal(
+                                cratonvm_jit::DirectBindRefusal::CalleeExceptionTable,
+                            );
                             return None;
                         }
                     }
@@ -3823,6 +4175,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                     // the site on `jit_invoke_dispatch`, whose
                     // `try_resume_trapped_callee` resolves the trap in place.
                     if compiled.has_indy_trap {
+                        cratonvm_jit::note_direct_callee_bind_refusal(
+                            cratonvm_jit::DirectBindRefusal::IndyTrap,
+                        );
                         return None;
                     }
                     // Cast: object/code pointer to integer address
@@ -3844,6 +4199,9 @@ pub(super) fn try_jit_upgrade_with_gate(
             )?;
             // Direct callee compilation must share the synchronized-method gate.
             if method.is_synchronized() {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::Synchronized,
+                );
                 return None;
             }
 
@@ -3892,6 +4250,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                     .map(crate::vm::is_class_initialized_fast)
                     .unwrap_or(false);
                 if !declaring_class_initialized {
+                    cratonvm_jit::note_direct_callee_bind_refusal(
+                        cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized,
+                    );
                     return None;
                 }
             }
@@ -4329,6 +4690,12 @@ pub(super) fn try_jit_upgrade_with_gate(
                 &callee_cached.method_descriptor,
                 &mut compiled,
             );
+            // Stamp the wrapped-entry requirement before the body is shared.
+            // See `CompiledMethod::requires_wrapped_entry`: publication is the
+            // last point that still knows this is an `ACC_SYNCHRONIZED` method,
+            // and every unwrapped consumer downstream holds only a raw entry
+            // pointer.
+            compiled.requires_wrapped_entry = callee_cached.is_synchronized;
             {
                 let mut jit_cache = shared.jit.jit_cache.write();
                 jit_cache.put(
@@ -4487,6 +4854,12 @@ pub(super) fn try_jit_upgrade_with_gate(
         &cached.method_descriptor,
         &mut compiled,
     );
+    // Stamp the wrapped-entry requirement before the body is shared.
+    // See `CompiledMethod::requires_wrapped_entry`: publication is the
+    // last point that still knows this is an `ACC_SYNCHRONIZED` method,
+    // and every unwrapped consumer downstream holds only a raw entry
+    // pointer.
+    compiled.requires_wrapped_entry = cached.is_synchronized;
     let compiled_arc = {
         let mut jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(
@@ -4731,6 +5104,25 @@ pub fn try_jit_compile_callee(
         // kept a mocked class interpreted forever.
         let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
+            // A published body is not automatically a body THIS caller may
+            // enter. `try_jit_compile_callee` is the by-name entry point for
+            // the UNWRAPPED direct-call doors, and its slow path refuses an
+            // `ACC_SYNCHRONIZED` callee for a reason that does not stop being
+            // true once the body already exists: the compiled code carries no
+            // monitor prologue, so a raw CALL to it simply does not lock.
+            //
+            // The background tiering door publishes synchronized bodies on
+            // purpose — `try_jit_compile_wrapped_entry` — because
+            // `execute_jit_call` wraps them. Serving one from here handed the
+            // wrapped-entry body to a caller that supplies no monitor, which is
+            // how `RSyncMethodJit`'s `static synchronized bumpStatic` lost
+            // ~35 of 240 000 increments per run.
+            if compiled.requires_wrapped_entry {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::Synchronized,
+                );
+                return None;
+            }
             // Cast: object/code pointer to integer address
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -5568,8 +5960,15 @@ pub(super) fn try_jit_compile_callee_slow(
                                 callee_method: &str,
                                 callee_desc: &str|
      -> Option<(usize, bool)> {
+        // Each arm names its refusal TWICE on purpose: the string is for the
+        // per-site `dbg_jitc` trace, the `DirectBindRefusal` variant is for the
+        // process-wide tally the `intrinsic-stats` census prints. A bare
+        // `bind_misses` total cannot distinguish a compile-ORDER accident
+        // (re-bindable) from a standing policy refusal (not), which is the
+        // choice the two-causes page leaves open.
         macro_rules! dc_no {
-                ($why:expr) => {{
+                ($why:expr, $reason:expr) => {{
+                    cratonvm_jit::note_direct_callee_bind_refusal($reason);
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
                             "[cratonvm-jitc] bg-direct-call DECLINED {callee_class}.{callee_method}{callee_desc}: {}",
@@ -5580,7 +5979,7 @@ pub(super) fn try_jit_compile_callee_slow(
                 }};
             }
         if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
-            dc_no!("fjp-blocklist");
+            dc_no!("fjp-blocklist", cratonvm_jit::DirectBindRefusal::FjpBlocklist);
         }
         if shared
             .natives
@@ -5588,14 +5987,14 @@ pub(super) fn try_jit_compile_callee_slow(
             .find(callee_class, callee_method, callee_desc)
             .is_some()
         {
-            dc_no!("native-shadow");
+            dc_no!("native-shadow", cratonvm_jit::DirectBindRefusal::NativeShadow);
         }
         let callee_class_id = {
             let cm = shared.classes.class_manager.read();
             let Some(callee_cid) =
                 cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
             else {
-                dc_no!("callee-class-not-found");
+                dc_no!("callee-class-not-found", cratonvm_jit::DirectBindRefusal::CalleeClassNotFound);
             };
             let store = cm.class_store();
             let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
@@ -5604,16 +6003,26 @@ pub(super) fn try_jit_compile_callee_slow(
                 callee_desc,
                 store,
             ) else {
-                dc_no!("callee-method-not-found");
+                dc_no!("callee-method-not-found", cratonvm_jit::DirectBindRefusal::CalleeMethodNotFound);
             };
             if method.is_synchronized() {
-                dc_no!("synchronized");
+                dc_no!("synchronized", cratonvm_jit::DirectBindRefusal::Synchronized);
             }
-            if method
-                .code()
-                .map_or(true, |c| !c.exception_table.is_empty())
-            {
-                dc_no!("callee-exception-table");
+            // A callee with no `Code` attribute at all (`map_or(true, ..)`)
+            // is always refused — there is no body to bake a CALL to. A callee
+            // that merely DECLARES a table is refused only while
+            // `direct_call_exc_table_publish_enabled` is off; see that function
+            // for why the stated reason has expired and what it is interlocked
+            // against.
+            let callee_code_bars_direct_call = match method.code() {
+                None => true,
+                Some(c) => {
+                    !c.exception_table.is_empty()
+                        && !cratonvm_jit::direct_call_exc_table_publish_enabled()
+                }
+            };
+            if callee_code_bars_direct_call {
+                dc_no!("callee-exception-table", cratonvm_jit::DirectBindRefusal::CalleeExceptionTable);
             }
             if method.is_static()
                 && !store
@@ -5621,7 +6030,7 @@ pub(super) fn try_jit_compile_callee_slow(
                     .map(crate::vm::is_class_initialized_fast)
                     .unwrap_or(false)
             {
-                dc_no!("declaring-class-not-initialized");
+                dc_no!("declaring-class-not-initialized", cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized);
             }
             callee_cid
         };
@@ -5679,20 +6088,20 @@ pub(super) fn try_jit_compile_callee_slow(
             Some(compiled) => compiled,
             None => {
                 if !crate::runtime::env_cache::jit_eager_callee_chain() {
-                    dc_no!("callee-not-yet-compiled");
+                    dc_no!("callee-not-yet-compiled", cratonvm_jit::DirectBindRefusal::CalleeNotYetCompiled);
                 }
                 if cratonvm_jit::jit_active_compile_depth() > MAX_EAGER_CALLEE_CHAIN_DEPTH {
-                    dc_no!("eager-callee-chain-depth");
+                    dc_no!("eager-callee-chain-depth", cratonvm_jit::DirectBindRefusal::EagerChainDepth);
                 }
                 if cratonvm_jit::jit_active_compile_contains(
                     callee_class,
                     callee_method,
                     callee_desc,
                 ) {
-                    dc_no!("eager-callee-chain-cycle");
+                    dc_no!("eager-callee-chain-cycle", cratonvm_jit::DirectBindRefusal::EagerChainCycle);
                 }
                 if !eager_callee_chain_try_spend() {
-                    dc_no!("eager-callee-chain-budget");
+                    dc_no!("eager-callee-chain-budget", cratonvm_jit::DirectBindRefusal::EagerChainBudget);
                 }
                 // `optimize` is this compile's own backend selection, so a C1 body's
                 // callees are compiled at C1 and a C2 body's at C2 — the callee never
@@ -5704,13 +6113,13 @@ pub(super) fn try_jit_compile_callee_slow(
                     callee_desc,
                     optimize,
                 ) else {
-                    dc_no!("eager-callee-chain-compile-declined");
+                    dc_no!("eager-callee-chain-compile-declined", cratonvm_jit::DirectBindRefusal::EagerChainCompileDeclined);
                 };
                 body
             }
         };
         if compiled.has_indy_trap {
-            dc_no!("indy-trap");
+            dc_no!("indy-trap", cratonvm_jit::DirectBindRefusal::IndyTrap);
         }
         if crate::runtime::env_cache::dbg_jitc() {
             eprintln!(
@@ -5906,6 +6315,12 @@ pub(super) fn try_jit_compile_callee_slow(
         &method_desc_key,
         &mut compiled,
     );
+    // Stamp the wrapped-entry requirement before the body is shared.
+    // See `CompiledMethod::requires_wrapped_entry`: publication is the
+    // last point that still knows this is an `ACC_SYNCHRONIZED` method,
+    // and every unwrapped consumer downstream holds only a raw entry
+    // pointer.
+    compiled.requires_wrapped_entry = cached.is_synchronized;
     let published = {
         let jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(

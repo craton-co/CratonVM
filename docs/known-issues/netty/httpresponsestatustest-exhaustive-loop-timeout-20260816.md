@@ -1,27 +1,42 @@
-# `HttpResponseStatusTest` — `testHttpStatusClassValueOf` needs 42 ns/iteration and gets 120
+# `HttpResponseStatusTest` — `testHttpStatusClassValueOf` needs 42 ns/iteration and gets 92, and 63 of them are the JUnit assert
 
 **Status: OPEN, throughput. The compile-ORDER mechanism this page was about is
-FIXED (2026-08-17); the remaining gap is ~2.9x and has a different cause.**
+FIXED (2026-08-17); the remaining gap is 2.2x and has a different cause.**
 Original measurement 2026-08-16 on `3ef3eb744`; per-iteration decomposition
-2026-08-17 on `cf141b8a8`; the fix and the numbers below 2026-08-17 on
-`perf/netty-exhaustive-loop-walls-20260817`. Windows host, release build, G1,
-real-JDK mode, against HotSpot 25 on the same host.
+2026-08-17 on `cf141b8a8`; the compile-order fix 2026-08-17 on
+`perf/netty-exhaustive-loop-walls-20260817` (Windows host). **The decomposition
+re-measured 2026-08-17 on `perf/osr-exception-table-and-nesting-inline-20260817`,
+Azure Linux host, inverts this page's estimate: the JUnit assertion chain is
+~63 ns of the 92, not `valueOf`** — see
+[What the remaining cost is](#what-the-remaining-cost-is--measured-2026-08-17-and-the-split-is-inverted).
 
 ## Summary
 
 | | found | ok | failed | wall |
 |---|---|---|---|---|
-| CratonVM G1 (isolated), 2026-08-16 | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
-| HotSpot 25 (isolated) | 13 | 13 | 0 | 4.6s |
+| CratonVM G1 (isolated), 2026-08-16 and still 2026-08-17 | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
+| HotSpot 25 (isolated), Windows host | 13 | 13 | 0 | 4.6s |
+| **HotSpot 25 (isolated), Azure Linux host, 2026-08-17** | 13 | 13 | 0 | **1.925s** |
 
 Per-test progress instrumentation confirms the process is inside
 `testHttpStatusClassValueOf` when the cap fires, and nowhere else. On HotSpot that
-single method is **2.607 s** (`ProgressRunner`, `@@RESULT ... ms=2607`), so the
-180 s per-class wall leaves CratonVM an allowance of **~69x HotSpot** on this
-class. Contrast the sibling
+single method is **2.607 s** on the Windows host (`ProgressRunner`,
+`@@RESULT ... ms=2607`), so the 180 s per-class wall leaves CratonVM an allowance
+of **~69x HotSpot** there — and **~93x** against the 1.925 s the whole class takes
+on the Azure Linux host, which is where this page's later work runs. Either way
+the allowance is generous and the class still hangs; the budget below (42
+ns/iteration) is derived from the wall and the iteration count, so it does not
+move with the host.
+
+Contrast the sibling
 [`httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`](httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md),
-where the same wall allows only ~2.1x: the two pages are not one problem at two
-scales, and treating them as one mis-sized both.
+where the same wall allows ~5.9x (re-measured on the Azure host; that page's
+earlier ~2.1x came from a Windows control that does not transfer). The two pages
+are not one problem at two scales, and treating them as one mis-sized both. That
+page's own blocker — its two loops never compiled at all, because the OSR door
+refused any method with an exception table — was closed 2026-08-17, which does
+not touch this class: `testHttpStatusClassValueOf` has no `try`, so it compiled
+all along and its residual below is unchanged.
 
 ## The budget, exactly
 
@@ -115,72 +130,202 @@ addresses were all *true* and all irrelevant: the differing bind was one level
 DEEPER than either body, in a method neither dump covered. The MIC/PIC
 "per-site runtime state" hypothesis the page ended on is not the answer either.
 
-## What the remaining 120 ns is
+## What the remaining cost is — MEASURED 2026-08-17, and the split is inverted
 
-`probes/CallCostProbe.java`, same binary, after the fix:
+The decomposition below replaces the estimate this section used to carry, and it
+reverses it. Azure Linux host, release build, real-JDK mode, current dev binary.
 
-| | CratonVM |
-|---|---:|
-| no call | 0.66 ns/iter |
-| 1 static call | 0.84 |
-| 2 static calls | 1.86 |
-| 1 virtual call | 6.20 |
-| 1 interface call | 5.74 |
+**`probes/StatusLoopArmsProbe.java`** — the loop with one rung replaced at a
+time, every arm a separate once-invoked method:
 
-Compiled-to-compiled calls are no longer the story; **the number of them is**.
-One iteration is ~10 real call frames:
+| arm | HotSpot ns/iter | CratonVM ns/iter |
+|---|---:|---:|
+| bare | 0.51 | 1.07 |
+| getstatic | 1.09 | 1.56 |
+| valueOf | 0.86 | **17.71** |
+| full (`assertEquals`) | 12.51 | **80.57** |
 
-* `HttpStatusClass.valueOf(int)` is five `invokevirtual contains(int)` calls, one
-  per enum constant, each a distinct anonymous subclass (`HttpStatusClass$1..$5`)
-  — five monomorphic sites at ~6 ns, so ~30 ns;
-* `Assertions.assertEquals` → `AssertEquals.assertEquals(Object,Object)` →
-  `(Object,Object,String)` → `AssertionUtils.objectsAreEqual` → `Enum.equals`,
-  four more frames;
-* plus the `getstatic HttpStatusClass.UNKNOWN` the assert needs (3.67 ns).
+**`probes/AssertChainProbe.java`** — the assertion chain split rung by rung,
+each row adding exactly one level to the row above, `n = 2e7`:
 
-HotSpot collapses all of it: `contains` inlines to a pair of compares and
-`assertEquals` to one reference comparison and a branch.
+| rung | HotSpot ns/iter | CratonVM ns/iter | CratonVM delta |
+|---|---:|---:|---:|
+| bare (control) | 0.51 | 0.80 | — |
+| + `valueOf` | 1.19 | 18.29 | **+17.5** |
+| + reference compare | 0.63 | 17.36 | ~0 |
+| + `UNKNOWN.equals(k)` | 0.77 | 28.12 | **+10.8** |
+| + one more static rung | 0.80 | 36.03 | **+7.9** |
+| + the real `Assertions.assertEquals` | 4.91 | 91.55 | **+55.5** |
 
-**Neither compile door can do that, and the reason is not a missing flag.** The
-single-pass emitter's `try_emit_inline_body` bails on any callee invoke that is
-not a resolver-proven elidable super-`<init>` — it splices LEAF bodies only. Both
-`valueOf` (five invokes) and every rung of the assertion chain (one invoke each)
-are therefore ineligible at every door. Measured, same binary, on the real-loop
-probe: `CRATONVM_JIT_MAIN_INLINE=1` 96.8 ns/iter,
+So the split is **`valueOf` 17.5 ns and the JUnit assertion chain ~63 ns**, not
+"`valueOf` ~30 ns plus four more frames". The chain is 78% of the cost and is the
+thing standing between this class and its budget. HotSpot's whole chain is
+~11.7 ns on the same probe, and 4.91 ns/iter end to end.
+
+Note also that the class is **91.55 ns/iteration on the current binary, not
+120.3** — 393 s extrapolated against the 180 s wall, so the gap is **2.2x**, not
+2.9x.
+
+### Three things that are NOT the cause, each ruled out by a counter
+
+* **The generic dispatch helper.** `CRATONVM_DBG=mic-prof` on the assert loop:
+  `disp_calls=3776` over 2 000 000 iterations. The eager-callee-chain fix above
+  is working and the chain is direct-bound.
+* **A rung left interpreted.** `CRATONVM_DBG=jit-method-stats` on the same run:
+  `hot_but_stuck_in_interpreter=0`, `c2=18`, `compiles: c1=18 c2=20 osr=3`.
+  Every frame in the chain is compiled.
+* **Reference arguments.** A compiled call that passes oops must spill them and
+  publish an oop map, which an int-only call need not, so it was worth pricing.
+  `probes/CallArgCostProbe.java` says it is worth ~2 ns, not the ~14 ns per
+  frame the chain shows. The hypothesis is dead; do not re-run it.
+
+### The per-call floor, measured
+
+`probes/CallArgCostProbe.java`, deltas over its own no-call control:
+
+| | HotSpot | CratonVM |
+|---|---:|---:|
+| static, no args | ~0 | **4.13** |
+| static, 1 int | ~0 | 4.16 |
+| static, 2 ints | ~0 | 5.41 |
+| static, 1 reference | ~0 | 6.46 |
+| static, 2 references | ~0 | 7.51 |
+| virtual, 1 int | ~0 | 8.19 |
+| virtual, 1 reference | ~0 | 8.96 |
+
+HotSpot's whole column is ~0 because it inlines all of them; the negative deltas
+there are noise around a loop that has been optimised to nothing.
+
+**This is the whole argument for what is left.** One iteration of this test is
+~10 real call frames. At a measured floor of 4.1 ns per static call and 8.2 per
+virtual one, ten frames cost 40-80 ns before any of them does any work — and the
+budget for the entire iteration is 42 ns. **No arrangement of real calls fits.**
+The only lever is not making the calls, i.e. inlining, which is what HotSpot
+does and what the numbers above say it is worth. (Supersedes the earlier
+`CallCostProbe` figures of 0.84 ns per static call and 6.20 per virtual: that
+probe's arms are shaped so its callees inline, so it prices a call that does not
+happen.)
+
+## Why the inliner cannot do it, and in what order that is fixable
+
+**The single-pass emitter splices LEAF bodies only**, and there are two
+independent gates, not one:
+
+1. `resolve_inline_site_from` (`vm/src/runtime/interpreter/jit_bridge.rs`)
+   rejects a callee containing `invokevirtual` / `invokestatic` /
+   `invokeinterface` outright, so no such site is ever planned.
+2. `try_emit_inline_body` (`jit/src/x64/inlining.rs`) has no arm for those
+   opcodes either — they hit its catch-all bail. The one invoke it admits is a
+   resolver-proven elidable super-`<init>`, which emits no code at all.
+
+So both `valueOf` (five invokes) and every rung of the assertion chain are
+ineligible at every door. Measured on the real-loop probe:
+`CRATONVM_JIT_MAIN_INLINE=1` 96.8 ns/iter,
 `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1` 94.9, both 108.9, neither 92.8 — all
 inside each other's noise. Turning inlining knobs on cannot help while the
 inliner cannot nest.
 
-That also restates the `inline_candidates=0` observation precisely. It is not
-that the optimizing tier declines to inline: the inline planner runs on the
-single-pass path only, and the ONE emitter both tiers share cannot represent a
-non-leaf inline, so there is nothing for the planner to admit here either way.
+**And the thing that must land first is not the inliner — nor even the inline
+metadata.** `try_emit_inline_site` refuses, as a *postcondition*, any spliced
+body that published deopt metadata:
 
-## What is left
+> Every inlined body … is entered and left inside ONE frame, the caller's own,
+> and deopt metadata has no way to say otherwise: `deopt::FrameState::caller`
+> exists but no producer populates it, so an inlined scope is not representable.
+> A deopt point published from inside a spliced body would therefore name the
+> CALLER's method with the CALLEE's bci.
 
-Closing 120 → 42 ns/iteration on this shape needs an inliner that can splice a
-callee containing calls — one that nests. Two smaller items are worth doing
-first, because each is measurable on its own and generalises well beyond this
-class:
+A callee containing a real call publishes exactly that — `emit_post_invoke_
+exception_check` records a reason-9 point at the callee's bci.
 
-* `Enum.ordinal()` and `Object.equals` are registered natives on the ~160 ns
-  funnel (222 ns and 190 ns per
-  [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)),
-  so any assertion chain that reaches one pays it. `Enum.equals` is bytecode and
-  measures 37 ns, already six times a compiled virtual call.
-* `probes/StatusLoopArmsProbe.java` decomposes the loop by replacing one rung at
-  a time (bare / getstatic / valueOf / plain reference compare / full assert), so
-  the split between `valueOf` and the JUnit chain becomes a measurement rather
-  than an estimate. Use it before touching either.
+The obvious reading is "record the scope, then relax the postcondition". **That
+is wrong for this class, and the reason is specific to it: the method that needs
+inlining here is a `@Test` body, invoked ONCE, so OSR is its only door out of the
+interpreter.** And an artifact carrying an inlined caller scope cannot be
+OSR-entered at all:
 
-## A note on this page's own probe, for the next reader
+* `CompiledMethod::osr_exit_policy` refuses any deopt point with
+  `frame_state.caller.is_some()` (`OSR_REFUSE_INLINED_SCOPE`), because
+* the VM's in-place OSR-exit transfer is single-frame —
+  `transfer_osr_exit_into_live_frame` bails on `"inlined caller chain"`, and so
+  do `resume_from_ir_deopt` and `build_deopt_frame_inner`. Its own comment says
+  "Lift this the same day that transfer grows a multi-frame path."
+
+So recording scopes first would make **exactly the artifact that needs inlining
+un-enterable**, and the loop would run interpreted — strictly worse than not
+inlining at all. That constraint was prose until 2026-08-17; it is now pinned by
+`a_deopt_point_with_an_inlined_caller_scope_refuses_the_osr_entry`
+(`jit/src/lib.rs`), which also asserts the same artifact without the scope IS
+admitted, and which fails if either refusal arm is removed.
+
+The order is therefore:
+
+1. **VM-side multi-frame deopt resume** — build a chain of interpreter frames
+   from `ReconstructedFrame::caller_frames` instead of refusing it, at all three
+   sinks. A caller scope is parked mid-`invoke`, so its `ResumeSemantics` is
+   `RESUME` and the frame must resume *after* the call with the callee's result
+   pushed; that protocol does not exist yet.
+2. **Multi-frame OSR-exit transfer**, and only then relax `osr_exit_policy`'s
+   `caller.is_some()` refusal. Steps 1 and 2 are what make an inlined artifact
+   usable by an OSR-only method at all.
+3. **Inline scopes in deopt metadata** — give `FrameState::caller` a producer.
+   The IR-side representation is already built and tested
+   (`docs/jit/deopt-inline-scopes.md`: `InlineScopeTable`, `caller_chain_for`,
+   `lower_inner_with_scopes`, chain-aware `frame_state_is_resumable`); what is
+   missing for THIS backend is the single-pass scope stack, "pushed at the splice
+   and popped at the callee's return", replacing
+   `build_and_record_deopt_point`'s hard-coded `caller: None`.
+4. **A real call inside a spliced body.** With scopes recorded and resumable,
+   `try_emit_inline_body` can emit the ordinary dispatch/direct-call sequence for
+   `0xb6`/`0xb8`/`0xb9` instead of bailing, and the postcondition above relaxes
+   from "published any metadata" to "published metadata with no caller scope".
+   Note this needs BOTH gates opened: `resolve_inline_site_from` rejects those
+   opcodes outright too, so a site is never even planned.
+5. **Nesting.** `InlineSite` grows a `nested_sites: HashMap<callee_pc,
+   InlineSite>`, `resolve_inline_site_from` fills it recursively under a depth
+   budget, and the emitter recurses. Statically bound callees are the tractable
+   first cut and are most of what this class needs — the assertion chain's first
+   four rungs are all `invokestatic`. `valueOf`'s five `contains` calls are
+   `invokevirtual` on static-final constants of anonymous subclasses, so they
+   additionally need devirtualisation with a guard.
+
+Steps 1-4 are correctness-critical, and their failure mode is a silent wrong
+stack rather than a slow loop. That is the honest size of "needs an inliner that
+can nest", and the inliner is the last item on the list rather than the first.
+
+## What is left, in order
+
+1. The five-step chain above, in that order — multi-frame resume, multi-frame
+   OSR transfer, inline scopes, calls inside spliced bodies, nesting. It is the
+   only item that can close the 2.2x, and its first two steps are VM work rather
+   than compiler work.
+2. `Enum.equals` at **10.8 ns for one virtual call** (`AssertChainProbe`) against
+   a measured 8.2-9.0 ns virtual-call floor — so it is a plain virtual call and
+   nothing more, which retires this page's earlier "37 ns, six times a compiled
+   virtual call" reading. `Enum.ordinal()` and `Object.equals` remain registered
+   natives on the ~160 ns funnel
+   ([`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)),
+   but this chain reaches neither.
+
+## Two notes on this page's own probes, for the next reader
 
 `probes/DecomposeProbe.java`'s `empty` arm measures **43 ns/iter** for
 `sink += c` on a `static long` — so every row of that probe carries a ~43 ns
 baseline that has nothing to do with the rung it names, and its `valueOf` row
 (312 ns) additionally includes an `Enum.ordinal()` call, which is a registered
-native. Read `HttpStatusClassLoopRate` and `StatusLoopArmsProbe` for this loop's
-cost; `DecomposeProbe`'s rows are only comparable to each other.
+native. Read `HttpStatusClassLoopRate`, `StatusLoopArmsProbe` and
+`AssertChainProbe` for this loop's cost; `DecomposeProbe`'s rows are only
+comparable to each other.
+
+**`StatusLoopArmsProbe`'s `refcheck` arm was measuring the interpreter, and said
+so out loud if anyone had read it.** It wrote `throw new IllegalStateException()`
+inline, which puts an `athrow` in the method, and RBC.6 (`has_athrow`) refuses
+OSR for any method that `athrow`s — so that one arm ran interpreted while its
+four siblings compiled. It read **825.91 ns/iter against `full`'s 80.57**: the
+SUBSET arm ten times slower than the superset it is a subset of, which is
+arithmetically impossible and is the tell. Fixed 2026-08-17 by routing the
+failure through a callee. Any arm added here must be checked against
+`CRATONVM_DBG_JITC=1` for `OSR-compile FAILED` before its number is believed.
 
 ## Repro
 
@@ -215,9 +360,9 @@ java @common.args ProgressRunner \
 * [`httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`](httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md)
   — sized as "the same mechanism at twice the iteration count". It is not the same
   mechanism: those loops never compile at all. That page carries the correction.
-* [`../jit/osr-refuses-any-method-with-an-exception-table-20260817.md`](../jit/osr-refuses-any-method-with-an-exception-table-20260817.md)
-  — the defect the sibling page turned out to be. This loop has no `try`, which is
-  why it is compiled and merely slow.
+* `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`
+  — the defect the sibling page turned out to be, fixed 2026-08-17. This loop has
+  no `try`, which is why it is compiled and merely slow.
 * [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)
   — the per-call floor for anything reaching a registered native, which is what
   prices `Enum.ordinal`/`Object.equals` above.

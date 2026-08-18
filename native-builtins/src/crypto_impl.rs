@@ -2078,6 +2078,121 @@ fn rsa_private_modpow_blinded(base: &BigUint, d: &BigUint, e: &BigUint, n: &BigU
     base.modpow(d, n)
 }
 
+/// `base^d mod n` through the Chinese Remainder Theorem, using the
+/// `(p, q, dP, dQ, qInv)` the key already carries.
+///
+/// Two half-width exponentiations replace one full-width one. A modexp is
+/// `O(exponent_bits x limbs^2)`, so halving both is `2 * 1/2 * 1/4 = 1/4` — the
+/// ~4x that `internal/performance/rsa-private-key-op-crt-FIXED-20260817`
+/// named.
+///
+/// Returns `None` — sending the caller back to the full-width `d` — in every
+/// case where the CRT answer cannot be *trusted*, not merely where it cannot be
+/// computed:
+///
+/// * the key carries no CRT parameters (a bare `(n, d)` import), or they are
+///   structurally degenerate;
+/// * the public exponent cannot verify the result (see below);
+/// * **the fault check fails.**
+///
+/// ## The fault check is not optional
+///
+/// CRT-RSA that returns an unverified result is the Bellcore fault attack: if
+/// exactly one half computes wrongly — a bit flip, a malformed imported
+/// parameter, or a bug in this function — then `gcd(s - s_correct, n)` hands
+/// the attacker a factor of `n`, and a *single* faulty signature is enough.
+/// This matters here specifically because CRT parameters do not only come from
+/// `generate_keypair`: `parse_rsa_private_key_der` reads all five straight out
+/// of a PKCS#8 file with no consistency check, so `p` and `q` can be attacker-
+/// supplied and need not satisfy `n == p*q` at all.
+///
+/// So the result is verified with one public exponentiation before it is
+/// returned. `e` is small (65537 in practice, 17 bits), which makes the check
+/// ~3% of the operation it protects. A key whose `e` is too small to verify
+/// with gets no CRT at all rather than an unverified fast path — declining to
+/// go fast is always available, and going fast unverified is not.
+fn rsa_crt_exponentiate(key: &RsaPrivateKey, base: &BigUint) -> Option<BigUint> {
+    let (Some(p), Some(q), Some(dp), Some(dq), Some(qinv)) = (
+        key.p.as_ref(),
+        key.q.as_ref(),
+        key.dp.as_ref(),
+        key.dq.as_ref(),
+        key.qinv.as_ref(),
+    ) else {
+        return None; // bare (n, d) import — nothing to use
+    };
+    // A zero or one modulus has no residue ring worth the name, and `modulo`
+    // by zero is not a question this should be asking.
+    if p.is_zero() || q.is_zero() || p.is_one() || q.is_one() {
+        return None;
+    }
+    // No verifiable public exponent => no CRT. See the fault-check note above.
+    if key.e.cmp(&BigUint::from_u64(3)) == std::cmp::Ordering::Less {
+        return None;
+    }
+
+    // The two halves. Reducing the base first is what makes each exponentiation
+    // half-width in the *modulus* as well as the exponent.
+    let m1 = base.modulo(p).modpow(dp, p);
+    let m2 = base.modulo(q).modpow(dq, q);
+
+    // Garner recombination: h = qInv * (m1 - m2) mod p, m = m2 + q*h.
+    // `BigUint::sub` panics on underflow and `m1 < m2` is perfectly ordinary,
+    // so the difference is taken in [0, p) explicitly. `m2` is reduced mod `p`
+    // first because nothing here guarantees `q < p` — the JDK convention holds
+    // for generated keys, but an imported key may carry them either way round,
+    // and Garner does not actually care as long as `qInv*q == 1 (mod p)`.
+    let m2p = m2.modulo(p);
+    let diff = if m1.cmp(&m2p) == std::cmp::Ordering::Less {
+        m1.add(p).sub(&m2p)
+    } else {
+        m1.sub(&m2p)
+    };
+    let h = qinv.mul(&diff).modulo(p);
+    let m = m2.add(&q.mul(&h));
+
+    // Bellcore. Everything above is unverified arithmetic until this passes.
+    if m.modpow(&key.e, &key.n).cmp(&base.modulo(&key.n)) != std::cmp::Ordering::Equal {
+        return None;
+    }
+    Some(m)
+}
+
+/// `base^d mod n`, by CRT when the key can support a *verified* one and by the
+/// full-width exponent otherwise. The fallback is what makes every refusal in
+/// [`rsa_crt_exponentiate`] safe: declining CRT costs speed, never correctness.
+fn rsa_private_exponentiate(key: &RsaPrivateKey, base: &BigUint) -> BigUint {
+    match rsa_crt_exponentiate(key, base) {
+        Some(m) => m,
+        None => base.modpow(&key.d, &key.n),
+    }
+}
+
+/// The private-key operation every signing path should call: base blinding on
+/// the outside, CRT on the inside.
+///
+/// The composition order is the one OpenSSL uses and it is the only one that
+/// works: blind first, so the secret-exponent arithmetic — both CRT halves
+/// included — runs on a uniformly random, message-independent operand, then
+/// unblind the result. Blinding the *output* would leave the halves running on
+/// attacker-chosen data and defeat the point (VULN(2)).
+///
+/// The fault check inside runs against the blinded base, which is exactly
+/// right: it verifies the arithmetic that actually executed.
+fn rsa_private_op_blinded(key: &RsaPrivateKey, base: &BigUint) -> BigUint {
+    if let Some(r) = rsa_random_coprime(&key.n) {
+        if let Some(r_inv) = r.modinv(&key.n) {
+            let re = r.modpow(&key.e, &key.n);
+            let blinded = base.mul(&re).modulo(&key.n);
+            let s_blinded = rsa_private_exponentiate(key, &blinded);
+            return s_blinded.mul(&r_inv).modulo(&key.n);
+        }
+    }
+    // Blinding material unavailable (OS entropy down). Still CRT, still
+    // verified — just without the message-independence property.
+    rsa_private_exponentiate(key, base)
+}
+
 /// Compute `base^d mod n` with blinding when the public exponent `e` is NOT
 /// available (the `Cipher` decrypt path only carries `(n, d)`).
 ///
@@ -2336,7 +2451,7 @@ impl Rsa {
         // timing channel of the variable-time `modpow` (VULN(2)). The public
         // exponent `e` is available on `RsaPrivateKey`, so use the efficient
         // single-secret-modpow `r^e` blinding.
-        let s = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
+        let s = rsa_private_op_blinded(key, &m);
         s.to_bytes_be_padded(k)
     }
 
@@ -2471,7 +2586,7 @@ impl Rsa {
             return Vec::new();
         };
         let m = BigUint::from_bytes_be(&em);
-        rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n).to_bytes_be_padded(k)
+        rsa_private_op_blinded(key, &m).to_bytes_be_padded(k)
     }
 
     fn pkcs1v15_encode_digest(
@@ -2551,7 +2666,7 @@ impl Rsa {
         // Blinded, for the same VULN(2) reason `sign_sha256` is blinded: the
         // variable-time `modpow` otherwise leaks a message-dependent timing
         // signal, and `NONEwithRSA` payloads are frequently attacker-chosen.
-        let sig = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
+        let sig = rsa_private_op_blinded(key, &m);
         Some(sig.to_bytes_be_padded(k))
     }
 
@@ -2806,7 +2921,31 @@ fn rsa_oaep_hash(pad: RsaCipherPadding, data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// MGF1 mask generation (RFC 8017 Appendix B.2.1) over the OAEP digest.
+/// The digest MGF1 uses, which is NOT the OAEP message digest.
+///
+/// `OAEPWith<md>AndMGF1Padding` names only `<md>`, and SunJCE reads the rest
+/// from `OAEPParameterSpec`'s default rather than from the name: MGF1 is
+/// **SHA-1** whatever `<md>` is. That is a documented JDK quirk and it is
+/// interop-visible, because a peer that defaults MGF1 to `<md>` instead
+/// produces ciphertext this engine cannot read and vice versa.
+///
+/// Measured on jdk-25: ciphertext from SunJCE's
+/// `OAEPWithSHA-256AndMGF1Padding` decrypts under BouncyCastle only when BC is
+/// given `MGF1ParameterSpec.SHA1`, and refuses `MGF1ParameterSpec.SHA256`.
+/// This engine answers as SunJCE, so it has to make SunJCE's choice —
+/// `RSATest.oaepCompatibilityTest`, which encrypts with SunJCE and decrypts
+/// with BC, failed `BadBlockException: unable to decrypt block` for every
+/// digest but SHA-1, where the two happen to coincide.
+///
+/// NOTE: an explicit `OAEPParameterSpec` is still ignored by the `Cipher`
+/// registrations (the digest is taken from the transformation string), so this
+/// matches SunJCE's DEFAULT only. Honouring a caller-supplied MGF1 digest needs
+/// the spec to be read at `init` first.
+const OAEP_MGF1_DIGEST: RsaCipherPadding = RsaCipherPadding::OaepSha1;
+
+/// MGF1 mask generation (RFC 8017 Appendix B.2.1). `pad` selects the MGF1
+/// digest, which callers pass as [`OAEP_MGF1_DIGEST`] — not the padding's own
+/// message digest.
 fn rsa_mgf1(pad: RsaCipherPadding, seed: &[u8], len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len + pad.hlen());
     let mut counter: u32 = 0;
@@ -2991,9 +3130,9 @@ fn rsa_oaep_pad(pad: RsaCipherPadding, msg: &[u8], k: usize) -> Result<Vec<u8>, 
     db.extend_from_slice(msg);
     let mut seed = vec![0u8; hlen];
     SecureRandom::new().next_bytes(&mut seed);
-    let db_mask = rsa_mgf1(pad, &seed, k - hlen - 1);
+    let db_mask = rsa_mgf1(OAEP_MGF1_DIGEST, &seed, k - hlen - 1);
     let masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
-    let seed_mask = rsa_mgf1(pad, &masked_db, hlen);
+    let seed_mask = rsa_mgf1(OAEP_MGF1_DIGEST, &masked_db, hlen);
     let masked_seed: Vec<u8> = seed
         .iter()
         .zip(seed_mask.iter())
@@ -3025,13 +3164,13 @@ fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
     }
     let masked_seed = &em[1..1 + hlen];
     let masked_db = &em[1 + hlen..];
-    let seed_mask = rsa_mgf1(pad, masked_db, hlen);
+    let seed_mask = rsa_mgf1(OAEP_MGF1_DIGEST, masked_db, hlen);
     let seed: Vec<u8> = masked_seed
         .iter()
         .zip(seed_mask.iter())
         .map(|(a, b)| a ^ b)
         .collect();
-    let db_mask = rsa_mgf1(pad, &seed, masked_db.len());
+    let db_mask = rsa_mgf1(OAEP_MGF1_DIGEST, &seed, masked_db.len());
     let db: Vec<u8> = masked_db
         .iter()
         .zip(db_mask.iter())
@@ -3126,6 +3265,70 @@ pub fn rsa_cipher_decrypt(
 ) -> Result<Vec<u8>, RsaCipherError> {
     let n_big = BigUint::from_bytes_be(n);
     let d_big = BigUint::from_bytes_be(d);
+    // Blinded private exponentiation (VULN(2)): this entry point carries only
+    // `(n, d)` — no public exponent, no CRT parameters — so it takes the no-`e`
+    // two-modpow blinding and the full-width exponent. Callers that can name a
+    // key handle should prefer `rsa_cipher_decrypt_by_id`, which reaches the
+    // CRT parameters and is ~3x faster.
+    rsa_cipher_decrypt_with(&n_big, pad, ct, |c| {
+        rsa_private_modpow_blinded_no_e(c, &d_big, &n_big)
+    })
+}
+
+/// `rsa_cipher_decrypt` for a caller that holds a `crypto_impl` key handle.
+///
+/// The handle reaches the whole `RsaPrivateKey` — including the CRT parameters
+/// the byte-slice entry point above cannot see — so this takes the CRT private
+/// op. Returns `None` when the handle cannot be trusted to name this key, which
+/// the caller treats as "fall back to the `(n, d)` form", not as a decryption
+/// failure.
+///
+/// ## `expect_n` is a safety interlock, not a sanity check
+///
+/// A handle can be *wrong* rather than merely absent. The JCA layer resolves it
+/// from an identity side-table and, failing that, from a fixed field slot on the
+/// key object — and on a genuine JDK key that slot holds whatever that class
+/// puts there. Key ids are small consecutive integers, so an unrelated small
+/// `int` in that slot can easily collide with a live id and name **a different
+/// key**, which would decrypt to a wrong plaintext rather than to an error.
+///
+/// So the handle is only honoured when the key it names carries the modulus the
+/// caller actually initialised with. A collision then declines instead of
+/// decrypting, and the cost is one big-endian comparison.
+///
+/// Retires the `Cipher` decrypt half of
+/// `internal/performance/rsa-private-key-op-crt-FIXED-20260817`.
+pub fn rsa_cipher_decrypt_by_id(
+    id: u64,
+    expect_n: &[u8],
+    pad: RsaCipherPadding,
+    ct: &[u8],
+) -> Option<Result<Vec<u8>, RsaCipherError>> {
+    let guard = RSA_KEY_STORE.read();
+    let key = &guard.as_ref()?.get(&id)?.private_key;
+    // The interlock. `BigUint` round-trips through `to_bytes_be`, so comparing
+    // the parsed values rather than the raw slices tolerates leading-zero
+    // padding differences between the two sources.
+    if key.n.cmp(&BigUint::from_bytes_be(expect_n)) != std::cmp::Ordering::Equal {
+        return None;
+    }
+    let n_big = key.n.clone();
+    Some(rsa_cipher_decrypt_with(&n_big, pad, ct, |c| {
+        rsa_private_op_blinded(key, c)
+    }))
+}
+
+/// The shared body of both decrypt entry points. Everything about length
+/// refusal, representative range, and the collapsed padding-failure surface is
+/// identical; only the private-key operation differs, so only that is a
+/// parameter. Keeping one body is what stops the two paths from drifting into
+/// different exception classes for the same input.
+fn rsa_cipher_decrypt_with(
+    n_big: &BigUint,
+    pad: RsaCipherPadding,
+    ct: &[u8],
+    private_op: impl FnOnce(&BigUint) -> BigUint,
+) -> Result<Vec<u8>, RsaCipherError> {
     let k = (n_big.bit_length() + 7) / 8;
     if k == 0 {
         return Err(RsaCipherError::Key("RSA: invalid (zero) modulus".into()));
@@ -3147,16 +3350,15 @@ pub fn rsa_cipher_decrypt(
     // not a decryptable representative and SunJCE says so with a checked
     // `BadPaddingException("Message is larger than modulus")`. Reachable only
     // through `NoPadding`, where the caller supplies the integer directly.
-    if c.cmp(&n_big) != std::cmp::Ordering::Less {
+    if c.cmp(n_big) != std::cmp::Ordering::Less {
         return Err(RsaCipherError::Padding(
             "Message is larger than modulus".into(),
         ));
     }
-    // Blinded private exponentiation (VULN(2)): the `Cipher` decrypt path only
-    // carries `(n, d)` — the public exponent `e` is not threaded here — so use
-    // the no-`e` two-modpow blinding to remove the message-dependent (adaptive
-    // ciphertext) timing channel that an RSA decryption-timing attacker probes.
-    let m = rsa_private_modpow_blinded_no_e(&c, &d_big, &n_big);
+    // The blinded private exponentiation the caller chose (VULN(2)): blinding
+    // is what removes the message-dependent timing channel an adaptive
+    // ciphertext attacker probes, so both forms of `private_op` blind.
+    let m = private_op(&c);
     let em = m.to_bytes_be_padded(k);
     // Every padding failure — wrong key, flipped byte, short ciphertext — has
     // already been collapsed to the single opaque `RSA_PADDING_ERROR` string by
@@ -3307,7 +3509,7 @@ pub fn rsa_sign_pss_ex(
     em.extend_from_slice(&h);
     em.push(0xbc);
     let m = BigUint::from_bytes_be(&em);
-    rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n).to_bytes_be_padded(k)
+    rsa_private_op_blinded(key, &m).to_bytes_be_padded(k)
 }
 
 /// RSASSA-PSS verify with MGF1 over the same digest and salt length == hLen
@@ -4420,8 +4622,12 @@ impl X509Cert {
                 }
             }
             "SHA384withECDSA" => {
-                if let Some(pub_key) = parse_ecdsa_public_key(issuer_spki) {
-                    Ecdsa::verify_sha384(&pub_key, &self.tbs_bytes, &self.signature_bytes)
+                // Named-curve: `Ecdsa::verify_sha384` is P-256 with a SHA-384
+                // hash, which is a real pairing but not the common one -- a
+                // SHA-384 signature is overwhelmingly made by a P-384 key,
+                // and that is precisely the case the P-256 parser refused.
+                if let Some(pub_key) = parse_named_ec_public_key(issuer_spki) {
+                    verify_named_ecdsa(&pub_key, &Sha384::digest(&self.tbs_bytes), &self.signature_bytes)
                 } else {
                     false
                 }
@@ -4814,6 +5020,655 @@ pub fn parse_ecdsa_public_key(spki: &[u8]) -> Option<EcdsaPublicKey> {
     }
     let pk_bytes = &bs_content[1..]; // skip unused bits
     Ecdsa::public_key_from_bytes(pk_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Named-curve ECDSA verification (P-256 / P-384 / P-521)
+// ---------------------------------------------------------------------------
+//
+// WHY A SECOND ECDSA IMPLEMENTATION EXISTS BESIDE `Ecdsa`.
+//
+// `Ecdsa`/`EcPoint`/`FieldElement256` above are P-256 and only P-256:
+// `public_key_from_bytes` requires exactly 65 bytes, the field element is a
+// fixed 4x64-bit type, and the generator is hard-coded to P-256's. Every one
+// of those is correct for what it was written for and none of them can be
+// asked about another curve.
+//
+// That was invisible for as long as the certificate validator was never handed
+// a real chain. MEASURED the moment it was
+// (`tls-client-captures-only-the-leaf-...`, RealChainProbe, 20 live public
+// sites): SIX rejected with `BadSignature`, and every one of the six had a
+// P-384 issuer key -- Let's Encrypt's YE1/YE2 under Root YE, Sectigo's
+// Server Authentication Root E46, DigiCert's Global G3 TLS ECC, Google's WE1
+// under GTS Root R4. The modern public ECDSA hierarchy is P-384 at the top
+// almost everywhere, so "P-256 only" is not a corner: it is most of the
+// internet's ECDSA chains.
+//
+// The parameters below were read off OpenSSL 3.0
+// (`openssl ecparam -name <curve> -param_enc explicit -text -noout`) rather
+// than transcribed from a document, and `A` came back as `p - 3` on all three,
+// which is what lets the doubling formula below assume `a = -3`. They are
+// exercised end to end: the tests at the bottom verify signatures made by
+// OpenSSL itself.
+//
+// Speed is deliberately not the goal. Point arithmetic runs in Jacobian
+// coordinates (one modular inversion per scalar multiplication instead of one
+// per addition), over the general-purpose `BigUint` rather than a
+// curve-specialised field. A handshake verifies two or three signatures; the
+// hot paths in this VM are elsewhere.
+
+/// A NIST prime-field short-Weierstrass curve `y^2 = x^3 - 3x + b (mod p)`.
+pub struct NistCurve {
+    /// The named-curve OID's CONTENT bytes, as they appear inside the
+    /// `AlgorithmIdentifier` parameters of a `SubjectPublicKeyInfo`.
+    pub oid: &'static [u8],
+    pub name: &'static str,
+    p_hex: &'static str,
+    b_hex: &'static str,
+    gx_hex: &'static str,
+    gy_hex: &'static str,
+    n_hex: &'static str,
+    /// Bytes per field element in the uncompressed point encoding.
+    pub field_bytes: usize,
+}
+
+/// `1.2.840.10045.3.1.7` — prime256v1 / secp256r1 / NIST P-256.
+pub const OID_EC_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+/// `1.3.132.0.34` — secp384r1 / NIST P-384.
+pub const OID_EC_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+/// `1.3.132.0.35` — secp521r1 / NIST P-521.
+pub const OID_EC_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
+
+pub static NIST_P256: NistCurve = NistCurve {
+    oid: OID_EC_P256,
+    name: "P-256",
+    p_hex: "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+    b_hex: "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b",
+    gx_hex: "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+    gy_hex: "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+    n_hex: "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+    field_bytes: 32,
+};
+
+pub static NIST_P384: NistCurve = NistCurve {
+    oid: OID_EC_P384,
+    name: "P-384",
+    p_hex: "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe\
+            ffffffff0000000000000000ffffffff",
+    b_hex: "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875a\
+            c656398d8a2ed19d2a85c8edd3ec2aef",
+    gx_hex: "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a38\
+             5502f25dbf55296c3a545e3872760ab7",
+    gy_hex: "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c0\
+             0a60b1ce1d7e819d7a431d7c90ea0e5f",
+    n_hex: "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf\
+            581a0db248b0a77aecec196accc52973",
+    field_bytes: 48,
+};
+
+pub static NIST_P521: NistCurve = NistCurve {
+    oid: OID_EC_P521,
+    name: "P-521",
+    p_hex: "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+            ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+            ffff",
+    b_hex: "51953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109\
+            e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b503f\
+            00",
+    gx_hex: "00c6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d\
+             3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5\
+             bd66",
+    gy_hex: "011839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e\
+             662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd1\
+             6650",
+    n_hex: "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+            fffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e9138\
+            6409",
+    field_bytes: 66,
+};
+
+/// The curve a named-curve OID selects, or `None` for one this verifier does
+/// not implement. `None` is a REFUSAL, never a silent success: the caller
+/// reports it as a failed signature, which is the safe direction.
+pub fn nist_curve_for_oid(oid_content: &[u8]) -> Option<&'static NistCurve> {
+    for c in [&NIST_P256, &NIST_P384, &NIST_P521] {
+        if c.oid == oid_content {
+            return Some(c);
+        }
+    }
+    None
+}
+
+fn hex_to_biguint(h: &str) -> BigUint {
+    let mut bytes = Vec::with_capacity(h.len() / 2 + 1);
+    let digits: Vec<u8> = h
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .map(|b| match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            // The literals above are compile-time constants in this file; a
+            // non-hex byte here is a source-editing mistake, not input.
+            _ => unreachable!("non-hex digit in a curve parameter literal"),
+        })
+        .collect();
+    // An odd digit count would silently shift every byte; the constants are
+    // written in whole bytes, so treat it as the editing mistake it is.
+    assert!(digits.len() % 2 == 0, "curve parameter has an odd hex digit count");
+    for pair in digits.chunks(2) {
+        bytes.push((pair[0] << 4) | pair[1]);
+    }
+    BigUint::from_bytes_be(&bytes)
+}
+
+/// The parsed parameters, built once per curve.
+struct CurveParams {
+    p: BigUint,
+    b: BigUint,
+    gx: BigUint,
+    gy: BigUint,
+    n: BigUint,
+}
+
+impl NistCurve {
+    fn params(&'static self) -> &'static CurveParams {
+        static CACHE: std::sync::OnceLock<
+            parking_lot::Mutex<std::collections::HashMap<&'static str, &'static CurveParams>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let mut guard = cache.lock();
+        if let Some(found) = guard.get(self.name) {
+            return found;
+        }
+        // Leaked deliberately: three curves, once each, for the process
+        // lifetime. The alternative is re-parsing five big integers on every
+        // signature verification.
+        let params: &'static CurveParams = Box::leak(Box::new(CurveParams {
+            p: hex_to_biguint(self.p_hex),
+            b: hex_to_biguint(self.b_hex),
+            gx: hex_to_biguint(self.gx_hex),
+            gy: hex_to_biguint(self.gy_hex),
+            n: hex_to_biguint(self.n_hex),
+        }));
+        guard.insert(self.name, params);
+        params
+    }
+
+    /// The curve's group order, for the range checks and the `mod n`
+    /// arithmetic in ECDSA verification.
+    pub fn order(&'static self) -> &'static BigUint {
+        &self.params().n
+    }
+}
+
+/// A point in Jacobian coordinates: affine `(X/Z^2, Y/Z^3)`, with `Z == 0`
+/// standing for the point at infinity.
+#[derive(Clone)]
+struct JPoint {
+    x: BigUint,
+    y: BigUint,
+    z: BigUint,
+}
+
+fn mod_add(a: &BigUint, b: &BigUint, p: &BigUint) -> BigUint {
+    a.add(b).modulo(p)
+}
+
+/// `a - b (mod p)`, with both operands already reduced. Written out rather
+/// than `a.sub(b)` because `BigUint` is UNSIGNED: the borrow case has to be
+/// turned into `a + p - b` before the subtraction, not after it.
+fn mod_sub(a: &BigUint, b: &BigUint, p: &BigUint) -> BigUint {
+    match a.cmp(b) {
+        std::cmp::Ordering::Less => a.add(p).sub(b).modulo(p),
+        _ => a.sub(b).modulo(p),
+    }
+}
+
+fn mod_mul(a: &BigUint, b: &BigUint, p: &BigUint) -> BigUint {
+    a.mul(b).modulo(p)
+}
+
+fn mod_sqr(a: &BigUint, p: &BigUint) -> BigUint {
+    a.mul(a).modulo(p)
+}
+
+fn mod_mul_small(a: &BigUint, k: u32, p: &BigUint) -> BigUint {
+    a.mul_u32(k).modulo(p)
+}
+
+impl JPoint {
+    fn infinity() -> Self {
+        JPoint {
+            x: BigUint::one(),
+            y: BigUint::one(),
+            z: BigUint::zero(),
+        }
+    }
+
+    fn is_infinity(&self) -> bool {
+        self.z.is_zero()
+    }
+
+    fn from_affine(x: BigUint, y: BigUint) -> Self {
+        JPoint {
+            x,
+            y,
+            z: BigUint::one(),
+        }
+    }
+
+    /// `dbl-2001-b`, the standard `a = -3` doubling. Every NIST prime curve
+    /// here has `a = p - 3`, which OpenSSL's own explicit parameters confirm.
+    fn double(&self, p: &BigUint) -> JPoint {
+        if self.is_infinity() || self.y.is_zero() {
+            return JPoint::infinity();
+        }
+        let delta = mod_sqr(&self.z, p);
+        let gamma = mod_sqr(&self.y, p);
+        let beta = mod_mul(&self.x, &gamma, p);
+        let alpha = mod_mul(
+            &mod_mul_small(&mod_sub(&self.x, &delta, p), 3, p),
+            &mod_add(&self.x, &delta, p),
+            p,
+        );
+        let x3 = mod_sub(&mod_sqr(&alpha, p), &mod_mul_small(&beta, 8, p), p);
+        let z3 = mod_sub(
+            &mod_sub(&mod_sqr(&mod_add(&self.y, &self.z, p), p), &gamma, p),
+            &delta,
+            p,
+        );
+        let y3 = mod_sub(
+            &mod_mul(&alpha, &mod_sub(&mod_mul_small(&beta, 4, p), &x3, p), p),
+            &mod_mul_small(&mod_sqr(&gamma, p), 8, p),
+            p,
+        );
+        JPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// `add-2007-bl`.
+    fn add(&self, other: &JPoint, p: &BigUint) -> JPoint {
+        if self.is_infinity() {
+            return other.clone();
+        }
+        if other.is_infinity() {
+            return self.clone();
+        }
+        let z1z1 = mod_sqr(&self.z, p);
+        let z2z2 = mod_sqr(&other.z, p);
+        let u1 = mod_mul(&self.x, &z2z2, p);
+        let u2 = mod_mul(&other.x, &z1z1, p);
+        let s1 = mod_mul(&mod_mul(&self.y, &other.z, p), &z2z2, p);
+        let s2 = mod_mul(&mod_mul(&other.y, &self.z, p), &z1z1, p);
+        if u1.cmp(&u2) == std::cmp::Ordering::Equal {
+            return if s1.cmp(&s2) == std::cmp::Ordering::Equal {
+                self.double(p)
+            } else {
+                JPoint::infinity()
+            };
+        }
+        let h = mod_sub(&u2, &u1, p);
+        let i = mod_sqr(&mod_mul_small(&h, 2, p), p);
+        let j = mod_mul(&h, &i, p);
+        let r = mod_mul_small(&mod_sub(&s2, &s1, p), 2, p);
+        let v = mod_mul(&u1, &i, p);
+        let x3 = mod_sub(
+            &mod_sub(&mod_sqr(&r, p), &j, p),
+            &mod_mul_small(&v, 2, p),
+            p,
+        );
+        let y3 = mod_sub(
+            &mod_mul(&r, &mod_sub(&v, &x3, p), p),
+            &mod_mul_small(&mod_mul(&s1, &j, p), 2, p),
+            p,
+        );
+        let z3 = mod_mul(
+            &mod_sub(
+                &mod_sub(&mod_sqr(&mod_add(&self.z, &other.z, p), p), &z1z1, p),
+                &z2z2,
+                p,
+            ),
+            &h,
+            p,
+        );
+        JPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    fn scalar_mul(&self, k: &BigUint, p: &BigUint) -> JPoint {
+        let mut acc = JPoint::infinity();
+        let bits = k.bit_length();
+        if bits == 0 {
+            return acc;
+        }
+        for i in (0..bits).rev() {
+            acc = acc.double(p);
+            if k.bit(i) {
+                acc = acc.add(self, p);
+            }
+        }
+        acc
+    }
+
+    /// The affine x coordinate, or `None` at infinity.
+    fn affine_x(&self, p: &BigUint) -> Option<BigUint> {
+        if self.is_infinity() {
+            return None;
+        }
+        let z_inv = self.z.modinv(p)?;
+        Some(mod_mul(&self.x, &mod_sqr(&z_inv, p), p))
+    }
+}
+
+/// A public key on a named curve, as recovered from a `SubjectPublicKeyInfo`.
+pub struct NamedEcPublicKey {
+    pub curve: &'static NistCurve,
+    x: BigUint,
+    y: BigUint,
+}
+
+/// Parse a `SubjectPublicKeyInfo` that names one of the curves above.
+///
+/// The curve OID is READ, not assumed. `parse_ecdsa_public_key` (the P-256
+/// path beside this) discards the `AlgorithmIdentifier` parameters entirely
+/// and then requires a 65-byte point, which is how a P-384 key came back as
+/// `None` and the caller reported a bad signature -- a REFUSAL that reads
+/// exactly like a forged certificate.
+pub fn parse_named_ec_public_key(spki: &[u8]) -> Option<NamedEcPublicKey> {
+    let (_, outer) = der_read_tag_length(spki)?;
+    let (alg_total, alg_content) = der_read_tag_length(outer)?;
+    // AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY }.
+    // The first OID must be id-ecPublicKey; the second is the named curve.
+    let (first_total, _) = der_read_tag_length(alg_content)?;
+    if alg_content.first() != Some(&0x06) {
+        return None;
+    }
+    let params = alg_content.get(first_total..)?;
+    if params.first() != Some(&0x06) {
+        // Explicit (non-named) curve parameters, or an absent one. Neither is
+        // something a public PKIX chain uses, and guessing is not an option.
+        return None;
+    }
+    let (_, curve_oid) = der_read_tag_length(params)?;
+    let curve = nist_curve_for_oid(curve_oid)?;
+
+    let rest = outer.get(alg_total..)?;
+    if rest.first() != Some(&0x03) {
+        return None;
+    }
+    let (_, bs_content) = der_read_tag_length(rest)?;
+    if bs_content.is_empty() {
+        return None;
+    }
+    let point = &bs_content[1..]; // skip the unused-bits octet
+    let fb = curve.field_bytes;
+    if point.len() != 1 + 2 * fb || point[0] != 0x04 {
+        // Compressed points are legal ASN.1 and are not used by any CA whose
+        // chain reaches this code; refusing is the safe answer.
+        return None;
+    }
+    Some(NamedEcPublicKey {
+        curve,
+        x: BigUint::from_bytes_be(&point[1..1 + fb]),
+        y: BigUint::from_bytes_be(&point[1 + fb..1 + 2 * fb]),
+    })
+}
+
+/// ECDSA verification (FIPS 186-4 §6.4) on the key's own curve.
+///
+/// `digest` is the PRE-HASHED message. Its leftmost `min(bitlen(n), 8*len)`
+/// bits become `z`, which is what makes SHA-256 usable with P-384 and
+/// SHA-512 with P-256 without a separate path per pairing.
+pub fn verify_named_ecdsa(key: &NamedEcPublicKey, digest: &[u8], der_sig: &[u8]) -> bool {
+    let (r_bytes, s_bytes) = match der_decode_ecdsa_signature(der_sig) {
+        Some(v) => v,
+        None => return false,
+    };
+    let params = key.curve.params();
+    let (p, n) = (&params.p, &params.n);
+    let r = BigUint::from_bytes_be(&r_bytes);
+    let s = BigUint::from_bytes_be(&s_bytes);
+    if r.is_zero() || r.cmp(n) != std::cmp::Ordering::Less {
+        return false;
+    }
+    if s.is_zero() || s.cmp(n) != std::cmp::Ordering::Less {
+        return false;
+    }
+    // The public key must actually be ON the curve. Without this an attacker
+    // can supply a point on a different (weaker) curve and have the group law
+    // above compute in that group instead -- the classic invalid-curve attack.
+    // Cheap here, and this verifier is reachable from certificate parsing.
+    let lhs = mod_sqr(&key.y, p);
+    let rhs = mod_add(
+        &mod_sub(
+            &mod_mul(&mod_sqr(&key.x, p), &key.x, p),
+            &mod_mul_small(&key.x, 3, p),
+            p,
+        ),
+        &params.b,
+        p,
+    );
+    if lhs.cmp(&rhs) != std::cmp::Ordering::Equal {
+        return false;
+    }
+
+    let n_bits = n.bit_length();
+    let digest_bits = digest.len() * 8;
+    let mut z = BigUint::from_bytes_be(digest);
+    if digest_bits > n_bits {
+        z = z.shr_bits((digest_bits - n_bits) as u32);
+    }
+    let z = z.modulo(n);
+
+    let s_inv = match s.modinv(n) {
+        Some(v) => v,
+        None => return false,
+    };
+    let u1 = z.mul(&s_inv).modulo(n);
+    let u2 = r.mul(&s_inv).modulo(n);
+
+    let g = JPoint::from_affine(params.gx.clone(), params.gy.clone());
+    let q = JPoint::from_affine(key.x.clone(), key.y.clone());
+    let point = g.scalar_mul(&u1, p).add(&q.scalar_mul(&u2, p), p);
+    match point.affine_x(p) {
+        Some(x) => x.modulo(n).cmp(&r) == std::cmp::Ordering::Equal,
+        None => false,
+    }
+}
+
+/// The curve table, checked as a table.
+///
+/// A transcription error in `p`, `n` or `b` does not produce a wrong answer —
+/// it produces a verifier that rejects EVERYTHING, which is indistinguishable
+/// from "the signature was bad" and is exactly the failure mode this whole
+/// section exists to fix. So the parameters are checked as parameters, with
+/// relations that only hold for the real curve.
+#[cfg(test)]
+mod named_curve_param_tests {
+    use super::*;
+
+    #[test]
+    fn the_generator_is_on_the_curve() {
+        for curve in [&NIST_P256, &NIST_P384, &NIST_P521] {
+            let params = curve.params();
+            let p = &params.p;
+            let lhs = mod_sqr(&params.gy, p);
+            let rhs = mod_add(
+                &mod_sub(
+                    &mod_mul(&mod_sqr(&params.gx, p), &params.gx, p),
+                    &mod_mul_small(&params.gx, 3, p),
+                    p,
+                ),
+                &params.b,
+                p,
+            );
+            assert_eq!(
+                lhs.to_bytes_be(),
+                rhs.to_bytes_be(),
+                "{}: the generator is not on y^2 = x^3 - 3x + b — a parameter is wrong",
+                curve.name
+            );
+        }
+    }
+
+    /// `n * G` is the identity: the definition of the group order, and the one
+    /// relation that exercises the whole double-and-add ladder — both point
+    /// formulas, on every curve — against a value that is not derived from
+    /// them.
+    #[test]
+    fn the_generator_has_the_stated_order() {
+        for curve in [&NIST_P256, &NIST_P384, &NIST_P521] {
+            let params = curve.params();
+            let g = JPoint::from_affine(params.gx.clone(), params.gy.clone());
+            assert!(
+                g.scalar_mul(&params.n, &params.p).is_infinity(),
+                "{}: n*G is not the identity — the group law or a parameter is wrong",
+                curve.name
+            );
+            // …and (n-1)*G is NOT, or a ladder that returned infinity for
+            // every scalar would pass the line above just as well.
+            assert!(
+                !g.scalar_mul(&params.n.sub(&BigUint::one()), &params.p)
+                    .is_infinity(),
+                "{}: (n-1)*G is the identity — the ladder collapses everything",
+                curve.name
+            );
+        }
+    }
+
+    #[test]
+    fn field_and_order_have_the_documented_bit_lengths() {
+        for (curve, bits) in [(&NIST_P256, 256), (&NIST_P384, 384), (&NIST_P521, 521)] {
+            let params = curve.params();
+            assert_eq!(params.p.bit_length(), bits, "{} p", curve.name);
+            assert_eq!(params.n.bit_length(), bits, "{} n", curve.name);
+            assert_eq!(curve.field_bytes, bits.div_ceil(8), "{} field_bytes", curve.name);
+        }
+    }
+
+    /// The OID is READ, not assumed. That is the whole difference from
+    /// `parse_ecdsa_public_key`, which discards the named-curve OID and then
+    /// fails on the point LENGTH — so a perfectly good P-384 key read as a
+    /// corrupt one and the caller reported a bad signature.
+    #[test]
+    fn an_unsupported_curve_oid_parses_to_none() {
+        // secp256k1 (1.3.132.0.10): a real curve, deliberately not implemented.
+        assert!(nist_curve_for_oid(&[0x2b, 0x81, 0x04, 0x00, 0x0a]).is_none());
+        assert_eq!(nist_curve_for_oid(OID_EC_P256).map(|c| c.name), Some("P-256"));
+        assert_eq!(nist_curve_for_oid(OID_EC_P384).map(|c| c.name), Some("P-384"));
+        assert_eq!(nist_curve_for_oid(OID_EC_P521).map(|c| c.name), Some("P-521"));
+    }
+
+    /// A key that is not ON the curve must be refused before the group law
+    /// touches it — the invalid-curve attack, which this verifier is reachable
+    /// from certificate parsing by.
+    #[test]
+    fn a_public_key_off_the_curve_is_refused() {
+        let params = NIST_P384.params();
+        let key = NamedEcPublicKey {
+            curve: &NIST_P384,
+            x: params.gx.clone(),
+            y: mod_add(&params.gy, &BigUint::one(), &params.p),
+        };
+        // A well-formed (r, s), so the refusal cannot be the signature
+        // decoder's doing instead.
+        let sig = der_encode_ecdsa_signature(&[0x01, 0x02], &[0x03, 0x04]);
+        assert!(!verify_named_ecdsa(&key, &[7u8; 48], &sig));
+    }
+}
+
+/// The verifier, checked against signatures it did not make.
+///
+/// A verifier tested only against its own signer proves the two AGREE, not
+/// that either is right — and there is no signer here at all, only a verifier,
+/// so the arithmetic has to be checked against an outside authority. OpenSSL
+/// is that authority: it generates the key, makes the signature, and encodes
+/// the SPKI; this code only reads and verifies.
+///
+/// Every acceptance is paired with a rejection of the SAME signature over a
+/// changed message. Without the pair, a `verify` that returned `true`
+/// unconditionally would pass every case here.
+#[cfg(all(test, unix))]
+mod named_curve_openssl_tests {
+    use super::*;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::sign::Signer;
+
+    fn round_trip(nid: Nid, digest: MessageDigest, expect: &str) {
+        let group = EcGroup::from_curve_name(nid).expect("group");
+        let key = EcKey::generate(&group).expect("keygen");
+        let spki = key.public_key_to_der().expect("spki der");
+        let pkey = PKey::from_ec_key(key).expect("pkey");
+
+        let msg = b"cratonvm named-curve verification vector";
+        let mut signer = Signer::new(digest, &pkey).expect("signer");
+        signer.update(msg).expect("update");
+        let sig = signer.sign_to_vec().expect("sign");
+
+        let parsed = parse_named_ec_public_key(&spki)
+            .unwrap_or_else(|| panic!("{expect}: OpenSSL's own SPKI did not parse"));
+        assert_eq!(parsed.curve.name, expect, "curve read from the SPKI");
+
+        let hash = |m: &[u8]| -> Vec<u8> {
+            match digest.type_() {
+                t if t == MessageDigest::sha256().type_() => Sha256::digest(m).to_vec(),
+                t if t == MessageDigest::sha384().type_() => Sha384::digest(m).to_vec(),
+                _ => Sha512::digest(m).to_vec(),
+            }
+        };
+
+        assert!(
+            verify_named_ecdsa(&parsed, &hash(msg), &sig),
+            "{expect}: a signature OpenSSL made was rejected"
+        );
+        assert!(
+            !verify_named_ecdsa(&parsed, &hash(b"cratonvm named-curve verification vecto!"), &sig),
+            "{expect}: the same signature was accepted over a DIFFERENT message"
+        );
+    }
+
+    #[test]
+    fn p256_sha256_round_trips_against_openssl() {
+        round_trip(Nid::X9_62_PRIME256V1, MessageDigest::sha256(), "P-256");
+    }
+
+    /// The one that was broken. Every ECDSA chain on the public internet whose
+    /// issuer key is P-384 — Let's Encrypt Root YE, Sectigo Root E46, DigiCert
+    /// Global G3 TLS ECC, Google GTS Root R4 — failed here.
+    #[test]
+    fn p384_sha384_round_trips_against_openssl() {
+        round_trip(Nid::SECP384R1, MessageDigest::sha384(), "P-384");
+    }
+
+    #[test]
+    fn p521_sha512_round_trips_against_openssl() {
+        round_trip(Nid::SECP521R1, MessageDigest::sha512(), "P-521");
+    }
+
+    /// A digest WIDER than the curve order has to be truncated to the order's
+    /// bit length (FIPS 186-4 §6.4), not reduced modulo it. Getting that wrong
+    /// is invisible whenever the two happen to agree, so it is asked
+    /// explicitly: SHA-512 over P-256 is the widest mismatch available.
+    #[test]
+    fn a_digest_wider_than_the_order_is_truncated_not_reduced() {
+        round_trip(Nid::X9_62_PRIME256V1, MessageDigest::sha512(), "P-256");
+    }
+
+    /// …and a digest NARROWER than the order is used whole.
+    #[test]
+    fn a_digest_narrower_than_the_order_is_used_whole() {
+        round_trip(Nid::SECP521R1, MessageDigest::sha256(), "P-521");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7310,6 +8165,12 @@ mod tests {
         }
         let secret_modpow = t.elapsed();
 
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = rsa_crt_exponentiate(&sk, &m).expect("CRT");
+        }
+        let crt = t.elapsed();
+
         let r = rsa_random_coprime(&sk.n).expect("blinding factor");
         let t = Instant::now();
         for _ in 0..10 {
@@ -7331,7 +8192,8 @@ mod tests {
 
         println!("--- RSA-2048 sign_sha256, x10 ---");
         println!("  whole signature      {whole:>12.2?}");
-        println!("  secret-exponent modpow {secret_modpow:>10.2?}");
+        println!("  secret-exponent modpow {secret_modpow:>10.2?}   (full-width d)");
+        println!("  CRT + fault check    {crt:>12.2?}");
         println!("  r.modinv(n)          {modinv:>12.2?}");
         println!("  r^e mod n            {public_modpow:>12.2?}");
         println!("  draw blinding factor {draw:>12.2?}");
@@ -7427,6 +8289,298 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The CRT private op against the full-width one it replaced.
+    ///
+    /// `internal/performance/rsa-private-key-op-crt-FIXED-20260817`
+    /// set the bar: "a differential test against the non-CRT path across key
+    /// sizes, imported-key (`None` CRT params) fallback, and the fault-check
+    /// branch". All three are here, and the differential is against
+    /// `base.modpow(&d, &n)` — the exact expression the CRT path replaced — so
+    /// the new arm is never checked only against itself.
+    #[test]
+    fn crt_private_op_matches_the_full_width_exponentiation() {
+        for bits in [1024usize, 2048] {
+            let (_pk, sk) = Rsa::generate_keypair(bits);
+            assert!(sk.p.is_some(), "generated key must carry CRT parameters");
+
+            // A spread of bases, including the ones that exercise the
+            // `m1 < m2` borrow in Garner and the degenerate residues.
+            let mut bases = vec![
+                BigUint::zero(),
+                BigUint::one(),
+                BigUint::from_u64(2),
+                BigUint::from_u64(65537),
+                sk.n.sub(&BigUint::one()),
+            ];
+            let mut seed = 0x5eed_c27_0817u64;
+            for _ in 0..24 {
+                let mut bytes = vec![0u8; bits / 8];
+                for b in bytes.iter_mut() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    *b = seed as u8;
+                }
+                bases.push(BigUint::from_bytes_be(&bytes).modulo(&sk.n));
+            }
+
+            for base in &bases {
+                let want = base.modpow(&sk.d, &sk.n);
+                let crt = rsa_crt_exponentiate(&sk, base).expect("CRT must engage");
+                assert_eq!(
+                    crt.to_bytes_be(),
+                    want.to_bytes_be(),
+                    "{bits}-bit CRT disagrees with full-width d"
+                );
+                // The dispatcher must pick the same value either way.
+                assert_eq!(
+                    rsa_private_exponentiate(&sk, base).to_bytes_be(),
+                    want.to_bytes_be(),
+                    "{bits}-bit dispatcher"
+                );
+                // Blinded, the answer is still the answer — the blinding factor
+                // is random per call, so this also says the unblind is right.
+                assert_eq!(
+                    rsa_private_op_blinded(&sk, base).to_bytes_be(),
+                    want.to_bytes_be(),
+                    "{bits}-bit blinded CRT"
+                );
+            }
+        }
+    }
+
+    /// A key with no CRT parameters — every `(n, d)` import — must still sign,
+    /// via the full-width fallback. Losing the parameters may cost speed; it
+    /// may never change an answer.
+    #[test]
+    fn crt_absent_falls_back_and_still_signs() {
+        let (pk, sk) = Rsa::generate_keypair(1024);
+        let stripped = RsaPrivateKey {
+            n: sk.n.clone(),
+            d: sk.d.clone(),
+            e: sk.e.clone(),
+            p: None,
+            q: None,
+            dp: None,
+            dq: None,
+            qinv: None,
+        };
+        let base = BigUint::from_u64(0xdead_beef);
+        assert!(
+            rsa_crt_exponentiate(&stripped, &base).is_none(),
+            "no parameters => no CRT"
+        );
+        assert_eq!(
+            rsa_private_exponentiate(&stripped, &base).to_bytes_be(),
+            base.modpow(&sk.d, &sk.n).to_bytes_be(),
+            "fallback must equal the full-width answer"
+        );
+        let msg = b"imported key, no CRT tail";
+        let sig = Rsa::sign_sha256(&stripped, msg);
+        assert!(Rsa::verify_sha256(&pk, msg, &sig), "stripped key still signs");
+
+        // Partial parameters are not usable parameters: any missing member
+        // sends it back to the fallback rather than half-computing.
+        for drop_idx in 0..5 {
+            let mut k = clone_key(&sk);
+            match drop_idx {
+                0 => k.p = None,
+                1 => k.q = None,
+                2 => k.dp = None,
+                3 => k.dq = None,
+                _ => k.qinv = None,
+            }
+            assert!(
+                rsa_crt_exponentiate(&k, &base).is_none(),
+                "missing member {drop_idx} must decline CRT"
+            );
+            assert_eq!(
+                rsa_private_exponentiate(&k, &base).to_bytes_be(),
+                base.modpow(&sk.d, &sk.n).to_bytes_be(),
+                "missing member {drop_idx} still answers correctly"
+            );
+        }
+    }
+
+    /// The Bellcore branch: a key whose CRT parameters are WRONG must be caught
+    /// by the fault check and fall back, never return the faulty value.
+    ///
+    /// This is the whole reason the check exists. A faulty CRT signature lets
+    /// `gcd(s - s_correct, n)` recover a factor of `n` from a single sample,
+    /// and `parse_rsa_private_key_der` reads all five parameters out of a
+    /// PKCS#8 file without ever checking `n == p*q`, so a hostile key file
+    /// reaches this code directly.
+    #[test]
+    fn corrupt_crt_parameters_are_caught_and_do_not_leak_a_factor() {
+        let (_pk, sk) = Rsa::generate_keypair(1024);
+        let base = BigUint::from_u64(0x1234_5678_9abc);
+        let correct = base.modpow(&sk.d, &sk.n);
+
+        // Corrupt each parameter in turn. `dP`/`dQ` are the realistic fault
+        // (a flipped exponent bit); `p`/`q`/`qInv` cover a malformed import.
+        for name in ["dP", "dQ", "qInv", "p", "q"] {
+            let mut bad = clone_key(&sk);
+            let one = BigUint::one();
+            let two = BigUint::from_u64(2);
+            match name {
+                "dP" => bad.dp = Some(bad.dp.as_ref().unwrap().add(&one)),
+                "dQ" => bad.dq = Some(bad.dq.as_ref().unwrap().add(&one)),
+                "qInv" => bad.qinv = Some(bad.qinv.as_ref().unwrap().add(&one)),
+                "p" => bad.p = Some(bad.p.as_ref().unwrap().add(&two)),
+                _ => bad.q = Some(bad.q.as_ref().unwrap().add(&two)),
+            }
+            assert!(
+                rsa_crt_exponentiate(&bad, &base).is_none(),
+                "corrupt {name} must fail the fault check"
+            );
+            // And the caller-facing entry points still return the RIGHT answer,
+            // because declining CRT falls back rather than failing.
+            assert_eq!(
+                rsa_private_exponentiate(&bad, &base).to_bytes_be(),
+                correct.to_bytes_be(),
+                "corrupt {name}: fallback answer"
+            );
+            assert_eq!(
+                rsa_private_op_blinded(&bad, &base).to_bytes_be(),
+                correct.to_bytes_be(),
+                "corrupt {name}: blinded fallback answer"
+            );
+        }
+
+        // A degenerate p or q declines before any arithmetic runs.
+        for degenerate in [BigUint::zero(), BigUint::one()] {
+            let mut bad = clone_key(&sk);
+            bad.p = Some(degenerate.clone());
+            assert!(rsa_crt_exponentiate(&bad, &base).is_none(), "degenerate p");
+            let mut bad = clone_key(&sk);
+            bad.q = Some(degenerate.clone());
+            assert!(rsa_crt_exponentiate(&bad, &base).is_none(), "degenerate q");
+        }
+
+        // An unverifiable public exponent gets no CRT at all.
+        for tiny in [BigUint::zero(), BigUint::one(), BigUint::from_u64(2)] {
+            let mut bad = clone_key(&sk);
+            bad.e = tiny;
+            assert!(
+                rsa_crt_exponentiate(&bad, &base).is_none(),
+                "e too small to verify => no CRT"
+            );
+        }
+    }
+
+    fn clone_key(k: &RsaPrivateKey) -> RsaPrivateKey {
+        RsaPrivateKey {
+            n: k.n.clone(),
+            d: k.d.clone(),
+            e: k.e.clone(),
+            p: k.p.clone(),
+            q: k.q.clone(),
+            dp: k.dp.clone(),
+            dq: k.dq.clone(),
+            qinv: k.qinv.clone(),
+        }
+    }
+
+    /// The handle-based decrypt (CRT) must be indistinguishable from the
+    /// `(n, d)` decrypt it accelerates — same plaintexts AND same failure
+    /// classes. The two share a body precisely so they cannot drift, and this
+    /// is the test that says so.
+    #[test]
+    fn decrypt_by_id_matches_the_n_d_path_including_its_refusals() {
+        let (pk, sk) = Rsa::generate_keypair(2048);
+        let id = rsa_key_next_id();
+        rsa_key_store(
+            id,
+            RsaKeyPairData {
+                public_key: pk,
+                private_key: sk,
+            },
+        );
+        let (n, d) = rsa_key_get_priv(id).expect("private components");
+        let (_, e) = rsa_key_get_pub(id).expect("public components");
+
+        for pad in [
+            RsaCipherPadding::Pkcs1,
+            RsaCipherPadding::OaepSha1,
+            RsaCipherPadding::OaepSha256,
+        ] {
+            // A ciphertext with a leading zero byte makes the "short" row below
+            // hand decrypt the same integer; re-roll, as the sibling test does.
+            let ct = loop {
+                let c = rsa_cipher_encrypt(&n, &e, pad, b"crt payload").expect("encrypt");
+                if c[0] != 0 {
+                    break c;
+                }
+            };
+
+            let by_id = rsa_cipher_decrypt_by_id(id, &n, pad, &ct)
+                .expect("handle is in the store")
+                .expect("decrypt");
+            let by_nd = rsa_cipher_decrypt(&n, &d, pad, &ct).expect("decrypt");
+            assert_eq!(by_id, b"crt payload".to_vec(), "{pad:?}: plaintext");
+            assert_eq!(by_id, by_nd, "{pad:?}: the two paths must agree");
+
+            // Refusals must carry the same class from both entry points.
+            let mut corrupt = ct.clone();
+            corrupt[200] ^= 0x01;
+            let a = rsa_cipher_decrypt_by_id(id, &n, pad, &corrupt)
+                .expect("handle")
+                .expect_err("corrupt must not decrypt");
+            let b = rsa_cipher_decrypt(&n, &d, pad, &corrupt).expect_err("corrupt");
+            assert_eq!(a.jca_class(), b.jca_class(), "{pad:?}: corrupt class");
+            assert_eq!(a.message(), b.message(), "{pad:?}: corrupt message");
+
+            let mut long = ct.clone();
+            long.push(0);
+            let a = rsa_cipher_decrypt_by_id(id, &n, pad, &long)
+                .expect("handle")
+                .expect_err("over-long must be refused");
+            let b = rsa_cipher_decrypt(&n, &d, pad, &long).expect_err("over-long");
+            assert_eq!(a.jca_class(), b.jca_class(), "{pad:?}: over-long class");
+            assert_eq!(a.message(), b.message(), "{pad:?}: over-long message");
+
+            let a = rsa_cipher_decrypt_by_id(id, &n, pad, &ct[1..])
+                .expect("handle")
+                .expect_err("short must not decrypt");
+            let b = rsa_cipher_decrypt(&n, &d, pad, &ct[1..]).expect_err("short");
+            assert_eq!(a.jca_class(), b.jca_class(), "{pad:?}: short class");
+        }
+
+        // An unknown handle is "I cannot help", not a decryption failure — the
+        // caller falls back to (n, d) rather than reporting a bad ciphertext.
+        assert!(
+            rsa_cipher_decrypt_by_id(u64::MAX, &n, RsaCipherPadding::Pkcs1, b"x").is_none(),
+            "unknown handle must decline, not fail"
+        );
+
+        // THE INTERLOCK. A handle that names a real but DIFFERENT key must
+        // decline rather than decrypt with it. This is the collision the JCA
+        // layer's field-slot fallback can produce on a genuine JDK key, and
+        // without the modulus check it would silently return a wrong plaintext.
+        let (other_pk, other_sk) = Rsa::generate_keypair(2048);
+        let other_id = rsa_key_next_id();
+        rsa_key_store(
+            other_id,
+            RsaKeyPairData {
+                public_key: other_pk,
+                private_key: other_sk,
+            },
+        );
+        let ct = rsa_cipher_encrypt(&n, &e, RsaCipherPadding::Pkcs1, b"crt payload")
+            .expect("encrypt");
+        assert!(
+            rsa_cipher_decrypt_by_id(other_id, &n, RsaCipherPadding::Pkcs1, &ct).is_none(),
+            "a handle naming a different key must decline"
+        );
+        // ...while the right handle for that same modulus still works.
+        assert_eq!(
+            rsa_cipher_decrypt_by_id(id, &n, RsaCipherPadding::Pkcs1, &ct)
+                .expect("handle")
+                .expect("decrypt"),
+            b"crt payload".to_vec()
+        );
     }
 
     // RF.6: RSA key generation produces a functional sign/verify pair.

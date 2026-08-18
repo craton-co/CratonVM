@@ -2413,20 +2413,10 @@ pub fn execute(
                         let cm = shared.classes.class_manager.read();
                         let class = cm.get_class(class_id)?;
                         for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-                            let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
-                            let leaf = class_name_ref.trim_start_matches('[');
-                            let leaf_et = match leaf.as_bytes().first() {
-                                Some(b'I') => 10u8,
-                                Some(b'J') => 11,
-                                Some(b'F') => 6,
-                                Some(b'D') => 7,
-                                Some(b'B') => 8,
-                                Some(b'C') => 5,
-                                Some(b'S') => 9,
-                                Some(b'Z') => 4,
-                                _ => 0,
-                            };
-                            mna_info.push((pc, leaf_et));
+                            // A malformed CP entry is still a whole-compile refusal.
+                            let _ = class.constant_pool.get_class_name(cp_idx)?;
+                            mna_info
+                                .push((pc, crate::jit::pack_multianewarray_site(class_id.as_u32(), cp_idx)));
                         }
                     }
                     // Resolve typecheck entries (checkcast/instanceof) if present
@@ -4697,6 +4687,12 @@ pub(crate) enum OsrBackoffOutcome {
     /// OSR didn't fire (either backoff not yet, or `try_osr` rejected and
     /// the rejection has been recorded). Caller falls through to its
     /// post-back-edge work (typically `safepoint_check` then `continue`).
+    ///
+    /// Since the RBC.6b lift this also covers a case where OSR very much DID
+    /// fire: the OSR'd body raised an exception this method catches, and the
+    /// live frame has been left parked at the handler. The caller's action is
+    /// identical — resume interpreting this frame — but no rejection is
+    /// recorded, because nothing was rejected. See `try_osr`'s `committed_out`.
     Skip,
     /// OSR completed and we're back at the root frame of this
     /// `execute_frame` invocation — bubble the return value up to the
@@ -4710,10 +4706,14 @@ pub(crate) enum OsrBackoffOutcome {
     /// `frame_idx` out-parameter (which the helper mutates).
     ContinueDispatch,
     /// The OSR'd code exited with a Java exception in flight that this frame
-    /// cannot catch (an OSR'd method provably declares no exception table —
-    /// see RBC.6b in `compile_osr_artifact`). The caller must hand the
-    /// throwable to the dispatch loop's `pending_java_exception` channel so it
-    /// unwinds from THIS frame, instead of resuming the loop.
+    /// cannot catch. Until the RBC.6b lift that was a property of the whole
+    /// population — an OSR'd method provably declared no exception table — and
+    /// now it is a per-throw verdict reached by
+    /// `route_osr_exception_out_of_artifact`: either no handler covers the
+    /// precise throw bci, or the throw site lies outside every protected range.
+    /// The caller must hand the throwable to the dispatch loop's
+    /// `pending_java_exception` channel so it unwinds from THIS frame, instead
+    /// of resuming the loop.
     ///
     /// The old behaviour here was `Skip` + a re-stashed exception, i.e.
     /// "keep interpreting this frame from where it was". That is correct only
@@ -4762,7 +4762,7 @@ fn loop_work_dbg() -> bool {
 ///     OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
 ///     OsrBackoffOutcome::ContinueDispatch => continue,
 ///     OsrBackoffOutcome::ThrowJava(exc) => {
-///         pending_java_exception = Some((exc, entry_pc));
+///         pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
 ///         continue;
 ///     }
 ///     OsrBackoffOutcome::Skip => {}
@@ -4939,6 +4939,10 @@ pub(crate) fn try_osr_with_backoff(
     // function; a single out-parameter written on exactly one path is the
     // minimal honest channel.
     let mut osr_throw: Option<ObjectRef> = None;
+    // Sibling out-channel: the OSR'd body ran and advanced this frame, but
+    // returned no value and threw nothing out — the RBC.6b lift's handler
+    // entry. See `try_osr`'s parameter doc.
+    let mut osr_committed = false;
     let osr_result = try_osr(
         shared,
         thread,
@@ -4946,12 +4950,23 @@ pub(crate) fn try_osr_with_backoff(
         osr_class_id,
         entry_pc,
         &mut osr_throw,
+        &mut osr_committed,
     );
     // Checked BEFORE the rejection bookkeeping below: the OSR'd body RAN (and
     // committed loop iterations), so this is not a rejected attempt and must
     // not consume the per-pc rejection budget.
     if let Some(exc) = osr_throw {
         return OsrBackoffOutcome::ThrowJava(exc);
+    }
+    // Same rule, same reason, for the path that ran and CAUGHT. `Skip`'s "fall
+    // through to your post-back-edge work" is the right action here — the frame
+    // is parked at a handler with the throwable on its stack, so the dispatch
+    // loop resumes there (after its safepoint check) and re-enters the cached
+    // artifact at the next hot back-edge. What must NOT happen is the rejection
+    // bookkeeping below: charging a caught exception against the per-pc budget
+    // retires OSR after five of them.
+    if osr_committed {
+        return OsrBackoffOutcome::Skip;
     }
     match osr_result {
         Some(osr_val) => {
@@ -5422,7 +5437,8 @@ fn execute_frame_from_index(
                                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                             OsrBackoffOutcome::ContinueDispatch => continue,
                                             OsrBackoffOutcome::ThrowJava(exc) => {
-                                                pending_java_exception = Some((exc, entry_pc));
+                                                pending_java_exception =
+                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                                 continue;
                                             }
                                             OsrBackoffOutcome::Skip => {}
@@ -5750,7 +5766,7 @@ fn execute_frame_from_index(
                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                             OsrBackoffOutcome::ContinueDispatch => continue,
                             OsrBackoffOutcome::ThrowJava(exc) => {
-                                pending_java_exception = Some((exc, entry_pc));
+                                pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                 continue;
                             }
                             OsrBackoffOutcome::Skip => {}
@@ -5796,7 +5812,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -5845,7 +5862,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -5893,7 +5911,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -5941,7 +5960,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -5989,7 +6009,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6037,7 +6058,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6282,7 +6304,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6329,7 +6352,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6376,7 +6400,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6423,7 +6448,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6470,7 +6496,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -6517,7 +6544,8 @@ fn execute_frame_from_index(
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                     continue;
                                 }
                                 OsrBackoffOutcome::Skip => {}
@@ -8222,7 +8250,9 @@ pub use field_access::*;
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod site_cache;
-pub use site_cache::{FieldSiteCache, MethodSiteCache, MethodSiteInfo};
+pub use site_cache::{
+    ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
+};
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
 // ---------------------------------------------------------------------------
@@ -8761,6 +8791,251 @@ fn double_binop(frame: &mut Frame, op: impl FnOnce(f64, f64) -> f64) -> Result<(
 }
 
 // -- Multi-dimensional array allocation --
+
+/// The part of a `multianewarray` site's answer that does not depend on the
+/// dimension VALUES: the leaf element type, the descriptor's bracket count, and
+/// the per-level component class ids.
+///
+/// All three are functions of `(referencing class, cp index, dimensions)` only,
+/// and that triple is fixed for a given bytecode site. Recomputing them per
+/// execution costs a `class_manager` read lock, a `get_class_name`, two `String`
+/// builds and up to two loader-aware class resolutions — measured at +227 ns on
+/// a 300k-iteration `new String[4][4]` loop (418 → 645 ns/op), which is 55% on
+/// top of the allocation itself. Memoized, the site pays that once.
+struct MultiANewArrayPlan {
+    leaf_et: ArrayElementType,
+    total_array_depth: usize,
+    /// Component class id per allocated level, outermost first.
+    component_ids: Box<[ClassId]>,
+}
+
+/// Per-site memo for [`MultiANewArrayPlan`], keyed by
+/// `(referencing_class_id, cp_index, dimensions)`.
+///
+/// Only FULLY resolved plans are inserted (see `plan_is_cacheable`). A level
+/// whose component class did not resolve falls back to `ClassId(0)` — the
+/// pre-existing behaviour — and caching that would make a transient resolution
+/// failure permanent, which is exactly the shape of bug this whole change is
+/// fixing.
+type MultiANewArrayPlanCache =
+    parking_lot::RwLock<rustc_hash::FxHashMap<(u32, u16, u8), Arc<MultiANewArrayPlan>>>;
+
+fn multianewarray_plan_cache() -> &'static MultiANewArrayPlanCache {
+    static CACHE: std::sync::OnceLock<MultiANewArrayPlanCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Drop every memoized [`MultiANewArrayPlan`].
+///
+/// **Class ids are recycled.** `unload_user_classes` can retire `p/X` under a
+/// live loader and let that loader define a fresh `p/X` with the same id — the
+/// exact aliasing `ClassManager::array_class_for` guards against by
+/// re-synthesising rather than trusting its own cache. A plan holds ids on both
+/// sides (the key names the referencing class, the value names each level's
+/// component class), so it is invalidated wholesale from the one place that
+/// already retires the JIT's other class-keyed caches
+/// (`memory::gc`'s unload path). Unloading is rare and batched; refilling a
+/// site costs one resolution.
+pub(crate) fn invalidate_multianewarray_plans() {
+    multianewarray_plan_cache().write().clear();
+}
+
+/// Resolve a `multianewarray` site's array class and allocate the array.
+///
+/// **This is the ONE implementation of JVMS §multianewarray's typing rules in
+/// this VM.** The interpreter's `Instruction::Multianewarray` arm and the JIT's
+/// `jit_multianewarray_2d` helper are both thin callers of it, and that is
+/// deliberate: the two used to be separate transcriptions and only the
+/// interpreter's carried the component-class resolution below. The JIT's copy
+/// allocated every level with `ClassId(0)`, so a JIT-compiled `new String[a][b]`
+/// produced an object whose `getClass()` read back `[Ljava.lang.Object;` — the
+/// `DSCompiler.getCompiler` `ClassCastException` witness.
+///
+/// `sizes` is outermost-first and must be non-empty; its length is the
+/// `dimensions` operand, which JVMS §4.9.1 allows to be SMALLER than the
+/// referenced array class's bracket count (the unspecified inner dimensions
+/// stay null).
+pub(crate) fn multianewarray_alloc(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    cp_index: u16,
+    sizes: &[usize],
+) -> Result<ObjectRef, MethodCallFailed> {
+    if sizes.is_empty() {
+        return Err(VmError::Internal {
+            message: "multianewarray: dimensions must be >= 1".to_string(),
+        }
+        .into());
+    }
+    // `dimensions` is a single bytecode operand, so it never exceeds u8::MAX;
+    // the guard below rejects anything past the descriptor's bracket count
+    // anyway, and 255 is the JVMS ceiling on that.
+    let dims_key = u8::try_from(sizes.len()).unwrap_or(u8::MAX);
+    let cache_key = (referencing_class_id.as_u32(), cp_index, dims_key);
+
+    // Clone the `Arc` and DROP THE LOCK before allocating. `alloc_multi_array`
+    // can trigger a GC, and the GC's own `unload_user_classes` path is what
+    // calls `invalidate_multianewarray_plans` — i.e. it takes this lock for
+    // WRITE. Holding the read guard across the allocation would let a thread
+    // wait for a collection that is waiting for this reader, through a
+    // `parking_lot::RwLock` that is neither reentrant nor writer-starving. One
+    // refcount bump is the whole cost of not having that edge.
+    let hit = multianewarray_plan_cache().read().get(&cache_key).cloned();
+    if let Some(plan) = hit {
+        return alloc_multi_array(
+            shared,
+            sizes,
+            0,
+            plan.leaf_et,
+            plan.total_array_depth,
+            &plan.component_ids,
+        );
+    }
+
+    // Resolve the leaf element type AND total array depth from the array class
+    // descriptor. The `dimensions` operand may be less than the total `[`
+    // count, in which case the unspecified inner dimensions stay null and the
+    // deepest *allocated* array must hold references (not the leaf type) — see
+    // `alloc_multi_array`.
+    let (leaf_et, total_array_depth, leaf_desc) = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm
+            .get_class(referencing_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: "current class not found".to_string(),
+            })?;
+        let array_class_name =
+            class
+                .constant_pool
+                .get_class_name(cp_index)
+                .ok_or_else(|| VmError::Internal {
+                    message: format!("invalid class ref at cp#{cp_index}"),
+                })?;
+        // Strip leading '[' to find the leaf type descriptor; the count of
+        // stripped `[`s is the total array depth.
+        let total_depth = array_class_name
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b'[')
+            .count();
+        let leaf = &array_class_name.as_bytes()[total_depth..];
+        let et = match leaf.first() {
+            Some(b'I') => ArrayElementType::Int,
+            Some(b'J') => ArrayElementType::Long,
+            Some(b'F') => ArrayElementType::Float,
+            Some(b'D') => ArrayElementType::Double,
+            Some(b'B') => ArrayElementType::Byte,
+            Some(b'C') => ArrayElementType::Char,
+            Some(b'S') => ArrayElementType::Short,
+            Some(b'Z') => ArrayElementType::Boolean,
+            _ => ArrayElementType::Reference,
+        };
+        (et, total_depth, array_class_name[total_depth..].to_string())
+    };
+
+    // JVMS §4.9.1 static constraint: `dimensions` must not exceed the number of
+    // leading `[` in the referenced array class.
+    //
+    // SECURITY (defense-in-depth, same policy as `execute_ldc`'s
+    // `ClassFormatError` conversion): the type-state verifier does enforce this
+    // (`verify_insn.rs`, `Instruction::Multianewarray`), but that pass does NOT
+    // run for every class. Pass 3 is deferred wholesale for any class defined
+    // by a user-defined loader while `loader_aware_resolution()` is on — which
+    // is the default, and covers every Spring / WildFly / H2 application class
+    // — and the structural-only substitute
+    // (`verifier::verify_method_structural`) never looks at this operand.
+    // `-Xverify:none` removes it too.
+    //
+    // Without this guard `total_array_depth - d - 1` below underflows: in a
+    // release build (overflow-checks off) it wraps to `usize::MAX`, and
+    // `"[".repeat(usize::MAX)` then asks the allocator for `usize::MAX` bytes,
+    // which aborts the process rather than raising anything Java can catch.
+    // It sits in front of the cache insert as well as the subtraction: a site
+    // that throws here must throw every time, never be memoized into a plan.
+    if sizes.len() > total_array_depth {
+        let (cls, mname) = match thread.frames.last() {
+            Some(f) => (f.class_name().to_string(), f.method_name().to_string()),
+            None => (String::new(), String::new()),
+        };
+        return Err(crate::runtime::exceptions::throw_linkage_error(
+            shared,
+            thread,
+            LinkageError::VerifyError {
+                class_name: cls,
+                method_name: mname,
+                message: format!(
+                    "multianewarray: dimensions {} exceeds array bracket count {} \
+                     of type at cp#{cp_index}",
+                    sizes.len(),
+                    total_array_depth
+                ),
+            },
+        ));
+    }
+
+    // Resolve the *component* class id for each allocated array level so the
+    // array objects carry their precise class (e.g. the outer level of
+    // `new String[8][8]` is a `[[Ljava/lang/String;` whose component is
+    // `[Ljava/lang/String;`). Without this every multi-dim array was allocated
+    // with `ClassId(0)` and `getClass().getName()` collapsed to
+    // `[Ljava/lang/Object;`. Each level d's component descriptor is
+    // `[`×(total_depth-d-1) followed by the leaf descriptor; a primitive leaf
+    // (`I`, `C`, …) needs no class (the element type drives naming).
+    let leaf_is_reference = leaf_desc.starts_with('L') && leaf_desc.ends_with(';');
+    let mut component_ids: Vec<ClassId> = Vec::with_capacity(sizes.len());
+    // Every level except a primitive leaf names a class that must resolve; if
+    // any did not, the plan is a fallback and must not be memoized.
+    let mut fully_resolved = true;
+    for d in 0..sizes.len() {
+        let comp_brackets = total_array_depth - d - 1;
+        let cid = if comp_brackets > 0 {
+            // Component is itself an array class — resolve `[…`.
+            //
+            // JVMS §5.3.3: that inner array class is defined by the defining
+            // loader of ITS component, so it must be resolved loader-faithfully.
+            // This `ClassId` is stamped into the allocated array object's header
+            // and is what a later `getClass()` / `getComponentType()` reads back,
+            // so collapsing two loaders' `[Lp/X;` here would make
+            // `new p.X[2][2]` report the wrong loader's element type.
+            let comp_desc = format!("{}{}", "[".repeat(comp_brackets), leaf_desc);
+            resolve_class_or_array_loader_aware(shared, thread, referencing_class_id, &comp_desc)
+                .unwrap_or(ClassId::new(0))
+        } else if leaf_is_reference {
+            // Reference leaf — component is the element class itself.
+            let comp_name = &leaf_desc[1..leaf_desc.len() - 1];
+            resolve_class_loader_aware(shared, thread, referencing_class_id, comp_name)
+                .unwrap_or(ClassId::new(0))
+        } else {
+            // Primitive leaf: element type carries the descriptor.
+            ClassId::new(0)
+        };
+        if cid == ClassId::new(0) && (comp_brackets > 0 || leaf_is_reference) {
+            fully_resolved = false;
+        }
+        component_ids.push(cid);
+    }
+
+    if fully_resolved {
+        multianewarray_plan_cache().write().insert(
+            cache_key,
+            Arc::new(MultiANewArrayPlan {
+                leaf_et,
+                total_array_depth,
+                component_ids: component_ids.clone().into_boxed_slice(),
+            }),
+        );
+    }
+
+    alloc_multi_array(
+        shared,
+        sizes,
+        0,
+        leaf_et,
+        total_array_depth,
+        &component_ids,
+    )
+}
 
 /// Maximum recursion depth for multianewarray to prevent stack overflow.
 /// The JVM spec allows at most 255 dimensions, but we cap at 255 to be safe.

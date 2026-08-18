@@ -399,6 +399,62 @@ pub fn osr_newarray_allowed() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_OSR_ATHROW` — back-edge OSR for a method that contains a bare
+/// `athrow` (0xbf) and declares **no** local exception handlers. **Default: ON**
+/// (RBC.6 lift, 2026-08-17).
+///
+/// RBC.6 refused every `athrow`-containing method outright, because the OSR
+/// bail path's only move was to re-stash the throwable and resume the live
+/// interpreter frame at the STALE pre-OSR back-edge pc — re-running every
+/// iteration the OSR'd code had already committed (RBC.7's silent-corruption
+/// shape). With no handlers declared, the throwable provably cannot be caught
+/// by the OSR'd frame, so `propagate_osr_exception` unwinds it out of the frame
+/// instead and there is no resume left to be stale. A method that DOES declare
+/// handlers is still refused here, for a reason RBC.6b's own lift does not
+/// cover — see the gate itself, in `compile_osr_artifact`, for that argument.
+///
+/// Set `CRATONVM_JIT_OSR_ATHROW=0` to restore the blanket refusal so ONE binary
+/// can A/B the lift (a cross-binary A/B is not an A/B). Read once and cached.
+#[inline]
+pub fn osr_athrow_allowed() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_ATHROW") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_OSR_EXC_TABLE` — back-edge OSR for a method with a non-empty
+/// exception table. **Default: ON** (2026-08-17, this is the RBC.6b lift).
+///
+/// RBC.6b refused every such method outright. Because OSR is the ONLY door out
+/// of the interpreter for a method invoked once — a `@Test` body, a `main`, any
+/// one-shot driver — that made "a hot loop with a try/catch in it" run
+/// interpreted for its whole life: netty's two `HttpHeaderValidationUtilTest`
+/// exhaustive loops measured 19 242 and 309 423 ns/iteration against HotSpot's
+/// 8.2 and 9.4.
+///
+/// The lift stages the method-entry path's precise-exception-frame contract for
+/// the OSR compile and admits only methods where every throwing site inside a
+/// protected range publishes a reason-9 frame
+/// (`first_unsupported_precise_frame_site`). Set `=0` to restore the blanket
+/// refusal, so one binary can A/B the lift — the arm that answers "did this
+/// change the answer, or only the speed?". Read once and cached.
+///
+/// See fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md.
+#[inline]
+pub fn osr_exception_table_allowed() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_EXC_TABLE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.

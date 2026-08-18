@@ -2339,6 +2339,19 @@ pub struct CompiledMethod {
     /// `!compiler.indy_info.is_empty()`; `false` for IR-path artifacts (the
     /// IR lowerer rejects invokedynamic methods).
     pub has_indy_trap: bool,
+    /// Memoised [`Self::osr_exit_policy`] verdict.
+    ///
+    /// That function walks EVERY deopt point of the artifact, and per point
+    /// walks the whole frame state (`deopt::first_unresumable_slot`). It is
+    /// asked once per OSR ENTRY, from `validate_osr_entry` — and its answer is
+    /// a pure function of `deopt_points`, which is immutable after publication.
+    ///
+    /// Recomputing it was 3.3% of a throw-heavy OSR loop under `perf record`
+    /// (`probes/OsrExcRateProbe.java`), because since the RBC.6b lift a caught
+    /// exception is an OSR exit plus a re-entry — so a `try`/`catch` loop pays
+    /// one full policy walk per throw, over a point list that just grew a
+    /// reason-9 entry per protected invoke.
+    pub(crate) osr_exit_policy_memo: std::sync::OnceLock<Result<OsrExitPolicy, bailout::Bailout>>,
     /// deopt-osr Step 7 — the loop-boundary bcis (OSR-vetted, outside every
     /// LICM-hoisted body) for which an OSR-exit map was emitted into
     /// `deopt_points` (tagged `DeoptReason::OsrExit`). Empty unless
@@ -2362,6 +2375,30 @@ pub struct CompiledMethod {
     /// (possibly-freed, under `CRATONVM_JIT_FREE_CODE=1`) box. The pointed-to
     /// guard is leaked (process-lifetime), so this raw pointer is always valid.
     pub deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
+    /// This body is an `ACC_SYNCHRONIZED` method's, so entering it is only
+    /// legal through a caller that supplies the implicit monitor.
+    ///
+    /// A compiled body carries no monitor prologue/epilogue — the CALLER
+    /// supplies it. Exactly two entry points do: `execute_jit_call` and
+    /// `execute_jit_call_decoded`, which wrap the activation in a
+    /// `JitSynchronizedMonitorGuard`. Every other consumer CALLs the raw entry
+    /// pointer, and for one of those a synchronized method simply does not
+    /// lock: `RSyncMethodJit` lost ~35 of 240 000 monitor-protected increments
+    /// per run once `bumpStatic` was both published and reached from compiled
+    /// code.
+    ///
+    /// The refusal used to live only in `try_jit_compile_callee_slow`, which
+    /// is the COMPILE path. Its by-name caller `try_jit_compile_callee` serves
+    /// an already-published body straight out of `jit_cache` without re-asking,
+    /// and `jit_invoke_dispatch`'s own `jit_cache` arm never went through
+    /// either — so a body legitimately published FOR the wrapped entry (the
+    /// background tiering door passes `allow_synchronized_wrapped_entry`) was
+    /// handed to unwrapped ones. A predicate that only guards the slow path
+    /// guards nothing once the fast path can answer.
+    ///
+    /// Stamped at publication beside [`Self::owner_class_id`], so it travels
+    /// with the body to every door that holds only a raw entry pointer.
+    pub requires_wrapped_entry: bool,
     /// `ClassId` of the class this body was published under, or
     /// [`cratonvm_types::jit_activation::NO_OWNER_CLASS`] for an artifact that
     /// was never published (test fixtures, probe bodies).
@@ -2545,9 +2582,11 @@ impl CompiledMethod {
             can_deopt_resume: false,
             can_osr_exit: false,
             has_indy_trap: false,
+            osr_exit_policy_memo: std::sync::OnceLock::new(),
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            requires_wrapped_entry: false,
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
@@ -2615,9 +2654,11 @@ impl CompiledMethod {
             can_deopt_resume: false,
             can_osr_exit: false,
             has_indy_trap: false,
+            osr_exit_policy_memo: std::sync::OnceLock::new(),
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
+            requires_wrapped_entry: false,
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
@@ -3605,12 +3646,30 @@ impl OsrEntryPlan {
         let point = match osr_exit::resume_image(&artifact.deopt_points, rframe.bci) {
             osr_exit::ResumeImage::Unique { index, .. } => &artifact.deopt_points[index],
             osr_exit::ResumeImage::None => {
+                // Two different states share this arm, and saying so matters:
+                // `resume_image` skips `rethrow_exception` points (they are not
+                // resume images — see its doc), so a bci whose ONLY point is a
+                // reason-9 exceptional frame answers `None` here. That is not a
+                // mis-routed stash, it is a frame arriving at the wrong sink:
+                // its bci names a THROWING instruction and it belongs to
+                // `take_exceptional_frame`, not to a resume.
+                let rethrow_here = artifact
+                    .deopt_points
+                    .iter()
+                    .any(|p| p.bci == rframe.bci && p.semantics.rethrow_exception);
                 return Err(osr_refusal(
                     OSR_REFUSE_EXIT_REPLAY,
-                    format!(
-                        "exit bci {} is not a recorded deopt point of this artifact",
-                        rframe.bci
-                    ),
+                    if rethrow_here {
+                        format!(
+                            "exit bci {} names only a RETHROW point, which is not a resume                              point at all — it must be routed through the exception table                              (REEXECUTE semantics are required here)",
+                            rframe.bci
+                        )
+                    } else {
+                        format!(
+                            "exit bci {} is not a recorded deopt point of this artifact",
+                            rframe.bci
+                        )
+                    },
                 ));
             }
             osr_exit::ResumeImage::Ambiguous { first, second } => {
@@ -3758,6 +3817,16 @@ impl CompiledMethod {
     /// compiled body has committed iterations, and the only remaining options
     /// are to replay them or to lose them.
     fn osr_exit_policy(&self) -> Result<OsrExitPolicy, bailout::Bailout> {
+        // Memoised: the verdict is a pure function of `deopt_points`, which is
+        // immutable once the artifact is published, and this is asked once per
+        // OSR ENTRY rather than once per compile. See `osr_exit_policy_memo`.
+        self.osr_exit_policy_memo
+            .get_or_init(|| self.osr_exit_policy_uncached())
+            .clone()
+    }
+
+    /// The real walk behind [`Self::osr_exit_policy`]'s memo.
+    fn osr_exit_policy_uncached(&self) -> Result<OsrExitPolicy, bailout::Bailout> {
         if self.deopt_points.is_empty() {
             return Ok(OsrExitPolicy::PropagateOnly);
         }
@@ -8432,6 +8501,88 @@ pub static DIRECT_CALLEE_BIND_HITS: std::sync::atomic::AtomicU64 =
 pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Why a statically bound site was NOT offered a direct `CALL`, one counter per
+/// refusal reason.
+///
+/// `DIRECT_CALLEE_BIND_MISSES` alone says a site stayed on the Rust dispatch
+/// helper; it does not say WHICH gate refused, and the gates are not
+/// interchangeable — "the callee was not compiled at that instant" is a
+/// compile-ORDER accident that a re-bind can repair, while "the callee declares
+/// an exception table" is a standing policy that no amount of re-binding
+/// touches. A single number cannot be used to choose between those two fixes,
+/// which is exactly the choice
+/// `internal/performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
+/// left open, and which this counter is what closed.
+///
+/// Compile-time only: one relaxed `fetch_add` per refused site per compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum DirectBindRefusal {
+    FjpBlocklist = 0,
+    NativeShadow = 1,
+    CalleeClassNotFound = 2,
+    CalleeMethodNotFound = 3,
+    Synchronized = 4,
+    CalleeExceptionTable = 5,
+    DeclaringClassNotInitialized = 6,
+    CalleeNotYetCompiled = 7,
+    EagerChainDepth = 8,
+    EagerChainCycle = 9,
+    EagerChainBudget = 10,
+    EagerChainCompileDeclined = 11,
+    IndyTrap = 12,
+    /// The mutator-side `callee_compiler` door, which returns a bare `None`
+    /// from several arms that have no separate reason string.
+    MutatorDoorOther = 13,
+}
+
+/// Names in `DirectBindRefusal` declaration order — index IS the discriminant.
+pub const DIRECT_BIND_REFUSAL_NAMES: [&str; DIRECT_BIND_REFUSAL_COUNT] = [
+    "fjp-blocklist",
+    "native-shadow",
+    "callee-class-not-found",
+    "callee-method-not-found",
+    "synchronized",
+    "callee-exception-table",
+    "declaring-class-not-initialized",
+    "callee-not-yet-compiled",
+    "eager-callee-chain-depth",
+    "eager-callee-chain-cycle",
+    "eager-callee-chain-budget",
+    "eager-callee-chain-compile-declined",
+    "indy-trap",
+    "mutator-door-other",
+];
+
+pub const DIRECT_BIND_REFUSAL_COUNT: usize = 14;
+
+pub static DIRECT_CALLEE_BIND_REFUSALS: [std::sync::atomic::AtomicU64;
+    DIRECT_BIND_REFUSAL_COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; DIRECT_BIND_REFUSAL_COUNT];
+
+/// Tally one refusal. Called from the VM crate's two `callee_compiler` doors.
+#[inline]
+pub fn note_direct_callee_bind_refusal(reason: DirectBindRefusal) {
+    DIRECT_CALLEE_BIND_REFUSALS[reason as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(reason, count)` for every reason with a non-zero count, largest first.
+pub fn direct_callee_bind_refusal_reasons() -> Vec<(&'static str, u64)> {
+    let mut out: Vec<(&'static str, u64)> = DIRECT_BIND_REFUSAL_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            (
+                *name,
+                DIRECT_CALLEE_BIND_REFUSALS[i].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
 /// `(bound, unbound)` — see [`DIRECT_CALLEE_BIND_HITS`].
 pub fn direct_callee_bind_counts() -> (u64, u64) {
     (
@@ -12950,7 +13101,7 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
 /// is also the one that matters most — that door compiles a `@Test` method's hot
 /// loop, and a method denied there runs its whole life interpreted with no other
 /// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
-/// exhaustive loops (docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md).
+/// exhaustive loops (fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md).
 ///
 /// Consumes the thread-local site, like `try_compile`'s own recorder.
 pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
@@ -13977,6 +14128,45 @@ pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
     })
 }
 
+/// May a STATICALLY BOUND site bake a direct `CALL` to a callee that declares
+/// its own exception table?
+///
+/// The sibling of `mic_publish_exception_table_callees` (`vm/src/jit/helpers.rs`)
+/// for the other door. Both `callee_compiler` ladders refuse such a callee for
+/// the same stated reason — a raw `CALL` has no Rust frame to notice the
+/// `i64::MIN` sentinel and run the callee's own handler — and that reason has
+/// the same answer: `emit_inline_callee_deopt_check` is emitted after the baked
+/// `CALL` too (`x64/bytecode_walk.rs`, the `invokestatic` and `invokespecial`
+/// direct-call arms), and `jit_service_callee_deopt` resolves a statically bound
+/// callee by name.
+///
+/// Two interlocks, because a direct `CALL` has one precondition the inline
+/// cascade does not:
+///
+///  * `sp_ic_deopt_check_mode() == On`, exactly as the MIC gate requires; and
+///  * the emitter must have been able to reserve the contiguous service-argument
+///    slots that check needs. A site that could not is now a compile failure
+///    (`direct-call-service-slots`) rather than an unserviced raw edge, so
+///    "bound" implies "serviced" for every Java callee.
+///
+/// Default-OFF pending its own measurement: on netty's
+/// `BigEndianHeapByteBufTest` this gate accounts for 16 of 892 refused binds,
+/// against 736 for the native shadow, so it is a much smaller population than
+/// the virtual-site ban and is not worth defaulting on unmeasured.
+/// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1` opts in.
+pub fn direct_call_exc_table_publish_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        if sp_ic_deopt_check_mode() != SpIcDeoptCheck::On {
+            return false;
+        }
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 pub fn direct_jit_callee_calls_enabled() -> bool {
     // A raw JIT-to-JIT call produces a callee frame with no `JitEntryGuard`, so
     // it is not reachable from the entry chain: the active-RBP mirror points at
@@ -14127,6 +14317,35 @@ const fn invoke_kind_uses_inline_cache(invoke_kind: u8) -> bool {
 fn clear_jit_recursive_cycle_methods_for_test() {
     jit_recursive_cycle_methods().write().clear();
     JIT_COMPILE_STACK.with(|stack| stack.borrow_mut().clear());
+}
+
+/// Pack a `multianewarray` site's `(holder_class_id, cp_idx)` into the single
+/// i64 immediate the backend hands to the `multianewarray_2d` helper.
+///
+/// Windows x64 gives a helper only four register arguments and the helper
+/// already spends three on `(vm_ptr, dim1, dim2)`, so the site description has
+/// to fit in one. `ClassId` is a `u32` and a constant-pool index is a `u16`, so
+/// both fit with room to spare: class id in the low 32 bits, cp index in the
+/// next 16.
+///
+/// The helper cannot be given a pre-resolved class instead. Resolution defines
+/// array classes and can run a user `ClassLoader.loadClass` — arbitrary Java —
+/// which a background compile thread must not do; it belongs on the executing
+/// thread at first execution, the way the `new`/`anewarray` CP-indexed helpers
+/// already work. See [`unpack_multianewarray_site`] for the inverse, and
+/// `vm::jit::helpers::jit_multianewarray_2d` for the consumer.
+#[inline]
+#[must_use]
+pub fn pack_multianewarray_site(holder_class_id: u32, cp_idx: u16) -> i64 {
+    (u64::from(holder_class_id) | (u64::from(cp_idx) << 32)) as i64
+}
+
+/// Inverse of [`pack_multianewarray_site`]: `(holder_class_id, cp_idx)`.
+#[inline]
+#[must_use]
+pub fn unpack_multianewarray_site(site: i64) -> (u32, u16) {
+    let bits = site as u64;
+    (bits as u32, (bits >> 32) as u16)
 }
 
 /// Try to JIT-compile a cached bytecode method.
@@ -14916,7 +15135,62 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if matches!(op, 0xb2 | 0xc0) {
         return precise_getstatic_checkcast_enabled();
     }
+    if matches!(op, 0xbb | 0xbf) {
+        return precise_alloc_athrow_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Whether a protected `new` (0xbb) / `athrow` (0xbf) may be treated as
+/// publishing a precise exceptional frame.
+///
+/// **Unlike `getfield`/`getstatic`, this admission is NOT bookkeeping.** Both
+/// lowerings grew a publishing exit in the same change that added them here,
+/// which is the condition
+/// `fixed-bugs/rbc6-protected-field-ops-FIXED-20260802.md` states and the
+/// netty adaptive-allocator page insisted on: admitting `new` without giving
+/// its lowering a precise frame is a miscompile, not a speedup.
+///
+/// `new` (0xbb) — every non-scalar-replaced lowering funnels through
+/// `emit_post_alloc_oom_check`: the resolved inline-TLAB arm (whose slow edge
+/// falls into `jit_new_object`), the resolved helper arm
+/// (`emit_new_object_stub`) and the DEFERRED CP arm
+/// (`emit_new_object_cp_stub`, for a class not yet loaded at compile time).
+/// That guard now records a reason-9 frame at the allocating bci whenever the
+/// pc is protected. All three ways this site can raise — a `<clinit>` failure,
+/// a class-resolution failure on the deferred arm, and heap exhaustion — are
+/// reported by the same `0`/null sentinel the guard already tested for, so one
+/// publishing exit covers the lot.
+///
+/// The scalar-replaced arm (`self.scalar_replaced`) emits no call at all: it
+/// zero-fills frame slots and pushes a dummy. It raises nothing, and a site
+/// that raises nothing cannot hand a handler an unpublished frame. (That arm
+/// also skips `<clinit>`, which is a pre-existing residual recorded on
+/// `jit_new_object`, not something this admission introduces or depends on.)
+///
+/// `athrow` (0xbf) — its lowering calls `jit_throw_exception`, which stashes
+/// the exception together with this athrow's own bci, and then returned the
+/// sentinel straight through the epilogue. Inside a protected range it now
+/// jumps to the reason-9 stub instead, which spills the trapping registers,
+/// materializes the frame and runs the same epilogue. It is admitted alongside
+/// `new` rather than after it because `throw new X(...)` compiles to
+/// `new`/`dup`/`invokespecial`/`athrow`: netty's
+/// `AdaptivePoolingAllocator$Magazine.allocate` carries exactly that sequence
+/// at pc 338-345, so admitting `new` on its own would only have moved the bail
+/// seven bytes — the trap the page warned about in the same paragraph that
+/// named the refusal.
+///
+/// `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW=1` withdraws the admission so one
+/// binary can be A/B'd against its own pre-change behaviour; comparing against
+/// a separately built branch would confound this with everything else that
+/// landed. It withdraws only the ADMISSION — the publishing exits stay emitted,
+/// because they are correct for the opcodes already admitted around them.
+fn precise_alloc_athrow_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW").is_none()
+    })
 }
 
 /// Whether a protected `getstatic` / `checkcast` may be treated as publishing a
@@ -14984,6 +15258,19 @@ fn precise_getstatic_checkcast_enabled() -> bool {
 ///   never built. Not cached here: `inline_getfield_enabled` does its own
 ///   `OnceLock`, and this runs per protected opcode at COMPILE time, never on
 ///   any hot path.
+/// `CRATONVM_DBG_RBC6_EMIT=1` — trace which exit each protected throwing site
+/// is given at EMIT time.
+///
+/// The `[rbc6-dbg]` family traces the RUNTIME sinks. A frame that never reaches
+/// them can be missing for two different reasons and only this says which: the
+/// site chose the shared sentinel stub (no frame was ever built), or it chose
+/// the reason-9 stub and the frame was lost between the stub and the sink.
+pub(crate) fn rbc6_emit_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6_EMIT").is_some())
+}
+
 fn precise_field_ops_enabled() -> bool {
     if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_FIELD_OPS").is_some() {
         return false;
@@ -14999,6 +15286,124 @@ fn precise_virtual_invokes_enabled() -> bool {
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES").is_none()
     })
+}
+
+/// Does this method contain an **inline trapping bytecode inside a protected
+/// range** that the optimizing tier lowers to a *deopt it cannot resume*, with
+/// a side effect in the same range that a whole-method replay would repeat?
+///
+/// Returns the offending `(pc, opcode)`, or `None` when the optimizing tier may
+/// take the method.
+///
+/// ## What goes wrong without this
+///
+/// The IR tier lowers an array access, an `arraylength`, a field access and a
+/// division to **deopt guards** (`emit_array_null_bounds_guards`,
+/// `emit_deopt_if_zero`), on the stated promise that "the interpreter
+/// re-executes the opcode and throws the exact NPE / AIOOBE with full
+/// semantics (including any in-method handler)". Re-executing needs a precise
+/// resume — and `can_deopt_resume` is only ever set on the IR path in the
+/// narrow scalar-replacement case (`ir_lower.rs`, guarded by
+/// `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`), so on a production
+/// artifact it is **false**. The interpreter then has to fall back to replaying
+/// the whole method, refuses because that would re-run the side effects already
+/// committed, and raises a hard `InternalError`.
+///
+/// The single-pass backend has no such problem: its bounds check calls
+/// `jit_throw_aioobe` and returns the sentinel through the epilogue, and the
+/// interpreter routes the exception through the method's own exception table
+/// without resuming anything. So declining here is not "stay interpreted" — it
+/// is "use the backend that handles this shape", at single-pass code quality.
+///
+/// ## Why it is this narrow
+///
+/// `docs/internal/fixed-bugs/unresumable-unconditional-trap-mvmap-FIXED-20260802.md`
+/// warns in as many words: *"Do not apply the publish-side rule blind... the
+/// naive form would refuse every trap-carrying artifact, including the many
+/// whose re-run-from-entry fallback works fine."* Two narrowing terms keep that
+/// from happening:
+///
+/// 1. **only the deopt-guarded opcodes.** Invokes, `new`, `ldc`, `checkcast`
+///    and the monitor ops all leave through the `i64::MIN` sentinel and the
+///    exception-routing path, which needs no resume. They are not listed.
+/// 2. **only when the range also commits a side effect.** A read-only
+///    `try { return a[i]; } catch (...)` replays harmlessly, so the refusal
+///    would buy nothing and cost the compile. `advance()` — the reported
+///    witness — stores two fields on every iteration *before* the trapping
+///    `baload`, which is exactly what makes its replay observably wrong.
+///
+/// The side-effect scan is deliberately whole-range rather than
+/// "before the trap in pc order": the witness is a **loop**, where a store at a
+/// lower pc executes on the iteration *after* the one that traps. Pc order is
+/// not execution order, and the cheap conservative answer is the correct one.
+fn ir_unresumable_protected_trap(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> Option<(usize, u8)> {
+    if exception_table.is_empty() {
+        return None;
+    }
+    let covered = |pc: usize| {
+        exception_table
+            .iter()
+            .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
+    };
+    // The opcodes whose IR lowering is a deopt guard. Kept in step with
+    // `ir_lower.rs`: array element access and `arraylength` go through
+    // `emit_array_null_bounds_guards` / `emit_deopt_if_zero`, `getfield` /
+    // `putfield` through the inline null check, and the integer divisions
+    // through the div-by-zero guard.
+    let deopt_guarded = |op: u8| {
+        matches!(
+            op,
+            0x2e..=0x35 // array loads
+                | 0x4f..=0x56 // array stores
+                | 0x6c | 0x6d | 0x70 | 0x71 // idiv / irem / ldiv / lrem
+                | 0xb4 | 0xb5 // getfield / putfield
+                | 0xbe // arraylength
+        )
+    };
+    // What makes a replay observably wrong. Stores and calls only — a pure
+    // computation can be re-run.
+    let side_effecting = |op: u8| {
+        matches!(
+            op,
+            0x4f..=0x56 // array stores
+                | 0xb3 | 0xb5 // putstatic / putfield
+                | 0xb6..=0xba // the invokes
+                | 0xc2 | 0xc3 // monitorenter / monitorexit
+        )
+    };
+
+    let mut trap: Option<(usize, u8)> = None;
+    let mut has_side_effect = false;
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        if covered(pc) {
+            if trap.is_none() && deopt_guarded(op) {
+                trap = Some((pc, op));
+            }
+            if side_effecting(op) {
+                has_side_effect = true;
+            }
+        }
+        // Same walk `first_unsupported_precise_frame_site` uses; a length of 0
+        // or one that runs off the end means the scan lost sync, and the
+        // conservative answer to "I can no longer read this code" is to
+        // decline the tier rather than guess.
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return trap.or(Some((pc, op)));
+        }
+        pc += len;
+    }
+    if has_side_effect {
+        trap
+    } else {
+        None
+    }
 }
 
 /// Thin `bool` wrapper over [`first_unsupported_precise_frame_site`], kept for
@@ -15028,8 +15433,19 @@ fn precise_exception_frame_sites_supported(
 /// A malformed instruction stream also answers `Some` (at the offending pc,
 /// with the opcode that could not be measured): a walk that cannot find the
 /// next boundary has not proved anything about the rest of the method.
+///
+/// **Public because the OSR door asks the same question.** RBC.6b refused any
+/// OSR compile of a method with a non-empty exception table outright, on the
+/// grounds that an OSR artifact carries no handler ranges. Staging the same
+/// three requests the method-entry path stages (`set_precise_exception_frame_
+/// request` / `set_protected_ranges_request` / `set_pending_exception_ranges`)
+/// gives the OSR body reason-9 frames at its protected-range invokes — but only
+/// where every throwing site in those ranges publishes one. That is exactly
+/// this predicate, so `compile_osr_artifact` calls it rather than growing a
+/// second, drifting copy of the opcode table. See
+/// `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`.
 #[cfg(target_arch = "x86_64")]
-fn first_unsupported_precise_frame_site(
+pub fn first_unsupported_precise_frame_site(
     code: &[u8],
     code_len: usize,
     exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
@@ -15089,11 +15505,23 @@ fn first_unsupported_precise_frame_site(
     // `may_throw_without_precise_frame` set below — that set is the CANDIDATE
     // set, and `precise_frame_publishing_opcode` is what exempts them.
     //
+    // 2026-08-17: `new` (0xbb) and `athrow` (0xbf) have left it as well, and
+    // unlike every departure above them this one is NOT bookkeeping — both
+    // lowerings grew a publishing exit in the same change. See
+    // `precise_alloc_athrow_enabled` for the per-path argument, and note the
+    // two had to leave TOGETHER: `throw new X(...)` is one four-bytecode
+    // sequence, so admitting either alone only moves the bail to the other.
+    //
     // Still genuinely blocking, because their lowerings really do not publish:
-    // `new` (0xbb), `ldc` (0x12), `athrow` (0xbf), and `arraylength` (0xbe) —
-    // the last routes its NPE through the SHARED null-check stub, which records
-    // no frame at the bci. It was the one site blocking Tomcat's
-    // `IntrospectionUtils.setProperty` in the WebSocket-latency run.
+    // `ldc` (0x12) and `arraylength` (0xbe) — the last routes its NPE through
+    // the SHARED null-check stub, which records no frame at the bci. It was the
+    // one site blocking Tomcat's `IntrospectionUtils.setProperty` in the
+    // WebSocket-latency run. The array opcodes, the integer divides and
+    // `multianewarray` are still out too; `newarray`/`anewarray`/
+    // `multianewarray` reach the same publishing `emit_post_alloc_oom_check`
+    // that `new` does, so they are the cheapest next candidates — but each
+    // needs its own audit of the NegativeArraySizeException edge before it can
+    // be claimed, and none of them was blocking a measured method.
     let may_throw_without_precise_frame = |op: u8| {
         matches!(
             op,
@@ -15626,6 +16054,14 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
+        } else if let Some((pc, op)) =
+            ir_unresumable_protected_trap(code, code_len, &cached.exception_table)
+        {
+            format!(
+                "an inline trap this tier deopts on (pc={pc}, opcode={op:#04x}) sits in a \
+                 protected range that also commits a side effect; the deopt could not be \
+                 resumed, so the single-pass backend takes it"
+            )
         } else if let Some(k) = single_pass_only_lowering_for(code, code_len, cached) {
             format!(
                 "the single-pass backend has {} here and the IR tier has no equivalent",
@@ -15784,6 +16220,11 @@ fn try_compile_inner(
         // that landed — and as an escape hatch if a workload ever regresses.
         && !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
         && !precise_exception_frames
+        // An inline trap inside a protected range that this tier lowers to an
+        // unresumable deopt — see `ir_unresumable_protected_trap`. Falls
+        // through to the single-pass backend, which throws and routes through
+        // the exception table instead of deopting.
+        && ir_unresumable_protected_trap(code, code_len, &cached.exception_table).is_none()
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it
@@ -17612,29 +18053,31 @@ fn try_compile_inner(
     // separable from "the C2 tier was never asked".
     metrics.enter_single_pass();
 
-    // Resolve multianewarray entries
+    // Resolve multianewarray entries.
+    //
+    // What travels to the backend is the site's `(holder_class_id, cp_idx)`,
+    // packed — see `pack_multianewarray_site`. The helper resolves the array
+    // class from it at run time through the same
+    // `interpreter::multianewarray_alloc` the interpreter uses, so both tiers
+    // stamp the same per-level component classes. The old shape was a leaf
+    // element-type code, which named no class at all: the helper allocated
+    // every level with `ClassId(0)` and a compiled `new String[a][b]` read back
+    // as `[Ljava.lang.Object;`, so any `checkcast` to the declared array type
+    // threw. The resolver call stays, because a CP index that does not name a
+    // class is still a whole-compile refusal.
     let mut mna_info = Vec::new();
     if !scan.multianewarray_ops.is_empty() {
         let Some(resolver) = cp_class_name_resolver else {
             jitc_bail!("cp_class_name_resolver(multianewarray)")
         };
         for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-            let Some(class_name) = resolver(cp_idx) else {
+            let Some(_class_name) = resolver(cp_idx) else {
                 jitc_bail!("multianewarray_class")
             };
-            let leaf = class_name.trim_start_matches('[');
-            let leaf_et = match leaf.as_bytes().first() {
-                Some(b'I') => 10u8,
-                Some(b'J') => 11,
-                Some(b'F') => 6,
-                Some(b'D') => 7,
-                Some(b'B') => 8,
-                Some(b'C') => 5,
-                Some(b'S') => 9,
-                Some(b'Z') => 4,
-                _ => 0,
-            };
-            mna_info.push((pc, leaf_et));
+            mna_info.push((
+                pc,
+                pack_multianewarray_site(cached.declaring_class_id.as_u32(), cp_idx),
+            ));
         }
     }
 
@@ -20452,6 +20895,339 @@ mod code_buffer_retry_tests {
 #[cfg(test)]
 mod tests {
 
+    /// Every publication into `jit_cache` must stamp
+    /// `CompiledMethod::requires_wrapped_entry`.
+    ///
+    /// The bit is what tells an unwrapped consumer that this body is an
+    /// `ACC_SYNCHRONIZED` method's and carries no monitor prologue. A `put`
+    /// that forgets it publishes a body that every raw-entry door will happily
+    /// CALL unlocked — which is the defect, not a variant of it: `bumpStatic`
+    /// lost ~35 of 240 000 monitor-protected increments per run that way.
+    ///
+    /// A source witness because the alternative is a full `Vm` plus a
+    /// background compile thread; it is anchored on code text, not line
+    /// numbers, and on the `put` call itself, so a new publication site cannot
+    /// be added without either stamping or failing here.
+    #[test]
+    fn every_jit_cache_publication_stamps_the_wrapped_entry_requirement() {
+        let src = std::fs::read_to_string(format!(
+            "{}/../vm/src/runtime/interpreter/jit_bridge.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read jit_bridge.rs");
+
+        let puts: Vec<usize> = src.match_indices("jit_cache.put(").map(|(i, _)| i).collect();
+        assert!(
+            !puts.is_empty(),
+            "no `jit_cache.put(` sites found — retarget this witness"
+        );
+        for at in puts {
+            // The stamp is the last statement before the write lock is taken,
+            // so look back over a window comfortably wider than the
+            // `stamp_compilation_epoch` call that also sits in it.
+            let from = at.saturating_sub(900);
+            assert!(
+                src[from..at].contains("requires_wrapped_entry ="),
+                "a `jit_cache.put(` at byte {at} publishes a body without stamping \
+                 `requires_wrapped_entry`. An unstamped synchronized body is served \
+                 to the raw-entry dispatch doors and runs with no monitor."
+            );
+        }
+    }
+
+    /// The by-name callee entry point must refuse a wrapped-entry body on its
+    /// `jit_cache` FAST PATH, not only on the compile path behind it.
+    ///
+    /// This is the exact shape of the defect. `try_jit_compile_callee_slow`
+    /// refused `ACC_SYNCHRONIZED` callees all along; `try_jit_compile_callee`
+    /// answers from `jit_cache` first and never reached that refusal, so a body
+    /// the background tiering door published FOR the wrapped entry was handed
+    /// to callers that supply no monitor. A gate in front of a slow path guards
+    /// nothing once the fast path can answer.
+    #[test]
+    fn the_callee_cache_fast_path_refuses_a_wrapped_entry_body() {
+        let src = std::fs::read_to_string(format!(
+            "{}/../vm/src/runtime/interpreter/jit_bridge.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read jit_bridge.rs");
+
+        let at = src
+            .find("if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id)")
+            .expect("the callee `jit_cache` fast path must still exist");
+        let end = src[at..]
+            .find("return Some((compiled, entry, needs_ctx));")
+            .map(|off| at + off)
+            .expect("the fast path must still hand back an entry");
+        // The CODE form, not the bare identifier: this arm carries an
+        // explanatory comment that names the field, and matching that would
+        // let the witness pass against a deleted check. The sibling witness
+        // below was caught doing exactly that.
+        assert!(
+            src[at..end].contains("if compiled.requires_wrapped_entry"),
+            "`try_jit_compile_callee`'s `jit_cache` fast path hands back a compiled \
+             entry without asking `requires_wrapped_entry`. Every caller of this \
+             function CALLs that entry raw, with no monitor."
+        );
+    }
+
+    /// The dispatch helper's own `jit_cache` arm must refuse one too.
+    ///
+    /// It does not go through `try_jit_compile_callee` at all, and it CACHES
+    /// what it takes in `DISPATCH_CACHE` — so serving a synchronized body once
+    /// makes every later call at that site run unlocked as well.
+    #[test]
+    fn the_dispatch_helpers_jit_cache_arm_refuses_a_wrapped_entry_body() {
+        let src = std::fs::read_to_string(format!(
+            "{}/../vm/src/jit/helpers.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read vm/src/jit/helpers.rs");
+
+        // Anchor on the arm's own `get`, not on the `jit_cache.read()` above
+        // it: the file has an earlier reader that only inspects `has_indy_trap`
+        // and never hands out an entry, and matching that one would make this
+        // witness pass while the real arm went unguarded.
+        // Anchor on the arm that takes an `info`-keyed entry, matched without
+        // assuming a line ending: the file has an earlier `jit_cache` reader
+        // that only inspects `has_indy_trap` and never hands out an entry, and
+        // matching that one would make this witness pass while the real arm
+        // went unguarded.
+        let at = src
+            .match_indices("if let Some(compiled) = jit_cache.get(")
+            .map(|(i, _)| i)
+            .find(|&i| src[i..(i + 200).min(src.len())].contains("info.class_name"))
+            .expect("the dispatch helper's jit_cache arm must still exist");
+        let window = &src[at..(at + 1400).min(src.len())];
+        // The CODE form. Matching the bare identifier passed against a
+        // `.filter(|_c| true)` because the explanatory comment above the
+        // filter still named the field -- a probe that could not fail.
+        assert!(
+            window.contains("!compiled.requires_wrapped_entry"),
+            "`jit_invoke_dispatch`'s `jit_cache` arm fills `DISPATCH_CACHE` with a \
+             raw entry without asking `requires_wrapped_entry`"
+        );
+    }
+
+    /// `pack_multianewarray_site` must survive the round trip for every class
+    /// id and cp index a real site can carry, and must not let one field bleed
+    /// into the other.
+    ///
+    /// The packing exists only because Windows x64 gives a helper four register
+    /// arguments and three are already spent; if it ever silently truncated, the
+    /// helper would resolve the WRONG constant-pool entry and allocate an array
+    /// of the wrong class — which is precisely the defect the packed site was
+    /// introduced to fix, reappearing one layer down.
+    #[test]
+    fn multianewarray_site_packing_round_trips() {
+        for &cid in &[0u32, 1, 7, 4096, 0x0001_0000, 0x7FFF_FFFF, u32::MAX] {
+            for &cp in &[0u16, 1, 7, 255, 256, 4095, u16::MAX] {
+                let (got_cid, got_cp) =
+                    crate::unpack_multianewarray_site(crate::pack_multianewarray_site(cid, cp));
+                assert_eq!(
+                    (got_cid, got_cp),
+                    (cid, cp),
+                    "multianewarray site packing lost information for \
+                     (class_id={cid}, cp_idx={cp})"
+                );
+            }
+        }
+        // The two fields must be independent: changing only the cp index must
+        // not move the class id, and vice versa.
+        assert_ne!(
+            crate::pack_multianewarray_site(5, 1),
+            crate::pack_multianewarray_site(5, 2)
+        );
+        assert_ne!(
+            crate::pack_multianewarray_site(5, 1),
+            crate::pack_multianewarray_site(6, 1)
+        );
+    }
+
+    /// The `multianewarray` lowering must hand the helper the packed SITE, not
+    /// a pre-digested element type.
+    ///
+    /// A leaf element-type code names no class, so the helper could only
+    /// allocate with `ClassId(0)`: a JIT-compiled `new String[a][b]` came back
+    /// with `getClass() == [Ljava.lang.Object;` and every `checkcast` to the
+    /// declared array type threw. Commons Math's `DSCompiler.getCompiler`
+    /// publishes such an array through an `AtomicReference` and casts it back on
+    /// the next call — 118 of `DerivativeStructureTest`'s 124 methods failed
+    /// under the JIT and none under `--nojit`.
+    ///
+    /// This is a source witness because the alternative is a full `Vm` plus a
+    /// hand-built classfile; it is anchored on code text, not line numbers.
+    #[test]
+    fn multianewarray_lowering_passes_the_resolved_site_not_an_element_type() {
+        let src = std::fs::read_to_string(format!(
+            "{}/src/x64/bytecode_walk.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read bytecode_walk.rs");
+
+        let arm = src
+            .find("// multianewarray — allocate multi-dimensional array (2D only)")
+            .expect("the multianewarray arm must still exist");
+        let end = src[arm..]
+            .find("self.helpers.multianewarray_2d")
+            .map(|off| arm + off)
+            .expect("the arm must still call the multianewarray_2d helper");
+        let body = &src[arm..end];
+
+        assert!(
+            body.contains("multianewarray_info"),
+            "the multianewarray lowering must look its site up in \
+             `multianewarray_info`"
+        );
+        assert!(
+            !body.contains("unwrap_or(10)"),
+            "the multianewarray lowering must not fall back to a default \
+             element type: there is no default array CLASS, and a site with no \
+             resolved entry has to bail rather than allocate the wrong type"
+        );
+        assert!(
+            body.contains("emit_mov_imm64"),
+            "the packed site is a 64-bit immediate (class id + cp index); a \
+             32-bit move would truncate the cp index away"
+        );
+    }
+
+    /// The helper must resolve through the interpreter's own multianewarray
+    /// body, not carry a second transcription of JVMS §multianewarray.
+    ///
+    /// The two WERE separate copies, and only the interpreter's resolved the
+    /// per-level component classes. That is the whole defect; a second copy
+    /// reappearing is the whole regression.
+    #[test]
+    fn multianewarray_helper_calls_the_shared_interpreter_body() {
+        let helpers = std::fs::read_to_string(format!(
+            "{}/../vm/src/jit/helpers.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read vm/src/jit/helpers.rs");
+        let f = helpers
+            .find("pub unsafe extern \"C\" fn jit_multianewarray_2d(")
+            .expect("the multianewarray helper must still exist");
+        let body = &helpers[f..f + 4000];
+        assert!(
+            body.contains("multianewarray_alloc("),
+            "jit_multianewarray_2d must call `interpreter::multianewarray_alloc`; \
+             a private allocation loop here is how the JIT came to stamp \
+             `ClassId(0)` on every level"
+        );
+        assert!(
+            !body.contains("ClassId::new(0)"),
+            "jit_multianewarray_2d must not allocate any level with `ClassId(0)`: \
+             that is what made `new String[a][b]` read back as \
+             `[Ljava.lang.Object;`"
+        );
+    }
+
+    /// The optimizing tier must decline exactly the shape that crashed
+    /// `SparseRealVectorTest`, and nothing broader.
+    ///
+    /// Both directions matter and they fail differently. Refusing too much is
+    /// silent — the method drops to single-pass and only a benchmark notices,
+    /// which is why the measured reach is pinned here as well as the witness.
+    /// Refusing too little is a hard `InternalError` on the first trap.
+    #[test]
+    fn ir_declines_an_unresumable_protected_trap_and_only_that() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        fn range(start: u16, end: u16) -> Vec<ExceptionTableEntry> {
+            vec![ExceptionTableEntry {
+                start_pc: start,
+                end_pc: end,
+                handler_pc: end,
+                catch_type: 1,
+            }]
+        }
+
+        // `OpenIntToDoubleHashMap$Iterator.advance()` in miniature: a putfield
+        // (side effect) and a baload (deopt-guarded trap) inside one range.
+        //   0: aload_0        (0x2a)
+        //   1: aload_0        (0x2a)
+        //   2: getfield  #1   (0xb4 0x00 0x01)
+        //   5: putfield  #2   (0xb5 0x00 0x02)
+        //   8: aload_0        (0x2a)
+        //   9: iconst_0       (0x03)
+        //  10: baload         (0x33)
+        //  11: return         (0xb1)
+        let advance_like = [
+            0x2a, 0x2a, 0xb4, 0x00, 0x01, 0xb5, 0x00, 0x02, 0x2a, 0x03, 0x33, 0xb1,
+        ];
+        let site = ir_unresumable_protected_trap(&advance_like, advance_like.len(), &range(0, 11));
+        assert!(site.is_some(), "the witness shape must be declined");
+
+        // No exception table at all: the trap propagates out, nothing to route.
+        assert_eq!(
+            ir_unresumable_protected_trap(&advance_like, advance_like.len(), &[]),
+            None,
+            "an unprotected trap is not this gate's business"
+        );
+
+        // The trap is OUTSIDE the protected range.
+        assert_eq!(
+            ir_unresumable_protected_trap(&advance_like, advance_like.len(), &range(0, 2)),
+            None,
+            "a range that does not cover the trap must not be declined"
+        );
+
+        // Read-only range: a baload with nothing committed before it. Replaying
+        // from entry is harmless here, so declining would cost a compile and
+        // buy nothing — the narrowing term the H2 precedent asks for.
+        //   0: aload_0, 1: iconst_0, 2: baload, 3: ireturn
+        let read_only = [0x2a, 0x03, 0x33, 0xac];
+        assert_eq!(
+            ir_unresumable_protected_trap(&read_only, read_only.len(), &range(0, 3)),
+            None,
+            "a side-effect-free protected trap must still compile"
+        );
+
+        // A protected range whose only throwing site is an invoke: those exit
+        // through the sentinel + exception routing, which needs no resume.
+        //   0: aload_0, 1: invokevirtual #3, 4: return
+        let invoke_only = [0x2a, 0xb6, 0x00, 0x03, 0xb1];
+        assert_eq!(
+            ir_unresumable_protected_trap(&invoke_only, invoke_only.len(), &range(0, 4)),
+            None,
+            "an invoke is not a deopt-guarded inline trap"
+        );
+
+        // Side effect present but no deopt-guarded trap: putstatic only.
+        //   0: iconst_0, 1: putstatic #4, 4: return
+        let store_only = [0x03, 0xb3, 0x00, 0x04, 0xb1];
+        assert_eq!(
+            ir_unresumable_protected_trap(&store_only, store_only.len(), &range(0, 4)),
+            None,
+            "a side effect with no trap has nothing to deopt on"
+        );
+
+        // Every opcode family the IR tier lowers to a deopt guard must be
+        // recognised — this is the list that has to stay in step with
+        // `ir_lower.rs`, and the one that silently rots if nobody pins it.
+        for (op, label) in [
+            (0x2eu8, "iaload"),
+            (0x33u8, "baload"),
+            (0x4fu8, "iastore"),
+            (0x54u8, "bastore"),
+            (0x6cu8, "idiv"),
+            (0x70u8, "irem"),
+            (0xb4u8, "getfield"),
+            (0xbeu8, "arraylength"),
+        ] {
+            // `putstatic` supplies the side effect so the trap is the variable
+            // under test; two-byte operands for the field ops.
+            let code = [0x03, 0xb3, 0x00, 0x04, op, 0x00, 0x01, 0xb1];
+            let len = if matches!(op, 0xb4 | 0xb5) { 8 } else { 6 };
+            assert!(
+                ir_unresumable_protected_trap(&code[..len], len, &range(0, (len - 1) as u16))
+                    .is_some(),
+                "{label} must be recognised as a deopt-guarded trap"
+            );
+        }
+    }
+
     /// RBC.6's admission list must match what the lowerings actually publish.
     ///
     /// The failure mode this pins is asymmetric. Admitting an opcode whose
@@ -20474,6 +21250,10 @@ mod tests {
             0xb7, // invokespecial
             0xb8, // invokestatic
             0xb9, // invokeinterface
+            0xbb, // new         — every non-scalar-replaced arm funnels through
+            //           `emit_post_alloc_oom_check`, which publishes; the
+            //           scalar-replaced arm emits no call and cannot throw
+            0xbf, // athrow      — protected sites jump to the reason-9 stub
             0xc0, // checkcast   — single arm, always publishes
             0xc2, // monitorenter
             0xc3, // monitorexit
@@ -20486,15 +21266,14 @@ mod tests {
 
         // Do NOT publish. `arraylength` routes its NPE through the shared
         // `null_check_store_stubs` stub (`jit_npe_with_action` + sentinel +
-        // epilogue), which records nothing at the bci; `new`, `ldc` and
-        // `athrow` are the other three named on
-        // `first_unsupported_precise_frame_site`.
+        // epilogue), which records nothing at the bci; `ldc` reaches
+        // `helpers.ldc_string` / `helpers.ldc_class_cp` through the shared
+        // sentinel stub. They are the two left on
+        // `first_unsupported_precise_frame_site`'s named list.
         for op in [
             0x12u8, // ldc
             0x13,   // ldc_w
-            0xbb,   // new
             0xbe,   // arraylength
-            0xbf,   // athrow
         ] {
             assert!(
                 !super::precise_frame_publishing_opcode(op),
@@ -20541,6 +21320,59 @@ mod tests {
             super::first_unsupported_precise_frame_site(&arraylength, arraylength.len(), &table),
             Some((1, 0xbe)),
             "a protected arraylength must still refuse, at its own pc"
+        );
+    }
+
+    /// The exact bytecode shape RBC.6 was refusing on netty's
+    /// `AdaptivePoolingAllocator$Magazine.allocate`, both ways round.
+    ///
+    /// `throw new IllegalStateException()` inside a `try` is
+    /// `new`/`dup`/`invokespecial`/`athrow` — four bytecodes, two of which were
+    /// unadmitted. The method was reported refused at the `new` (pc=338,
+    /// op=0xbb); admitting only that opcode would have moved the refusal to the
+    /// `athrow` seven bytes later and measured nothing, which is why the two
+    /// landed together.
+    ///
+    /// The negative half is what makes this test non-vacuous: with the
+    /// admission withdrawn the same bytes MUST refuse, and refuse at the `new`.
+    /// Without it a gate that had quietly become unconditional would read green.
+    #[test]
+    fn rbc6_admits_a_protected_throw_new_and_refuses_it_when_withdrawn() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+        // pc 0: new #0        (3 bytes)
+        // pc 3: dup           (1)
+        // pc 4: invokespecial (3)
+        // pc 7: athrow        (1)
+        let code = [0xbbu8, 0x00, 0x00, 0x59, 0xb7, 0x00, 0x00, 0xbf];
+        let table = [ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 8,
+            handler_pc: 8,
+            catch_type: 0,
+        }];
+        assert_eq!(
+            super::first_unsupported_precise_frame_site(&code, code.len(), &table),
+            None,
+            "a protected `throw new X()` must compile — this is the netty              AdaptivePoolingAllocator$Magazine.allocate shape"
+        );
+
+        // Prove the RED. `precise_alloc_athrow_enabled` caches in a `OnceLock`,
+        // so this asks the predicate the same question the walk does rather
+        // than setting the env var (which a sibling test in this process may
+        // already have latched).
+        let withdrawn = |op: u8| -> bool {
+            if matches!(op, 0xbb | 0xbf) {
+                return false;
+            }
+            super::precise_frame_publishing_opcode(op)
+        };
+        assert!(
+            !withdrawn(0xbb) && !withdrawn(0xbf),
+            "the withdrawal must take both opcodes out — withdrawing one leaves              the other holding the same method down"
+        );
+        assert!(
+            withdrawn(0xb7),
+            "the withdrawal must not disturb invokespecial, which sits between              them in this very sequence"
         );
     }
 
@@ -24502,6 +25334,79 @@ mod tests {
         );
     }
 
+    /// **An OSR artifact may not contain an inlined body that publishes a deopt
+    /// point.** This is the constraint that gates the whole nesting-inliner
+    /// programme, and until now it existed only as prose.
+    ///
+    /// `osr_exit_policy` refuses any deopt point whose `frame_state.caller` is
+    /// set, because the VM's in-place OSR-exit transfer is single-frame
+    /// (`transfer_osr_exit_into_live_frame` bails on "inlined caller chain", as
+    /// do `resume_from_ir_deopt` and `build_deopt_frame_inner`). Nothing in this
+    /// crate sets `caller` today — `build_and_record_deopt_point` hard-codes
+    /// `None` and the IR-side `InlineScopeTable` has no producer — so this arm
+    /// had no test, and a future producer could have landed against it without
+    /// anything failing.
+    ///
+    /// Why it matters beyond tidiness, from
+    /// `netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`: the
+    /// method that needs inlining there is a `@Test` body, i.e. invoked ONCE, so
+    /// OSR is its only door out of the interpreter. An inliner that records
+    /// caller scopes would therefore make exactly the artifact that needs it
+    /// un-enterable, and the loop would run interpreted — strictly worse than
+    /// not inlining. The VM's multi-frame resume has to come first; this test is
+    /// what says so in code rather than in a design note.
+    ///
+    /// Both spellings are asserted, because they are two different gates and a
+    /// producer could satisfy one while tripping the other:
+    ///  * a point carrying a caller scope refuses at ADMISSION here;
+    ///  * a reconstructed frame carrying caller frames refuses at the EXIT
+    ///    (`resume_after_exit`, covered by
+    ///    `only_reexecute_semantics_yield_an_exact_resume_point`).
+    #[test]
+    fn a_deopt_point_with_an_inlined_caller_scope_refuses_the_osr_entry() {
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        // Sanity: the SAME artifact without the caller scope is admitted. Without
+        // this the test could pass because the fixture is malformed some other
+        // way, which is the shape of a guard that cannot fail.
+        let mut flat = osr_t_artifact(3);
+        flat.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        )];
+        flat.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("the same artifact without a caller scope must be admitted");
+
+        // The caller scope is fully DESCRIBABLE — every slot resolvable, no
+        // monitors, no virtuals. The refusal is not about describability; it is
+        // that the resume path has nowhere to put a second frame.
+        let mut inlined = osr_t_artifact(3);
+        let mut point = osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        );
+        point.frame_state.caller = Some(Box::new(deopt::FrameState {
+            method_key: "craton/probe/OsrEntry.caller:()V".to_string(),
+            bci: 12,
+            locals: vec![deopt::FrameValue::Int(7)],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        }));
+        inlined.deopt_points = vec![point];
+
+        let err = inlined
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a deopt point under an inlined caller scope must refuse the entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_INLINED_SCOPE));
+        assert!(
+            osr_refusal_is_permanent(&err),
+            "the point list is a pure function of the artifact, so the refusal is memoable"
+        );
+    }
+
     /// The lane's "what to refuse", and the two halves of getting it right:
     /// an ambiguous resume bci refuses the ENTRY, and copies that agree do not.
     ///
@@ -24524,20 +25429,30 @@ mod tests {
 
         // Two images of the loop header that disagree on the SEMANTICS.
         //
-        // `RETHROW`, not `RESUME`, and the choice is the whole point: a
-        // `RESUME` point anywhere in an artifact is already refused by the
-        // per-point rule above (`osr-entry-unresumable-exit`), so it could
-        // never reach this check. A `RETHROW` point is explicitly ALLOWED to
-        // exist — such points are stashed separately and never routed to a
-        // resume — which is exactly what makes it the reachable disagreement:
-        // `for_reason` answers `RETHROW` for `PendingException` and `REEXECUTE`
-        // for everything else.
+        // This used to be spelled `REEXECUTE` vs `RETHROW`, on the reasoning
+        // that a `RESUME` point is refused by the per-point rule before this
+        // check sees it while a `RETHROW` point is explicitly allowed to exist.
+        // Both halves of that were true and the conclusion was wrong: a
+        // `RETHROW` point is not a competing resume IMAGE — the same sentence
+        // that admits it says such points are "stashed separately and never
+        // routed to a resume" — so a bci carrying one plus one `REEXECUTE`
+        // point has exactly one image and no ambiguity.
+        //
+        // Refusing it was not academic. After the RBC.6b lift (2026-08-17) a
+        // `try { foo(x); } catch (...)` loop puts a speculative-dispatch guard
+        // and a `PendingException` frame on the same invoke bci, which is the
+        // ORDINARY shape of the population that lift admits;
+        // `probes/OsrExcTableProbe.java` reported `osr_entered=0
+        // osr_entry_refused_ambiguous_image=15` with every correctness arm
+        // green. `osr_exit::resume_image` now skips rethrow points, and
+        // `a_rethrow_point_is_not_a_competing_resume_image` is that case.
+        //
+        // What remains here is the genuine disagreement between two things that
+        // both claim to be resume points, which is the wrong-code half.
         let mut cm = osr_t_artifact(3);
         let mut other = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
         other.native_offset = 0x90;
-        other.reason = deopt::DeoptReason::PendingException;
-        other.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
-        assert_eq!(other.semantics, deopt::ResumeSemantics::RETHROW);
+        other.semantics = deopt::ResumeSemantics::RESUME;
         cm.deopt_points = vec![
             osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
             other,
@@ -24545,11 +25460,35 @@ mod tests {
         let err = cm
             .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
             .unwrap_err();
-        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE));
+        // The per-point `RESUME` rule fires first (it walks the list before the
+        // ambiguity scan), so THAT is what this pair reports. Assert the
+        // ambiguity scan itself directly, where nothing else can shadow it.
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
         assert!(
             osr_refusal_is_permanent(&err),
             "the point list is a pure function of the artifact, so the refusal is memoable"
         );
+        assert!(
+            osr_exit::first_ambiguous_resume_bci(&cm.deopt_points).is_some(),
+            "two points that both claim to be resume points and disagree are ambiguous"
+        );
+
+        // And the rethrow pairing, which must NOT be ambiguous — the correction
+        // above, asserted at the same level as the refusal it replaced.
+        let mut rethrow_pair = osr_t_artifact(3);
+        let mut exc = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        exc.native_offset = 0x90;
+        exc.reason = deopt::DeoptReason::PendingException;
+        exc.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
+        assert_eq!(exc.semantics, deopt::ResumeSemantics::RETHROW);
+        rethrow_pair.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            exc,
+        ];
+        let plan = rethrow_pair
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("a RETHROW point sharing a bci must not refuse the entry");
+        assert_eq!(plan.exit_policy, OsrExitPolicy::ExactTransfer);
 
         // Over-refusal guard 1: several native images of ONE bytecode is
         // exactly what a loop transform produces, and they agree on everything
@@ -24704,6 +25643,12 @@ mod tests {
         let err = plan.resume_after_exit(&cm, &rframe).unwrap_err();
         assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
         assert!(err.to_string().contains("REEXECUTE"), "{err}");
+        // …and it says WHY, rather than "not a recorded deopt point": since
+        // `resume_image` stopped counting rethrow points as resume images, a
+        // bci whose only point is one answers `None` there, and the generic
+        // "not recorded" wording would send the reader looking for a
+        // mis-routed stash that does not exist.
+        assert!(err.to_string().contains("RETHROW"), "{err}");
     }
 
     /// A crash handler must be able to tell "no compiled body covers this

@@ -107,6 +107,13 @@ fn maybe_dump_shutdown_reports() {
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
 
+    // The G1 live-region memo's tally, self-gated on
+    // `CRATONVM_DBG_G1_LIVE_MEMO`. Same argument as the line above, and it is
+    // the only usable one for that change: this host has no PMU, so a
+    // `perf stat -e instructions` A/B is unavailable, and its load average
+    // moves further in an hour than the effect does.
+    cratonvm_vm::dump_g1_live_region_memo_stats();
+
     // The JIT root-scan tally, self-gated the same way. It answers what the
     // method-stats line below cannot: those counters price the COMPILER, and a
     // run where compilation costs 3 ms while the JIT still costs +83% CPU has
@@ -4931,6 +4938,22 @@ fn run() -> Result<()> {
         let (bind_hits, bind_misses) = cratonvm_jit::direct_callee_bind_counts();
         eprintln!(
             "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the dispatch helper (statically bound sites where a ladder asked for a direct target)"
+        );
+        // WHICH gate refused. A bare miss total cannot separate a compile-ORDER
+        // accident (the callee simply was not compiled yet — repairable by
+        // re-binding) from a standing policy refusal (an exception table, a
+        // native shadow — which no re-bind touches), and those two want
+        // opposite fixes. `unattributed` is the mutator-side door's arms that
+        // return a bare `None`; a large value there means this list is the one
+        // to extend next, not that the misses are unexplained.
+        let reasons = cratonvm_jit::direct_callee_bind_refusal_reasons();
+        let attributed: u64 = reasons.iter().map(|(_, c)| *c).sum();
+        for (reason, count) in &reasons {
+            eprintln!("[cratonvm]   bind refused, {reason}: {count}");
+        }
+        eprintln!(
+            "[cratonvm]   bind refused, unattributed: {}",
+            bind_misses.saturating_sub(attributed)
         );
     }
 

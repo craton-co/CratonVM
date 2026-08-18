@@ -731,6 +731,65 @@ pub struct GcFlags {
     /// memory outside the collection set, so it is the first thing to rule out
     /// if a pause is suspected of losing a live humongous object.
     pub g1_eager_humongous: bool,
+    /// `CRATONVM_G1_YOUNG_PAUSE_TARGET` — let `max_gc_pause_ms` bound the
+    /// YOUNG generation, not just the old half of a mixed collection set.
+    /// **Opt-in** ([`parse::present`]); see the measurement below for why it is
+    /// not a default.
+    ///
+    /// G1's whole proposition is a configurable pause goal, and until this flag
+    /// the goal reached exactly one decision: how many OLD regions a mixed
+    /// collection set may take. The young half was unbounded — the only thing
+    /// that ever asked for a young collection was `needs_gc`, which fires when
+    /// the FREE pool falls below ~25% of the heap. So Eden grows to roughly
+    /// three quarters of `-Xmx` before the first pause, and young pause time
+    /// scales with the heap SIZE rather than with the pause goal: raising
+    /// `-Xmx` makes every pause longer, which is the opposite of what a
+    /// pause-target collector is for.
+    ///
+    /// With it on, the collector also collects once the young region count
+    /// reaches an adaptive target, shrunk after any pause that overruns
+    /// `max_gc_pause_ms` and grown back while pauses stay under half of it. Two
+    /// rules keep it from acting on anything but evidence:
+    ///
+    /// * the target starts at its ceiling AND a target at the ceiling is not a
+    ///   trigger, so the cap does nothing at all until a productive pause has
+    ///   been measured to overrun the goal. (Starting at the ceiling alone was
+    ///   not enough and this doc claimed it was: the ceiling is 60% of the
+    ///   region count while the free-pool trigger waits for 75%, so on a heap
+    ///   with headroom the ceiling itself fired. Measured at `-Xmx2048m`: a
+    ///   210 ms pause manufactured in a run whose other arms took none.)
+    /// * an unproductive pause (nothing copied, nothing freed — e.g. everything
+    ///   pinned) resets the target to the ceiling, so the cap can never turn
+    ///   into a storm of pauses that cannot help.
+    ///
+    /// # Measured, 2026-08-18 — why this is opt-IN
+    ///
+    /// `probes/G1ChurnPauseProbe 96 900` under `-Xmx2048m` (96 MiB retained,
+    /// 3.6 GiB of garbage, 200 ms goal), 3 interleaved reps, medians, all three
+    /// arms from ONE binary except `base` which differs only in `gc/src/g1.rs`
+    /// and `gc/src/region.rs`:
+    ///
+    /// | arm                    | wall    | pauses | total pause | p50     | p99     |
+    /// |------------------------|---------|--------|-------------|---------|---------|
+    /// | pre-audit baseline     | 5773 ms | 3      | 3801 ms     | 1082 ms | 1726 ms |
+    /// | audit, this flag OFF   | 2633 ms | 3      |  719 ms     |  236 ms |  243 ms |
+    /// | audit, this flag ON    | 2744 ms | 4      |  814 ms     |  187 ms |  250 ms |
+    ///
+    /// The 7x pause reduction in that table belongs to the audit's scan and
+    /// scrub fixes, NOT to this flag — the middle row has it off. What the flag
+    /// itself buys is the third row against the second: p50 -21%, p99 **+3%**,
+    /// wall +4.2%, one extra pause.
+    ///
+    /// p99 is the quantity a pause GOAL is about, and it did not move. It
+    /// cannot, on an adaptive scheme: the target only tightens after a pause
+    /// has already overrun, so the first (largest) pause is always paid in
+    /// full and it is the one p99 reports. The flag delivers a real median
+    /// improvement and a real throughput cost, which is a trade a specific
+    /// latency-sensitive workload may well want — but it is not a default, and
+    /// nothing measured here says it should be one.
+    ///
+    /// Turn it on and measure YOUR pause distribution before keeping it.
+    pub g1_young_pause_target: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
@@ -932,6 +991,7 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
+            g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
@@ -1795,6 +1855,21 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_VERTX`
     pub synthetic_vertx: bool,
 
+    /// `CRATONVM_TLS_OPENSSL_CLIENT` — back the default `SSLSocket` client
+    /// path with a raw `openssl::SslConnector` instead of
+    /// `native_tls::TlsConnector`. **Default ON** on Unix (no effect
+    /// elsewhere — `openssl` is a Unix-only dependency); `0` turns it off.
+    /// [`parse::on_unless_zero`].
+    ///
+    /// The kill switch exists so the two can be A/B'd in ONE binary. What
+    /// only the raw connector can do: hand out the peer's FULL certificate
+    /// chain (`SSL_get_peer_cert_chain`, which native-tls 0.2 does not
+    /// expose — it has `peer_certificate()` and nothing else), and set the
+    /// certificate security level. Both are load-bearing: an application
+    /// TrustManager cannot build a path from a one-element chain, and
+    /// OpenSSL's default security level of 2 is stricter than the JDK's own
+    /// 1024-bit floor.
+    pub tls_openssl_client: bool,
     /// `CRATONVM_TRACE_ARRAYS_HASHCODE`
     pub trace_arrays_hashcode: bool,
 
@@ -1985,6 +2060,7 @@ impl NativeFlags {
             synthetic_quarkus_start: present(src, "CRATONVM_SYNTHETIC_QUARKUS_START"),
             synthetic_rsa: present(src, "CRATONVM_SYNTHETIC_RSA"),
             synthetic_vertx: present(src, "CRATONVM_SYNTHETIC_VERTX"),
+            tls_openssl_client: on_unless_zero(src, "CRATONVM_TLS_OPENSSL_CLIENT"),
             trace_arrays_hashcode: present(src, "CRATONVM_TRACE_ARRAYS_HASHCODE"),
             trace_classvalue: present(src, "CRATONVM_TRACE_CLASSVALUE"),
             trace_pti_args: present(src, "CRATONVM_TRACE_PTI_ARGS"),

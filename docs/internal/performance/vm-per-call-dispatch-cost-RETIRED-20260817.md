@@ -318,7 +318,8 @@ page rather than leaving it open:
 Neither of those is this page's to build — one is call-site re-binding, the
 other is the inline cascade's exception routing, and both are JIT codegen. They
 are filed together, with their counts and their one-flag repro, as
-`known-issues/perf/a-compiled-call-goes-out-to-rust-two-causes-20260817.md`,
+`internal/performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
+(RETIRED the same day it was filed — both causes closed),
 which is this page's successor. A page whose every open item is answered and
 whose residual is a named mechanism owned by a live page belongs in `internal`,
 not in `known-issues`. **A page that says "this is the VM's per-call cost, and
