@@ -135,5 +135,7 @@ CRATONVM_DBG_STTRACE=1 <cratonvm> … 2>&1 | grep -c 'QuartzEndpoint.triggerQuar
   the page this was found from. Same class, different mechanism: that one is a
   `[moving-young]` fallback spiral under Generational, and this run logs none.
   Its thesis that the JIT is what breaks these classes survives.
-- `docs/known-issues/gc/generational-young-relocation-nulls-live-string-references-20260818.md`
-  — the other finding from the same re-measurement.
+- retired/generational-young-relocation-nulls-live-string-references-RETIRED-20260818.md
+  — the other finding from the same re-measurement, RETIRED and FIXED
+  2026-08-18. It was the proxy-dispatch `Method` cache being rooted without
+  being remapped, so it says nothing about this page's spin loop.

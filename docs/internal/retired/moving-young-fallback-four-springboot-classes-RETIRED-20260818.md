@@ -43,13 +43,15 @@ also called the risk that closed it: *"the fix might just move the failure."*
 
 Both successors are filed, and neither is this page's mechanism:
 
-* **`docs/known-issues/gc/generational-young-relocation-nulls-live-string-references-20260818.md`**
-  — with the refusals gone the young collector now actually relocates on these
-  classes, and Flyway and Integration fail 18/73 and 11/34 under Generational
-  with live `String` references reading back **null**
-  (`Method.getName()` returning null, a local NPEing as its own receiver). Both
-  pass under ZGC on the same binary. The fallback was refusing compaction
-  whenever the root set could not be verified; it was load-bearing.
+* **generational-young-relocation-nulls-live-string-references-RETIRED-20260818.md**
+  (in this folder) — **now itself RETIRED and FIXED, same day.** With the
+  refusals gone the young collector actually relocates on these classes, and
+  Flyway and Integration failed 18/73 and 11/34 under Generational with
+  `Method.getName()` returning null. The cause was NOT this page's mechanism
+  and not a precise-map edge: `SharedVm::classes::proxy_method_cache` was
+  scanned as a GC root but never remapped, so a moving cycle evacuated the
+  cached `java.lang.reflect.Method` and left the cache pointing at from-space.
+  Both classes are 73/73 and 34/34 under Generational post-fix.
 * **`docs/known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.md`**
   — Quartz now dies on **every** collector, growing ~350 MB/s of native memory
   to 22 GB with `--Xmx` having no effect and **zero** `[moving-young]` lines in
