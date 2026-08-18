@@ -66,6 +66,24 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+/// FxHash-backed aliases for the two collections on the flag *read* path.
+///
+/// PERF (2026-08-18, commons-math `BigDecimalBench` profile): `runtime_var_os`
+/// consults `declared_flag_names()` on EVERY call, and with the default
+/// `RandomState` that is a SipHash of the key plus a `memcmp`. On a
+/// `BigDecimal` benchmark that showed up as `hash_one::<&str>` 1.70% +
+/// `sip::Hasher::write` 1.41% of the whole process — for looking up string
+/// constants in a set that never changes after startup.
+///
+/// This is the same trade this crate already made for `StringPool` (see the
+/// `rustc-hash` dependency note in Cargo.toml): FxHash is ~3-5x faster than
+/// SipHash on the short ASCII keys these hold, and neither collection is
+/// exposed to untrusted input — the flag-name set is built from a compile-time
+/// inventory, and `MapSource` from the process environment — so the HashDoS
+/// resistance SipHash buys is not load-bearing here.
+type FxHashSetStr = rustc_hash::FxHashSet<&'static str>;
+type FxHashMapStr = rustc_hash::FxHashMap<String, OsString>;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -97,7 +115,7 @@ impl FlagSource for EnvSource {
 /// An explicit map, for tests and for launchers that layer `-XX:` flags over
 /// the environment.
 #[derive(Debug, Clone, Default)]
-pub struct MapSource(HashMap<String, OsString>);
+pub struct MapSource(FxHashMapStr);
 
 impl MapSource {
     /// Build from `(name, value)` pairs.
@@ -131,7 +149,7 @@ impl MapSource {
     /// not valid UTF-8 are dropped, which is not observable — every lookup is
     /// by `&str`, so such a name could never be matched anyway.
     pub fn from_process_env() -> Self {
-        let mut map: HashMap<String, OsString> = HashMap::new();
+        let mut map: FxHashMapStr = FxHashMapStr::default();
         for (name, value) in std::env::vars_os() {
             if let Ok(name) = name.into_string() {
                 map.entry(name).or_insert(value);
@@ -141,7 +159,7 @@ impl MapSource {
     }
 
     fn declared_snapshot(src: &dyn FlagSource) -> Self {
-        let mut map = HashMap::new();
+        let mut map = FxHashMapStr::default();
         for &name in declared_flag_names() {
             if let Some(value) = src.get(name) {
                 map.insert(name.to_string(), value);
@@ -2252,10 +2270,10 @@ impl VmFlags {
 
 static FLAGS: OnceLock<VmFlags> = OnceLock::new();
 
-fn declared_flag_names() -> &'static HashSet<&'static str> {
-    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+fn declared_flag_names() -> &'static FxHashSetStr {
+    static NAMES: OnceLock<FxHashSetStr> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let mut names = HashSet::new();
+        let mut names = FxHashSetStr::default();
         for entry in crate::flag_groups::INVENTORY {
             if let Some(name) = entry.on_key {
                 names.insert(name);

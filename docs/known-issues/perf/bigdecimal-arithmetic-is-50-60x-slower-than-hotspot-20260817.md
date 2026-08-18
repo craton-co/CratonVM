@@ -162,6 +162,53 @@ over many. `--dump-native-registry`'s invocation census plus a per-call probe
 (`probes/BignumNativeCostProbe.java`) separate those two; a flat profile alone
 cannot.
 
+### A fourth item, found by re-profiling AFTER the three above (2026-08-18)
+
+The three fixes above changed the shape of the profile, and a second
+`perf record` on `c8c7545af` surfaced something the first one had buried:
+**~4.3% of the run was hashing flag names with SipHash.**
+
+`cratonvm_types::flags::runtime_var_os` consults `declared_flag_names()` on
+**every** call, and with the default `RandomState` that is a SipHash of the key
+plus a `memcmp` — to look up compile-time string constants in a set that never
+changes after startup.
+
+| symbol | before | after |
+|---|---:|---:|
+| `hash_one::<&str>` (SipHash) | 1.70% | 0.24% (and now a `TypeId` caller, not this path) |
+| `sip::Hasher::write` | 1.41% | 0.19% |
+| `runtime_var_os::<&str>` | 1.21% | absent |
+| `FxHasher::hash_one` | — | 0.05% |
+
+The fix is the trade this crate had already made once: `types/Cargo.toml`
+records `StringPool` moving off SipHash because "FxHash is ~3-5x faster than
+SipHash for the short ASCII strings", and the same reasoning applies verbatim to
+`declared_flag_names()` and `MapSource`. Neither takes untrusted input — one is
+built from a compile-time inventory, the other from the process environment — so
+SipHash's HashDoS resistance is not load-bearing.
+
+**Wall clock: 7,993 -> 7,752 ms median over 9 interleaved rounds (+3.0%), which
+matches the profile share removed but is INSIDE this benchmark's noise** (the
+same binary ranges 7,064-21,012 ms across those rounds). Stated as "consistent
+with, not demonstrated by" the wall clock on purpose. One Azure run read
+1,311 ms against an earlier 2,233 ms — 1.7x — and that is **noise, not the
+effect**: the patched binary alone ranges 1,311-2,154 ms over five runs.
+Recorded because a 1.7x that cannot be true is exactly the figure somebody
+quotes later.
+
+Order-safety was the one real risk of swapping a hasher and was checked:
+`declared_flag_names()` is iterated in exactly one place, which inserts distinct
+names into a map (order cannot change the result), and `from_process_env`
+iterates `env::vars_os()` — the source, not the map — so its documented
+first-wins duplicate semantics are untouched.
+
+**Still unfound:** the *uncached* caller of `runtime_var_os`. Making the lookup
+cheap helps every caller, but something is reading a flag per operation and
+ought to cache it instead. `dwarf` stacks put it under `alloc_raw_tlab` /
+`is_object_address` / `get_field` / `set_field`, but inlining defeated exact
+attribution, and every `runtime_var_os` call site in `zgc.rs` is either
+`OnceLock`-cached or documented read-once-per-heap — so it is somewhere else.
+
 ## What is left, and why it is not on this page
 
 The post-fix profile of the witness class is flat and no longer bignum-shaped:
