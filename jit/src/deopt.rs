@@ -428,6 +428,36 @@ pub struct VirtualObjectState {
 /// `build_and_record_deopt_point`), while an `Unsupported` **local** means the
 /// local's kind or liveness could not be established. Those are different
 /// defects with different fixes, and the message could not tell them apart.
+/// How deep an inlined caller chain an OSR exit may carry.
+///
+/// This is a COUPLING, not a tuning knob: it is the VM's
+/// `deopt_resume::MAX_INLINE_RESUME_DEPTH`, which is that side's budget for
+/// materialising a chain atomically, and `CompiledMethod::osr_exit_policy`
+/// refuses at admission anything the transfer would refuse at the exit. The VM
+/// constant is defined as this one so the two cannot drift — a compile that
+/// admits a chain the VM then refuses spends a whole OSR entry to reach a safe
+/// reject, which is the shape admission-time checking exists to avoid.
+///
+/// 9 is HotSpot's own inlining depth limit. The IR-side
+/// `ir::MAX_INLINE_SCOPE_DEPTH` (64) and `MAX_SCOPE_CHAIN` (256) bound
+/// different things — what may be recorded, and what may be walked.
+pub const MAX_OSR_INLINE_RESUME_DEPTH: usize = 9;
+
+/// How many caller scopes `fs` carries. Bounded by [`MAX_SCOPE_CHAIN`], so a
+/// cyclic or absurd chain answers the cap rather than looping.
+pub fn caller_chain_depth(fs: &FrameState) -> usize {
+    let mut depth = 0usize;
+    let mut scope = fs.caller.as_deref();
+    while let Some(f) = scope {
+        depth += 1;
+        if depth >= MAX_SCOPE_CHAIN {
+            return depth;
+        }
+        scope = f.caller.as_deref();
+    }
+    depth
+}
+
 pub fn first_unresumable_slot(fs: &FrameState) -> Option<String> {
     let mut scope = Some(fs);
     let mut depth = 0usize;
