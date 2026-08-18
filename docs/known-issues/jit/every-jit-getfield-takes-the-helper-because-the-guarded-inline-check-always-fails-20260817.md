@@ -1,10 +1,14 @@
 # Every JIT `getfield` takes the checked helper — TWO independent guard clauses fail, one per collector family
 
 ## Status
-**PARTLY FIXED 2026-08-18.** The Generational defect is closed: 68 722 450
-helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). The ZGC/G1 defect is a
-different clause of the same guard, is now diagnosed and partly mitigated, and
-its proper fix is specified under "What is still open".
+**PARTLY FIXED 2026-08-18, and fully diagnosed.** The Generational defect is
+closed: 68 722 450 helper calls -> **0**, 25 638 -> 8 347 ns/op (3.07x). On ZGC
+and G1 the inline path is now engaged for **every primitive field read**
+(measured: 0 primitive misses on all three collectors); the entire remainder is
+**reference** reads. On ZGC those are blocked on the JIT load barrier and this
+page is finished. On G1 they are not blocked by anything and are the one
+actionable item left — see "What is still open" item 2, whose scope this
+measurement narrowed from "the general containment fix" to "a G1 fix".
 
 This title has now been wrong twice. The original blamed the containment check;
 the first correction concluded it was "NOT because the guarded inline check
@@ -414,43 +418,39 @@ Partial, and named as such.
 
 ## What is still open
 
-1. **What the remaining 56.9M ZGC/G1 misses ARE has not been measured** — and
-   the previous revision of this list asserted an answer, which on this page of
-   all pages was the wrong thing to do. Struck and replaced with the two
-   candidates and the instrument that separates them:
+1. **ANSWERED 2026-08-18: the residual is 100% reference-field reads, 0%
+   primitives.** Same binary, `SHA256Digest` x200 000, counts only (this is a
+   separate build from the timing numbers above — do not compare wall clocks
+   across them):
 
-   * **reference-field reads.** `emit_trusted_oop_receiver_check` was extended
-     to the IR tier for PRIMITIVES only, so every reference read still goes
-     through containment and still misses. `SHA256Digest`'s hottest field by a
-     wide margin is `X:[I` — a reference, read inside the 64-round loop — so
-     this is a real share of the residual. If it is most of it, the rest is
-     blocked on the ZGC JIT load barrier
-     (`feature-designs/zgc-jit-load-barrier.md`) and there is nothing to fix in
-     the getfield arms.
-   * **the single-pass arm's containment check.** That arm has its own
-     trusted-oop shortcut, gated on `stack_oop_marks_exact`, which
-     `bytecode_walk.rs:317` clears at any branch target reached through the
-     dead-code merge reconstruction with a non-empty stack. If the residual is
-     primitive-heavy, an arm is failing to take a shortcut it is entitled to,
-     and that is an ordinary bug.
+   | collector | helper calls | primitive | reference |
+   |---|---:|---:|---:|
+   | ZGC (default) | 56 932 090 | **0** | 56 932 090 |
+   | G1 | 56 930 831 | **0** | 56 930 831 |
+   | Generational | 0 | 0 | 0 |
 
-   The split is one counter — classify the `outside-published-bounds` bucket by
-   whether the field read is a reference — and it is in the tree. **Do not
-   infer the split from the numbers above**; inferring is what cost this page
-   four hypotheses.
+   A zero in the primitive column on every collector settles two things at
+   once, and one of them refutes what this list said a revision ago:
 
-   Two environment notes for whoever runs it, both of which cost an hour:
-   the release build failed three times, twice as `rustc` exiting
-   `0xc0000409 STATUS_STACK_BUFFER_OVERRUN` during the fat-LTO link and once
-   with the honest message, `os error 1455` — **the Windows page file was
-   exhausted**, with ~38 concurrent `rustc` processes from other sessions on
-   the box. Count toolchain processes before reading an LTO crash as a code
-   defect; `cargo check` passed throughout. And the obvious fallback does not
-   work: a **dev-profile** build (fine for a counting measurement, never for a
-   timing one) panics on this workload at `vm/src/jit/helpers.rs:1338`,
-   `jit_thread_mut: aliasing &mut JvmThread borrow detected`, twice during
-   boot — reproducible with every diagnostic flag OFF, so pre-existing and
-   unrelated, but it does block that route.
+   * **Every arm's PRIMITIVE path is now fully engaged, on all three
+     collectors.** The "single-pass arm is failing to take a shortcut it is
+     entitled to" candidate is dead — there is no primitive miss anywhere for
+     it to explain. `stack_oop_marks_exact` is evidently not the problem it
+     was hypothesised to be, and no further work on the trusted-oop shortcut
+     is indicated.
+   * **What is left is exactly the set that must not be inlined under ZGC.** A
+     compact reference slot there may hold `Z_COLORED_TAG | colour | offset`
+     rather than a pointer; inlining its load is the use-after-free
+     `heap.rs::read_prim_element` panics on by design and
+     `feature-designs/zgc-jit-load-barrier.md` (risk J1) rates worse than a
+     clean SIGSEGV. **On ZGC this page is finished** — the remainder is
+     blocked on that load barrier, which is a designed piece of work with its
+     own page, and there is nothing left to fix in the getfield arms.
+
+   **G1 is the exception, and it is now the one actionable item.** G1 has no
+   colored pointers: a reference field there is a plain pointer, and its
+   56.9M misses are pure containment failures with no soundness obstacle
+   behind them. See item 2 — whose value is now known to be G1-only.
 2. **The proper fix for containment under a non-publishing collector is a
    separate READ-SIDE bounds table.** This is a design, not a bug fix, and
    deserves its own page — but the shape is settled enough to write down, so
@@ -489,11 +489,21 @@ Partial, and named as such.
    constant `true` and says so **only** while no inline reference emission
    happens under an armed barrier.
 
-   *What it is worth.* Unknown until item 1 is measured. If the ZGC/G1
-   residual is mostly reference reads, this table buys little on its own and
-   the real gate is the ZGC JIT load barrier; if it is mostly primitives, it
-   buys most of the remaining 56.9M. **Measure item 1 first** — that ordering
-   is the whole point of this page.
+   *What it is worth, now that item 1 is measured.* **G1 only, and there it is
+   worth all 56.9M.** The split came back 100% reference / 0% primitive, so:
+
+   * on **ZGC** the table buys nothing on its own — the reads it would admit
+     are exactly the ones the colored-pointer representation forbids inlining,
+     so the real gate is the ZGC JIT load barrier and this table must not land
+     ahead of it;
+   * on **G1** there is no colored-pointer obstacle at all, and the entire
+     residual is containment failures on plain pointers. A read-side table is
+     the whole fix.
+
+   That inverts the original priority: this was written up as the general
+   containment fix and it is really a G1 fix. Scope it that way — Generational
+   already publishes, ZGC must wait for the barrier, and only G1 is left
+   paying for a table it could fill today.
 3. **`init_object_header` should honour the compact layout.** Defect 2 was fixed
    on the *reader* side, which is right and enough for `getfield` — but the
    underlying fact remains that ~99% of allocations ignore a registered compact
