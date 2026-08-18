@@ -203,6 +203,36 @@ Two changes were written, built, measured interleaved, and reverted
    read is nanoseconds, so that 18% is the hashing and the per-hit verification,
    not the lock. Reverted.
 
+### The mechanism, named exactly
+
+`p59_sw_walk` (`native-builtins/src/phases_late/reflect_invoke.rs:2581`):
+
+```rust
+let raw_trace = ctx.capture_stack_trace(0);
+let frames = ordered_stack_walk_frames(&raw_trace);
+let arr = ctx.new_ref_array(ClassId::new(0), frames.len());
+for (i, entry) in frames.iter().enumerate() {
+    let sf = populate_stack_frame(ctx, entry, retain_class_ref)?;  // a Java object PER FRAME
+    ...
+}
+```
+
+**Every `walk` materialises a Java `StackFrame` object for every frame on the
+stack before the caller's `Function` runs**, so the cost is
+`O(depth)` in Java allocations no matter how many frames the consumer reads.
+HotSpot fetches frames in BATCHES (8 by default) and only materialises more if
+the stream demands them — which is why its line in the table below is flat and
+ours is not, and why `findFirst` (what Mockito uses) is nearly free there and
+full price here.
+
+That is the fix, and it is the only one on this page with the right ceiling: a
+lazy `Stream<StackFrame>` — a spliterator that pulls a batch at a time through a
+`fetchFrames(from, count)` native — instead of an eagerly populated array. It is
+a real change (a new synthetic spliterator class, a batching native, and the
+`forEach`/`getCallerClass` siblings share the same eager path) and it lands in
+the code path every exception in the VM traverses, so it wants its own task with
+its own tests rather than being bolted on at the end of this one.
+
 ### The scaling, measured — and why it is not one symbol
 
 | stack depth | CratonVM | HotSpot | ratio |
