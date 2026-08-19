@@ -129,8 +129,25 @@ The batch of four was reverted; it was never committed.
 
 1. **the tag moved** — from a registry dump (§1, the test I first missed);
 2. **the behaviour holds** — the arms (which caught this one);
-3. **the surface was actually exercised** — non-zero invocations, or a direct
-   measurement that real objects are in play. Without this, (2) is vacuous.
+3. **the surface was actually exercised** — non-zero invocations. Without this,
+   (2) is vacuous: green arms over an unexercised surface prove nothing.
+
+**And a shortcut that does NOT work, tested rather than assumed.** The obvious
+way to satisfy (3) cheaply is to ask whether `--jdk-only` hands back real JDK
+objects — if the object is real, surely real bytecode can read it.
+`regression-suite/probes/RealObjectCheck.java` asks exactly that across 31
+containers and derived views, and answers **0 of 31 diverging**: every one,
+`LinkedHashMap.keySet()` included, already carries its real JDK class name.
+
+Yet retagging `LinkedHashMap` broke precisely that call. **Class identity is
+not state ownership.** The object really is a `java.util.LinkedHashMap`; what
+our `put()` shim maintains is a side structure rather than the real
+`table`/`head`/`tail` fields, so real `keySet()` bytecode reads a real object
+whose real fields were never populated.
+
+The probe is kept because a RED line is conclusive the other way — a stand-in
+class name disqualifies a registrar outright. It is a cheap disqualifier, never
+a certificate.
 
 Only the `unmodifiable` retag in this session satisfies all three on its own
 evidence.
