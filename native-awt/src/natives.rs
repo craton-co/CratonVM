@@ -578,12 +578,15 @@ fn get_double(args: &[Value], idx: usize) -> f64 {
 // must be confirmed with schema-v2 `invocations` counts before any group is
 // retagged. See audits/jdk-only-ambient-category-audit.md.
 pub fn register_all(registry: &mut NativeMethodRegistry) {
-    register_toolkit_natives(registry);
-    register_headless_natives(registry);
+    // EXPERIMENT (P0 over-tagging, per-group split)
+    registry.with_category(NativeKind::Bridge, register_toolkit_natives);
+    registry.with_category(NativeKind::Bridge, register_headless_natives);
     register_component_natives(registry);
     register_frame_natives(registry);
-    register_graphics_natives(registry);
-    register_image_natives(registry);
+    registry.with_category(NativeKind::Bridge, |r| {
+        register_graphics_natives(r);
+        register_image_natives(r);
+    });
     register_event_natives(registry);
     register_font_natives(registry);
     register_swing_natives(registry);

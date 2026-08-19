@@ -100,7 +100,8 @@ background — sat next to the missing `setBackground`. **Each gap was adjacent 
 its own other half**, which is exactly the configuration that makes a missing
 method invisible to a reader scanning for absent functionality.
 
-**This changes the P0 row's recommended order.** That row nominates `native-awt`
+**This changed the P0 row's recommended order — see §4b, where the per-group
+split it implies is now landed.** That row nominates `native-awt`
 as the FIRST retagging subsystem, on the grounds that it is small, single-file
 and has the clearest evidence. All true. But retagging decides which
 implementation answers a call, and the measurement above says a substantial
@@ -152,6 +153,42 @@ the census; it disables the instrument you would use to plan and validate the
 retag.
 
 The experiment was reverted. The tree is unchanged.
+
+## 4b. The per-group retag, LANDED
+
+§4a ran the wholesale retag and reverted it. The audit's actual prescription is
+a per-group split, and with a vector in place that is now testable rather than
+arguable. Bisected by measurement, not by reading:
+
+* ambient tag → `SyntheticStub`;
+* **pinned `Bridge`**: `toolkit`, `headless`, `graphics`, `image`;
+* **retagged**: `component`, `frame`, `event`, `font`, `swing`, `clipboard`.
+
+**54 of 199 `native-awt` registrations reclassified**, and under `--jdk-only`
+those 54 are now correctly DROPPED (145 remain) so real bytecode answers.
+Probe 0 of 25; vector 54 checks PASS; arms 101/101, 96/101, 61/62.
+
+**The vector earned its keep on the first attempt.** An intermediate split that
+left `toolkit` retagged passed the PROBE 0/25 and failed the VECTOR:
+`Toolkit.getDefaultToolkit()` reached real bytecode and went
+`PlatformGraphicsInfo.createToolkit` → `WToolkit.<init>`, the Windows toolkit
+that needs the platform AWT library. The probe does not call it; the vector's
+headful-refusal rows do. Without `G80-1` N3 that regression would have landed
+green.
+
+**What this does and does not establish.** The four pinned groups are pinned on
+EVIDENCE — `graphics`/`image` from §4a, `toolkit` from the failure above,
+`headless` because its font-family shim is the one thing standing between
+`getAvailableFontFamilyNames()` and the `NullPointerException` that `G81-1` §2
+rejects under rule 5.
+
+The six retagged groups are safe *for what is measured*. The vector exercises
+`frame`, `clipboard` and `component` only through their headful-refusal paths —
+where real bytecode throws `HeadlessException`, which is the correct answer and
+strictly better than a shim. It does NOT exercise Swing widget behaviour or
+event dispatch. Those six groups are now answered by real JDK bytecode under
+strict mode, which is what the row wants; the claim here is that nothing
+measured regressed, not that they are fully covered.
 
 ## 5. NOMINATIONS
 
