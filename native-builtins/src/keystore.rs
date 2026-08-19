@@ -3290,7 +3290,7 @@ pub(crate) fn engine_set_key_entry(
         // `JdkDelegatingPrivateKeyMethodTest`, any PKCS#11 or HSM key), and
         // dropping its entry with no trace means the alias simply is not there
         // later — indistinguishable from a keystore that was never populated.
-        // `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`
+        // the openssl-key-material-and-engine-residuals write-up (now retired)
         // asked for exactly this line. The store keeps working through the
         // live-keystore enumeration path
         // (`x509_manager::build_key_manager_state_from_live_keystore`), which

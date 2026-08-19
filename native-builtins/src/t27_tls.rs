@@ -2393,7 +2393,7 @@ struct PassthroughServerCertVerifier {
     /// straight back into an engine native. Deferring it costs the property
     /// below in the other direction — see
     /// `testHandshakeFailureOnlyFireExceptionOnce` in
-    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`,
+    /// the openssl-key-material-and-engine-residuals write-up (now retired),
     /// where the client sends its `Finished` for a chain its own TrustManager
     /// rejected. The
     /// identity check is not: it is a pure comparison of the presented chain
@@ -6596,12 +6596,17 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let list = lookup_sss_enabled_protocols(ctx, this)
                 .unwrap_or_else(|| vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]);
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            // GC NOTE: `create_string` allocates, so the array is rooted
+            // across the loop — see `x509_manager::materialize_string_array`.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let arr = scope.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            let arr_h = scope.root(arr);
             for (i, p) in list.iter().enumerate() {
-                let s = ctx.create_string(p);
-                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+                let s = scope.create_string(p);
+                let arr = scope.get(&arr_h);
+                scope.set_array_element(arr, i, Value::Object(Some(s)));
             }
-            Ok(Some(Value::Object(Some(arr))))
+            Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
         },
     );
     r.register(
@@ -6609,12 +6614,19 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "getSupportedProtocols",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
-            let s1 = ctx.create_string("TLSv1.3");
-            let s2 = ctx.create_string("TLSv1.2");
-            ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
-            ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
-            Ok(Some(Value::Object(Some(arr))))
+            // GC NOTE: rooted across the two `create_string` allocations —
+            // see `x509_manager::materialize_string_array`.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let arr = scope.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+            let arr_h = scope.root(arr);
+            let s1 = scope.create_string("TLSv1.3");
+            let s1_h = scope.root(s1);
+            let s2 = scope.create_string("TLSv1.2");
+            let s1 = scope.get(&s1_h);
+            let arr = scope.get(&arr_h);
+            scope.set_array_element(arr, 0, Value::Object(Some(s1)));
+            scope.set_array_element(arr, 1, Value::Object(Some(s2)));
+            Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
         },
     );
 
@@ -9603,7 +9615,7 @@ mod tests {
     /// reads `DecryptError` instead of the alert.)
     ///
     /// If this ever starts failing, section B of
-    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`
+    /// the openssl-key-material-and-engine-residuals write-up (now retired)
     /// has lost its destination and the plan needs rethinking before any more of
     /// it is built.
     /// Drive a client/server `EngineState` pair whose client verifier either
@@ -15715,12 +15727,17 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let id = engine_id_or_alloc(ctx, this);
             let list = with_engine(id, |s| s.enabled_protocols.clone())
                 .unwrap_or_else(|| vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]);
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            // GC NOTE: `create_string` allocates, so the array is rooted
+            // across the loop — see `x509_manager::materialize_string_array`.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let arr = scope.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            let arr_h = scope.root(arr);
             for (i, p) in list.iter().enumerate() {
-                let s = ctx.create_string(p);
-                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+                let s = scope.create_string(p);
+                let arr = scope.get(&arr_h);
+                scope.set_array_element(arr, i, Value::Object(Some(s)));
             }
-            Ok(Some(Value::Object(Some(arr))))
+            Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
         },
     );
 
@@ -17654,12 +17671,17 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
                 .get(&engine_objref_key(ctx, this))
                 .cloned()
                 .unwrap_or_else(|| vec!["h2".into(), "http/1.1".into()]);
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            // GC NOTE: `create_string` allocates, so the array is rooted
+            // across the loop — see `x509_manager::materialize_string_array`.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let arr = scope.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            let arr_h = scope.root(arr);
             for (i, p) in list.iter().enumerate() {
-                let s = ctx.create_string(p);
-                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+                let s = scope.create_string(p);
+                let arr = scope.get(&arr_h);
+                scope.set_array_element(arr, i, Value::Object(Some(s)));
             }
-            Ok(Some(Value::Object(Some(arr))))
+            Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
         },
     );
     r.set_category(__prev_cat);

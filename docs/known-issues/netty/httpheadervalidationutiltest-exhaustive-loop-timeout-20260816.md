@@ -174,7 +174,11 @@ in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
    (`iconst_1; goto L; iconst_0; L: ireturn`), which `try_emit_inline_body` has
    refused since commit 419a6f5. The call this work is about, at pc 16, is never
    reached. **The next lever is operand-stack merging in the inline emitter**,
-   not more evidence or more binding. Details and the full trace are on the
+   not more evidence or more binding. That landed the same day: the emitter
+   splices a value-producing merge now, which unblocked `objectsAreEqual` and
+   made the guarded splice fire for the first time
+   (`nested-splice-guarded=1`). Five interleaved rounds: **44.6 -> 33.8
+   ns/iter, −24%**, monotone, with codec-http identical off and on. Details and the full trace are on the
    sibling page.
 
    The chain's first two steps were VM work rather than compiler work: an artifact
