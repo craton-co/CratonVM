@@ -1070,6 +1070,33 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // `Long.valueOf(J)` — the twin of the `Integer.valueOf(I)`
+                    // recognition directly above, at this door for the same
+                    // stated reason: an OSR body is where a hot boxing loop
+                    // actually runs. `num_params: 1`, not 2 — the JIT counts one
+                    // operand slot per PARAMETER, not JVMS category-2 pairs.
+                    if invoke_kind == 3
+                        && cratonvm_jit::long_box_direct_helpers_enabled()
+                        && target_class == "java/lang/Long"
+                        && mn == "valueOf"
+                        && desc == "(J)Ljava/lang/Long;"
+                    {
+                        let entry =
+                            crate::jit::helpers::jit_long_value_of_direct as *const () as usize;
+                        cratonvm_jit::LONG_VALUE_OF_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
                     // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
                     // `AtomicInteger` read-modify-write family, through the
                     // SAME matcher `jit::try_compile_inner` uses so the two
@@ -1140,6 +1167,34 @@ pub(super) fn compile_osr_artifact(
                                 needs_context: true,
                                 num_params: 0,
                                 return_type: b'I',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `Long.longValue()` — the twin of `Integer.intValue()`
+                    // directly above. `java/lang/Long` is `final` on the same
+                    // terms, so a site declared against it is statically
+                    // monomorphic and needs no receiver guard; the helper
+                    // handles the null-receiver NPE and declines anything that
+                    // fails heap validation to the generic dispatcher.
+                    if invoke_kind == 0
+                        && cratonvm_jit::long_box_direct_helpers_enabled()
+                        && target_class == "java/lang/Long"
+                        && mn == "longValue"
+                        && desc == "()J"
+                    {
+                        let entry =
+                            crate::jit::helpers::jit_long_long_value_direct as *const () as usize;
+                        cratonvm_jit::LONG_LONG_VALUE_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'J',
                                 guard_class_id: 0,
                             },
                         ));
