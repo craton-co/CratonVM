@@ -141,3 +141,54 @@ to split — real wrappers, real immutable objects, and a stateless surface.
 crate's abstract-interface registrations and are the ones the file header warns
 hardest about), and a whole-cluster retag has not been run through the arms —
 only through five vectors.
+
+## 6. Why the row cannot complete in wave 1 — the clusters cross the contract line
+
+§5 left two clusters unmapped. Mapping the first one answers the row.
+
+Extending the retag to the Properties/Hashtable group — `properties`,
+`set_from_map`, on top of the whole map/set cluster, twelve registrars — left
+`RJdkBridge1` failing **identically**: *"equals/isEmpty are Hashtable's and
+must ignore the defaults table"*. Retagging everything this crate owns did not
+move it.
+
+Because this crate does not own it:
+
+```
+java/util/Properties + java/util/Hashtable registrations, by crate
+  native-builtins        67
+  native-collections     49
+```
+
+**The ownership cluster spans two crates, and the larger half lives in
+`native-builtins`** — the crate whose `lib.rs` contract §8 forbids editing this
+wave: *"Do not edit `native-builtins/src/lib.rs`; the stub reclassification is
+a separate wave with its own subsystem-per-PR discipline."*
+
+So the blocker is structural and measurable, not a matter of judgement or
+appetite:
+
+* §5 established the unit of work is the state-ownership CLUSTER, not the
+  registrar;
+* §6 establishes that cluster boundaries **do not respect crate boundaries**,
+  and at least one crosses into the file the contract protects.
+
+A wave-1 change cannot move a cluster that is 58 % outside the crate it is
+allowed to touch. That is why `Wholesale Bridge over-tagging` stops where it
+stops, and it is a better answer than "it is large".
+
+**What still stands, unaffected:** the 404 registrations retagged this session
+are all in surfaces with no shared mutable state to split — `native-awt`'s
+per-group split, the `unmodifiable` wrappers, the factories, `Comparator`,
+`Vector`. Those are complete clusters of one.
+
+## 7. NOMINATION
+
+**N4 — map the clusters BEFORE the wave-2 work starts, and map them by
+ownership rather than by crate.** The two instruments needed both exist and
+are cheap: `--dump-native-registry` gives `registered_by` per registration, so
+grouping by (class → registrars → crates) is a script. The map is what turns
+wave 2 from "reclassify 1300 registrations" into a list of clusters with a
+size, a crate span and a vector that proves each. This record contains two of
+them: the map/set cluster (ten registrars, one crate, three vectors green when
+moved together) and Properties/Hashtable (two crates, blocked by §8).
