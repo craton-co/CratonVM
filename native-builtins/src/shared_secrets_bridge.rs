@@ -2795,19 +2795,164 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
 
 // JavaUtilJarAccess -----------------------------------------------------------
 
+/// `JavaUtilJarAccess.jarFileHasClassPathAttribute(JarFile)` — does this jar's
+/// main manifest carry a `Class-Path` attribute?
+///
+/// **This used to hardcode `false`**, under the comment "Returning false is
+/// spec-compatible — callers short-circuit the full attribute scan". It is not
+/// spec-compatible and the short-circuit is the defect: this predicate is the
+/// gate on `jdk.internal.loader.URLClassPath$JarLoader.getClassPath()`, so a
+/// constant `false` tells the JDK's own loader that no jar in the process has a
+/// `Class-Path` manifest entry. A `false` here is not a cheaper `true`; it is a
+/// different answer, and the caller cannot tell.
+///
+/// It answers from the manifest now. `Attributes.getValue` is
+/// case-insensitive on the attribute NAME, which is why the literal spelling
+/// here does not have to match the file's.
+///
+/// A jar with no manifest answers `false` — that is the JDK's answer too, not a
+/// fallback: `getManifest()` returns `null` and there is no attribute to find.
+///
+/// `throws IOException` is on the interface (`javap -p
+/// jdk.internal.access.JavaUtilJarAccess`), so a failure to read the manifest
+/// PROPAGATES rather than being swallowed into `false`. Swallowing it would
+/// reintroduce the same defect in a narrower window.
+///
+/// GC NOTE: `manifest` and `attrs` outlive `create_string`, which allocates, so
+/// both are rooted and re-read — the shape that put six holes in TLS alias
+/// arrays on 2026-08-18.
 fn jujar_jar_file_has_classpath_attribute(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    // Returning false is spec-compatible — callers short-circuit
-    // the full attribute scan.
-    Ok(Some(Value::Int(0)))
+    let Some(Value::Object(Some(jar))) = args.get(1).copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let jar_h = scope.root(jar);
+    let jar = scope.get(&jar_h);
+    let manifest = match scope.invoke_virtual(jar, "getManifest", "()Ljava/util/jar/Manifest;", &[])?
+    {
+        Some(Value::Object(Some(m))) => m,
+        // No manifest: no attribute. Same answer the real body gives.
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let manifest_h = scope.root(manifest);
+    let manifest = scope.get(&manifest_h);
+    let attrs = match scope.invoke_virtual(
+        manifest,
+        "getMainAttributes",
+        "()Ljava/util/jar/Attributes;",
+        &[],
+    )? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let attrs_h = scope.root(attrs);
+    let key = scope.create_string("Class-Path");
+    let attrs = scope.get(&attrs_h);
+    let value = scope.invoke_virtual(
+        attrs,
+        "getValue",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[Value::Object(Some(key))],
+    )?;
+    let present = match value {
+        Some(Value::Object(Some(v))) => {
+            // A present-but-empty `Class-Path:` names no jars. The JDK's
+            // `getClassPath` would parse it to an empty array and add nothing,
+            // so answering `true` for one costs a scan and changes nothing;
+            // answering `false` is the same observable behaviour, cheaper, and
+            // is what the attribute means.
+            scope.read_string(v).is_some_and(|t| !t.trim().is_empty())
+        }
+        _ => false,
+    };
+    Ok(Some(Value::Int(i32::from(present))))
 }
 
+/// `JavaUtilJarAccess.ensureInitialization(JarFile)` — force the jar past its
+/// lazy manifest/verification setup.
+///
+/// A genuine no-op HERE, and the reason is not that it is hard. The JDK's body
+/// exists so that `JarFile`'s `checkForSpecialAttributes` has run before a
+/// caller reads `isMultiRelease`/signer state off a jar it did not open. This
+/// VM's `JarFile` has no such deferred phase to force: the manifest is parsed
+/// on demand by `getManifest()` and every reader of it goes through that.
+///
+/// Kept registered rather than deleted so the carrier cannot answer this
+/// interface method with an `AbstractMethodError` — which is what it did for
+/// the three methods added below.
 fn jujar_ensure_initialization(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
+/// `JavaUtilJarAccess.isInitializing()` — is the CURRENT THREAD inside
+/// `JarFile`'s initialization?
+///
+/// Always `false`, and truthfully so: [`jujar_ensure_initialization`] never
+/// enters such a phase, so no thread can be inside one. This is the honest
+/// answer for this VM rather than a placeholder — if the no-op above ever
+/// becomes a real initializer, this has to become a real thread-local flag with
+/// it, which is why the two doc comments name each other.
+fn jujar_is_initializing(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+/// `JavaUtilJarAccess.getTrustedAttributes(Manifest, String)` — the per-entry
+/// attributes of `name`, read from the manifest the caller supplies.
+///
+/// "Trusted" in the JDK names the SOURCE, not a filter: it reads the signed
+/// manifest's own copy rather than one an application may have replaced, so an
+/// attacker cannot forge per-entry attributes by handing over a `Manifest`
+/// object. This VM has no second, application-supplied copy to be confused
+/// with, so `Manifest.getAttributes(name)` IS that source.
+fn jujar_get_trusted_attributes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let (Some(Value::Object(Some(manifest))), Some(name)) =
+        (args.get(1).copied(), args.get(2).copied())
+    else {
+        return Ok(Some(Value::Object(None)));
+    };
+    ctx.invoke_virtual(
+        manifest,
+        "getAttributes",
+        "(Ljava/lang/String;)Ljava/util/jar/Attributes;",
+        &[name],
+    )
+}
+
+/// `JavaUtilJarAccess.entryFor(JarFile, String)` — the `JarEntry` for `name`.
+///
+/// `getJarEntry`, not `getEntry`: the interface's return type is `JarEntry` and
+/// `ZipFile.getEntry` answers a `ZipEntry`, so routing through the wider method
+/// would hand the caller an object that fails its own checkcast.
+fn jujar_entry_for(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (Some(Value::Object(Some(jar))), Some(name)) = (args.get(1).copied(), args.get(2).copied())
+    else {
+        return Ok(Some(Value::Object(None)));
+    };
+    ctx.invoke_virtual(
+        jar,
+        "getJarEntry",
+        "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+        &[name],
+    )
+}
+
+/// Register the carrier `SharedSecrets.javaUtilJarAccess()` hands out.
+///
+/// ALL FIVE interface methods, which two of them were not until 2026-08-19.
+/// `javap -p jdk.internal.access.JavaUtilJarAccess` declares
+/// `jarFileHasClassPathAttribute`, `getTrustedAttributes`,
+/// `ensureInitialization`, `isInitializing` and `entryFor`; this carrier had
+/// the first and the third. The other three are abstract on a synthetic class,
+/// so a caller reaching one got an `AbstractMethodError` — the same shape as
+/// the `X509KeyManager` interface-id defect in
+/// `openssl-key-material-and-engine-residuals`, and invisible until something
+/// calls it.
 fn register_java_util_jar_access(registry: &mut NativeMethodRegistry) {
     let owner = "cratonvm/internal/ss/JavaUtilJarAccess$1";
     registry.register(
@@ -2821,6 +2966,19 @@ fn register_java_util_jar_access(registry: &mut NativeMethodRegistry) {
         "ensureInitialization",
         "(Ljava/util/jar/JarFile;)V",
         jujar_ensure_initialization,
+    );
+    registry.register(owner, "isInitializing", "()Z", jujar_is_initializing);
+    registry.register(
+        owner,
+        "getTrustedAttributes",
+        "(Ljava/util/jar/Manifest;Ljava/lang/String;)Ljava/util/jar/Attributes;",
+        jujar_get_trusted_attributes,
+    );
+    registry.register(
+        owner,
+        "entryFor",
+        "(Ljava/util/jar/JarFile;Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+        jujar_entry_for,
     );
 }
 
