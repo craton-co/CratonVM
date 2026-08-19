@@ -91,7 +91,8 @@ public final class JarManifestClassPathProbe {
             failure = t;
         }
 
-        System.out.println("RESULT loaded=" + loaded + " attr=" + attr);
+        System.out.println("RESULT loaded=" + loaded + " attr=" + attr
+                + " predicate=" + askPredicate(mainJar));
         if (failure != null) {
             System.out.println("       failure=" + failure);
         }
@@ -107,6 +108,52 @@ public final class JarManifestClassPathProbe {
             System.exit(1);
         }
         System.out.println("PASSED");
+    }
+
+    /**
+     * Ask `JavaUtilJarAccess.jarFileHasClassPathAttribute` DIRECTLY.
+     *
+     * `loaded` above is the user-visible behaviour, and it can be satisfied by
+     * a VM whose own loader expands `Class-Path` without ever consulting this
+     * predicate — CratonVM's does. So `loaded` alone cannot tell you whether
+     * the predicate is right, and a fix to it would look inert. This line asks
+     * the changed thing itself.
+     *
+     * Needs `--add-exports java.base/jdk.internal.access=ALL-UNNAMED`; without
+     * it the answer is `unavailable(...)` and only `loaded` is meaningful.
+     */
+    private static String askPredicate(Path mainJar) {
+        try {
+            Class<?> secrets = Class.forName("jdk.internal.access.SharedSecrets");
+            Object access = secrets.getMethod("javaUtilJarAccess").invoke(null);
+            if (access == null) {
+                return "null-access";
+            }
+            // Interface first, receiver's class second. On HotSpot the
+            // interface `Method` works and `setAccessible` would need
+            // `--add-opens` on top of `--add-exports`. On CratonVM the carrier
+            // is a synthetic class that reflection reports as neither an
+            // instance of the interface nor a declarer of the method, so BOTH
+            // routes answer `unavailable` — recorded here rather than worked
+            // around, because "the predicate cannot be asked from Java on this
+            // VM" is the honest state and the next reader should not spend an
+            // hour rediscovering it.
+            java.lang.reflect.Method predicate;
+            try {
+                predicate = Class.forName("jdk.internal.access.JavaUtilJarAccess")
+                        .getMethod("jarFileHasClassPathAttribute", JarFile.class);
+            } catch (ReflectiveOperationException viaInterface) {
+                predicate = access
+                        .getClass()
+                        .getMethod("jarFileHasClassPathAttribute", JarFile.class);
+            }
+            try (JarFile jf = new JarFile(mainJar.toFile())) {
+                return String.valueOf(predicate.invoke(access, jf));
+            }
+        } catch (Throwable t) {
+            Throwable root = t.getCause() == null ? t : t.getCause();
+            return "unavailable(" + root.getClass().getSimpleName() + ")";
+        }
     }
 
     /** The probe's own class path holds `Dep.class`; read it as a resource. */
