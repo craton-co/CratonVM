@@ -296,3 +296,40 @@ CratonVM at every tier, including pinned to C1. So something else about the real
 method — it is an instance method reached through a wrapper, among other
 differences — is needed to trigger it. Naming that difference is the next step,
 and it is what turns this into a standalone regression test.
+
+### Two negative results on the standalone repro (do not repeat these)
+
+`probes/NttShapeProbe.java` — static method, exact loop shape, `sipush 256`
+bound, `getstatic` zeta table, same montgomery-reduce arithmetic. **PASSES** on
+CratonVM at default tiering, pinned to C1 (`CRATONVM_TIER_C2_THRESHOLD` huge),
+and under `--nojit`.
+
+`probes/NttShape2Probe.java` — the same, but `ntt` is a private INSTANCE method
+reached through a public `polyNtt` wrapper, matching the real class's shape, and
+self-checking the same way `NttRealProbe` does. **Also PASSES.**
+
+So neither the loop shape nor the instance-method-through-a-wrapper structure is
+sufficient on its own. What is still different about the real
+`HAETAEEngine.ntt`, and is where the next attempt should look:
+
+* it lives in a 3,860-line class of which ~44 methods are compiled in the same
+  run (`jit-method-stats`: `c1=44 c2=53 osr=17`), against 3-4 in the standalone
+  probes — so register pressure, code-cache state, or an interaction with a
+  neighbouring compile are all still live;
+* `montgomeryReduce` in the real class is reached as `invokestatic` from a
+  method that is itself hot, and is compiled too; the probes' copy may be
+  getting different treatment;
+* the real `ntt` has several callers (`polyNtt`, `polyveckNtt`, `polyveclNtt`,
+  `polyvecmNtt`, …), the probes have one.
+
+The cheapest way to close the gap is probably from the other end: read the C1
+disassembly of `ntt` (`CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=1`, which
+emits it as `full org/bouncycastle/…/HAETAEEngine.ntt([I)V … len=4465`) against
+the C2 body of the same method, and find where the middle loop's
+`start = j + len` update reads its `j`. The bytecode is unambiguous about what
+it should be: slot 3 stored at pc 82 inside the inner loop, loaded at pc 88 for
+the update.
+
+**Status: localised, not fixed.** The defect is live on dev at `b6fab962e`.
+`CRATONVM_JIT_DENY=HAETAEEngine.ntt` is a working local workaround for anyone who
+needs the pqc suite green in the meantime.
