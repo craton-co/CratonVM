@@ -476,10 +476,18 @@ fn component_fast_path(ctx: &mut dyn NativeContext, obj: ObjectRef) -> u8 {
 /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. The read copies a `bool`
 /// out and the write inserts an already-built `Box<[bool]>`; the one
 /// `NativeContext` call in this function (`record_components`) runs BETWEEN
-/// them, with no guard held. `LazyLock` is gone because
-/// `OrderedPlRwLock::new` is `const`.
-static BOOLEAN_COMPONENTS: cratonvm_types::lock_order::OrderedPlRwLock<std::collections::HashMap<u32, Box<[bool]>>> =
-    cratonvm_types::lock_order::OrderedPlRwLock::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch);
+/// them, with no guard held.
+///
+/// Still a `LazyLock`: `OrderedPlRwLock::new` IS `const`, but
+/// `HashMap::new` is not, so the pair cannot initialise a `static`.
+static BOOLEAN_COMPONENTS: std::sync::LazyLock<
+    cratonvm_types::lock_order::OrderedPlRwLock<std::collections::HashMap<u32, Box<[bool]>>>,
+> = std::sync::LazyLock::new(|| {
+    cratonvm_types::lock_order::OrderedPlRwLock::new(
+        std::collections::HashMap::new(),
+        cratonvm_types::lock_order::LockLevel::Scratch,
+    )
+});
 
 /// `true` if component `component_index` of `class_id` is declared `boolean`.
 fn is_boolean_component(
