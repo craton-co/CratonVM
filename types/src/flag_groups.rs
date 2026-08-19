@@ -1005,6 +1005,11 @@ pub const INVENTORY: &[E] = &[
     // restores the re-run encoding. See
     // `jit/src/x64/deopt_stubs.rs::osr_ambiguous_dead_enabled`.
     E { group: Group::JIT, token: "osr-ambiguous-dead", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD"), off_word: None },
+    // Declared 2026-08-19 beside `osr-ambiguous-dead`. Also an OPT-OUT: a
+    // per-bci-`Ref` local at a bci where the oop mask has no opinion is
+    // published as a reference by default. See
+    // `jit/src/x64/deopt_stubs.rs::osr_refined_ref_enabled`.
+    E { group: Group::JIT, token: "osr-refined-ref", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_REFINED_REF"), off_word: None },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },

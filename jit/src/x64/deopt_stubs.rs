@@ -20,6 +20,16 @@ use super::*;
 /// Default-ON: a per-bci `Ambiguous` local in an exception-free method is
 /// published `Undefined` rather than `Unsupported`. See the call site for the
 /// JVMS argument. `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD=1` is the kill switch.
+/// Default-ON: a per-bci `Ref` local at a bci where the oop mask has no
+/// opinion is published as a reference rather than `Unsupported`. See the call
+/// site. `CRATONVM_JIT_NO_OSR_REFINED_REF=1` is the kill switch.
+fn osr_refined_ref_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_REFINED_REF").is_none()
+    })
+}
+
 fn osr_ambiguous_dead_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -549,7 +559,47 @@ impl Compiler {
                 } else {
                     None
                 };
-                let kind = refined.unwrap_or(kind);
+                // A per-bci REFERENCE, at a bci where the oop mask has no
+                // opinion to defer to.
+                //
+                // `kind_at` filters `Ref` out on the stated grounds that "the
+                // flow-sensitive oop mask is the sole authority for ref-typed
+                // slots and has already had its say". At these bci it has not.
+                // The mask is a single `u64`, so it cannot address a slot at
+                // or above 64 at all -- the comment on `oop_mask` above says
+                // so, and names `local_kinds`'s `Ref` arm as "the reference
+                // authority above slot 63" -- and when the dataflow declines
+                // outright it publishes `oop_reached=false oop_mask=0x0`,
+                // which is silence, not a negative answer. Deferring to
+                // silence is what cost `BOBYQAOptimizer.trsbox` its OSR:
+                // `oop_reached=false` at EVERY one of its snapshots, local 87
+                // settled `Ref` by the per-bci dataflow, and the slot
+                // published `Unsupported` anyway.
+                //
+                // So publish exactly what `typed_local_frame_value`'s
+                // `LocalKind::Ref` arm publishes, for the reason it already
+                // gives, on a strictly stronger premise: that arm trusts a
+                // WHOLE-METHOD scan ("`Ref` everywhere it is ever accessed"),
+                // and this is a flow-sensitive answer at this pc.
+                //
+                // `has_jsr` is the one condition that must hold: `ret` is
+                // given no successors, which makes the graph NARROWER than the
+                // verifier's and could settle a kind the verifier would merge
+                // further. A handler's TOP seed is the opposite -- it can only
+                // turn a settled kind into `Ambiguous` -- so it is not checked.
+                let mask_has_no_opinion = !oop_reached || i >= 64;
+                let refined_ref = mask_has_no_opinion
+                    && !self.local_kinds_refined.has_jsr
+                    && matches!(
+                        self.local_kinds_refined.raw_at(bci, i),
+                        Some(LocalKind::Ref)
+                    )
+                    && osr_refined_ref_enabled();
+                let kind = if refined_ref {
+                    LocalKind::Ref
+                } else {
+                    refined.unwrap_or(kind)
+                };
                 let mut fv = typed_local_frame_value(reg, xmm, off, kind);
                 let was_unsupported = matches!(fv, crate::deopt::FrameValue::Unsupported);
                 // A slot the per-bci dataflow SETTLED as `Ambiguous` is not

@@ -647,6 +647,7 @@ export inherited from a parent shell.
 | `osr-athrow` | `CRATONVM_JIT_OSR_ATHROW` |
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
 | `osr-ambiguous-dead` | `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD` |
+| `osr-refined-ref` | `CRATONVM_JIT_NO_OSR_REFINED_REF` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |

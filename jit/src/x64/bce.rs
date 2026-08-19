@@ -485,6 +485,14 @@ pub(super) struct AmbiguousLocalKinds {
     /// False for either, and the callers that need the verifier equality then
     /// keep their conservative encoding.
     pub(super) cfg_is_exact: bool,
+    /// Does this method contain `jsr`/`ret`?
+    ///
+    /// The half of [`Self::cfg_is_exact`] that makes the graph NARROWER than
+    /// the verifier's, and therefore the only half a caller must check before
+    /// trusting a kind this pass SETTLED on. The handler half widens instead:
+    /// a TOP seed can only turn a settled kind into [`LocalKind::Ambiguous`],
+    /// never manufacture one, so it cannot make a settled answer wrong.
+    pub(super) has_jsr: bool,
 }
 
 impl AmbiguousLocalKinds {
@@ -556,21 +564,22 @@ pub(super) fn refine_ambiguous_local_kinds(
     }
     // See `AmbiguousLocalKinds::cfg_is_exact`. Scanned here rather than by the
     // caller so the flag can never disagree with the graph this pass walked.
-    let cfg_is_exact = exception_ranges.is_empty() && {
+    let has_jsr = {
         let mut pc = 0usize;
-        let mut clean = true;
+        let mut found = false;
         while pc < code_len {
             // jsr, ret, jsr_w, and the `wide ret` form.
             if matches!(code[pc], 0xa8 | 0xa9 | 0xc9)
                 || (code[pc] == 0xc4 && pc + 1 < code_len && code[pc + 1] == 0xa9)
             {
-                clean = false;
+                found = true;
                 break;
             }
             pc += bytecode_len_at(code, pc);
         }
-        clean
+        found
     };
+    let cfg_is_exact = exception_ranges.is_empty() && !has_jsr;
     let width = slots.len();
     let col_of = |slot: usize| slots.iter().position(|&s| s == slot);
 
@@ -653,6 +662,7 @@ pub(super) fn refine_ambiguous_local_kinds(
         slots,
         at,
         cfg_is_exact,
+        has_jsr,
     }
 }
 
@@ -2926,28 +2936,31 @@ mod ambiguous_local_cfg_exactness_tests {
     /// conjunct makes the second case read `true` and this test fails.
     #[test]
     fn cfg_exactness_tracks_handlers_and_jsr() {
-        // iconst_0; ifeq +7; iconst_1; istore_0; goto +4; dconst_0; dstore_0; return
+        // Slot 0 is an `int` on one arm of a branch and a `double` on the
+        // other, so the whole-method classifier must call it `Ambiguous` and
+        // the refinement has something to track:
+        //   0: iconst_0  1: ifeq ->9  4: iconst_1  5: istore_0
+        //   6: goto ->11  9: dconst_0 10: dstore_0 11: return
         let code: &[u8] = &[
-            0x03, // 0: iconst_0
-            0x99, 0x00, 0x07, // 1: ifeq -> 8
-            0x04, // 4: iconst_1
-            0x3b, // 5: istore_0
-            0xa7, 0x00, 0x04, // 6: goto -> 10
-            0x0e, // 9 (unreached as written; kept so the double arm exists)
-            0xb1, // 10: return
+            0x03, 0x99, 0x00, 0x08, 0x04, 0x3b, 0xa7, 0x00, 0x05, 0x0e, 0x47, 0xb1,
+        ];
+        // The same method with the trailing `return` replaced by `jsr; return`.
+        let jsr_code: &[u8] = &[
+            0x03, 0x99, 0x00, 0x08, 0x04, 0x3b, 0xa7, 0x00, 0x05, 0x0e, 0x47, 0xa8, 0x00,
+            0x03, 0xb1,
         ];
         let kinds = classify_local_kinds(code, code.len(), 4);
+        assert!(
+            matches!(kinds[0], LocalKind::Ambiguous),
+            "the fixture must actually produce an ambiguous slot, or every                assertion below passes vacuously"
+        );
         let clean = refine_ambiguous_local_kinds(code, code.len(), &kinds, &[]);
-        let with_handler =
-            refine_ambiguous_local_kinds(code, code.len(), &kinds, &[(0, 4, 10)]);
-
-        // jsr anywhere in the method clears it, even with no handler.
-        let jsr_code: &[u8] = &[0xa8, 0x00, 0x04, 0xb1, 0x57, 0xb1];
+        let with_handler = refine_ambiguous_local_kinds(code, code.len(), &kinds, &[(0, 4, 11)]);
         let jsr_kinds = classify_local_kinds(jsr_code, jsr_code.len(), 4);
         let with_jsr = refine_ambiguous_local_kinds(jsr_code, jsr_code.len(), &jsr_kinds, &[]);
 
         assert!(
-            clean.slots.is_empty() || clean.cfg_is_exact,
+            clean.cfg_is_exact && !clean.has_jsr,
             "an exception-free, jsr-free method's CFG IS the verifier's, and the                gate must say so or the relaxation it guards is dead code"
         );
         assert!(
@@ -2955,8 +2968,12 @@ mod ambiguous_local_cfg_exactness_tests {
             "a handler entry is seeded TOP, which is COARSER than the verifier's                merge of the protected range -- `Ambiguous` there does not imply                `top` and must not license dropping the slot"
         );
         assert!(
-            !with_jsr.cfg_is_exact,
-            "`ret` is given no successors at all, which makes the graph NARROWER                than the verifier's"
+            !with_handler.has_jsr,
+            "`has_jsr` is the half a caller may check ALONE before trusting a                SETTLED kind; folding the handler half into it would refuse every                method that merely has a try block"
+        );
+        assert!(
+            with_jsr.has_jsr && !with_jsr.cfg_is_exact,
+            "`ret` is given no successors at all, which makes the graph NARROWER                than the verifier's, and that is the half a settled kind cannot                survive"
         );
     }
 }
