@@ -39,6 +39,14 @@ public class NotDeclaredSplit {
             c[3]++;
             try {
                 Class<?> k = Class.forName(cn, false, cl);
+                // `<init>` is NOT a Method: getMethods() never returns
+                // constructors, so asking it about one reports a false ABSENT.
+                // Measured the hard way — `CopyOnWriteArraySet.<init>` came back
+                // absent from a class that plainly has constructors.
+                if (mn.equals("<init>")) {
+                    if (k.getDeclaredConstructors().length > 0) { c[0]++; } else { c[2]++; }
+                    continue;
+                }
                 Method found = null;
                 for (Method m : k.getMethods()) {
                     if (m.getName().equals(mn)) { found = m; break; }

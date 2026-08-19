@@ -2473,32 +2473,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_arraylist_natives(registry);
-    // RETAGGED per subsystem — fifth of ~45, and the hottest so far.
-    //
-    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
-    //   registrations 29 | invocations 69 | overwrote 0
-    //   real target: 26 CONCRETE BYTECODE, 0 ACC_NATIVE, 0 unmeasured,
-    //                3 "not declared with code here"
-    //
-    // Those 3 were checked individually rather than trusted to the count, and
-    // the distinction matters: they are `HashMap.equals`, `hashCode` and
-    // `toString` — INHERITED from `AbstractMap`/`Object` on a CONCRETE class,
-    // not registrations on an abstract interface. The file header's warning is
-    // about the latter, which decide dispatch for every implementor; these
-    // reach only `HashMap` subclasses, and all three have 0 invocations.
-    //
-    // (That count column conflates "abstract interface" with "inherited, so
-    // not declared here" — the same methodology error G79-1 §2 found in the
-    // audit's own absent-method figures. Worth re-checking per registrar
-    // rather than ranking on the raw number.)
-    //
-    // Rule 4. `java.util.HashMap` has a complete real implementation and no VM
-    // boundary to bridge to; it is exercised by essentially every collections
-    // vector in all three arms.
-    registry.with_category(
-        cratonvm_native_api::NativeKind::SyntheticStub,
-        register_hashmap_natives,
-    );
+    register_hashmap_natives(registry);
     register_hashset_natives(registry);
     register_hibernate_persistent_map_natives(registry);
     // Guard against an invokeinterface/assignability edge where AssertJ's
@@ -2516,28 +2491,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     }
     register_iterator_natives(registry);
     register_arrays_natives(registry);
-    // RETAGGED per subsystem — fourth of ~45, and the first with a NON-ZERO
-    // invocation count, which changes what the evidence proves.
-    //
-    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
-    //   registrations 20 | invocations 27 | overwrote 0
-    //   real target: 20 CONCRETE BYTECODE, 0 abstract, 0 ACC_NATIVE,
-    //                0 unmeasured
-    //
-    // The three retags below (ArrayDeque, LinkedList, Vector) all had ZERO
-    // invocations: nothing in the corpus depended on those shims answering, so
-    // dropping them could not change a live answer. This one IS live — 27
-    // dispatches in a single censused run — so the argument is different and
-    // weaker: it rests on `java.util.Optional` having a complete real
-    // implementation (all 20 targets carry concrete bytecode) and on the arms
-    // exercising it heavily, rather than on nothing depending on it.
-    //
-    // Exercised by six vectors: RJdkOptionalShape, RJdkCollections,
-    // RJdkBridge1, RJdkForeign, RJdkModule and RJdkProcess.
-    registry.with_category(
-        cratonvm_native_api::NativeKind::SyntheticStub,
-        register_optional_natives,
-    );
+    register_optional_natives(registry);
     register_collections_utility_natives(registry);
     register_map_entry_natives(registry);
     register_factory_natives(registry);
@@ -2554,79 +2508,11 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_optional_int_natives(registry);
     register_optional_long_natives(registry);
     register_optional_double_natives(registry);
-    // RETAGGED per subsystem — second of this crate's ~45 registrars, same
-    // discipline and same rule as the ArrayDeque block below.
-    //
-    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
-    //   registrations 45 | invocations 0 | overwrote 0
-    //   real target: 30 CONCRETE BYTECODE, 6 abstract, 0 ACC_NATIVE,
-    //                9 on classes this run never loaded
-    //
-    // Rule 4 again. Ranked second by the objective criterion the header's
-    // warning implies: `overwrote` 0 (nothing depends on these winning) and
-    // only 6 abstract-interface registrations, against 88 in the largest
-    // registrar.
-    //
-    // The 9 unmeasured rows are stated rather than glossed: their classes were
-    // not loaded in the censused run, so their targets are UNKNOWN, not clean.
-    // They are carried on the same rule-4 reasoning as the 30 — `java.util` has
-    // no VM boundary to bridge to — and on the arms, which exercise LinkedList
-    // through RJdkBridge1, RJdkMapViews and ROverlaySystemGcStress.
-    registry.with_category(
-        cratonvm_native_api::NativeKind::SyntheticStub,
-        register_linked_list_natives,
-    );
+    register_linked_list_natives(registry);
     register_linked_hashmap_natives(registry);
-    // RETAGGED per subsystem (P0 "wholesale Bridge over-tagging"), with the
-    // evidence this file's own header demands — "Retag per subsystem, one PR
-    // each, with schema-v2 `invocations` and `overwrote` evidence".
-    //
-    // MEASURED 2026-08-19 from `--dump-native-registry` under `--jdk-only`:
-    //   registrations 33 | invocations 0 | overwrote 0
-    //   real target: 32 have CONCRETE BYTECODE, 1 abstract, 0 ACC_NATIVE
-    //
-    // That is jdk-only-native-review.md rule 4 — "concrete bytecode +
-    // incomplete replacement -> delete from the strict path". `java.util` is
-    // pure Java; there is no VM/OS boundary here to bridge to, and `ArrayDeque`
-    // has a complete real implementation to fall back to.
-    //
-    // Chosen FIRST of this crate's ~45 registrars precisely because it is the
-    // least entangled: `overwrote` is 0, so no other registration depends on
-    // this one winning, and only ONE registration is abstract — the header
-    // warns that abstract-interface registrations decide dispatch for every
-    // USER subclass, not just for `java.util`.
-    //
-    // (This comment originally named `register_set_view_carrier_natives` and
-    // its 88 not-declared-here rows as "not where to start". That was WRONG,
-    // and is corrected at that registrar: a reflection pass showed all 88 are
-    // INHERITED-CONCRETE and none is abstract-interface. Ranking on the raw
-    // count reproduces the very error G79-1 §2 documented.)
-    //
-    // Exercised by RCollections and RJdkBridge1 (core) and RJdkMapViews
-    // (jdk-only), so all three arms adjudicate this change.
-    registry.with_category(
-        cratonvm_native_api::NativeKind::SyntheticStub,
-        register_array_deque_natives,
-    );
+    register_array_deque_natives(registry);
     register_priority_queue_natives(registry);
-    // RETAGGED per subsystem — third of ~45, and the cleanest profile in the
-    // crate by the ranking the header's warning implies.
-    //
-    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
-    //   registrations 28 | invocations 0 | overwrote 0
-    //   real target: 28 CONCRETE BYTECODE, 0 abstract, 0 ACC_NATIVE,
-    //                0 unmeasured
-    //
-    // Every single registration shadows real bytecode and none is on an
-    // abstract interface, so rule 4 applies to the whole registrar with no
-    // residue and no user-subclass dispatch to disturb — the one case so far
-    // where the evidence has no caveat attached.
-    //
-    // Exercised by RJdkBridge1 and RChaCha20Cipher.
-    registry.with_category(
-        cratonvm_native_api::NativeKind::SyntheticStub,
-        register_vector_natives,
-    );
+    register_vector_natives(registry);
     register_stack_natives(registry);
     register_bulk_ops_natives(registry);
     register_queue_deque_interface_natives(registry);
@@ -4907,24 +4793,7 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
     // Fix (item 6): the backed-view class returned by `subList`.
     register_al_sublist_natives(r);
     // The classes a map's `values()`/`entrySet()` view is minted under.
-    //
-    // RETAGGED per subsystem — the set-view carriers' sibling, and safe for the
-    // same measured reason.
-    //
-    // MEASURED 2026-08-19 (`--dump-native-registry` + the reflection split in
-    // `regression-suite/probes/NotDeclaredSplit.java`, `--jdk-only`):
-    //   registrations 84 | invocations 2 | overwrote 0
-    //   46 not-declared-here rows resolve as 46 INHERITED-CONCRETE and
-    //   **0 ABSTRACT-INTERFACE**; the other 38 are declared with code here.
-    //
-    // Every row resolves to a concrete method with a body, so the header's
-    // user-implementor dispatch hazard does not apply. Ranked by the CORRECTED
-    // criterion (reflection split, not the raw not-declared-here count) — see
-    // the note at `register_set_view_carrier_natives`.
-    r.with_category(
-        cratonvm_native_api::NativeKind::SyntheticStub,
-        register_map_view_carrier_natives,
-    );
+    register_map_view_carrier_natives(r);
 }
 
 /// The `Collection` surface of a map view, registered on each of the
@@ -15963,32 +15832,7 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
     // The classes a map's `keySet()`/`entrySet()` view is minted under.
-    //
-    // RETAGGED per subsystem — the LARGEST single registrar in this crate, and
-    // the one I had nominated as "where not to start". That was wrong; the
-    // reflection pass corrected it.
-    //
-    // MEASURED 2026-08-19 (`--dump-native-registry` plus the reflection split
-    // in `regression-suite/probes/NotDeclaredSplit.java`, under `--jdk-only`):
-    //   registrations 140 | invocations 5 | overwrote 0
-    //   140 not-declared-here rows resolve as 88 INHERITED-CONCRETE and
-    //   **0 ABSTRACT-INTERFACE**; the remaining 52 are declared with code here.
-    //
-    // The header's warning — abstract-interface registrations decide dispatch
-    // for every USER implementor, not just `java.util` — is the reason to fear
-    // a large registrar. It does not apply here: every row resolves to a
-    // concrete method with a body. The raw "not declared here" count made this
-    // look like the crate's most dangerous registrar; it is one of its safest.
-    //
-    // The genuinely abstract-interface rows live elsewhere — 254 crate-wide,
-    // concentrated in `register_stream_natives` (50), the three primitive
-    // stream registrars (86 between them), `register_interface_natives` (26),
-    // `register_queue_deque_interface_natives` (18) and
-    // `register_iterator_protocol_natives` (15). Those are the ones to leave.
-    r.with_category(
-        cratonvm_native_api::NativeKind::SyntheticStub,
-        register_set_view_carrier_natives,
-    );
+    register_set_view_carrier_natives(r);
 }
 
 /// The `Set` surface of a keySet/entrySet view, registered on each of the
