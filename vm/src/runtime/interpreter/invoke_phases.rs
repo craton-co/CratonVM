@@ -149,4 +149,13 @@ pub fn dump() {
         "[invoke-phases]   {:8.1} cyc/call measured (rdtsc overhead INCLUDED; ranking, not costing)",
         total as f64 / calls as f64
     );
+    // Frame-kind split. `OwnedFrameMeta` is boxed, which trades one heap
+    // allocation per `Owned` frame for 64 bytes off every frame — a trade that
+    // is only correct while `Owned` stays rare. Printed so that stays checked.
+    let (owned, cached) = crate::runtime::frame::frame_kind_counts();
+    let tot = owned + cached;
+    let pct = if tot == 0 { 0.0 } else { 100.0 * owned as f64 / tot as f64 };
+    eprintln!(
+        "[invoke-phases] frames: owned={owned} cached={cached} owned_share={pct:.3}%"
+    );
 }
