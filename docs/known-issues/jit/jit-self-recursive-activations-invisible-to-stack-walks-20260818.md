@@ -125,6 +125,67 @@ That is what still fails
 `stackwalker_log4j_deep_repeated_walks_finish_under_jit`: Log4j2's caller lookup
 wants `LoggerFactory.resolveCaller`, which is inlined away.
 
+### Design survey, 2026-08-19 — what a fix needs, and the one thing that blocks it
+
+Read this before starting: the obvious plan does not work, and the reason is a
+single missing runtime value.
+
+**The metadata half is nearly free.** `InlineSite` already carries the inlined
+callee's `class_name` / `method_name` / `descriptor`, and the emitter knows the
+native offsets it is writing (`self.buf.pos()`), so recording an extent table —
+`(native_start, native_end, label, owner_class_id)` per spliced body, nested
+sites included — is a contained change:
+
+* `CompiledMethod` has exactly ONE constructor (`CompiledMethod::new`), so
+  adding a field costs one edit, not twenty.
+* `try_emit_inline_site` already has the checkpoint/rollback discipline a new
+  vector must join (`exception_check_stubs`, `deopt_stubs`, `forward_patches`,
+  … all truncated on bail). Its comment explains what a stale speculative entry
+  does to the buffer; an extents vector that skipped that set would be the same
+  class of bug.
+* `runtime::stackwalker::compiled_frame_entry` wants only
+  `(depth, "class/Name.method:descriptor", owner_class_id)`, so a synthesized
+  inline frame needs no new consumer-side type.
+
+**The blocker is that a stack walk cannot learn the innermost frame's own PC.**
+Expanding an extent table needs a code offset per physical frame. The RBP walk
+gives one for every ANCESTOR frame — `[rbp+8]` is the return address into the
+caller, i.e. the caller's current PC — but the innermost frame's own PC is the
+return address pushed by the call it is currently inside, which lives below
+`exact_rbp` in the Rust helper's frame and is not reachable from the chain.
+
+And the innermost frame is exactly the one that needs expanding. Measured, not
+assumed: the `[acf]` diagnostic on `SWFrames` reports
+`nested=65 [recurse | recurse | …]` — `nested[0]`, the innermost, is the frame
+carrying the inlined callee. Same shape in `SWCross`, where the trace is
+captured inside the inlined `helper()`.
+
+The frame-record mirror that generated code already maintains is a PAIR — RBP
+(`inline_rbp_tls_disp`) and compile id (`inline_cm_tls_disp`), republished after
+every call by `emit_post_call_frame_record`. **There is no PC in it.** So the
+options are:
+
+1. **Publish the call-site PC as a third mirror slot**, beside the two that are
+   already written. Conceptually simple and it makes the extent table
+   immediately usable — but it adds a store to every call-out from compiled
+   code, which is a throughput cost on the hottest path in the VM and wants its
+   own measurement before anyone commits to it.
+2. **Key the extents by BYTECODE pc instead of native offset** and read the
+   frame's live safepoint id from `[rbp - sp_id_slot_off]`, which costs nothing
+   new because the frame already stores it. The catch: inlined bodies map their
+   bcis back through `orig_bci`, so a point inside a spliced body reports the
+   ENCLOSING invoke's bci — which identifies the inline SITE (sites are keyed by
+   caller pc) but is only as fresh as the last safepoint.
+3. **Reuse the deopt scope chain.** `FrameState::caller` is populated for
+   inlined scopes since 2026-08-18 (`push_inline_scope` / `pop_inline_scope`),
+   and it is the richest description available — but it is keyed by
+   `native_offset` at DEOPT POINTS, which do not coincide with the arbitrary PC
+   a stack walk lands on.
+
+Option 2 is the cheapest and needs no codegen change; option 1 is the most
+accurate. Neither is a small enough call to make without measuring, which is
+why this page is still open rather than half-fixed.
+
 **A wrong turn worth not repeating.** Resolving the innermost frame
 "decode-first" — preferring `direct_call_callee`'s `E8 rel32` decode over the
 published-compile-id mirror — looks like the fix for the naming and is not: it
