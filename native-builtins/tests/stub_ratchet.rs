@@ -795,6 +795,38 @@ fn census_covers_more_than_the_essentials_registrar() {
     );
 }
 
+/// LIST the synthetic stubs, one `class.method descriptor` per line.
+///
+/// The gate above reports a NUMBER, and a number cannot be paid back: the work
+/// it asks for is per-registration, so the first thing anyone who trips it
+/// needs is the set. Reconstructing that set from `git blame` is worse than it
+/// sounds — a line-ending normalisation commit re-blames whole files, and a
+/// registration can move between registrars without changing.
+///
+/// Run this at the last freeze commit and at `HEAD` and diff the two outputs;
+/// the difference IS the list to fix, exactly, with no attribution step.
+///
+/// ```text
+/// cargo test -p cratonvm-native-builtins --test stub_ratchet dump_synthetic_stubs -- --nocapture
+/// ```
+///
+/// Printing only — it asserts nothing the gate does not already assert, so it
+/// cannot fail independently and cannot go stale.
+#[test]
+fn dump_synthetic_stubs() {
+    let mut stubs: Vec<String> = census_rows()
+        .into_iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
+        .map(|(class, method, descriptor, _)| format!("{class}.{method}{descriptor}"))
+        .collect();
+    stubs.sort();
+    stubs.dedup();
+    println!("@@STUBS {} distinct in [{MEASURED_CONFIG}]", stubs.len());
+    for s in &stubs {
+        println!("@@STUB {s}");
+    }
+}
+
 /// THE GATE: the synthetic-stub count must not exceed the frozen baseline.
 ///
 /// A failure here means a change ADDED one or more synthetic stubs to the
