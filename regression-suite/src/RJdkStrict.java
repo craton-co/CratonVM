@@ -105,6 +105,39 @@ public class RJdkStrict {
         String s = "ref";
         check(id.apply(s) == s, "identity must return the same reference");
 
+        // BEHAVIOURAL parity, which is what closure rule 3 actually asks for:
+        // "executed from real bytecode (the native is deleted from the strict
+        // path)". Registry-dump evidence for the deletion: the four
+        // Function$Identity registrations present in the default registry are
+        // ABSENT under --jdk-only. These rows are the other half — proof that
+        // what answers instead is right.
+        //
+        // NOT asserted here, deliberately: andThen(null)/compose(null) must
+        // throw NullPointerException, and under --jdk-only they do — but this
+        // vector is scheduled in BOTH modes by SUITE=all, and in COMPATIBLE
+        // mode they answer `no-throw`. Asserting them here turns a
+        // compatible-mode defect into a red strict-mode vector, which is a
+        // different claim from the one this vector makes. The defect is real
+        // and is recorded separately (G84-1 N1) rather than hidden; it is the
+        // sharpest available evidence that a stand-in is answering, so it
+        // belongs in a compatible-mode vector, not this one.
+        check("y!".equals(id.andThen((String v) -> v + "!").apply("y")),
+                "identity.andThen must compose after");
+        check("z?".equals(id.compose((String v) -> v + "?").apply("z")),
+                "identity.compose must compose before");
+        check(id.apply(null) == null, "identity must carry null through");
+        check("u".equals(java.util.function.UnaryOperator.identity().apply("u")),
+                "UnaryOperator.identity shares the contract");
+        check(java.util.stream.Stream.of("p", "q").map(Function.identity())
+                        .collect(java.util.stream.Collectors.toList()).equals(
+                                java.util.List.of("p", "q")),
+                "identity through a stream map");
+        check(java.util.stream.Stream.of("a", "bb")
+                        .collect(java.util.stream.Collectors.toMap(Function.identity(),
+                                String::length))
+                        .equals(java.util.Map.of("a", 1, "bb", 2)),
+                "identity as a toMap key mapper — the commonest real use");
+
         // The stand-in class must not be loadable by name either.
         boolean threw = false;
         try {
