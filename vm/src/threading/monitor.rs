@@ -2383,10 +2383,52 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
         // `dead` is processed under the collector's stop-the-world token, so
         // no mutator can retain a cache hit while its registry owner is
         // removed. The next mutator observation must use a fresh lookup.
+        //
+        // Bumped unconditionally, BEFORE the survey below decides whether any
+        // removal is possible. One relaxed atomic add is not worth reasoning
+        // about whether a mutator can hold a cached handle for an address the
+        // sweep has just recycled.
         self.cas_lock_epoch.fetch_add(1, Ordering::Release);
-        {
+        // Which shards hold anything at all, asked ONCE.
+        //
+        // `dead` is every address the sweep freed, so on an allocation-heavy
+        // workload it is millions of entries per cycle, while the number of
+        // INFLATED monitors is usually zero and never more than a handful --
+        // inflation needs real contention. The loops below used to lock a
+        // shard and hash a key for every one of those addresses, in both
+        // registries, to remove nothing: `MonitorTable::prune_dead` measured
+        // 5.36% of `LegendreHighPrecisionTest` and 4.98% of
+        // `PSquarePercentileTest`, two workloads with no contended monitor in
+        // them at all.
+        //
+        // 64 shards, so this costs at most 128 uncontended lock/unlock pairs
+        // and answers the only question that matters: an empty shard cannot
+        // contain any dead address, so every key hashing to it can be skipped
+        // without taking its lock. When nothing is inflated -- the common case
+        // -- the whole prune becomes those 128 pairs instead of `2 * dead.len()`.
+        //
+        // Sound because this runs under the collector's stop-the-world token:
+        // no mutator can inflate a monitor between the survey and the loops,
+        // so a shard observed empty stays empty for the duration.
+        let mut monitors_nonempty = [false; MONITOR_SHARDS];
+        let mut cas_nonempty = [false; MONITOR_SHARDS];
+        let mut any_monitor = false;
+        let mut any_cas = false;
+        for i in 0..MONITOR_SHARDS {
+            monitors_nonempty[i] = !self.monitors[i].lock().is_empty();
+            cas_nonempty[i] = !self.cas_locks[i].lock().is_empty();
+            any_monitor |= monitors_nonempty[i];
+            any_cas |= cas_nonempty[i];
+        }
+        if !any_monitor && !any_cas {
+            return;
+        }
+        if any_monitor {
             // Group by shard so each shard is locked once; never two at a time.
             for d in dead {
+                if !monitors_nonempty[shard_of(*d)] {
+                    continue;
+                }
                 let removed = self.monitor_shard(*d).lock().remove(d);
                 if let Some(monitor) = removed {
                     // SAFETY: `dead` is documented EXACT — this address was a
@@ -2398,8 +2440,11 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
                 }
             }
         }
-        {
+        if any_cas {
             for d in dead {
+                if !cas_nonempty[shard_of(*d)] {
+                    continue;
+                }
                 self.cas_locks[shard_of(*d)].lock().remove(d);
             }
         }
@@ -2796,8 +2841,70 @@ mod tests {
         );
     }
 
+    /// The shard survey must not lose a removal.
+    ///
+    /// `prune_dead` skips a dead address whose shard is empty, which is what
+    /// makes it O(shards) instead of O(dead) on an allocation-heavy workload.
+    /// The risk of that shortcut is precisely that it skips a shard that is
+    /// NOT empty, so this inflates a real monitor, prunes it alongside a large
+    /// slab of unrelated dead addresses, and asserts the entry is gone.
+    ///
+    /// Verified by BREAKING it: making the survey answer `false` for every
+    /// shard (`monitors_nonempty = [false; MONITOR_SHARDS]`) leaves the entry
+    /// in the index and fails here.
+    #[test]
+    fn prune_dead_still_removes_an_inflated_monitor_among_many_dead() {
+        use cratonvm_gc::MonitorCleanup;
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(1);
+
+        // Force inflation, then release it so the entry is prunable.
+        table.enter(obj, tid);
+        table.wait(obj, tid, Some(1), None).unwrap();
+        table.exit(obj, tid).ok();
+        let before = table.indexed_monitor_count();
+        assert!(
+            before > 0,
+            "the fixture must actually inflate, or the assertion below passes             vacuously against an index that was empty all along"
+        );
+
+        // A realistic `dead` slab: the one real address buried in a crowd of
+        // addresses that hash all over the 64 shards.
+        let mut dead: Vec<usize> = (1..=4096).map(|i| i * 4096).collect();
+        dead.push(obj.as_ptr() as usize);
+        table.prune_dead(&dead);
+
+        assert_eq!(
+            table.indexed_monitor_count(),
+            before - 1,
+            "the shard survey must not let a real entry through: an address             whose shard is NON-empty has to be looked up"
+        );
+    }
+
+    /// The other half of the same shortcut: with nothing inflated anywhere,
+    /// pruning must be a no-op that touches no key.
+    ///
+    /// This is the case that dominates in practice -- `LegendreHighPrecision`
+    /// and `PSquarePercentile` inflate no monitor at all -- and it is the one
+    /// the old code spent 5% of the run on.
+    #[test]
+    fn prune_dead_on_an_empty_table_removes_nothing() {
+        use cratonvm_gc::MonitorCleanup;
+        let table = MonitorTable::new();
+        assert_eq!(table.indexed_monitor_count(), 0);
+        let dead: Vec<usize> = (1..=4096).map(|i| i * 4096).collect();
+        table.prune_dead(&dead);
+        assert_eq!(
+            table.indexed_monitor_count(),
+            0,
+            "an empty index must stay empty"
+        );
+    }
+
     #[test]
     fn monitor_contention_two_threads() {
+
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let heap = Heap::new();
