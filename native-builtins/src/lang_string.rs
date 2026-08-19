@@ -654,12 +654,16 @@ pub(crate) fn native_string_intern(
 /// string literals, so `"\uD800" == "\uD800"` and
 /// `LITERAL == LITERAL.intern()` are both required to hold, and two tables
 /// would answer the second one `false`.
-fn surrogate_intern_pool() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>
-{
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions —
+/// [`surrogate_intern_probe`]'s read and [`surrogate_intern_claim`]'s
+/// `entry().or_insert()` — copy a `usize` handle out and drop the guard in the
+/// same statement, so neither can hold it across a call back into the VM.
+fn surrogate_intern_pool(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<Vec<u16>, usize>> {
     static P: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>,
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<Vec<u16>, usize>>,
     > = std::sync::OnceLock::new();
-    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    P.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The global-root handle already canonical for `units`, if any.

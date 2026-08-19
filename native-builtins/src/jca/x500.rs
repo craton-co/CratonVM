@@ -553,10 +553,13 @@ const X500_DER_MAX_ENTRIES: usize = 4096;
 /// the reported failure named a DIFFERENT distribution point, because
 /// `checkCRLs` keeps only the LAST exception and retries with one synthesised
 /// from the issuer.
-fn x500_der_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Vec<u8>>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, Vec<u8>>>> =
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both callers evaluate
+/// `ctx.identity_hash_code` into a local BEFORE acquiring, and the bodies under
+/// the guard are map operations on `Vec<u8>` only.
+fn x500_der_table() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>> {
+    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>>> =
         std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Record the encoding this principal was built from.
