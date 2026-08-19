@@ -102,8 +102,23 @@ change and check the affected class's `kind`. It is one command, it is the only
 test that distinguishes a safe retag from an inert one, and its absence made
 five commits of false progress look like five commits of verified progress.
 
-**N3 — the 12 ambient-inheriting registrars are the ones the call-site
-technique actually works on.** They are the correct next target for the
-technique demonstrated on `native-awt`, and they can be identified
-mechanically: a registrar with no `set_category(NativeKind::Bridge)` in its
-body.
+**N3 — DONE for one, and the corrected procedure is demonstrated end to end.**
+The 12 ambient-inheriting registrars are the ones the call-site technique works
+on, and they are identified mechanically: no `set_category(NativeKind::Bridge)`
+in the body. `register_comparator_natives` (14 registrations, 0 invocations, 0
+`overwrote`, 12 declared-with-code) was retagged and **the tag move was asserted
+from a registry dump BEFORE any behavioural test** — `{'synthetic-stub': 14}`.
+Then the arms: 101/101, 96/101, 61/62.
+
+That ordering is the whole correction. Dump first, arms second. A no-op passes
+the arms; it cannot pass the dump.
+
+The remaining 11: `register_unmodifiable_natives` (300 registrations, 137
+invocations, and 300 not-declared-here rows that the reflection pass has not
+resolved — NOT a next candidate without that work), `register_factory_natives`
+(36, all declared-with-code, but 60 invocations and adjacent to the already-red
+`RImmutableFactoryTypes`), `register_linked_blocking_deque_stub_natives` (15),
+`register_string_joiner_natives_with_category` (7),
+`register_map_conditional_mutators` (3),
+`register_hibernate_persistent_map_natives` (2), and five with no
+registrations of their own.

@@ -2502,7 +2502,26 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_double_stream_natives(registry);
     register_interface_natives(registry);
     register_copy_constructor_natives(registry);
-    register_comparator_natives(registry);
+    // RETAGGED per subsystem (P0 "wholesale Bridge over-tagging").
+    //
+    // This registrar is one of the TWELVE in this crate that INHERIT the
+    // ambient tag. The other 48 set their own `set_category(Bridge)` at their
+    // head, which silently overrides a call-site wrapper — six retags written
+    // that way on 2026-08-19 were no-ops and were reverted (G85-1). The
+    // call-site technique only works here, and the tag move is verified from a
+    // registry dump rather than inferred from green arms.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 14 | invocations 0 | overwrote 0
+    //   real target: 12 declared with code, 2 not-declared-here, 0 ACC_NATIVE
+    //
+    // Rule 4: `java.util.Comparator`'s implementations are pure Java with no
+    // VM boundary to bridge to, and nothing in the corpus depends on these
+    // shims answering.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_comparator_natives,
+    );
     register_string_joiner_natives(registry);
     register_random_natives(registry);
     register_optional_int_natives(registry);
