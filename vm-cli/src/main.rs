@@ -158,6 +158,14 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        eprintln!(
+            "[cratonvm] membership walks by site: {}",
+            cratonvm_vm::jit::helpers::membership_walks_by_site()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
         // fall-through crosses. The two lines above count EMISSIONS, which is
