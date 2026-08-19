@@ -119,6 +119,19 @@ row in docs/jdk-only-runtime-services.md it maps to (P0/P1 table).
                                                        volatile long state into side-state is
                                                        a split brain; every assertion here is
                                                        a value such a model gets wrong)
+  WatchService contracts        RJdkWatchService   P0 "Wholesale Bridge over-tagging"
+                                                   P1 "NIO, files, networking"
+                                                   (written to make a RETAG verifiable:
+                                                   native-io/src/watch.rs holds 27 Bridge
+                                                   registrations of which ZERO are
+                                                   ACC_NATIVE, but it had 0 invocations, so
+                                                   moving the tag would have been unprovable
+                                                   -- G88-1 §9. Asks contracts only, never
+                                                   event timing, so it cannot be flaky. Two
+                                                   of its rows were DEFECTS when written:
+                                                   registering a file, and registering with
+                                                   an empty kind set, both returned a key
+                                                   where the JDK refuses.)
   headless AWT contracts        RJdkAwtHeadless    P0 "Wholesale Bridge over-tagging"
                                                    P2 "Headful AWT"  <-- CLOSES this
                                                    row under closure rule 5; the
