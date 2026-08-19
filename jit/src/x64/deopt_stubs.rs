@@ -555,10 +555,11 @@ impl Compiler {
                 {
                     eprintln!(
                         "[osr-slot] UNSUPPORTED local={i} bci={bci} whole_method_kind={:?} \
-                         refined={:?} reg={:?} xmm={:?} spill_off={off} live_covered={} \
+                         refined={:?} raw={:?} reg={:?} xmm={:?} spill_off={off} live_covered={} \
                          method={}",
                         self.local_kinds.get(i),
                         refined,
+                        self.local_kinds_refined.raw_at(bci, i),
                         reg,
                         xmm,
                         self.local_liveness_covered.get(bci).copied().unwrap_or(false),

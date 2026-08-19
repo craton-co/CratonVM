@@ -476,6 +476,30 @@ impl AmbiguousLocalKinds {
     /// for ref-typed slots and has already had its say by the time a caller
     /// consults this, so a `Ref` here means "the mask could not prove it live
     /// as an oop" — the one case that must stay a safe re-run.
+    /// The RAW dataflow state of `slot` on entry to `pc` — before
+    /// [`Self::kind_at`]'s "only concrete non-ref kinds" filter.
+    ///
+    /// The two answers [`Self::kind_at`] collapses into `None` are different
+    /// facts and want different fixes, and until this existed no caller could
+    /// tell them apart:
+    ///
+    /// * [`LocalKind::Ambiguous`] — the dataflow REACHED this pc and two
+    ///   different concrete kinds arrive on different paths. By JVMS 4.10.1.6
+    ///   the verifier assigns such a local `top`, and a `top` local cannot be
+    ///   the operand of any load, so no reachable bytecode reads it.
+    /// * [`LocalKind::Unknown`] — the dataflow never reached this pc, or the
+    ///   slot is undefined on every path here. No evidence either way.
+    /// * [`LocalKind::Ref`] — the flow-sensitive oop mask, not this pass, is
+    ///   the authority; a `Ref` here means the mask could not prove the slot
+    ///   live as an oop.
+    pub(super) fn raw_at(&self, pc: usize, slot: usize) -> Option<LocalKind> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let col = self.slots.iter().position(|&s| s == slot)?;
+        self.at.get(pc * self.slots.len() + col).copied()
+    }
+
     pub(super) fn kind_at(&self, pc: usize, slot: usize) -> Option<LocalKind> {
         if self.slots.is_empty() {
             return None;
