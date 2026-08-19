@@ -190,6 +190,37 @@ event dispatch. Those six groups are now answered by real JDK bytecode under
 strict mode, which is what the row wants; the claim here is that nothing
 measured regressed, not that they are fully covered.
 
+## 4c. Why `native-collections` did NOT follow in the same session
+
+Having landed §4b, the obvious next move is the same treatment for
+`native-collections` — a different crate from `native-builtins`, so contract §8
+permits it, and unlike AWT it is heavily covered by existing vectors, so the
+arms would adjudicate immediately.
+
+The call site forbids it, in terms:
+
+> **DO NOT flip this line to `SyntheticStub` as a bulk edit.** That is the exact
+> shape of the 2026-07-14 regression, at ~8x the blast radius, and the 214
+> abstract-interface registrations additionally decide dispatch for every USER
+> subclass, not just for `java.util` classes. **Retag per subsystem, one PR
+> each, with schema-v2 `invocations` and `overwrote` evidence.**
+
+Two things in that are not obvious from outside and would have cost a
+regression to learn. The **abstract-interface** registrations do not merely
+shadow `java.util`; they intercept any user class implementing the interface,
+so their blast radius is unbounded by the JDK. And a **bulk flip has been tried
+before**, on 2026-07-14, at an eighth of this size.
+
+So the boundary here is not §8 and not my judgement — it is this crate's own
+stated discipline: **one subsystem, one PR, with invocations and overwrote
+evidence.** This session's PR for that row is `native-awt` (§4b). The next
+subsystem is the next PR, by the rule the file states.
+
+The method §4b demonstrates transfers directly, and the evidence the comment
+demands is already available: `--dump-native-registry` carries `invocations`
+and `overwrote` per registration, and `G79-1`'s force-loading probe populates
+the `real_declaring_method` census for whichever classes a subsystem targets.
+
 ## 5. NOMINATIONS
 
 **N1 — DONE via option (A).** `BufferedImage.<init>` now builds the genuine
