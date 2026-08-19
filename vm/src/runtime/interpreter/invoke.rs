@@ -2683,11 +2683,17 @@ fn param_tag_scan_disabled() -> bool {
 }
 
 impl ParamTags {
-    const INLINE: usize = 16;
+    // 8, not 16. Measured: at 16 the struct cost ~11ns of fixed setup on EVERY
+    // call (zero-arg calls regressed in 7 of 8 paired rounds) against ~7.6ns
+    // saved per argument — break-even at ~1.5 args, which is a pessimisation for
+    // the 0-2 arg calls that dominate real Java. Eight covers essentially every
+    // method; wider ones take the fallback and are unchanged.
+    const INLINE: usize = 8;
 
     /// Tokenise `descriptor` once. Tokenisation mirrors [`nth_param_tag_byte`]
     /// exactly, including its `b'['`-for-arrays tag and its `b'L'` answer for
     /// an out-of-range index; `param_tags_match_nth_param_tag_byte` pins that.
+    #[inline]
     pub(super) fn of(descriptor: &str) -> Self {
         if param_tag_scan_disabled() {
             return Self { tags: [b'L'; Self::INLINE], len: 0, overflow: false, bypass: true };
