@@ -40874,7 +40874,25 @@ fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn register_vector_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // RETAGGED (P0 "wholesale Bridge over-tagging"). This is one of the 48
+    // registrars that set their OWN category rather than inheriting the
+    // ambient one, so a call-site wrapper is inert on it (G85-1) and the line
+    // itself has to change.
+    //
+    // That is not overriding somebody's judgement. This crate's header says
+    // the tag "is not a per-registration judgement: it is a dynamic ambient
+    // assignment that every callee in this file inherits", and the local
+    // save/restore here carries NO rationale — it is the same idiom repeated,
+    // not a decision about `java.util.Vector`.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 28 | invocations 0 | overwrote 0
+    //   real target: 28 CONCRETE BYTECODE, 0 not-declared-here, 0 ACC_NATIVE
+    //
+    // The cleanest profile in the crate: every row shadows a complete real
+    // implementation, nothing is abstract, nothing depends on these winning,
+    // and nothing invoked them. Rule 4 with no residue.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/Vector";
 
     r.register(c, "<init>", "()V", native_al_init);
