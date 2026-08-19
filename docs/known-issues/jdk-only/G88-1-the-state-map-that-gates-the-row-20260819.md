@@ -1,7 +1,7 @@
 # G88-1 — which collections carry REAL state, and which carry ours
 
-**Status:** MEASURED. Experiment reverted, nothing shipped. Converts the
-over-tagging row's blocker from an inference into a result.
+**Status:** MEASURED, then **PARTLY REFUTED BY A SECOND EXPERIMENT — read §5
+before using §2.** Both experiments reverted, nothing shipped.
 **Provenance:** eight `native-collections` registrars retagged to
 `SyntheticStub` at once, five collection vectors run under `--jdk-only`,
 CratonVM `C:/craton/target-nolto`, 2026-08-19. Reverted; tree unchanged.
@@ -93,3 +93,51 @@ spread across `G85-1` and this record.
 first: make the real `table` the truth and delete the side map, then the
 registrar retags by itself and the five vectors above become the proof. That is
 a wave-2 shape, but it is a bounded first step rather than a rewrite.
+
+## 5. CORRECTION — §2's conclusion was an artefact of my own experiment design
+
+§1 retagged the CONTAINERS (`hashmap`, `linked_hashmap`, `hashset`,
+`concurrent_hashmap`, …) and left the VIEW CARRIERS
+(`map_view_carrier`, `set_view_carrier`, `chm_key_set_view`) as `Bridge`. So
+`put`/`get` became real bytecode writing the real table, while `keySet()`
+stayed a shim reading the side structure the containers no longer wrote.
+
+**I created the split, then read the resulting failures as evidence of
+pervasive VM-owned state.** That inference does not survive its own control.
+
+Retagging the WHOLE cluster together — containers, view carriers, iterators,
+map entries, bulk ops, ten registrars in one build:
+
+| vector | §1 (containers only) | §5 (whole cluster) |
+| --- | --- | --- |
+| `RCollections` | NPE on `toArray()` | **PASS (53 checks)** |
+| `RJdkMapViews` | `keySet IS content-equal` | **PASS (74 checks)** |
+| `RChmKeySetView` | `add() did not reach the backing map` | **PASS** |
+| `RJdkCollections` | NPE | NPE — but at the STREAM boundary |
+| `RJdkBridge1` | `stringPropertyNames` size | `Hashtable`'s `equals/isEmpty` |
+
+**Three of five went from broken to green.** And the two still failing are
+outside the cluster, failing the same way for the same reason one level out:
+`RJdkBridge1` on `register_properties_natives` (Hashtable/Properties, not
+retagged), `RJdkCollections` at `java.util.List.size()` on a collector result
+(the stream/collectors surface, not retagged).
+
+**So the real finding is the opposite of §2's.** Real JDK bytecode CAN own
+these containers. What fails is a PARTIAL retag: state ownership has to move as
+a complete cluster, because a shim reading side state and real bytecode writing
+real fields cannot both be half-right.
+
+§2's rule stands only in this weaker form: a registrar cannot be retagged
+ALONE if anything else still shims the same object's state. The unit of work is
+the ownership cluster, not the registrar — which is why the per-registrar
+discipline that worked for `native-awt` mis-fires here.
+
+**What §2 got right and keeps:** `unmodifiable`, the factories and `Comparator`
+retag safely as individuals precisely because they have no shared mutable state
+to split — real wrappers, real immutable objects, and a stateless surface.
+
+**This does not close the row either.** Two clusters remain unmapped
+(Properties/Hashtable; streams/collectors, whose registrars hold 254 of the
+crate's abstract-interface registrations and are the ones the file header warns
+hardest about), and a whole-cluster retag has not been run through the arms —
+only through five vectors.
