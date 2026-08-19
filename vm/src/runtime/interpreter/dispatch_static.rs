@@ -1510,11 +1510,17 @@ pub(super) fn execute_invokestatic_cached(
                 &cached,
             )
         }
+        // Bound BY VALUE, not `ref`: the entry `Arc` cloned out of the invoke
+        // cache above is owned by `target`, which dies at the end of this arm,
+        // so the frame can take it by MOVE. Bound by reference it had to be
+        // cloned again — two atomic refcount bumps per call (and two matching
+        // decrements on pop) where one is the minimum, since the cache keeps
+        // its own and the frame needs its own.
         CachedInvokeTarget::Bytecode {
-            ref cached,
-            gate: ref entry_gate,
+            cached,
+            gate: entry_gate,
         } => {
-            if cached_static_owner_stale(shared, caller_class_id, cached) {
+            if cached_static_owner_stale(shared, caller_class_id, &cached) {
                 thread.invoke_cache.evict(caller_class_id, cp_index, false);
                 return Ok(CachedCallResult::CacheMiss);
             }
@@ -1726,7 +1732,7 @@ pub(super) fn execute_invokestatic_cached(
                     // declaring class, so a future `redefine_class` must
                     // invalidate this JIT entry too.
                     let upgrade_result =
-                        try_jit_upgrade_with_gate(shared, cached, entry_gate.clone());
+                        try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone());
                     if upgrade_result.is_none() && crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
                             "[cratonvm-jitc] upgrade-FAIL {}.{}{} invoc_count={}",
@@ -1880,7 +1886,7 @@ pub(super) fn execute_invokestatic_cached(
                 ph_t3,
             );
             let mut frame = Frame::new_pooled_cached(
-                cached.clone(),
+                cached,
                 args_slice,
                 &mut thread.locals_pool,
                 &mut thread.stacks_pool,
