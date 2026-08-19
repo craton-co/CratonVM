@@ -47,7 +47,7 @@ The 11-class compression `*IntegrationTest` cluster → `compression-testhugedec
 `DnsNameResolverTest`, `CertificateBuilderTest` →
 `certificatebuildertest-fail-status-not-a-regression-20260816.md` and, for the
 `HANG` → `ABORTED` change flagged here, **answered 2026-08-19**:
-`docs/internal/fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md`.
+`fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md`.
 Not the `0.0.0.1` bug (fixed and retired by `62cd387c1`) and not a second
 issue — the 16 aborts are eight Windows-only tests × two channel strategies,
 byte-identical on stock HotSpot. The `HANG` was the class running to 82% of
@@ -62,7 +62,7 @@ session did.
 1. ~~**17 `NativeImageHandlerMetadataTest` classes, one per module** — all
    `FAIL→FAIL` identically on all three collectors.~~ **RESOLVED 2026-08-19,
    17 FAIL → 17 PASS:**
-   `docs/internal/fixed-suite-bugs/netty/nativeimagehandlermetadatatest-harness-module-scope-FIXED-20260819.md`.
+   `fixed-suite-bugs/netty/nativeimagehandlermetadatatest-harness-module-scope-FIXED-20260819.md`.
    One shared root cause as suspected, and not a VM one: the suite ran these
    build-hygiene tests from the fixture directory against the flat
    whole-reactor classpath, so they looked for a `null/null` resource path

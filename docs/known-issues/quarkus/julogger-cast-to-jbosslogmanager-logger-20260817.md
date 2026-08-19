@@ -1,7 +1,9 @@
 # `java.util.logging.Logger` cannot be cast to `org.jboss.logmanager.Logger` — FIXED 2026-08-17
 
-**Status: FIXED, same session.** Found and fixed 2026-08-17 (Azure host,
-`cratonvm-quarkus-zgc`, dev base `496bc3c2c`). Was the dominant blocker in a
+**Status: FIXED and landed on `dev`.** Found and fixed 2026-08-17 (Azure
+host, `cratonvm-quarkus-zgc`, dev base `496bc3c2c`), committed and pushed
+same session as `04483c5ee` (`fix/jboss-logmanager-getlogger-dispatch-20260817`,
+fast-forward merged to `dev`). Was the dominant blocker in a
 quarkus full-suite rerun — ~78% of all recorded results, 99/105 `NOSTART`
 classes failing identically:
 

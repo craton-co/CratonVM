@@ -17,7 +17,7 @@
 # are false-by-construction on this platform can never reach PASS here, so it
 # gets re-flagged into others.txt on every categorize run, forever, and costs a
 # fresh investigation each time. `DnsNameResolverTest` has now cost three
-# (docs/internal/fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md).
+# (fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md).
 #
 # SAFETY: EXACT-COUNT MATCH, NOT NAME MATCH
 #

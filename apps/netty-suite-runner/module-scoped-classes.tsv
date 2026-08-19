@@ -16,7 +16,7 @@
 # module's checked-in
 #   src/main/resources/META-INF/native-image/<groupId>/<artifactId>/generated/handlers/reflect-config.json
 # Two things about the flat run break it, on CratonVM and on stock HotSpot alike
-# (see docs/internal/fixed-suite-bugs/netty/nativeimagehandlermetadatatest-harness-module-scope-FIXED-20260819.md):
+# (see fixed-suite-bugs/netty/nativeimagehandlermetadatatest-harness-module-scope-FIXED-20260819.md):
 #
 #   1. The expected path is built from `nativeImage.handlerMetadataGroupId` and
 #      `nativeimage.handlerMetadataArtifactId`, which netty's pom.xml feeds to

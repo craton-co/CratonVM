@@ -240,7 +240,7 @@ print_benign_aborts() {
 # Maven test classpath plus the groupId/artifactId system properties surefire
 # would have set. Without this, all 17 NativeImageHandlerMetadataTest classes
 # fail identically on CratonVM and on stock HotSpot -- see
-# docs/internal/fixed-suite-bugs/netty/nativeimagehandlermetadatatest-harness-module-scope-FIXED-20260819.md
+# fixed-suite-bugs/netty/nativeimagehandlermetadatatest-harness-module-scope-FIXED-20260819.md
 declare -A CLASS_WORKDIR=()
 declare -A CLASS_ARGFILE=()
 MODSCOPE_STATE="disabled"

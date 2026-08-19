@@ -46,7 +46,7 @@ print; it is one of the eight, not the only one.
 **3. The predecessor page was not lost.** `dnsnameresolvertest-searchdomaintest-hang-fail-20260816.md`
 was retired deliberately by `62cd387c1` ("netty: retire the DNS and
 DefaultThreadFactory pages"), which deleted it alongside a real VM fix and wrote
-`docs/internal/fixed-suite-bugs/netty/dns-localhost-bind-family-and-datagramsocket-doors-FIXED-20260817.md`
+`fixed-suite-bugs/netty/dns-localhost-bind-family-and-datagramsocket-doors-FIXED-20260817.md`
 in its place. The `0.0.0.1`-routing defect it described is genuinely fixed, and
 the sibling class from that page is clean too:
 

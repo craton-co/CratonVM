@@ -25,5 +25,5 @@
 # byte-identical at ok=216 aborted=16. A saturated full-suite run has no headroom
 # left, and a class killed at the cap is reported HANG, which is exactly how this
 # class was first characterized. 600s is generous rather than marginal on purpose.
-# See docs/internal/fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md
+# See fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md
 io.netty.resolver.dns.DnsNameResolverTest	600	-
