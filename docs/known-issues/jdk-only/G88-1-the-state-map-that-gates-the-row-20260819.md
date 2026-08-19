@@ -299,12 +299,42 @@ person starts from the verdict rather than from the tag.
 **That closes the wave-1 tail.** What remains in it is each blocked for a
 *different, measured* reason, which is the useful summary:
 
-| entry | regs | why not now |
+| entry | regs | outcome |
 | --- | ---: | --- |
-| `data_stream` | 37 | 1039 invocations — hot, and by §8's pattern likely load-bearing |
+| `watch.rs` | 27 | **LANDED** — see §10; the one retag verified all three ways |
+| `data_stream` | 37 | **LOAD-BEARING (measured)** — retagged, `RDataInputFastPull: skipped.next = -19`, reverted |
+| `scanner` | 40 | **LOAD-BEARING (measured)** — `findWithinHorizon` returned null, reverted |
 | `instrument.rs` | 33 | mixed: 10 genuine `ACC_NATIVE` bridges; needs a per-group split, unverifiable at 0 invocations |
-| `watch.rs` | 27 | 0 bridges but 0 invocations — correct by classification, unverifiable by exercise |
-| `scanner` | 40 | correctly classified, LOAD-BEARING (measured) |
 | `native-builtins-security` | 3 | already `Intrinsic` |
 
 None of these is blocked by judgement or appetite. Each has a number attached.
+
+## 10. `watch.rs` — the one that landed, and what made it different
+
+`watch.rs` and `scanner` had the SAME census verdict: correctly classified
+"stub", zero `ACC_NATIVE`, tag inherited rather than judged. One retagged
+cleanly and one broke. **The census cannot tell those apart; only running it
+can.**
+
+What separated them was who owns the state, and for `watch.rs` that needed a
+measurement no vector can make. The registrar's own doc says these natives
+exist so a caller "still gets real OS-level notifications" — so the risk was
+that real bytecode would satisfy every contract and silently deliver nothing.
+Contracts are assertable; delivery is not, without depending on filesystem
+latency. So it was measured separately: create a directory, register, create a
+file, poll. **HotSpot EVENT / CratonVM EVENT, with all 27 natives refused.**
+
+The route there is the reusable part, and it produced more than the retag did:
+
+1. census said mistagged (0 `ACC_NATIVE`) but invocations were 0, so §9
+   declined it;
+2. writing the missing exercise found **two real defects** — registering a
+   regular file, and registering with an empty kind set, both returned a live
+   key where the JDK refuses `NotDirectoryException` /
+   `IllegalArgumentException`. Fixed;
+3. the contract probe became `RJdkWatchService` (13 checks, scheduled);
+4. delivery was measured out-of-band;
+5. only then did the tag move.
+
+Steps 2 and 3 are worth more than step 5. A retag removes a mistag; those two
+fixed defects users could hit.
