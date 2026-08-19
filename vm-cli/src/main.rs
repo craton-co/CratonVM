@@ -160,7 +160,7 @@ fn maybe_dump_shutdown_reports() {
         );
         eprintln!(
             "[cratonvm] membership walks: TOTAL={} | by JIT site: {}",
-            cratonvm_gc::vm_heap::is_object_address_calls(),
+            cratonvm_vm::jit::helpers::total_membership_walks(),
             cratonvm_vm::jit::helpers::membership_walks_by_site()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
