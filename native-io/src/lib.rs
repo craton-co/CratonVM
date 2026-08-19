@@ -7673,6 +7673,22 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // Tagged `Bridge` purely by inheritance from `register_io_natives`.
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
+    // RETAG ATTEMPTED 2026-08-19 AND REVERTED — the classification above is
+    // right and the tag is nevertheless LOAD-BEARING, the same shape the
+    // `FileInputStream` block in this file already calls out.
+    //
+    // `java.util.Scanner` declares no ACC_NATIVE method, so "stub" is the
+    // correct verdict. But this VM OWNS a Scanner's state: the source is an
+    // `Arc<str>` and the tokenizer is a Rust regex engine over `&str` (see
+    // known-issues/jdk-only/G71-1). Refuse the shim under `--jdk-only` and the
+    // real bytecode runs against a Scanner whose real fields were never
+    // populated:
+    //
+    //   RJdkIntrinsics3: findWithinHorizon(String, 0) expected "42", got null
+    //
+    // So a correct classification does NOT imply the registrar can be retagged.
+    // That needs the state to move first (G88-1 §5) — retiring the Rust
+    // tokenizer, which is wave-2 work.
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Scanner";
 
@@ -11862,7 +11878,18 @@ fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
 // stub-tagged inner block should stay, the surrounding `Bridge` should not.
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // RETAGGED to match the JDK-ONLY-CLASSIFY verdict above, which already
+    // reads "stub" for java.io.StringReader/StringWriter. Only the TAG disagreed.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`): registrations 1,
+    // invocations 0, 0 ACC_NATIVE targets.
+    //
+    // Note what this REMOVES: some of these registrations sit on
+    // `java/lang/AutoCloseable` and `java/io/Closeable` — interfaces, so the
+    // shim was deciding dispatch for every USER class implementing them, not
+    // just for the JDK's. Refusing it under `--jdk-only` narrows that blast
+    // radius rather than widening it.
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // RDR-MIGRATION 2026-06-01: these StringReader natives track state in the
     // GC-stable `SR_STATE` side table (not object fields — see the comment
     // above `SR_STATE`), so they work against either the synthetic stub or a
