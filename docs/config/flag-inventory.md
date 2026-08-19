@@ -883,6 +883,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_OSR_BIND` | DBG | `CRATONVM_DBG=osr-bind` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_OSR_FRAME_TRACE` | DBG | `CRATONVM_DBG=osr-frame-trace` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_OSR_META` | DBG | `CRATONVM_DBG=osr-meta` | opt-in | off | diag | snapshot | jit |
+| `CRATONVM_DBG_OSR_SLOTS` | DBG | `CRATONVM_DBG=osr-slots` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_OSR_SEED_COLLISION` | DBG | `CRATONVM_DBG=osr-seed-collision` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_OVERLAY` | DBG | `CRATONVM_DBG=overlay` | opt-in | off | diag | snapshot | classloading, native-builtins, vm |
 | `CRATONVM_DBG_OVERLAY_ALL` | DBG | `CRATONVM_DBG=overlay-all` | opt-in | off | diag | snapshot | classloading, vm |

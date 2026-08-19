@@ -533,12 +533,39 @@ impl Compiler {
                 // for the METHOD and usually not here. `kind_at` only ever
                 // answers a concrete NON-ref kind, so the oop mask (which ran
                 // above) keeps sole authority over ref-typed slots.
-                let kind = if matches!(kind, LocalKind::Ambiguous) {
-                    self.local_kinds_refined.kind_at(bci, i).unwrap_or(kind)
+                let refined = if matches!(kind, LocalKind::Ambiguous) {
+                    self.local_kinds_refined.kind_at(bci, i)
                 } else {
-                    kind
+                    None
                 };
-                typed_local_frame_value(reg, xmm, off, kind)
+                let kind = refined.unwrap_or(kind);
+                let fv = typed_local_frame_value(reg, xmm, off, kind);
+                // `CRATONVM_DBG_OSR_SLOTS=1` names the slot that costs a method
+                // its OSR entry. `osr_exit_policy` is an artifact-wide veto --
+                // ONE `Unsupported` slot at ONE deopt point refuses OSR entry
+                // at every back edge of the method -- and until this existed
+                // the only report was "local 87 is Unsupported", which says
+                // that a slot could not be described but not WHY. The three
+                // answers below are three different bugs: an `Ambiguous` kind
+                // the per-bci dataflow did not settle, a settled kind whose
+                // machine home contradicts it, or a slot liveness should have
+                // dropped before reaching here.
+                if matches!(fv, crate::deopt::FrameValue::Unsupported)
+                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SLOTS").is_some()
+                {
+                    eprintln!(
+                        "[osr-slot] UNSUPPORTED local={i} bci={bci} whole_method_kind={:?} \
+                         refined={:?} reg={:?} xmm={:?} spill_off={off} live_covered={} \
+                         method={}",
+                        self.local_kinds.get(i),
+                        refined,
+                        reg,
+                        xmm,
+                        self.local_liveness_covered.get(bci).copied().unwrap_or(false),
+                        self.method_key,
+                    );
+                }
+                fv
             } else {
                 // No kind table (gate off / unmapped) — Phase-A int/provenance.
                 frame_value_for_slot(reg, xmm, off, false)

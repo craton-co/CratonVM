@@ -381,6 +381,7 @@ export inherited from a parent shell.
 | `osr-bind` | `CRATONVM_DBG_OSR_BIND` |
 | `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
+| `osr-slots` | `CRATONVM_DBG_OSR_SLOTS` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
