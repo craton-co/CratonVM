@@ -164,9 +164,35 @@ The work is a per-group split rather than one line, and it has a REAL hazard
 §4a did not have to face, because the retag broke `createGraphics` before it
 could: our `getRGB`/`setRGB`/`createGraphics` read a side table keyed off the
 image, populated by our own `<init>`. Let the real `<init>` run and no
-side-table entry exists — so the image group cannot move to real bytecode until
-the rasterizer writes into the REAL raster instead of the side table. That is
-the actual piece of work, and it is bounded: one backing store instead of two.
+side-table entry exists.
+
+**I called that "bounded: one backing store instead of two". Then I measured
+it, and it is not.** `native-awt/src/renderer.rs`, `graphics2d.rs` and
+`image.rs` are 4770 lines containing **zero** references to `NativeContext` —
+they are deliberately VM-independent Rust, which is why they are testable
+without a VM at all. A rasterizer cannot write into a Java `int[]` without VM
+access. So this is an ownership inversion, not a plumbing change. Three
+honest options, in ascending cost:
+
+**(A) Sync at interception points.** Register `getRaster()` / `getData()` as
+natives that copy the Rust buffer into the real `DataBufferInt` before
+returning the field. Bounded — the real `<init>` already builds correct raster
+and colour-model objects (§4a proved that). The gap it leaves must be
+documented, not hidden: writes made THROUGH the returned raster do not flow
+back, so `raster.getDataBuffer()` is a snapshot, not a view.
+
+**(B) Invert ownership.** The Java `int[]` becomes the truth and the renderer
+operates on it through `ctx`. Correct with no snapshot semantics, and it costs
+`NativeContext` threaded through all 4770 lines plus the loss of their
+VM-independence and their standalone tests.
+
+**(C) Declare the raster APIs unsupported under `--jdk-only`** (closure rule
+5) and make them throw rather than return `null` — which is at least a
+truthful failure, and is strictly better than today whatever else is chosen.
+
+**(C) should land regardless**, because returning `null` from a method that
+cannot return `null` is the one option nobody would defend. (A) is the natural
+next increment. (B) is a project.
 
 **N2 — DONE.** `Graphics.getColor`, `Graphics2D.setBackground` and
 `getBackground` are registered. 10 diverging rows -> 3.
