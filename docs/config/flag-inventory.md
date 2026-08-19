@@ -1221,6 +1221,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_OSR` | JIT | `CRATONVM_JIT=osr` | opt-in | off | behaviour | snapshot | difftest, vm |
 | `CRATONVM_JIT_OSR_ATHROW` | JIT | `CRATONVM_JIT=osr-athrow` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_OSR_DEAD_LOCALS` | JIT | `CRATONVM_JIT=osr-dead-locals` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD` | JIT | `CRATONVM_JIT=osr-ambiguous-dead` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` | JIT | `CRATONVM_JIT=osr-dead-mask-blanket` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR_EXC_TABLE` | JIT | `CRATONVM_JIT=osr-exc-table` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_CALLS` | JIT | `CRATONVM_JIT=inline-calls` | opt-in | off | behaviour | snapshot | vm |

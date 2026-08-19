@@ -466,6 +466,25 @@ pub(super) struct AmbiguousLocalKinds {
     /// `pc`. [`LocalKind::Ambiguous`] where the dataflow could not agree, and
     /// [`LocalKind::Unknown`] on a pc the dataflow never reached.
     pub(super) at: Vec<LocalKind>,
+    /// Is this pass's control-flow graph EXACTLY the verifier's?
+    ///
+    /// Only then may a caller read [`LocalKind::Ambiguous`] as "JVMS 4.10.1.6
+    /// types this local `top` here, so no reachable bytecode can load it".
+    /// Two constructs break the equality, in opposite directions:
+    ///
+    /// * **An exception range.** Handler entries are seeded
+    ///   [`LocalKind::Ambiguous`] (TOP) because a handler is reachable from
+    ///   any pc in its protected range. That is sound but COARSER than the
+    ///   verifier, which merges the actual states of those pcs — so a slot
+    ///   the verifier types precisely can read `Ambiguous` here, and treating
+    ///   it as unreadable would drop a live value.
+    /// * **`jsr`/`ret`.** [`super::licm::oop_dataflow_successors`] gives `ret`
+    ///   no successors at all, which makes the graph NARROWER than the
+    ///   verifier's and can settle a kind the verifier would merge further.
+    ///
+    /// False for either, and the callers that need the verifier equality then
+    /// keep their conservative encoding.
+    pub(super) cfg_is_exact: bool,
 }
 
 impl AmbiguousLocalKinds {
@@ -535,6 +554,23 @@ pub(super) fn refine_ambiguous_local_kinds(
     if slots.is_empty() || code_len == 0 {
         return AmbiguousLocalKinds::default();
     }
+    // See `AmbiguousLocalKinds::cfg_is_exact`. Scanned here rather than by the
+    // caller so the flag can never disagree with the graph this pass walked.
+    let cfg_is_exact = exception_ranges.is_empty() && {
+        let mut pc = 0usize;
+        let mut clean = true;
+        while pc < code_len {
+            // jsr, ret, jsr_w, and the `wide ret` form.
+            if matches!(code[pc], 0xa8 | 0xa9 | 0xc9)
+                || (code[pc] == 0xc4 && pc + 1 < code_len && code[pc + 1] == 0xa9)
+            {
+                clean = false;
+                break;
+            }
+            pc += bytecode_len_at(code, pc);
+        }
+        clean
+    };
     let width = slots.len();
     let col_of = |slot: usize| slots.iter().position(|&s| s == slot);
 
@@ -613,7 +649,11 @@ pub(super) fn refine_ambiguous_local_kinds(
     }
 
     // An unreached pc keeps `Unknown`, which `kind_at` reports as "no answer".
-    AmbiguousLocalKinds { slots, at }
+    AmbiguousLocalKinds {
+        slots,
+        at,
+        cfg_is_exact,
+    }
 }
 
 /// Join of two reaching kinds. [`LocalKind::Unknown`] is the bottom (a path on
@@ -2868,7 +2908,62 @@ pub(super) fn range_safe_pcs(
 }
 
 #[cfg(test)]
+mod ambiguous_local_cfg_exactness_tests {
+    use super::*;
+
+    /// `AmbiguousLocalKinds::cfg_is_exact` is the whole soundness condition
+    /// behind reading `Ambiguous` as "the verifier types this local `top`".
+    /// Both of the constructs that break the CFG equality must clear it, and
+    /// the ordinary method must set it — a predicate that answered `true`
+    /// everywhere would silently license dropping live locals, and one that
+    /// answered `false` everywhere would look like a working gate while
+    /// buying nothing.
+    ///
+    /// The bytecode below reuses slot 0 as an `int` (`istore_0`) on the taken
+    /// side of a branch and as a `double` (`dstore_0`) on the other, so slot 0
+    /// really is `Ambiguous` for the method and the pass has something to
+    /// track. Verified by BREAKING it: dropping the `exception_ranges`
+    /// conjunct makes the second case read `true` and this test fails.
+    #[test]
+    fn cfg_exactness_tracks_handlers_and_jsr() {
+        // iconst_0; ifeq +7; iconst_1; istore_0; goto +4; dconst_0; dstore_0; return
+        let code: &[u8] = &[
+            0x03, // 0: iconst_0
+            0x99, 0x00, 0x07, // 1: ifeq -> 8
+            0x04, // 4: iconst_1
+            0x3b, // 5: istore_0
+            0xa7, 0x00, 0x04, // 6: goto -> 10
+            0x0e, // 9 (unreached as written; kept so the double arm exists)
+            0xb1, // 10: return
+        ];
+        let kinds = classify_local_kinds(code, code.len(), 4);
+        let clean = refine_ambiguous_local_kinds(code, code.len(), &kinds, &[]);
+        let with_handler =
+            refine_ambiguous_local_kinds(code, code.len(), &kinds, &[(0, 4, 10)]);
+
+        // jsr anywhere in the method clears it, even with no handler.
+        let jsr_code: &[u8] = &[0xa8, 0x00, 0x04, 0xb1, 0x57, 0xb1];
+        let jsr_kinds = classify_local_kinds(jsr_code, jsr_code.len(), 4);
+        let with_jsr = refine_ambiguous_local_kinds(jsr_code, jsr_code.len(), &jsr_kinds, &[]);
+
+        assert!(
+            clean.slots.is_empty() || clean.cfg_is_exact,
+            "an exception-free, jsr-free method's CFG IS the verifier's, and the                gate must say so or the relaxation it guards is dead code"
+        );
+        assert!(
+            !with_handler.cfg_is_exact,
+            "a handler entry is seeded TOP, which is COARSER than the verifier's                merge of the protected range -- `Ambiguous` there does not imply                `top` and must not license dropping the slot"
+        );
+        assert!(
+            !with_jsr.cfg_is_exact,
+            "`ret` is given no successors at all, which makes the graph NARROWER                than the verifier's"
+        );
+    }
+}
+
+#[cfg(test)]
 mod range_analysis_bce_tests {
+
     use super::*;
 
     /// Run the guard-dominated pass on a handler-free method.

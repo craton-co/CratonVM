@@ -1000,6 +1000,11 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `jit::osr_dead_local_entry_allowed` answers `true` for
     // `Err(_)` and reads `0`/`off`/`false`/`no` as the kill switch.
     E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-19. An OPT-OUT: publishing a per-bci-`Ambiguous` local
+    // as `Undefined` rather than `Unsupported` is the default, and this key
+    // restores the re-run encoding. See
+    // `jit/src/x64/deopt_stubs.rs::osr_ambiguous_dead_enabled`.
+    E { group: Group::JIT, token: "osr-ambiguous-dead", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD"), off_word: None },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
