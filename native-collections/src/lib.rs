@@ -2508,7 +2508,28 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_optional_int_natives(registry);
     register_optional_long_natives(registry);
     register_optional_double_natives(registry);
-    register_linked_list_natives(registry);
+    // RETAGGED per subsystem — second of this crate's ~45 registrars, same
+    // discipline and same rule as the ArrayDeque block below.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
+    //   registrations 45 | invocations 0 | overwrote 0
+    //   real target: 30 CONCRETE BYTECODE, 6 abstract, 0 ACC_NATIVE,
+    //                9 on classes this run never loaded
+    //
+    // Rule 4 again. Ranked second by the objective criterion the header's
+    // warning implies: `overwrote` 0 (nothing depends on these winning) and
+    // only 6 abstract-interface registrations, against 88 in the largest
+    // registrar.
+    //
+    // The 9 unmeasured rows are stated rather than glossed: their classes were
+    // not loaded in the censused run, so their targets are UNKNOWN, not clean.
+    // They are carried on the same rule-4 reasoning as the 30 — `java.util` has
+    // no VM boundary to bridge to — and on the arms, which exercise LinkedList
+    // through RJdkBridge1, RJdkMapViews and ROverlaySystemGcStress.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_linked_list_natives,
+    );
     register_linked_hashmap_natives(registry);
     // RETAGGED per subsystem (P0 "wholesale Bridge over-tagging"), with the
     // evidence this file's own header demands — "Retag per subsystem, one PR
