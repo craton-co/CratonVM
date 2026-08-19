@@ -167,6 +167,15 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        let (by_caller, slots_used) = cratonvm_vm::jit::helpers::membership_walks_by_caller();
+        for (file, line, calls, what) in by_caller.iter().take(30) {
+            eprintln!("[cratonvm]   census {what} @ {file}:{line} = {calls}");
+        }
+        eprintln!(
+            "[cratonvm]   membership walk sites: {} distinct, {} of 512 slots used",
+            by_caller.len(),
+            slots_used
+        );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
         // fall-through crosses. The two lines above count EMISSIONS, which is

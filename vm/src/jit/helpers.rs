@@ -6722,6 +6722,13 @@ pub fn total_membership_walks() -> u64 {
     cratonvm_gc::vm_heap::is_object_address_calls()
 }
 
+/// Per-CALL-SITE census of every membership walk in the process — `(file,
+/// line, calls)` most-frequent first, plus slots used. Re-exported for the
+/// same reason as [`total_membership_walks`].
+pub fn membership_walks_by_caller() -> (Vec<(&'static str, u32, u64, &'static str)>, usize) {
+    cratonvm_gc::vm_heap::is_object_address_callers()
+}
+
 /// `(name, count)` for every site that walked at least once.
 pub fn membership_walks_by_site() -> Vec<(&'static str, u64)> {
     MEMBERSHIP_WALK_SITE_NAMES
