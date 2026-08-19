@@ -1445,6 +1445,47 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
             void_ok()
         });
 
+        // G80-1 N2. Both of these were MISSING, and because the real classes
+        // are abstract the call did not fall through to anything — it raised
+        // `AbstractMethodError: has no Code attribute`, which a user program
+        // cannot work around. `setColor` was registered directly above and
+        // `clearRect` consumes the background, so both gaps sat next to their
+        // own other half; that adjacency is how they survived.
+        registry.register(class, "getColor", "()Ljava/awt/Color;", |ctx, args| {
+            let argb = match get_obj(args, 0) {
+                Some(this) => with_gfx(ctx, this, |gs| gs.color()),
+                None => 0xFF_000000,
+            };
+            let color_obj = ctx.new_object("java/awt/Color")?;
+            if let Some(Value::Object(Some(obj))) = &color_obj {
+                ctx.set_field_by_name(*obj, "value", Value::Int(argb as i32));
+            }
+            Ok(color_obj)
+        });
+        registry.register(class, "setBackground", "(Ljava/awt/Color;)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let argb = get_obj(args, 1)
+                    .map(|c| match ctx.get_field_by_name(c, "value") {
+                        Value::Int(v) => v as u32,
+                        _ => 0xFF_FFFFFF,
+                    })
+                    .unwrap_or(0xFF_FFFFFF);
+                with_gfx(ctx, this, |gs| gs.set_background(argb));
+            }
+            void_ok()
+        });
+        registry.register(class, "getBackground", "()Ljava/awt/Color;", |ctx, args| {
+            let argb = match get_obj(args, 0) {
+                Some(this) => with_gfx(ctx, this, |gs| gs.background()),
+                None => 0xFF_FFFFFF,
+            };
+            let color_obj = ctx.new_object("java/awt/Color")?;
+            if let Some(Value::Object(Some(obj))) = &color_obj {
+                ctx.set_field_by_name(*obj, "value", Value::Int(argb as i32));
+            }
+            Ok(color_obj)
+        });
+
         // ── Font ──────────────────────────────────────────────────
         registry.register(class, "setFont", "(Ljava/awt/Font;)V", |ctx, args| {
             if let Some(this) = get_obj(args, 0) {
@@ -2111,12 +2152,36 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                     if let Some(img) = reg.get(id) {
                         let (w, h) = (img.width() as i32, img.height() as i32);
                         if x < 0 || y < 0 || x >= w || y >= h {
-                            // Match the JDK: the index reported is the offending
-                            // linear pixel index `y * width + x`.
+                            // MEASURED (Sweep17): the comment that stood here
+                            // claimed the JDK reports the linear pixel index. It
+                            // does not. `BufferedImage.getRGB` bottoms out in the
+                            // raster's own bounds check, which throws
+                            // `ArrayIndexOutOfBoundsException("Coordinate out of
+                            // bounds!")` — no index at all. HotSpot 25.0.3 was
+                            // asked; the index wording was invented.
                             let index = (y as i64) * (w as i64) + (x as i64);
-                            return Err(RuntimeError::aioobe_index_only(index as i32).into());
+                            return Err(RuntimeError::aioobe_with_message(
+                                index as i32,
+                                "Coordinate out of bounds!",
+                            )
+                            .into());
                         }
-                        return int_ok(img.get_rgb(x as u32, y as u32) as i32);
+                        // An OPAQUE image type has no alpha channel to report, so
+                        // `getRGB` must set it: the JDK returns the ColorModel's
+                        // RGB, and an opaque ColorModel answers 0xFF for alpha
+                        // whatever the backing store holds. Ours returned the raw
+                        // 24-bit value, so every pixel the RASTERIZER had touched
+                        // came back with alpha 0 — while a pristine image read
+                        // correctly, because `try_new` fills opaque images with
+                        // 0xFF000000. That split is why this looked like a
+                        // drawing bug rather than a read bug.
+                        let px = img.get_rgb(x as u32, y as u32);
+                        let px = if img.image_type().has_alpha() {
+                            px
+                        } else {
+                            px | 0xFF00_0000
+                        };
+                        return int_ok(px as i32);
                     }
                 }
             }
@@ -2136,8 +2201,13 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                     if let Some(img) = reg.get_mut(id) {
                         let (w, h) = (img.width() as i32, img.height() as i32);
                         if x < 0 || y < 0 || x >= w || y >= h {
+                            // Same correction as `getRGB` above.
                             let index = (y as i64) * (w as i64) + (x as i64);
-                            return Err(RuntimeError::aioobe_index_only(index as i32).into());
+                            return Err(RuntimeError::aioobe_with_message(
+                                index as i32,
+                                "Coordinate out of bounds!",
+                            )
+                            .into());
                         }
                         img.set_rgb(x as u32, y as u32, argb);
                     }
