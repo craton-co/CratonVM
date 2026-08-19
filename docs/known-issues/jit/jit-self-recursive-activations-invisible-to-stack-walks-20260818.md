@@ -114,21 +114,66 @@ table below is an A/B **inside one binary**.
 ## What remains OPEN
 
 `SWCross` puts a distinct `helper()` at the bottom of the hot recursion. Its
-frame count now matches HotSpot (68), but the frame is still named `recurse`,
-not `helper` — because **`helper` is inlined into `recurse` and has no physical
-frame to find**. No stack walk can recover it; that needs the compiled method
-to carry inline frame records (`precise-inline-frame-record` /
-`verify-inline-frame-record` are the existing hooks) so virtual frames can be
-reconstructed the way HotSpot does.
+frame count now matches HotSpot (68), but the frame is named `recurse`, not
+`helper`.
+
+> ### ⚠ The "it is inlined" attribution below was REFUTED 2026-08-19
+>
+> This section used to say the missing frame was inlined into its caller, and
+> the design survey after it costed three ways to add inline frame records. Both
+> are wrong, and acting on them wasted a session — read the refutation first.
+>
+> **The missing methods are not inlined. They are fully compiled, with real
+> frames.** Measured with `CRATONVM_DBG_JITC` on the two probes:
+>
+> ```
+> inline-resolve REFUSED cratonvm/SWCross.helper()V depth=0: new/anewarray/multianewarray
+> ```
+>
+> `helper()` constructs an exception, so the inline resolver refuses it outright.
+> And the Log4j shape has **zero splices in the entire run** (`grep -c
+> inline-splice` = 0) while its supposedly-inlined method is compiled standalone
+> and called directly:
+>
+> ```
+> full-compile   cratonvm/SWFrames$LoggerFactory.resolveCaller()Ljava/util/List; entry=0x… len=475
+> bg-direct-call BOUND cratonvm/SWFrames$LoggerFactory.resolveCaller()Ljava/util/List;
+> ```
+>
+> So the real shape is a **compiled→compiled DIRECT call that pushes no chain
+> entry**, and the walk then misidentifies the innermost frame. The `[acf2]`
+> diagnostic on `SWCross` shows exactly that: `nested=1`,
+> `ret_caller=<non-jit>`, `decoded=<no-decode>`, and the frame-record mirror
+> answering `published=cratonvm/SWCross.recurse:(I)V` for a frame that is not
+> `recurse`. The innermost frame is misnamed by the mirror, not absent because
+> of inlining.
+>
+> **Two facts that also invalidate the survey's "cheapest" option.** The hot
+> methods are admitted to the OPTIMIZING (IR) pipeline, and (a) `IrBuilder::build`
+> does not inline at all — `Lowerer::inline_scopes` is empty on every compile,
+> as its own doc comment states — and (b) IR's sp-id is a **monotonic counter**
+> (`next_sp_id`, starts at 1), not a bytecode pc. The survey's option 2 keyed
+> extents by bci and read that slot; it cannot work for an IR-compiled frame.
+> The `cur_bc_pc` invariant it rested on holds only for the single-pass backend.
+>
+> What is actually needed is to identify the innermost compiled frame correctly
+> when it was entered by a direct compiled→compiled call. `direct_call_callee`
+> is the intended mechanism and returns `<no-decode>` here because the innermost
+> frame's `[rbp+8]` resolves to `<non-jit>` — start there, and re-measure before
+> assuming anything in this file.
 
 That is what still fails
 `stackwalker_log4j_deep_repeated_walks_finish_under_jit`: Log4j2's caller lookup
 wants `LoggerFactory.resolveCaller`, which is inlined away.
 
-### Design survey, 2026-08-19 — what a fix needs, and the one thing that blocks it
+### Design survey, 2026-08-19 — SUPERSEDED, see the refutation above
 
-Read this before starting: the obvious plan does not work, and the reason is a
-single missing runtime value.
+**Kept only so the dead end is not re-walked.** It reasons about adding inline
+frame records, and the premise that the missing frames are inlined is false
+(measured; see above). Its one durable finding is the mechanical inventory —
+`InlineSite` carries the callee identity, `CompiledMethod` has a single
+constructor, `try_emit_inline_site` owns the rollback set — which is still
+accurate should real inline frames ever be needed for a DIFFERENT reason.
 
 **The metadata half is nearly free.** `InlineSite` already carries the inlined
 callee's `class_name` / `method_name` / `descriptor`, and the emitter knows the
