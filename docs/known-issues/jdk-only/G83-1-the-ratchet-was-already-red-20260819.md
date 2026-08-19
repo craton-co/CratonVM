@@ -1,7 +1,8 @@
 # G83-1 — the ratchet a P0 row cites has been red, and nobody ran it
 
-**Status:** MEASURED. Nothing fixed — the failure is PRE-EXISTING and its
-remedy is explicitly not "raise the baseline". Two published numbers corrected.
+**Status:** MEASURED. Nothing fixed — the failure is PRE-EXISTING, its remedy is
+explicitly not "raise the baseline", and the work is CONTRACTUALLY DEFERRED to a
+later wave (§5). Three published numbers corrected.
 **Provenance:** `cargo test -p cratonvm-native-builtins --test stub_ratchet`,
 run 2026-08-19 on `90d27779d` and again on `8a7e2727f` in a clean worktree.
 Registry composition from `--dump-native-registry` on both modes.
@@ -87,6 +88,49 @@ own ratchet is red.
 
 It does not license raising the baseline to 1308, which the failure message
 explicitly forbids and which would erase the only signal that 31 stubs appeared.
+
+## 5. THE END-STATE GATE — and the contract clause that defers it
+
+The same file carries an `#[ignore]`d test, `strict_mode_refuses_nothing`,
+labelled **"THE END-STATE GATE"**. Run on demand (`-- --ignored`), it reports:
+
+```
+1328 SyntheticStub registrations still have to be refused at VM init.
+Zero refusals is the real end state: it means the stubs were reclassified or
+deleted at the source, not merely filtered out of the table on the way in.
+```
+
+**1328** — a THIRD figure for this population, alongside the row's `157` and
+this test's own doc comment saying `549`. The measured registry says 1330. Only
+one of those four numbers is re-derived from the tree.
+
+Its doc comment states plainly why `strict_registry_has_zero_synthetic_stubs`
+passing means so little, in words this record reached independently in §2:
+
+> passes today for a weak reason: `register()` refuses the stubs at the door.
+> The 549 registrations still exist … and are still what an ordinary
+> `--real-jdk` run dispatches into. **Refused is not retired.**
+
+And it lists the three things that must land before the gate can be un-ignored:
+reclassify or delete every `SyntheticStub` registration subsystem by subsystem;
+drive the baseline to 0 in the same change; un-ignore the test and promote the
+CI `jdk-only` job from advisory to blocking.
+
+**The decisive line, for anyone asking why this row is not closed here:**
+
+> This is explicitly *not* wave 1 work (contract §8: "do not edit
+> `native-builtins/src/lib.rs`; the 549-stub reclassification is a separate
+> wave with its own subsystem-per-PR discipline").
+
+So the remaining work on this row is not merely large — it is **contractually
+deferred to a later wave, with a stated discipline (one subsystem per PR), and
+the contract forbids editing the file it lives in during wave 1.** A session
+that "finished" this row would be violating §8 to do it.
+
+That is worth stating precisely because three separate measurements in this
+session pointed the other way — rows that were stale, or already satisfied, or
+waiting on a command. This one is not. It is deferred on purpose, and the
+deferral is written down.
 
 ## 4. NOMINATIONS
 
