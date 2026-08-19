@@ -162,6 +162,64 @@ frame count now matches HotSpot (68), but the frame is named `recurse`, not
 > frame's `[rbp+8]` resolves to `<non-jit>` — start there, and re-measure before
 > assuming anything in this file.
 
+### The misnaming: FIXED 2026-08-19, one line
+
+The innermost compiled frame of every **fast-tier** method was reported under
+its CALLER's name. Cause: `CompiledMethod::compile_id` defaults to 0, the
+optimizing backend assigns it (`ir_lower.rs`, `cm.compile_id = compile_id`), and
+the single-pass backend's finalize **never did**. So the prologue published
+`compiler.compile_id` into the identity mirror on entry while `bind_compile_id`
+bound `CompiledMethod::compile_id` — which was 0, and `bind_compile_id`
+early-returns on 0. The id was therefore never bound, `lookup_compile_id`
+answered `None`, and `innermost_frame_method` fell through to the boundary
+method.
+
+The `[acf3]` dump is what named it: `cm_id=4 published=<none>` on the innermost
+chain entry — an id the frame publishes and the registry cannot resolve. Fix is
+`cm.compile_id = compiler.compile_id;` in `x64/driver.rs`, mirroring the line
+the IR backend already had.
+
+Measured (`--java-home` JDK 25, `CRATONVM_JIT_THRESHOLD=1` where noted):
+
+| probe | before | after | HotSpot 25 |
+|---|---|---|---|
+| `SWFrames` (Log4j caller shape) | `hasLoggerFactory=false`, n=67 | **`true`, n=68** | `true`, n=68 |
+| `SWCross` innermost frame name | `recurse` (wrong) | **`helper`** | `helper` |
+
+`cargo test -p cratonvm-vm --release --lib`: 2569 passed, 0 failed.
+
+### What is STILL open, and it is a third mechanism
+
+`stackwalker_log4j_deep_repeated_walks_finish_under_jit` remains red. Not
+inlining (refuted above), not the misnaming (fixed above): a compiled frame in
+the middle of the chain is **unreachable by the walk**.
+
+`SWStress3` instruments the failing walk itself — same call path, same heat, so
+it observes the hot stack rather than a cold copy, which is where `SWStress2`
+went wrong. Its output:
+
+```
+got=cratonvm.SWStress3   saw=Locator.getCallerClass | recurse | recurse | recurse | …
+```
+
+`LoggerFactory.resolveCaller` sits between `getCallerClass` and `recurse` on the
+real stack and is absent from the walk. It is not inlined (`grep -c
+inline-splice` = 0 for this probe too). The shape that produces the gap:
+`getCallerClass` has its own chain entry whose `[rbp+8]` is a non-JIT return
+address, so the per-entry RBP walk stops immediately (`nested=1`); and
+`resolveCaller`, entered by a DIRECT compiled→compiled call from `recurse`, has
+no chain entry of its own. It therefore falls between two entries and no walk
+covers it.
+
+Closing that needs the walk to cross chain-entry boundaries — one walk over the
+whole native stack rather than a band per entry — which is a bigger change than
+either fix above and should be measured on its own.
+
+Also visible now that the innermost frame is named correctly: `SWCross` reports
+69 frames where HotSpot reports 68, because an OSR'd `main` appears twice —
+once as its interpreter frame and once as its compiled chain entry. Pre-existing
+and independent; the trace reads `[0] main [1] main [2] grab …`.
+
 That is what still fails
 `stackwalker_log4j_deep_repeated_walks_finish_under_jit`: Log4j2's caller lookup
 wants `LoggerFactory.resolveCaller`, which is inlined away.
