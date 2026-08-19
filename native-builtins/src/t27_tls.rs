@@ -6860,9 +6860,12 @@ const SSS_MODE_DEFAULT: (i32, i32) = (0, 1);
 /// real `java.net.ServerSocket` layout has no slot that means either of these
 /// (see [`SSS_FIELDS`]), and writing into one that means something else is the
 /// defect this whole block exists to undo.
-fn sss_mode_states() -> &'static Mutex<HashMap<u64, (i32, i32)>> {
-    static T: OnceLock<Mutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Every acquisition takes
+/// the guard after `gc_stable_objref_key` has already produced the key, and
+/// holds it only across a `HashMap::entry` on a `(i32, i32)`.
+fn sss_mode_states() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (i32, i32)>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn sss_mode_state(ctx: &dyn NativeContext, socket: ObjectRef) -> (i32, i32) {
@@ -6877,9 +6880,11 @@ fn sss_mode_state(ctx: &dyn NativeContext, socket: ObjectRef) -> (i32, i32) {
 /// Per-`SSLServerSocket` `setEnabledCipherSuites` list. Absent means "never
 /// narrowed", which reads back as the full supported list — not as an empty
 /// one, which would say this socket can negotiate nothing.
-fn sss_enabled_suites_table() -> &'static Mutex<HashMap<u64, Vec<String>>> {
-    static T: OnceLock<Mutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions are one
+/// statement over an already-built key and an already-built `Vec<String>`.
+fn sss_enabled_suites_table() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, Vec<String>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn stash_sss_enabled_suites(ctx: &dyn NativeContext, socket: ObjectRef, suites: Vec<String>) {
@@ -18556,9 +18561,13 @@ pub(crate) fn record_local_cert_chain(
 /// so its port is an ephemeral one and comparing it to the listener's port is
 /// the wrong test; `RSslLiveSession` asserts `> 0` there and `== port` on the
 /// client side, and those are different questions on purpose.
-fn session_peer_endpoint_table() -> &'static Mutex<HashMap<u64, (String, i32)>> {
-    static T: OnceLock<Mutex<HashMap<u64, (String, i32)>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both callers evaluate
+/// `gc_stable_objref_key` — which calls `ctx.identity_hash_code` — into a local
+/// BEFORE acquiring. It used to sit inside the lock expression, which is the
+/// same shape the 2026-08-17 round hoisted out of five other tables.
+fn session_peer_endpoint_table() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (String, i32)>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (String, i32)>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Record the endpoint a session's peer was reached at. See
@@ -18578,17 +18587,16 @@ pub(crate) fn record_session_peer_endpoint(
     if host.is_empty() && port <= 0 {
         return;
     }
+    let key = gc_stable_objref_key(ctx, session);
     session_peer_endpoint_table()
         .lock()
-        .insert(gc_stable_objref_key(ctx, session), (host.to_string(), port));
+        .insert(key, (host.to_string(), port));
 }
 
 /// The recorded endpoint for a session object, or `None` if none was recorded.
 fn session_peer_endpoint(ctx: &dyn NativeContext, session: ObjectRef) -> Option<(String, i32)> {
-    session_peer_endpoint_table()
-        .lock()
-        .get(&gc_stable_objref_key(ctx, session))
-        .cloned()
+    let key = gc_stable_objref_key(ctx, session);
+    session_peer_endpoint_table().lock().get(&key).cloned()
 }
 
 /// The remote address of an accepted rustls server stream, as
@@ -18808,9 +18816,13 @@ pub(crate) fn peer_certs_for_session(ctx: &dyn NativeContext, session: ObjectRef
 /// *live* session as invalidated. That is the same exposure the two cert
 /// tables already carry and it is not made worse by a table that is empty in
 /// the common case; the key width is a separate fix for all three.
-fn session_invalidated_table() -> &'static Mutex<std::collections::HashSet<u64>> {
-    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Same hoist as
+/// [`session_peer_endpoint_table`]: `gc_stable_objref_key` is evaluated into a
+/// local before either acquisition, so no `NativeContext` call runs under the
+/// guard.
+fn session_invalidated_table() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashSet::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Record that `invalidate()` was called on this session. Crate-visible so
@@ -18832,9 +18844,8 @@ pub(crate) fn session_mark_invalidated(ctx: &dyn NativeContext, session: ObjectR
     if !session_has_negotiated(ctx, session) {
         return;
     }
-    session_invalidated_table()
-        .lock()
-        .insert(gc_stable_objref_key(ctx, session));
+    let key = gc_stable_objref_key(ctx, session);
+    session_invalidated_table().lock().insert(key);
 }
 
 /// **The one predicate behind `SSLSession.isValid()`, in both modes.**
@@ -18873,10 +18884,11 @@ pub(crate) fn session_mark_invalidated(ctx: &dyn NativeContext, session: ObjectR
 /// (see its registration), so it is already on the right side of the
 /// invalidated case and merely under-reports the live one.
 pub(crate) fn session_is_valid(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
-    session_has_negotiated(ctx, session)
-        && !session_invalidated_table()
-            .lock()
-            .contains(&gc_stable_objref_key(ctx, session))
+    if !session_has_negotiated(ctx, session) {
+        return false;
+    }
+    let key = gc_stable_objref_key(ctx, session);
+    !session_invalidated_table().lock().contains(&key)
 }
 
 /// Did the `javax/net/ssl/SSLSession` object `this` actually negotiate

@@ -281,9 +281,15 @@ fn https_recycle_carrier(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// drained nor closed leaves one two-integer row — strictly less than what
 /// this whole mechanism removes, since an unrecycled carrier holds a GC root
 /// on an `SSLSession` for the life of the process.
-fn https_response_streams() -> &'static Mutex<HashMap<u64, crate::net_phase_e::NativeObjKey>> {
-    static R: OnceLock<Mutex<HashMap<u64, crate::net_phase_e::NativeObjKey>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions are a
+/// single map operation on integers, with the `ctx.identity_hash_code` that
+/// produces the key evaluated into a local BEFORE the guard is taken — see
+/// `note_response_stream`, which is where it used to sit inside the
+/// `table.insert(..)` argument list.
+fn https_response_streams(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, crate::net_phase_e::NativeObjKey>> {
+    static R: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, crate::net_phase_e::NativeObjKey>>> = OnceLock::new();
+    R.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Remember that `stream` is the response body of `carrier`, so draining it
@@ -302,8 +308,13 @@ fn note_response_stream(ctx: &dyn NativeContext, stream: ObjectRef, carrier: Opt
     {
         return;
     }
+    // The key is evaluated BEFORE the guard: `identity_hash_code` is a call
+    // back into the VM, and the lock-discipline level stamped on this table
+    // claims no such call happens under it. Idempotent, so hoisting it is
+    // behaviour-preserving.
+    let stream_key = ctx.identity_hash_code(stream) as u32 as u64;
     if let Ok(mut table) = https_response_streams().lock() {
-        table.insert(ctx.identity_hash_code(stream) as u32 as u64, carrier_key);
+        table.insert(stream_key, carrier_key);
     }
 }
 

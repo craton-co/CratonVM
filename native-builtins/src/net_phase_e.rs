@@ -995,9 +995,13 @@ fn ssc_set<F: FnOnce(&mut SscSide)>(ctx: &dyn NativeContext, this: ObjectRef, f:
 /// identity is not cosmetic on this API: a caller that caches the context and
 /// later compares, or uses it as a map key, silently accumulates one entry per
 /// call.
-fn ssc_carrier_roots() -> &'static Mutex<HashMap<SscKey, usize>> {
-    static T: OnceLock<Mutex<HashMap<SscKey, usize>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions copy a
+/// `usize` root handle in or out in a single statement; the
+/// `ctx.resolve_global_root` calls that surround them run on the next
+/// statement, with no guard held.
+fn ssc_carrier_roots() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<SscKey, usize>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<SscKey, usize>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The carrier for `(owner, tag)`, minted once and handed back thereafter.
@@ -15519,9 +15523,13 @@ struct SssOptionDelegate {
 /// Receiver identity hash -> its delegate. Only a `usize` handle and a `bool`
 /// are stored, so the table needs no GC roots of its own and survives object
 /// relocation (identity hash codes are stable across a move).
-fn sss_option_delegates() -> &'static Mutex<HashMap<i32, SssOptionDelegate>> {
-    static T: OnceLock<Mutex<HashMap<i32, SssOptionDelegate>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Each of the three
+/// acquisitions is one statement — a `get().copied()` or an `insert()` of a
+/// `Copy` row — and the delegate construction (`new_object_initialized`,
+/// `add_global_root`) happens between them rather than under them.
+fn sss_option_delegates() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<i32, SssOptionDelegate>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<i32, SssOptionDelegate>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Resolve — creating on first use — the delegate handle for `this`, and bring

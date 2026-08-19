@@ -3113,6 +3113,22 @@ const INTEGER_CACHE_HIGH_PROPERTY: &str = "java.lang.Integer.IntegerCache.high";
 /// VM-scoped rather than a process-global `OnceLock`: a `OnceLock` latches the
 /// FIRST VM's answer for the lifetime of the process, and this crate's Rust
 /// tests build several independent VMs in one binary.
+///
+/// NO LOCK LEVEL, deliberately — and it is the one member of this family that
+/// could not take one. `resolve_integer_cache_high` holds this guard across
+/// `integer_cache().lock()`, so this is the OUTER lock of a two-lock nest and
+/// `INTEGER_CACHE` is the inner one. A level is a claim that no lock at or
+/// below it is held when this one is taken, and the ordering it implies runs
+/// the other way: the inner lock would have to sit BELOW this one. `Scratch`
+/// is the floor, so stamping `Scratch` here would demand a level that cannot
+/// exist, and any higher level would be a claim about the VM's own hierarchy
+/// that this cache has no business making.
+///
+/// The nesting is load-bearing, not incidental: `high` and the matching
+/// `entries` must be installed atomically or two racing threads can publish a
+/// `high` whose cache is the wrong length. So the fix is to restructure the
+/// publish, not to relabel the lock — the same verdict `java_recordings` and
+/// `boot_layer_memo` got, and it stays in the §A6 backlog for the same reason.
 static INTEGER_CACHE_HIGH: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashMap<usize, i32>>,
 > = std::sync::OnceLock::new();
@@ -3258,29 +3274,29 @@ fn long_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
 
 /// `CharacterCache` for `Character.valueOf(char)`. 128 slots indexed by the
 /// code unit itself — there is no offset because the low bound is zero.
-static CHARACTER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<128>>> =
+static CHARACTER_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<128>>> =
     std::sync::OnceLock::new();
 
-fn character_cache() -> &'static parking_lot::Mutex<ScopedValueCache<128>> {
-    CHARACTER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn character_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<128>> {
+    CHARACTER_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `ByteCache` for `Byte.valueOf(byte)`. 256 slots indexed by `b + 128`, and
 /// unlike every other cache in this file it covers the type's ENTIRE domain.
-static BYTE_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+static BYTE_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
     std::sync::OnceLock::new();
 
-fn byte_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
-    BYTE_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn byte_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
+    BYTE_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `ShortCache` for `Short.valueOf(short)`. 256 slots indexed by `s + 128`,
 /// covering -128..=127 out of a 65,536-value domain.
-static SHORT_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+static SHORT_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
     std::sync::OnceLock::new();
 
-fn short_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
-    SHORT_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn short_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
+    SHORT_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The canonical-instance dance, once, for the caches added above.

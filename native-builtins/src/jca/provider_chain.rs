@@ -823,33 +823,45 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// sections; a continuation-free read is enough for the lookups callers make,
 /// and a file that cannot be read leaves every key unanswered exactly as before.
 fn java_security_file_property(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
+    // LOCK LEVEL (lock-discipline ratchet): `Scratch`. That level is a claim
+    // that no call back into the VM happens under this guard, and the parse
+    // below calls `ctx.get_system_property`. So the parse runs OUTSIDE the
+    // lock and only the publish is taken under it.
+    //
+    // Two threads that miss together both parse; `get_or_insert` keeps the
+    // first and drops the second. Behaviour-preserving — the file is read-only
+    // and both parses produce the same map — and strictly cheaper than the
+    // alternative of holding a lock across a filesystem read.
     static FILE_PROPS: std::sync::OnceLock<
-        parking_lot::Mutex<Option<std::collections::HashMap<String, String>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<Option<std::collections::HashMap<String, String>>>,
     > = std::sync::OnceLock::new();
-    let cell = FILE_PROPS.get_or_init(|| parking_lot::Mutex::new(None));
-    let mut guard = cell.lock();
-    if guard.is_none() {
-        let mut parsed = std::collections::HashMap::new();
-        if let Some(home) = ctx.get_system_property("java.home") {
-            let path = std::path::Path::new(&home)
-                .join("conf")
-                .join("security")
-                .join("java.security");
-            if let Ok(text) = std::fs::read_to_string(path) {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    if let Some((k, v)) = line.split_once('=') {
-                        parsed.insert(k.trim().to_string(), v.trim().to_string());
-                    }
+    let cell = FILE_PROPS.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(None, cratonvm_types::lock_order::LockLevel::Scratch));
+    if let Some(answer) = {
+        let guard = cell.lock();
+        guard.as_ref().map(|m| m.get(key).cloned())
+    } {
+        return answer;
+    }
+    let mut parsed = std::collections::HashMap::new();
+    if let Some(home) = ctx.get_system_property("java.home") {
+        let path = std::path::Path::new(&home)
+            .join("conf")
+            .join("security")
+            .join("java.security");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    parsed.insert(k.trim().to_string(), v.trim().to_string());
                 }
             }
         }
-        *guard = Some(parsed);
     }
-    guard.as_ref().and_then(|m| m.get(key).cloned())
+    let mut guard = cell.lock();
+    guard.get_or_insert(parsed).get(key).cloned()
 }
 
 /// Process-wide overrides written by `Security.setProperty`.

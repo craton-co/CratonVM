@@ -2092,7 +2092,14 @@ pub(crate) struct TlsEntry {
     /// Per-stream mutex, deliberately NOT guarded by `s2_registry()`: a
     /// blocking TLS read/write must not hold the process-wide socket
     /// registry lock (see `s2_tls_read`'s doc comment).
-    pub(crate) stream: Arc<parking_lot::Mutex<TlsClientStream>>,
+    ///
+    /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Its two acquisitions
+    /// (`s2_tls_read`, `s2_tls_write`) each hold it across exactly one
+    /// `read`/`write` on the underlying stream and then `drop(guard)`; both
+    /// release `s2_registry()` before taking it, which is the ordering the
+    /// field comment above already required in prose. Nothing under the guard
+    /// touches a `NativeContext`.
+    pub(crate) stream: Arc<cratonvm_types::lock_order::OrderedPlMutex<TlsClientStream>>,
     /// A `try_clone`d handle on the same underlying socket, for fd-level
     /// operations (`shutdownInput/Output`, `set/getSoTimeout`) that must NOT
     /// wait on `stream`'s mutex — `shutdownInput` is exactly how a caller
@@ -2345,7 +2352,7 @@ pub(crate) fn s2_tls_connect_on(
 
     let raw = tls_stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Native(tls_stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Native(tls_stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2425,7 +2432,7 @@ pub(crate) fn s2_legacy_dsa_tls_connect_on(
     let peer_cert_chain_der = openssl_peer_chain_der(stream.ssl()).map_err(|e| hs(&e))?;
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Openssl(stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2654,7 +2661,7 @@ pub(crate) fn s2_openssl_tls_connect_on(
 
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Openssl(stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2967,7 +2974,7 @@ pub(crate) fn s2_schannel_tls_connect_on(
         .map(|p| String::from_utf8_lossy(&p).into_owned());
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Schannel(stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Schannel(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
