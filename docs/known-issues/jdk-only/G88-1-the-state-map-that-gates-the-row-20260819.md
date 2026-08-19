@@ -304,7 +304,7 @@ person starts from the verdict rather than from the tag.
 | `watch.rs` | 27 | **LANDED** — see §10; the one retag verified all three ways |
 | `data_stream` | 37 | **LOAD-BEARING (measured)** — retagged, `RDataInputFastPull: skipped.next = -19`, reverted |
 | `scanner` | 40 | **LOAD-BEARING (measured)** — `findWithinHorizon` returned null, reverted |
-| `instrument.rs` | 33 | mixed: 10 genuine `ACC_NATIVE` bridges; needs a per-group split, unverifiable at 0 invocations |
+| `instrument.rs` | 33 | mixed: 10 genuine `ACC_NATIVE` bridges — **all 10 already pinned** with `register_with_kind`, so narrowing the ambient tag would correctly drop only the 23 shims. SAFE to split; blocked solely on verification (0 invocations, and `InstrumentationImpl` needs a `-javaagent` to reach). |
 | `native-builtins-security` | 3 | already `Intrinsic` |
 
 None of these is blocked by judgement or appetite. Each has a number attached.
@@ -338,3 +338,16 @@ The route there is the reusable part, and it produced more than the retag did:
 
 Steps 2 and 3 are worth more than step 5. A retag removes a mistag; those two
 fixed defects users could hit.
+
+**One more nomination that turned out already satisfied.** §8 stopped a blind
+retag of `instrument.rs` by censusing its 10 genuine bridges. The obvious
+follow-up — pin those 10 explicitly so a later narrowing cannot drop them — is
+**already done**: every one is registered through `register_with_kind`, and the
+inverse query finds nothing pinned that is not `ACC_NATIVE`.
+
+That is the second time this session a "pin before you narrow" nomination was
+already satisfied in the tree (`G79-1` N1 for `native-awt` was the first). The
+pattern is worth noting on its own: **the protective work has generally been
+done; what is missing is the verification that would let someone act on it.**
+`instrument.rs` is safe to split today and cannot be proven so, because
+`sun.instrument.InstrumentationImpl` needs a `-javaagent` to reach at all.
