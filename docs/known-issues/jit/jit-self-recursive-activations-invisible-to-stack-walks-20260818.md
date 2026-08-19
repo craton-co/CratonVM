@@ -1,10 +1,15 @@
 # A JIT-compiled method's self-recursive activations are invisible to every Java stack walk
 
-**Status: OPEN, reproduced and isolated 2026-08-18 on `dev` `a392c9ded`.
-Once a directly self-recursive method tiers up, 64 nested activations report as
-ONE frame to both `Throwable.getStackTrace()` and `StackWalker`. The computed
-answers stay correct — this is a stack-VISIBILITY defect, not a miscompile.
-HotSpot 25 and `--nojit` keep all 67 frames on the same probes.**
+**Status: the headline defect is FIXED 2026-08-18 (`f5e941a4b` + this branch).
+A directly self-recursive method's nested activations are now enumerated from
+the saved-RBP chain, so 64 activations report as 65 frames instead of one —
+exact HotSpot parity on the recursion probes.**
+
+**A DIFFERENT residual remains OPEN and keeps
+`stackwalker_log4j_deep_repeated_walks_finish_under_jit` red: an INLINED callee
+has no physical frame at all, so it is reported as its caller. That is not the
+mechanism this page was opened for — it needs inline frame records, not a stack
+walk — and it is scoped in "What remains" below.**
 
 ## The failure
 
@@ -82,13 +87,53 @@ the invariant this defect violates:
 `active_compiled_frames` reads `JIT_ENTRY_CHAIN`, which holds **one entry per
 interpreter→JIT entry**. A compiled method that calls *itself* from inside
 compiled code never re-enters the JIT from the interpreter, so it pushes no
-chain entry — 64 activations, one entry. A compiled method calling a
-*different* compiled method evidently does push one (the mutual-recursion row
-keeps its frames), which is why the defect is specific to direct self-calls.
+chain entry — 64 activations, one entry.
+
+## The fix
+
+`active_compiled_frames` now walks the saved-RBP chain outward from
+`exact_rbp`, exactly as `remap_active_jit_frames`' Stage 5 already does for the
+collector (`push rbp; mov rbp,rsp` frames, `[rbp]` = caller RBP, `[rbp+8]` =
+return address into the caller, same bound checks and the same 4096 guard),
+and emits one entry per activation instead of one per chain entry. The walk is
+read-only where Stage 5 rewrites oop slots, and it never reports FEWER frames
+than before: a walk cut short by a bound still owes the boundary method.
+
+`CRATONVM_JIT_NO_NESTED_TRACE_FRAMES=1` restores the old answer, so the whole
+table below is an A/B **inside one binary**.
+
+| probe (round 39, post-tier-up) | walk ON | walk OFF | HotSpot 25 |
+|---|---|---|---|
+| `SWShape` tail self-recursion | **67** | 3 | 67 |
+| `SWShape` non-tail self-recursion | **67** | 3 | 67 |
+| `SWShape` distinct chain | 10 | 10 | 10 |
+| `SWMutual` mutual recursion | 67 | 67 | 67 |
+| `SWCross` (inlined callee below the recursion) | 68 | 67 | 68 |
+| `SWValue` computed answers | `VALUES_OK` | — | `VALUES_OK` |
+
+## What remains OPEN
+
+`SWCross` puts a distinct `helper()` at the bottom of the hot recursion. Its
+frame count now matches HotSpot (68), but the frame is still named `recurse`,
+not `helper` — because **`helper` is inlined into `recurse` and has no physical
+frame to find**. No stack walk can recover it; that needs the compiled method
+to carry inline frame records (`precise-inline-frame-record` /
+`verify-inline-frame-record` are the existing hooks) so virtual frames can be
+reconstructed the way HotSpot does.
+
+That is what still fails
+`stackwalker_log4j_deep_repeated_walks_finish_under_jit`: Log4j2's caller lookup
+wants `LoggerFactory.resolveCaller`, which is inlined away.
+
+**A wrong turn worth not repeating.** Resolving the innermost frame
+"decode-first" — preferring `direct_call_callee`'s `E8 rel32` decode over the
+published-compile-id mirror — looks like the fix for the naming and is not: it
+pushed `SWCross` to **69** frames (one spurious entry) and still did not name
+`helper`, because there is no `helper` frame to name. Measured and reverted.
 
 ## What is NOT established
 
-- **Which emitter is responsible.** The obvious suspect,
+- **Which emitter is responsible for the pre-fix collapse.** The obvious suspect,
   `ir_lower.rs::emit_self_recursive_call` (a direct `CALL rel32` to the
   method's own entry, bypassing `jit_invoke_dispatch`), is **REFUTED**:
   `CRATONVM_JIT_IR_SELFREC_DIRECT=0` changes nothing, measured in one binary,
