@@ -35,7 +35,10 @@ import org.bouncycastle.util.test.FixedSecureRandom;
  * cwd must be the bc-java checkout):
  *
  *   javac -d <out> -cp "$(cat bcjca-classpath.txt)" HaetaeKat.java
- *   cratonvm --java-home <jdk25> --Xmx 1g \n *       -Dbc.test.data.home=<bc-test-data> -c "<out>:$(cat bcjca-classpath.txt)" \n *       org.bouncycastle.pqc.crypto.test.HaetaeKat 6 0
+ *   cratonvm --java-home <jdk25> --Xmx 1g \
+ *       -Dbc.test.data.home=<bc-test-data> \
+ *       -c "<out>:$(cat bcjca-classpath.txt)" \
+ *       org.bouncycastle.pqc.crypto.test.HaetaeKat 6 0
  *
  * `HaetaeKat 6 0` is the repro for the JIT defect recorded in
  * bug-bcjava-pqc-53class-20260818.md: vector count=5 of mode2 reports sig=OK with
