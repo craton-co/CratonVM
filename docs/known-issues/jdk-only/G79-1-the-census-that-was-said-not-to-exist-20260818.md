@@ -150,11 +150,38 @@ counts measure different questions.
 
 ## 5. NOMINATIONS
 
-**N1 — pin the 22 genuine bridges with `register_as` BEFORE narrowing the
-ambient tag.** This is behaviour-neutral today (they are already `Bridge`) and
-is what makes the eventual retag safe: once the real bridges are pinned
-explicitly, changing the ambient default cannot silently flip them. The audit's
-§8.3 stage 2, now with the exact list of 22 to pin (§1).
+**N1 — WITHDRAWN: already done, and I should have measured before nominating.**
+The audit's §8.3 stage 2 asks for a `register_as` that does not exist. The
+mechanism does exist, under another name — `NativeMethodRegistry::
+register_with_kind`, which sets the kind explicitly and records
+`kind_stated` so the census can tell *"someone adjudicated this"* from *"this
+inherited the default"*. And the dump carries `kind_stated` per registration, so
+the question is answerable rather than arguable:
+
+> **All 22 genuine bridges in `native-awt` are ALREADY pinned.** `kind_stated`
+> is true for every one; none inherits the ambient tag.
+
+So the preparatory stage for this crate is complete, and the only thing standing
+between here and a retag is the semantic decision in §3 — which is the part that
+needs the conformance gaps closed first (`G80-1` §4), not more bookkeeping.
+
+**N1a — the INVERSE query, which the forward one could not find.** Asking
+which registrations are pinned but are NOT `ACC_NATIVE` returns exactly one:
+
+```
+java/awt/image/ComponentSampleModel.initIDs()V   kind_stated=true, method ABSENT
+```
+
+Someone adjudicated that as a bridge, and the adjudication is wrong: §2's
+reflection pass puts `ComponentSampleModel.initIDs` in the *truly absent*
+group — the real class declares no such method and inherits none. A STATED
+bridge against a method that does not exist is worse than an inherited one,
+because the census now reports it as reviewed.
+
+It is deliberately NOT deleted here. The census is one image (JDK 25), and this
+record's own §2 warns against exactly that inference; `initIDs` is the kind of
+method that has come and gone across versions, so the check belongs on 17 and 21
+before the registration is removed. Recorded rather than acted on.
 
 **N2 — fix the six inverse-placement registrations regardless of the retag.**
 `Graphics2D`-only methods registered on `java.awt.Graphics` are wrong under any
