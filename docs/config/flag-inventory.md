@@ -1201,6 +1201,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE` | JIT | `CRATONVM_JIT=mic-rust-entry-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NATIVE_SITE_CACHE` | JIT | `CRATONVM_JIT=native-site-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_CAST_SITE_CACHE` | JIT | `CRATONVM_JIT=cast-site-cache` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_PARAM_TAG_SCAN` | JIT | `CRATONVM_JIT=param-tag-scan` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_LDC_CONST_CACHE` | JIT | `CRATONVM_JIT=ldc-const-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NEW_SITE_CACHE` | JIT | `CRATONVM_JIT=new-site-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` | JIT | `CRATONVM_JIT=precise-alloc-athrow` | opt-out | on | behaviour | snapshot | jit |

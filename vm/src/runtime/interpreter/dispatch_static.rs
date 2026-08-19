@@ -354,8 +354,10 @@ pub(super) fn execute_invokestatic(
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
+    // ONE forward scan, hoisted out of the per-argument loop below.
+    let param_tags = ParamTags::of(&method_descriptor);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
@@ -1780,7 +1782,9 @@ pub(super) fn execute_invokestatic_cached(
             // way. See gaps/bc-ec-mod-mododdinverse-investigation.md.
             const MAX_INLINE_ARGS: usize = 16;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
-            let pd_byte = |i: usize| -> u8 { nth_param_tag_byte(&cached.method_descriptor, i) };
+            // ONE forward scan; the per-argument form rescanned from `(` each time.
+            let param_tags = ParamTags::of(&cached.method_descriptor);
+            let pd_byte = |i: usize| -> u8 { param_tags.get(&cached.method_descriptor, i) };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &mut [Value] = if num_params <= MAX_INLINE_ARGS {

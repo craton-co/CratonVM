@@ -529,8 +529,10 @@ pub(super) fn execute_invoke_kind(
     }
     let mut args = Vec::with_capacity(total_args);
     args.push(coerce_invoke_arg_for_descriptor(b'L', recv_val));
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&method_descriptor);
     for i in 0..num_params {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
@@ -2636,6 +2638,127 @@ pub(super) fn nth_param_tag_byte(descriptor: &str, n: usize) -> u8 {
     b'L'
 }
 
+/// Every parameter tag byte of a descriptor, collected in ONE forward scan.
+///
+/// [`nth_param_tag_byte`] answers for a single index and rescans from `(` each
+/// time. Every caller in the tree is a per-ARGUMENT loop, so the descriptor was
+/// being re-tokenised once per argument: popping N args cost O(N^2) scanning,
+/// re-derived on every call, for a descriptor that is fixed per call site.
+///
+/// Measured before writing this: against HotSpot's interpreter CratonVM runs
+/// `iadd` at 4.1x but pays ~32ns per extra argument against HotSpot's ~0.94ns,
+/// a 34x gap that is far above its own baseline. `args8` cost 479.6ns against
+/// `args0`'s 221.0ns on the same run.
+///
+/// This is the same shape the 2026-08-18 interpreter audit kept finding, and
+/// the fix already exists one variant away: `CachedInvokeTarget::Intrinsic`
+/// carries `param_descs`, "split ONCE at IC-fill time ... without re-parsing
+/// the descriptor string". The bytecode variants never got it. Doing it per
+/// call rather than per IC fill keeps the change inside the dispatch arms —
+/// `CachedBytecodeMethod` cannot take a new field without touching its 38
+/// struct literals across four crates, none of which has a `..` tail.
+///
+/// `INLINE` matches the dispatch arms' own `MAX_INLINE_ARGS`. A descriptor with
+/// more parameters than that falls back to the per-index scan, so behaviour is
+/// unchanged for the rare wide case rather than capped.
+pub(super) struct ParamTags {
+    tags: [u8; Self::INLINE],
+    /// Number of entries in `tags` that were filled by the single scan.
+    len: usize,
+    /// `true` when the descriptor has more parameters than `tags` can hold, so
+    /// `get` must fall back rather than answer `b'L'` for a real parameter.
+    overflow: bool,
+    /// Kill switch: `CRATONVM_JIT_NO_PARAM_TAG_SCAN=1` skips the scan entirely
+    /// and sends every `get` back through the per-index rescan, reproducing the
+    /// pre-change behaviour EXACTLY. It exists so the speedup can be measured
+    /// on one binary — a cross-binary comparison is not an A/B.
+    bypass: bool,
+}
+
+fn param_tag_scan_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PARAM_TAG_SCAN").is_some()
+    })
+}
+
+impl ParamTags {
+    const INLINE: usize = 16;
+
+    /// Tokenise `descriptor` once. Tokenisation mirrors [`nth_param_tag_byte`]
+    /// exactly, including its `b'['`-for-arrays tag and its `b'L'` answer for
+    /// an out-of-range index; `param_tags_match_nth_param_tag_byte` pins that.
+    pub(super) fn of(descriptor: &str) -> Self {
+        if param_tag_scan_disabled() {
+            return Self { tags: [b'L'; Self::INLINE], len: 0, overflow: false, bypass: true };
+        }
+        let bytes = descriptor.as_bytes();
+        let mut tags = [b'L'; Self::INLINE];
+        let mut len = 0usize;
+        let mut overflow = false;
+        let mut i = 1; // skip '('
+        while i < bytes.len() && bytes[i] != b')' {
+            let tag = bytes[i]; // first byte of this token ('[' for arrays)
+            while i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'L' => {
+                    while i < bytes.len() && bytes[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1; // consume ';'
+                }
+                _ => {
+                    i += 1; // single-char primitive
+                }
+            }
+            if len < Self::INLINE {
+                tags[len] = tag;
+                len += 1;
+            } else {
+                overflow = true;
+            }
+        }
+        Self {
+            tags,
+            len,
+            overflow,
+            bypass: false,
+        }
+    }
+
+    /// The n-th parameter's tag byte. Identical to
+    /// `nth_param_tag_byte(descriptor, n)` for every `n`.
+    #[inline]
+    pub(super) fn get(&self, descriptor: &str, n: usize) -> u8 {
+        if self.bypass {
+            nth_param_tag_byte(descriptor, n)
+        } else if n < self.len {
+            self.tags[n]
+        } else if self.overflow {
+            nth_param_tag_byte(descriptor, n)
+        } else {
+            b'L'
+        }
+    }
+
+    /// The tag for argument slot `i` of a NON-STATIC call, where slot 0 is the
+    /// receiver and carries `b'L'`. Spelled out here because every virtual arm
+    /// had written the same `if i == 0 { b'L' } else { ...(i - 1) }` closure.
+    #[inline]
+    pub(super) fn get_with_receiver(&self, descriptor: &str, i: usize) -> u8 {
+        if i == 0 {
+            b'L'
+        } else {
+            self.get(descriptor, i - 1)
+        }
+    }
+}
+
 /// Unbox a boxed primitive wrapper object into its primitive `Value`.
 /// Returns the original value unchanged if it's not a recognized wrapper.
 pub(super) fn unbox_wrapper(shared: &SharedVm, prim_char: char, v: Value) -> Value {
@@ -4725,5 +4848,87 @@ mod tests {
         let registry = cratonvm_native_api::NativeMethodRegistry::new();
         assert_eq!(mark_stackless_exotic_natives_incomplete_in(&registry), 0);
         assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+    }
+}
+
+#[cfg(test)]
+mod param_tags_tests {
+    use super::{nth_param_tag_byte, ParamTags};
+
+    /// The whole safety argument for replacing the per-argument
+    /// `nth_param_tag_byte` scan with one `ParamTags::of`: the two must answer
+    /// identically for EVERY index, including out-of-range ones, or a
+    /// category-2 `long`/`double` argument gets popped down the category-1
+    /// path and its high bits are silently dropped. That is the exact failure
+    /// `nth_param_tag_byte`'s own call sites were written to prevent (BC
+    /// safegcd `0xFFFC_…` accumulators), and it is silent — a wrong tag
+    /// produces a plausible number, not a crash.
+    ///
+    /// Indices are probed past the parameter count on purpose: the dispatch
+    /// arms index by argument slot, which for a wide (category-2) descriptor
+    /// runs past the parameter count.
+    #[test]
+    fn param_tags_match_nth_param_tag_byte() {
+        let mut descriptors: Vec<String> = vec![
+            "()V".to_string(),
+            "()I".to_string(),
+            "(I)I".to_string(),
+            "(J)J".to_string(),
+            "(D)D".to_string(),
+            "(F)V".to_string(),
+            "(Z)Z".to_string(),
+            "(B)B".to_string(),
+            "(S)S".to_string(),
+            "(C)C".to_string(),
+            "(Ljava/lang/String;)V".to_string(),
+            "([I)V".to_string(),
+            "([[Ljava/lang/Object;)V".to_string(),
+            "(IJDLjava/lang/String;[BF)Ljava/lang/Object;".to_string(),
+            "(Ljava/lang/String;Ljava/lang/String;)Z".to_string(),
+            "([Ljava/lang/String;[[JI)V".to_string(),
+            // Degenerate/malformed shapes the scanner must not disagree on.
+            "(".to_string(),
+            "()".to_string(),
+            "(L".to_string(),
+            "([".to_string(),
+            "(Ljava/lang/String".to_string(),
+        ];
+
+        // Exactly at, one below and one above the inline capacity, so the
+        // overflow fallback is exercised rather than assumed.
+        for n in [15usize, 16, 17, 40] {
+            descriptors.push(format!("({})V", "I".repeat(n)));
+            descriptors.push(format!("({})V", "J".repeat(n)));
+            descriptors.push(format!("({})V", "Ljava/lang/String;".repeat(n)));
+            descriptors.push(format!("({})V", "[I".repeat(n)));
+        }
+
+        for d in &descriptors {
+            let tags = ParamTags::of(d);
+            for n in 0..64 {
+                assert_eq!(
+                    tags.get(d, n),
+                    nth_param_tag_byte(d, n),
+                    "descriptor {d:?} index {n}"
+                );
+            }
+        }
+    }
+
+    /// Slot 0 of a non-static call is the receiver and must answer `b'L'`
+    /// whatever the descriptor says, with parameter `k` at slot `k + 1`.
+    #[test]
+    fn get_with_receiver_offsets_by_one() {
+        let d = "(JLjava/lang/String;I)V";
+        let tags = ParamTags::of(d);
+        assert_eq!(tags.get_with_receiver(d, 0), b'L');
+        for k in 0..8 {
+            assert_eq!(
+                tags.get_with_receiver(d, k + 1),
+                nth_param_tag_byte(d, k),
+                "slot {} vs param {k}",
+                k + 1
+            );
+        }
     }
 }
