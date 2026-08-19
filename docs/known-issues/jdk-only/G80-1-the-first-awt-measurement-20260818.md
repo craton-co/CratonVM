@@ -110,14 +110,63 @@ of code that does not work yet. `G79-1` §1's 22 genuine bridges are still worth
 PINNING (that record's N1, behaviour-neutral); the wholesale retag should wait
 behind the conformance gaps here.
 
+## 4a. The retag, actually run — and what it measured
+
+`G79-1` §3 said retagging is a semantic change and should be taken
+deliberately. It can also just be TRIED, which is cheaper than arguing about
+it: the ambient tag is one line, and because all 22 genuine bridges are already
+pinned with `register_with_kind` (`G79-1` N1), flipping it cannot touch them.
+
+```rust
+// native-awt/src/lib.rs:115  — EXPERIMENT, reverted
+registry.with_category(NativeKind::SyntheticStub, natives::register_all);
+```
+
+Under `--jdk-only` a `SyntheticStub` is refused, so the real bytecode answers.
+**3 diverging rows became 8**, and the split is the useful part:
+
+| group | effect of the retag |
+| --- | --- |
+| `java.awt.image.*` | **FIXED, exactly.** `getRaster()`, `getSampleModel()` and `getColorModel()` all answer correctly and match HotSpot byte for byte. The real `BufferedImage.<init>` runs and populates its own fields. |
+| `Graphics`/`Graphics2D`/`SunGraphics2D` | **BROKEN.** 7 rows became `UnsatisfiedLinkError: sun/java2d/windows/WindowsFlags.initNativeFlags()Z` and `NoClassDefFoundError: java/awt/GraphicsEnvironment$LocalGE`. |
+| `ImageIO` | **BROKEN**, downstream of the same cause. |
+
+**So the shims are not gratuitous.** The Java2D path bottoms out in the
+PLATFORM native library — `awt.dll`'s JNI, which CratonVM does not implement —
+and that is why the shim exists. Retagging that group converts a working
+approximation into a hard failure. Retagging the image group replaces a
+side-table fake with the genuine implementation, for free.
+
+This is exactly the per-group split the ambient-category audit §8.3 prescribes,
+now with evidence rather than advice behind it. It also answers N1 below: the
+question was never "populate the fields or declare them out of scope" — the
+real constructor populates them correctly the moment it is allowed to run.
+
+**A consequence of over-tagging the P0 row does not mention.** `CRATONVM_REAL`
+is the differential switch built for precisely this comparison — run real
+bytecode instead of a fake, and diff. It only bypasses `SyntheticStub`
+registrations. With 1300 `native-collections` and 165 `native-awt` shims
+mistagged `Bridge`, `CRATONVM_REAL=all` changes NOTHING for either surface
+(measured). The over-tagging does not only inflate a count and hide stubs from
+the census; it disables the instrument you would use to plan and validate the
+retag.
+
+The experiment was reverted. The tree is unchanged.
+
 ## 5. NOMINATIONS
 
-**N1 — populate `BufferedImage.raster` / `colorModel`, or declare them out of
-scope.** §4. These are not obscure APIs; `getRaster()` is how most image code
-reaches pixels. Either the side table becomes a real `Raster` the JDK classes
-can see, or the P0 closure rule 5 route is taken and the image surface is
-declared unsupported under `--jdk-only` — but the present state, returning
-`null` from a method that cannot return `null`, is neither.
+**N1 — SUPERSEDED by §4a: retag the `java.awt.image.*` group only.** The
+framing here was wrong. Neither option was needed: the real constructor
+populates `raster`/`sampleModel`/`colorModel` correctly as soon as the shim
+stops shadowing it, measured exact against HotSpot.
+
+The work is a per-group split rather than one line, and it has a REAL hazard
+§4a did not have to face, because the retag broke `createGraphics` before it
+could: our `getRGB`/`setRGB`/`createGraphics` read a side table keyed off the
+image, populated by our own `<init>`. Let the real `<init>` run and no
+side-table entry exists — so the image group cannot move to real bytecode until
+the rasterizer writes into the REAL raster instead of the side table. That is
+the actual piece of work, and it is bounded: one backing store instead of two.
 
 **N2 — DONE.** `Graphics.getColor`, `Graphics2D.setBackground` and
 `getBackground` are registered. 10 diverging rows -> 3.
