@@ -1252,6 +1252,11 @@ pub const INVENTORY: &[E] = &[
     // serial; `relocate` reads 0/off/false/no as off.
     E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-19 with the ZGC read-bounds publish. An OPT-OUT, not an
+    // opt-in: ZGC publishing its arena envelope into `JIT_READ_BOUNDS` is the
+    // default, and this key is the kill switch that restores helper-only
+    // reference reads. See `gc/src/zgc.rs::zgc_jit_read_bounds_enabled`.
+    E { group: Group::GC, token: "zgc-jit-read-bounds", on_key: None, off_key: Some("CRATONVM_ZGC_NO_JIT_READ_BOUNDS"), off_word: None },
     // Declared 2026-08-16 with genuine concurrent marking. `conc-start` is the
     // percentage of the collection threshold at which a CONCURRENT mark cycle
     // opens, and its parser reads `0` as "never". It is DEFAULT-OFF (the
