@@ -203,3 +203,96 @@ where the funnel actually shows up.
 
 None of this is touched by the JCA work in the sibling page; these classes were
 simply never measured before.
+
+## LOCALISED: the C1 compile of `HAETAEEngine.ntt`
+
+Not fixed on current dev. A fresh binary from dev `6559b300d` — 143 commits and a
+different md5 from the one the rows above were measured on — reproduces count=5
+`verifies=false` unchanged.
+
+`CRATONVM_JIT_DENY` matches on `class.method`, so it bisects to a method. A
+binary search over `HAETAEEngine`'s 147 methods, ~2s per arm:
+
+```text
+control(no deny)  = verifies=false
+control(all deny) = verifies=true
+  deny [0,73)  n=73 -> verifies=true
+  deny [0,36)  n=36 -> verifies=false
+  deny [36,54) n=18 -> verifies=true
+  ...
+CULPRIT INDEX 43 -> ntt
+confirm deny-only-that: verifies=true
+```
+
+Denying that ONE method — `CRATONVM_JIT_DENY=HAETAEEngine.ntt` — turns the KAT
+green. And the tier knobs say which compile of it is wrong:
+
+| arm | count=5 |
+|---|---|
+| control | `verifies=false` |
+| `CRATONVM_JIT_DENY=HAETAEEngine.ntt` | **`verifies=true`** |
+| `CRATONVM_JIT_FORCE_C2=1` | **`verifies=true`** |
+| `CRATONVM_TIER_C1_THRESHOLD` huge (never C1) | **`verifies=true`** |
+| `CRATONVM_TIER_C2_THRESHOLD` huge (C1 only) | `verifies=false` |
+| `CRATONVM_TIER_C2_THRESHOLD` huge + deny ntt | **`verifies=true`** |
+| OSR backedge and/or threshold huge | `verifies=false` |
+
+**It is the C1 full compile of `ntt`.** C2's compile of the same method is
+correct, the interpreter is correct, and OSR is not involved — the disassembly
+shows an OSR body for `ntt` as well, but disabling OSR changes nothing.
+
+All 53 off-switchable JIT passes were swept individually against the repro
+(`aaload-licm`, `bce`, `unroll`, `local-liveness`, `long-intrinsics`,
+`scalar-replacement`, `precise-reg-spill`, `slot-mirror`, …). **None of them
+makes it pass**, so this is core C1 codegen, not an optional pass.
+
+### The repro: `probes/NttRealProbe.java`, ~2 seconds
+
+It drives the real method through its public wrapper and needs no reference
+implementation, because it checks something that must hold on any VM: every
+iteration hands `polyNtt` a freshly built array with identical contents, so
+every iteration must return the identical result. Iteration 0 defines the
+answer.
+
+```text
+HotSpot 25              iterations=5000 diverged=0    firstBad=-1  => PASS
+CratonVM --nojit        iterations=5000 diverged=0    firstBad=-1  => PASS
+CratonVM JIT            DIVERGED first at iteration 502, element [0]:
+                            got=-827016358 expected(iteration 0)=-27922
+                        iterations=5000 diverged=4498 firstBad=502 => FAIL
+```
+
+**Iteration 502 against a `c1_threshold=500`.** Everything before the C1 compile
+is right and everything after it is wrong, which is what makes vector count=5 of
+mode2 special: nothing about that vector's data matters, it is simply where the
+invocation counter crosses the threshold. The same reading explains count=6's
+hang — once `ntt` is wrong, the rejection sampler downstream never accepts.
+
+### What `ntt` looks like
+
+```java
+private void ntt(int[] a)
+{
+    int k = 0, j;
+    for (int len = 128; len > 0; len >>= 1)
+        for (int start = 0; start < HAETAEParameters.N; start = j + len)
+        {
+            int zeta = ZETAS[++k];
+            for (j = start; j < start + len; ++j) { ... }
+        }
+}
+```
+
+`j` is declared outside both loops, advanced by the INNER loop, and read back by
+the MIDDLE loop's update expression (`start = j + len`) — so it is live across
+the inner loop's exit and feeds the enclosing loop's induction. `javap` confirms
+that is what the JIT sees: slot 3 is stored at pc 82 inside the inner loop and
+loaded at pc 88 for the middle loop's update.
+
+That shape is the obvious suspect, and it is **not on its own sufficient**: a
+standalone probe reproducing exactly that structure (`probes/NttShapeProbe.java`,
+static method, same `sipush 256` bound, same `getstatic` zeta table) passes on
+CratonVM at every tier, including pinned to C1. So something else about the real
+method — it is an instance method reached through a wrapper, among other
+differences — is needed to trigger it. Naming that difference is the next step,
+and it is what turns this into a standalone regression test.
