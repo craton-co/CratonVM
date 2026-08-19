@@ -644,12 +644,48 @@ pub(crate) fn native_string_intern(
 /// practice bounded by how many distinct lone-surrogate strings a program
 /// interns, which is a set every measurement in this tree has found empty
 /// outside a test.
+///
+/// **One table, two callers.** `String.intern()` reaches it through
+/// [`intern_unrepresentable`] below; the interpreter's `ldc` of a
+/// surrogate-bearing *literal* reaches it through
+/// [`surrogate_intern_probe`] / [`surrogate_intern_claim`], which exist
+/// because that caller lives in the `vm` crate and holds a `SharedVm` rather
+/// than a `NativeContext`. It has to be the SAME table: JVMS §5.1 interns
+/// string literals, so `"\uD800" == "\uD800"` and
+/// `LITERAL == LITERAL.intern()` are both required to hold, and two tables
+/// would answer the second one `false`.
 fn surrogate_intern_pool() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>
 {
     static P: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>,
     > = std::sync::OnceLock::new();
     P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The global-root handle already canonical for `units`, if any.
+///
+/// Read half of the pool, for a caller that owns a different root API. A hit
+/// lets `ldc` skip allocating the `String` at all.
+pub fn surrogate_intern_probe(units: &[u16]) -> Option<usize> {
+    let pool = surrogate_intern_pool().lock().ok()?;
+    pool.get(units).copied()
+}
+
+/// Publish `handle` as the canonical instance for `units`, returning whichever
+/// handle won. A caller whose handle lost must release it.
+///
+/// Write half of [`surrogate_intern_probe`]. Takes the handle rather than the
+/// `ObjectRef` for the reason the module comment gives: the collector owns the
+/// reference, and a raw `ObjectRef` parked in a `static` would be a stale
+/// address after the next relocating cycle.
+pub fn surrogate_intern_claim(units: Vec<u16>, handle: usize) -> usize {
+    match surrogate_intern_pool().lock() {
+        Ok(mut pool) => *pool.entry(units).or_insert(handle),
+        // A poisoned pool must not silently de-intern: returning the caller's
+        // own handle keeps this call's identity self-consistent, which is the
+        // same direction `intern_unrepresentable` takes on the same failure.
+        Err(_) => handle,
+    }
 }
 
 /// Canonical instance for a string the Rust-text pools cannot represent.
@@ -665,13 +701,15 @@ fn intern_unrepresentable(
     this: cratonvm_types::ObjectRef,
     units: Vec<u16>,
 ) -> cratonvm_types::ObjectRef {
+    // Probe before rooting: an already-interned literal (the common case once
+    // `ldc` populates this table) costs one lock and no root traffic.
+    if let Some(winner) = surrogate_intern_probe(&units) {
+        if let Some(obj) = ctx.resolve_global_root(winner) {
+            return obj;
+        }
+    }
     let handle = ctx.add_global_root(this);
-    let winner = {
-        let Ok(mut pool) = surrogate_intern_pool().lock() else {
-            return this;
-        };
-        *pool.entry(units).or_insert(handle)
-    };
+    let winner = surrogate_intern_claim(units, handle);
     if winner != handle {
         ctx.remove_global_root(handle);
     }

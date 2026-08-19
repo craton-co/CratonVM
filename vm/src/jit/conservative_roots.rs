@@ -3281,26 +3281,132 @@ pub fn current_thread_jit_depth() -> usize {
 /// Entries with no label are skipped rather than reported as an unnamed frame:
 /// the only artifacts with an empty `method_label` are the legacy/test compile
 /// wrapper's, and inventing a frame for one would be worse than omitting it.
+/// Kill switch for the nested-activation walk in [`active_compiled_frames`].
+///
+/// Default ON. `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES=1` restores the historical
+/// one-frame-per-chain-entry answer, so the frame-count difference is an A/B
+/// inside ONE binary instead of a comparison across two builds.
+fn nested_trace_frames_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES").is_none()
+    })
+}
+
 pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
+    let nested_enabled = nested_trace_frames_enabled();
+    let scanner_sp = current_stack_pointer();
     JIT_ENTRY_CHAIN.with(|c| {
-        c.borrow()
-            .iter()
-            .filter_map(|e| {
-                let info = e.precise.as_ref()?;
+        // The top entry's `exact_rbp` lives in the `TOP_RBP` mirror between
+        // push/pop boundaries; the walk below needs the LIVE innermost RBP, so
+        // flush it exactly as `remap_active_jit_frames` does. `try_borrow_mut`
+        // rather than `borrow_mut`: a stack capture is reachable from paths
+        // that may already hold the chain borrow, and a stale (higher)
+        // `exact_rbp` only shortens the walk — it degrades this function to the
+        // answer it gave before, and never walks past a bound.
+        if nested_enabled {
+            if let Ok(mut v) = c.try_borrow_mut() {
+                flush_top_rbp_cache_to_chain(v.as_mut_slice());
+            }
+        }
+        let chain = c.borrow();
+        let mut out: Vec<(u32, String, u32)> = Vec::with_capacity(chain.len());
+        for e in chain.iter() {
+            let Some(info) = e.precise else {
+                continue;
+            };
+            let entry_sp = e.entry_sp;
+            // One chain entry is one interpreter->JIT boundary, but the
+            // compiled region behind it can be many ACTIVATIONS deep: compiled
+            // code calling itself never re-enters from the interpreter, so it
+            // pushes no further chain entry. Reporting only the boundary method
+            // made 64 nested activations read as ONE frame to
+            // `Throwable.getStackTrace()` and `StackWalker` alike — Log4j2's
+            // caller lookup then walked past the frame it wanted and answered
+            // with the enclosing class
+            // (`stackwalker_log4j_deep_repeated_walks_finish_under_jit`).
+            // Walk the saved-RBP chain the way `remap_active_jit_frames`'
+            // Stage 5 already does, and report every activation.
+            let mut nested: Vec<*const cratonvm_jit::CompiledMethod> = Vec::new();
+            if nested_enabled {
+                if let Some(innermost) = innermost_frame_method(
+                    info.exact_rbp,
+                    info.exact_cm_id,
+                    entry_sp,
+                    scanner_sp,
+                    info.compiled_method,
+                ) {
+                    nested.push(innermost);
+                }
+                // JIT frames use `push rbp; mov rbp,rsp`, so `[rbp]` is the
+                // caller RBP and `[rbp+8]` the return address INTO that caller.
+                // Same bound checks, same order and the same 4096 guard as the
+                // Stage 5 walk — this one only READS, where that one rewrites
+                // oop slots.
+                let mut child_rbp = info.exact_rbp;
+                let mut guard = 0usize;
+                while guard < 4096 {
+                    guard += 1;
+                    if child_rbp == 0 || child_rbp & 0x7 != 0 {
+                        break;
+                    }
+                    if child_rbp < scanner_sp || child_rbp >= entry_sp {
+                        break;
+                    }
+                    // SAFETY: `child_rbp` is an aligned address inside this
+                    // thread's own live JIT stack region, bounded by
+                    // `scanner_sp` (this frame) and `entry_sp` (the boundary
+                    // that pushed the chain entry), and validated before use
+                    // exactly as the other rbp-chain walks in this file do.
+                    let parent_rbp = unsafe { (child_rbp as *const usize).read() };
+                    let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                    if parent_rbp <= child_rbp
+                        || parent_rbp & 0x7 != 0
+                        || parent_rbp < scanner_sp
+                        || parent_rbp >= entry_sp
+                    {
+                        break;
+                    }
+                    match cratonvm_jit::lookup_jit_code_range(ret_addr) {
+                        Some(cm_ptr) => {
+                            nested.push(cm_ptr as *const cratonvm_jit::CompiledMethod)
+                        }
+                        // The parent is the interpreter / Rust boundary: this
+                        // entry has no further compiled ancestors.
+                        None => break,
+                    }
+                    child_rbp = parent_rbp;
+                }
+            }
+            // Never report FEWER frames than the pre-walk answer. A walk cut
+            // short by a bound, one that never started (`exact_rbp == 0`), and
+            // the kill-switch path all still owe the boundary method the chain
+            // entry was pushed for.
+            if nested.last() != Some(&info.compiled_method) {
+                nested.push(info.compiled_method);
+            }
+            // `nested` is innermost-first; the splice in
+            // `runtime::stackwalker::interleave_compiled_frames` wants
+            // outermost-first, and entries sharing an `interp_depth` keep their
+            // push order.
+            for cm_ptr in nested.iter().rev() {
                 // SAFETY: exactly the contract documented on
                 // `PreciseFrameInfo::compiled_method` — the JIT cache holds an
                 // owning `Arc` for as long as the body is registered, and the
                 // chain entry is popped the moment the call returns or unwinds,
                 // so there is no stale-pointer window. This read happens on the
                 // owning thread, from a Java-level stack capture, i.e. strictly
-                // inside that window.
-                let cm = unsafe { &*info.compiled_method };
+                // inside that window. Pointers added by the walk came from
+                // `lookup_jit_code_range`, which only answers for a code range
+                // still registered in the cache.
+                let cm = unsafe { &**cm_ptr };
                 if cm.method_label.is_empty() {
-                    return None;
+                    continue;
                 }
-                Some((e.interp_depth, cm.method_label.clone(), cm.owner_class_id))
-            })
-            .collect()
+                out.push((e.interp_depth, cm.method_label.clone(), cm.owner_class_id));
+            }
+        }
+        out
     })
 }
 

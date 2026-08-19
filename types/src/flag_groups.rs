@@ -938,6 +938,9 @@ pub const INVENTORY: &[E] = &[
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "ir-selfrec-direct", on_key: Some("CRATONVM_JIT_IR_SELFREC_DIRECT"), off_key: None, off_word: None },
+    // Default-ON: `conservative_roots::nested_trace_frames_enabled` treats the
+    // key's PRESENCE as "restore the one-frame-per-chain-entry answer".
+    E { group: Group::JIT, token: "nested-trace-frames", on_key: None, off_key: Some("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES"), off_word: None },
     // Default-ON, `"0"` turns it off — same polarity as `ir-reloc-emit`, and
     // the row must spell it that way round. The consumer refuses to install a
     // compilation stamped older than the last cache flush; setting this to `0`
@@ -1064,6 +1067,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
+    E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None },
     E { group: Group::JIT, token: "new-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-hiwater", on_key: Some("CRATONVM_JIT_UNREG_MEMO_HIWATER"), off_key: None, off_word: None },
