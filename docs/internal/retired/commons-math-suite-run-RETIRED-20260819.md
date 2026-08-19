@@ -172,3 +172,103 @@ The shape of what is left, and the honest picture of the remaining gap:
 | `analysis.differentiation.SparseGradientTest` | 14.4 s | 6.1 s |
 
 `BOBYQAOptimizerTest` is no longer in this list.
+
+---
+
+## Appendix — the superseded document, verbatim
+
+`apps/commons-math/RESULTS-20260819.md` was never committed (`apps/` is
+gitignored), so it is preserved here rather than cited into a void. Read it
+against the Corrections section above.
+
+> # CratonVM test run — Apache Commons Math 4.0-SNAPSHOT (2026-08-19 rerun)
+> 
+> **Supersedes** `docs/internal/retired/commons-math-suite-run-RETIRED-20260818.md` (Azure Linux closing run) with a same-tree Windows rerun after merging `dev` forward. Both agree on direction (large improvement over the 08-17 baseline) with some host-load noise, noted below.
+> 
+> **Binary:** `target/release/cratonvm.exe`, dev `2bd19943a` (rebuilt this run; previous local binary was ~23h stale)
+> **JDK backend:** `--java-home` real JDK25 (Eclipse Adoptium jdk-25.0.3.9-hotspot), real-jdk mode, JIT on, default GC (ZGC)
+> **Harness:** `CratonRunner` (from `apps/netty-suite-runner/`), one JUnit4/5 class per process, 90s/class timeout, `--Xmx 1g`
+> **Population:** same 309 classes as the 2026-08-17 baseline run (6 modules; `neuralnet.OffsetFeatureInitializer` is a non-test helper, `found=0`)
+> **Total wall time:** 1227s (~20.5 min)
+> 
+> ## Headline
+> 
+> | Status | 2026-08-17 baseline | 2026-08-19 rerun |
+> |---|---:|---:|
+> | PASS | 275 | **280** |
+> | FAIL | 31 | 26 |
+> | HANG (>90s) | 2 | 3 |
+> | CRASH | 1 | 0 |
+> | **Total** | **309** | **309** |
+> 
+> Net: **+5 PASS, CRASH eliminated.** Confirms real fixes landed on `dev` between the two runs — `DerivativeStructureTest` (was failing ~10/124 methods) now passes **124/124** on the fresh binary; `SparseRealVectorTest` (was CRASH) now passes clean.
+> 
+> ## Complete non-PASS list (29 classes)
+> 
+> ### HANG — 3, all already-documented CratonVM throughput/admission gaps, not new
+> 
+> | Class | Doc |
+> |---|---|
+> | `optim.nonlinear.scalar.noderiv.BOBYQAOptimizerTest` | `docs/known-issues/perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md` — `ArrayRealVector` getEntry/setEntry dispatch cost, not an OSR admission gap (that part was fixed and moved nothing) |
+> | `optim.nonlinear.scalar.noderiv.SimplexOptimizerTest` | New HANG since 08-17 (was FAIL then) — not yet filed; likely the same numeric-kernel cost as BOBYQA, unconfirmed |
+> | `analysis.integration.gauss.LegendreHighPrecisionTest` | `docs/known-issues/perf/bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md` — documented as "borderline PASS" post-fix (86-105s against a 90s budget); this run landed on the HANG side of that border |
+> 
+> ### FAIL — 26
+> 
+> Two of these produced **no output at all** (abnormal exit mid-sweep, no exception, no JUnit result) and passed cleanly on standalone retry — flagged separately, not double-counted as a real defect:
+> 
+> | Class | rc | Standalone retry |
+> |---|---|---|
+> | `analysis.integration.IterativeLegendreGaussIntegratorTest` | 1, no output | **PASS** 5/5, 65.7s (comfortably but not generously under the 90s budget) |
+> | `analysis.integration.gauss.LegendreHighPrecisionParametricTest` | 1, no output | **PASS** 30/30, 26.2s |
+> 
+> Read as shared-host timing pressure (this box runs 250+ concurrent Claude sessions) pushing already-slow classes over the edge mid-sweep, not a regression. True standalone-conditions PASS count is **282/309**.
+> 
+> One more no-output/abnormal-exit case is a known, pre-existing throughput cliff, not new:
+> 
+> | Class | rc | Note |
+> |---|---|---|
+> | `core.jdkmath.AccurateMathTest` | 127, no output | Already documented — "the other half of the PSquare throughput cliff... correct given a large enough budget, and 90s is below the cost of the work". Standalone retry did not finish within 2 min either; consistent with the known doc, not investigated further here. |
+> 
+> The remaining 23 are pre-existing, unseeded-RNG-driven test flakiness — cross-checked against HotSpot in the 08-17 investigation (repeat-run 3-5x on both VMs, comparable failure rates on both) and reconfirmed present in the 08-18 Azure closing run's own cross-check table:
+> 
+> ```
+> analysis.interpolation.AkimaSplineInterpolatorTest        testInterpolateLine
+> analysis.interpolation.UnivariatePeriodicInterpolatorTest testLessThanOnePeriodCoverage
+> distribution.AbstractIntegerDistributionTest               testProbabilitiesRangeArguments
+> distribution.EnumeratedIntegerDistributionTest              testExceptions
+> distribution.EnumeratedRealDistributionTest                 testExceptions
+> distribution.MultivariateNormalDistributionTest             testSampling
+> fitting.PolynomialCurveFitterTest                           testFit
+> fitting.SimpleCurveFitterTest                                testPolynomialFit
+> fitting.leastsquares.EvaluationTestValidation                testParametersErrorMonteCarloParameters
+> fitting.leastsquares.LevenbergMarquardtOptimizerTest         testParameterValidator
+> linear.HessenbergTransformerTest                             testRandomDataNormalDistribution
+> linear.SchurTransformerTest                                  testRandomDataNormalDistribution
+> optim.nonlinear.scalar.noderiv.CMAESOptimizerTest             testConstrainedRosen
+> optim.nonlinear.scalar.noderiv.SimplexOptimizerNelderMeadTest testFourExtremaMaximize1
+> stat.correlation.KendallsCorrelationTest                      testStdErrorConsistency
+> stat.correlation.PearsonsCorrelationTest                      testStdErrorConsistency
+> stat.correlation.SpearmansRankCorrelationTest                 testSwissFertility
+> stat.descriptive.AggregateSummaryStatisticsTest               testAggregateStatisticalSummary
+> stat.descriptive.ResizableDoubleArrayTest                     testWithInitialCapacityAndExpansionFactor
+> stat.descriptive.moment.WeightedMeanTest                      testWeightedConsistency
+> stat.descriptive.moment.WeightedVarianceTest                  testWeightedConsistency
+> stat.descriptive.rank.PSquarePercentileTest                   testDistribution
+> stat.regression.GLSMultipleLinearRegressionTest               testGLSEfficiency
+> ```
+> 
+> ## Bottom line
+> 
+> **280-282/309 passing** (up from 275/309), **0 crashes** (down from 1). Every one of the 29 non-passes traces to an already-documented cause: pre-existing RNG flakiness (23), a documented throughput cliff (1), documented perf gaps still borderline against the 90s budget (2), one new-since-08-17 HANG not yet filed (`SimplexOptimizerTest`, likely same family as BOBYQA), and two host-load timing artifacts that pass standalone (2).
+> 
+> ## Reproduction
+> 
+> ```bash
+> CV="C:/craton/CratonVM/target/release/cratonvm.exe"
+> JDK="C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot"
+> CP="<aggregate test classpath — see prior RESULTS doc / retired doc for how to build it>"
+> "$CV" --java-home "$JDK" --Xmx 1g -c "<runner-dir>;$CP" CratonRunner org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest
+> ```
+> 
+> Full per-class logs and `results.tsv` are under the session scratchpad `/tmp/cm-suite-cratonvm-rerun/` (not committed — ephemeral).
