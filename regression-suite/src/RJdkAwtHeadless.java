@@ -3,6 +3,8 @@ import java.awt.Graphics2D;
 import java.awt.GraphicsEnvironment;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
+import java.awt.image.ColorModel;
+import java.awt.image.Raster;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import javax.imageio.ImageIO;
@@ -23,12 +25,18 @@ import javax.imageio.ImageIO;
  * pinned them would be asserting an implementation rather than a contract.
  * Every row below is a contract: a value the platform specifies.
  *
- * WHAT IT DELIBERATELY OMITS. G80-1 measured three rows that still diverge and
- * they are NOT asserted here: BufferedImage.getRaster(), getSampleModel() and
- * getColorModel() answer null under --jdk-only, because our BufferedImage is a
- * handle into a native side table whose fields the real object never sees.
- * Writing the present behaviour in would freeze a defect into the suite. When
- * G80-1 N1 is settled, those rows belong here.
+ * THE RASTER ROWS. getRaster(), getSampleModel() and getColorModel() answered
+ * null when this vector was first written, and were deliberately left out
+ * rather than asserted -- writing the present behaviour in would have frozen a
+ * defect into the suite. G80-1 N1 has since been settled (the objects are built
+ * by real JDK bytecode), so they are asserted here now, including the row that
+ * reads a band THROUGH the raster after drawing, which is what tests the
+ * synchronisation rather than merely the object's existence.
+ *
+ * ONE KNOWN LIMIT, not asserted because it is a divergence: the raster we hand
+ * out is a SNAPSHOT refreshed at getRaster(), not a live view. Pixels written
+ * THROUGH the raster do not flow back to the rasterizer. Removing that limit is
+ * option (B) in G80-1 N1 and costs the VM-independence of four thousand lines.
  *
  * Determinism: no display, no fonts, no timing, no file system. Headless is set
  * before any AWT class initialises.
@@ -213,6 +221,38 @@ public class RJdkAwtHeadless {
         System.out.println("CK RJdkAwtHeadless imageio=ok");
     }
 
+    // ---- the raster, colour model and sample model -------------------------
+    // These answered null until G80-1 N1: our <init> shim shadowed the real
+    // constructor and never built what it builds. They are real JDK objects now
+    // -- DataBufferInt, Raster.createPackedRaster, DirectColorModel -- all of
+    // which run as real bytecode under --jdk-only.
+    static void rasterModel() {
+        Raster r = rgb(6, 3).getRaster();
+        ckI(r.getWidth(), 6, "raster width");
+        ckI(r.getHeight(), 3, "raster height");
+        ckI(r.getNumBands(), 3, "an opaque image has three bands");
+        check("java.awt.image.SinglePixelPackedSampleModel"
+                        .equals(rgb(6, 3).getSampleModel().getClass().getName()),
+                "the sample model of a packed int image, got "
+                        + rgb(6, 3).getSampleModel().getClass().getName());
+        ColorModel cm = new BufferedImage(6, 3, BufferedImage.TYPE_INT_ARGB).getColorModel();
+        ckI(cm.getPixelSize(), 32, "an ARGB colour model is 32 bits");
+        check(cm.hasAlpha(), "an ARGB colour model has alpha");
+        check(!rgb(6, 3).getColorModel().hasAlpha(), "an RGB colour model has no alpha");
+
+        // The row that actually tests the synchronisation: draw, THEN read
+        // through the raster. Our raster is a snapshot refreshed when it is
+        // handed out, so a read after a draw must still see the drawn pixel.
+        BufferedImage b = rgb(4, 4);
+        Graphics2D g = b.createGraphics();
+        g.setColor(new Color(0x11, 0x22, 0x33));
+        g.fillRect(0, 0, 4, 4);
+        g.dispose();
+        int sample = b.getRaster().getSample(1, 1, 0);
+        ckI(sample, 0x11, "the red band read THROUGH the raster after drawing");
+        System.out.println("CK RJdkAwtHeadless raster=ok");
+    }
+
     public static void main(String[] args) throws Exception {
         System.setProperty("java.awt.headless", "true");
         check(GraphicsEnvironment.isHeadless(), "the vector must run headless");
@@ -223,6 +263,7 @@ public class RJdkAwtHeadless {
         clip();
         colourState();
         bounds();
+        rasterModel();
         imageio();
 
         System.out.println("CK RJdkAwtHeadless checks=" + checks);

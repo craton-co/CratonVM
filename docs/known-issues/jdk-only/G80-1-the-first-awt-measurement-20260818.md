@@ -1,7 +1,7 @@
 # G80-1 — the first AWT measurement, and why it changes the retag order
 
-**Status:** MEASURED (25 rows, **10 diverged**); **7 FIXED, 3 left** — and the
-three that remain are one design decision, not three gaps.
+**Status:** MEASURED (25 rows, **10 diverged**); **all 10 FIXED**. The probe is
+clean at 0 of 25 under `--jdk-only`, with one known limit stated in N1.
 **Provenance:** both VMs, headless (`-Djava.awt.headless=true`). Oracle HotSpot
 25.0.3+9-LTS; CratonVM `--jdk-only`. Probe
 `regression-suite/probes/Sweep17AwtHeadless.java`.
@@ -155,7 +155,20 @@ The experiment was reverted. The tree is unchanged.
 
 ## 5. NOMINATIONS
 
-**N1 — SUPERSEDED by §4a: retag the `java.awt.image.*` group only.** The
+**N1 — DONE via option (A).** `BufferedImage.<init>` now builds the genuine
+`DataBufferInt` / `WritableRaster` / `DirectColorModel` trio — every one of them
+real JDK bytecode, each verified identical to HotSpot BEFORE any Rust was
+written — and stamps them onto the object's own fields. `getRaster()` is
+registered solely to synchronise the rasterizer's pixels into the data buffer
+before it leaves for Java. Probe 3 diverging rows -> 0; the vector asserts 40
+checks including a band read THROUGH the raster after drawing, which tests the
+synchronisation rather than the object's mere existence.
+
+**The limit, stated rather than left to be discovered:** the raster is a
+SNAPSHOT refreshed when handed out, not a live view. Pixels written through it
+do not flow back. That is option (B) below, and it still costs what it cost.
+
+*Superseded framing, kept because the correction is the point:* the original
 framing here was wrong. Neither option was needed: the real constructor
 populates `raster`/`sampleModel`/`colorModel` correctly as soon as the shim
 stops shadowing it, measured exact against HotSpot.

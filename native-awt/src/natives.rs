@@ -2059,6 +2059,154 @@ fn encode_rendered_image(
 // remaining 15 (`BufferedImage.createGraphics`, `getRGB`/`setRGB`, …) have
 // concrete bytecode and are stubs; `BufferedImage.flush()V` is inherited from
 // `java.awt.Image` and does not exist on `BufferedImage` itself.
+// ---------------------------------------------------------------------------
+// G80-1 N1 option (A) — give BufferedImage a REAL raster and colour model
+// ---------------------------------------------------------------------------
+//
+// `BufferedImage.getRaster()`, `getSampleModel()` and `getColorModel()`
+// answered `null` under --jdk-only, because our `<init>` shim shadows the real
+// constructor and never populated the fields the real one builds. Returning
+// `null` from a method that cannot return `null` is the one behaviour nobody
+// would defend, so it is fixed here.
+//
+// The 4770 lines of renderer/graphics2d/image are deliberately VM-INDEPENDENT
+// (zero `NativeContext` references), so the rasterizer cannot draw into a Java
+// `int[]`. That rules out making the Java array the single backing store
+// without an ownership inversion. What is done instead — measured feasible
+// first — is to build the genuine JDK objects, which all work verbatim under
+// --jdk-only (`DataBufferInt`, `Raster.createPackedRaster`,
+// `SinglePixelPackedSampleModel`, `DirectColorModel` were each verified
+// identical to HotSpot before a line of this was written), and to SYNCHRONISE
+// the pixels into the data buffer at the point the raster is handed out.
+//
+// THE LIMIT, stated rather than discovered later: the returned raster is a
+// SNAPSHOT, not a view. Pixels written through it do not flow back into the
+// rasterizer's buffer. Reads are exact; writes through the raster are lost.
+// Option (B) in the record removes that limit and costs the VM-independence of
+// four thousand lines.
+
+/// Band masks for the packed int layouts we hand out a raster for.
+fn packed_masks(image_type: i32) -> Option<[i32; 4]> {
+    match image_type {
+        // TYPE_INT_RGB — 3 bands, no alpha.
+        1 => Some([0x00FF0000u32 as i32, 0x0000FF00, 0x000000FF, 0]),
+        // TYPE_INT_ARGB — 4 bands.
+        2 => Some([
+            0x00FF0000u32 as i32,
+            0x0000FF00,
+            0x000000FF,
+            0xFF000000u32 as i32,
+        ]),
+        _ => None,
+    }
+}
+
+/// Build the real `DataBufferInt` / `WritableRaster` / `ColorModel` trio for an
+/// image and stamp them onto the `BufferedImage`'s own fields.
+///
+/// Every object here is built by REAL JDK bytecode; nothing is fabricated.
+fn attach_real_raster(ctx: &mut dyn NativeContext, this: ObjectRef, w: i32, h: i32, image_type: i32) {
+    let Some(masks) = packed_masks(image_type) else {
+        return;
+    };
+    let has_alpha = image_type == 2;
+    let nbands = if has_alpha { 4 } else { 3 };
+
+    let size = match w.checked_mul(h) {
+        Some(v) if v >= 0 => v,
+        _ => return,
+    };
+    let Ok(Some(Value::Object(Some(db)))) =
+        ctx.new_object_initialized("java/awt/image/DataBufferInt", "(I)V", &[Value::Int(size)])
+    else {
+        return;
+    };
+
+    let mask_arr = ctx.new_array(ArrayElementType::Int, nbands);
+    for (i, m) in masks.iter().take(nbands).enumerate() {
+        ctx.set_array_element(mask_arr, i, Value::Int(*m));
+    }
+
+    let raster = match ctx.invoke(
+        "java/awt/image/Raster",
+        "createPackedRaster",
+        "(Ljava/awt/image/DataBuffer;III[ILjava/awt/Point;)Ljava/awt/image/WritableRaster;",
+        &[
+            Value::Object(Some(db)),
+            Value::Int(w),
+            Value::Int(h),
+            Value::Int(w),
+            Value::Object(Some(mask_arr)),
+            Value::Object(None),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(r)))) => r,
+        _ => return,
+    };
+
+    let cm_desc = if has_alpha { "(IIIII)V" } else { "(IIII)V" };
+    let cm_args: Vec<Value> = if has_alpha {
+        vec![
+            Value::Int(32),
+            Value::Int(masks[0]),
+            Value::Int(masks[1]),
+            Value::Int(masks[2]),
+            Value::Int(masks[3]),
+        ]
+    } else {
+        vec![
+            Value::Int(24),
+            Value::Int(masks[0]),
+            Value::Int(masks[1]),
+            Value::Int(masks[2]),
+        ]
+    };
+    let Ok(Some(Value::Object(Some(cm)))) =
+        ctx.new_object_initialized("java/awt/image/DirectColorModel", cm_desc, &cm_args)
+    else {
+        return;
+    };
+
+    ctx.set_field_by_name(this, "raster", Value::Object(Some(raster)));
+    ctx.set_field_by_name(this, "colorModel", Value::Object(Some(cm)));
+}
+
+/// Copy the rasterizer's pixels into the real `DataBufferInt` behind `this`'s
+/// raster, so a raster handed to Java reflects what has been drawn.
+///
+/// Called at the points where a raster (or its data) leaves for Java. See the
+/// SNAPSHOT limit in the block comment above.
+fn sync_raster_pixels(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let Some(id) = buffered_image_id(ctx, this) else {
+        return;
+    };
+    let pixels: Vec<u32> = {
+        let reg = image::image_registry();
+        match reg.get(id) {
+            Some(img) => img.get_rgb_region(0, 0, img.width(), img.height()),
+            None => return,
+        }
+    };
+    let Value::Object(Some(raster)) = ctx.get_field_by_name(this, "raster") else {
+        return;
+    };
+    let Ok(Some(Value::Object(Some(db)))) = ctx.invoke_virtual(
+        raster,
+        "getDataBuffer",
+        "()Ljava/awt/image/DataBuffer;",
+        &[],
+    ) else {
+        return;
+    };
+    let Value::Object(Some(data)) = ctx.get_field_by_name(db, "data") else {
+        return;
+    };
+    let len = ctx.array_length(data).min(pixels.len());
+    for i in 0..len {
+        ctx.set_array_element(data, i, Value::Int(pixels[i] as i32));
+    }
+}
+
 fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/image/BufferedImage", "<init>", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
@@ -2095,9 +2243,30 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "width", Value::Int(w as i32));
             ctx.set_field_by_name(this, "height", Value::Int(h as i32));
             bind_buffered_image(ctx, this, img_id);
+            // G80-1 N1(A): give the object the REAL raster and colour model the
+            // real constructor would have built, so getRaster()/getSampleModel()/
+            // getColorModel() stop answering null. Best-effort: an unsupported
+            // image type simply leaves the fields as they were.
+            attach_real_raster(ctx, this, w_raw, h_raw, get_int(args, 3));
         }
         void_ok()
     });
+    // Registered ONLY to synchronise before the raster leaves for Java — the
+    // return value is the field the real constructor's counterpart would have
+    // returned. Without this the raster is real but its pixels are whatever the
+    // rasterizer had not yet written.
+    registry.register(
+        "java/awt/image/BufferedImage",
+        "getRaster",
+        "()Ljava/awt/image/WritableRaster;",
+        |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                sync_raster_pixels(ctx, this);
+                return Ok(Some(ctx.get_field_by_name(this, "raster")));
+            }
+            null_ok()
+        },
+    );
     registry.register(
         "java/awt/image/BufferedImage",
         "getWidth",
@@ -2136,6 +2305,8 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             int_ok(0)
         },
     );
+
+
     registry.register(
         "java/awt/image/BufferedImage",
         "getRGB",
