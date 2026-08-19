@@ -780,3 +780,44 @@ one.
 `try_jit_site_cached_native_dispatch` 8.81% + `safe_native_call_impl` 8.33% —
 per-call native dispatch, a different page — and `jit_getfield`'s own remaining
 body at 16.31%. The membership walk is no longer the single largest item.
+
+## Caller census for the surviving walks — it is NATIVE DISPATCH, not putfield
+
+`perf` could not answer this: DWARF unwinding on the optimized build returns
+self-recursive frames, and LBR is unavailable on the virtualised PMU. Grouping
+all 132 `is_object_address` call sites by enclosing function pointed at the
+native-dispatch path rather than the obvious `getfield` siblings, and counting
+confirmed it (SHA256Digest x200 000, ZGC):
+
+| site | membership walks |
+|---|---|
+| `decode_dispatch_values_into` | **5 495 224** |
+| `try_jit_site_cached_native_dispatch` | 439 463 |
+| `getfield` | **0** |
+
+Two things follow.
+
+**The getfield fix is complete on its own terms** — zero walks remain from that
+arm, where there were ~34 M.
+
+**`putfield` and the array helpers were the wrong suspects.** The surviving
+walker is the per-call native argument decode: ~27 walks per loop iteration,
+which is exactly the native-call count of this kernel (16 `Pack.bigEndianToInt`
+per block x 2 blocks, plus `SHA256Digest.processBlock`). **Every native call
+membership-walks each of its reference arguments.**
+
+That means "extend the proven-oop argument" and "per-call native dispatch" —
+listed as two separate follow-ups — are **one item**. It also means the SHA-256
+intrinsic landed for the bc-java PQC page pays this tax on every invocation, so
+the two pages meet here.
+
+The same trust argument should apply: the JIT knows these arguments are oops.
+That is the next fix, and it is **not** done here — this section is the census,
+not the change.
+
+### Caveat on the census's scope
+
+Only the JIT helpers in `vm/src/jit/helpers.rs` are tagged. `is_object_address`
+has 132 call sites across the VM; the GC's and the interpreter's are not
+counted, so these numbers are the JIT-side share and not the process total. Do
+not subtract them from a profile percentage and expect the remainder to be zero.
