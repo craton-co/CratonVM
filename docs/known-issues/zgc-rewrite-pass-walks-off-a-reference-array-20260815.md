@@ -772,6 +772,51 @@ rewrite-pass fault is what changed. A bisect is now justified — and its first
 duty is to **record which frames each crash symbolizes to**, or it will merge two
 defects into one answer.
 
+## Bisect, step 1 — and the step size is wrong
+
+Rather than a blind midpoint over 108 GC-touching commits, the first step tested
+a commit with prior evidence: **`175dc1751`**, *"the proxy Method cache was rooted
+but never remapped"* — a cache holding pre-slide addresses the slide moved, which
+is this defect's shape exactly.
+
+| tree | reps | SIGSEGV |
+|---|---:|---:|
+| `7eab6d6c2` (pre-fix control) | 26 | **2** |
+| `175dc1751` (the remap fix) | 26 | **0** |
+| current `dev` | 52 | **0** |
+
+So the closer is **provisionally** in `(7eab6d6c2, 175dc1751]`.
+
+### Why "provisionally", and this is the important part
+
+**A 26-rep clean step is not evidence.** At the control's measured rate of
+2/26 ≈ 0.077:
+
+```
+P(0 crashes in 26 | p = 0.077) = 0.923^26 = 0.125
+```
+
+**One step in eight will read clean when nothing changed.** A bisect built on
+26-rep steps therefore makes a wrong call at roughly that rate, and every step
+after a wrong call searches the wrong half — which is exactly the failure this
+page already has on its record, where a `0/12` closed the case and the reopening
+noted "a ~1-in-10 event and zero in twelve draws are entirely compatible".
+
+For 95% confidence that a step is genuinely clean, at this rate:
+
+```
+0.923^n < 0.05  ->  n >= 38 reps per step
+```
+
+At ~90 s per rep that is ~1 hour of running per step **plus** a ~20 minute build,
+over log₂ of the ~124 commits still in range — call it 7 steps, so **the honest
+price of this bisect is 8–9 hours**, not the ~4 estimated before the rate was
+known. The `0/52` on current `dev` is the one figure here that clears the bar
+(P = 1.6%); the two 26-rep readings do not, on their own.
+
+**Do not narrow the range further on 26-rep steps.** Re-run `175dc1751` at n ≥ 38
+before trusting the bracket above.
+
 ## The control this run WAS missing, and why it mattered
 
 The arm was proven non-vacuous — it collects and it compacts, checked above. **The
