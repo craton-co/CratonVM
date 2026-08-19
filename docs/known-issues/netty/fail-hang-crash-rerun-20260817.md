@@ -45,31 +45,36 @@ The 11-class compression `*IntegrationTest` cluster → `compression-testhugedec
 `ResourceLeakDetectorTest` → `resourceleakdetector-concurrentusage-timeout-20260815.md` /
 `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`.
 `DnsNameResolverTest`, `CertificateBuilderTest` →
-`dnsnameresolvertest-searchdomaintest-hang-fail-20260816.md` /
-`certificatebuildertest-fail-status-not-a-regression-20260816.md` (note:
-`DnsNameResolverTest` reads `ABORTED` in this rerun rather than the `HANG`
-that doc characterized — worth a quick look at whether that's the same
-`0.0.0.1` bug surfacing differently in isolation, or a second issue).
+`certificatebuildertest-fail-status-not-a-regression-20260816.md` and, for the
+`HANG` → `ABORTED` change flagged here, **answered 2026-08-19**:
+`docs/internal/fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md`.
+Not the `0.0.0.1` bug (fixed and retired by `62cd387c1`) and not a second
+issue — the 16 aborts are eight Windows-only tests × two channel strategies,
+byte-identical on stock HotSpot. The `HANG` was the class running to 82% of
+the 180s cap; it now has a 600s per-class override and a
+`known-benign-aborts.tsv` entry so `categorize` stops re-flagging it.
 `BootstrapTest`/`ServerBootstrapTest` (`UnsupportedOperationException:
 CONNECT_TIMEOUT_MILLIS`) were already known from the very first triage this
 session did.
 
 **New clusters, not yet triaged:**
 
-1. **17 `NativeImageHandlerMetadataTest` classes, one per module
-   (`io.netty.channel`, `io.netty.handler`, `io.netty.handler.codec.*` ×12,
-   `io.netty.handler.proxy`, `io.netty.resolver.dns`) — all `FAIL→FAIL`,
-   identically, on all three collectors.** This is 17 of the 29 `FAIL`
-   classes — very likely one shared root cause (GraalVM native-image
-   reflect-config/resource-config metadata validation, not netty's runtime
-   behavior). Worth a single investigation, not 17.
+1. ~~**17 `NativeImageHandlerMetadataTest` classes, one per module** — all
+   `FAIL→FAIL` identically on all three collectors.~~ **RESOLVED 2026-08-19,
+   17 FAIL → 17 PASS:**
+   `docs/internal/fixed-suite-bugs/netty/nativeimagehandlermetadatatest-harness-module-scope-FIXED-20260819.md`.
+   One shared root cause as suspected, and not a VM one: the suite ran these
+   build-hygiene tests from the fixture directory against the flat
+   whole-reactor classpath, so they looked for a `null/null` resource path
+   and over-collected handlers from sibling modules. Stock HotSpot failed
+   them byte-identically. They now run module-scoped and pass on both VMs.
 2. **7 buffer classes, `ABORTED` uniformly**:
    `AdvancedLeakAwareCompositeByteBufTest`, `AlignedPooledByteBufAllocatorTest`,
    `BigEndianCompositeByteBufTest`, `LittleEndianCompositeByteBufTest`,
    `PooledByteBufAllocatorTest`, `SimpleLeakAwareCompositeByteBufTest`,
    `WrappedCompositeByteBufTest`. Not examined — worth checking whether
-   these share an `assumeTrue`/`@EnabledIf` gate the same way the
-   `NativeImageHandlerMetadataTest` cluster might.
+   these share an `assumeTrue`/`@EnabledIf` gate — see
+   `buffer-alignment-abort-cluster-not-a-cratonvm-bug-20260819.md`.
 3. **3 HTTP/2 classes**: `DataCompressionHttp2Test`,
    `UniformStreamByteDistributorFlowControllerTest`,
    `WeightedFairQueueRemoteFlowControllerTest`.
