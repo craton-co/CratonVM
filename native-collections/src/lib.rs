@@ -2594,8 +2594,13 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // least entangled: `overwrote` is 0, so no other registration depends on
     // this one winning, and only ONE registration is abstract — the header
     // warns that abstract-interface registrations decide dispatch for every
-    // USER subclass, not just for `java.util`, so a subsystem with 88 of them
-    // (`register_set_view_carrier_natives`) is not where to start.
+    // USER subclass, not just for `java.util`.
+    //
+    // (This comment originally named `register_set_view_carrier_natives` and
+    // its 88 not-declared-here rows as "not where to start". That was WRONG,
+    // and is corrected at that registrar: a reflection pass showed all 88 are
+    // INHERITED-CONCRETE and none is abstract-interface. Ranking on the raw
+    // count reproduces the very error G79-1 §2 documented.)
     //
     // Exercised by RCollections and RJdkBridge1 (core) and RJdkMapViews
     // (jdk-only), so all three arms adjudicate this change.
@@ -15941,7 +15946,32 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
     // The classes a map's `keySet()`/`entrySet()` view is minted under.
-    register_set_view_carrier_natives(r);
+    //
+    // RETAGGED per subsystem — the LARGEST single registrar in this crate, and
+    // the one I had nominated as "where not to start". That was wrong; the
+    // reflection pass corrected it.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry` plus the reflection split
+    // in `regression-suite/probes/NotDeclaredSplit.java`, under `--jdk-only`):
+    //   registrations 140 | invocations 5 | overwrote 0
+    //   140 not-declared-here rows resolve as 88 INHERITED-CONCRETE and
+    //   **0 ABSTRACT-INTERFACE**; the remaining 52 are declared with code here.
+    //
+    // The header's warning — abstract-interface registrations decide dispatch
+    // for every USER implementor, not just `java.util` — is the reason to fear
+    // a large registrar. It does not apply here: every row resolves to a
+    // concrete method with a body. The raw "not declared here" count made this
+    // look like the crate's most dangerous registrar; it is one of its safest.
+    //
+    // The genuinely abstract-interface rows live elsewhere — 254 crate-wide,
+    // concentrated in `register_stream_natives` (50), the three primitive
+    // stream registrars (86 between them), `register_interface_natives` (26),
+    // `register_queue_deque_interface_natives` (18) and
+    // `register_iterator_protocol_natives` (15). Those are the ones to leave.
+    r.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_set_view_carrier_natives,
+    );
 }
 
 /// The `Set` surface of a keySet/entrySet view, registered on each of the
