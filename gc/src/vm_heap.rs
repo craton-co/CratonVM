@@ -242,6 +242,15 @@ macro_rules! dispatch {
     };
 }
 
+/// Every `VmHeap::is_object_address` call, from any caller. Diagnostic only.
+pub static IS_OBJECT_ADDRESS_CALLS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`IS_OBJECT_ADDRESS_CALLS`].
+pub fn is_object_address_calls() -> u64 {
+    IS_OBJECT_ADDRESS_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 impl VmHeap {
     /// Create a new VmHeap with the specified backend and total capacity.
     pub fn new(backend: GcBackend, total_bytes: usize) -> Self {
@@ -515,6 +524,12 @@ impl VmHeap {
     /// this heap. See [`crate::gen_heap::GenerationalHeap::is_object_address`]
     /// for the full contract.
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
+        // TOTAL walk counter, every caller. The per-site census in
+        // `vm/src/jit/helpers.rs` tags only the JIT helpers; comparing its sum
+        // against this says whether those sites are the whole story or a
+        // fraction. Getting that backwards would mean optimising 3% while
+        // claiming 12%.
+        IS_OBJECT_ADDRESS_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         match self {
             VmHeap::Generational(h) => h.is_object_address(addr),
             VmHeap::G1(h) => h.is_object_address(addr),
