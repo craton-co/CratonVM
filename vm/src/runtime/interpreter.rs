@@ -5937,6 +5937,19 @@ fn execute_frame_from_index(
                 }
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
+                    // Calibration: two adjacent reads measuring nothing, so the
+                    // other phases can be corrected for rdtsc latency instead of
+                    // compared against an assumed one.
+                    {
+                        let c0 = crate::runtime::interpreter::invoke_phases::now();
+                        let c1 = crate::runtime::interpreter::invoke_phases::now();
+                        crate::runtime::interpreter::invoke_phases::charge(
+                            crate::runtime::interpreter::invoke_phases::P_CALIB,
+                            c0,
+                            c1,
+                        );
+                    }
+                    let ph_r0 = crate::runtime::interpreter::invoke_phases::now();
                     // Bit-exact return-value transfer. The prior
                     // `pop_unchecked()` + `push_unchecked()` round-tripped the
                     // slot through `to_value()`/`from_value()`, which decoded a
@@ -6087,7 +6100,14 @@ fn execute_frame_from_index(
                     );
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent.
+                        let ph_r1 = crate::runtime::interpreter::invoke_phases::now();
                         pop_and_recycle_frame(shared, thread);
+                        let ph_r2 = crate::runtime::interpreter::invoke_phases::now();
+                        crate::runtime::interpreter::invoke_phases::charge(
+                            crate::runtime::interpreter::invoke_phases::P_RET_RECYCLE,
+                            ph_r1,
+                            ph_r2,
+                        );
                         frame_idx -= 1;
                         if opcode == 0xb0 {
                             // areturn: push the normalized reference value.
@@ -6113,6 +6133,11 @@ fn execute_frame_from_index(
                             // values, raw copy is sufficient.
                             thread.frames[frame_idx].stack.push_compact(cv);
                         }
+                        crate::runtime::interpreter::invoke_phases::charge(
+                            crate::runtime::interpreter::invoke_phases::P_RET_TOTAL,
+                            ph_r0,
+                            crate::runtime::interpreter::invoke_phases::now(),
+                        );
                         continue;
                     }
                     return Ok(Some(value));
