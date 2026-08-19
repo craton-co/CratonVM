@@ -2241,6 +2241,22 @@ pub fn compile_with_param_slots(
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
+    // The identity half of the frame record. The prologue this compile emitted
+    // publishes `compiler.compile_id` into the compile-id mirror on entry, and
+    // `bind_compile_id` at publication binds whatever `CompiledMethod::compile_id`
+    // holds — so leaving it 0 here bound NOTHING (`bind_compile_id` early-returns
+    // on 0) while every frame of this method went on publishing an id no lookup
+    // could resolve.
+    //
+    // The consequence was silent and only visible from Java: with the id
+    // unresolvable, `conservative_roots::innermost_frame_method` fell through to
+    // the boundary method, so the INNERMOST compiled frame of every fast-tier
+    // method was reported under its CALLER's name. `SWCross` shows it directly —
+    // a `helper()` frame read as a second `recurse` — and it is why Log4j2's
+    // caller lookup answered with the enclosing class. The optimizing backend
+    // never had the bug: `ir_lower.rs` assigns `cm.compile_id` at its own
+    // finalize, which is the line this mirrors.
+    cm.compile_id = compiler.compile_id;
     // Stage A.2 (precise oop maps, B-K fix) — a method is "fully precisely
     // covered" only when EVERY GC-capable safepoint that flushed its
     // register-locals (`safepoint_pcs`) also recorded a precise oop map
