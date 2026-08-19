@@ -106,6 +106,7 @@ fn maybe_dump_shutdown_reports() {
     // is what proves the lever is live before anyone times it — an inert gate
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
+    cratonvm_vm::runtime::interpreter::invoke_phases::dump();
 
     // The G1 live-region memo's tally, self-gated on
     // `CRATONVM_DBG_G1_LIVE_MEMO`. Same argument as the line above, and it is

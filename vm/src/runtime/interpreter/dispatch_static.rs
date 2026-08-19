@@ -1309,10 +1309,17 @@ pub(super) fn execute_invokestatic_cached(
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
     // invokespecial in the same class (different CP entries semantically).
+    let ph_t0 = crate::runtime::interpreter::invoke_phases::now();
     let target = match thread.invoke_cache.get(caller_class_id, cp_index, false) {
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    let ph_t1 = crate::runtime::interpreter::invoke_phases::now();
+    crate::runtime::interpreter::invoke_phases::charge(
+        crate::runtime::interpreter::invoke_phases::P_IC_LOOKUP,
+        ph_t0,
+        ph_t1,
+    );
     // JVMTI redefine guard (static): never serve a cached native/intrinsic
     // SHADOW for a static method whose declaring class an agent has redefined
     // (e.g. Mockito `mockStatic(X)` woves X's static methods) — evict and
@@ -1782,6 +1789,12 @@ pub(super) fn execute_invokestatic_cached(
             // way. See gaps/bc-ec-mod-mododdinverse-investigation.md.
             const MAX_INLINE_ARGS: usize = 16;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
+            let ph_t2 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_GUARDS,
+                ph_t1,
+                ph_t2,
+            );
             // ONE forward scan; the per-argument form rescanned from `(` each time.
             let param_tags = ParamTags::of(&cached.method_descriptor);
             let pd_byte = |i: usize| -> u8 { param_tags.get(&cached.method_descriptor, i) };
@@ -1841,6 +1854,12 @@ pub(super) fn execute_invokestatic_cached(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 (cached.max_stack as usize).max(16) + 8,
             );
+            let ph_t3 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_ARGS,
+                ph_t2,
+                ph_t3,
+            );
             let mut frame = Frame::new_pooled_cached(
                 cached.clone(),
                 args_slice,
@@ -1857,7 +1876,20 @@ pub(super) fn execute_invokestatic_cached(
                     frame.method_descriptor()
                 );
             }
+            let ph_t4 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_FRAME_BUILD,
+                ph_t3,
+                ph_t4,
+            );
             push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+            let ph_t5 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_PUSH,
+                ph_t4,
+                ph_t5,
+            );
+            crate::runtime::interpreter::invoke_phases::count_call();
             Ok(CachedCallResult::FramePushed)
         }
         _ => Ok(CachedCallResult::CacheMiss),

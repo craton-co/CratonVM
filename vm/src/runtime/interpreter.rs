@@ -8321,6 +8321,7 @@ pub use field_access::*;
 // The interpreter's resolved constant pool: per-thread, lock-free site caches
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
+pub mod invoke_phases;
 pub mod site_cache;
 pub use site_cache::{
     CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo,

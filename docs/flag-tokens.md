@@ -680,6 +680,7 @@ export inherited from a parent shell.
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
+| `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
