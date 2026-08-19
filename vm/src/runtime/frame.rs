@@ -4160,3 +4160,13 @@ mod frame_size_probe {
         eprintln!("align_of::<Frame>()     = {}", std::mem::align_of::<Frame>());
     }
 }
+
+#[cfg(test)]
+mod value_size_probe {
+    #[test]
+    fn report_value_size() {
+        eprintln!("size_of::<Value>()        = {}", std::mem::size_of::<cratonvm_types::Value>());
+        eprintln!("16-slot args_buf bytes    = {}", 16 * std::mem::size_of::<cratonvm_types::Value>());
+        eprintln!("size_of::<CompactValue>() = {}", std::mem::size_of::<cratonvm_types::CompactValue>());
+    }
+}

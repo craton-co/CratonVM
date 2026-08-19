@@ -1787,7 +1787,14 @@ pub(super) fn execute_invokestatic_cached(
             // dropping the high bits before it reached the callee's locals.
             // The non-cached `execute_invokestatic` path already decodes this
             // way. See gaps/bc-ec-mod-mododdinverse-investigation.md.
-            const MAX_INLINE_ARGS: usize = 16;
+            // 8, not 16. `args_buf` is `[Value; MAX_INLINE_ARGS]` and `Value`
+            // is 16 bytes, so at 16 this initialised 256 BYTES on every call
+            // regardless of how many arguments the callee actually takes. The
+            // phase instrument charged 60.9 cyc/call to argument handling on a
+            // workload of nothing but ZERO-argument calls, which is what that
+            // initialisation costs. Eight covers essentially every method and
+            // wider ones still spill to `args_vec` exactly as before.
+            const MAX_INLINE_ARGS: usize = 8;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
             let ph_t2 = crate::runtime::interpreter::invoke_phases::now();
             crate::runtime::interpreter::invoke_phases::charge(
@@ -1795,24 +1802,36 @@ pub(super) fn execute_invokestatic_cached(
                 ph_t1,
                 ph_t2,
             );
-            // ONE forward scan; the per-argument form rescanned from `(` each time.
-            let param_tags = ParamTags::of(&cached.method_descriptor);
-            let pd_byte = |i: usize| -> u8 { param_tags.get(&cached.method_descriptor, i) };
-            let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
+            // A zero-argument call builds no buffer and scans no descriptor at
+            // all. `invokestatic` of a no-arg method is a very common shape and
+            // it was paying for both. `args_buf` is deliberately declared
+            // WITHOUT an initialiser so the 128 bytes are written only on the
+            // path that uses them.
+            let mut args_buf: [Value; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
-            let args_slice: &mut [Value] = if num_params <= MAX_INLINE_ARGS {
+            let args_slice: &mut [Value] = if num_params == 0 {
+                &mut []
+            } else if num_params <= MAX_INLINE_ARGS {
+                // ONE forward scan; the per-argument form rescanned from `(` each time.
+                let param_tags = ParamTags::of(&cached.method_descriptor);
+                args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                 for i in (0..num_params).rev() {
                     args_buf[i] = thread.frames[frame_idx]
                         .stack
-                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
+                        .pop_arg_for_descriptor_checked(
+                            param_tags.get(&cached.method_descriptor, i),
+                        )?;
                 }
                 &mut args_buf[..num_params]
             } else {
+                let param_tags = ParamTags::of(&cached.method_descriptor);
                 args_vec.resize(num_params, Value::Uninitialized);
                 for i in (0..num_params).rev() {
                     args_vec[i] = thread.frames[frame_idx]
                         .stack
-                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
+                        .pop_arg_for_descriptor_checked(
+                            param_tags.get(&cached.method_descriptor, i),
+                        )?;
                 }
                 &mut args_vec
             };
